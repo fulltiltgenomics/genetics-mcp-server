@@ -34,6 +34,7 @@ All environment variables are optional but needed for each type of functionality
 ### MCP Server
 
 ```bash
+cd src
 export GENETICS_API_URL=https://.../api
 # stdio transport
 python -m genetics_mcp_server.mcp_server
@@ -44,6 +45,7 @@ python -m genetics_mcp_server.mcp_server --transport streamable-http --port 8080
 ### Chat API Server
 
 ```bash
+cd src
 export ANTHROPIC_API_KEY=sk-ant-...
 export GENETICS_API_URL=https://.../api
 uvicorn genetics_mcp_server.chat_api:app --port 8000
