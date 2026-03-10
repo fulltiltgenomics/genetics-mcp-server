@@ -1,0 +1,49 @@
+[project]
+name = "genetics-mcp-server"
+version = "0.1.0"
+description = "MCP server and LLM service for genetics data tools"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]==1.25.0",
+    "httpx==0.28.1",
+    "polars==1.37.0",
+    "python-dotenv==1.2.1",
+    "matplotlib==3.10.8",
+    "anthropic==0.75.0",
+    "openai==2.15.0",
+    "fastapi==0.128.0",
+    "uvicorn==0.40.0",
+    "sse-starlette==3.1.2",
+    "pydantic==2.12.5",
+    "duckduckgo-search==8.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.2",
+    "pytest-asyncio==1.3.0",
+    "pytest-cov==7.0.0",
+    "ruff==0.14.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/genetics_mcp_server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+# E501: line too long (handled by formatter)
+# E402: module level import not at top of file (load_dotenv must be called before project imports)
+ignore = ["E501", "E402"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
