@@ -538,6 +538,7 @@ TOOL_PROFILES: dict[str, set[str]] = {
 def get_anthropic_tools(
     custom_descriptions: dict[str, str] | None = None,
     tool_profile: str | None = None,
+    disabled_tools: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return tool definitions in Anthropic's format, filtered by tool profile.
@@ -547,10 +548,14 @@ def get_anthropic_tools(
         tool_profile: Profile controlling which tool categories to include.
             None = all tools, "api" = general+api, "bigquery" = general+bigquery,
             "rag" = general only (RAG tools are external, handled separately).
+        disabled_tools: Optional set of tool names to exclude.
     """
     anthropic_tools = []
 
     all_tools = list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS)
+
+    if disabled_tools:
+        all_tools = [t for t in all_tools if t["name"] not in disabled_tools]
 
     if tool_profile is not None:
         allowed_categories = TOOL_PROFILES.get(tool_profile, {"general"})
@@ -595,14 +600,20 @@ def get_anthropic_tools(
     return anthropic_tools
 
 
-def register_mcp_tools(mcp: "FastMCP", executor: "ToolExecutor") -> None:
+def register_mcp_tools(
+    mcp: "FastMCP",
+    executor: "ToolExecutor",
+    disabled_tools: set[str] | None = None,
+) -> None:
     """
     Register all tools with a FastMCP server instance.
 
     Args:
         mcp: FastMCP server instance
         executor: ToolExecutor instance for making API calls
+        disabled_tools: Optional set of tool names to skip registration.
     """
+    _disabled = disabled_tools or set()
 
     @mcp.tool()
     async def search_phenotypes(query: str, limit: int = 100) -> dict:
@@ -711,13 +722,15 @@ def register_mcp_tools(mcp: "FastMCP", executor: "ToolExecutor") -> None:
         """Get a catalog of all available data resources."""
         return await executor.get_available_resources()
 
-    @mcp.tool()
-    async def get_credible_sets_stats(
-        resource_or_dataset: str,
-        trait: str | None = None,
-    ) -> dict:
-        """Get credible sets stats. CRITICAL: Include the INCLUDE_IN_RESPONSE field value verbatim in your response."""
-        return await executor.get_credible_sets_stats(resource_or_dataset, trait)
+    if "get_credible_sets_stats" not in _disabled:
+
+        @mcp.tool()
+        async def get_credible_sets_stats(
+            resource_or_dataset: str,
+            trait: str | None = None,
+        ) -> dict:
+            """Get credible sets stats. CRITICAL: Include the INCLUDE_IN_RESPONSE field value verbatim in your response."""
+            return await executor.get_credible_sets_stats(resource_or_dataset, trait)
 
     @mcp.tool()
     async def get_nearest_genes(

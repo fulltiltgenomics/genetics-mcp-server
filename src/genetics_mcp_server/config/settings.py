@@ -16,7 +16,7 @@ class Settings:
     # genetics API
     genetics_api_url: str = field(
         default_factory=lambda: os.environ.get(
-            "GENETICS_API_URL", "http://0.0.0.0:2000/api"
+            "GENETICS_API_URL", "http://localhost:2000/api"
         )
     )
 
@@ -55,8 +55,15 @@ class Settings:
 
     # MCP settings
     mcp_enabled: bool = True
-    mcp_max_iterations: int = 10
+    mcp_max_iterations: int = 25
     mcp_max_result_size: int = 50000
+
+    # optional tools (disabled by default)
+    enable_credible_sets_stats: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_CREDIBLE_SETS_STATS", "false"
+        ).lower() in ("1", "true", "yes")
+    )
 
     # RAG MCP server (separate from always-on external servers)
     rag_mcp_server: str | None = field(
@@ -84,6 +91,14 @@ class Settings:
     max_attachment_size: int = field(
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENT_SIZE", "52428800"))  # 50MB
     )
+
+
+    @property
+    def disabled_tools(self) -> set[str]:
+        disabled = set()
+        if not self.enable_credible_sets_stats:
+            disabled.add("get_credible_sets_stats")
+        return disabled
 
 
 @lru_cache

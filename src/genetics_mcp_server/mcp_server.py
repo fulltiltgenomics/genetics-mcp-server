@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import TransportSecuritySettings
 
+from genetics_mcp_server.config.settings import get_settings
 from genetics_mcp_server.tools.definitions import register_mcp_tools
 from genetics_mcp_server.tools.executor import ToolExecutor
 
@@ -72,7 +73,9 @@ else:
 # create executor and register tools
 api_url = os.environ.get("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 executor = ToolExecutor(api_base_url=api_url)
-register_mcp_tools(mcp, executor)
+
+_settings = get_settings()
+register_mcp_tools(mcp, executor, disabled_tools=_settings.disabled_tools)
 
 logger.info(f"Registered MCP tools. API URL: {api_url}")
 
