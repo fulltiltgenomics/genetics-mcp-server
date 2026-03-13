@@ -12,8 +12,6 @@ from .llm_config_db import (
     ToolDescriptionVersion,
     UserApiToken,
     UserComment,
-    UserInstructions,
-    UserToolDescription,
     get_llm_config_db,
 )
 from .singleton import Singleton
@@ -28,8 +26,6 @@ __all__ = [
     "ToolDescriptionVersion",
     "UserApiToken",
     "UserComment",
-    "UserInstructions",
-    "UserToolDescription",
     "get_llm_config_db",
     "Singleton",
 ]

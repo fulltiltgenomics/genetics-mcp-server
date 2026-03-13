@@ -24,7 +24,9 @@ def is_public_endpoint(request: Request) -> bool:
 async def auth_required(request: Request) -> str | None:
     """Dependency that requires authentication via IAP/oauth2-proxy header."""
     if not _require_auth:
-        return None
+        # still check for IAP header in case it's present
+        user = get_authenticated_user(request)
+        return user or "anonymous"
 
     if is_public_endpoint(request):
         return None
