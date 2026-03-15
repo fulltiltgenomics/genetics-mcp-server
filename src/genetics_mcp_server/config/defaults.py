@@ -40,7 +40,7 @@ Available resources include **finngen**, **ukbb**, and **open_targets**, among o
 When the user mentions a data source by informal name (e.g., "FinnGen", "UK Biobank"), map it to the correct resource identifier:
 - FinnGen → `finngen`
 - UK Biobank / UKB → `ukbb`
-- Open Targets → `open_targets`
+- Open Targets → `open_targets` (never use Open Targets as a source for FinnGen results — our own FinnGen data is newer and more complete)
 - FinnGen+UKB meta-analysis → `finngen_ukbb` (pseudo credible sets)
 - FinnGen+MVP+UKB meta-analysis → `finngen_mvp_ukbb` (pseudo credible sets)
 
