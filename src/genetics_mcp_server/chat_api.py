@@ -241,6 +241,7 @@ async def stream_chat(
                 enable_tools=request.enable_tools,
                 literature_backend=request.literature_backend,
                 tool_profile=request.tool_profile,
+                secret=request.secret,
             ):
                 if chunk.type == "text":
                     yield {

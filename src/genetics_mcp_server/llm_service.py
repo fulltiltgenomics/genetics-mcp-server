@@ -93,6 +93,7 @@ class LLMService:
         custom_tool_descriptions: dict[str, str] | None = None,
         literature_backend: str | None = None,
         tool_profile: str | None = None,
+        secret: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -108,6 +109,7 @@ class LLMService:
             tool_profile: Tool profile controlling which categories are available.
                 None = all tools, "api" = general+api, "bigquery" = general+bigquery,
                 "rag" = general+RAG external tools.
+            secret: If True, suppress detailed logging to avoid persisting chat content.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -121,7 +123,7 @@ class LLMService:
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile,
+                literature_backend, tool_profile, secret,
             ):
                 yield chunk
         else:
@@ -178,6 +180,7 @@ class LLMService:
         custom_tool_descriptions: dict[str, str] | None = None,
         literature_backend: str | None = None,
         tool_profile: str | None = None,
+        secret: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -201,7 +204,10 @@ class LLMService:
         }
 
         if system_prompt:
-            request_params["system"] = system_prompt
+            # use structured format with cache_control for prompt caching
+            request_params["system"] = [
+                {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+            ]
 
         # add tool definitions if enabled
         tool_definitions = None
@@ -224,15 +230,23 @@ class LLMService:
                 rag_tools = get_rag_anthropic_tools()
                 tool_definitions.extend(rag_tools)
 
+            # mark last tool for prompt caching so tool definitions are cached
+            if tool_definitions:
+                tool_definitions[-1] = {
+                    **tool_definitions[-1],
+                    "cache_control": {"type": "ephemeral"},
+                }
             request_params["tools"] = tool_definitions
-            logger.info(
-                f"Including {len(tool_definitions)} MCP tools "
-                f"(profile={tool_profile or 'all'}, {local_count} local, "
-                f"{len(external_tools)} external, {len(rag_tools)} RAG)"
-            )
+            if not secret:
+                logger.info(
+                    f"Including {len(tool_definitions)} MCP tools "
+                    f"(profile={tool_profile or 'all'}, {local_count} local, "
+                    f"{len(external_tools)} external, {len(rag_tools)} RAG)"
+                )
 
         try:
-            logger.info(f"Streaming Anthropic chat with model {model}")
+            if not secret:
+                logger.info(f"Streaming Anthropic chat with model {model}")
             max_iterations = settings.mcp_max_iterations
             iteration = 0
 
@@ -259,30 +273,31 @@ class LLMService:
                 if not tool_uses or not self.executor:
                     break
 
-                # execute tools and collect results
-                tool_results = []
+                # emit tool-use indicators to stream
                 for tool_use in tool_uses:
-                    # build effective input for display (with injected params)
                     effective_input = dict(tool_use.input)
                     if tool_use.name == "search_scientific_literature" and literature_backend:
                         effective_input["backend"] = literature_backend
-
-                    logger.info(f"Executing tool: {tool_use.name} with input: {effective_input}")
+                    if not secret:
+                        logger.info(f"Executing tool: {tool_use.name} with input: {effective_input}")
                     params_str = ", ".join(f"{k}: {v}" for k, v in effective_input.items())
                     yield StreamChunk(
                         type="text", content=f"\n\n*[Using tool: {tool_use.name}; {params_str}]*\n\n"
                     )
 
-                    result = await self._execute_tool(tool_use.name, tool_use.input, literature_backend)
+                # execute all tools in parallel
+                raw_results = await asyncio.gather(
+                    *(self._execute_tool(tu.name, tu.input, literature_backend) for tu in tool_uses)
+                )
 
-                    # check if result contains an image - stream it and remove from LLM context
+                # process results: extract images, truncate, build tool_results
+                tool_results = []
+                for tool_use, result in zip(tool_uses, raw_results):
                     if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
                         image_data = result["image_base64"]
                         image_format = result.get("image_format", "png")
-                        # validate base64 data is present and reasonably sized
                         if image_data and len(image_data) > 100:
                             logger.info(f"Streaming image: format={image_format}, size={len(image_data)} chars")
-                            # stream image as a separate event type for reliable handling
                             yield StreamChunk(
                                 type="image",
                                 content=image_data,
@@ -291,13 +306,11 @@ class LLMService:
                             )
                         else:
                             logger.warning(f"Invalid image data: size={len(image_data) if image_data else 0}")
-                        # remove image from result to avoid sending huge base64 to LLM
                         result = {k: v for k, v in result.items() if k != "image_base64"}
                         result["note"] = "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
 
                     result_json = json.dumps(result)
 
-                    # truncate large results
                     if len(result_json) > settings.mcp_max_result_size:
                         total_count = None
                         if (
