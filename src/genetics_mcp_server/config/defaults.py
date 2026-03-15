@@ -41,8 +41,27 @@ When the user mentions a data source by informal name (e.g., "FinnGen", "UK Biob
 - FinnGen → `finngen`
 - UK Biobank / UKB → `ukbb`
 - Open Targets → `open_targets`
+- FinnGen+UKB meta-analysis → `finngen_ukbb` (pseudo credible sets)
+- FinnGen+MVP+UKB meta-analysis → `finngen_mvp_ukbb` (pseudo credible sets)
 
 Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQTL`, `caQTL`.
+
+### Pseudo Credible Sets
+
+Results with resource `finngen_ukbb` or `finngen_mvp_ukbb` are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data.
+
+Pseudo credible sets are approximate credible sets constructed from GWAS summary statistics and LD information, without formal statistical fine-mapping (like SuSiE or FINEMAP). Each set is built around a lead variant from a GWAS locus.
+
+**Membership criteria** — a variant is included if any of these hold (relative to the lead variant):
+1. It is the lead variant itself
+2. r² > 0.95 to the lead (unconditional inclusion regardless of p-value)
+3. r² > 0.6 to the lead AND |lead_mlog10p − variant_mlog10p| < 3.0 (moderate LD + similar association signal)
+
+**PIP assignment**: Each member gets a pseudo PIP proportional to 10^mlog10p (i.e. 1/p-value), normalized so the set sums to ~0.99. Variants with PIP < 0.01 are clamped to that floor.
+
+**Filters applied**: Proximity filter suppresses redundant nearby loci; HLA filter keeps only the top signal in the MHC region (chr6:25–34 Mb); optional minimum lead mlog10p and pairwise LD filters.
+
+**Key distinction**: These are heuristic groupings based on LD and association strength. PIPs from pseudo credible sets should be interpreted with more caution than those from formal fine-mapping.
 
 For BigQuery queries, always call get_bigquery_schema first to discover all available tables and their columns.
 The database contains tables for credible sets, colocalization, exome/burden test results, and more.

@@ -260,6 +260,7 @@ Per-user API tokens are also supported: users create tokens via the chat API (`P
 | `MCP_DISABLE_TRANSPORT_SECURITY` | Allow all hosts/origins (dev only) |
 | `EXTERNAL_MCP_SERVERS` | Comma-separated URLs of always-on external MCP servers (gnomAD, Open Targets) |
 | `EXTERNAL_MCP_EXCLUDE_TOOLS` | Tool names to exclude from proxying |
+| `ENABLE_CREDIBLE_SETS_STATS` | Enable `get_credible_sets_stats` tool (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
 
 Default external servers:

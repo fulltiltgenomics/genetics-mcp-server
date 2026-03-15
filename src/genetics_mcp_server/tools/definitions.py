@@ -707,10 +707,12 @@ def register_mcp_tools(
         """Get rare variant burden test results for a gene."""
         return await executor.get_exome_results_by_gene(gene)
 
-    @mcp.tool()
-    async def get_phenotype_report(resource: str, phenotype_code: str) -> dict:
-        """Get a detailed markdown report for a phenotype."""
-        return await executor.get_phenotype_report(resource, phenotype_code)
+    if "get_phenotype_report" not in _disabled:
+
+        @mcp.tool()
+        async def get_phenotype_report(resource: str, phenotype_code: str) -> dict:
+            """Get a detailed markdown report for a phenotype."""
+            return await executor.get_phenotype_report(resource, phenotype_code)
 
     @mcp.tool()
     async def lookup_phenotype_names(codes: list[str]) -> dict:

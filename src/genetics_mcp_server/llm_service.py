@@ -208,7 +208,9 @@ class LLMService:
         if enable_tools and settings.mcp_enabled:
             # get local tools filtered by profile
             tool_definitions = get_anthropic_tools(
-                custom_tool_descriptions, tool_profile=tool_profile
+                custom_tool_descriptions,
+                tool_profile=tool_profile,
+                disabled_tools=settings.disabled_tools,
             )
             local_count = len(tool_definitions)
 
