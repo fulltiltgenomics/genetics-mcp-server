@@ -140,9 +140,9 @@ Each tool has a `category` field in its definition:
 | `null` (default) | general + api + bigquery | always-on (gnomAD, OT) + RAG |
 | `"api"` | general + api | always-on only |
 | `"bigquery"` | general + bigquery | always-on only |
-| `"rag"` | general only | always-on + RAG |
+| `"rag"` | general only | RAG only |
 
-Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"`. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
 
 ## Architecture
 

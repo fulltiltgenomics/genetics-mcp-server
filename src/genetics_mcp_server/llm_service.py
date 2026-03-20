@@ -220,9 +220,11 @@ class LLMService:
             )
             local_count = len(tool_definitions)
 
-            # always-on external tools (gnomAD, Open Targets) are always included
-            external_tools = get_external_anthropic_tools()
-            tool_definitions.extend(external_tools)
+            # always-on external tools (gnomAD, Open Targets) excluded in RAG profile
+            external_tools = []
+            if tool_profile != "rag":
+                external_tools = get_external_anthropic_tools()
+                tool_definitions.extend(external_tools)
 
             # RAG tools only included when profile is None (all) or "rag"
             rag_tools = []
@@ -363,8 +365,14 @@ class LLMService:
         try:
             # check if this is an external tool
             if is_external_tool(tool_name):
-                logger.debug(f"Executing external tool: {tool_name}")
-                return await execute_external_tool(tool_name, tool_input)
+                logger.info(f"Executing external tool: {tool_name}")
+                result = await execute_external_tool(tool_name, tool_input)
+                result_str = json.dumps(result)
+                logger.info(
+                    f"External tool {tool_name} result ({len(result_str)} chars): "
+                    f"{result_str[:200]}{'...[truncated]' if len(result_str) > 200 else ''}"
+                )
+                return result
 
             # local tool execution
             if not self.executor:

@@ -129,8 +129,12 @@ class MCPProxyClient:
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
 
+        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self.auth_token else 'no'}")
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(url, json=payload, headers=headers)
+            logger.debug(f"Response status={response.status_code} content-type={response.headers.get('content-type')}")
+            logger.debug(f"Response body (first 500 chars): {response.text[:500]}")
             response.raise_for_status()
 
             if "mcp-session-id" in response.headers:
@@ -222,6 +226,11 @@ class MCPProxyClient:
                 {"name": name, "arguments": arguments},
             )
             result = await self._post_async(payload)
+            result_str = json.dumps(result)
+            logger.info(
+                f"External tool {name} response ({len(result_str)} chars): "
+                f"{result_str[:500]}{'...[truncated]' if len(result_str) > 500 else ''}"
+            )
 
             if "error" in result:
                 error_msg = result["error"]
@@ -506,7 +515,7 @@ def _initialize_rag_server() -> int:
     server_url, auth_token = _parse_server_config(rag_server.strip())
     logger.info(f"Connecting to RAG MCP server: {server_url}")
     try:
-        proxy_client = MCPProxyClient(base_url=server_url, timeout=60.0, auth_token=auth_token)
+        proxy_client = MCPProxyClient(base_url=server_url, timeout=180.0, auth_token=auth_token)
         tools = proxy_client.list_tools_sync()
 
         if not tools:
