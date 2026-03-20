@@ -57,10 +57,12 @@ disable_security = os.environ.get("MCP_DISABLE_TRANSPORT_SECURITY", "").lower() 
 )
 
 # create MCP server instance
+# stateless_http: required for streamable-http behind reverse proxies / load balancers
 if disable_security:
     logger.warning("Transport security DISABLED - allowing all hosts and origins")
     mcp = FastMCP(
         "Genetics Data Tools",
+        stateless_http=True,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=False,
             allowed_hosts=["*"],
@@ -68,7 +70,7 @@ if disable_security:
         ),
     )
 else:
-    mcp = FastMCP("Genetics Data Tools")
+    mcp = FastMCP("Genetics Data Tools", stateless_http=True)
 
 # create executor and register tools
 api_url = os.environ.get("GENETICS_API_URL", "http://0.0.0.0:2000/api")
