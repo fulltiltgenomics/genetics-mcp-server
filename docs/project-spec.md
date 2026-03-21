@@ -166,6 +166,12 @@ src/genetics_mcp_server/
 │   ├── definitions.py   # tool definitions (shared)
 │   ├── executor.py      # tool execution via HTTP
 │   └── phewas_categories.py  # PheWAS plot category mappings
+├── subagent.py             # parallel subagent service
+├── skills/
+│   ├── __init__.py
+│   ├── definitions.py      # skill definitions and registry
+│   ├── sandbox_tools.py    # file read and script execution tools
+│   └── instructions/       # markdown instruction files per skill
 ├── auth/
 │   ├── __init__.py
 │   ├── core.py          # IAP/oauth2-proxy header extraction
@@ -186,6 +192,7 @@ src/genetics_mcp_server/
 
 1. **MCP Server mode**: Client → FastMCP → ToolExecutor → Genetics API
 2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
+3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
 
 ### Tool execution
 
@@ -207,6 +214,36 @@ The `mcp_proxy.py` module allows connecting to remote MCP servers:
 2. Dynamically creates wrapper functions using exec()
 3. Forwards tool calls to the remote server
 4. Parses SSE responses and extracts JSON-RPC results
+
+### Subagent system
+
+The subagent system enables the main agent to launch parallel specialized agents for complex queries. When enabled, the main agent has access to a `launch_subagents` tool that dispatches tasks to specialized subagents.
+
+**Skills** define subagent capabilities:
+- `genetics_data_extraction` — API tools for GWAS, QTL, credible sets, etc.
+- `literature_review` — scientific literature and web search
+- `bigquery_analysis` — complex SQL queries against the genetics database
+- `data_analysis` — Python script execution for custom analysis and visualizations
+
+Each skill has:
+- A markdown instruction file (system prompt) in `skills/instructions/`
+- Tool categories controlling which tools the subagent can use
+- Configurable model, max iterations, and timeout
+- Optional sandbox tools (file read, script execution)
+
+**Execution flow**:
+1. Main agent calls `launch_subagents` with a list of skill+query tasks
+2. `SubagentService` validates skills and launches subagents in parallel via `asyncio.gather()`
+3. Each subagent runs its own agentic loop (non-streaming) with Claude API
+4. Results are collected and returned to the main agent as a single tool result
+5. Main agent synthesizes subagent outputs into its response
+
+**Security**:
+- File access restricted to configured `SUBAGENT_ALLOWED_PATHS` directories
+- Script execution gated behind `ENABLE_SCRIPT_EXECUTION` flag
+- Interpreter whitelist: `python3`, `Rscript`, `bash`
+- Sensitive environment variables stripped from script processes
+- Per-subagent and per-script timeouts
 
 ## Configuration
 
@@ -267,6 +304,17 @@ Default external servers:
 - gnomAD: `https://gnomad-mcp-dpsnoyqx6q-uc.a.run.app`
 - Open Targets: `https://mcp.platform.opentargets.org`
 
+### Subagent options
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENABLE_SUBAGENTS` | Enable the `launch_subagents` tool | `false` |
+| `SUBAGENT_MODEL` | Model for subagents (falls back to `fast_model`) | `""` |
+| `SUBAGENT_TIMEOUT` | Seconds per subagent execution | `120` |
+| `SUBAGENT_ALLOWED_PATHS` | Comma-separated directories for file access | `""` |
+| `ENABLE_SCRIPT_EXECUTION` | Allow subagents to execute scripts | `false` |
+| `SUBAGENT_SCRIPT_TIMEOUT` | Seconds per script execution | `30` |
+
 ## Logging
 
 The application uses structured JSON logging for GCP Cloud Logging via `logging_config.py`:
@@ -296,6 +344,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
 | `test_phewas_categories.py` | PheWAS category mappings |
+| `test_subagent.py` | Subagent service, skills, sandbox tools |
 
 Run tests:
 ```bash

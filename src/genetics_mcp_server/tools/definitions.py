@@ -527,6 +527,47 @@ Always include a LIMIT clause.""",
     },
 ]
 
+SUBAGENT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "name": "launch_subagents",
+        "category": "general",
+        "description": """Launch one or more specialized subagents in parallel to handle complex queries.
+Each subagent has its own skill (instructions + tools) and runs independently.
+Use this when the question requires multiple independent data gathering or analysis tasks that can run simultaneously.
+
+Available skills:
+- **genetics_data_extraction**: Extract genetics data (GWAS, QTL, credible sets, gene expression, LD, etc.)
+- **literature_review**: Search scientific literature and web for relevant publications
+- **bigquery_analysis**: Run complex SQL queries against the genetics database
+- **data_analysis**: Execute Python scripts for statistical analysis or custom visualizations""",
+        "parameters": {
+            "tasks": {
+                "type": "array",
+                "description": "List of subagent tasks to run in parallel",
+                "required": True,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "description": "Skill name (genetics_data_extraction, literature_review, bigquery_analysis, data_analysis)",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Specific question or task for this subagent",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Additional context from the conversation to pass to the subagent",
+                        },
+                    },
+                    "required": ["skill", "query"],
+                },
+            },
+        },
+    },
+]
+
 # valid tool profiles and which categories each profile includes
 TOOL_PROFILES: dict[str, set[str]] = {
     "api": {"general", "api"},
@@ -552,7 +593,7 @@ def get_anthropic_tools(
     """
     anthropic_tools = []
 
-    all_tools = list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS)
+    all_tools = list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS) + list(SUBAGENT_TOOL_DEFINITIONS)
 
     if disabled_tools:
         all_tools = [t for t in all_tools if t["name"] not in disabled_tools]

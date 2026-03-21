@@ -4,6 +4,7 @@ import pytest
 
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
+    SUBAGENT_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
     get_anthropic_tools,
     register_mcp_tools,
@@ -73,7 +74,7 @@ class TestAnthropicToolFormat:
     def test_anthropic_tools_count_matches(self):
         """Test that default (no profile) returns all tools."""
         tools = get_anthropic_tools()
-        assert len(tools) == len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS)
+        assert len(tools) == len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS) + len(SUBAGENT_TOOL_DEFINITIONS)
 
     def test_anthropic_tool_structure(self):
         """Test that Anthropic tools have correct structure."""

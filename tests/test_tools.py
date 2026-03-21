@@ -5,6 +5,7 @@ import pytest
 from genetics_mcp_server.tools import ToolExecutor
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
+    SUBAGENT_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
     TOOL_PROFILES,
     get_anthropic_tools,
@@ -593,7 +594,7 @@ class TestToolDefinitions:
     def test_valid_categories(self):
         """Tool categories must be one of the known values."""
         valid = {"general", "api", "bigquery"}
-        for tool in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS:
+        for tool in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS + SUBAGENT_TOOL_DEFINITIONS:
             assert tool["category"] in valid, (
                 f"Tool {tool['name']} has invalid category {tool['category']}"
             )
@@ -607,7 +608,7 @@ class TestToolDefinitions:
         assert "get_credible_sets_by_gene" in names  # api
         assert "query_bigquery" in names  # bigquery
 
-        total = len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS)
+        total = len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS) + len(SUBAGENT_TOOL_DEFINITIONS)
         assert len(tools) == total
 
     def test_get_anthropic_tools_api_profile(self):

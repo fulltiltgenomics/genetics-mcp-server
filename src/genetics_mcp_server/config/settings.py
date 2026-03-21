@@ -97,6 +97,37 @@ class Settings:
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENT_SIZE", "52428800"))  # 50MB
     )
 
+    # subagent settings
+    enable_subagents: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_SUBAGENTS", "false"
+        ).lower() in ("1", "true", "yes")
+    )
+    subagent_model: str = field(
+        default_factory=lambda: os.environ.get("SUBAGENT_MODEL", "")
+    )
+    subagent_max_tokens: int = 4096
+    subagent_max_iterations: int = 10
+    subagent_timeout: int = field(
+        default_factory=lambda: int(os.environ.get("SUBAGENT_TIMEOUT", "120"))
+    )
+    subagent_allowed_paths: str = field(
+        default_factory=lambda: os.environ.get("SUBAGENT_ALLOWED_PATHS", "")
+    )
+    enable_script_execution: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_SCRIPT_EXECUTION", "false"
+        ).lower() in ("1", "true", "yes")
+    )
+    subagent_script_timeout: int = field(
+        default_factory=lambda: int(os.environ.get("SUBAGENT_SCRIPT_TIMEOUT", "30"))
+    )
+
+    @property
+    def subagent_allowed_paths_list(self) -> list[str]:
+        if not self.subagent_allowed_paths:
+            return []
+        return [p.strip() for p in self.subagent_allowed_paths.split(",") if p.strip()]
 
     @property
     def disabled_tools(self) -> set[str]:
@@ -105,6 +136,8 @@ class Settings:
             disabled.add("get_credible_sets_stats")
         if not self.enable_phenotype_report:
             disabled.add("get_phenotype_report")
+        if not self.enable_subagents:
+            disabled.add("launch_subagents")
         return disabled
 
 

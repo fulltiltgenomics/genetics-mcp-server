@@ -19,6 +19,7 @@ from genetics_mcp_server.mcp_proxy import (
     initialize_external_servers,
     is_external_tool,
 )
+from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class LLMService:
         self.openai_client = None
         self.anthropic_client = None
         self.executor: ToolExecutor | None = None
+        self.subagent_service: SubagentService | None = None
         self._initialize_clients()
 
     def _initialize_clients(self):
@@ -77,6 +79,11 @@ class LLMService:
             api_base_url=settings.genetics_api_url,
             bigquery_api_url=settings.bigquery_api_url,
         )
+
+        # initialize subagent service
+        if self.anthropic_client and self.executor and settings.enable_subagents:
+            self.subagent_service = SubagentService(self.anthropic_client, self.executor)
+            logger.info("Subagent service initialized")
 
         # initialize external MCP servers
         external_tool_count = initialize_external_servers()
@@ -363,6 +370,12 @@ class LLMService:
     ) -> dict[str, Any]:
         """Execute a tool by name using the executor or external proxy."""
         try:
+            # subagent tool
+            if tool_name == "launch_subagents":
+                if not self.subagent_service:
+                    return {"success": False, "error": "Subagent service not initialized"}
+                return await self.subagent_service.run_subagents(tool_input.get("tasks", []))
+
             # check if this is an external tool
             if is_external_tool(tool_name):
                 logger.info(f"Executing external tool: {tool_name}")
