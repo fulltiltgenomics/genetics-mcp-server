@@ -25,6 +25,61 @@ from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
+    """Strip orphaned tool_use/tool_result blocks from conversation history.
+
+    Persisted history may contain tool_use blocks in assistant messages without
+    matching tool_result blocks in the next user message (because the agentic loop
+    results were not persisted as separate messages). The Anthropic API rejects
+    such sequences, so we remove orphaned blocks before sending.
+    """
+    result = []
+    for i, msg in enumerate(messages):
+        content = msg["content"]
+        if not isinstance(content, list):
+            result.append({"role": msg["role"], "content": content})
+            continue
+
+        if msg["role"] == "assistant":
+            # collect tool_result ids from the next message (if any)
+            next_tool_result_ids: set[str] = set()
+            if i + 1 < len(messages):
+                next_content = messages[i + 1].get("content")
+                if isinstance(next_content, list):
+                    next_tool_result_ids = {
+                        b.get("tool_use_id") for b in next_content
+                        if isinstance(b, dict) and b.get("type") == "tool_result"
+                    }
+            # keep tool_use blocks only if they have a matching tool_result
+            content = [
+                b for b in content
+                if not isinstance(b, dict)
+                or b.get("type") != "tool_use"
+                or b.get("id") in next_tool_result_ids
+            ]
+        elif msg["role"] == "user":
+            # collect tool_use ids from the previous message (if any)
+            prev_tool_use_ids: set[str] = set()
+            if i - 1 >= 0:
+                prev_content = messages[i - 1].get("content")
+                if isinstance(prev_content, list):
+                    prev_tool_use_ids = {
+                        b.get("id") for b in prev_content
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    }
+            # keep tool_result blocks only if they have a matching tool_use
+            content = [
+                b for b in content
+                if not isinstance(b, dict)
+                or b.get("type") != "tool_result"
+                or b.get("tool_use_id") in prev_tool_use_ids
+            ]
+
+        if content:
+            result.append({"role": msg["role"], "content": content})
+    return result
+
+
 @dataclass
 class StreamChunk:
     """A chunk from the LLM stream."""
@@ -193,11 +248,11 @@ class LLMService:
         settings = get_settings()
         model = model or settings.default_model
 
-        # convert messages to Anthropic format
-        anthropic_messages = []
-        for msg in messages:
-            if msg["role"] != "system":
-                anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
+        # convert messages to Anthropic format, stripping orphaned tool_use
+        # blocks that were persisted without matching tool_result messages
+        anthropic_messages = _sanitize_tool_blocks(
+            [msg for msg in messages if msg["role"] != "system"]
+        )
 
         # prepare request parameters
         request_params: dict[str, Any] = {
