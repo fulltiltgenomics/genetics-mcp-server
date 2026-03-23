@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from genetics_mcp_server.config import get_settings
+from genetics_mcp_server.cost import estimate_cost
 from genetics_mcp_server.mcp_proxy import (
     execute_external_tool,
     get_external_anthropic_tools,
@@ -94,6 +95,7 @@ class LLMService:
         literature_backend: str | None = None,
         tool_profile: str | None = None,
         secret: bool = False,
+        user: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -110,6 +112,7 @@ class LLMService:
                 None = all tools, "api" = general+api, "bigquery" = general+bigquery,
                 "rag" = general+RAG external tools.
             secret: If True, suppress detailed logging to avoid persisting chat content.
+            user: Authenticated user email for logging.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -123,7 +126,7 @@ class LLMService:
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile, secret,
+                literature_backend, tool_profile, secret, user,
             ):
                 yield chunk
         else:
@@ -181,6 +184,7 @@ class LLMService:
         literature_backend: str | None = None,
         tool_profile: str | None = None,
         secret: bool = False,
+        user: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -247,10 +251,16 @@ class LLMService:
                 )
 
         try:
-            if not secret:
-                logger.info(f"Streaming Anthropic chat with model {model}")
+            log_prefix = f"[user={user or 'unknown'}] "
+            if secret:
+                logger.info(f"{log_prefix}Streaming Anthropic secret chat with model {model}")
+            else:
+                logger.info(f"{log_prefix}Streaming Anthropic chat with model {model}")
             max_iterations = settings.mcp_max_iterations
             iteration = 0
+            total_cost = 0.0
+            total_input_tokens = 0
+            total_output_tokens = 0
 
             # collect all content blocks for persistence
             all_content_blocks: list[dict[str, Any]] = []
@@ -266,6 +276,23 @@ class LLMService:
 
                         message = await stream.get_final_message()
 
+                # log token usage and cost for this iteration
+                usage = message.usage
+                input_tok = usage.input_tokens
+                output_tok = usage.output_tokens
+                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+                cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                iter_cost = estimate_cost(model, input_tok, output_tok, cache_read, cache_create)
+                total_cost += iter_cost
+                total_input_tokens += input_tok
+                total_output_tokens += output_tok
+                logger.info(
+                    f"{log_prefix}API call iteration={iteration} model={model} "
+                    f"input_tokens={input_tok} output_tokens={output_tok} "
+                    f"cache_read={cache_read} cache_create={cache_create} "
+                    f"cost=${iter_cost:.4f}"
+                )
+
                 # add this iteration's content blocks
                 for block in message.content:
                     all_content_blocks.append(block.model_dump(exclude_none=True))
@@ -280,8 +307,10 @@ class LLMService:
                     effective_input = dict(tool_use.input)
                     if tool_use.name == "search_scientific_literature" and literature_backend:
                         effective_input["backend"] = literature_backend
-                    if not secret:
-                        logger.info(f"Executing tool: {tool_use.name} with input: {effective_input}")
+                    if secret:
+                        logger.info(f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)")
+                    else:
+                        logger.info(f"{log_prefix}Executing tool: {tool_use.name} with input: {effective_input}")
                     params_str = ", ".join(f"{k}: {v}" for k, v in effective_input.items())
                     yield StreamChunk(
                         type="text", content=f"\n\n*[Using tool: {tool_use.name}; {params_str}]*\n\n"
@@ -345,6 +374,12 @@ class LLMService:
                 all_content_blocks.append(
                     {"type": "text", "text": "\n\n*[Max tool iterations reached]*\n"}
                 )
+
+            logger.info(
+                f"{log_prefix}Chat complete: model={model} iterations={iteration} "
+                f"total_input_tokens={total_input_tokens} total_output_tokens={total_output_tokens} "
+                f"total_cost=${total_cost:.4f}"
+            )
 
             yield StreamChunk(type="done", message_content=all_content_blocks)
 

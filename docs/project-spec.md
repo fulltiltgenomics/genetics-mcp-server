@@ -21,6 +21,8 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **External MCP server proxying**: Aggregate tools from remote MCP servers (e.g., gnomAD, Open Targets Platform)
 - **Optional IAP/oauth2-proxy authentication**: Protect the chat API via `X-Goog-Authenticated-User-Email` header
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
+- **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
+- **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Chat history persistence**: SQLite-based storage of conversation threads
 - **Configurable prompts**: Per-user LLM configuration stored in database
 
@@ -157,6 +159,8 @@ src/genetics_mcp_server/
 ├── chat_api.py          # FastAPI chat service
 ├── llm_service.py       # LLM provider integration
 ├── logging_config.py    # GCP Cloud Logging JSON formatter
+├── rate_limit.py        # per-user sliding window rate limiter
+├── cost.py              # Anthropic API cost estimation
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py      # configuration dataclass
@@ -252,6 +256,15 @@ All configuration is via environment variables (`.env` file supported):
 
 Per-user API tokens are also supported: users create tokens via the chat API (`POST /chat/v1/tokens`), which are validated alongside `MCP_API_KEY` in the MCP server's bearer auth middleware. Tokens are stored as SHA-256 hashes in the LLM config SQLite DB.
 
+### Rate limiting
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RATE_LIMIT_PER_HOUR` | Max chat messages per user per hour | `20` |
+| `RATE_LIMIT_PER_DAY` | Max chat messages per user per day | `100` |
+
+Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. Both limits use sliding windows. Returns HTTP 429 with the specific limit hit when exceeded.
+
 ### MCP server options
 
 | Variable | Description |
@@ -277,8 +290,10 @@ The application uses structured JSON logging for GCP Cloud Logging via `logging_
 - **Log level**: Controlled by `LOG_LEVEL` env var (default `INFO`)
 - **Noisy loggers suppressed**: `uvicorn.access`, `httpx`, `httpcore`, `urllib3`, `asyncio` are set to WARNING
 
+**Cost logging**: Every Anthropic API call logs estimated cost based on model pricing and token usage (input, output, cache read, cache creation). A summary line is logged when the chat completes with total tokens and cost. Cost is logged even for secret chats. User email is included in all log lines.
+
 Log levels:
-- **INFO**: Server startup, tool registration, external server connections
+- **INFO**: Server startup, tool registration, external server connections, API call cost
 - **WARNING**: Fallback scenarios (e.g., Tavily→DuckDuckGo)
 - **ERROR**: API failures, tool execution errors (with tracebacks)
 - **DEBUG**: HTTP call details, SSE parsing
@@ -322,6 +337,5 @@ pytest --cov=src/genetics_mcp_server  # with coverage
 
 1. Add caching for genetics API responses
 2. Support additional LLM providers (Google, local models)
-3. Add rate limiting for public deployments
-4. Implement tool-level access control
-5. Add WebSocket transport for bidirectional streaming
+3. Implement tool-level access control
+4. Add WebSocket transport for bidirectional streaming

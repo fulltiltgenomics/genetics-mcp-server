@@ -32,6 +32,7 @@ from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_p
 from genetics_mcp_server.config import get_settings
 from genetics_mcp_server.config.defaults import DEFAULT_SYSTEM_PROMPT
 from genetics_mcp_server.llm_service import get_llm_service
+from genetics_mcp_server.rate_limit import check_rate_limit, configure as configure_rate_limit
 from genetics_mcp_server.routers import api_tokens_router, chat_history_router, llm_config_router
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
 
@@ -60,6 +61,10 @@ def _classify_error(e: Exception) -> str:
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     logger.info("Starting chat API server")
+    configure_rate_limit(
+        max_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", "20")),
+        max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "100")),
+    )
     # eagerly initialize LLM service and external MCP servers at startup
     get_llm_service()
     yield
@@ -212,6 +217,15 @@ async def stream_chat(
     service = get_llm_service()
     provider = request.provider or settings.default_provider
 
+    # per-user rate limiting
+    allowed, limit_reason = check_rate_limit(user)
+    if not allowed:
+        logger.warning(f"Rate limit exceeded for user={user}: {limit_reason}")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded ({limit_reason}). Please try again later.",
+        )
+
     # validate provider
     if provider == "anthropic" and not service.anthropic_client:
         raise HTTPException(
@@ -242,6 +256,7 @@ async def stream_chat(
                 literature_backend=request.literature_backend,
                 tool_profile=request.tool_profile,
                 secret=request.secret,
+                user=user,
             ):
                 if chunk.type == "text":
                     yield {
