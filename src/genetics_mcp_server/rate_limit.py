@@ -47,10 +47,10 @@ def check_rate_limit(user: str) -> tuple[bool, str | None]:
         hour_count = sum(1 for t in timestamps if t > hour_cutoff)
 
         if hour_count >= _max_per_hour:
-            return False, f"hourly limit ({_max_per_hour}/hour)"
+            return False, f"hourly limit {_max_per_hour}/hour"
 
         if len(timestamps) >= _max_per_day:
-            return False, f"daily limit ({_max_per_day}/day)"
+            return False, f"daily limit {_max_per_day}/day"
 
         timestamps.append(now)
         return True, None
