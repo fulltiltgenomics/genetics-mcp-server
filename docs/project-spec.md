@@ -87,6 +87,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | Tool | Description |
 |------|-------------|
 | `create_phewas_plot` | Create a PheWAS plot showing phenotype associations for a variant (returns base64 PNG) |
+| `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -167,6 +168,8 @@ src/genetics_mcp_server/
 │   ├── executor.py      # tool execution via HTTP
 │   └── phewas_categories.py  # PheWAS plot category mappings
 ├── subagent.py             # parallel subagent service
+├── scripts/
+│   └── analyze_variants.py # standalone variant list analysis CLI
 ├── skills/
 │   ├── __init__.py
 │   ├── definitions.py      # skill definitions and registry
@@ -345,6 +348,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_llm_config_router.py` | LLM config API |
 | `test_phewas_categories.py` | PheWAS category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
+| `test_variant_analysis.py` | Variant list analysis tool |
 
 Run tests:
 ```bash

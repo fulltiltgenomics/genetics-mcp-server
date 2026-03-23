@@ -1,10 +1,13 @@
 """Tool executor - handles HTTP calls to genetics API and external services."""
 
+import asyncio
 import base64
 import io
 import logging
 import os
+import re
 import traceback
+from collections import defaultdict
 from typing import Any
 from urllib.parse import quote
 
@@ -934,6 +937,298 @@ class ToolExecutor:
                 f"Error in get_credible_sets_stats({resource_or_dataset}): {e}\n{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # -------------------------------------------------------------------------
+    # Variant List Analysis
+    # -------------------------------------------------------------------------
+
+    async def analyze_variant_list(
+        self,
+        variants: str,
+        resource: str | None = None,
+    ) -> dict[str, Any]:
+        """Analyze a list of variants for phenotype, QTL, and tissue patterns."""
+        try:
+            parsed = self._parse_variant_list(variants)
+            if not parsed:
+                return {"success": False, "error": "No valid variants found in input"}
+
+            has_betas = any(v.get("beta") is not None for v in parsed)
+            variant_ids = [v["variant"] for v in parsed]
+            # build lookup for input betas
+            input_betas: dict[str, float | None] = {
+                v["variant"]: v.get("beta") for v in parsed
+            }
+
+            sem = asyncio.Semaphore(20)
+
+            # fetch credible sets and nearest genes in parallel
+            async def _fetch_cs(variant_id: str) -> dict[str, Any]:
+                async with sem:
+                    params: dict[str, Any] = {"format": "json"}
+                    if resource:
+                        params["resources"] = resource
+                    try:
+                        resp = await self.client.get(
+                            f"{self.base_url}/v1/credible_sets_by_variant/{variant_id}",
+                            params=params,
+                        )
+                        if resp.status_code == 200:
+                            return {"variant": variant_id, "results": resp.json()}
+                        return {"variant": variant_id, "results": []}
+                    except Exception:
+                        return {"variant": variant_id, "results": []}
+
+            async def _fetch_nearest(variant_id: str) -> dict[str, Any]:
+                async with sem:
+                    try:
+                        resp = await self.client.get(
+                            f"{self.base_url}/v1/nearest_genes/{variant_id}",
+                            params={"format": "json", "n": 1, "gene_type": "protein_coding"},
+                        )
+                        if resp.status_code == 200:
+                            genes = resp.json()
+                            if genes:
+                                return {
+                                    "variant": variant_id,
+                                    "gene": genes[0].get("name") or genes[0].get("hgnc_symbol", ""),
+                                    "distance": genes[0].get("distance", 0),
+                                }
+                        return {"variant": variant_id, "gene": "", "distance": -1}
+                    except Exception:
+                        return {"variant": variant_id, "gene": "", "distance": -1}
+
+            cs_results, gene_results = await asyncio.gather(
+                asyncio.gather(*(_fetch_cs(v) for v in variant_ids)),
+                asyncio.gather(*(_fetch_nearest(v) for v in variant_ids)),
+            )
+
+            # aggregate credible set data
+            gwas_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "consistent": set(), "inconsistent": set()})
+            pqtl_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "consistent": set(), "inconsistent": set()})
+            eqtl_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "consistent": set(), "inconsistent": set()})
+            caqtl_counts: dict[str, set] = defaultdict(set)
+            tissue_eqtl_variants: dict[str, set] = defaultdict(set)
+            pqtl_variants: set[str] = set()
+            variants_with_cs: set[str] = set()
+
+            for cs_data in cs_results:
+                vid = cs_data["variant"]
+                for r in cs_data["results"]:
+                    data_type = r.get("data_type")
+                    if not data_type:
+                        continue
+                    variants_with_cs.add(vid)
+
+                    cs_beta = r.get("beta")
+                    in_beta = input_betas.get(vid)
+
+                    if data_type == "GWAS":
+                        trait = r.get("trait", "")
+                        if trait:
+                            gwas_counts[trait]["variants"].add(vid)
+                            if has_betas and in_beta is not None and cs_beta is not None:
+                                if (in_beta > 0) == (cs_beta > 0):
+                                    gwas_counts[trait]["consistent"].add(vid)
+                                else:
+                                    gwas_counts[trait]["inconsistent"].add(vid)
+
+                    elif data_type == "pQTL":
+                        gene = r.get("gene_most_severe", "")
+                        if gene:
+                            pqtl_counts[gene]["variants"].add(vid)
+                            pqtl_variants.add(vid)
+                            if has_betas and in_beta is not None and cs_beta is not None:
+                                if (in_beta > 0) == (cs_beta > 0):
+                                    pqtl_counts[gene]["consistent"].add(vid)
+                                else:
+                                    pqtl_counts[gene]["inconsistent"].add(vid)
+
+                    elif data_type == "eQTL":
+                        gene = r.get("gene_most_severe", "")
+                        tissue = r.get("cell_type", "")
+                        if gene and tissue:
+                            key = f"{gene}||{tissue}"
+                            eqtl_counts[key]["variants"].add(vid)
+                            tissue_eqtl_variants[tissue].add(vid)
+                            if has_betas and in_beta is not None and cs_beta is not None:
+                                if (in_beta > 0) == (cs_beta > 0):
+                                    eqtl_counts[key]["consistent"].add(vid)
+                                else:
+                                    eqtl_counts[key]["inconsistent"].add(vid)
+
+                    elif data_type == "caQTL":
+                        tissue = r.get("cell_type", "")
+                        if tissue:
+                            caqtl_counts[tissue].add(vid)
+
+            # lookup phenotype names for GWAS traits
+            trait_codes = list(gwas_counts.keys())
+            code_to_name: dict[str, str] = {}
+            if trait_codes:
+                names_data = await self.lookup_phenotype_names(trait_codes)
+                if names_data.get("success"):
+                    code_to_name = names_data.get("names", {})
+
+            # build output sorted by count descending
+            gwas_phenotypes = sorted(
+                [
+                    {
+                        "trait": trait,
+                        "name": code_to_name.get(trait, ""),
+                        "n_variants": len(d["variants"]),
+                        **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
+                    }
+                    for trait, d in gwas_counts.items()
+                ],
+                key=lambda x: -x["n_variants"],
+            )
+
+            pqtl_genes = sorted(
+                [
+                    {
+                        "gene": gene,
+                        "n_variants": len(d["variants"]),
+                        **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
+                    }
+                    for gene, d in pqtl_counts.items()
+                ],
+                key=lambda x: -x["n_variants"],
+            )
+
+            eqtl_genes = sorted(
+                [
+                    {
+                        "gene": key.split("||")[0],
+                        "tissue": key.split("||")[1],
+                        "n_variants": len(d["variants"]),
+                        **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
+                    }
+                    for key, d in eqtl_counts.items()
+                ],
+                key=lambda x: -x["n_variants"],
+            )
+
+            caqtl_tissues = sorted(
+                [{"tissue": tissue, "n_variants": len(vids)} for tissue, vids in caqtl_counts.items()],
+                key=lambda x: -x["n_variants"],
+            )
+
+            tissue_enrichment = sorted(
+                [{"tissue": tissue, "n_eqtl_variants": len(vids)} for tissue, vids in tissue_eqtl_variants.items()],
+                key=lambda x: -x["n_eqtl_variants"],
+            )
+
+            variant_genes = [
+                {"variant": g["variant"], "nearest_gene": g["gene"], "distance": g["distance"]}
+                for g in gene_results
+            ]
+
+            return {
+                "success": True,
+                "n_variants": len(variant_ids),
+                "n_variants_with_cs": len(variants_with_cs),
+                "input_has_betas": has_betas,
+                "gwas_phenotypes": gwas_phenotypes,
+                "pqtl_genes": pqtl_genes,
+                "eqtl_genes": eqtl_genes,
+                "caqtl_tissues": caqtl_tissues,
+                "tissue_enrichment": tissue_enrichment,
+                "pqtl_summary": {"n_variants_with_pqtl": len(pqtl_variants)},
+                "variant_genes": variant_genes,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in analyze_variant_list: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    @staticmethod
+    def _parse_variant_list(text: str) -> list[dict[str, Any]]:
+        """Parse a variant list with optional beta/se/pvalue columns.
+
+        Accepts one variant per line, tab or comma separated.
+        Variant format: chr:pos:ref:alt (chr prefix optional).
+        Optional header row detected by first field not matching variant pattern.
+        """
+        variant_pattern = re.compile(r"^(?:chr)?(\d{1,2}|X|Y|MT):(\d+):([ACGT]+):([ACGT]+)$", re.IGNORECASE)
+        results = []
+
+        # normalize literal \n (from inline pasting) to actual newlines
+        text = text.replace("\\n", "\n")
+
+        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        # detect separator
+        sep = "\t" if "\t" in lines[0] else ","
+
+        # detect header row — check both raw and dash-converted
+        first_fields = lines[0].split(sep)
+        first_field = first_fields[0].strip()
+        has_header = not (
+            variant_pattern.match(first_field)
+            or variant_pattern.match(first_field.replace("-", ":"))
+        )
+        start_idx = 1 if has_header else 0
+
+        # detect column positions from header
+        col_map: dict[str, int] = {}
+        if has_header:
+            for i, col in enumerate(first_fields):
+                col_lower = col.strip().lower()
+                if col_lower in ("variant", "varid", "var_id", "snp", "id"):
+                    col_map["variant"] = i
+                elif col_lower in ("beta", "effect"):
+                    col_map["beta"] = i
+                elif col_lower in ("se", "stderr", "standard_error"):
+                    col_map["se"] = i
+                elif col_lower in ("pvalue", "p", "pval", "p_value"):
+                    col_map["pvalue"] = i
+
+        for line in lines[start_idx:]:
+            fields = [f.strip() for f in line.split(sep)]
+            if not fields:
+                continue
+
+            # get variant from mapped column or first field
+            var_idx = col_map.get("variant", 0)
+            if var_idx >= len(fields):
+                continue
+            raw_var = fields[var_idx]
+
+            # normalize: strip chr prefix
+            m = variant_pattern.match(raw_var)
+            if not m:
+                # try dash-separated format (chr-pos-ref-alt)
+                dash_var = raw_var.replace("-", ":")
+                m = variant_pattern.match(dash_var)
+                if not m:
+                    continue
+                raw_var = dash_var
+
+            variant_id = f"{m.group(1)}:{m.group(2)}:{m.group(3).upper()}:{m.group(4).upper()}"
+
+            entry: dict[str, Any] = {"variant": variant_id}
+
+            # parse optional stats columns
+            for stat_name in ("beta", "se", "pvalue"):
+                idx = col_map.get(stat_name, None)
+                if idx is None and not has_header:
+                    # positional: variant, beta, se, pvalue
+                    positional = {"beta": 1, "se": 2, "pvalue": 3}
+                    idx = positional.get(stat_name)
+                if idx is not None and idx < len(fields):
+                    try:
+                        entry[stat_name] = float(fields[idx])
+                    except (ValueError, TypeError):
+                        entry[stat_name] = None
+                else:
+                    entry[stat_name] = None
+
+            results.append(entry)
+
+        return results
 
     async def get_nearest_genes(
         self,

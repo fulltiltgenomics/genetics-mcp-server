@@ -478,6 +478,33 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "analyze_variant_list",
+        "category": "api",
+        "description": """Analyze a list of variants for shared phenotype associations, QTL patterns, and tissue enrichment.
+
+Use this when a user provides a list of variants (e.g., lead variants from a GWAS) and wants to know:
+- Which phenotypes are associated with multiple variants (pleiotropy)
+- Which pQTL and eQTL genes are shared across variants
+- Which tissues show eQTL enrichment
+- What the nearest gene is for each variant
+
+Input: one variant per line (chr:pos:ref:alt format), optionally with beta/se/pvalue columns (tab or comma separated).
+If betas are provided, direction consistency is reported (whether the variant's effect and the association effect are in the same direction).
+
+Returns aggregated counts sorted by frequency.""",
+        "parameters": {
+            "variants": {
+                "type": "string",
+                "description": "Variant list: one per line in chr:pos:ref:alt format. Optionally include tab/comma-separated beta, se, pvalue columns. A header row is auto-detected.",
+                "required": True,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Filter to a specific data resource (e.g., 'finngen', 'ukbb'). Omit to search all.",
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -539,7 +566,8 @@ Available skills:
 - **genetics_data_extraction**: Extract genetics data (GWAS, QTL, credible sets, gene expression, LD, etc.)
 - **literature_review**: Search scientific literature and web for relevant publications
 - **bigquery_analysis**: Run complex SQL queries against the genetics database
-- **data_analysis**: Execute Python scripts for statistical analysis or custom visualizations""",
+- **data_analysis**: Execute Python scripts for statistical analysis or custom visualizations
+- **variant_list_analysis**: Analyze a list of variants for phenotype, QTL, and tissue patterns""",
         "parameters": {
             "tasks": {
                 "type": "array",
@@ -865,6 +893,14 @@ def register_mcp_tools(
     ) -> dict:
         """Get all variants in LD with a given variant from FinnGen reference panel."""
         return await executor.get_variants_in_ld(variant, window, r2_threshold, panel)
+
+    @mcp.tool()
+    async def analyze_variant_list(
+        variants: str,
+        resource: str | None = None,
+    ) -> dict:
+        """Analyze a list of variants for phenotype, QTL, and tissue patterns."""
+        return await executor.analyze_variant_list(variants, resource)
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()

@@ -63,6 +63,16 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         instruction_file="bigquery_analysis.md",
         tool_categories={"general", "bigquery"},
     ),
+    "variant_list_analysis": SkillDefinition(
+        name="variant_list_analysis",
+        description=(
+            "Analyze a list of variants (e.g., lead variants from a GWAS) for shared "
+            "phenotype associations, QTL patterns, tissue enrichment, and nearest genes. "
+            "Use when a user pastes or attaches a list of variants."
+        ),
+        instruction_file="variant_list_analysis.md",
+        tool_categories={"general", "api"},
+    ),
     "data_analysis": SkillDefinition(
         name="data_analysis",
         description=(
