@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from genetics_mcp_server.config import get_settings
+from genetics_mcp_server.cost import estimate_cost
 from genetics_mcp_server.mcp_proxy import (
     execute_external_tool,
     get_external_anthropic_tools,
@@ -23,6 +24,61 @@ from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
+    """Strip orphaned tool_use/tool_result blocks from conversation history.
+
+    Persisted history may contain tool_use blocks in assistant messages without
+    matching tool_result blocks in the next user message (because the agentic loop
+    results were not persisted as separate messages). The Anthropic API rejects
+    such sequences, so we remove orphaned blocks before sending.
+    """
+    result = []
+    for i, msg in enumerate(messages):
+        content = msg["content"]
+        if not isinstance(content, list):
+            result.append({"role": msg["role"], "content": content})
+            continue
+
+        if msg["role"] == "assistant":
+            # collect tool_result ids from the next message (if any)
+            next_tool_result_ids: set[str] = set()
+            if i + 1 < len(messages):
+                next_content = messages[i + 1].get("content")
+                if isinstance(next_content, list):
+                    next_tool_result_ids = {
+                        b.get("tool_use_id") for b in next_content
+                        if isinstance(b, dict) and b.get("type") == "tool_result"
+                    }
+            # keep tool_use blocks only if they have a matching tool_result
+            content = [
+                b for b in content
+                if not isinstance(b, dict)
+                or b.get("type") != "tool_use"
+                or b.get("id") in next_tool_result_ids
+            ]
+        elif msg["role"] == "user":
+            # collect tool_use ids from the previous message (if any)
+            prev_tool_use_ids: set[str] = set()
+            if i - 1 >= 0:
+                prev_content = messages[i - 1].get("content")
+                if isinstance(prev_content, list):
+                    prev_tool_use_ids = {
+                        b.get("id") for b in prev_content
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    }
+            # keep tool_result blocks only if they have a matching tool_use
+            content = [
+                b for b in content
+                if not isinstance(b, dict)
+                or b.get("type") != "tool_result"
+                or b.get("tool_use_id") in prev_tool_use_ids
+            ]
+
+        if content:
+            result.append({"role": msg["role"], "content": content})
+    return result
 
 
 @dataclass
@@ -101,6 +157,7 @@ class LLMService:
         literature_backend: str | None = None,
         tool_profile: str | None = None,
         secret: bool = False,
+        user: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -117,6 +174,7 @@ class LLMService:
                 None = all tools, "api" = general+api, "bigquery" = general+bigquery,
                 "rag" = general+RAG external tools.
             secret: If True, suppress detailed logging to avoid persisting chat content.
+            user: Authenticated user email for logging.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -130,7 +188,7 @@ class LLMService:
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile, secret,
+                literature_backend, tool_profile, secret, user,
             ):
                 yield chunk
         else:
@@ -188,6 +246,7 @@ class LLMService:
         literature_backend: str | None = None,
         tool_profile: str | None = None,
         secret: bool = False,
+        user: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -196,11 +255,11 @@ class LLMService:
         settings = get_settings()
         model = model or settings.default_model
 
-        # convert messages to Anthropic format
-        anthropic_messages = []
-        for msg in messages:
-            if msg["role"] != "system":
-                anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
+        # convert messages to Anthropic format, stripping orphaned tool_use
+        # blocks that were persisted without matching tool_result messages
+        anthropic_messages = _sanitize_tool_blocks(
+            [msg for msg in messages if msg["role"] != "system"]
+        )
 
         # prepare request parameters
         request_params: dict[str, Any] = {
@@ -254,10 +313,16 @@ class LLMService:
                 )
 
         try:
-            if not secret:
-                logger.info(f"Streaming Anthropic chat with model {model}")
+            log_prefix = f"[user={user or 'unknown'}] "
+            if secret:
+                logger.info(f"{log_prefix}Streaming Anthropic secret chat with model {model}")
+            else:
+                logger.info(f"{log_prefix}Streaming Anthropic chat with model {model}")
             max_iterations = settings.mcp_max_iterations
             iteration = 0
+            total_cost = 0.0
+            total_input_tokens = 0
+            total_output_tokens = 0
 
             # collect all content blocks for persistence
             all_content_blocks: list[dict[str, Any]] = []
@@ -273,6 +338,23 @@ class LLMService:
 
                         message = await stream.get_final_message()
 
+                # log token usage and cost for this iteration
+                usage = message.usage
+                input_tok = usage.input_tokens
+                output_tok = usage.output_tokens
+                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+                cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                iter_cost = estimate_cost(model, input_tok, output_tok, cache_read, cache_create)
+                total_cost += iter_cost
+                total_input_tokens += input_tok
+                total_output_tokens += output_tok
+                logger.info(
+                    f"{log_prefix}API call iteration={iteration} model={model} "
+                    f"input_tokens={input_tok} output_tokens={output_tok} "
+                    f"cache_read={cache_read} cache_create={cache_create} "
+                    f"cost=${iter_cost:.4f}"
+                )
+
                 # add this iteration's content blocks
                 for block in message.content:
                     all_content_blocks.append(block.model_dump(exclude_none=True))
@@ -287,8 +369,10 @@ class LLMService:
                     effective_input = dict(tool_use.input)
                     if tool_use.name == "search_scientific_literature" and literature_backend:
                         effective_input["backend"] = literature_backend
-                    if not secret:
-                        logger.info(f"Executing tool: {tool_use.name} with input: {effective_input}")
+                    if secret:
+                        logger.info(f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)")
+                    else:
+                        logger.info(f"{log_prefix}Executing tool: {tool_use.name} with input: {effective_input}")
                     params_str = ", ".join(f"{k}: {v}" for k, v in effective_input.items())
                     yield StreamChunk(
                         type="text", content=f"\n\n*[Using tool: {tool_use.name}; {params_str}]*\n\n"
@@ -352,6 +436,12 @@ class LLMService:
                 all_content_blocks.append(
                     {"type": "text", "text": "\n\n*[Max tool iterations reached]*\n"}
                 )
+
+            logger.info(
+                f"{log_prefix}Chat complete: model={model} iterations={iteration} "
+                f"total_input_tokens={total_input_tokens} total_output_tokens={total_output_tokens} "
+                f"total_cost=${total_cost:.4f}"
+            )
 
             yield StreamChunk(type="done", message_content=all_content_blocks)
 
