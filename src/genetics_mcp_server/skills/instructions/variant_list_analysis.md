@@ -7,13 +7,14 @@ Use this skill when a user provides a list of variants (e.g., lead variants from
 ## How to use
 
 1. Call `analyze_variant_list` with the user's variant list. If the user mentioned a specific data source (FinnGen, UK Biobank), pass the `resource` parameter.
-2. Interpret the results following the guidelines below.
+2. The response already includes nearest genes for every variant (in the `variant_genes` array) — do NOT call `get_nearest_genes` separately.
+3. Interpret the results following the guidelines below.
 
 ## Interpreting the output
 
 ### GWAS phenotypes
 - Phenotypes associated with many variants suggest pleiotropy or shared biology
-- If betas were provided, check direction consistency — consistent direction across variants strengthens the signal
+- If betas were provided, check direction consistency — shared consistent or opposite direction across variants can point to shared biology
 - Highlight phenotypes where >2 variants associate
 
 ### pQTL genes

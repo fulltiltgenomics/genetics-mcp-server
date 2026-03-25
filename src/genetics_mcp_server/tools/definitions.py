@@ -92,7 +92,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_variant",
         "category": "api",
-        "description": "Get credible sets containing a specific variant. Returns fine-mapped associations where this variant is part of a credible set. Use this to find which phenotypes/traits a variant is associated with and its causal probability (PIP).",
+        "description": "Get credible sets containing a specific variant. Returns fine-mapped associations where this variant is part of a credible set. Use this to find which phenotypes/traits a variant is associated with and its causal probability (PIP). NOTE: For 3+ variants, use analyze_variant_list instead — it is much faster and provides aggregated pattern analysis.",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -489,14 +489,17 @@ Use this when a user provides a list of variants (e.g., lead variants from a GWA
 - Which tissues show eQTL enrichment
 - What the nearest gene is for each variant
 
-Input: one variant per line (chr:pos:ref:alt format), optionally with beta/se/pvalue columns (tab or comma separated).
+Input: variants separated by newlines or spaces (chr:pos:ref:alt format, any separator like : - _ | / accepted, chr prefix optional, 23 treated as X).
+Optionally include beta/se/pvalue columns (tab, comma, or space separated).
 If betas are provided, direction consistency is reported (whether the variant's effect and the association effect are in the same direction).
 
-Returns aggregated counts sorted by frequency.""",
+IMPORTANT: When a user provides multiple variants (3+), ALWAYS use this tool instead of fetching individual variant details one by one.
+
+Returns aggregated counts sorted by frequency. The response already includes nearest genes for every variant in the variant_genes array — do NOT call get_nearest_genes separately after using this tool.""",
         "parameters": {
             "variants": {
                 "type": "string",
-                "description": "Variant list: one per line in chr:pos:ref:alt format. Optionally include tab/comma-separated beta, se, pvalue columns. A header row is auto-detected.",
+                "description": "Variant list: one per line or space-separated. Format: chr:pos:ref:alt (any CPRA separator accepted: : - _ | / \\). Optionally include tab/comma/space-separated beta, se, pvalue columns. A header row is auto-detected.",
                 "required": True,
             },
             "resource": {
@@ -578,7 +581,7 @@ Available skills:
                     "properties": {
                         "skill": {
                             "type": "string",
-                            "description": "Skill name (genetics_data_extraction, literature_review, bigquery_analysis, data_analysis)",
+                            "description": "Skill name (genetics_data_extraction, literature_review, bigquery_analysis, data_analysis, variant_list_analysis)",
                         },
                         "query": {
                             "type": "string",

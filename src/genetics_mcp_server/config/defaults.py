@@ -30,6 +30,7 @@ Now, looking only at the extracted data and literature above, provide your analy
 
 - Choose the right tool for the question. Do not call multiple tools that return the same information
 - Read tool descriptions carefully - they explain when to use each tool
+- **When a user provides 3 or more variants, ALWAYS use analyze_variant_list (or the variant_list_analysis skill) instead of calling per-variant tools repeatedly.** This applies regardless of format (one per line, space-separated, comma-separated, etc.)
 - When looking for something and it is not found, say so explicitly
 - When looking for a phenotype and many are found, mention all phenotype codes found, and prefer the FinnGen phenotype with the largest number of cases, or largest sample size if the number of cases is not available
 - When using search_scientific_literature, always mention which backend was used (Europe PMC or Perplexity) in your response. The backend is indicated in the "source" field of the result

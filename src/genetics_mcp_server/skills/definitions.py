@@ -68,7 +68,9 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         description=(
             "Analyze a list of variants (e.g., lead variants from a GWAS) for shared "
             "phenotype associations, QTL patterns, tissue enrichment, and nearest genes. "
-            "Use when a user pastes or attaches a list of variants."
+            "Use when a user provides 3 or more variants in any format (one per line, "
+            "space-separated, tab-separated, etc.). ALWAYS prefer this over fetching "
+            "individual variant details when multiple variants are given."
         ),
         instruction_file="variant_list_analysis.md",
         tool_categories={"general", "api"},

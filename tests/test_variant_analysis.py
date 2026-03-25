@@ -79,6 +79,67 @@ class TestParseVariantList:
         assert result[0]["se"] == 0.02
         assert result[0]["pvalue"] == 1e-8
 
+    def test_space_separated(self):
+        text = "1:154453788:C:T 0.15 0.02 1e-12\n19:44908684:T:C -0.08 0.01 5e-8"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 2
+        assert result[0]["beta"] == 0.15
+        assert result[1]["beta"] == -0.08
+
+    def test_space_separated_with_header(self):
+        text = "variant beta se pvalue\n1:154453788:C:T 0.15 0.02 1e-12"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 1
+        assert result[0]["beta"] == 0.15
+
+    def test_pipe_separated_variant(self):
+        text = "1|154453788|C|T\n19|44908684|T|C"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 2
+        assert result[0]["variant"] == "1:154453788:C:T"
+
+    def test_underscore_separated_variant(self):
+        text = "1_154453788_C_T\n19_44908684_T_C"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 2
+        assert result[0]["variant"] == "1:154453788:C:T"
+
+    def test_slash_separated_variant(self):
+        text = "1/154453788/C/T\n19\\44908684\\T\\C"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 2
+        assert result[0]["variant"] == "1:154453788:C:T"
+        assert result[1]["variant"] == "19:44908684:T:C"
+
+    def test_chr23_converted_to_x(self):
+        text = "23:12345678:A:G\nchr23:99999999:C:T"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 2
+        assert result[0]["variant"] == "X:12345678:A:G"
+        assert result[1]["variant"] == "X:99999999:C:T"
+
+    def test_chr23_dash_separated(self):
+        text = "23-12345678-A-G"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 1
+        assert result[0]["variant"] == "X:12345678:A:G"
+
+    def test_space_separated_variants_single_line(self):
+        text = "1:109279521:G:A 1:109274241:T:TC 19:44909976:G:T"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 3
+        assert result[0]["variant"] == "1:109279521:G:A"
+        assert result[1]["variant"] == "1:109274241:T:TC"
+        assert result[2]["variant"] == "19:44909976:G:T"
+
+    def test_space_separated_variants_not_confused_with_stats(self):
+        """Space-separated variant+stats on multiple lines should still work."""
+        text = "1:100:A:G 0.15 0.02 1e-12\n2:200:C:T -0.08 0.01 5e-8"
+        result = ToolExecutor._parse_variant_list(text)
+        assert len(result) == 2
+        assert result[0]["beta"] == 0.15
+        assert result[1]["beta"] == -0.08
+
 
 class TestAnalyzeVariantList:
     """Tests for the analyze_variant_list aggregation logic."""
@@ -102,12 +163,12 @@ class TestAnalyzeVariantList:
         # credible set responses
         cs_responses = {
             v1: [
-                {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None},
-                {"data_type": "eQTL", "trait": "expr", "beta": 0.2, "gene_most_severe": "SORT1", "cell_type": "liver"},
+                {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None, "resource": "FinnGen", "dataset": "FG_R13"},
+                {"data_type": "eQTL", "trait": "expr", "beta": 0.2, "gene_most_severe": "SORT1", "cell_type": "liver", "resource": "GTEx", "dataset": "GTEx_v8"},
             ],
             v2: [
-                {"data_type": "GWAS", "trait": "T2D", "beta": -0.05, "gene_most_severe": "G2", "cell_type": None},
-                {"data_type": "pQTL", "trait": "prot", "beta": 0.3, "gene_most_severe": "PCSK9", "cell_type": "plasma"},
+                {"data_type": "GWAS", "trait": "T2D", "beta": -0.05, "gene_most_severe": "G2", "cell_type": None, "resource": "FinnGen", "dataset": "FG_R13"},
+                {"data_type": "pQTL", "trait": "prot", "beta": 0.3, "gene_most_severe": "PCSK9", "cell_type": "plasma", "resource": "UKB", "dataset": "UKB_pQTL"},
             ],
         }
 
@@ -116,18 +177,28 @@ class TestAnalyzeVariantList:
             v2: [{"name": "APOE", "distance": 5000}],
         }
 
-        async def mock_get(url, **kwargs):
+        def _vid_to_fields(vid: str) -> dict:
+            parts = vid.split(":")
+            return {"chr": int(parts[0]), "pos": int(parts[1]), "ref": parts[2], "alt": parts[3]}
+
+        async def mock_post(url, **kwargs):
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             if "credible_sets_by_variant" in url:
-                vid = url.split("/")[-1]
-                mock_resp.json.return_value = cs_responses.get(vid, [])
+                all_cs = []
+                for vid, records in cs_responses.items():
+                    for r in records:
+                        all_cs.append({**r, **_vid_to_fields(vid)})
+                mock_resp.json.return_value = all_cs
             elif "nearest_genes" in url:
-                vid = url.split("/")[-1].split("?")[0]
-                mock_resp.json.return_value = gene_responses.get(vid, [])
+                all_genes = []
+                for vid, records in gene_responses.items():
+                    for r in records:
+                        all_genes.append({**r, "variant": vid.replace(":", "-")})
+                mock_resp.json.return_value = all_genes
             return mock_resp
 
-        mock_client.get = mock_get
+        mock_client.post = mock_post
 
         # mock lookup_phenotype_names
         with patch.object(
@@ -146,15 +217,21 @@ class TestAnalyzeVariantList:
         gwas = {p["trait"]: p for p in result["gwas_phenotypes"]}
         assert gwas["T2D"]["n_variants"] == 2
         assert gwas["T2D"]["name"] == "Type 2 diabetes"
+        assert gwas["T2D"]["resource"] == "FinnGen"
+        assert gwas["T2D"]["dataset"] == "FG_R13"
 
         # PCSK9 pQTL from one variant
         pqtl = {g["gene"]: g for g in result["pqtl_genes"]}
         assert pqtl["PCSK9"]["n_variants"] == 1
+        assert pqtl["PCSK9"]["resource"] == "UKB"
+        assert pqtl["PCSK9"]["dataset"] == "UKB_pQTL"
 
         # eQTL: SORT1/liver from one variant
         assert len(result["eqtl_genes"]) == 1
         assert result["eqtl_genes"][0]["gene"] == "SORT1"
         assert result["eqtl_genes"][0]["tissue"] == "liver"
+        assert result["eqtl_genes"][0]["resource"] == "GTEx"
+        assert result["eqtl_genes"][0]["dataset"] == "GTEx_v8"
 
         # tissue enrichment
         tissues = {t["tissue"]: t for t in result["tissue_enrichment"]}
@@ -174,18 +251,18 @@ class TestAnalyzeVariantList:
 
         v1 = "1:100:A:G"
 
-        async def mock_get(url, **kwargs):
+        async def mock_post(url, **kwargs):
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             if "credible_sets_by_variant" in url:
                 mock_resp.json.return_value = [
-                    {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None},
+                    {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None, "resource": "FG", "dataset": "FG_R13", "chr": 1, "pos": 100, "ref": "A", "alt": "G"},
                 ]
             elif "nearest_genes" in url:
-                mock_resp.json.return_value = [{"name": "G1", "distance": 0}]
+                mock_resp.json.return_value = [{"name": "G1", "distance": 0, "variant": "1-100-A-G"}]
             return mock_resp
 
-        mock_client.get = mock_get
+        mock_client.post = mock_post
 
         with patch.object(
             executor, "lookup_phenotype_names",

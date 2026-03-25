@@ -960,54 +960,80 @@ class ToolExecutor:
                 v["variant"]: v.get("beta") for v in parsed
             }
 
-            sem = asyncio.Semaphore(20)
+            variants_payload = {"variants": "\n".join(variant_ids)}
 
-            # fetch credible sets and nearest genes in parallel
-            async def _fetch_cs(variant_id: str) -> dict[str, Any]:
-                async with sem:
-                    params: dict[str, Any] = {"format": "json"}
-                    if resource:
-                        params["resources"] = resource
-                    try:
-                        resp = await self.client.get(
-                            f"{self.base_url}/v1/credible_sets_by_variant/{variant_id}",
-                            params=params,
-                        )
-                        if resp.status_code == 200:
-                            return {"variant": variant_id, "results": resp.json()}
-                        return {"variant": variant_id, "results": []}
-                    except Exception:
-                        return {"variant": variant_id, "results": []}
+            async def _fetch_cs_batch() -> list[dict[str, Any]]:
+                params: dict[str, Any] = {"format": "json"}
+                if resource:
+                    params["resources"] = resource
+                try:
+                    resp = await self.client.post(
+                        f"{self.base_url}/v1/credible_sets_by_variant",
+                        params=params,
+                        json=variants_payload,
+                    )
+                    if resp.status_code == 200:
+                        return resp.json()
+                    return []
+                except Exception:
+                    return []
 
-            async def _fetch_nearest(variant_id: str) -> dict[str, Any]:
-                async with sem:
-                    try:
-                        resp = await self.client.get(
-                            f"{self.base_url}/v1/nearest_genes/{variant_id}",
-                            params={"format": "json", "n": 1, "gene_type": "protein_coding"},
-                        )
-                        if resp.status_code == 200:
-                            genes = resp.json()
-                            if genes:
-                                return {
-                                    "variant": variant_id,
-                                    "gene": genes[0].get("name") or genes[0].get("hgnc_symbol", ""),
-                                    "distance": genes[0].get("distance", 0),
-                                }
-                        return {"variant": variant_id, "gene": "", "distance": -1}
-                    except Exception:
-                        return {"variant": variant_id, "gene": "", "distance": -1}
+            async def _fetch_nearest_batch() -> list[dict[str, Any]]:
+                try:
+                    resp = await self.client.post(
+                        f"{self.base_url}/v1/nearest_genes",
+                        params={"format": "json", "n": 1, "gene_type": "protein_coding"},
+                        json=variants_payload,
+                    )
+                    if resp.status_code == 200:
+                        return resp.json()
+                    return []
+                except Exception:
+                    return []
 
-            cs_results, gene_results = await asyncio.gather(
-                asyncio.gather(*(_fetch_cs(v) for v in variant_ids)),
-                asyncio.gather(*(_fetch_nearest(v) for v in variant_ids)),
+            cs_raw, genes_raw = await asyncio.gather(
+                _fetch_cs_batch(),
+                _fetch_nearest_batch(),
             )
 
+            def _normalize_vid(v: str) -> str:
+                return v.replace("-", ":")
+
+            # group credible set results by variant
+            cs_by_variant: dict[str, list] = defaultdict(list)
+            for r in cs_raw:
+                if "variant" in r:
+                    vid = _normalize_vid(r["variant"])
+                elif "chr" in r and "pos" in r and "ref" in r and "alt" in r:
+                    vid = f"{r['chr']}:{r['pos']}:{r['ref']}:{r['alt']}"
+                else:
+                    continue
+                cs_by_variant[vid].append(r)
+            cs_results = [{"variant": vid, "results": cs_by_variant.get(vid, [])} for vid in variant_ids]
+
+            # build per-variant nearest gene results
+            nearest_by_variant: dict[str, dict] = {}
+            for g in genes_raw:
+                vid = _normalize_vid(g.get("variant", ""))
+                if vid and vid not in nearest_by_variant:
+                    nearest_by_variant[vid] = {
+                        "variant": vid,
+                        "gene": g.get("name") or g.get("hgnc_symbol", ""),
+                        "distance": g.get("distance", 0),
+                    }
+            gene_results = [
+                nearest_by_variant.get(vid, {"variant": vid, "gene": "", "distance": -1})
+                for vid in variant_ids
+            ]
+
             # aggregate credible set data
-            gwas_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "consistent": set(), "inconsistent": set()})
-            pqtl_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "consistent": set(), "inconsistent": set()})
-            eqtl_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "consistent": set(), "inconsistent": set()})
-            caqtl_counts: dict[str, set] = defaultdict(set)
+            def _new_counts() -> dict:
+                return {"variants": set(), "consistent": set(), "inconsistent": set(), "resources": set(), "datasets": set()}
+
+            gwas_counts: dict[str, dict] = defaultdict(_new_counts)
+            pqtl_counts: dict[str, dict] = defaultdict(_new_counts)
+            eqtl_counts: dict[str, dict] = defaultdict(_new_counts)
+            caqtl_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "resources": set(), "datasets": set()})
             tissue_eqtl_variants: dict[str, set] = defaultdict(set)
             pqtl_variants: set[str] = set()
             variants_with_cs: set[str] = set()
@@ -1022,11 +1048,17 @@ class ToolExecutor:
 
                     cs_beta = r.get("beta")
                     in_beta = input_betas.get(vid)
+                    cs_resource = r.get("resource", "")
+                    cs_dataset = r.get("dataset", "")
 
                     if data_type == "GWAS":
                         trait = r.get("trait", "")
                         if trait:
                             gwas_counts[trait]["variants"].add(vid)
+                            if cs_resource:
+                                gwas_counts[trait]["resources"].add(cs_resource)
+                            if cs_dataset:
+                                gwas_counts[trait]["datasets"].add(cs_dataset)
                             if has_betas and in_beta is not None and cs_beta is not None:
                                 if (in_beta > 0) == (cs_beta > 0):
                                     gwas_counts[trait]["consistent"].add(vid)
@@ -1038,6 +1070,10 @@ class ToolExecutor:
                         if gene:
                             pqtl_counts[gene]["variants"].add(vid)
                             pqtl_variants.add(vid)
+                            if cs_resource:
+                                pqtl_counts[gene]["resources"].add(cs_resource)
+                            if cs_dataset:
+                                pqtl_counts[gene]["datasets"].add(cs_dataset)
                             if has_betas and in_beta is not None and cs_beta is not None:
                                 if (in_beta > 0) == (cs_beta > 0):
                                     pqtl_counts[gene]["consistent"].add(vid)
@@ -1051,6 +1087,10 @@ class ToolExecutor:
                             key = f"{gene}||{tissue}"
                             eqtl_counts[key]["variants"].add(vid)
                             tissue_eqtl_variants[tissue].add(vid)
+                            if cs_resource:
+                                eqtl_counts[key]["resources"].add(cs_resource)
+                            if cs_dataset:
+                                eqtl_counts[key]["datasets"].add(cs_dataset)
                             if has_betas and in_beta is not None and cs_beta is not None:
                                 if (in_beta > 0) == (cs_beta > 0):
                                     eqtl_counts[key]["consistent"].add(vid)
@@ -1060,7 +1100,11 @@ class ToolExecutor:
                     elif data_type == "caQTL":
                         tissue = r.get("cell_type", "")
                         if tissue:
-                            caqtl_counts[tissue].add(vid)
+                            caqtl_counts[tissue]["variants"].add(vid)
+                            if cs_resource:
+                                caqtl_counts[tissue]["resources"].add(cs_resource)
+                            if cs_dataset:
+                                caqtl_counts[tissue]["datasets"].add(cs_dataset)
 
             # lookup phenotype names for GWAS traits
             trait_codes = list(gwas_counts.keys())
@@ -1076,6 +1120,8 @@ class ToolExecutor:
                     {
                         "trait": trait,
                         "name": code_to_name.get(trait, ""),
+                        "resource": ", ".join(sorted(d["resources"])),
+                        "dataset": ", ".join(sorted(d["datasets"])),
                         "n_variants": len(d["variants"]),
                         **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
                     }
@@ -1088,6 +1134,8 @@ class ToolExecutor:
                 [
                     {
                         "gene": gene,
+                        "resource": ", ".join(sorted(d["resources"])),
+                        "dataset": ", ".join(sorted(d["datasets"])),
                         "n_variants": len(d["variants"]),
                         **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
                     }
@@ -1101,6 +1149,8 @@ class ToolExecutor:
                     {
                         "gene": key.split("||")[0],
                         "tissue": key.split("||")[1],
+                        "resource": ", ".join(sorted(d["resources"])),
+                        "dataset": ", ".join(sorted(d["datasets"])),
                         "n_variants": len(d["variants"]),
                         **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
                     }
@@ -1110,7 +1160,15 @@ class ToolExecutor:
             )
 
             caqtl_tissues = sorted(
-                [{"tissue": tissue, "n_variants": len(vids)} for tissue, vids in caqtl_counts.items()],
+                [
+                    {
+                        "tissue": tissue,
+                        "resource": ", ".join(sorted(d["resources"])),
+                        "dataset": ", ".join(sorted(d["datasets"])),
+                        "n_variants": len(d["variants"]),
+                    }
+                    for tissue, d in caqtl_counts.items()
+                ],
                 key=lambda x: -x["n_variants"],
             )
 
@@ -1150,26 +1208,53 @@ class ToolExecutor:
         Variant format: chr:pos:ref:alt (chr prefix optional).
         Optional header row detected by first field not matching variant pattern.
         """
+        # canonical form uses : as CPRA separator
         variant_pattern = re.compile(r"^(?:chr)?(\d{1,2}|X|Y|MT):(\d+):([ACGT]+):([ACGT]+)$", re.IGNORECASE)
+        # accepted CPRA separators: : - _ | / \
+        cpra_sep_pattern = re.compile(r"[-_|/\\]")
         results = []
+
+        def _normalize_variant(raw: str) -> re.Match | None:
+            """Try to match a variant, normalizing CPRA separators and chr23->X."""
+            m = variant_pattern.match(raw)
+            if m:
+                return m
+            normalized = cpra_sep_pattern.sub(":", raw)
+            # convert chr23 -> chrX
+            normalized = re.sub(r"^(?:chr)?23:", "X:", normalized, flags=re.IGNORECASE)
+            return variant_pattern.match(normalized)
 
         # normalize literal \n (from inline pasting) to actual newlines
         text = text.replace("\\n", "\n")
 
-        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        # if input is a single line with space-separated variants, split into multiple lines
+        raw_lines = text.strip().splitlines()
+        if len(raw_lines) == 1 and "\t" not in raw_lines[0] and "," not in raw_lines[0]:
+            tokens = raw_lines[0].split()
+            if len(tokens) > 1 and all(_normalize_variant(t) for t in tokens):
+                raw_lines = tokens
+
+        lines = [line.strip() for line in raw_lines if line.strip()]
         if not lines:
             return []
 
-        # detect separator
-        sep = "\t" if "\t" in lines[0] else ","
+        # detect field separator: tab > spaces > comma
+        if "\t" in lines[0]:
+            sep = "\t"
+        elif "," in lines[0]:
+            sep = ","
+        else:
+            sep = None  # split on whitespace
 
-        # detect header row — check both raw and dash-converted
-        first_fields = lines[0].split(sep)
+        def _split_fields(line: str) -> list[str]:
+            if sep is None:
+                return line.split()
+            return line.split(sep)
+
+        # detect header row
+        first_fields = _split_fields(lines[0])
         first_field = first_fields[0].strip()
-        has_header = not (
-            variant_pattern.match(first_field)
-            or variant_pattern.match(first_field.replace("-", ":"))
-        )
+        has_header = not _normalize_variant(first_field)
         start_idx = 1 if has_header else 0
 
         # detect column positions from header
@@ -1187,7 +1272,7 @@ class ToolExecutor:
                     col_map["pvalue"] = i
 
         for line in lines[start_idx:]:
-            fields = [f.strip() for f in line.split(sep)]
+            fields = [f.strip() for f in _split_fields(line)]
             if not fields:
                 continue
 
@@ -1197,17 +1282,14 @@ class ToolExecutor:
                 continue
             raw_var = fields[var_idx]
 
-            # normalize: strip chr prefix
-            m = variant_pattern.match(raw_var)
+            m = _normalize_variant(raw_var)
             if not m:
-                # try dash-separated format (chr-pos-ref-alt)
-                dash_var = raw_var.replace("-", ":")
-                m = variant_pattern.match(dash_var)
-                if not m:
-                    continue
-                raw_var = dash_var
+                continue
 
-            variant_id = f"{m.group(1)}:{m.group(2)}:{m.group(3).upper()}:{m.group(4).upper()}"
+            chrom = m.group(1)
+            if chrom == "23":
+                chrom = "X"
+            variant_id = f"{chrom}:{m.group(2)}:{m.group(3).upper()}:{m.group(4).upper()}"
 
             entry: dict[str, Any] = {"variant": variant_id}
 
