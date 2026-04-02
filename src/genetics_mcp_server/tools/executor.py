@@ -698,6 +698,57 @@ class ToolExecutor:
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     # -------------------------------------------------------------------------
+    # Summary Statistics Tools
+    # -------------------------------------------------------------------------
+
+    async def get_summary_stats(
+        self,
+        variants: list[str],
+        phenotypes: list[str],
+        resource: str = "finngen",
+        data_type: str = "gwas",
+    ) -> dict[str, Any]:
+        """Get summary statistics for variant-phenotype pairs from a resource."""
+        if not variants:
+            return {"success": False, "error": "No variants provided"}
+        if not phenotypes:
+            return {"success": False, "error": "No phenotypes provided"}
+
+        # normalize variant separators to dash (API expects CHR-POS-REF-ALT)
+        normalized = []
+        for v in variants:
+            normalized.append(re.sub(r"[:_|]", "-", v.strip()))
+
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/v1/summary_stats/{resource}/{data_type}",
+                params={"format": "json"},
+                json={"variants": normalized, "phenotypes": phenotypes},
+                timeout=60.0,
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                return {
+                    "success": True,
+                    "resource": resource,
+                    "data_type": data_type,
+                    "count": len(results),
+                    "results": results,
+                }
+            if resp.status_code == 404:
+                return {
+                    "success": False,
+                    "error": f"Not found: {resp.text}",
+                }
+            return {
+                "success": False,
+                "error": f"HTTP {resp.status_code}: {resp.text}",
+            }
+        except Exception as e:
+            logger.error(f"Error in get_summary_stats: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # -------------------------------------------------------------------------
     # Visualization Tools
     # -------------------------------------------------------------------------
 

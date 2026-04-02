@@ -76,6 +76,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_colocalization` | Find traits sharing causal signals at a variant |
 | `get_phenotype_report` | Get detailed markdown report for a phenotype |
 | `get_available_resources` | List available data sources and datasets |
+| `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
 
 ### LD tools (FinnGen LD Server)
 

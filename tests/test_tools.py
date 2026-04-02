@@ -581,6 +581,106 @@ class TestVisualizationTools:
         assert "error" in result
 
 
+class TestSummaryStatsTools:
+    """Tests for summary statistics tools."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_executor(self):
+        """Create and cleanup executor for each test."""
+        self.executor = ToolExecutor()
+        yield
+        await self.executor.close()
+
+    async def test_get_summary_stats(self):
+        """Test fetching summary stats for a variant-phenotype pair."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C"],
+            phenotypes=["T2D"],
+            resource="finngen",
+            data_type="gwas",
+        )
+
+        assert result["success"] is True
+        assert result["resource"] == "finngen"
+        assert result["data_type"] == "gwas"
+        assert "results" in result
+        assert result["count"] > 0
+        row = result["results"][0]
+        assert "pval" in row
+        assert "beta" in row
+        assert "se" in row
+
+    async def test_get_summary_stats_multiple_variants(self):
+        """Test fetching summary stats for multiple variants."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C", "19:44908822:C:T"],
+            phenotypes=["T2D"],
+            resource="finngen",
+        )
+
+        assert result["success"] is True
+        assert result["count"] > 0
+
+    async def test_get_summary_stats_multiple_phenotypes(self):
+        """Test fetching summary stats for multiple phenotypes."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C"],
+            phenotypes=["T2D", "I9_CHD"],
+        )
+
+        assert result["success"] is True
+        assert result["count"] >= 2
+
+    async def test_get_summary_stats_colon_separator(self):
+        """Test that colon-separated variants are normalized correctly."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C"],
+            phenotypes=["T2D"],
+        )
+
+        assert result["success"] is True
+
+    async def test_get_summary_stats_empty_variants(self):
+        """Test with empty variant list."""
+        result = await self.executor.get_summary_stats(
+            variants=[],
+            phenotypes=["T2D"],
+        )
+
+        assert result["success"] is False
+        assert "error" in result
+
+    async def test_get_summary_stats_empty_phenotypes(self):
+        """Test with empty phenotype list."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C"],
+            phenotypes=[],
+        )
+
+        assert result["success"] is False
+        assert "error" in result
+
+    async def test_get_summary_stats_invalid_phenotype(self):
+        """Test with nonexistent phenotype."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C"],
+            phenotypes=["NONEXISTENT_PHENO_XYZ"],
+        )
+
+        assert result["success"] is False
+
+    async def test_get_summary_stats_meta_analysis(self):
+        """Test fetching from meta-analysis resource."""
+        result = await self.executor.get_summary_stats(
+            variants=["19:44908684:T:C"],
+            phenotypes=["T2D"],
+            resource="finngen_mvp_ukbb",
+            data_type="gwas",
+        )
+
+        assert result["success"] is True
+
+
 class TestToolDefinitions:
     """Tests for tool definitions and profile filtering."""
 

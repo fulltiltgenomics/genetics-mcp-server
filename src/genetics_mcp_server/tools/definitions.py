@@ -479,6 +479,43 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_summary_stats",
+        "category": "api",
+        "description": """Get summary statistics (p-value, beta, standard error, allele frequencies) for specific variant-phenotype pairs from a resource.
+
+Use this tool when:
+- The user asks about a variant's association with a specific phenotype (e.g., "what is the p-value of rs429358 for Alzheimer's in FinnGen?")
+- A result seems suspiciously missing — e.g., a variant is in a credible set for a FinnGen phenotype but not in the corresponding meta-analysis credible set
+- You need the actual effect size or p-value for a variant-phenotype combination, not just whether it's in a credible set
+- You want to compare association statistics across resources for the same variant-phenotype pair
+
+Do NOT use this as a discovery tool — use credible set tools or PheWAS for that. This tool is for targeted lookups when you already know which variant(s) and phenotype(s) to query.""",
+        "parameters": {
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of variant IDs in chr:pos:ref:alt format (e.g., ['19:44908684:T:C', '1:154453788:C:T']). Separator can be : - _ or |",
+                "required": True,
+            },
+            "phenotypes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of phenotype codes (e.g., ['T2D', 'I9_CHD'])",
+                "required": True,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Data resource: 'finngen' or 'finngen_mvp_ukbb'",
+                "default": "finngen",
+            },
+            "data_type": {
+                "type": "string",
+                "description": "Analysis data type: 'gwas' or 'eqtl'",
+                "default": "gwas",
+            },
+        },
+    },
+    {
         "name": "analyze_variant_list",
         "category": "api",
         "description": """Analyze a list of variants for shared phenotype associations, QTL patterns, and tissue enrichment.
@@ -904,6 +941,16 @@ def register_mcp_tools(
     ) -> dict:
         """Analyze a list of variants for phenotype, QTL, and tissue patterns."""
         return await executor.analyze_variant_list(variants, resource)
+
+    @mcp.tool()
+    async def get_summary_stats(
+        variants: list[str],
+        phenotypes: list[str],
+        resource: str = "finngen",
+        data_type: str = "gwas",
+    ) -> dict:
+        """Get summary statistics for specific variant-phenotype pairs."""
+        return await executor.get_summary_stats(variants, phenotypes, resource, data_type)
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()
