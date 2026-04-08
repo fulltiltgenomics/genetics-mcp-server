@@ -9,7 +9,7 @@ import re
 import traceback
 from collections import defaultdict
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 import matplotlib
@@ -78,6 +78,14 @@ class ToolExecutor:
         headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
         self.client = httpx.AsyncClient(timeout=30.0, headers=headers)
 
+    def _build_download_url(self, path: str, params: dict[str, Any] | None = None) -> str:
+        """Build a public download URL for a genetics API endpoint."""
+        url = f"{self.public_url}{path}"
+        query = {"format": "tsv"}
+        if params:
+            query.update(params)
+        return f"{url}?{urlencode(query)}"
+
     async def close(self):
         """Close the HTTP client."""
         await self.client.aclose()
@@ -85,6 +93,14 @@ class ToolExecutor:
     # -------------------------------------------------------------------------
     # BigQuery Tools
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _strip_trailing_limit(sql: str) -> tuple[str, bool]:
+        """Strip a trailing LIMIT clause (and optional semicolon) from SQL. Returns (sql, was_stripped)."""
+        stripped = re.sub(r'\bLIMIT\s+\d+\s*;?\s*$', '', sql, flags=re.IGNORECASE).strip()
+        # also strip a bare trailing semicolon
+        stripped = stripped.rstrip(';').rstrip()
+        return stripped, stripped != sql.strip().rstrip(';').rstrip()
 
     async def query_bigquery(
         self,
@@ -100,26 +116,52 @@ class ToolExecutor:
             }
 
         try:
+            # strip SQL LIMIT so the download gets the full result set;
+            # always fetch up to 100k rows for the download, the LLM
+            # result is truncated to max_rows and further by mcp_max_result_size
+            download_sql, _ = self._strip_trailing_limit(sql)
+            fetch_max = max(max_rows, 100_000)
+
             resp = await self.client.post(
                 f"{self.bigquery_url}/query",
-                json={"sql": sql, "max_rows": max_rows, "dry_run": dry_run},
-                timeout=60.0,
+                json={"sql": download_sql, "max_rows": fetch_max, "dry_run": dry_run},
+                timeout=120.0,
             )
-            if resp.status_code == 200:
-                data = resp.json()
+            if resp.status_code != 200:
                 return {
-                    "success": True,
-                    "sql": sql,
-                    "columns": data.get("columns", []),
-                    "rows": data.get("rows", []),
-                    "total_rows": data.get("total_rows", 0),
-                    "bytes_processed": data.get("bytes_processed", 0),
-                    "truncated": data.get("truncated", False),
+                    "success": False,
+                    "error": f"HTTP {resp.status_code}: {resp.text}",
                 }
-            return {
-                "success": False,
-                "error": f"HTTP {resp.status_code}: {resp.text}",
+
+            data = resp.json()
+            columns = data.get("columns", [])
+            all_rows = data.get("rows", [])
+
+            # download gets all fetched rows
+            download_data = (
+                {"columns": columns, "rows": all_rows, "filename": "finngenie_results.tsv"}
+                if all_rows else None
+            )
+
+            # LLM gets at most max_rows
+            llm_rows = all_rows[:max_rows] if len(all_rows) > max_rows else all_rows
+
+            download_capped = data.get("truncated", False)
+            result: dict[str, Any] = {
+                "success": True,
+                "sql": sql,
+                "columns": columns,
+                "rows": llm_rows,
+                "total_rows": data.get("total_rows", 0),
+                "rows_in_download": len(all_rows),
+                "download_capped_at_100k": download_capped,
+                "bytes_processed": data.get("bytes_processed", 0),
+                "truncated": len(all_rows) > max_rows or download_capped,
             }
+            if download_data:
+                result["_download_data"] = download_data
+
+            return result
         except Exception as e:
             logger.error(f"Error in query_bigquery: {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
@@ -223,6 +265,13 @@ class ToolExecutor:
             if data_types:
                 params["data_types"] = data_types
 
+            dl_params: dict[str, Any] = {"window": window}
+            if resource:
+                dl_params["resources"] = resource
+            if data_types:
+                dl_params["data_types"] = data_types
+            download_url = self._build_download_url(f"/v1/credible_sets_by_gene/{gene}", dl_params)
+
             if summarize:
                 params["format"] = "tsv"
                 resp = await self.client.get(
@@ -230,7 +279,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "gene": gene, **summary}
+                    return {"success": True, "gene": gene, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -248,6 +297,7 @@ class ToolExecutor:
                         "gene": gene,
                         "total_count": len(results),
                         "results": results,
+                        "_download_url": download_url,
                     }
                 return {
                     "success": False,
@@ -274,6 +324,9 @@ class ToolExecutor:
             if data_types:
                 params["data_types"] = data_types
 
+            dl_params = {k: v for k, v in params.items()}
+            download_url = self._build_download_url(f"/v1/credible_sets_by_variant/{variant}", dl_params)
+
             if summarize:
                 params["format"] = "tsv"
                 resp = await self.client.get(
@@ -282,7 +335,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "variant": variant, **summary}
+                    return {"success": True, "variant": variant, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -301,6 +354,7 @@ class ToolExecutor:
                         "variant": variant,
                         "total_count": len(results),
                         "results": results,
+                        "_download_url": download_url,
                     }
                 return {
                     "success": False,
@@ -320,6 +374,10 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         """Get credible sets for a phenotype."""
         try:
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_phenotype/{resource}/{phenotype}"
+            )
+
             if summarize:
                 resp = await self.client.get(
                     f"{self.base_url}/v1/credible_sets_by_phenotype/{resource}/{phenotype}",
@@ -327,7 +385,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_trait(resp.text)
-                    return {"success": True, "phenotype": phenotype, **summary}
+                    return {"success": True, "phenotype": phenotype, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -342,6 +400,7 @@ class ToolExecutor:
                         "success": True,
                         "phenotype": phenotype,
                         "results": resp.json(),
+                        "_download_url": download_url,
                     }
                 return {
                     "success": False,
@@ -362,6 +421,9 @@ class ToolExecutor:
         """Get all variants in a specific credible set."""
         try:
             encoded_cs_id = quote(credible_set_id, safe="")
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_id/{resource}/{phenotype}/{encoded_cs_id}"
+            )
             resp = await self.client.get(
                 f"{self.base_url}/v1/credible_sets_by_id/{resource}/{phenotype}/{encoded_cs_id}",
                 params={"format": "json"},
@@ -375,6 +437,7 @@ class ToolExecutor:
                     "credible_set_id": credible_set_id,
                     "n_variants": len(variants),
                     "variants": variants,
+                    "_download_url": download_url,
                 }
             return {
                 "success": False,
@@ -401,6 +464,9 @@ class ToolExecutor:
             if resource:
                 params["resources"] = resource
 
+            dl_params = {k: v for k, v in params.items()}
+            download_url = self._build_download_url(f"/v1/credible_sets_by_qtl_gene/{gene}", dl_params)
+
             if summarize:
                 params["format"] = "tsv"
                 resp = await self.client.get(
@@ -409,7 +475,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "gene": gene, **summary}
+                    return {"success": True, "gene": gene, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -421,7 +487,7 @@ class ToolExecutor:
                     params=params,
                 )
                 if resp.status_code == 200:
-                    return {"success": True, "gene": gene, "results": resp.json()}
+                    return {"success": True, "gene": gene, "results": resp.json(), "_download_url": download_url}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -442,7 +508,11 @@ class ToolExecutor:
             f"{self.base_url}/v1/expression_by_gene/{gene}", params={"format": "json"}
         )
         if resp.status_code == 200:
-            return {"success": True, "gene": gene, "results": resp.json()}
+            results = resp.json()
+            return {
+                "success": True, "gene": gene, "results": results,
+                "_download_data": {"results": results, "filename": f"{gene}_expression.tsv"},
+            }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:
@@ -451,7 +521,11 @@ class ToolExecutor:
             f"{self.base_url}/v1/gene_disease/{gene}", params={"format": "json"}
         )
         if resp.status_code == 200:
-            return {"success": True, "gene": gene, "results": resp.json()}
+            results = resp.json()
+            result: dict[str, Any] = {"success": True, "gene": gene, "results": results}
+            if results:
+                result["_download_data"] = {"results": results, "filename": f"{gene}_disease_associations.tsv"}
+            return result
         elif resp.status_code == 404:
             return {
                 "success": True,
@@ -468,7 +542,11 @@ class ToolExecutor:
             params={"format": "json"},
         )
         if resp.status_code == 200:
-            return {"success": True, "gene": gene, "results": resp.json()}
+            results = resp.json()
+            return {
+                "success": True, "gene": gene, "results": results,
+                "_download_data": {"results": results, "filename": f"{gene}_exome_results.tsv"},
+            }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     # -------------------------------------------------------------------------
@@ -639,7 +717,7 @@ class ToolExecutor:
             # sort by r2 descending
             variants_in_ld.sort(key=lambda x: x.get("r2") or 0, reverse=True)
 
-            return {
+            result: dict[str, Any] = {
                 "success": True,
                 "query_variant": variant,
                 "window": window,
@@ -648,6 +726,12 @@ class ToolExecutor:
                 "n_variants": len(variants_in_ld),
                 "variants": variants_in_ld,
             }
+            if variants_in_ld:
+                result["_download_data"] = {
+                    "results": variants_in_ld,
+                    "filename": f"{variant}_ld_variants.tsv",
+                }
+            return result
 
         except Exception as e:
             logger.error(
@@ -666,7 +750,11 @@ class ToolExecutor:
             params={"format": "json"},
         )
         if resp.status_code == 200:
-            return {"success": True, "variant": variant, "results": resp.json()}
+            results = resp.json()
+            return {
+                "success": True, "variant": variant, "results": results,
+                "_download_data": {"results": results, "filename": f"{variant}_colocalization.tsv"},
+            }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_phenotype_report(self, resource: str, phenotype_code: str) -> dict[str, Any]:
@@ -728,13 +816,16 @@ class ToolExecutor:
             )
             if resp.status_code == 200:
                 results = resp.json()
-                return {
+                result: dict[str, Any] = {
                     "success": True,
                     "resource": resource,
                     "data_type": data_type,
                     "count": len(results),
                     "results": results,
                 }
+                if results:
+                    result["_download_data"] = {"results": results, "filename": "summary_stats.tsv"}
+                return result
             if resp.status_code == 404:
                 return {
                     "success": False,

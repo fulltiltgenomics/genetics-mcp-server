@@ -87,6 +87,21 @@ class Settings:
         )
     )
 
+    # download storage (for tool result TSV files)
+    chat_public_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAT_PUBLIC_URL", "http://localhost:4000"
+        )
+    )
+    download_storage_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "DOWNLOAD_STORAGE_PATH", "/mnt/disks/data/downloads"
+        )
+    )
+    download_ttl_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("DOWNLOAD_TTL_SECONDS", "2592000"))
+    )
+
     # attachment storage
     attachment_storage_path: str = field(
         default_factory=lambda: os.environ.get(

@@ -6,6 +6,8 @@ Integrates with MCP tools for agentic queries when using Anthropic.
 """
 
 import asyncio
+import csv
+import io
 import json
 import logging
 from dataclasses import dataclass
@@ -13,6 +15,7 @@ from typing import Any, AsyncIterator
 
 from genetics_mcp_server.config import get_settings
 from genetics_mcp_server.cost import estimate_cost
+from genetics_mcp_server.download_store import get_download_store
 from genetics_mcp_server.mcp_proxy import (
     execute_external_tool,
     get_external_anthropic_tools,
@@ -92,6 +95,68 @@ class StreamChunk:
     # image fields (only set when type="image")
     image_format: str | None = None
     image_alt: str | None = None
+
+
+def _convert_to_tsv(download_info: dict) -> bytes:
+    """Convert download data to TSV bytes.
+
+    Supports two formats:
+    - {"results": [list of dicts]} — keys from first dict become headers
+    - {"columns": [...], "rows": [[...], ...]} — BigQuery-style columnar data
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter="\t", lineterminator="\n")
+
+    if "columns" in download_info and "rows" in download_info:
+        writer.writerow(download_info["columns"])
+        for row in download_info["rows"]:
+            writer.writerow(row)
+    elif "results" in download_info:
+        results = download_info["results"]
+        if not results:
+            return b""
+        headers = list(results[0].keys())
+        writer.writerow(headers)
+        for row in results:
+            writer.writerow([row.get(h, "") for h in headers])
+    else:
+        return b""
+
+    return buf.getvalue().encode("utf-8")
+
+
+def _add_include_in_response(result: dict, value: str) -> dict:
+    """Add INCLUDE_IN_RESPONSE at the front of the dict so it survives JSON truncation."""
+    return {"INCLUDE_IN_RESPONSE": value, **{k: v for k, v in result.items() if k != "INCLUDE_IN_RESPONSE"}}
+
+
+def _process_download_hints(result: dict) -> dict:
+    """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links."""
+    if not isinstance(result, dict) or not result.get("success"):
+        return result
+
+    settings = get_settings()
+
+    if "_download_url" in result:
+        url = result.pop("_download_url")
+        link = f"\U0001f4e5 [Download full results as TSV]({url})"
+        return _add_include_in_response(result, link)
+
+    if "_download_data" in result:
+        download_info = result.pop("_download_data")
+        try:
+            tsv_bytes = _convert_to_tsv(download_info)
+            if tsv_bytes:
+                filename = download_info.get("filename", "results.tsv")
+                store = get_download_store()
+                download_id = store.store(tsv_bytes, filename)
+                url = f"{settings.chat_public_url}/chat/v1/downloads/{download_id}"
+                link = f"\U0001f4e5 [Download full results as TSV]({url})"
+                return _add_include_in_response(result, link)
+        except Exception as e:
+            logger.warning(f"Failed to create download: {e}")
+
+    return result
 
 
 class LLMService:
@@ -401,6 +466,9 @@ class LLMService:
                             logger.warning(f"Invalid image data: size={len(image_data) if image_data else 0}")
                         result = {k: v for k, v in result.items() if k != "image_base64"}
                         result["note"] = "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
+
+                    # convert download hints into INCLUDE_IN_RESPONSE links
+                    result = _process_download_hints(result)
 
                     result_json = json.dumps(result)
 

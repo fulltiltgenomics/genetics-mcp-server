@@ -31,8 +31,10 @@ setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
 from genetics_mcp_server.config import get_settings
 from genetics_mcp_server.config.defaults import DEFAULT_SYSTEM_PROMPT
+from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import get_llm_service
-from genetics_mcp_server.rate_limit import check_rate_limit, configure as configure_rate_limit
+from genetics_mcp_server.rate_limit import check_rate_limit
+from genetics_mcp_server.rate_limit import configure as configure_rate_limit
 from genetics_mcp_server.routers import api_tokens_router, chat_history_router, llm_config_router
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
 
@@ -67,8 +69,22 @@ async def lifespan(app: FastAPI):
     )
     # eagerly initialize LLM service and external MCP servers at startup
     get_llm_service()
+    # initialize download store
+    get_download_store()
+
+    # periodic cleanup of expired downloads
+    async def _download_cleanup_loop():
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                get_download_store().cleanup_expired()
+            except Exception as e:
+                logger.error(f"Download cleanup error: {e}")
+
+    cleanup_task = asyncio.create_task(_download_cleanup_loop())
     yield
     # cleanup
+    cleanup_task.cancel()
     service = get_llm_service()
     await service.close()
     logger.info("Chat API server stopped")
@@ -305,6 +321,29 @@ async def stream_chat(
 async def health_check():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+# -----------------------------------------------------------------------------
+# Download endpoint
+# -----------------------------------------------------------------------------
+
+
+@app.get("/chat/v1/downloads/{download_id}")
+@is_public
+async def download_file(download_id: str):
+    """Serve a stored download file (TSV)."""
+    store = get_download_store()
+    result = store.get(download_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=EXPIRED_MESSAGE)
+
+    data, filename, content_type = result
+    from starlette.responses import Response
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 if __name__ == "__main__":

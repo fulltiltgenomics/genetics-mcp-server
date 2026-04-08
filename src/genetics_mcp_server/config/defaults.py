@@ -28,6 +28,7 @@ Now, looking only at the extracted data and literature above, provide your analy
 
 ## Tool Usage Guidelines
 
+- When tool results contain an INCLUDE_IN_RESPONSE field, you MUST include its value verbatim in your response. It contains a download link for the full data.
 - Choose the right tool for the question. Do not call multiple tools that return the same information
 - Read tool descriptions carefully - they explain when to use each tool
 - **When a user provides 3 or more variants, ALWAYS use analyze_variant_list (or the variant_list_analysis skill) instead of calling per-variant tools repeatedly.** This applies regardless of format (one per line, space-separated, comma-separated, etc.)

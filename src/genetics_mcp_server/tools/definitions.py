@@ -567,7 +567,9 @@ For simple single-gene or single-variant lookups, prefer specialized tools (get_
 
 Use fully qualified view names (e.g., `genetics_results.credible_sets_v`).
 Views include a `resource` column (finngen, ukbb, open_targets, etc.) for filtering by data source.
-Always include a LIMIT clause.""",
+Always include a LIMIT clause in your SQL to control how many rows are shown to the user.
+The download file automatically includes all matching rows (up to 100,000) regardless of the SQL LIMIT.
+If the download hits the 100,000-row cap, tell the user to add filters to narrow the results.""",
         "parameters": {
             "sql": {
                 "type": "string",
@@ -576,7 +578,7 @@ Always include a LIMIT clause.""",
             },
             "max_rows": {
                 "type": "integer",
-                "description": "Maximum rows to return (default 1000, max 10000)",
+                "description": "Maximum rows to return to the LLM (default 1000). The download file is not affected by this limit.",
                 "default": 1000,
             },
             "dry_run": {
