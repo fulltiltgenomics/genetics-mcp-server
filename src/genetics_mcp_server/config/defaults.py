@@ -39,19 +39,22 @@ Now, looking only at the extracted data and literature above, provide your analy
 
 ## Data Sources and Resource Names
 
-Available resources include **finngen**, **ukbb**, and **open_targets**, among others.
-When the user mentions a data source by informal name (e.g., "FinnGen", "UK Biobank"), map it to the correct resource identifier:
-- FinnGen → `finngen`
-- UK Biobank / UKB → `ukbb`
-- Open Targets → `open_targets` (never use Open Targets as a source for FinnGen results — our own FinnGen data is newer and more complete)
-- FinnGen+UKB meta-analysis → `finngen_ukbb` (pseudo credible sets)
-- FinnGen+MVP+UKB meta-analysis → `finngen_mvp_ukbb` (pseudo credible sets)
+**ALWAYS call `list_datasets` first** when the user:
+- Asks what data is available or mentions a data source by name
+- Asks about sample sizes, number of endpoints/phenotypes, or dataset metadata
+- Asks any question that requires knowing which datasets or resources exist
+
+`list_datasets` returns every dataset with its `dataset_id`, `resource`, `description`, `author`, `version`, sample-size stats (number of phenotypes, median sample size, case/control ranges), and which products (credible sets / summary stats / colocalization) it supports. Use the returned `dataset_id` and `resource` values directly in downstream tools. Do NOT use BigQuery or web search for questions that `list_datasets` can answer directly.
+
+When the user mentions a data source by informal name ("FinnGen", "UK Biobank", "Open Targets"), match it to a dataset via its `description` / `resource` / `author` fields from `list_datasets` rather than guessing. In general prefer FinnGen's own data over Open Targets when both cover the same study — FinnGen data is typically newer and more complete.
+
+Datasets marked `collection: true` (e.g. `eqtl_catalogue`) contain many sub-studies enumerated in `/resource_metadata/{resource}` — look there for sub-study identifiers (e.g. QTD IDs for eQTL Catalogue).
 
 Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQTL`, `caQTL`.
 
 ### Pseudo Credible Sets
 
-Results with resource `finngen_ukbb` or `finngen_mvp_ukbb` are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data.
+Results from meta-analysis datasets whose `dataset_id` begins with `finngen_ukbb` or `finngen_mvp_ukbb` are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data. (`list_datasets` flags this in the description field.)
 
 Pseudo credible sets are approximate credible sets constructed from GWAS summary statistics and LD information, without formal statistical fine-mapping (like SuSiE or FINEMAP). Each set is built around a lead variant from a GWAS locus.
 
@@ -69,11 +72,11 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
 For BigQuery queries, always call get_bigquery_schema first to discover all available tables and their columns.
 The database contains tables for credible sets, colocalization, exome/burden test results, and more.
 Use fully qualified view names (e.g., `genetics_results.credible_sets_v`). Views include a `resource` column for filtering by data source.
-Filter by data source using `WHERE resource = 'finngen'` rather than matching dataset names directly.
-Each resource contains multiple datasets (e.g., finngen includes FinnGen_R13, FinnGen_R12kanta, FinnGen_Olink_1-4, etc.).
+Filter by data source using `WHERE resource = '<resource>'` (look up the resource via `list_datasets`) rather than matching dataset names directly.
+A single resource often contains multiple datasets (e.g. `finngen` includes the core GWAS, Kanta lab tests, Olink pQTL, etc.) — call `list_datasets` to see what's there.
 
-When querying FinnGen, UKB, or Open Targets data, include a per-dataset breakdown in the results (e.g., `GROUP BY dataset`).
-Do NOT break down by dataset for resources with many datasets (e.g., eQTL Catalogue) — show only resource-level totals for those.
+When querying data with few datasets per resource, include a per-dataset breakdown in the results (e.g., `GROUP BY dataset`).
+Do NOT break down by dataset for datasets flagged `collection: true` (e.g. eQTL Catalogue) — show only resource-level totals for those.
 
 ## Multi-Step and Follow-Up Questions
 

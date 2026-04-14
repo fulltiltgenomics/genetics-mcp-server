@@ -75,7 +75,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 |------|-------------|
 | `get_colocalization` | Find traits sharing causal signals at a variant |
 | `get_phenotype_report` | Get detailed markdown report for a phenotype |
-| `get_available_resources` | List available data sources and datasets |
+| `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
 
 ### LD tools (FinnGen LD Server)
@@ -133,7 +133,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, get_available_resources, search_scientific_literature, web_search, create_phewas_plot |
+| `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, create_phewas_plot |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, etc. |
 | `bigquery` | BigQuery SQL tools: query_bigquery, get_bigquery_schema |
 

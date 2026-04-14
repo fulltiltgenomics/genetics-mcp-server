@@ -250,10 +250,30 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "get_available_resources",
+        "name": "list_datasets",
         "category": "general",
-        "description": "Get a catalog of all available data resources.",
-        "parameters": {},
+        "description": (
+            "List all datasets available in the API with descriptions, provenance "
+            "(author, version, publication date), sample-size statistics (number of "
+            "phenotypes, median sample size, case/control ranges), and which products "
+            "(credible sets / summary stats / colocalization) each dataset supports. "
+            "ALWAYS call this FIRST when the user asks about data availability, sample "
+            "sizes, number of endpoints/phenotypes, dataset metadata, or mentions a "
+            "data source by name. The returned `dataset_id` and `resource` are what "
+            "you pass to downstream tools. For datasets marked `collection: true` "
+            "(e.g. eQTL Catalogue), sub-studies are enumerated in "
+            "/resource_metadata/{resource} (link in `metadata_endpoint`)."
+        ),
+        "parameters": {
+            "resource": {
+                "type": "string",
+                "description": "Optional: filter to a specific resource (e.g. 'finngen', 'eqtl_catalogue'). Omit to list all.",
+            },
+            "include_stats": {
+                "type": "boolean",
+                "description": "Include aggregate sample-size stats. Default true.",
+            },
+        },
     },
     {
         "name": "get_credible_sets_stats",
@@ -262,7 +282,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "parameters": {
             "resource_or_dataset": {
                 "type": "string",
-                "description": "Resource ID (e.g., 'finngen') or dataset ID (e.g., 'finngen_kanta', 'finngen_gwas'). Use get_available_resources to see available options.",
+                "description": "Resource name or dataset_id. Call list_datasets to see available dataset_ids and their resources.",
                 "required": True,
             },
             "trait": {
@@ -831,9 +851,11 @@ def register_mcp_tools(
         return await executor.lookup_phenotype_names(codes)
 
     @mcp.tool()
-    async def get_available_resources() -> dict:
-        """Get a catalog of all available data resources."""
-        return await executor.get_available_resources()
+    async def list_datasets(
+        resource: str | None = None, include_stats: bool = True
+    ) -> dict:
+        """List all datasets with descriptions, products, and sample sizes."""
+        return await executor.list_datasets(resource, include_stats)
 
     if "get_credible_sets_stats" not in _disabled:
 

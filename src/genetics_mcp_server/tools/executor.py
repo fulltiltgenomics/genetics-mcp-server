@@ -785,6 +785,20 @@ class ToolExecutor:
             return {"success": True, "resources": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
+    async def list_datasets(
+        self, resource: str | None = None, include_stats: bool = True
+    ) -> dict[str, Any]:
+        """Get catalog of datasets with descriptions, products, and aggregate stats."""
+        params: dict[str, Any] = {}
+        if resource:
+            params["resource"] = resource
+        if not include_stats:
+            params["include_stats"] = "false"
+        resp = await self.client.get(f"{self.base_url}/v1/datasets", params=params)
+        if resp.status_code == 200:
+            return {"success": True, "datasets": resp.json()}
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
     # -------------------------------------------------------------------------
     # Summary Statistics Tools
     # -------------------------------------------------------------------------

@@ -42,7 +42,7 @@ class TestToolDefinitions:
             "get_credible_sets_by_variant",
             "get_credible_sets_by_phenotype",
             "get_gene_expression",
-            "get_available_resources",
+            "list_datasets",
             "search_scientific_literature",
         ]
 
@@ -196,17 +196,17 @@ class TestMCPServerIntegration:
         assert result["success"] is True
         assert "results" in result
 
-    async def test_mcp_tool_get_available_resources(self):
-        """Test MCP tool for getting available resources."""
+    async def test_mcp_tool_list_datasets(self):
+        """Test MCP tool for listing datasets."""
         from mcp.server.fastmcp import FastMCP
 
         mcp = FastMCP("Test Server")
         register_mcp_tools(mcp, self.executor)
 
-        result = await self.executor.get_available_resources()
+        result = await self.executor.list_datasets()
 
         assert result["success"] is True
-        assert "resources" in result
+        assert "datasets" in result
 
 
 class TestToolDescriptions:

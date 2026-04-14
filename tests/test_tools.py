@@ -323,12 +323,12 @@ class TestColocalizationTools:
         assert result["success"] is True
         assert result["phenotype_code"] == "T2D"
 
-    async def test_get_available_resources(self):
-        """Test getting catalog of available resources."""
-        result = await self.executor.get_available_resources()
+    async def test_list_datasets(self):
+        """Test listing datasets."""
+        result = await self.executor.list_datasets()
 
         assert result["success"] is True
-        assert "resources" in result
+        assert "datasets" in result
 
 
 class TestRegionTools:
