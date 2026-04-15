@@ -105,13 +105,12 @@ class TestProcessDownloadHints:
         }
         processed = _process_download_hints(result)
         assert "INCLUDE_IN_RESPONSE" in processed
-        assert "https://api.example.com/data?format=tsv" in processed["INCLUDE_IN_RESPONSE"]
+        assert "/data?format=tsv" in processed["INCLUDE_IN_RESPONSE"]
         assert "_download_url" not in processed
 
     def test_download_data_hint(self, tmp_path, monkeypatch):
         # patch settings to use temp dir
         monkeypatch.setenv("DOWNLOAD_STORAGE_PATH", str(tmp_path))
-        monkeypatch.setenv("CHAT_PUBLIC_URL", "http://test:4000")
 
         # reset singletons
         import genetics_mcp_server.download_store as ds
@@ -129,7 +128,7 @@ class TestProcessDownloadHints:
         }
         processed = _process_download_hints(result)
         assert "INCLUDE_IN_RESPONSE" in processed
-        assert "http://test:4000/chat/v1/downloads/" in processed["INCLUDE_IN_RESPONSE"]
+        assert "/chat/v1/downloads/" in processed["INCLUDE_IN_RESPONSE"]
         assert "_download_data" not in processed
 
         # cleanup singletons

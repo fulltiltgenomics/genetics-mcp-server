@@ -288,7 +288,6 @@ All configuration is via environment variables (`.env` file supported):
 | `CHAT_HISTORY_DB` | Path to chat history SQLite DB | `/path/to/chat_history.db` |
 | `ATTACHMENT_STORAGE_PATH` | Path for file attachment storage | `/path/to/attachments` |
 | `MAX_ATTACHMENT_SIZE` | Max attachment size in bytes | `52428800` (50MB) |
-| `CHAT_PUBLIC_URL` | Public URL of the chat API (for download links) | `http://localhost:4000` |
 | `DOWNLOAD_STORAGE_PATH` | Path for tool result download files | `/mnt/disks/data/downloads` |
 | `DOWNLOAD_TTL_SECONDS` | TTL for download files in seconds | `2592000` (30 days) |
 
@@ -391,7 +390,7 @@ pytest --cov=src/genetics_mcp_server  # with coverage
 4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
 6. **Result truncation**: Large responses are truncated with warnings to prevent context overflow
-7. **Downloadable results**: Tools returning tabular data include `INCLUDE_IN_RESPONSE` download links. Direct API URLs are used for genetics API tools that support TSV format; other tools (BigQuery, LD, summary stats) have their results converted to TSV and stored on disk, served via `/chat/v1/downloads/{id}`. The `_download_url` and `_download_data` hints in tool results are processed by `_process_download_hints()` in `llm_service.py` before being sent to the LLM. `INCLUDE_IN_RESPONSE` is placed at the front of the result dict so it survives JSON truncation for large results. For BigQuery, trailing SQL `LIMIT` clauses are stripped and `max_rows` is set to 100,000 so the download contains the full result set even when the LLM only displays a subset. The BigQuery proxy (`genetics-results-db`) enforces `MAX_ROWS=100000` as a hard cap.
+7. **Downloadable results**: Tools returning tabular data include `INCLUDE_IN_RESPONSE` download links. Direct API URLs are used for genetics API tools that support TSV format; other tools (BigQuery, LD, summary stats) have their results converted to TSV and stored on disk, served via `/chat/v1/downloads/{id}`. The `_download_url` and `_download_data` hints in tool results are processed by `_process_download_hints()` in `llm_service.py` before being sent to the LLM. All download links use relative URLs (e.g., `/api/v1/...` or `/chat/v1/downloads/...`) so they work correctly regardless of deployment domain. `INCLUDE_IN_RESPONSE` is placed at the front of the result dict so it survives JSON truncation for large results. For BigQuery, trailing SQL `LIMIT` clauses are stripped and `max_rows` is set to 100,000 so the download contains the full result set even when the LLM only displays a subset. The BigQuery proxy (`genetics-results-db`) enforces `MAX_ROWS=100000` as a hard cap.
 
 ## Future considerations
 

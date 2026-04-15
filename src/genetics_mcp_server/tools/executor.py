@@ -1078,10 +1078,12 @@ class ToolExecutor:
             for col in stat_cols:
                 totals[col] = sum(row.get(col, 0) or 0 for row in data)
 
-            download_url = f"{self.public_url}/v1/credible_sets/{resource_or_dataset}/stats"
+            download_url = self._build_download_url(
+                f"/v1/credible_sets/{resource_or_dataset}/stats"
+            )
 
             return {
-                "INCLUDE_IN_RESPONSE": f"📥 [Download full data as TSV]({download_url})",
+                "_download_url": download_url,
                 "success": True,
                 "resource_or_dataset": resource_or_dataset,
                 "n_traits": len(data),

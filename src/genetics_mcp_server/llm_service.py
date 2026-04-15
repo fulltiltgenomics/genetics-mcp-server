@@ -131,15 +131,20 @@ def _add_include_in_response(result: dict, value: str) -> dict:
 
 
 def _process_download_hints(result: dict) -> dict:
-    """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links."""
+    """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links.
+
+    Uses relative URLs so links work regardless of deployment domain.
+    """
     if not isinstance(result, dict) or not result.get("success"):
         return result
 
-    settings = get_settings()
-
     if "_download_url" in result:
         url = result.pop("_download_url")
-        link = f"\U0001f4e5 [Download full results as TSV]({url})"
+        # convert absolute URL to relative path for browser rendering
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        relative_url = f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
+        link = f"\U0001f4e5 [Download full results as TSV]({relative_url})"
         return _add_include_in_response(result, link)
 
     if "_download_data" in result:
@@ -150,7 +155,7 @@ def _process_download_hints(result: dict) -> dict:
                 filename = download_info.get("filename", "results.tsv")
                 store = get_download_store()
                 download_id = store.store(tsv_bytes, filename)
-                url = f"{settings.chat_public_url}/chat/v1/downloads/{download_id}"
+                url = f"/chat/v1/downloads/{download_id}"
                 link = f"\U0001f4e5 [Download full results as TSV]({url})"
                 return _add_include_in_response(result, link)
         except Exception as e:

@@ -503,8 +503,8 @@ class TestCredibleSetStatsTools:
         assert "totals" in result
         assert "n_protective_cs" in result["totals"]
         assert "n_risk_cs" in result["totals"]
-        assert "INCLUDE_IN_RESPONSE" in result
-        assert "finngen/stats" in result["INCLUDE_IN_RESPONSE"]
+        assert "_download_url" in result
+        assert "finngen/stats" in result["_download_url"]
 
     async def test_get_credible_sets_stats_with_dataset_id(self):
         """Test getting stats with specific dataset ID."""
