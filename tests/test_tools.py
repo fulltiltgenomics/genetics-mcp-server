@@ -199,6 +199,30 @@ class TestGeneDataTools:
         assert result["success"] is True
         assert result["gene"] == "APOE"
 
+    async def test_get_gene_based_results(self):
+        """Test getting gene-level burden test results."""
+        result = await self.executor.get_gene_based_results("APOE")
+
+        assert result["success"] is True
+        assert result["gene"] == "APOE"
+        assert "count" in result
+        assert "results" in result
+        assert isinstance(result["results"], list)
+
+    async def test_get_gene_based_results_multiple_genes(self):
+        """Test getting gene-based results for multiple genes."""
+        result = await self.executor.get_gene_based_results("APOE,BRCA1")
+
+        assert result["success"] is True
+        assert result["gene"] == "APOE,BRCA1"
+        assert result["count"] > 0
+
+    async def test_get_gene_based_results_invalid_gene(self):
+        """Test gene-based results for a non-existent gene."""
+        result = await self.executor.get_gene_based_results("FAKEGENE12345")
+
+        assert result["success"] is False
+
 
 class TestLDTools:
     """Tests for FinnGen LD server tools."""

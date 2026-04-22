@@ -220,6 +220,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_gene_based_results",
+        "category": "api",
+        "description": "Get gene-level burden test results from genebass and SCHEMA datasets. Returns gene-based association statistics aggregated at the gene level. Different from get_exome_results_by_gene which returns individual variant-level exome results.",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol or comma-separated list of gene symbols (e.g., 'APOE', 'BRCA1,TP53')",
+                "required": True,
+            },
+        },
+    },
+    {
         "name": "get_phenotype_report", # TODO WHEN DISCUSSING SAMPLE SIZE, INCLUDE NUMBERS OF CASES AND CONTROLS
         "category": "api",
         "description": "Get a detailed markdown report for a phenotype. Returns a markdown report with credible sets and gene evidence summaries in those credible sets. This is the first line of phenotype-based inquiry and should be called first before calling other tools.",
@@ -525,7 +537,7 @@ Do NOT use this as a discovery tool — use credible set tools or PheWAS for tha
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource: 'finngen' or 'finngen_mvp_ukbb'",
+                "description": "Data resource — use list_datasets to find available resources. Common values: 'finngen', 'finngen_mvp_ukbb', 'finngen_ukbb', 'pgc'",
                 "default": "finngen",
             },
             "data_type": {
@@ -837,6 +849,11 @@ def register_mcp_tools(
     async def get_exome_results_by_gene(gene: str) -> dict:
         """Get rare variant burden test results for a gene."""
         return await executor.get_exome_results_by_gene(gene)
+
+    @mcp.tool()
+    async def get_gene_based_results(gene: str) -> dict:
+        """Get gene-level burden test results from genebass and SCHEMA."""
+        return await executor.get_gene_based_results(gene)
 
     if "get_phenotype_report" not in _disabled:
 

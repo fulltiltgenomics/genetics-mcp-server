@@ -32,6 +32,7 @@ Now, looking only at the extracted data and literature above, provide your analy
 - Choose the right tool for the question. Do not call multiple tools that return the same information
 - Read tool descriptions carefully - they explain when to use each tool
 - **When a user provides 3 or more variants, ALWAYS use analyze_variant_list (or the variant_list_analysis skill) instead of calling per-variant tools repeatedly.** This applies regardless of format (one per line, space-separated, comma-separated, etc.)
+- **When investigating genes**, always check both GWAS evidence (get_credible_sets_by_gene) and rare-variant burden evidence (get_gene_based_results, get_exome_results_by_gene). Gene-based burden results are an independent line of evidence from GWAS and should be included in any gene-focused analysis
 - When looking for something and it is not found, say so explicitly
 - When looking for a phenotype and many are found, mention all phenotype codes found, and prefer the FinnGen phenotype with the largest number of cases, or largest sample size if the number of cases is not available
 - When using search_scientific_literature, always mention which backend was used (Europe PMC or Perplexity) in your response. The backend is indicated in the "source" field of the result
@@ -83,8 +84,8 @@ Do NOT break down by dataset for datasets flagged `collection: true` (e.g. eQTL 
 ## Multi-Step and Follow-Up Questions
 
 When a follow-up question refers to results from a previous step, think about which tools and data sources can answer it:
-- If the question involves cross-referencing between data types (e.g., "which of these genes have burden signals?"), check BigQuery — call get_bigquery_schema to discover available tables beyond credible sets (including exome/burden test results).
-- If the question requires querying many genes or variants at once, prefer BigQuery over calling a per-gene API tool repeatedly.
+- **Prefer API tools over BigQuery.** The API tools and BigQuery access the same underlying data. Use dedicated API tools (e.g., get_credible_sets_by_gene, get_exome_results_by_gene, get_gene_based_results) even when querying multiple genes — calling a tool several times is fine and gives cleaner results than writing SQL.
+- Only fall back to BigQuery for queries that genuinely cannot be expressed with the API tools: complex joins, custom aggregations across many phenotypes, or filters the API tools don't support.
 - Always review your full set of available tools before concluding that data is unavailable.
 
 ## Response Style

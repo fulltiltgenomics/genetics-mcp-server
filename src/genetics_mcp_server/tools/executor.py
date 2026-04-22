@@ -549,6 +549,29 @@ class ToolExecutor:
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
+    async def get_gene_based_results(self, gene: str) -> dict[str, Any]:
+        """Get gene-level burden test results (genebass, SCHEMA)."""
+        import csv
+        import io
+
+        resp = await self.client.get(f"{self.base_url}/v1/gene_based/{gene}")
+        if resp.status_code == 200:
+            reader = csv.DictReader(io.StringIO(resp.text), delimiter="\t")
+            results = list(reader)
+            result: dict[str, Any] = {
+                "success": True,
+                "gene": gene,
+                "count": len(results),
+                "results": results,
+            }
+            if results:
+                result["_download_data"] = {
+                    "results": results,
+                    "filename": f"{gene}_gene_based_results.tsv",
+                }
+            return result
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
     # -------------------------------------------------------------------------
     # LD Tools (FinnGen LD Server)
     # -------------------------------------------------------------------------

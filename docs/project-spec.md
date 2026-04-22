@@ -66,6 +66,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_gene_expression` | Get tissue-specific gene expression levels |
 | `get_gene_disease_associations` | Get Mendelian disease relationships from ClinGen/GENCC |
 | `get_exome_results_by_gene` | Get rare variant burden test results |
+| `get_gene_based_results` | Get gene-level burden test results from genebass and SCHEMA |
 | `get_nearest_genes` | Get genes nearest to a variant position |
 | `get_genes_in_region` | Get all genes in a genomic region |
 
