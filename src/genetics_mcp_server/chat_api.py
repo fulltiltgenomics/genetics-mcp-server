@@ -337,12 +337,15 @@ async def health_check():
 @is_public
 async def download_file(download_id: str):
     """Serve a stored download file (TSV)."""
+    logger.info(f"Download requested: {download_id}")
     store = get_download_store()
     result = store.get(download_id)
     if result is None:
+        logger.error(f"Download failed (404): {download_id}")
         raise HTTPException(status_code=404, detail=EXPIRED_MESSAGE)
 
     data, filename, content_type = result
+    logger.info(f"Serving download {download_id}: {filename} ({len(data)} bytes)")
     from starlette.responses import Response
     return Response(
         content=data,

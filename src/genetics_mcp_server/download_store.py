@@ -51,22 +51,26 @@ class DownloadStore:
         """Retrieve download by ID. Returns (data, filename, content_type) or None."""
         # validate ID to prevent path traversal
         if not download_id.isalnum():
+            logger.error(f"Download request with invalid ID: {download_id}")
             return None
 
         data_path = os.path.join(self._storage_path, f"{download_id}.tsv")
         meta_path = os.path.join(self._storage_path, f"{download_id}.json")
 
         if not os.path.exists(data_path) or not os.path.exists(meta_path):
+            logger.error(f"Download not found: {download_id}")
             return None
 
         try:
             with open(meta_path) as f:
                 meta = DownloadMetadata(**json.load(f))
         except (json.JSONDecodeError, TypeError, KeyError):
-            logger.warning(f"Corrupt metadata for download {download_id}")
+            logger.error(f"Corrupt metadata for download {download_id}")
             return None
 
-        if time.time() - meta.created_at > self._ttl_seconds:
+        elapsed = time.time() - meta.created_at
+        if elapsed > self._ttl_seconds:
+            logger.error(f"Download expired: {download_id} (age {elapsed:.0f}s, ttl {self._ttl_seconds}s)")
             self._remove(download_id)
             return None
 
