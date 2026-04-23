@@ -400,13 +400,38 @@ class LLMService:
             while iteration < max_iterations:
                 iteration += 1
 
-                # 5 min timeout per iteration to prevent indefinite hangs
-                async with asyncio.timeout(300):
-                    async with self.anthropic_client.messages.stream(**request_params) as stream:
-                        async for text in stream.text_stream:
-                            yield StreamChunk(type="text", content=text)
+                # retry transient Anthropic errors with exponential backoff
+                max_retries = 3
+                for attempt in range(max_retries + 1):
+                    text_yielded_this_attempt = False
+                    try:
+                        # 5 min timeout per iteration to prevent indefinite hangs
+                        async with asyncio.timeout(300):
+                            async with self.anthropic_client.messages.stream(**request_params) as stream:
+                                async for text in stream.text_stream:
+                                    text_yielded_this_attempt = True
+                                    yield StreamChunk(type="text", content=text)
 
-                        message = await stream.get_final_message()
+                                message = await stream.get_final_message()
+                        break
+                    except Exception as e:
+                        from anthropic import APIConnectionError, APIStatusError
+                        is_retryable = isinstance(e, APIConnectionError) or (
+                            isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529)
+                        )
+                        if not is_retryable or attempt >= max_retries:
+                            raise
+                        wait = 2 ** attempt
+                        logger.warning(
+                            f"{log_prefix}Retryable Anthropic error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                            f"Retrying in {wait}s..."
+                        )
+                        if text_yielded_this_attempt:
+                            yield StreamChunk(
+                                type="text",
+                                content="\n\n*[Connection interrupted, retrying...]*\n\n",
+                            )
+                        await asyncio.sleep(wait)
 
                 # log token usage and cost for this iteration
                 usage = message.usage

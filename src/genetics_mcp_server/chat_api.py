@@ -55,7 +55,12 @@ def _classify_error(e: Exception) -> str:
     if name in ("BadRequestError", "UnprocessableEntityError"):
         return "Invalid request sent to LLM service."
     if name == "InternalServerError":
-        return "LLM service returned an internal error. Please try again."
+        return "External LLM service returned an internal error. Please try again."
+    if name == "APIStatusError":
+        status = getattr(e, "status_code", None)
+        if status and status >= 500:
+            return "External LLM service returned an internal error. Please try again."
+        return "External LLM service error. Please try again."
     return "An internal server error occurred. Please try again."
 
 
