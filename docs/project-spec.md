@@ -237,20 +237,41 @@ The subagent system enables the main agent to launch parallel specialized agents
 - `variant_list_analysis` — analyze multiple variants for shared patterns
 - `data_analysis` — Python script execution for custom analysis and visualizations
 
-The default system prompt (`config/defaults.py`) includes orchestration guidance that tells the LLM when to use subagents vs direct tool calls, lists available skills, and explains how to structure subagent tasks effectively.
-
 Each skill has:
 - A markdown instruction file (system prompt) in `skills/instructions/`
 - Tool categories controlling which tools the subagent can use
 - Configurable model, max iterations, and timeout
 - Optional sandbox tools (file read, script execution)
 
+**Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
+
+**Cost and token tracking**: `SubagentResult` accumulates `input_tokens` and `output_tokens` across all iterations of a subagent's agentic loop. After `launch_subagents` completes, `llm_service.py` sums tokens across all subagent results and logs an aggregated cost estimate using the same `estimate_cost()` function as the main agent.
+
+**Progress streaming**: Subagent progress is streamed to the user in real time via an `asyncio.Queue` bridge:
+1. `SubagentService.run_subagents()` accepts an optional `progress_callback` invoked at subagent start, each tool call, completion, and failure
+2. In `llm_service.py`, the callback puts messages onto an `asyncio.Queue`
+3. The main streaming loop drains the queue, yielding each message as an SSE `StreamChunk` (displayed as italicized status text)
+4. A sentinel `None` signals all subagents have finished, ending the drain loop
+5. Regular tools and subagents run concurrently — regular tool tasks are gathered alongside the subagent task
+
+**System prompt orchestration guidance**: The default system prompt (`config/defaults.py`) includes a "Subagent Orchestration" section that tells the LLM:
+- When to use subagents vs direct tool calls (parallel independent tasks vs simple lookups)
+- Available skills and their best use cases
+- How to structure subagent tasks (self-contained questions, pass context explicitly, split by skill not entity)
+
+**Skill instructions**: Each skill has a markdown instruction file in `skills/instructions/` that serves as the subagent's system prompt. Instructions include:
+- Guidelines for structured output format (exact numbers, systematic organization)
+- Error handling rules (report missing data explicitly, handle tool failures gracefully)
+- Data source mapping guidance (use `list_datasets` to discover datasets, case-sensitive data types)
+- Scope constraints (e.g., data extraction skills should not interpret, just organize)
+
 **Execution flow**:
 1. Main agent calls `launch_subagents` with a list of skill+query tasks
 2. `SubagentService` validates skills and launches subagents in parallel via `asyncio.gather()`
 3. Each subagent runs its own agentic loop (non-streaming) with Claude API
-4. Results are collected and returned to the main agent as a single tool result
-5. Main agent synthesizes subagent outputs into its response
+4. Progress callbacks stream status to the user via `asyncio.Queue`
+5. Results (including per-subagent token counts) are collected and returned to the main agent
+6. Main agent synthesizes subagent outputs into its response
 
 **Security**:
 - File access restricted to configured `SUBAGENT_ALLOWED_PATHS` directories
