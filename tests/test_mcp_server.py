@@ -161,6 +161,7 @@ class TestMCPToolRegistration:
             assert expected <= registered_names
 
 
+@pytest.mark.integration
 class TestMCPServerIntegration:
     """Integration tests for MCP server (requires live API)."""
 

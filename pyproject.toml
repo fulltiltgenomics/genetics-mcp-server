@@ -47,3 +47,7 @@ ignore = ["E501", "E402"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: tests requiring a running genetics API server",
+]

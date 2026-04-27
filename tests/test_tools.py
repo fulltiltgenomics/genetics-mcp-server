@@ -1,4 +1,7 @@
-"""Integration tests for tool executor (requires running genetics API)."""
+"""Integration tests for tool executor (requires running genetics API).
+
+Run with: pytest -m integration
+"""
 
 import pytest
 
@@ -12,6 +15,7 @@ from genetics_mcp_server.tools.definitions import (
 )
 
 
+@pytest.mark.integration
 class TestSearchTools:
     """Tests for search tools."""
 
@@ -90,6 +94,7 @@ class TestSearchTools:
         assert "error" in result
 
 
+@pytest.mark.integration
 class TestCredibleSetTools:
     """Tests for credible set tools."""
 
@@ -160,6 +165,7 @@ class TestCredibleSetTools:
         assert result["gene"] == "APOE"
 
 
+@pytest.mark.integration
 class TestGeneDataTools:
     """Tests for gene data tools."""
 
@@ -224,6 +230,7 @@ class TestGeneDataTools:
         assert result["success"] is False
 
 
+@pytest.mark.integration
 class TestLDTools:
     """Tests for FinnGen LD server tools."""
 
@@ -323,6 +330,7 @@ class TestLDTools:
             assert r2_values == sorted(r2_values, reverse=True)
 
 
+@pytest.mark.integration
 class TestColocalizationTools:
     """Tests for colocalization and report tools."""
 
@@ -355,6 +363,7 @@ class TestColocalizationTools:
         assert "datasets" in result
 
 
+@pytest.mark.integration
 class TestRegionTools:
     """Tests for region/variant location tools."""
 
@@ -395,6 +404,7 @@ class TestRegionTools:
         assert "genes" in result
 
 
+@pytest.mark.integration
 class TestLiteratureSearch:
     """Tests for literature search tools."""
 
@@ -464,6 +474,7 @@ class TestLiteratureSearch:
         assert "unavailable" in result["error"].lower()
 
 
+@pytest.mark.integration
 class TestLiteratureSearchPerplexity:
     """Tests for Perplexity-based literature search (requires API key)."""
 
@@ -508,6 +519,7 @@ class TestLiteratureSearchPerplexity:
         assert result.get("source") == "perplexity"
 
 
+@pytest.mark.integration
 class TestCredibleSetStatsTools:
     """Tests for credible set statistics tools."""
 
@@ -547,6 +559,7 @@ class TestCredibleSetStatsTools:
             assert len(result["traits"]) > 0
 
 
+@pytest.mark.integration
 class TestVisualizationTools:
     """Tests for visualization tools."""
 
@@ -605,6 +618,7 @@ class TestVisualizationTools:
         assert "error" in result
 
 
+@pytest.mark.integration
 class TestSummaryStatsTools:
     """Tests for summary statistics tools."""
 
@@ -717,7 +731,7 @@ class TestToolDefinitions:
 
     def test_valid_categories(self):
         """Tool categories must be one of the known values."""
-        valid = {"general", "api", "bigquery"}
+        valid = {"general", "api", "bigquery", "orchestration"}
         for tool in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS + SUBAGENT_TOOL_DEFINITIONS:
             assert tool["category"] in valid, (
                 f"Tool {tool['name']} has invalid category {tool['category']}"
