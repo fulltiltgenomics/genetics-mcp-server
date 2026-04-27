@@ -36,11 +36,43 @@ Use this skill when a user provides a list of variants (e.g., lead variants from
 - Nearest gene is a simple baseline for gene assignment
 - Compare with pQTL/eQTL results — if a nearest gene also has QTL support, the evidence is stronger
 
+## Error handling
+
+- If `analyze_variant_list` fails, check the error message. Common issues: malformed variant IDs, empty list.
+- Fix variant format issues if possible (e.g. normalize chr prefix) and retry once.
+- If the tool returns partial results (some variants not found), report what was found and note missing variants.
+- Never return an empty response — always include whatever data was retrieved.
+
 ## Output format
 
-Present a structured summary:
-1. Overview (number of variants, how many have credible sets)
-2. Top phenotype associations (pleiotropy patterns)
-3. Top QTL genes (pQTL and eQTL)
-4. Tissue enrichment summary
-5. Notable findings or patterns
+Return results in this structure:
+
+```
+## Variant List Analysis
+
+**Variants analyzed:** N of M provided (list any not found)
+
+### Phenotype Associations
+[Top phenotypes with variant counts, effect directions]
+
+### QTL Genes
+**pQTL:** [genes with variant counts]
+**eQTL:** [top gene/tissue pairs with variant counts]
+
+### Tissue Enrichment
+[Top tissues with eQTL variant counts]
+
+### Variant-Gene Mapping
+| Variant | Nearest Gene | pQTL Support | eQTL Support |
+|---------|-------------|-------------|-------------|
+
+### Notable Patterns
+[2-3 sentences on key findings]
+
+### Errors
+- [any issues encountered]
+```
+
+- Include actual counts and gene names — not vague descriptions
+- Be concise: no conversational filler, no restating the question
+- Always include the variant-gene mapping table with all variants
