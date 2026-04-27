@@ -71,49 +71,38 @@ QUALITY CODING RULES
 **Don't forget any of the 'QUALITY CODING RULES' above!!!**
 
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+<!-- BEGIN BEADS INTEGRATION -->
+# Issue Tracking (Beads)
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project uses beads (`bd`) for tracking epics and tasks. Issues live in `.beads/` and sync with git.
 
-### Quick Reference
+Essential commands:
+- `bd create "title" -d "description" -t <type> -p <priority>` - create issue (types: `epic`, `task`, `subtask`; priority: 1-4)
+- `bd create "title" -t subtask --parent <epic-id>` - create subtask under epic
+- `bd ready` - show unblocked tasks ready for work
+- `bd list` - list all issues (`--json` for programmatic access)
+- `bd show <id>` - view issue details
+- `bd update <id> --status in_progress` - start working on a task
+- `bd update <id> --status done` - mark task complete
+- `bd close <id>` - close an issue
+- `bd link <id1> <id2> --type blocks` - set dependency between tasks
+- `bd sync` - sync with git
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
+Task loop: `bd ready` -> pick task -> `bd update <id> --status in_progress` -> do work -> `bd update <id> --status done` -> repeat
 
-### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+# Feature Planning Workflow
 
-## Session Completion
+When the user requests a new feature:
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+1. **Create epic**: `bd create "Feature: <name>" -d "<description>" -t epic -p 2`
+2. **Explore alternatives**: invoke the architecture-explorer agent with the feature description — it proposes 3 architecture alternatives with max reasoning effort
+3. **User selects alternative**: present the 3 alternatives and wait for the user's choice
+4. **Create subtasks**: break the selected alternative into ultrafocused subtasks under the epic
+   - each subtask has a single responsibility and small scope
+   - each is independently implementable with minimal context needed
+   - include specific files to modify in the description
+   - `bd create "subtask title" -d "details" -t subtask --parent <epic-id>`
+5. **Set dependencies**: `bd link <blocker-id> <blocked-id> --type blocks` for ordered work
+6. **Execute**: work through subtasks via `bd ready`, updating status as you go
 <!-- END BEADS INTEGRATION -->
