@@ -631,7 +631,7 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
 SUBAGENT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "launch_subagents",
-        "category": "general",
+        "category": "orchestration",
         "description": """Launch one or more specialized subagents in parallel to handle complex queries.
 Each subagent has its own skill (instructions + tools) and runs independently.
 Use this when the question requires multiple independent data gathering or analysis tasks that can run simultaneously.
@@ -672,8 +672,8 @@ Available skills:
 
 # valid tool profiles and which categories each profile includes
 TOOL_PROFILES: dict[str, set[str]] = {
-    "api": {"general", "api"},
-    "bigquery": {"general", "bigquery"},
+    "api": {"general", "api", "orchestration"},
+    "bigquery": {"general", "bigquery", "orchestration"},
     "rag": {"general"},
 }
 

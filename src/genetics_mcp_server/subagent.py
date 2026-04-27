@@ -267,9 +267,13 @@ class SubagentService:
         else:
             tool_profile = "rag"  # general-only
 
+        # exclude orchestration tools to prevent recursive subagent launches
+        disabled = set(settings.disabled_tools) if settings.disabled_tools else set()
+        disabled.add("launch_subagents")
+
         tools = get_anthropic_tools(
             tool_profile=tool_profile,
-            disabled_tools=settings.disabled_tools,
+            disabled_tools=disabled,
         )
 
         # filter to only extra_tools if categories are minimal
@@ -330,7 +334,12 @@ class SubagentService:
             if method is None:
                 return {"success": False, "error": f"Unknown tool: {tool_name}"}
 
-            return await method(**tool_input)
+            result = await method(**tool_input)
+
+            # lazy import to avoid circular dependency with llm_service
+            from genetics_mcp_server.llm_service import _process_download_hints
+
+            return _process_download_hints(result)
 
         except Exception as e:
             logger.error(f"Subagent tool '{tool_name}' error: {e}")

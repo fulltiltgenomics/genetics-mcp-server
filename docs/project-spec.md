@@ -137,14 +137,15 @@ Each tool has a `category` field in its definition:
 | `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, create_phewas_plot |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, etc. |
 | `bigquery` | BigQuery SQL tools: query_bigquery, get_bigquery_schema |
+| `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |
 
 ### Profile behavior
 
 | `tool_profile` value | Local tools | External tools |
 |----------------------|-------------|----------------|
-| `null` (default) | general + api + bigquery | always-on (gnomAD, OT) + RAG |
-| `"api"` | general + api | always-on only |
-| `"bigquery"` | general + bigquery | always-on only |
+| `null` (default) | general + api + bigquery + orchestration | always-on (gnomAD, OT) + RAG |
+| `"api"` | general + api + orchestration | always-on only |
+| `"bigquery"` | general + bigquery + orchestration | always-on only |
 | `"rag"` | general only | RAG only |
 
 Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"`. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
