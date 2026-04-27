@@ -473,10 +473,80 @@ class LLMService:
                         type="text", content=f"\n\n*[Using tool: {tool_use.name}; {params_str}]*\n\n"
                     )
 
-                # execute all tools in parallel
-                raw_results = await asyncio.gather(
-                    *(self._execute_tool(tu.name, tu.input, literature_backend) for tu in tool_uses)
-                )
+                # separate subagent tool from regular tools for progress streaming
+                subagent_tool = None
+                regular_tool_uses = []
+                for tu in tool_uses:
+                    if tu.name == "launch_subagents" and self.subagent_service:
+                        subagent_tool = tu
+                    else:
+                        regular_tool_uses.append(tu)
+
+                raw_results_map: dict[str, dict[str, Any]] = {}
+
+                # handle subagent tool with progress streaming
+                if subagent_tool:
+                    progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+                    def _on_progress(msg: str) -> None:
+                        progress_queue.put_nowait(msg)
+
+                    async def _run_subagents() -> dict[str, Any]:
+                        try:
+                            result = await self.subagent_service.run_subagents(
+                                subagent_tool.input.get("tasks", []),
+                                progress_callback=_on_progress,
+                            )
+                            # log cost just like _execute_tool does
+                            if result.get("success") and result.get("results"):
+                                total_in = sum(r.get("input_tokens", 0) for r in result["results"])
+                                total_out = sum(r.get("output_tokens", 0) for r in result["results"])
+                                sa_model = settings.subagent_model or settings.fast_model
+                                sa_cost = estimate_cost(sa_model, total_in, total_out)
+                                logger.info(
+                                    f"Subagents completed: {len(result['results'])} agents, "
+                                    f"input_tokens={total_in} output_tokens={total_out} "
+                                    f"estimated_cost=${sa_cost:.4f}"
+                                )
+                            return result
+                        finally:
+                            progress_queue.put_nowait(None)
+
+                    # launch regular tools and subagents concurrently
+                    subagent_task = asyncio.create_task(_run_subagents())
+                    if regular_tool_uses:
+                        regular_task = asyncio.create_task(
+                            asyncio.gather(
+                                *(self._execute_tool(tu.name, tu.input, literature_backend) for tu in regular_tool_uses)
+                            )
+                        )
+                    else:
+                        regular_task = None
+
+                    # drain progress queue while subagents run
+                    while True:
+                        msg = await progress_queue.get()
+                        if msg is None:
+                            break
+                        yield StreamChunk(type="text", content=f"\n\n*[{msg}]*\n\n")
+
+                    subagent_result = await subagent_task
+                    raw_results_map[subagent_tool.id] = subagent_result
+
+                    if regular_task:
+                        regular_results = await regular_task
+                        for tu, res in zip(regular_tool_uses, regular_results):
+                            raw_results_map[tu.id] = res
+                else:
+                    # no subagent tool — execute all tools in parallel as before
+                    regular_results = await asyncio.gather(
+                        *(self._execute_tool(tu.name, tu.input, literature_backend) for tu in regular_tool_uses)
+                    )
+                    for tu, res in zip(regular_tool_uses, regular_results):
+                        raw_results_map[tu.id] = res
+
+                # build ordered results list matching original tool_uses order
+                raw_results = [raw_results_map[tu.id] for tu in tool_uses]
 
                 # process results: extract images, truncate, build tool_results
                 tool_results = []
