@@ -37,6 +37,8 @@ class SubagentResult:
     output: str
     tools_used: list[str] = field(default_factory=list)
     iterations: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     success: bool = True
     error: str | None = None
 
@@ -119,6 +121,8 @@ class SubagentService:
                     "output": result.output,
                     "tools_used": result.tools_used,
                     "iterations": result.iterations,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
                     "error": result.error,
                 })
 
@@ -159,6 +163,8 @@ class SubagentService:
         max_tokens = skill.max_tokens
         tools_used: list[str] = []
         iteration = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
         final_text = ""
 
         logger.info(
@@ -181,6 +187,11 @@ class SubagentService:
                     request_params["tools"] = tool_definitions
 
                 message = await self._client.messages.create(**request_params)
+
+                # accumulate token usage
+                if hasattr(message, "usage") and message.usage:
+                    total_input_tokens += message.usage.input_tokens
+                    total_output_tokens += message.usage.output_tokens
 
                 # extract text from response
                 text_parts = []
@@ -230,7 +241,8 @@ class SubagentService:
 
             logger.info(
                 f"Subagent '{skill.name}' completed: {iteration} iterations, "
-                f"{len(tools_used)} tool calls"
+                f"{len(tools_used)} tool calls, "
+                f"input_tokens={total_input_tokens} output_tokens={total_output_tokens}"
             )
 
             return SubagentResult(
@@ -239,6 +251,8 @@ class SubagentService:
                 output=final_text,
                 tools_used=tools_used,
                 iterations=iteration,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
                 success=True,
             )
 
@@ -250,6 +264,8 @@ class SubagentService:
                 output=final_text,
                 tools_used=tools_used,
                 iterations=iteration,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
                 success=False,
                 error=str(e),
             )

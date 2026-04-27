@@ -562,7 +562,19 @@ class LLMService:
             if tool_name == "launch_subagents":
                 if not self.subagent_service:
                     return {"success": False, "error": "Subagent service not initialized"}
-                return await self.subagent_service.run_subagents(tool_input.get("tasks", []))
+                result = await self.subagent_service.run_subagents(tool_input.get("tasks", []))
+                if result.get("success") and result.get("results"):
+                    total_in = sum(r.get("input_tokens", 0) for r in result["results"])
+                    total_out = sum(r.get("output_tokens", 0) for r in result["results"])
+                    settings = get_settings()
+                    model = settings.subagent_model or settings.fast_model
+                    cost = estimate_cost(model, total_in, total_out)
+                    logger.info(
+                        f"Subagents completed: {len(result['results'])} agents, "
+                        f"input_tokens={total_in} output_tokens={total_out} "
+                        f"estimated_cost=${cost:.4f}"
+                    )
+                return result
 
             # check if this is an external tool
             if is_external_tool(tool_name):
