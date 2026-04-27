@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "genetics_mcp_server",
+  "project_id": "9bfa797f-7eee-4d2f-bee0-be1935d51689"
+}
