@@ -234,7 +234,10 @@ The subagent system enables the main agent to launch parallel specialized agents
 - `genetics_data_extraction` — API tools for GWAS, QTL, credible sets, etc.
 - `literature_review` — scientific literature and web search
 - `bigquery_analysis` — complex SQL queries against the genetics database
+- `variant_list_analysis` — analyze multiple variants for shared patterns
 - `data_analysis` — Python script execution for custom analysis and visualizations
+
+The default system prompt (`config/defaults.py`) includes orchestration guidance that tells the LLM when to use subagents vs direct tool calls, lists available skills, and explains how to structure subagent tasks effectively.
 
 Each skill has:
 - A markdown instruction file (system prompt) in `skills/instructions/`
