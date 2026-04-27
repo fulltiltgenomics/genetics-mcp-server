@@ -31,7 +31,7 @@ QUALITY CODING RULES
 
 1. Don't guess and do things which you are not certain about. Ask the user instead.
 2. Don't add or modify code unrelated to the specific request and context at the moment.
-3. Only use git when asked, and when using git, only stage changes and propose a commit message. Let the user review the changes and commit them.
+3. In interactive mode: only use git when asked, stage changes and propose a commit message for user review. In autonomous/orchestrator mode (e.g. ralph wiggum): commit after each completed task with a descriptive message.
 4. **Always** prior to finishing a task and considering it completed, revise all the changes and update Project Specification files.
 5. **Always** prior to finishing a task and considering it completed, make sure all tests run successfully.
 6. When trying to fix any bug or compiler error **ALWAYS** think carefully and analyze in detail what happened and WHY? Explain and confirm with user.
@@ -88,7 +88,7 @@ Essential commands:
 - `bd link <id1> <id2> --type blocks` - set dependency between tasks
 - `bd sync` - sync with git
 
-Task loop: `bd ready` -> pick task -> `bd update <id> --status in_progress` -> do work -> `bd update <id> --status done` -> repeat
+Task loop: `bd ready` -> pick task -> `bd update <id> --status in_progress` -> do work -> commit changes -> `bd close <id>` -> repeat
 
 
 # Feature Planning Workflow
