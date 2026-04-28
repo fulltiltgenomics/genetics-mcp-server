@@ -29,6 +29,7 @@ class SkillDefinition:
     allow_file_read: bool = False
     allow_script_exec: bool = False
     allowed_paths: list[str] = field(default_factory=list)
+    include_external: bool = False
 
 
 SKILL_REGISTRY: dict[str, SkillDefinition] = {
@@ -41,6 +42,7 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         ),
         instruction_file="genetics_data_extraction.md",
         tool_categories={"general", "api"},
+        include_external=True,
     ),
     "literature_review": SkillDefinition(
         name="literature_review",

@@ -28,6 +28,29 @@ from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
 
 logger = logging.getLogger(__name__)
 
+_VALUE_TRUNCATE_LEN = 50
+
+
+def _format_tool_params(tool_input: dict, max_len: int = 80) -> str:
+    """Produce a compact (key='val', ...) string from tool input dict."""
+    if not tool_input:
+        return ""
+
+    parts = []
+    for key, value in tool_input.items():
+        if isinstance(value, (list, dict)):
+            formatted = f"{key}=<{type(value).__name__}>"
+        elif isinstance(value, str) and len(value) > _VALUE_TRUNCATE_LEN:
+            formatted = f"{key}='{value[:_VALUE_TRUNCATE_LEN]}...'"
+        else:
+            formatted = f"{key}='{value}'"
+        parts.append(formatted)
+
+    result = f"({', '.join(parts)})"
+    if len(result) > max_len:
+        return result[: max_len - 3] + "..."
+    return result
+
 
 @dataclass
 class SubagentResult:
@@ -36,6 +59,7 @@ class SubagentResult:
     skill_name: str
     query: str
     output: str
+    subagent_id: str = ""
     tools_used: list[str] = field(default_factory=list)
     iterations: int = 0
     input_tokens: int = 0
@@ -85,19 +109,21 @@ class SubagentService:
         timeout = settings.subagent_timeout
 
         async def _run_with_timeout(
-            skill: SkillDefinition, query: str, context: str | None
+            skill: SkillDefinition, query: str, context: str | None,
+            subagent_id: str,
         ) -> SubagentResult:
             try:
                 return await asyncio.wait_for(
-                    self._run_subagent(skill, query, context, progress_callback),
+                    self._run_subagent(skill, query, context, progress_callback, subagent_id),
                     timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                logger.error(f"Subagent '{skill.name}' timed out after {timeout}s")
+                logger.error(f"Subagent '{skill.name}' [{subagent_id}] timed out after {timeout}s")
                 if progress_callback:
-                    progress_callback(f"Subagent '{skill.name}' timed out after {timeout}s")
+                    progress_callback(f"Subagent '{skill.name}' [{subagent_id}] timed out after {timeout}s")
                 return SubagentResult(
                     skill_name=skill.name,
+                    subagent_id=subagent_id,
                     query=query,
                     output="",
                     success=False,
@@ -105,7 +131,10 @@ class SubagentService:
                 )
 
         results = await asyncio.gather(
-            *(_run_with_timeout(s, q, c) for s, q, c in validated_tasks),
+            *(
+                _run_with_timeout(s, q, c, f"sa-{i + 1}")
+                for i, (s, q, c) in enumerate(validated_tasks)
+            ),
             return_exceptions=True,
         )
 
@@ -113,16 +142,19 @@ class SubagentService:
         processed = []
         for i, result in enumerate(results):
             skill_name = validated_tasks[i][0].name
+            subagent_id = f"sa-{i + 1}"
             if isinstance(result, Exception):
-                logger.error(f"Subagent '{skill_name}' failed with exception: {result}")
+                logger.error(f"Subagent '{skill_name}' [{subagent_id}] failed with exception: {result}")
                 processed.append({
                     "skill": skill_name,
+                    "subagent_id": subagent_id,
                     "success": False,
                     "error": str(result),
                 })
             else:
                 processed.append({
                     "skill": result.skill_name,
+                    "subagent_id": result.subagent_id,
                     "success": result.success,
                     "output": result.output,
                     "tools_used": result.tools_used,
@@ -140,6 +172,7 @@ class SubagentService:
         query: str,
         context: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        subagent_id: str = "sa-0",
     ) -> SubagentResult:
         """Run a single subagent with its own agentic loop."""
         settings = get_settings()
@@ -150,6 +183,7 @@ class SubagentService:
         if not instructions:
             return SubagentResult(
                 skill_name=skill.name,
+                subagent_id=subagent_id,
                 query=query,
                 output="",
                 success=False,
@@ -175,11 +209,11 @@ class SubagentService:
         final_text = ""
 
         logger.info(
-            f"Subagent '{skill.name}' starting: model={model}, "
+            f"Subagent '{skill.name}' [{subagent_id}] starting: model={model}, "
             f"tools={len(tool_definitions)}, max_iter={max_iterations}"
         )
         if progress_callback:
-            progress_callback(f"Subagent '{skill.name}' started")
+            progress_callback(f"Subagent '{skill.name}' [{subagent_id}] started")
 
         try:
             while iteration < max_iterations:
@@ -221,10 +255,10 @@ class SubagentService:
                 for tool_use in tool_uses:
                     tools_used.append(tool_use.name)
                     logger.info(
-                        f"Subagent '{skill.name}' calling tool: {tool_use.name}"
+                        f"Subagent '{skill.name}' [{subagent_id}] calling tool: {tool_use.name}"
                     )
                     if progress_callback:
-                        progress_callback(f"Subagent '{skill.name}' calling {tool_use.name}")
+                        progress_callback(f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}")
                     result = await self._execute_subagent_tool(
                         tool_use.name, dict(tool_use.input), skill
                     )
@@ -251,15 +285,16 @@ class SubagentService:
                 ]
 
             logger.info(
-                f"Subagent '{skill.name}' completed: {iteration} iterations, "
+                f"Subagent '{skill.name}' [{subagent_id}] completed: {iteration} iterations, "
                 f"{len(tools_used)} tool calls, "
                 f"input_tokens={total_input_tokens} output_tokens={total_output_tokens}"
             )
             if progress_callback:
-                progress_callback(f"Subagent '{skill.name}' completed ({len(tools_used)} tool calls)")
+                progress_callback(f"Subagent '{skill.name}' [{subagent_id}] completed ({len(tools_used)} tool calls)")
 
             return SubagentResult(
                 skill_name=skill.name,
+                subagent_id=subagent_id,
                 query=query,
                 output=final_text,
                 tools_used=tools_used,
@@ -270,11 +305,12 @@ class SubagentService:
             )
 
         except Exception as e:
-            logger.error(f"Subagent '{skill.name}' error: {e}")
+            logger.error(f"Subagent '{skill.name}' [{subagent_id}] error: {e}")
             if progress_callback:
-                progress_callback(f"Subagent '{skill.name}' failed: {e}")
+                progress_callback(f"Subagent '{skill.name}' [{subagent_id}] failed: {e}")
             return SubagentResult(
                 skill_name=skill.name,
+                subagent_id=subagent_id,
                 query=query,
                 output=final_text,
                 tools_used=tools_used,
