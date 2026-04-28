@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from genetics_mcp_server.config import get_settings
-from genetics_mcp_server.mcp_proxy import execute_external_tool, is_external_tool
+from genetics_mcp_server.mcp_proxy import (
+    execute_external_tool,
+    get_external_anthropic_tools,
+    is_external_tool,
+)
 from genetics_mcp_server.skills.definitions import (
     SkillDefinition,
     get_skill,
@@ -42,8 +46,10 @@ def _format_tool_params(tool_input: dict, max_len: int = 80) -> str:
             formatted = f"{key}=<{type(value).__name__}>"
         elif isinstance(value, str) and len(value) > _VALUE_TRUNCATE_LEN:
             formatted = f"{key}='{value[:_VALUE_TRUNCATE_LEN]}...'"
-        else:
+        elif isinstance(value, str):
             formatted = f"{key}='{value}'"
+        else:
+            formatted = f"{key}={value}"
         parts.append(formatted)
 
     result = f"({', '.join(parts)})"
@@ -254,11 +260,12 @@ class SubagentService:
                 tool_results = []
                 for tool_use in tool_uses:
                     tools_used.append(tool_use.name)
+                    params_str = _format_tool_params(tool_use.input)
                     logger.info(
-                        f"Subagent '{skill.name}' [{subagent_id}] calling tool: {tool_use.name}"
+                        f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}"
                     )
                     if progress_callback:
-                        progress_callback(f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}")
+                        progress_callback(f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}")
                     result = await self._execute_subagent_tool(
                         tool_use.name, dict(tool_use.input), skill
                     )
@@ -360,6 +367,9 @@ class SubagentService:
             allow_script_exec=skill.allow_script_exec and settings.enable_script_execution,
         )
         tools.extend(sandbox_tools)
+
+        if skill.include_external:
+            tools.extend(get_external_anthropic_tools())
 
         return tools
 
