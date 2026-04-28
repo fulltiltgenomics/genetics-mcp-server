@@ -18,7 +18,7 @@ from genetics_mcp_server.skills.sandbox_tools import (
     list_directory,
     read_file,
 )
-from genetics_mcp_server.subagent import SubagentResult, SubagentService
+from genetics_mcp_server.subagent import SubagentResult, SubagentService, _format_tool_params
 
 
 class TestSkillDefinitions:
@@ -247,6 +247,11 @@ class TestSubagentResult:
         assert result.error is None
         assert result.tools_used == []
         assert result.iterations == 0
+        assert result.subagent_id == ""
+
+    def test_subagent_id_set(self):
+        result = SubagentResult(skill_name="test", query="q", output="o", subagent_id="sa-3")
+        assert result.subagent_id == "sa-3"
 
 
 class TestSubagentService:
@@ -658,7 +663,7 @@ class TestProgressCallback:
 
     @pytest.mark.asyncio
     async def test_callback_on_start_and_completion(self):
-        """Progress callback fires at start and completion of a simple run."""
+        """Progress callback fires at start and completion with subagent ID."""
         msg = self._make_message("result")
         mock_client = MagicMock()
         mock_client.messages.create = AsyncMock(return_value=msg)
@@ -670,18 +675,18 @@ class TestProgressCallback:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            await service._run_subagent(skill, "test", progress_callback=callback)
+            await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-1")
 
         calls = [c.args[0] for c in callback.call_args_list]
-        assert any("started" in c for c in calls)
-        assert any("completed" in c for c in calls)
+        assert any("[sa-1]" in c and "started" in c for c in calls)
+        assert any("[sa-1]" in c and "completed" in c for c in calls)
 
     @pytest.mark.asyncio
     async def test_callback_on_tool_call(self):
-        """Progress callback fires when subagent calls a tool."""
+        """Progress callback fires with tool name, params, and subagent ID."""
         tool_msg = self._make_message(
             text="",
-            tool_uses=[{"id": "t1", "name": "search_variants", "input": {}}],
+            tool_uses=[{"id": "t1", "name": "search_variants", "input": {"query": "BRCA1"}}],
         )
         final_msg = self._make_message("done")
 
@@ -699,14 +704,17 @@ class TestProgressCallback:
             patch("genetics_mcp_server.subagent.is_external_tool", return_value=False),
         ):
             mock_settings.return_value = self._make_settings_mock()
-            await service._run_subagent(skill, "test", progress_callback=callback)
+            await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-2")
 
         calls = [c.args[0] for c in callback.call_args_list]
-        assert any("calling search_variants" in c for c in calls)
+        assert any("[sa-2]" in c and "calling search_variants" in c for c in calls)
+        # params should appear in the tool call message
+        tool_call_msg = next(c for c in calls if "calling search_variants" in c)
+        assert "query='BRCA1'" in tool_call_msg
 
     @pytest.mark.asyncio
     async def test_callback_on_failure(self):
-        """Progress callback fires with failure message when an exception occurs."""
+        """Progress callback fires with failure message including subagent ID."""
         mock_client = MagicMock()
         mock_client.messages.create = AsyncMock(side_effect=RuntimeError("API down"))
         mock_executor = MagicMock()
@@ -717,12 +725,12 @@ class TestProgressCallback:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            result = await service._run_subagent(skill, "test", progress_callback=callback)
+            result = await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-1")
 
         assert result.success is False
         calls = [c.args[0] for c in callback.call_args_list]
-        assert any("started" in c for c in calls)
-        assert any("failed" in c for c in calls)
+        assert any("[sa-1]" in c and "started" in c for c in calls)
+        assert any("[sa-1]" in c and "failed" in c for c in calls)
 
     @pytest.mark.asyncio
     async def test_callback_on_timeout(self):
@@ -748,4 +756,175 @@ class TestProgressCallback:
             await service.run_subagents(tasks, progress_callback=callback)
 
         calls = [c.args[0] for c in callback.call_args_list]
-        assert any("timed out" in c for c in calls)
+        assert any("[sa-1]" in c and "timed out" in c for c in calls)
+
+
+class TestFormatToolParams:
+    """Tests for the _format_tool_params helper."""
+
+    def test_empty_dict(self):
+        assert _format_tool_params({}) == ""
+
+    def test_string_values(self):
+        result = _format_tool_params({"gene": "BRCA1", "species": "human"})
+        assert result == "(gene='BRCA1', species='human')"
+
+    def test_non_string_values(self):
+        result = _format_tool_params({"limit": 10, "verbose": True})
+        assert result == "(limit=10, verbose=True)"
+
+    def test_long_string_truncated(self):
+        long_val = "A" * 100
+        result = _format_tool_params({"query": long_val})
+        assert "..." in result
+        assert len(result.split("'")[1]) < 100
+
+    def test_list_value(self):
+        result = _format_tool_params({"ids": [1, 2, 3]})
+        assert result == "(ids=<list>)"
+
+    def test_dict_value(self):
+        result = _format_tool_params({"filter": {"key": "val"}})
+        assert result == "(filter=<dict>)"
+
+    def test_max_len_truncation(self):
+        result = _format_tool_params(
+            {"a": "short", "b": "short", "c": "short", "d": "short"},
+            max_len=20,
+        )
+        assert len(result) <= 20
+        assert result.endswith("...")
+
+    def test_mixed_types(self):
+        result = _format_tool_params({"gene": "TP53", "limit": 5, "data": [1]})
+        assert "gene='TP53'" in result
+        assert "limit=5" in result
+        assert "data=<list>" in result
+
+
+class TestExternalToolInclusion:
+    """Tests that _get_tool_definitions includes external tools when include_external is True."""
+
+    def test_external_tools_included_when_flag_set(self):
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        service = SubagentService(mock_client, mock_executor)
+
+        skill = get_skill("genetics_data_extraction")
+        assert skill is not None
+
+        fake_external = [{"name": "ext_tool_1", "description": "ext", "input_schema": {}}]
+
+        with (
+            patch("genetics_mcp_server.subagent.get_settings") as mock_settings,
+            patch("genetics_mcp_server.subagent.get_external_anthropic_tools", return_value=fake_external),
+            patch.object(skill, "include_external", True),
+        ):
+            settings = MagicMock()
+            settings.disabled_tools = set()
+            settings.enable_subagents = True
+            settings.enable_script_execution = False
+            settings.subagent_allowed_paths_list = []
+            mock_settings.return_value = settings
+
+            tools = service._get_tool_definitions(skill)
+
+        tool_names = [t["name"] for t in tools]
+        assert "ext_tool_1" in tool_names
+
+    def test_external_tools_excluded_when_flag_not_set(self):
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        service = SubagentService(mock_client, mock_executor)
+
+        skill = get_skill("literature_review")
+        assert skill is not None
+
+        with (
+            patch("genetics_mcp_server.subagent.get_settings") as mock_settings,
+            patch("genetics_mcp_server.subagent.get_external_anthropic_tools") as mock_ext,
+        ):
+            settings = MagicMock()
+            settings.disabled_tools = set()
+            settings.enable_subagents = True
+            settings.enable_script_execution = False
+            settings.subagent_allowed_paths_list = []
+            mock_settings.return_value = settings
+
+            # ensure include_external is False
+            assert not skill.include_external
+
+            service._get_tool_definitions(skill)
+
+        mock_ext.assert_not_called()
+
+
+class TestSubagentIdInResults:
+    """Tests that subagent_id propagates through to run_subagents output."""
+
+    def _make_settings_mock(self):
+        settings = MagicMock()
+        settings.subagent_model = ""
+        settings.fast_model = "claude-haiku-4-5"
+        settings.temperature = 0.3
+        settings.mcp_max_result_size = 50000
+        settings.subagent_timeout = 120
+        settings.subagent_script_timeout = 30
+        settings.enable_subagents = True
+        settings.enable_script_execution = False
+        settings.disabled_tools = set()
+        settings.subagent_allowed_paths_list = []
+        return settings
+
+    def _make_message(self, text="done"):
+        content = []
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = text
+        content.append(text_block)
+
+        msg = MagicMock()
+        msg.content = content
+        msg.stop_reason = "end_turn"
+        msg.usage = MagicMock()
+        msg.usage.input_tokens = 10
+        msg.usage.output_tokens = 5
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_subagent_id_in_run_subagent_result(self):
+        msg = self._make_message("result")
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=msg)
+        mock_executor = MagicMock()
+
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("literature_review")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            mock_settings.return_value = self._make_settings_mock()
+            result = await service._run_subagent(skill, "test", subagent_id="sa-5")
+
+        assert result.subagent_id == "sa-5"
+
+    @pytest.mark.asyncio
+    async def test_subagent_ids_in_parallel_results(self):
+        """run_subagents assigns sequential sa-N IDs to each task."""
+        msg = self._make_message("done")
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=msg)
+        mock_executor = MagicMock()
+
+        service = SubagentService(mock_client, mock_executor)
+        tasks = [
+            {"skill": "literature_review", "query": "q1"},
+            {"skill": "genetics_data_extraction", "query": "q2"},
+        ]
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            mock_settings.return_value = self._make_settings_mock()
+            result = await service.run_subagents(tasks)
+
+        assert result["success"] is True
+        assert result["results"][0]["subagent_id"] == "sa-1"
+        assert result["results"][1]["subagent_id"] == "sa-2"
