@@ -242,17 +242,21 @@ Each skill has:
 - Tool categories controlling which tools the subagent can use
 - Configurable model, max iterations, and timeout
 - Optional sandbox tools (file read, script execution)
+- `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
 **Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
 
 **Cost and token tracking**: `SubagentResult` accumulates `input_tokens` and `output_tokens` across all iterations of a subagent's agentic loop. After `launch_subagents` completes, `llm_service.py` sums tokens across all subagent results and logs an aggregated cost estimate using the same `estimate_cost()` function as the main agent.
 
+**Subagent IDs**: Each subagent receives a unique ID (`sa-1`, `sa-2`, ...) assigned sequentially when `run_subagents()` launches them. The ID appears in all log messages and progress callbacks, e.g. `Subagent 'literature_review' [sa-2] calling search_scientific_literature(query='PCSK9')`.
+
 **Progress streaming**: Subagent progress is streamed to the user in real time via an `asyncio.Queue` bridge:
 1. `SubagentService.run_subagents()` accepts an optional `progress_callback` invoked at subagent start, each tool call, completion, and failure
-2. In `llm_service.py`, the callback puts messages onto an `asyncio.Queue`
-3. The main streaming loop drains the queue, yielding each message as an SSE `StreamChunk` (displayed as italicized status text)
-4. A sentinel `None` signals all subagents have finished, ending the drain loop
-5. Regular tools and subagents run concurrently — regular tool tasks are gathered alongside the subagent task
+2. Progress messages include the subagent ID and tool call parameters formatted by `_format_tool_params()` — a helper that produces compact `(key='value', ...)` strings, truncating long values and representing complex types as `<list>`/`<dict>`
+3. In `llm_service.py`, the callback puts messages onto an `asyncio.Queue`
+4. The main streaming loop drains the queue, yielding each message as an SSE `StreamChunk` (displayed as italicized status text)
+5. A sentinel `None` signals all subagents have finished, ending the drain loop
+6. Regular tools and subagents run concurrently — regular tool tasks are gathered alongside the subagent task
 
 **System prompt orchestration guidance**: The default system prompt (`config/defaults.py`) includes a "Subagent Orchestration" section that tells the LLM:
 - When to use subagents vs direct tool calls (parallel independent tasks vs simple lookups)
