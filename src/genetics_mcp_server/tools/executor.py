@@ -823,6 +823,89 @@ class ToolExecutor:
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     # -------------------------------------------------------------------------
+    # Variant Annotation Tools
+    # -------------------------------------------------------------------------
+
+    async def get_variant_annotations(
+        self,
+        variant: str | None = None,
+        region: str | None = None,
+        gene: str | None = None,
+        variants: list[str] | None = None,
+        source: str = "finngen",
+    ) -> dict[str, Any]:
+        """Get variant annotations by variant, region, gene, or batch variants."""
+        # exactly one query type must be provided
+        provided = sum(x is not None for x in [variant, region, gene, variants])
+        if provided != 1:
+            return {
+                "success": False,
+                "error": "Exactly one of 'variant', 'region', 'gene', or 'variants' must be provided",
+            }
+
+        try:
+            if variants is not None:
+                # POST endpoint for batch variant lookup
+                if not variants:
+                    return {"success": False, "error": "No variants provided"}
+                resp = await self.client.post(
+                    f"{self.base_url}/v1/variant_annotation/{source}",
+                    params={"format": "json"},
+                    json={"variants": variants},
+                    timeout=60.0,
+                )
+            else:
+                # GET endpoint for single variant, region, or gene
+                params: dict[str, Any] = {"format": "json"}
+                if variant is not None:
+                    params["variant"] = variant
+                elif region is not None:
+                    params["region"] = region
+                else:
+                    params["gene"] = gene
+                resp = await self.client.get(
+                    f"{self.base_url}/v1/variant_annotation/{source}",
+                    params=params,
+                    timeout=60.0,
+                )
+
+            if resp.status_code == 200:
+                results = resp.json()
+                query_desc = variant or region or gene or f"{len(variants)} variants"
+                result: dict[str, Any] = {
+                    "success": True,
+                    "source": source,
+                    "query": query_desc,
+                    "count": len(results),
+                    "results": results,
+                }
+                if results:
+                    # build download URL for GET queries
+                    if variants is None:
+                        dl_params: dict[str, str] = {}
+                        if variant is not None:
+                            dl_params["variant"] = variant
+                        elif region is not None:
+                            dl_params["region"] = region
+                        else:
+                            dl_params["gene"] = gene  # type: ignore[assignment]
+                        result["_download_url"] = self._build_download_url(
+                            f"/v1/variant_annotation/{source}", dl_params
+                        )
+                    else:
+                        result["_download_data"] = {
+                            "results": results,
+                            "filename": "variant_annotations.tsv",
+                        }
+                return result
+            if resp.status_code == 404:
+                return {"success": False, "error": f"Not found: {resp.text}"}
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(f"Error in get_variant_annotations: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # -------------------------------------------------------------------------
     # Summary Statistics Tools
     # -------------------------------------------------------------------------
 

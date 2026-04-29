@@ -719,6 +719,93 @@ class TestSummaryStatsTools:
         assert result["success"] is True
 
 
+@pytest.mark.integration
+class TestVariantAnnotationTools:
+    """Tests for variant annotation tools."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_executor(self):
+        """Create and cleanup executor for each test."""
+        self.executor = ToolExecutor()
+        yield
+        await self.executor.close()
+
+    async def test_get_variant_annotations_by_gene(self):
+        """Test fetching variant annotations for a gene."""
+        result = await self.executor.get_variant_annotations(gene="PCSK9")
+
+        assert result["success"] is True
+        assert result["source"] == "finngen"
+        assert result["count"] > 0
+        assert "results" in result
+        row = result["results"][0]
+        assert "most_severe" in row
+        assert "gene_most_severe" in row
+
+    async def test_get_variant_annotations_by_variant(self):
+        """Test fetching annotation for a single variant."""
+        result = await self.executor.get_variant_annotations(variant="1:13668:G:A")
+
+        assert result["success"] is True
+        assert "results" in result
+
+    async def test_get_variant_annotations_by_region(self):
+        """Test fetching variant annotations for a region."""
+        result = await self.executor.get_variant_annotations(region="1:13668-14506")
+
+        assert result["success"] is True
+        assert "results" in result
+
+    async def test_get_variant_annotations_batch(self):
+        """Test batch variant annotation lookup via POST."""
+        result = await self.executor.get_variant_annotations(
+            variants=["1:13668:G:A", "1:14506:G:A"]
+        )
+
+        assert result["success"] is True
+        assert "results" in result
+
+    async def test_get_variant_annotations_no_query(self):
+        """Test that missing query parameter returns error."""
+        result = await self.executor.get_variant_annotations()
+
+        assert result["success"] is False
+        assert "error" in result
+
+    async def test_get_variant_annotations_multiple_query_params(self):
+        """Test that providing multiple query params returns error."""
+        result = await self.executor.get_variant_annotations(
+            variant="1:13668:G:A", gene="PCSK9"
+        )
+
+        assert result["success"] is False
+        assert "error" in result
+
+    async def test_get_variant_annotations_unknown_gene(self):
+        """Test that unknown gene returns not found error."""
+        result = await self.executor.get_variant_annotations(gene="NONEXISTENTGENE123")
+
+        assert result["success"] is False
+
+    async def test_get_variant_annotations_download_url(self):
+        """Test that GET queries include download URL."""
+        result = await self.executor.get_variant_annotations(gene="PCSK9")
+
+        assert result["success"] is True
+        if result["count"] > 0:
+            assert "_download_url" in result
+
+    async def test_get_variant_annotations_batch_download_data(self):
+        """Test that POST queries include download data."""
+        result = await self.executor.get_variant_annotations(
+            variants=["1:13668:G:A"]
+        )
+
+        assert result["success"] is True
+        if result["count"] > 0:
+            assert "_download_data" in result
+
+
 class TestToolDefinitions:
     """Tests for tool definitions and profile filtering."""
 

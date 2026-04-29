@@ -577,6 +577,46 @@ Returns aggregated counts sorted by frequency. The response already includes nea
             },
         },
     },
+    {
+        "name": "get_variant_annotations",
+        "category": "api",
+        "description": """Get variant annotations including allele frequency, consequence, gene, rsID, and enrichment data.
+
+Use this tool when:
+- The user asks about a variant's functional annotation (e.g., "what is the consequence of rs429358?")
+- The user wants to see all variants in a gene with their annotations (e.g., "list variants in PCSK9")
+- The user wants variant annotations for a genomic region
+- The user needs allele frequencies, consequence types, or enrichment values for variants
+
+Query by exactly ONE of: a single variant, a genomic region, or a gene name.
+For batch lookups of multiple specific variants, use the 'variants' parameter instead.
+
+Returns: variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), heterozygous/homozygous counts, most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values.""",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Single variant in chr:pos:ref:alt format (e.g., '1:13668:G:A'). Any separator (: - _ |) accepted.",
+            },
+            "region": {
+                "type": "string",
+                "description": "Genomic region in chr:start-end format (e.g., '1:13668-14506'). 1-based, inclusive.",
+            },
+            "gene": {
+                "type": "string",
+                "description": "Gene name (e.g., 'PCSK9', 'BRCA2'). Case-insensitive, supports HGNC aliases and ENSG IDs.",
+            },
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of variant IDs for batch lookup (e.g., ['1:13668:G:A', '1:14506:G:A']). Max 2000.",
+            },
+            "source": {
+                "type": "string",
+                "description": "Annotation source (default 'finngen')",
+                "default": "finngen",
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -992,6 +1032,19 @@ def register_mcp_tools(
     ) -> dict:
         """Get summary statistics for specific variant-phenotype pairs."""
         return await executor.get_summary_stats(variants, phenotypes, resource, data_type)
+
+    @mcp.tool()
+    async def get_variant_annotations(
+        variant: str | None = None,
+        region: str | None = None,
+        gene: str | None = None,
+        variants: list[str] | None = None,
+        source: str = "finngen",
+    ) -> dict:
+        """Get variant annotations (consequence, allele frequency, rsID, enrichment)."""
+        return await executor.get_variant_annotations(
+            variant=variant, region=region, gene=gene, variants=variants, source=source
+        )
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()
