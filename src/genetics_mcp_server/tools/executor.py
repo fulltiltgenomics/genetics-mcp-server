@@ -842,12 +842,19 @@ class ToolExecutor:
                 "success": False,
                 "error": "Exactly one of 'variant', 'region', 'gene', or 'variants' must be provided",
             }
+        if variants is not None and not variants:
+            return {"success": False, "error": "No variants provided"}
+
+        # determine query key/value for GET requests
+        query_key: str | None = None
+        query_value: str | None = None
+        if variants is None:
+            query_key = "variant" if variant is not None else "region" if region is not None else "gene"
+            query_value = variant or region or gene
 
         try:
             if variants is not None:
                 # POST endpoint for batch variant lookup
-                if not variants:
-                    return {"success": False, "error": "No variants provided"}
                 resp = await self.client.post(
                     f"{self.base_url}/v1/variant_annotation/{source}",
                     params={"format": "json"},
@@ -856,13 +863,7 @@ class ToolExecutor:
                 )
             else:
                 # GET endpoint for single variant, region, or gene
-                params: dict[str, Any] = {"format": "json"}
-                if variant is not None:
-                    params["variant"] = variant
-                elif region is not None:
-                    params["region"] = region
-                else:
-                    params["gene"] = gene
+                params: dict[str, Any] = {"format": "json", query_key: query_value}
                 resp = await self.client.get(
                     f"{self.base_url}/v1/variant_annotation/{source}",
                     params=params,
@@ -871,7 +872,7 @@ class ToolExecutor:
 
             if resp.status_code == 200:
                 results = resp.json()
-                query_desc = variant or region or gene or f"{len(variants)} variants"
+                query_desc = query_value if variants is None else f"{len(variants)} variants"
                 result: dict[str, Any] = {
                     "success": True,
                     "source": source,
@@ -880,17 +881,9 @@ class ToolExecutor:
                     "results": results,
                 }
                 if results:
-                    # build download URL for GET queries
                     if variants is None:
-                        dl_params: dict[str, str] = {}
-                        if variant is not None:
-                            dl_params["variant"] = variant
-                        elif region is not None:
-                            dl_params["region"] = region
-                        else:
-                            dl_params["gene"] = gene  # type: ignore[assignment]
                         result["_download_url"] = self._build_download_url(
-                            f"/v1/variant_annotation/{source}", dl_params
+                            f"/v1/variant_annotation/{source}", {query_key: query_value}
                         )
                     else:
                         result["_download_data"] = {
