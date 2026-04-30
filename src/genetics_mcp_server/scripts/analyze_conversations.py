@@ -372,7 +372,11 @@ def compute_success_score(m: ConversationMetrics) -> float:
 
     # LLM quality score is next best (1-5 scale like user rating)
     if m.llm_quality_score is not None:
-        return round((m.llm_quality_score - 1) / 4.0, 3)
+        try:
+            q = int(m.llm_quality_score)
+        except (ValueError, TypeError):
+            q = 3
+        return round((q - 1) / 4.0, 3)
 
     # heuristic fallback
     score = 0.5
@@ -501,7 +505,10 @@ def apply_quality_assessments(
     for m in metrics:
         if m.session_id in assessments:
             qa = assessments[m.session_id]
-            m.llm_quality_score = qa.get("quality_score")
+            try:
+                m.llm_quality_score = int(qa.get("quality_score", 0))
+            except (ValueError, TypeError):
+                m.llm_quality_score = 3
             m.llm_answered = qa.get("answered", "")
             m.llm_accurate = qa.get("accurate", "")
             m.llm_efficient = qa.get("efficient", "")
@@ -891,6 +898,11 @@ async def main():
         for row in first_messages.iter_rows(named=True)
     ]
 
+    # cache paths for LLM results
+    cache_dir = output_dir / ".cache"
+    topics_cache = cache_dir / "topics.json"
+    quality_cache = cache_dir / "quality.json"
+
     if args.no_llm:
         print("  Using keyword categorization...", file=sys.stderr)
         topics = {}
@@ -902,8 +914,21 @@ async def main():
                 "brief_reason": f"keyword match (confidence={confidence:.1f})",
             }
     else:
-        print(f"  Using LLM categorization (model={args.model})...", file=sys.stderr)
-        topics = await categorize_with_llm(session_first_msgs, model=args.model)
+        # load cached topic classifications
+        cached_topics = {}
+        if topics_cache.exists():
+            cached_topics = json.loads(topics_cache.read_text())
+            print(f"  Loaded {len(cached_topics)} cached topic classifications", file=sys.stderr)
+
+        uncached_msgs = [m for m in session_first_msgs if m["id"] not in cached_topics]
+        if uncached_msgs:
+            print(f"  Using LLM categorization for {len(uncached_msgs)} sessions "
+                  f"(model={args.model})...", file=sys.stderr)
+            new_topics = await categorize_with_llm(uncached_msgs, model=args.model)
+            cached_topics.update(new_topics)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            topics_cache.write_text(json.dumps(cached_topics, indent=2))
+        topics = cached_topics
 
     topic_dist = Counter(v["topic"] for v in topics.values())
     print(f"  Topics: {dict(topic_dist.most_common())}", file=sys.stderr)
@@ -914,14 +939,27 @@ async def main():
 
     # --- LLM quality evaluation ---
     if not args.no_llm:
-        session_ids = [m.session_id for m in all_metrics]
-        print(f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)...",
-              file=sys.stderr)
-        assessments = await evaluate_quality_with_llm(
-            session_ids, messages, model=args.model,
-        )
-        apply_quality_assessments(all_metrics, assessments)
-        print(f"  {len(assessments)} conversations evaluated", file=sys.stderr)
+        # load cached quality assessments
+        cached_quality: dict[str, dict] = {}
+        if quality_cache.exists():
+            cached_quality = json.loads(quality_cache.read_text())
+            print(f"  Loaded {len(cached_quality)} cached quality assessments", file=sys.stderr)
+
+        session_ids = [m.session_id for m in all_metrics if m.session_id not in cached_quality]
+        if session_ids:
+            print(f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)...",
+                  file=sys.stderr)
+            new_assessments = await evaluate_quality_with_llm(
+                session_ids, messages, model=args.model,
+            )
+            cached_quality.update(new_assessments)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            quality_cache.write_text(json.dumps(cached_quality, indent=2))
+        else:
+            print("  All quality assessments cached, skipping LLM calls", file=sys.stderr)
+
+        apply_quality_assessments(all_metrics, cached_quality)
+        print(f"  {len(cached_quality)} conversations evaluated", file=sys.stderr)
 
     success_dist = Counter(m.success_label for m in all_metrics)
     print(f"  Success: {dict(success_dist)}", file=sys.stderr)
