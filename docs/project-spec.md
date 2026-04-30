@@ -178,7 +178,9 @@ src/genetics_mcp_server/
 │   └── phewas_categories.py  # PheWAS plot category mappings
 ├── subagent.py             # parallel subagent service
 ├── scripts/
-│   └── analyze_variants.py # standalone variant list analysis CLI
+│   ├── analyze_variants.py # standalone variant list analysis CLI
+│   ├── analyze_conversations.py # conversation history analysis and eval extraction
+│   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
 │   ├── definitions.py      # skill definitions and registry
@@ -400,6 +402,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint |
+| `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 
 Run tests:
 ```bash
