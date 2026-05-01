@@ -93,6 +93,8 @@ Task loop: `bd ready` -> pick task -> `bd update <id> --status in_progress` -> d
 
 # Feature Planning Workflow
 
+This workflow is for **planning only** — it creates beads issues but does NOT execute any code changes. Use `beads-ralph-wiggum` skill separately to execute the plan.
+
 When the user requests a new feature:
 
 1. **Create epic**: `bd create "Feature: <name>" -d "<description>" -t epic -p 2`
@@ -103,6 +105,6 @@ When the user requests a new feature:
    - each is independently implementable with minimal context needed
    - include specific files to modify in the description
    - `bd create "subtask title" -d "details" -t subtask --parent <epic-id>`
-5. **Set dependencies**: `bd link <blocker-id> <blocked-id> --type blocks` for ordered work
-6. **Execute**: work through subtasks via `bd ready`, updating status as you go
+5. **Set dependencies**: `bd dep add <blocked-id> <blocker-id>` for ordered work
+6. **Stop**: present the plan to the user. Do NOT start implementation.
 <!-- END BEADS INTEGRATION -->

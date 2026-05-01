@@ -107,6 +107,22 @@ class Settings:
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENT_SIZE", "52428800"))  # 50MB
     )
 
+    # admin page
+    enable_admin_page: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_ADMIN_PAGE", "false"
+        ).lower() in ("1", "true", "yes")
+    )
+    admin_users: str = field(
+        default_factory=lambda: os.environ.get("ADMIN_USERS", "")
+    )
+
+    @property
+    def admin_users_list(self) -> list[str]:
+        if not self.admin_users:
+            return []
+        return [u.strip().lower() for u in self.admin_users.split(",") if u.strip()]
+
     # subagent settings
     enable_subagents: bool = field(
         default_factory=lambda: os.environ.get(

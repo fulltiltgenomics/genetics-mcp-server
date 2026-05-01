@@ -418,6 +418,97 @@ class ChatHistoryDB(object, metaclass=Singleton):
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def list_all_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        user_filter: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        session_id_filter: str | None = None,
+    ) -> tuple[list[ChatSession], int]:
+        """List all sessions across all users with optional filters.
+
+        Returns (sessions, total_count) for pagination.
+        """
+        conditions = []
+        params: list = []
+
+        if user_filter:
+            conditions.append("s.user_id LIKE ?")
+            params.append(f"%{user_filter}%")
+        if date_from:
+            conditions.append("s.created_at >= ?")
+            params.append(date_from)
+        if date_to:
+            conditions.append("s.created_at <= ?")
+            params.append(date_to + " 23:59:59")
+        if session_id_filter:
+            conditions.append("s.id LIKE ?")
+            params.append(f"%{session_id_filter}%")
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"SELECT COUNT(*) as cnt FROM chat_sessions s {where}",
+            params,
+        )
+        total = cursor.fetchone()["cnt"]
+
+        cursor.execute(
+            f"""
+            SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
+                   s.rating, s.comment, s.phenotype_code
+            FROM chat_sessions s
+            {where}
+            ORDER BY s.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        )
+        sessions = [self._row_to_session(row) for row in cursor.fetchall()]
+        return sessions, total
+
+    def get_session_any_user(self, session_id: str) -> ChatSession | None:
+        """Get a session by ID without user ownership check (admin use)."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code
+            FROM chat_sessions WHERE id = ?
+            """,
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return self._row_to_session(row)
+
+    def get_usage_analytics(self, period: str = "week") -> list[dict]:
+        """Get daily unique users and conversation counts for the given period.
+
+        period: 'week' (7 days), 'month' (30 days), or 'year' (365 days)
+        """
+        days = {"week": 7, "month": 30, "year": 365}.get(period, 7)
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT date(created_at) as day,
+                   COUNT(DISTINCT user_id) as unique_users,
+                   COUNT(*) as conversations
+            FROM chat_sessions
+            WHERE created_at >= date('now', ?)
+            GROUP BY date(created_at)
+            ORDER BY day ASC
+            """,
+            (f"-{days} days",),
+        )
+        return [
+            {"date": row["day"], "unique_users": row["unique_users"], "conversations": row["conversations"]}
+            for row in cursor.fetchall()
+        ]
+
     def _row_to_attachment(self, row: sqlite3.Row) -> ChatAttachment:
         return ChatAttachment(
             id=row["id"],

@@ -197,6 +197,7 @@ src/genetics_mcp_server/
 │   └── chat_history_db.py  # conversation persistence
 └── routers/
     ├── __init__.py
+    ├── admin.py         # admin page: all conversations, analytics
     ├── api_tokens.py    # per-user API token management
     ├── llm_config.py    # LLM config API endpoints
     └── chat_history.py  # chat history API endpoints
@@ -333,6 +334,24 @@ All configuration is via environment variables (`.env` file supported):
 
 Per-user API tokens are also supported: users create tokens via the chat API (`POST /chat/v1/tokens`), which are validated alongside `MCP_API_KEY` in the MCP server's bearer auth middleware. Tokens are stored as SHA-256 hashes in the LLM config SQLite DB.
 
+### Admin page
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ENABLE_ADMIN_PAGE` | Enable admin page and API endpoints | `false` |
+| `ADMIN_USERS` | Comma-separated admin email addresses | `""` |
+
+When `ENABLE_ADMIN_PAGE=true`, admin endpoints are available at `/chat/v1/admin/`. Access control depends on `REQUIRE_AUTH`:
+- `REQUIRE_AUTH=false` (dev mode): any user can access admin endpoints
+- `REQUIRE_AUTH=true`: only users listed in `ADMIN_USERS` can access admin endpoints
+
+Admin endpoints:
+- `GET /chat/v1/admin/sessions` — list all sessions with filters (user, date range, session ID) and pagination
+- `GET /chat/v1/admin/sessions/{id}` — session detail with all messages
+- `GET /chat/v1/admin/analytics/usage?period=week|month|year` — daily usage stats (unique users, conversations)
+
+The `/chat/v1/auth` endpoint includes an `is_admin` boolean in its response, used by the frontend to show/hide the admin menu.
+
 ### Rate limiting
 
 | Variable | Description | Default |
@@ -403,6 +422,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
+| `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 
 Run tests:
 ```bash

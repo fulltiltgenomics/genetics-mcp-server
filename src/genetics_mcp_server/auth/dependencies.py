@@ -3,7 +3,7 @@
 import logging
 import os
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 
 from genetics_mcp_server.auth.core import get_authenticated_user
 
@@ -38,6 +38,33 @@ async def auth_required(request: Request) -> str | None:
     user = get_authenticated_user(request)
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+async def admin_required(
+    request: Request,
+    user: str | None = Depends(auth_required),
+) -> str:
+    """Dependency that requires admin access.
+
+    Returns 404 when ENABLE_ADMIN_PAGE is false.
+    When REQUIRE_AUTH is false (dev mode), any authenticated user is an admin.
+    When REQUIRE_AUTH is true, user must be in the ADMIN_USERS list.
+    """
+    from genetics_mcp_server.config import get_settings
+    settings = get_settings()
+
+    if not settings.enable_admin_page:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if not _require_auth:
+        return user or "anonymous"
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    if user.lower() not in settings.admin_users_list:
+        raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
 

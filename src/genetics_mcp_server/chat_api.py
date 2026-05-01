@@ -35,7 +35,12 @@ from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_sto
 from genetics_mcp_server.llm_service import get_llm_service
 from genetics_mcp_server.rate_limit import check_rate_limit
 from genetics_mcp_server.rate_limit import configure as configure_rate_limit
-from genetics_mcp_server.routers import api_tokens_router, chat_history_router, llm_config_router
+from genetics_mcp_server.routers import (
+    admin_router,
+    api_tokens_router,
+    chat_history_router,
+    llm_config_router,
+)
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
 
 logger = logging.getLogger(__name__)
@@ -116,6 +121,8 @@ app.include_router(api_tokens_router, prefix="/chat/v1", tags=["api-tokens"])
 app.include_router(chat_history_router, prefix="/chat/v1", tags=["chat-history"])
 app.include_router(llm_config_router, prefix="/chat/v1", tags=["llm-config"])
 
+app.include_router(admin_router, prefix="/chat/v1", tags=["admin"])
+
 
 class ChatMessage(BaseModel):
     """A single message in the chat history."""
@@ -174,9 +181,18 @@ class ChatStatusResponse(BaseModel):
 async def auth(request: Request):
     """Return current authentication status."""
     user = get_authenticated_user(request)
+    settings = get_settings()
+    require_auth = os.environ.get("REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
+    is_admin = False
+    if settings.enable_admin_page:
+        if not require_auth:
+            is_admin = True
+        elif user and user.lower() in settings.admin_users_list:
+            is_admin = True
     return JSONResponse({
         "authenticated": user is not None,
         "user": user,
+        "is_admin": is_admin,
     })
 
 
