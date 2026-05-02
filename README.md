@@ -13,7 +13,7 @@ This is deployed as part of FinnGenie AI assistant (see [https://github.com/full
 ### Install requirements
 
 ```
-uv pip install --system -r requirements.txt
+uv pip install --system .
 ```
 
 ### Environment Variables

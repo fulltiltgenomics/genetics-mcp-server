@@ -6,10 +6,9 @@ RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
 
 RUN pip install uv --upgrade
 
-COPY requirements.txt .
-RUN uv pip install --system -r requirements.txt
-
+COPY pyproject.toml README.md ./
 COPY src/ src/
+RUN uv pip install --system .
 
 ENV PORT=8000
 ENV PYTHONPATH=/app/src

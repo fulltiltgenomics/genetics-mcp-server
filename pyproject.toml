@@ -5,26 +5,26 @@ description = "MCP server and LLM service for genetics data tools"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]==1.25.0",
+    "mcp[cli]==1.27.0",
     "httpx==0.28.1",
-    "polars==1.37.0",
-    "python-dotenv==1.2.1",
-    "matplotlib==3.10.8",
-    "anthropic==0.75.0",
-    "openai==2.15.0",
-    "fastapi==0.128.0",
-    "uvicorn==0.40.0",
-    "sse-starlette==3.1.2",
-    "pydantic==2.12.5",
-    "duckduckgo-search==8.1.1",
+    "polars==1.40.1",
+    "python-dotenv==1.2.2",
+    "matplotlib==3.10.9",
+    "anthropic==0.97.0",
+    "openai==2.33.0",
+    "fastapi==0.136.1",
+    "uvicorn==0.46.0",
+    "sse-starlette==3.4.1",
+    "pydantic==2.13.3",
+    "ddgs==9.14.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest==9.0.2",
+    "pytest==9.0.3",
     "pytest-asyncio==1.3.0",
-    "pytest-cov==7.0.0",
-    "ruff==0.14.11",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.12",
 ]
 
 [build-system]

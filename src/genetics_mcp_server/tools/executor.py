@@ -2221,14 +2221,10 @@ class ToolExecutor:
         """Search using DuckDuckGo (free fallback)."""
         import asyncio
 
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            from duckduckgo_search import DDGS
+        from ddgs import DDGS
 
         def sync_search():
-            with DDGS() as ddgs:
-                return list(ddgs.text(query, max_results=max_results))
+            return DDGS().text(query, max_results=max_results)
 
         try:
             results = await asyncio.to_thread(sync_search)
