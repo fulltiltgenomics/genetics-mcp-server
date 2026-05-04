@@ -23,7 +23,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
-- **Context window tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens)
+- **Context usage tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens). During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
 - **Chat history persistence**: SQLite-based storage of conversation threads
 - **Configurable prompts**: Per-user LLM configuration stored in database
 
@@ -209,6 +209,31 @@ src/genetics_mcp_server/
 1. **MCP Server mode**: Client → FastMCP → ToolExecutor → Genetics API
 2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
+
+### SSE event types
+
+The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON object with a `type` field:
+
+| Event type | Description | Key payload fields |
+|------------|-------------|--------------------|
+| `content` | Streamed text token from the LLM response | `content` (string) |
+| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
+| `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
+| `error` | Error message from the backend | `content` (error string) |
+| `done` | Signals the stream is complete | `content` (empty or final message) |
+
+The `usage` event is emitted by `_stream_anthropic()` in `llm_service.py` after token accounting in each iteration of the agentic loop. It is yielded as a `StreamChunk(type="usage")` with a JSON-serialized payload. The `event_generator()` in `chat_api.py` forwards it as an SSE event, spreading the usage fields into the top-level payload alongside `"type": "usage"`.
+
+Payload fields for `usage`:
+- `iteration` — current agentic loop iteration number
+- `input_tokens` — input tokens consumed in the current API call
+- `output_tokens` — output tokens generated in the current API call
+- `total_input_tokens` — cumulative input tokens across all iterations
+- `total_output_tokens` — cumulative output tokens across all iterations
+- `context_window` — total context window size for the model (from `get_context_window()`)
+- `context_percent` — percentage of context window consumed (`total_input_tokens / context_window * 100`)
+
+The frontend uses `usage` events to render a live progress bar showing how much of the model's context window has been consumed during the conversation.
 
 ### Tool execution
 
@@ -451,7 +476,7 @@ pytest --cov=src/genetics_mcp_server  # with coverage
 1. **Shared tool definitions**: Single source of truth in `definitions.py` prevents drift between MCP and LLM service
 2. **Async throughout**: All I/O uses async/await for concurrent tool execution
 3. **Graceful degradation**: External service failures don't crash the server; fallbacks are used where available
-4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. After each agentic loop iteration, a `StreamChunk(type="usage")` is emitted with a JSON payload containing iteration number, current and accumulated token counts, context window size, and context usage percentage. The `event_generator()` in `chat_api.py` forwards this as an SSE event with `{"type": "usage", ...}` (the usage fields are spread into the payload).
+4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `usage`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
 6. **Retry on transient errors**: Anthropic API calls are retried up to 2 times with exponential backoff (1s, 2s) for transient errors (HTTP 500, 502, 503, 529). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. Non-retryable errors (auth, bad request, rate limit) propagate immediately.
 7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow
