@@ -127,9 +127,6 @@ class TestMCPToolRegistration:
         mcp = FastMCP("Test Server")
         executor = ToolExecutor()
 
-        # count tools before registration
-        initial_count = len(mcp._tool_manager._tools) if hasattr(mcp, "_tool_manager") else 0
-
         register_mcp_tools(mcp, executor)
 
         # after registration, tools should be added
@@ -239,3 +236,116 @@ class TestToolDescriptions:
                         f"Required param '{param_name}' in {tool['name']} "
                         "should have description"
                     )
+
+
+class TestBearerAuthMiddleware:
+    """Tests for ASGI bearer auth middleware with query param support."""
+
+    VALID_KEY = "test-secret-key-123"
+    INVALID_KEY = "wrong-key"
+
+    @staticmethod
+    def _make_scope(*, headers=None, query_string=b"", scope_type="http"):
+        """Build a minimal ASGI scope for testing."""
+        scope = {
+            "type": scope_type,
+            "headers": headers or [],
+            "query_string": query_string,
+            "client": ("127.0.0.1", 12345),
+        }
+        return scope
+
+    @staticmethod
+    def _bearer_header(token: str) -> list[tuple[bytes, bytes]]:
+        return [(b"authorization", f"Bearer {token}".encode())]
+
+    @pytest.fixture()
+    def wrapped_app(self, monkeypatch):
+        """Create an auth-wrapped ASGI app that records whether the inner app was called."""
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        # bypass _validate_user_token so only static keys matter
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
+        )
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        app = _wrap_with_bearer_auth(inner_app, [self.VALID_KEY])
+        return app, call_log
+
+    @staticmethod
+    async def _collect_response(app, scope):
+        """Invoke the ASGI app and collect sent response messages."""
+        messages: list[dict] = []
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_query_param_token_accepted(self, wrapped_app):
+        """Valid token via ?token= query param should reach the inner app."""
+        app, call_log = wrapped_app
+        scope = self._make_scope(query_string=f"token={self.VALID_KEY}".encode())
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 1, "Inner app should have been called"
+        # no 401 response messages expected
+        assert not messages
+
+    @pytest.mark.asyncio
+    async def test_bearer_header_accepted(self, wrapped_app):
+        """Valid Bearer header should reach the inner app."""
+        app, call_log = wrapped_app
+        scope = self._make_scope(headers=self._bearer_header(self.VALID_KEY))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 1, "Inner app should have been called"
+        assert not messages
+
+    @pytest.mark.asyncio
+    async def test_header_takes_precedence_over_query_param(self, wrapped_app):
+        """Invalid Bearer header should reject even if valid query param exists."""
+        app, call_log = wrapped_app
+        scope = self._make_scope(
+            headers=self._bearer_header(self.INVALID_KEY),
+            query_string=f"token={self.VALID_KEY}".encode(),
+        )
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_invalid_query_param_rejected(self, wrapped_app):
+        """Invalid token via ?token= should return 401."""
+        app, call_log = wrapped_app
+        scope = self._make_scope(query_string=f"token={self.INVALID_KEY}".encode())
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_missing_both_header_and_query_param(self, wrapped_app):
+        """No auth credentials at all should return 401."""
+        app, call_log = wrapped_app
+        scope = self._make_scope()
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
