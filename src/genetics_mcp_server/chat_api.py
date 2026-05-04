@@ -312,6 +312,11 @@ async def stream_chat(
                             "image_alt": chunk.image_alt or "Generated image",
                         }),
                     }
+                elif chunk.type == "usage":
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({"type": "usage", **json.loads(chunk.content)}),
+                    }
                 elif chunk.type == "done":
                     yield {
                         "event": "message",

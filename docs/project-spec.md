@@ -451,7 +451,7 @@ pytest --cov=src/genetics_mcp_server  # with coverage
 1. **Shared tool definitions**: Single source of truth in `definitions.py` prevents drift between MCP and LLM service
 2. **Async throughout**: All I/O uses async/await for concurrent tool execution
 3. **Graceful degradation**: External service failures don't crash the server; fallbacks are used where available
-4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. After each agentic loop iteration, a `StreamChunk(type="usage")` is emitted with a JSON payload containing iteration number, current and accumulated token counts, context window size, and context usage percentage.
+4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. After each agentic loop iteration, a `StreamChunk(type="usage")` is emitted with a JSON payload containing iteration number, current and accumulated token counts, context window size, and context usage percentage. The `event_generator()` in `chat_api.py` forwards this as an SSE event with `{"type": "usage", ...}` (the usage fields are spread into the payload).
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
 6. **Retry on transient errors**: Anthropic API calls are retried up to 2 times with exponential backoff (1s, 2s) for transient errors (HTTP 500, 502, 503, 529). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. Non-retryable errors (auth, bad request, rate limit) propagate immediately.
 7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow
