@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from genetics_mcp_server.chat_api import app
 from genetics_mcp_server.auth import auth_required
+from genetics_mcp_server.chat_api import app
 from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
 from genetics_mcp_server.db.singleton import Singleton
 

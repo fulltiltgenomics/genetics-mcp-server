@@ -1,11 +1,10 @@
 """Unit tests for phenotype categorization."""
 
-import pytest
 
 from genetics_mcp_server.tools.phewas_categories import (
+    CATEGORY_COLORS,
     categorize_phenotype,
     get_category_color,
-    CATEGORY_COLORS,
 )
 
 

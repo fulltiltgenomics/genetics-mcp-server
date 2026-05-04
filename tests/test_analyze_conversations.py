@@ -2,8 +2,6 @@
 
 import json
 import sqlite3
-import tempfile
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import polars as pl
@@ -25,7 +23,6 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     load_data,
     parse_tool_calls,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

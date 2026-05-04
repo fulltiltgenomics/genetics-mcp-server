@@ -1,6 +1,5 @@
 """Unit tests for database layer."""
 
-import pytest
 
 
 class TestChatHistoryDB:

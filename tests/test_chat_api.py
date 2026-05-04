@@ -1,6 +1,5 @@
 """Integration tests for chat API endpoints."""
 
-import json
 from unittest.mock import patch
 
 
