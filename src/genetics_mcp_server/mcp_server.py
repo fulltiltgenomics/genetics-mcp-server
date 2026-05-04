@@ -137,25 +137,38 @@ def _validate_user_token(token: str) -> bool:
 def _wrap_with_bearer_auth(app, api_keys: list[str]):
     """Wrap an ASGI app with bearer token authentication middleware."""
     import hmac
+    from urllib.parse import parse_qs
+
+    def _token_is_valid(token: str) -> bool:
+        if any(hmac.compare_digest(token, key) for key in api_keys):
+            return True
+        return _validate_user_token(token)
 
     async def auth_middleware(scope, receive, send):
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization", b"").decode()
 
-            if not auth_header.startswith("Bearer "):
-                if scope["type"] == "http":
-                    await _send_401(send)
-                    return
-            else:
+            if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
-                # check static keys first
-                if not any(hmac.compare_digest(token, key) for key in api_keys):
-                    # fall back to per-user tokens
-                    if not _validate_user_token(token):
-                        if scope["type"] == "http":
-                            await _send_401(send)
-                            return
+                if not _token_is_valid(token):
+                    if scope["type"] == "http":
+                        await _send_401(send)
+                        return
+            else:
+                # fall back to query string ?token= parameter
+                query_string = scope.get("query_string", b"").decode()
+                params = parse_qs(query_string)
+                token_values = params.get("token", [])
+                token = token_values[0] if token_values else None
+
+                if token and _token_is_valid(token):
+                    logger.warning("Authentication via query parameter token (client: %s)",
+                                   scope.get("client", ("unknown",))[0])
+                else:
+                    if scope["type"] == "http":
+                        await _send_401(send)
+                        return
 
         await app(scope, receive, send)
 
