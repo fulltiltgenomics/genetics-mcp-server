@@ -1,6 +1,9 @@
 """Integration tests for chat API endpoints."""
 
+import json
 from unittest.mock import patch
+
+from genetics_mcp_server.llm_service import StreamChunk
 
 
 class TestStatusEndpoint:
@@ -168,6 +171,71 @@ class TestChatEndpoint:
 
         # should either reject the provider or fall back
         assert response.status_code in [200, 400, 422]
+
+    def test_chat_stream_emits_usage_event(self, test_client):
+        """Test that a usage StreamChunk is emitted as an SSE event with usage data."""
+        usage_payload = {
+            "iteration": 1,
+            "input_tokens": 1500,
+            "output_tokens": 200,
+            "total_input_tokens": 1500,
+            "total_output_tokens": 200,
+            "context_window": 200000,
+            "context_percent": 0.8,
+        }
+
+        async def mock_stream(**kwargs):
+            yield StreamChunk(type="usage", content=json.dumps(usage_payload))
+            yield StreamChunk(
+                type="done",
+                content="",
+                message_content=[{"type": "text", "text": "Hello!"}],
+            )
+
+        with patch(
+            "genetics_mcp_server.chat_api.get_llm_service"
+        ) as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                },
+            )
+
+        assert response.status_code == 200
+        content_type = response.headers.get("content-type", "")
+        assert "text/event-stream" in content_type
+
+        # parse SSE events from response body
+        events = []
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                data_str = line[len("data:"):].strip()
+                if data_str:
+                    events.append(json.loads(data_str))
+
+        # find the usage event
+        usage_events = [e for e in events if e.get("type") == "usage"]
+        assert len(usage_events) == 1
+        usage_event = usage_events[0]
+        assert usage_event["iteration"] == 1
+        assert usage_event["input_tokens"] == 1500
+        assert usage_event["output_tokens"] == 200
+        assert usage_event["total_input_tokens"] == 1500
+        assert usage_event["total_output_tokens"] == 200
+        assert usage_event["context_window"] == 200000
+        assert usage_event["context_percent"] == 0.8
+
+        # verify done event also present
+        done_events = [e for e in events if e.get("type") == "done"]
+        assert len(done_events) == 1
 
 
 class TestChatEndpointProviders:
