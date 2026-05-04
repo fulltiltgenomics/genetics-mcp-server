@@ -9,6 +9,22 @@ _PRICING: dict[str, tuple[float, float, float, float]] = {
 }
 
 
+_CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-opus":   200_000,
+    "claude-sonnet": 200_000,
+    "claude-haiku":  200_000,
+}
+
+
+def get_context_window(model: str) -> int:
+    """Return context window size (tokens) for the given model."""
+    for prefix, window in _CONTEXT_WINDOWS.items():
+        if prefix in model:
+            return window
+    # fallback to 200k
+    return 200_000
+
+
 def _match_pricing(model: str) -> tuple[float, float, float, float]:
     """Find pricing by matching model name prefix."""
     for prefix, pricing in _PRICING.items():

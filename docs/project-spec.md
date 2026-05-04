@@ -23,6 +23,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
+- **Context window tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens)
 - **Chat history persistence**: SQLite-based storage of conversation threads
 - **Configurable prompts**: Per-user LLM configuration stored in database
 
@@ -425,6 +426,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_downloads.py` | Download store, TSV conversion, download endpoint |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
+| `test_cost.py` | Cost estimation and context window lookup |
 
 Run tests:
 ```bash
