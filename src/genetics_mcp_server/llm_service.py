@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 from genetics_mcp_server.config import get_settings
-from genetics_mcp_server.cost import estimate_cost
+from genetics_mcp_server.cost import estimate_cost, get_context_window
 from genetics_mcp_server.download_store import get_download_store
 from genetics_mcp_server.mcp_proxy import (
     execute_external_tool,
@@ -88,7 +88,7 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "done", "image"
+    type: str  # "text", "done", "image", "usage"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -448,6 +448,20 @@ class LLMService:
                     f"input_tokens={input_tok} output_tokens={output_tok} "
                     f"cache_read={cache_read} cache_create={cache_create} "
                     f"cost=${iter_cost:.4f}"
+                )
+
+                context_window = get_context_window(model)
+                yield StreamChunk(
+                    type="usage",
+                    content=json.dumps({
+                        "iteration": iteration,
+                        "input_tokens": input_tok,
+                        "output_tokens": output_tok,
+                        "total_input_tokens": total_input_tokens,
+                        "total_output_tokens": total_output_tokens,
+                        "context_window": context_window,
+                        "context_percent": round(input_tok / context_window * 100, 1),
+                    }),
                 )
 
                 # add this iteration's content blocks
