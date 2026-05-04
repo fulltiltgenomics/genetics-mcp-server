@@ -332,6 +332,8 @@ All configuration is via environment variables (`.env` file supported):
 | `REQUIRE_AUTH` | Require `X-Goog-Authenticated-User-Email` header (`true`/`false`) |
 | `MCP_API_KEY` | Comma-separated bearer tokens for MCP server SSE/HTTP transport auth |
 
+Tokens can be supplied either as an `Authorization: Bearer XXX` header or as a `?token=XXX` query parameter. The query parameter is useful for clients that don't support custom headers (e.g., claude.ai). When both are present, the Bearer header takes precedence.
+
 Per-user API tokens are also supported: users create tokens via the chat API (`POST /chat/v1/tokens`), which are validated alongside `MCP_API_KEY` in the MCP server's bearer auth middleware. Tokens are stored as SHA-256 hashes in the LLM config SQLite DB.
 
 ### Admin page
