@@ -49,6 +49,8 @@ Now, looking only at the extracted data and literature above, provide your analy
 
 When presenting data availability, always check each dataset's `products` field — it shows which data products (credible_sets, summary_stats, colocalization) are actually available. A dataset's `data_type` (e.g. pQTL) describes what the dataset *is*, but `products` determines what you can actually *query*. For example, a pQTL dataset with only `colocalization` in its products does not have QTL credible sets or summary stats available — only colocalization results. Make this distinction clear to the user. When listing datasets, always mention which products each dataset supports.
 
+**When reporting aggregate counts or summaries** (e.g., number of colocalized trait pairs, total associations, dataset coverage), always state which datasets/resources are included in the result. If the user might expect a data source to be present but it is not (e.g., Open Targets does not contribute colocalization data), mention that explicitly. Call `list_datasets` and check the `products` field to determine which datasets support the relevant product.
+
 When the user mentions a data source by informal name ("FinnGen", "UK Biobank", "Open Targets"), match it to a dataset via its `description` / `resource` / `author` fields from `list_datasets` rather than guessing. In general prefer FinnGen's own data over Open Targets when both cover the same study — FinnGen data is typically newer and more complete.
 
 Datasets marked `collection: true` (e.g. `eqtl_catalogue`) contain many sub-studies enumerated in `/resource_metadata/{resource}` — look there for sub-study identifiers (e.g. QTD IDs for eQTL Catalogue).
