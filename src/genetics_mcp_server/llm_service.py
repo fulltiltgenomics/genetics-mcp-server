@@ -450,17 +450,19 @@ class LLMService:
                     f"cost=${iter_cost:.4f}"
                 )
 
+                # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
+                context_tokens = input_tok + cache_read + cache_create
                 context_window = get_context_window(model)
                 yield StreamChunk(
                     type="usage",
                     content=json.dumps({
                         "iteration": iteration,
-                        "input_tokens": input_tok,
+                        "input_tokens": context_tokens,
                         "output_tokens": output_tok,
                         "total_input_tokens": total_input_tokens,
                         "total_output_tokens": total_output_tokens,
                         "context_window": context_window,
-                        "context_percent": round(input_tok / context_window * 100, 1),
+                        "context_percent": round(context_tokens / context_window * 100, 1),
                     }),
                 )
 
