@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from genetics_mcp_server.auth import admin_required
-from genetics_mcp_server.db import get_chat_history_db
+from genetics_mcp_server.db import get_chat_history_db, get_llm_config_db
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,23 @@ class UsageDataPoint(BaseModel):
 class UsageAnalyticsResponse(BaseModel):
     period: str
     data: list[UsageDataPoint]
+
+
+class FeedbackItem(BaseModel):
+    user: str
+    comment: str
+    preview: str
+    created_at: str
+    source: str
+    session_id: Optional[str] = None
+
+
+class FeedbackListResponse(BaseModel):
+    items: list[FeedbackItem]
+    total: int
+    latest_at: Optional[str] = None
+    limit: int
+    offset: int
 
 
 # --- Endpoints ---
@@ -170,4 +187,50 @@ async def get_usage_analytics(
     return UsageAnalyticsResponse(
         period=period,
         data=[UsageDataPoint(**d) for d in data],
+    )
+
+
+@router.get("/admin/feedback", response_model=FeedbackListResponse)
+async def list_feedback(
+    limit: int = 50,
+    offset: int = 0,
+    admin_user: str = Depends(admin_required),
+):
+    """List all user feedback from both feedback dialogs and session comments."""
+    # collect feedback from both sources
+    items: list[FeedbackItem] = []
+
+    for uc in get_llm_config_db().list_all_user_comments():
+        items.append(FeedbackItem(
+            user=uc.user_id,
+            comment=uc.comment,
+            preview=uc.comment[:100],
+            created_at=uc.created_at.isoformat(),
+            source="feedback_dialog",
+        ))
+
+    for sc in get_chat_history_db().list_sessions_with_comments():
+        comment = sc["comment"]
+        items.append(FeedbackItem(
+            user=sc["user_id"],
+            comment=comment,
+            preview=comment[:100],
+            created_at=sc["created_at"].isoformat(),
+            source="session_comment",
+            session_id=sc["session_id"],
+        ))
+
+    # sort by created_at descending
+    items.sort(key=lambda x: x.created_at, reverse=True)
+
+    total = len(items)
+    latest_at = items[0].created_at if items else None
+    page = items[offset:offset + limit]
+
+    return FeedbackListResponse(
+        items=page,
+        total=total,
+        latest_at=latest_at,
+        limit=limit,
+        offset=offset,
     )
