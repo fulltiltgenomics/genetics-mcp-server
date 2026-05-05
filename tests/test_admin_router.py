@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import time
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from genetics_mcp_server.auth import admin_required, auth_required
 from genetics_mcp_server.chat_api import app
 from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+from genetics_mcp_server.db.llm_config_db import LLMConfigDB
 from genetics_mcp_server.db.singleton import Singleton
 
 
@@ -228,3 +230,193 @@ class TestAdminDBMethods:
         for period in ("week", "month", "year"):
             data = seeded_db.get_usage_analytics(period)
             assert isinstance(data, list)
+
+    def test_list_all_user_comments(self):
+        """list_all_user_comments returns all comments ordered by created_at DESC."""
+        if LLMConfigDB in Singleton._instances:
+            del Singleton._instances[LLMConfigDB]
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+
+        try:
+            config_db = LLMConfigDB(db_path)
+            # insert with explicit timestamps for deterministic ordering
+            cursor = config_db._conn.cursor()
+            cursor.execute(
+                "INSERT INTO user_comments (user_id, comment, created_at) VALUES (?, ?, ?)",
+                ("alice@example.com", "first comment", "2025-01-01T10:00:00"),
+            )
+            cursor.execute(
+                "INSERT INTO user_comments (user_id, comment, created_at) VALUES (?, ?, ?)",
+                ("bob@example.com", "second comment", "2025-01-01T11:00:00"),
+            )
+            cursor.execute(
+                "INSERT INTO user_comments (user_id, comment, created_at) VALUES (?, ?, ?)",
+                ("alice@example.com", "third comment", "2025-01-01T12:00:00"),
+            )
+            config_db._conn.commit()
+
+            results = config_db.list_all_user_comments()
+            assert len(results) == 3
+            assert results[0].comment == "third comment"
+            assert results[1].comment == "second comment"
+            assert results[2].comment == "first comment"
+            # verify multiple users are present
+            users = {r.user_id for r in results}
+            assert users == {"alice@example.com", "bob@example.com"}
+        finally:
+            if LLMConfigDB in Singleton._instances:
+                del Singleton._instances[LLMConfigDB]
+            os.unlink(db_path)
+
+    def test_list_sessions_with_comments(self, test_db):
+        """list_sessions_with_comments returns only sessions with non-empty comments."""
+        # session with a comment
+        s1 = test_db.create_session("alice@example.com")
+        test_db.update_session(s1.id, "alice@example.com", comment="great session")
+
+        # session without a comment
+        s2 = test_db.create_session("bob@example.com")
+        test_db.add_message(s2.id, "msg-1", "user", "hi")
+
+        # another session with a comment
+        s3 = test_db.create_session("carol@example.com")
+        test_db.update_session(s3.id, "carol@example.com", comment="needs improvement")
+
+        results = test_db.list_sessions_with_comments()
+        assert len(results) == 2
+        session_ids = {r["session_id"] for r in results}
+        assert s1.id in session_ids
+        assert s3.id in session_ids
+        assert s2.id not in session_ids
+        # verify returned fields
+        for r in results:
+            assert "user_id" in r
+            assert "comment" in r
+            assert "created_at" in r
+            assert "session_id" in r
+
+
+class TestAdminFeedbackEndpoint:
+
+    @pytest.fixture
+    def feedback_client(self, test_db):
+        """Client with both chat_history_db and llm_config_db mocked for feedback tests."""
+        from genetics_mcp_server.config.settings import get_settings
+
+        if LLMConfigDB in Singleton._instances:
+            del Singleton._instances[LLMConfigDB]
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            config_db_path = f.name
+
+        config_db = LLMConfigDB(config_db_path)
+
+        async def mock_admin():
+            return "admin@example.com"
+
+        app.dependency_overrides[admin_required] = mock_admin
+
+        with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
+            get_settings.cache_clear()
+            with (
+                patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db),
+                patch("genetics_mcp_server.routers.admin.get_llm_config_db", return_value=config_db),
+            ):
+                with TestClient(app) as client:
+                    yield client, test_db, config_db
+            get_settings.cache_clear()
+
+        app.dependency_overrides.clear()
+        if LLMConfigDB in Singleton._instances:
+            del Singleton._instances[LLMConfigDB]
+        os.unlink(config_db_path)
+
+    def test_list_feedback_empty(self, feedback_client):
+        client, _, _ = feedback_client
+        response = client.get("/chat/v1/admin/feedback")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"] == []
+        assert data["total"] == 0
+        assert data["latest_at"] is None
+
+    def test_list_feedback_combined(self, feedback_client):
+        """Feedback from both user_comments and session comments are merged and sorted."""
+        client, chat_db, config_db = feedback_client
+
+        # add feedback dialog comments
+        config_db.add_user_comment("alice@example.com", "feedback dialog comment 1")
+        time.sleep(0.05)
+
+        # add session with comment
+        s = chat_db.create_session("bob@example.com")
+        chat_db.update_session(s.id, "bob@example.com", comment="session comment")
+        time.sleep(0.05)
+
+        config_db.add_user_comment("carol@example.com", "feedback dialog comment 2")
+
+        response = client.get("/chat/v1/admin/feedback")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["total"] == 3
+        assert len(data["items"]) == 3
+        assert data["latest_at"] is not None
+
+        # verify sorted by created_at DESC — latest first
+        timestamps = [item["created_at"] for item in data["items"]]
+        assert timestamps == sorted(timestamps, reverse=True)
+
+        # verify source fields
+        sources = {item["source"] for item in data["items"]}
+        assert sources == {"feedback_dialog", "session_comment"}
+
+        # session_comment item should have session_id
+        session_items = [i for i in data["items"] if i["source"] == "session_comment"]
+        assert len(session_items) == 1
+        assert session_items[0]["session_id"] == s.id
+        assert session_items[0]["user"] == "bob@example.com"
+
+        # feedback_dialog items should have no session_id
+        dialog_items = [i for i in data["items"] if i["source"] == "feedback_dialog"]
+        assert all(i["session_id"] is None for i in dialog_items)
+
+    def test_list_feedback_pagination(self, feedback_client):
+        """Pagination limit/offset work on the merged feed."""
+        client, chat_db, config_db = feedback_client
+
+        # seed 5 items total
+        for i in range(3):
+            config_db.add_user_comment(f"user{i}@example.com", f"dialog comment {i}")
+            time.sleep(0.02)
+
+        for i in range(2):
+            s = chat_db.create_session(f"sess_user{i}@example.com")
+            chat_db.update_session(s.id, f"sess_user{i}@example.com", comment=f"session comment {i}")
+            time.sleep(0.02)
+
+        # full list
+        resp_all = client.get("/chat/v1/admin/feedback?limit=50&offset=0")
+        assert resp_all.json()["total"] == 5
+
+        # first page
+        resp_p1 = client.get("/chat/v1/admin/feedback?limit=2&offset=0")
+        data_p1 = resp_p1.json()
+        assert len(data_p1["items"]) == 2
+        assert data_p1["total"] == 5
+
+        # second page
+        resp_p2 = client.get("/chat/v1/admin/feedback?limit=2&offset=2")
+        data_p2 = resp_p2.json()
+        assert len(data_p2["items"]) == 2
+
+        # third page (last item)
+        resp_p3 = client.get("/chat/v1/admin/feedback?limit=2&offset=4")
+        data_p3 = resp_p3.json()
+        assert len(data_p3["items"]) == 1
+
+        # no overlap between pages
+        all_comments = [i["comment"] for i in data_p1["items"] + data_p2["items"] + data_p3["items"]]
+        assert len(all_comments) == len(set(all_comments))
