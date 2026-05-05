@@ -509,6 +509,31 @@ class ChatHistoryDB(object, metaclass=Singleton):
             for row in cursor.fetchall()
         ]
 
+    def list_sessions_with_comments(self) -> list[dict]:
+        """List sessions with non-empty comments, ordered by created_at DESC.
+
+        Returns dicts with user_id, comment, created_at, session_id for use
+        in the unified admin feedback feed.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT user_id, comment, created_at, id as session_id
+            FROM chat_sessions
+            WHERE comment IS NOT NULL AND comment != ''
+            ORDER BY created_at DESC
+            """
+        )
+        return [
+            {
+                "user_id": row["user_id"],
+                "comment": row["comment"],
+                "created_at": datetime.fromisoformat(row["created_at"]),
+                "session_id": row["session_id"],
+            }
+            for row in cursor.fetchall()
+        ]
+
     def _row_to_attachment(self, row: sqlite3.Row) -> ChatAttachment:
         return ChatAttachment(
             id=row["id"],

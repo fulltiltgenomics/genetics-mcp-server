@@ -387,6 +387,26 @@ class LLMConfigDB(object, metaclass=Singleton):
             for row in cursor.fetchall()
         ]
 
+    def list_all_user_comments(self) -> list[UserComment]:
+        """List all user comments across all users, ordered by created_at DESC."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, comment, created_at
+            FROM user_comments
+            ORDER BY created_at DESC
+            """
+        )
+        return [
+            UserComment(
+                id=row["id"],
+                user_id=row["user_id"],
+                comment=row["comment"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
     def add_user_comment(self, user_id: str, comment: str) -> UserComment:
         """Add a new comment for a user."""
         cursor = self._conn.cursor()
