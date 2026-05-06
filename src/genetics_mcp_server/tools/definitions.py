@@ -663,8 +663,13 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
     {
         "name": "get_bigquery_schema",
         "category": "bigquery",
-        "description": "Get schema for ALL available BigQuery tables and views. **Always call this before query_bigquery** to discover what data is available — the database contains tables for credible sets, colocalization, exome/burden test results, and more. Returns column names, types, and descriptions for each table.",
-        "parameters": {},
+        "description": "Get schema for BigQuery tables. **Always call this before query_bigquery** to discover available data. Returns resource descriptions with aliases, table/column metadata with allowed filter values, and example SQL queries. Optionally pass a table name to get schema for just that table.",
+        "parameters": {
+            "table": {
+                "type": "string",
+                "description": "Optional: return schema for just this table (e.g. 'gene_burden_results_v'). Omit for all tables. Available: credible_sets_v, colocalization_v, coloc_credsets_v, exome_variant_results_v, gene_burden_results_v",
+            },
+        },
     },
 ]
 
@@ -1057,6 +1062,6 @@ def register_mcp_tools(
         return await executor.query_bigquery(sql, max_rows, dry_run)
 
     @mcp.tool()
-    async def get_bigquery_schema() -> dict:
-        """Get schema for ALL available BigQuery tables. Always call this before writing queries."""
-        return await executor.get_bigquery_schema()
+    async def get_bigquery_schema(table: str | None = None) -> dict:
+        """Get schema for BigQuery tables. Always call this before writing queries. Pass a table name to get just that table's schema."""
+        return await executor.get_bigquery_schema(table)

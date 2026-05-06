@@ -166,7 +166,7 @@ class ToolExecutor:
             logger.error(f"Error in query_bigquery: {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
-    async def get_bigquery_schema(self) -> dict[str, Any]:
+    async def get_bigquery_schema(self, table: str | None = None) -> dict[str, Any]:
         """Get schema information for the BigQuery tables."""
         if not self.bigquery_url:
             return {
@@ -175,7 +175,10 @@ class ToolExecutor:
             }
 
         try:
-            resp = await self.client.get(f"{self.bigquery_url}/schema")
+            params = {}
+            if table:
+                params["table"] = table
+            resp = await self.client.get(f"{self.bigquery_url}/schema", params=params)
             if resp.status_code == 200:
                 return {"success": True, "schema": resp.json()}
             return {

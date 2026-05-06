@@ -100,9 +100,9 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | Tool | Description |
 |------|-------------|
 | `query_bigquery` | Execute custom SQL against genetics views (fallback for queries specialized tools cannot handle) |
-| `get_bigquery_schema` | Get schema for BigQuery views before writing queries |
+| `get_bigquery_schema` | Get schema for BigQuery views before writing queries. Accepts optional `table` parameter to get just one table's schema. Returns resource metadata with aliases, column descriptions, allowed filter values, and example SQL queries |
 
-BigQuery contains multiple tables beyond just credible sets — including exome/burden test results, colocalization, and more. The `get_bigquery_schema` tool discovers all available tables. Views include a derived `resource` column that maps dataset names to resource identifiers (e.g., `FinnGen_R13` → `finngen`, `UKB_PPP` → `ukbb`, `Open_Targets_25.12` → `open_targets`). This allows filtering by `WHERE resource = 'finngen'` instead of matching dataset names directly.
+BigQuery contains multiple tables beyond just credible sets — including exome/burden test results, colocalization, and more. The `get_bigquery_schema` tool discovers all available tables. Views include a derived `resource` column that maps dataset names to resource identifiers (e.g., `FinnGen_R13` → `finngen`, `UKB_PPP` → `ukbb`, `Open_Targets_25.12` → `open_targets`). This allows filtering by `WHERE resource = 'finngen'` instead of matching dataset names directly. The schema response includes resource metadata with human-readable labels and aliases to help agents map user intent to correct filter values (e.g., "bipex" → `resource = 'bipex2'`). Collection resources like eQTL Catalogue are collapsed into summaries rather than listing hundreds of individual IDs.
 
 ### External search tools
 
