@@ -77,7 +77,9 @@ api_url = os.environ.get("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 executor = ToolExecutor(api_base_url=api_url)
 
 _settings = get_settings()
-register_mcp_tools(mcp, executor, disabled_tools=_settings.disabled_tools)
+# literature search is only available via the chat backend (uses Perplexity API)
+_mcp_disabled = _settings.disabled_tools | {"search_scientific_literature"}
+register_mcp_tools(mcp, executor, disabled_tools=_mcp_disabled)
 
 logger.info(f"Registered MCP tools. API URL: {api_url}")
 

@@ -961,18 +961,20 @@ def register_mcp_tools(
             chr, start, end, gene_type, gencode_version
         )
 
-    @mcp.tool()
-    async def search_scientific_literature(
-        query: str,
-        max_results: int = 10,
-        include_preprints: bool = True,
-        date_range: str | None = None,
-        backend: str | None = None,
-    ) -> dict:
-        """Search scientific literature via Europe PMC or Perplexity."""
-        return await executor.search_scientific_literature(
-            query, max_results, include_preprints, date_range, backend
-        )
+    if "search_scientific_literature" not in _disabled:
+
+        @mcp.tool()
+        async def search_scientific_literature(
+            query: str,
+            max_results: int = 10,
+            include_preprints: bool = True,
+            date_range: str | None = None,
+            backend: str | None = None,
+        ) -> dict:
+            """Search scientific literature via Europe PMC or Perplexity."""
+            return await executor.search_scientific_literature(
+                query, max_results, include_preprints, date_range, backend
+            )
 
     @mcp.tool()
     async def web_search(
