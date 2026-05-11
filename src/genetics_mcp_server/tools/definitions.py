@@ -976,17 +976,19 @@ def register_mcp_tools(
                 query, max_results, include_preprints, date_range, backend
             )
 
-    @mcp.tool()
-    async def web_search(
-        query: str,
-        max_results: int = 5,
-        include_domains: list[str] | None = None,
-        exclude_domains: list[str] | None = None,
-    ) -> dict:
-        """Search the web for general information."""
-        return await executor.web_search(
-            query, max_results, include_domains, exclude_domains
-        )
+    if "web_search" not in _disabled:
+
+        @mcp.tool()
+        async def web_search(
+            query: str,
+            max_results: int = 5,
+            include_domains: list[str] | None = None,
+            exclude_domains: list[str] | None = None,
+        ) -> dict:
+            """Search the web for general information."""
+            return await executor.web_search(
+                query, max_results, include_domains, exclude_domains
+            )
 
     @mcp.tool()
     async def create_phewas_plot(
