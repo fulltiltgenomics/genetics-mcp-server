@@ -92,7 +92,7 @@ class StreamableHttpClient:
         payload = self._jsonrpc_request(
             "initialize",
             {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {"name": "mcp-client", "version": "1.0.0"},
             },
