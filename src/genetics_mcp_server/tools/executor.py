@@ -552,8 +552,42 @@ class ToolExecutor:
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
+    async def get_exome_results_by_phenotype(
+        self, resource: str, phenotype: str
+    ) -> dict[str, Any]:
+        """Get individual variant exome results for a specific phenotype."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/v1/exome_results_by_phenotype/{resource}/{phenotype}",
+                params={"format": "json"},
+                timeout=60.0,
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                return {
+                    "success": True,
+                    "resource": resource,
+                    "phenotype": phenotype,
+                    "count": len(results),
+                    "results": results,
+                    "_download_url": self._build_download_url(
+                        f"/v1/exome_results_by_phenotype/{resource}/{phenotype}"
+                    ),
+                }
+            if resp.status_code == 404:
+                return {
+                    "success": False,
+                    "error": f"Not found: phenotype '{phenotype}' in resource '{resource}'",
+                }
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in get_exome_results_by_phenotype({resource}, {phenotype}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
     async def get_gene_based_results(self, gene: str) -> dict[str, Any]:
-        """Get gene-level burden test results (genebass, SCHEMA)."""
+        """Get gene-level burden test results (genebass, IBD, BipEx2, SCHEMA)."""
         import csv
         import io
 

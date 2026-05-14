@@ -214,15 +214,32 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_exome_results_by_gene",
         "category": "api",
-        "description": "Get rare variant burden test results for a gene. Returns gene-level association statistics from exome sequencing across available resources (FinnGen, UKBB/Genebass, etc.). Use this for single-gene burden queries. For batch queries across many genes, use BigQuery instead (call get_bigquery_schema to find the exome results table).",
+        "description": "Get rare variant burden test results for a gene. Returns individual variant-level association statistics from exome sequencing across available resources (genebass/UKBB filtered to p<1e-4, IBD exome containing only exome-wide significant variants). Use this for single-gene queries. For batch queries across many genes, use BigQuery instead (call get_bigquery_schema to find the exome results table). For full individual-trait results, use get_exome_results_by_phenotype.",
         "parameters": {
             "gene": {"type": "string", "description": "Gene symbol or comma-separated list of gene symbols", "required": True},
         },
     },
     {
+        "name": "get_exome_results_by_phenotype",
+        "category": "api",
+        "description": "Get individual variant exome results for a specific phenotype within an exome dataset. Returns the full set of variant-level results for one trait from a given resource (e.g. genebass, ibd_exome_2026). Use this when you need all exome variants for a particular phenotype rather than a gene-centric view.",
+        "parameters": {
+            "resource": {
+                "type": "string",
+                "description": "Exome data resource (e.g. 'genebass', 'ibd_exome_2026')",
+                "required": True,
+            },
+            "phenotype": {
+                "type": "string",
+                "description": "Phenotype or study code (e.g. 'categorical_41210_both_sexes_S068_', 'IBD')",
+                "required": True,
+            },
+        },
+    },
+    {
         "name": "get_gene_based_results",
         "category": "api",
-        "description": "Get gene-level burden test results from genebass and SCHEMA datasets. Returns gene-based association statistics aggregated at the gene level. Different from get_exome_results_by_gene which returns individual variant-level exome results.",
+        "description": "Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA datasets. Returns gene-based association statistics aggregated at the gene level. Different from get_exome_results_by_gene which returns individual variant-level exome results.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -896,8 +913,13 @@ def register_mcp_tools(
         return await executor.get_exome_results_by_gene(gene)
 
     @mcp.tool()
+    async def get_exome_results_by_phenotype(resource: str, phenotype: str) -> dict:
+        """Get individual variant exome results for a specific phenotype within an exome dataset."""
+        return await executor.get_exome_results_by_phenotype(resource, phenotype)
+
+    @mcp.tool()
     async def get_gene_based_results(gene: str) -> dict:
-        """Get gene-level burden test results from genebass and SCHEMA."""
+        """Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA."""
         return await executor.get_gene_based_results(gene)
 
     if "get_phenotype_report" not in _disabled:
