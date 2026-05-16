@@ -272,6 +272,42 @@ class ChatHistoryDB(object, metaclass=Singleton):
         self._conn.commit()
         return cursor.rowcount > 0
 
+    def set_shared(self, session_id: str, user_id: str, shared: bool) -> bool:
+        """Set the shared flag on a session. Returns False if user doesn't own it."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "UPDATE chat_sessions SET shared = ? WHERE id = ? AND user_id = ?",
+            (shared, session_id, user_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def get_session_for_access(
+        self, session_id: str, user_id: str
+    ) -> tuple[ChatSession, bool] | None:
+        """Get a session if user owns it or it is shared.
+
+        Returns (session, is_owner) or None if not accessible.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
+            FROM chat_sessions
+            WHERE id = ?
+            """,
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        session = self._row_to_session(row)
+        if session.user_id == user_id:
+            return (session, True)
+        if session.shared:
+            return (session, False)
+        return None
+
     def add_message(
         self,
         session_id: str,
@@ -492,6 +528,65 @@ class ChatHistoryDB(object, metaclass=Singleton):
         if row is None:
             return None
         return self._row_to_session(row)
+
+    def fork_session(self, source_session_id: str, target_user_id: str) -> ChatSession | None:
+        """Fork a shared session for another user.
+
+        Copies the session and all messages with new UUIDs.
+        Does NOT copy attachments.
+        Returns the new ChatSession, or None if source is not shared/not found.
+        """
+        source = self.get_session_any_user(source_session_id)
+        if source is None or not source.shared:
+            return None
+
+        title = f"Fork of: {source.title or 'Untitled'}"
+        new_session_id = str(uuid.uuid4())
+        now = datetime.now()
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO chat_sessions (id, user_id, title, phenotype_code)
+            VALUES (?, ?, ?, ?)
+            """,
+            (new_session_id, target_user_id, title, source.phenotype_code),
+        )
+
+        # copy messages preserving order
+        cursor.execute(
+            """
+            SELECT role, content, content_json, literature_backend, tool_profile
+            FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY created_at ASC
+            """,
+            (source_session_id,),
+        )
+        for row in cursor.fetchall():
+            new_msg_id = str(uuid.uuid4())
+            cursor.execute(
+                """
+                INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (new_msg_id, new_session_id, row["role"], row["content"],
+                 row["content_json"], row["literature_backend"], row["tool_profile"]),
+            )
+
+        self._conn.commit()
+
+        return ChatSession(
+            id=new_session_id,
+            user_id=target_user_id,
+            title=title,
+            created_at=now,
+            updated_at=now,
+            rating=None,
+            comment=None,
+            phenotype_code=source.phenotype_code,
+            shared=False,
+        )
 
     def get_usage_analytics(self, period: str = "week") -> list[dict]:
         """Get daily unique users and conversation counts for the given period.
