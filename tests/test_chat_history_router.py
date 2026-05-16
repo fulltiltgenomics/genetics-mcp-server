@@ -384,3 +384,190 @@ class TestSessionPreview:
         sessions = response.json()
         assert sessions[0]["title"] == "APOE Discussion"
         assert sessions[0]["preview"] is None
+
+
+class TestShareAndForkEndpoints:
+    """Tests for session sharing and forking endpoints."""
+
+    @pytest.fixture
+    def two_user_clients(self, test_db):
+        """Create two test clients with different authenticated users."""
+        # owner client
+        async def mock_auth_owner():
+            return "owner@example.com"
+
+        app.dependency_overrides[auth_required] = mock_auth_owner
+
+        with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+            with TestClient(app) as owner_client:
+                # create a session with a message as owner
+                create_resp = owner_client.post("/chat/v1/chat/sessions", json={})
+                session_id = create_resp.json()["id"]
+                owner_client.post(
+                    f"/chat/v1/chat/sessions/{session_id}/messages",
+                    json={"id": "msg-1", "role": "user", "content": "Hello from owner"},
+                )
+
+        app.dependency_overrides.clear()
+
+        yield test_db, session_id
+
+    def _make_client(self, test_db, user_email):
+        """Helper to create a test client for a specific user."""
+        async def mock_auth():
+            return user_email
+
+        app.dependency_overrides[auth_required] = mock_auth
+
+        return patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db)
+
+    def test_owner_can_share_session(self, two_user_clients):
+        """Test that the session owner can share a session."""
+        test_db, session_id = two_user_clients
+
+        with self._make_client(test_db, "owner@example.com"):
+            with TestClient(app) as client:
+                response = client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": True},
+                )
+
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.json()["shared"] is True
+
+    def test_non_owner_cannot_share_session(self, two_user_clients):
+        """Test that a non-owner gets 403 when trying to share."""
+        test_db, session_id = two_user_clients
+
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": True},
+                )
+
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 403
+
+    def test_non_owner_can_access_shared_session(self, two_user_clients):
+        """Test that a non-owner can access a shared session via GET."""
+        test_db, session_id = two_user_clients
+
+        # owner shares the session
+        with self._make_client(test_db, "owner@example.com"):
+            with TestClient(app) as client:
+                client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": True},
+                )
+        app.dependency_overrides.clear()
+
+        # non-owner accesses the shared session
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.get(f"/chat/v1/chat/sessions/{session_id}")
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == session_id
+        assert data["is_owner"] is False
+        assert len(data["messages"]) == 1
+
+    def test_non_owner_cannot_access_non_shared_session(self, two_user_clients):
+        """Test that a non-owner gets 404 for a non-shared session."""
+        test_db, session_id = two_user_clients
+
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.get(f"/chat/v1/chat/sessions/{session_id}")
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 404
+
+    def test_fork_shared_session(self, two_user_clients):
+        """Test that an authenticated user can fork a shared session."""
+        test_db, session_id = two_user_clients
+
+        # owner shares the session
+        with self._make_client(test_db, "owner@example.com"):
+            with TestClient(app) as client:
+                client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": True},
+                )
+        app.dependency_overrides.clear()
+
+        # other user forks the session
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.post(f"/chat/v1/chat/sessions/{session_id}/fork")
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "id" in data
+        assert data["id"] != session_id
+
+        # verify the forked session has copied messages
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                get_resp = client.get(f"/chat/v1/chat/sessions/{data['id']}")
+        app.dependency_overrides.clear()
+
+        assert get_resp.status_code == 200
+        forked = get_resp.json()
+        assert forked["is_owner"] is True
+        assert len(forked["messages"]) == 1
+        assert forked["messages"][0]["content"] == "Hello from owner"
+
+    def test_fork_non_shared_session_fails(self, two_user_clients):
+        """Test that forking a non-shared session returns 404."""
+        test_db, session_id = two_user_clients
+
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.post(f"/chat/v1/chat/sessions/{session_id}/fork")
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 404
+
+    def test_unshare_blocks_non_owner_access(self, two_user_clients):
+        """Test that after unsharing, non-owner gets 404."""
+        test_db, session_id = two_user_clients
+
+        # owner shares the session
+        with self._make_client(test_db, "owner@example.com"):
+            with TestClient(app) as client:
+                client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": True},
+                )
+        app.dependency_overrides.clear()
+
+        # verify non-owner can access
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.get(f"/chat/v1/chat/sessions/{session_id}")
+        app.dependency_overrides.clear()
+        assert response.status_code == 200
+
+        # owner unshares the session
+        with self._make_client(test_db, "owner@example.com"):
+            with TestClient(app) as client:
+                client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": False},
+                )
+        app.dependency_overrides.clear()
+
+        # non-owner can no longer access
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.get(f"/chat/v1/chat/sessions/{session_id}")
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 404
