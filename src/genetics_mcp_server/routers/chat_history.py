@@ -80,6 +80,13 @@ class SessionDetailResponse(BaseModel):
     comment: Optional[str] = None
     phenotype_code: Optional[str] = None
     messages: list[MessageResponse]
+    is_owner: Optional[bool] = None
+    shared: Optional[bool] = None
+
+
+class ShareRequest(BaseModel):
+    """Request to toggle session sharing."""
+    shared: bool
 
 
 class MessageSaveRequest(BaseModel):
@@ -222,15 +229,16 @@ async def get_session(
     session_id: str,
     user: str = Depends(auth_required),
 ):
-    """Get a chat session with all its messages."""
+    """Get a chat session with all its messages. Returns session if owned or shared."""
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
     db = get_chat_history_db()
-    session = db.get_session(session_id, user)
-    if session is None:
+    result = db.get_session_for_access(session_id, user)
+    if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    session, is_owner = result
     messages = db.get_messages(session_id)
 
     return SessionDetailResponse(
@@ -241,6 +249,8 @@ async def get_session(
         rating=session.rating,
         comment=session.comment,
         phenotype_code=session.phenotype_code,
+        is_owner=is_owner,
+        shared=session.shared,
         messages=[
             MessageResponse(
                 id=msg.id,
@@ -304,6 +314,57 @@ async def delete_session(
 
     logger.info(f"Chat session {session_id} deleted by {user}")
     return {"deleted": True}
+
+
+@router.put(
+    "/chat/sessions/{session_id}/share",
+    summary="Toggle session sharing",
+)
+async def share_session(
+    session_id: str,
+    request: ShareRequest,
+    user: str = Depends(auth_required),
+):
+    """Toggle the shared flag on a session. Only the owner can share/unshare."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    db = get_chat_history_db()
+    updated = db.set_shared(session_id, user, request.shared)
+    if not updated:
+        # check if session exists but user doesn't own it
+        session = db.get_session_any_user(session_id)
+        if session is not None:
+            raise HTTPException(status_code=403, detail="Not the session owner")
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger.info(f"Session {session_id} shared={request.shared} by {user}")
+    return {"shared": request.shared}
+
+
+@router.post(
+    "/chat/sessions/{session_id}/fork",
+    summary="Fork a shared session",
+    response_model=SessionCreateResponse,
+)
+async def fork_session(
+    session_id: str,
+    user: str = Depends(auth_required),
+):
+    """Fork a shared session for the current user. Creates a copy with all messages."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    db = get_chat_history_db()
+    new_session = db.fork_session(session_id, user)
+    if new_session is None:
+        raise HTTPException(status_code=404, detail="Session not found or not shared")
+
+    logger.info(f"Session {session_id} forked by {user} as {new_session.id}")
+    return SessionCreateResponse(
+        id=new_session.id,
+        created_at=new_session.created_at.isoformat(),
+    )
 
 
 # --- Message Endpoints ---
