@@ -25,6 +25,7 @@ class ChatSession:
     rating: int | None
     comment: str | None
     phenotype_code: str | None
+    shared: bool = False
 
 
 @dataclass
@@ -146,6 +147,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
         if "tool_profile" not in columns:
             cursor.execute("ALTER TABLE chat_messages ADD COLUMN tool_profile TEXT")
 
+        # migrations: add columns to chat_sessions if they don't exist
+        cursor.execute("PRAGMA table_info(chat_sessions)")
+        session_columns = {row[1] for row in cursor.fetchall()}
+        if "shared" not in session_columns:
+            cursor.execute("ALTER TABLE chat_sessions ADD COLUMN shared BOOLEAN DEFAULT 0")
+
         self._conn.commit()
 
     def create_session(
@@ -172,6 +179,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             rating=None,
             comment=None,
             phenotype_code=phenotype_code,
+            shared=False,
         )
 
     def get_session(self, session_id: str, user_id: str) -> ChatSession | None:
@@ -179,7 +187,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
             FROM chat_sessions
             WHERE id = ? AND user_id = ?
             """,
@@ -195,7 +203,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
             FROM chat_sessions
             WHERE user_id = ?
             ORDER BY updated_at DESC
@@ -459,7 +467,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute(
             f"""
             SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
-                   s.rating, s.comment, s.phenotype_code
+                   s.rating, s.comment, s.phenotype_code, s.shared
             FROM chat_sessions s
             {where}
             ORDER BY s.updated_at DESC
@@ -475,7 +483,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
             FROM chat_sessions WHERE id = ?
             """,
             (session_id,),
@@ -556,6 +564,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             rating=row["rating"],
             comment=row["comment"],
             phenotype_code=row["phenotype_code"],
+            shared=bool(row["shared"]) if row["shared"] is not None else False,
         )
 
     def _row_to_message(self, row: sqlite3.Row) -> ChatMessageRecord:
