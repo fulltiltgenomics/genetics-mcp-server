@@ -48,7 +48,9 @@ class Settings:
 
     # LLM defaults
     default_provider: str = "anthropic"
-    default_model: str = "claude-sonnet-4-6"
+    default_model: str = field(
+        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
+    )
     fast_model: str = "claude-haiku-4-5"
     max_tokens: int = 8192
     temperature: float = 0.3
