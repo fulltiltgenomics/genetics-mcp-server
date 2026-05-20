@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from genetics_mcp_server.config import get_settings
+from genetics_mcp_server.config import get_settings, model_rejects_temperature
 from genetics_mcp_server.mcp_proxy import (
     execute_external_tool,
     get_external_anthropic_tools,
@@ -229,9 +229,11 @@ class SubagentService:
                     "model": model,
                     "messages": messages,
                     "max_tokens": max_tokens,
-                    "temperature": settings.temperature,
                     "system": instructions,
                 }
+                # some models (e.g. claude-opus-4-7) don't support temperature
+                if not model_rejects_temperature(model):
+                    request_params["temperature"] = settings.temperature
                 if tool_definitions:
                     request_params["tools"] = tool_definitions
 

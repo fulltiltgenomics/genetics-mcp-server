@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
-from genetics_mcp_server.config import get_settings
+from genetics_mcp_server.config import get_settings, model_rejects_temperature
 from genetics_mcp_server.cost import estimate_cost, get_context_window
 from genetics_mcp_server.download_store import get_download_store
 from genetics_mcp_server.mcp_proxy import (
@@ -336,8 +336,10 @@ class LLMService:
             "model": model,
             "messages": anthropic_messages,
             "max_tokens": settings.max_tokens,
-            "temperature": settings.temperature,
         }
+        # some models (e.g. claude-opus-4-7) don't support temperature
+        if not model_rejects_temperature(model):
+            request_params["temperature"] = settings.temperature
 
         if system_prompt:
             # use structured format with cache_control for prompt caching
