@@ -147,6 +147,10 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         return _validate_user_token(token)
 
     async def auth_middleware(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/healthz":
+            await _send_healthz(send)
+            return
+
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization", b"").decode()
@@ -173,6 +177,17 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                         return
 
         await app(scope, receive, send)
+
+    async def _send_healthz(send):
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"status":"ok"}',
+        })
 
     async def _send_401(send):
         await send({
