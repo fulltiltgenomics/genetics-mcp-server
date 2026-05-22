@@ -5,7 +5,7 @@ from genetics_mcp_server.cost import estimate_cost, get_context_window
 
 class TestGetContextWindow:
     def test_opus_model(self):
-        assert get_context_window("claude-opus-4-20250514") == 200_000
+        assert get_context_window("claude-opus-4-20250514") == 1_000_000
 
     def test_sonnet_model(self):
         assert get_context_window("claude-sonnet-4-20250514") == 200_000

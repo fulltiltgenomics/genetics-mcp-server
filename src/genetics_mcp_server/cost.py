@@ -10,7 +10,7 @@ _PRICING: dict[str, tuple[float, float, float, float]] = {
 
 
 _CONTEXT_WINDOWS: dict[str, int] = {
-    "claude-opus":   200_000,
+    "claude-opus":   1_000_000,
     "claude-sonnet": 200_000,
     "claude-haiku":  200_000,
 }
