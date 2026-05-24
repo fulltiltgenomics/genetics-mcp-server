@@ -55,7 +55,7 @@ When the user mentions a data source by informal name ("FinnGen", "UK Biobank", 
 
 Datasets marked `collection: true` (e.g. `eqtl_catalogue`) contain many sub-studies enumerated in `/resource_metadata/{resource}` — look there for sub-study identifiers (e.g. QTD IDs for eQTL Catalogue).
 
-Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQTL`, `caQTL`.
+Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQTL`, `caQTL`, `asmQTL`.
 
 ### Pseudo Credible Sets
 

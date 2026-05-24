@@ -80,7 +80,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "data_types": {
                 "type": "string",
-                "description": "Comma-separated data types: 'GWAS' (disease), 'eQTL' (expression), 'pQTL' (protein), 'sQTL' (splicing), 'caQTL' (chromatin).",
+                "description": "Comma-separated data types: 'GWAS' (disease), 'eQTL' (expression), 'pQTL' (protein), 'sQTL' (splicing), 'caQTL' (chromatin accessibility).",
             },
             "summarize": {
                 "type": "boolean",
