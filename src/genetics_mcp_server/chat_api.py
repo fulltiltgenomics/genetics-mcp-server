@@ -390,5 +390,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     uvicorn.run(
-        "genetics_mcp_server.chat_api:app", host="0.0.0.0", port=args.port, reload=True
+        "genetics_mcp_server.chat_api:app", host="0.0.0.0", port=args.port, reload=True, log_config=None
     )

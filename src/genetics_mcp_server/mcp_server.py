@@ -250,7 +250,7 @@ def main():
         logger.info(f"Bearer token authentication enabled ({len(api_keys)} key(s))")
 
         logger.info(f"Starting {args.transport} server on {args.host}:{args.port}")
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port, log_config=None)
 
 
 if __name__ == "__main__":
