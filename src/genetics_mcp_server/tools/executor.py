@@ -78,6 +78,140 @@ class ToolExecutor:
         headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
         self.client = httpx.AsyncClient(timeout=30.0, headers=headers)
 
+    # -------------------------------------------------------------------------
+    # myvariant.info HGVS conversion
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _variant_to_hgvs(variant_id: str) -> str:
+        """Convert chr:pos:ref:alt to myvariant.info HGVS notation.
+
+        Handles SNVs (chr1:g.12345A>G), deletions (chr1:g.12345_12347del),
+        insertions (chr1:g.12345_12346insACG), and delins/MNVs
+        (chr1:g.12345_12347delinsACG).
+        """
+        parts = re.split(r"[:|\-_]", variant_id, maxsplit=3)
+        if len(parts) != 4:
+            raise ValueError(f"Invalid variant format: {variant_id}")
+
+        chrom, pos_str, ref, alt = parts
+        pos = int(pos_str)
+
+        # normalize chromosome
+        chrom_str = chrom if chrom.startswith("chr") else f"chr{chrom}"
+
+        if len(ref) == 1 and len(alt) == 1:
+            # SNV
+            return f"{chrom_str}:g.{pos}{ref}>{alt}"
+        elif len(alt) == 0 or alt == "-":
+            # pure deletion (no alt allele)
+            if len(ref) == 1:
+                return f"{chrom_str}:g.{pos}del"
+            else:
+                return f"{chrom_str}:g.{pos}_{pos + len(ref) - 1}del"
+        elif len(ref) == 0 or ref == "-":
+            # pure insertion (no ref allele)
+            return f"{chrom_str}:g.{pos}_{pos + 1}ins{alt}"
+        elif len(ref) > len(alt) and alt == ref[:len(alt)]:
+            # deletion (ref starts with alt, remaining bases are deleted)
+            del_start = pos + len(alt)
+            del_end = pos + len(ref) - 1
+            if del_start == del_end:
+                return f"{chrom_str}:g.{del_start}del"
+            else:
+                return f"{chrom_str}:g.{del_start}_{del_end}del"
+        elif len(alt) > len(ref) and alt[:len(ref)] == ref:
+            # insertion (alt starts with ref, remaining bases are inserted)
+            ins_after = pos + len(ref) - 1
+            return f"{chrom_str}:g.{ins_after}_{ins_after + 1}ins{alt[len(ref):]}"
+        else:
+            # MNV or complex substitution → delins
+            if len(ref) == 1:
+                return f"{chrom_str}:g.{pos}delins{alt}"
+            else:
+                return f"{chrom_str}:g.{pos}_{pos + len(ref) - 1}delins{alt}"
+
+    @staticmethod
+    def _flatten_myvariant_result(data: dict[str, Any]) -> dict[str, Any]:
+        """Extract key clinical/functional fields from a myvariant.info response."""
+        result: dict[str, Any] = {}
+
+        # ClinVar
+        clinvar = data.get("clinvar")
+        if clinvar:
+            rcv = clinvar.get("rcv")
+            if isinstance(rcv, list):
+                significances = list({r.get("clinical_significance") for r in rcv if r.get("clinical_significance")})
+                conditions = list({r.get("preferred_name") or r.get("conditions", {}).get("name", "") for r in rcv if r.get("preferred_name") or r.get("conditions")})
+            elif isinstance(rcv, dict):
+                significances = [rcv.get("clinical_significance")] if rcv.get("clinical_significance") else []
+                cond = rcv.get("preferred_name") or (rcv.get("conditions", {}).get("name", "") if isinstance(rcv.get("conditions"), dict) else "")
+                conditions = [cond] if cond else []
+            else:
+                significances = []
+                conditions = []
+
+            result["clinvar"] = {
+                "clinical_significance": significances,
+                "conditions": conditions,
+                "review_status": clinvar.get("review", {}).get("review_status") if isinstance(clinvar.get("review"), dict) else None,
+                "variant_id": clinvar.get("variant_id"),
+            }
+
+        # CADD
+        cadd = data.get("cadd")
+        if cadd:
+            result["cadd"] = {
+                "phred": cadd.get("phred"),
+                "raw_score": cadd.get("rawscore"),
+                "consequence": cadd.get("consequence"),
+            }
+
+        # dbNSFP functional predictions
+        dbnsfp = data.get("dbnsfp")
+        if dbnsfp:
+            preds: dict[str, Any] = {}
+            for predictor in ("sift", "polyphen2", "mutationtaster", "metalr", "metasvm", "fathmm"):
+                pred_data = dbnsfp.get(predictor)
+                if pred_data and isinstance(pred_data, dict):
+                    entry: dict[str, Any] = {}
+                    if "score" in pred_data:
+                        entry["score"] = pred_data["score"]
+                    if "pred" in pred_data:
+                        entry["prediction"] = pred_data["pred"]
+                    if "converted_rankscore" in pred_data:
+                        entry["rankscore"] = pred_data["converted_rankscore"]
+                    if entry:
+                        preds[predictor] = entry
+            if preds:
+                result["functional_predictions"] = preds
+            if dbnsfp.get("genename"):
+                result["gene"] = dbnsfp["genename"]
+
+        # COSMIC
+        cosmic = data.get("cosmic")
+        if cosmic:
+            result["cosmic"] = {
+                "cosmic_id": cosmic.get("cosmic_id"),
+                "tumor_site": cosmic.get("tumor_site"),
+            }
+
+        # CIViC
+        civic = data.get("civic")
+        if civic:
+            result["civic"] = {
+                "variant_id": civic.get("variant_id"),
+                "name": civic.get("name"),
+                "gene": civic.get("entrez_name"),
+            }
+
+        # dbSNP
+        dbsnp = data.get("dbsnp")
+        if dbsnp:
+            result["rsid"] = dbsnp.get("rsid")
+
+        return result
+
     def _build_download_url(self, path: str, params: dict[str, Any] | None = None) -> str:
         """Build a public download URL for a genetics API endpoint."""
         url = f"{self.public_url}{path}"
@@ -2282,3 +2416,116 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"DuckDuckGo search error: {e}")
             return {"success": False, "error": f"Web search failed: {str(e)}"}
+
+    # -------------------------------------------------------------------------
+    # myvariant.info
+    # -------------------------------------------------------------------------
+
+    _MYVARIANT_DEFAULT_FIELDS = "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp"
+
+    async def get_myvariant_annotations(
+        self,
+        variant: str | None = None,
+        variants: list[str] | None = None,
+        fields: str | None = None,
+    ) -> dict[str, Any]:
+        """Get clinical/functional variant annotations from myvariant.info."""
+        from genetics_mcp_server.config.settings import get_settings
+
+        settings = get_settings()
+        base_url = settings.myvariant_api_url
+
+        req_fields = fields or self._MYVARIANT_DEFAULT_FIELDS
+        params: dict[str, str] = {"fields": req_fields, "assembly": "hg38"}
+
+        try:
+            if variant:
+                # single variant lookup
+                try:
+                    hgvs_id = self._variant_to_hgvs(variant)
+                except ValueError as e:
+                    return {"success": False, "error": str(e)}
+
+                url = f"{base_url}/variant/{quote(hgvs_id, safe='')}"
+                resp = await self.client.get(url, params=params, timeout=15.0)
+
+                if resp.status_code == 404:
+                    return {"success": True, "variant": variant, "found": False, "annotations": {}}
+                if resp.status_code == 429:
+                    return {"success": False, "error": "myvariant.info rate limit exceeded. Try again shortly."}
+                resp.raise_for_status()
+
+                data = resp.json()
+                annotations = self._flatten_myvariant_result(data)
+                return {"success": True, "variant": variant, "found": bool(annotations), "annotations": annotations}
+
+            elif variants:
+                if len(variants) > 1000:
+                    return {"success": False, "error": "Maximum 1000 variants per batch query."}
+
+                # convert all variant IDs to HGVS
+                hgvs_ids = []
+                conversion_errors = []
+                for v in variants:
+                    try:
+                        hgvs_ids.append(self._variant_to_hgvs(v))
+                    except ValueError:
+                        conversion_errors.append(v)
+
+                if not hgvs_ids:
+                    return {"success": False, "error": f"Could not convert any variants to HGVS format. Invalid: {conversion_errors}"}
+
+                # batch query via POST
+                url = f"{base_url}/variant"
+                post_data = {
+                    "ids": ",".join(hgvs_ids),
+                    "fields": req_fields,
+                    "assembly": "hg38",
+                }
+
+                resp = await self.client.post(
+                    url,
+                    data=post_data,
+                    headers={"content-type": "application/x-www-form-urlencoded"},
+                    timeout=30.0,
+                )
+
+                if resp.status_code == 429:
+                    return {"success": False, "error": "myvariant.info rate limit exceeded. Try again shortly."}
+                resp.raise_for_status()
+
+                results_list = resp.json()
+                if not isinstance(results_list, list):
+                    results_list = [results_list]
+
+                # map back to original variant IDs
+                hgvs_to_original = dict(zip(hgvs_ids, variants[:len(hgvs_ids)]))
+                annotations = {}
+                for item in results_list:
+                    hgvs_key = item.get("_id", item.get("query", ""))
+                    original_id = hgvs_to_original.get(hgvs_key, hgvs_key)
+                    if item.get("notfound"):
+                        annotations[original_id] = {"found": False}
+                    else:
+                        flat = self._flatten_myvariant_result(item)
+                        annotations[original_id] = {"found": bool(flat), **flat}
+
+                result: dict[str, Any] = {
+                    "success": True,
+                    "total_queried": len(variants),
+                    "total_found": sum(1 for a in annotations.values() if a.get("found")),
+                    "annotations": annotations,
+                }
+                if conversion_errors:
+                    result["conversion_errors"] = conversion_errors
+                return result
+
+            else:
+                return {"success": False, "error": "Provide either 'variant' or 'variants' parameter."}
+
+        except httpx.TimeoutException:
+            logger.error("myvariant.info request timed out")
+            return {"success": False, "error": "myvariant.info request timed out."}
+        except Exception as e:
+            logger.error(f"myvariant.info error: {e}", exc_info=True)
+            return {"success": False, "error": INTERNAL_ERROR_MSG}

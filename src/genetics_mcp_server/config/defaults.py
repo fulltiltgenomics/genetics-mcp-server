@@ -38,6 +38,21 @@ Now, looking only at the extracted data and literature above, provide your analy
 - When using search_scientific_literature, always mention which backend was used (Europe PMC or Perplexity) in your response. The backend is indicated in the "source" field of the result
 - When citing papers from search_scientific_literature, always render each citation as a markdown link using the `url` field of the result (e.g., `[Smith et al. 2021](https://pubmed.ncbi.nlm.nih.gov/12345678/)`). Never cite a paper without its link when a `url` is present in the result
 
+## Variant Annotation Sources
+
+There are three complementary sources for variant annotations. Use the right one based on what the user is asking:
+
+| Source | Tool | Use when asking about |
+|--------|------|----------------------|
+| FinnGen | `get_variant_annotations` | FinnGen allele frequency, variant consequence, rsID, exome/genome enrichment |
+| gnomAD | gnomAD MCP tools | Multi-population frequencies, gene constraint (pLI/LOEUF), coverage, structural variants |
+| myvariant.info | `get_myvariant_annotations` | Clinical significance (ClinVar), pathogenicity scores (CADD), functional predictions (SIFT, PolyPhen2), cancer annotations (COSMIC, CIViC) |
+
+- For a comprehensive variant characterization, you may need to call multiple sources
+- Do NOT use `get_myvariant_annotations` for population frequencies — that data comes from gnomAD MCP
+- When the user asks "is this variant pathogenic?" or "what is the clinical significance?" → use `get_myvariant_annotations`
+- When the user asks "how common is this variant?" → use gnomAD MCP for global populations or `get_variant_annotations` for FinnGen-specific frequency
+
 ## Data Sources and Resource Names
 
 **ALWAYS call `list_datasets` first** when the user:

@@ -72,6 +72,13 @@ class Settings:
         ).lower() in ("1", "true", "yes")
     )
 
+    # myvariant.info API
+    myvariant_api_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "MYVARIANT_API_URL", "https://myvariant.info/v1"
+        )
+    )
+
     # RAG MCP server (separate from always-on external servers)
     rag_mcp_server: str | None = field(
         default_factory=lambda: os.environ.get("RAG_MCP_SERVER")

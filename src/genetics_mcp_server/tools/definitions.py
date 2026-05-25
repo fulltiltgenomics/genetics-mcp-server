@@ -634,6 +634,41 @@ Returns: variant ID, chromosome, position, ref/alt alleles, allele frequency (AF
             },
         },
     },
+    {
+        "name": "get_myvariant_annotations",
+        "category": "api",
+        "description": """Get clinical and functional variant annotations from myvariant.info.
+
+Use this tool when:
+- The user asks about clinical significance or pathogenicity of a variant (ClinVar data)
+- The user wants deleteriousness or pathogenicity scores (CADD scores)
+- The user wants functional impact predictions (SIFT, PolyPhen2, MutationTaster, etc.)
+- The user asks about cancer relevance of a variant (COSMIC, CIViC data)
+- The user asks "is this variant pathogenic?" or "what is the clinical interpretation?"
+
+Do NOT use this tool for:
+- Population allele frequencies → use gnomAD MCP tools instead
+- Gene constraint scores (pLI, LOEUF) → use gnomAD MCP get_gene instead
+- FinnGen-specific annotations (AF, consequence, enrichment) → use get_variant_annotations instead
+
+Returns: ClinVar clinical significance and conditions, CADD phred score, functional predictions (SIFT, PolyPhen2, MutationTaster, etc.), COSMIC cancer data, CIViC clinical evidence, and rsID.""",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Single variant in chr:pos:ref:alt format (e.g., '1:55051215:G:A'). Any separator (: - _ |) accepted.",
+            },
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of variant IDs for batch lookup (e.g., ['1:55051215:G:A', '7:117559590:ATCT:A']). Max 1000.",
+            },
+            "fields": {
+                "type": "string",
+                "description": "Comma-separated annotation sources to query (default: clinvar,cadd,dbnsfp,cosmic,civic,dbsnp). Do not include gnomad_genome or gnomad_exome.",
+                "default": "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp",
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -1076,6 +1111,19 @@ def register_mcp_tools(
         return await executor.get_variant_annotations(
             variant=variant, region=region, gene=gene, variants=variants, source=source
         )
+
+    if "get_myvariant_annotations" not in _disabled:
+
+        @mcp.tool()
+        async def get_myvariant_annotations(
+            variant: str | None = None,
+            variants: list[str] | None = None,
+            fields: str = "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp",
+        ) -> dict:
+            """Get clinical/functional variant annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data)."""
+            return await executor.get_myvariant_annotations(
+                variant=variant, variants=variants, fields=fields
+            )
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()

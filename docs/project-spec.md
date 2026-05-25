@@ -81,6 +81,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
+| `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
 ### LD tools (FinnGen LD Server)
 
@@ -116,7 +117,31 @@ BigQuery contains multiple tables beyond just credible sets — including exome/
 
 #### gnomAD MCP
 
-Provides variant population frequency and gene constraint data from gnomAD.
+Provides variant annotations, population frequencies, gene constraint/expression data, and pathogenicity interpretation from gnomAD. Server name: `gmd-agent`. Tools are registered without prefix. Five All of Us (AoU) tools are excluded via `EXTERNAL_MCP_EXCLUDE_TOOLS`.
+
+Available tools (after exclusions):
+
+| Tool | Description |
+|------|-------------|
+| `get_variant_details` | Variant details/summary |
+| `get_variant_frequencies` | Population allele frequencies |
+| `get_variant_summary` | Variant summary |
+| `get_multiple_variant_details` | Batch variant details |
+| `interpret_variant_pathogenicity` | Interpret variant pathogenicity |
+| `analyze_variant_cooccurrence` | Phase relationship (cis vs trans) between variants |
+| `analyze_variant_pext` | Proportion expressed across transcripts (pext) score |
+| `get_gene_summary` | Gene summary including constraint scores |
+| `get_gene_expression_summary` | Gene expression summary |
+| `get_gene_variants` | Variants for a gene |
+| `get_mendelian_gene_summary` | Mendelian disease gene summary |
+| `get_region_variants` | Variants in a genomic region |
+| `get_transcript_details` | Transcript details |
+| `list_gene_transcripts` | List transcripts for a gene |
+| `get_agent_info` | Agent information |
+
+#### myvariant.info (native tool, chat-backend only)
+
+The `get_myvariant_annotations` tool queries myvariant.info for clinical and functional variant annotations not available from gnomAD MCP or the local API. Provides ClinVar clinical significance, CADD deleteriousness scores, functional predictions (SIFT, PolyPhen2, MutationTaster), cancer annotations (COSMIC, CIViC), and dbSNP rsIDs. Excluded from the MCP server — only available via the chat API. gnomAD population frequency fields are excluded by default to avoid overlap with gnomAD MCP.
 
 #### Open Targets Platform MCP
 
@@ -332,6 +357,12 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude |
 | `OPENAI_API_KEY` | OpenAI API key |
+
+### myvariant.info (optional, chat-backend only)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MYVARIANT_API_URL` | myvariant.info API base URL | `https://myvariant.info/v1` |
 
 ### Search tools (optional)
 
