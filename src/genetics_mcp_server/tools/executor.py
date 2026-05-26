@@ -652,6 +652,58 @@ class ToolExecutor:
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
+    async def get_asm_qtl_by_variant(
+        self, variant: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get ASM-QTL data for a variant via the sumstats endpoint."""
+        phenotypes = "CpG,MDS"
+        if resources:
+            # map resource names to phenotype codes
+            pheno_map = {"decode_cpg": "CpG", "decode_mds": "MDS"}
+            phenotypes = ",".join(
+                pheno_map.get(r.strip(), r.strip())
+                for r in resources.split(",")
+            )
+        params: dict[str, Any] = {
+            "variants": variant,
+            "phenotypes": phenotypes,
+            "format": "json",
+        }
+        resp = await self.client.get(
+            f"{self.base_url}/v1/summary_stats/decode/asmqtl", params=params
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "variant": variant, "results": results,
+                "_download_data": {"results": results, "filename": f"{variant}_asm_qtl.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_asm_qtl_by_gene(
+        self, gene: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get ASM-QTL data for variants in a gene via BigQuery."""
+        dataset_filter = ""
+        if resources:
+            ds_map = {"decode_cpg": "deCODE_asmQTL_CpG", "decode_mds": "deCODE_asmQTL_MDS"}
+            datasets = [ds_map.get(r.strip(), r.strip()) for r in resources.split(",")]
+            quoted = ", ".join(f"'{d}'" for d in datasets)
+            dataset_filter = f" AND dataset IN ({quoted})"
+
+        sql = (
+            f"SELECT * FROM asm_qtl_v "
+            f"WHERE gene_most_severe = '{gene}'{dataset_filter} "
+            f"ORDER BY mlog10p DESC LIMIT 500"
+        )
+        result = await self.query_bigquery(sql, max_rows=500)
+        if result.get("success"):
+            return {
+                "success": True, "gene": gene, "results": result.get("results", []),
+                "_download_data": {"results": result.get("results", []), "filename": f"{gene}_asm_qtl.tsv"},
+            }
+        return result
+
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:
         """Get gene-disease associations."""
         resp = await self.client.get(

@@ -192,6 +192,38 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_asm_qtl_by_variant",
+        "category": "api",
+        "description": "Get allele-specific methylation QTL (ASM-QTL) data for a variant. Returns associations between a sequence variant and CpG/MDS methylation rates, including effect sizes, methylation rates on reference and alternative haplotypes, and variant rank (primary/secondary).",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Variant ID in format chr:pos:ref:alt (e.g., '1:808040:G:A')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'decode_cpg' (CpG methylation), 'decode_mds' (MDS methylation). Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_asm_qtl_by_gene",
+        "category": "api",
+        "description": "Get allele-specific methylation QTL (ASM-QTL) data for variants in a gene. Returns associations between sequence variants and CpG/MDS methylation rates where the gene has the most severe consequence.",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol or comma-separated list of gene symbols (e.g., 'PCSK9')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'decode_cpg' (CpG methylation), 'decode_mds' (MDS methylation). Omit to search all.",
+            },
+        },
+    },
+    {
         "name": "get_gene_disease_associations",
         "category": "api",
         "description": "Get Mendelian/rare disease gene-disease relationships from ClinGen/GENCC. Use ONLY for rare disease genetics questions, NOT for GWAS/common variant associations.",
@@ -931,6 +963,22 @@ def register_mcp_tools(
     async def get_gene_expression(gene: str) -> dict:
         """Get tissue-specific gene expression levels."""
         return await executor.get_gene_expression(gene)
+
+    @mcp.tool()
+    async def get_asm_qtl_by_variant(
+        variant: str,
+        resources: str | None = None,
+    ) -> dict:
+        """Get ASM-QTL data for a variant."""
+        return await executor.get_asm_qtl_by_variant(variant, resources)
+
+    @mcp.tool()
+    async def get_asm_qtl_by_gene(
+        gene: str,
+        resources: str | None = None,
+    ) -> dict:
+        """Get ASM-QTL data for variants in a gene."""
+        return await executor.get_asm_qtl_by_gene(gene, resources)
 
     @mcp.tool()
     async def get_gene_disease_associations(gene: str) -> dict:
