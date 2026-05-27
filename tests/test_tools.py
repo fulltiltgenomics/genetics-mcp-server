@@ -886,3 +886,222 @@ class TestToolDefinitions:
                 assert gen_tool in names, (
                     f"General tool {gen_tool} missing from profile {profile}"
                 )
+
+
+# MouseMine PathQuery returns row arrays whose column order is dictated by the
+# 'view=' attribute on the inline XML in executor._mgi_* helpers. The mocks
+# below mirror those exact column orders so the parsing logic is exercised.
+@pytest.mark.asyncio
+class TestSearchMGI:
+    """Mocked HTTP tests for ToolExecutor.search_mgi against MouseMine."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_executor(self):
+        from genetics_mcp_server.tools.executor import ToolExecutor
+
+        self.executor = ToolExecutor()
+        yield
+        await self.executor.close()
+
+    @staticmethod
+    def _mock_response(status_code: int = 200, json_data: dict | None = None, text: str = ""):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = text
+        resp.json = MagicMock(return_value=json_data or {})
+        return resp
+
+    async def test_gene_phenotypes_success(self):
+        from unittest.mock import AsyncMock, patch
+
+        # columns per executor._mgi_gene_phenotypes view:
+        # [mgi_id, symbol, name, mp_id, mp_term, allele_id, allele_symbol, allele_name]
+        json_data = {
+            "results": [
+                [
+                    "MGI:97874",
+                    "Trp53",
+                    "transformation related protein 53",
+                    "MP:0001262",
+                    "decreased body weight",
+                    "MGI:1857436",
+                    "Trp53<tm1Tyj>",
+                    "targeted mutation 1, Tyler Jacks",
+                ],
+                # second MP term on the same allele — collapsed into one gene entry
+                [
+                    "MGI:97874",
+                    "Trp53",
+                    "transformation related protein 53",
+                    "MP:0002169",
+                    "no abnormal phenotype detected",
+                    "MGI:1857436",
+                    "Trp53<tm1Tyj>",
+                    "targeted mutation 1, Tyler Jacks",
+                ],
+            ]
+        }
+        mock = self._mock_response(json_data=json_data)
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.search_mgi(query="Trp53", query_type="gene_phenotypes")
+
+        assert result["success"] is True
+        assert result["query"] == "Trp53"
+        assert result["query_type"] == "gene_phenotypes"
+        assert result["source"] == "mgi"
+        assert result["returned"] == 1
+        gene = result["results"][0]
+        assert gene["mgi_id"] == "MGI:97874"
+        assert gene["symbol"] == "Trp53"
+        assert gene["url"] == "https://www.informatics.jax.org/marker/MGI:97874"
+        mp_ids = {p["mp_id"] for p in gene["phenotype_terms"]}
+        assert mp_ids == {"MP:0001262", "MP:0002169"}
+        assert len(gene["alleles"]) == 1
+        assert gene["alleles"][0]["mgi_id"] == "MGI:1857436"
+        assert gene["alleles"][0]["url"] == "https://www.informatics.jax.org/allele/MGI:1857436"
+
+    async def test_phenotype_genes_success(self):
+        from unittest.mock import AsyncMock, patch
+
+        # columns per executor._mgi_phenotype_genes view:
+        # [mp_id, mp_term, gene_mgi_id, gene_symbol, gene_name]
+        json_data = {
+            "results": [
+                ["MP:0001262", "decreased body weight", "MGI:97874", "Trp53", "transformation related protein 53"],
+                ["MP:0001262", "decreased body weight", "MGI:88336", "Brca1", "breast cancer 1, early onset"],
+                # row with missing gene id is dropped
+                ["MP:0001262", "decreased body weight", None, None, None],
+            ]
+        }
+        mock = self._mock_response(json_data=json_data)
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.search_mgi(
+                query="MP:0001262", query_type="phenotype_genes"
+            )
+
+        assert result["success"] is True
+        assert result["returned"] == 2
+        symbols = {g["symbol"] for g in result["results"]}
+        assert symbols == {"Trp53", "Brca1"}
+        for gene in result["results"]:
+            assert gene["phenotype_terms"][0]["mp_id"] == "MP:0001262"
+            assert gene["url"].startswith("https://www.informatics.jax.org/marker/")
+
+    async def test_allele_success(self):
+        from unittest.mock import AsyncMock, patch
+
+        # columns per executor._mgi_allele view:
+        # [allele_id, allele_symbol, allele_name, allele_type,
+        #  gene_id, gene_symbol, gene_name, mp_id, mp_term]
+        json_data = {
+            "results": [
+                [
+                    "MGI:1857436",
+                    "Trp53<tm1Tyj>",
+                    "targeted mutation 1, Tyler Jacks",
+                    "Targeted (knock-out)",
+                    "MGI:97874",
+                    "Trp53",
+                    "transformation related protein 53",
+                    "MP:0001262",
+                    "decreased body weight",
+                ],
+            ]
+        }
+        mock = self._mock_response(json_data=json_data)
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.search_mgi(
+                query="MGI:1857436", query_type="allele"
+            )
+
+        assert result["success"] is True
+        assert result["source"] == "mgi"
+        assert result["returned"] == 1
+        entry = result["results"][0]
+        assert entry["mgi_id"] == "MGI:97874"
+        assert entry["symbol"] == "Trp53"
+        assert entry["alleles"][0]["mgi_id"] == "MGI:1857436"
+        assert entry["alleles"][0]["allele_type"] == "Targeted (knock-out)"
+        assert entry["phenotype_terms"][0]["mp_id"] == "MP:0001262"
+
+    async def test_ortholog_success(self):
+        from unittest.mock import AsyncMock, patch
+
+        # columns per executor._mgi_ortholog view:
+        # [mgi_id, symbol, name,
+        #  ortho_mgi_id, ortho_symbol, ortho_name, ortho_organism]
+        json_data = {
+            "results": [
+                [
+                    "MGI:97874",
+                    "Trp53",
+                    "transformation related protein 53",
+                    "HGNC:11998",
+                    "TP53",
+                    "tumor protein p53",
+                    "H. sapiens",
+                ],
+            ]
+        }
+        mock = self._mock_response(json_data=json_data)
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.search_mgi(
+                query="Trp53", query_type="ortholog", species="mouse"
+            )
+
+        assert result["success"] is True
+        assert result["returned"] == 1
+        entry = result["results"][0]
+        assert entry["symbol"] == "Trp53"
+        assert entry["orthologs"][0]["mgi_id"] == "HGNC:11998"
+        assert entry["orthologs"][0]["symbol"] == "TP53"
+        assert entry["orthologs"][0]["organism"] == "H. sapiens"
+        assert entry["url"] == "https://www.informatics.jax.org/marker/MGI:97874"
+
+    async def test_empty_results(self):
+        from unittest.mock import AsyncMock, patch
+
+        mock = self._mock_response(json_data={"results": []})
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.search_mgi(query="Xyz123", query_type="gene_phenotypes")
+
+        assert result["success"] is True
+        assert result["returned"] == 0
+        assert result["results"] == []
+        assert result["source"] == "mgi"
+
+    async def test_http_failure_returns_error_not_raises(self):
+        from unittest.mock import AsyncMock, patch
+
+        mock = self._mock_response(status_code=500, text="MouseMine is down")
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.search_mgi(query="Trp53")
+
+        assert result["success"] is False
+        assert "error" in result
+        assert "500" in result["error"]
+
+    async def test_network_exception_returns_error(self):
+        # network-level failure (e.g. timeout) must be caught by search_mgi
+        # and surfaced as {success: False, error: ...} rather than propagating
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
+        with patch.object(
+            self.executor.client,
+            "get",
+            new_callable=AsyncMock,
+            side_effect=httpx.TimeoutException("timed out"),
+        ):
+            result = await self.executor.search_mgi(query="Trp53")
+
+        assert result["success"] is False
+        assert "error" in result
+
+    async def test_unknown_query_type(self):
+        result = await self.executor.search_mgi(query="x", query_type="nonsense")
+        assert result["success"] is False
+        assert "Unknown query_type" in result["error"]

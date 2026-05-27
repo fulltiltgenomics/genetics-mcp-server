@@ -158,6 +158,61 @@ class TestMCPToolRegistration:
             assert expected <= registered_names
 
 
+class TestMCPDisabledTools:
+    """Tests that chat-backend-only tools are excluded from FastMCP registration."""
+
+    @staticmethod
+    def _registered_names(mcp) -> set[str]:
+        # FastMCP keeps registered tools on the internal _tool_manager.
+        # If the version differs and the attr is missing, skip rather than
+        # silently passing — the test would otherwise be a no-op.
+        if not hasattr(mcp, "_tool_manager"):
+            pytest.skip("FastMCP version exposes no _tool_manager; cannot introspect tools")
+        return set(mcp._tool_manager._tools.keys())
+
+    def test_search_mgi_in_tool_definitions(self):
+        """search_mgi must remain a defined tool (it is chat-backend only, not removed)."""
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        assert "search_mgi" in names
+
+    def test_search_mgi_excluded_from_mcp_when_disabled(self):
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools={"search_mgi"})
+
+        registered = self._registered_names(mcp)
+        assert "search_mgi" not in registered
+
+    def test_get_myvariant_annotations_excluded_from_mcp_when_disabled(self):
+        # mirror pattern for the other chat-backend-only tool
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools={"get_myvariant_annotations"})
+
+        registered = self._registered_names(mcp)
+        assert "get_myvariant_annotations" not in registered
+
+    def test_default_mcp_disabled_set_matches_runtime(self):
+        """The _mcp_disabled set used by mcp_server.py must exclude search_mgi.
+
+        Guards against accidental removal of the search_mgi entry from
+        mcp_server.py:82 since search_mgi calls require chat-backend wiring
+        (MouseMine + result truncation) not present in plain MCP clients.
+        """
+        from genetics_mcp_server import mcp_server
+
+        assert "search_mgi" in mcp_server._mcp_disabled
+        assert "get_myvariant_annotations" in mcp_server._mcp_disabled
+
+
 @pytest.mark.integration
 class TestMCPServerIntegration:
     """Integration tests for MCP server (requires live API)."""
