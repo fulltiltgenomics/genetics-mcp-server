@@ -422,7 +422,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "search_scientific_literature",
         "category": "general",
-        "description": "Search scientific literature (PubMed, bioRxiv, medRxiv preprints). Use for finding research papers about genes, variants, diseases, or biological mechanisms.",
+        "description": (
+            "Search scientific literature for research papers about genes, variants, diseases, or biological mechanisms. "
+            "Each call queries exactly ONE backend API (the 'backend' parameter): either 'europepmc' OR 'perplexity' — never both. "
+            "These two backends are distinct APIs, not interchangeable labels for the same source:\n"
+            "- 'europepmc' backend: queries the Europe PMC API, which indexes PubMed, Europe PMC, bioRxiv, and medRxiv. Returns structured paper records.\n"
+            "- 'perplexity' backend: queries the Perplexity AI API, which searches a broader configured set of scientific web domains and returns an AI-generated summary with citations.\n"
+            "When reporting results to the user, name the backend that was actually queried (the 'source' field in the response: 'europepmc' or 'perplexity'). "
+            "Do NOT invent hybrid labels like 'PubMed/Europe PMC' or 'Perplexity/PubMed' — PubMed etc. are content indexed by the europepmc backend, not separate backends."
+        ),
         "parameters": {
             "query": {
                 "type": "string",
@@ -436,7 +444,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "include_preprints": {
                 "type": "boolean",
-                "description": "Include bioRxiv/medRxiv preprints (default true)",
+                "description": "Include bioRxiv/medRxiv preprints (default true). Only affects the 'europepmc' backend.",
                 "default": True,
             },
             "date_range": {
@@ -445,7 +453,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "backend": {
                 "type": "string",
-                "description": "Search backend: 'europepmc' (structured results) or 'perplexity' (AI-enhanced with summary). Defaults to server configuration.",
+                "description": (
+                    "Which API to query for this call (NOT the underlying content source). "
+                    "'europepmc' = call the Europe PMC API (which indexes PubMed/Europe PMC/bioRxiv/medRxiv); returns structured paper records. "
+                    "'perplexity' = call the Perplexity AI API (broader scientific web); returns AI-generated summary with citations. "
+                    "Exactly one backend is queried per call. Defaults to server configuration."
+                ),
                 "enum": ["europepmc", "perplexity"],
             },
         },
