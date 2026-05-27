@@ -126,6 +126,19 @@ class Settings:
         default_factory=lambda: os.environ.get("ADMIN_USERS", "")
     )
 
+    # bearer token auth: allowed email domains and specific emails
+    # mirrors genetics-results-api/app/config/common.py parsing semantics
+    allowed_email_domains: set[str] = field(
+        default_factory=lambda: {
+            d.strip() for d in os.environ.get("ALLOWED_EMAIL_DOMAINS", "finngen.fi").split(",") if d.strip()
+        }
+    )
+    allowed_emails: set[str] = field(
+        default_factory=lambda: {
+            e.strip() for e in os.environ.get("ALLOWED_EMAILS", "").split(",") if e.strip()
+        }
+    )
+
     @property
     def admin_users_list(self) -> list[str]:
         if not self.admin_users:
