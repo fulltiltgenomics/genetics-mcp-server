@@ -108,10 +108,20 @@ BigQuery contains multiple tables beyond just credible sets — including exome/
 
 ### External search tools
 
+The external search tools split into two conceptually distinct families:
+
+- **Literature backends** (`search_scientific_literature`): query a paper-indexing API — either `europepmc` (covers PubMed, Europe PMC, bioRxiv, medRxiv) or `perplexity` (broader scientific web). Exactly one backend is queried per call; "backend" is the API hit, not the content source indexed.
+- **Structured curated databases** (`search_mgi`): query a curated biological database that returns structured records (genes, phenotypes, alleles, orthologs) rather than papers. Complements — does not replace — the literature backends.
+
 | Tool | Description |
 |------|-------------|
 | `search_scientific_literature` | Search PubMed/bioRxiv via Europe PMC or Perplexity |
 | `web_search` | General web search via Tavily or DuckDuckGo |
+| `search_mgi` | Search Jackson Lab Mouse Genome Informatics for curated mouse gene→phenotype annotations, knockout/transgenic allele phenotypes, and human-mouse ortholog mappings. Chat-backend only — excluded from MCP server |
+
+#### MGI (native tool, chat-backend only)
+
+The `search_mgi` tool queries Jackson Lab's MouseMine (InterMine REST endpoint) for curated mouse data: gene → MP-ontology phenotype terms, knockout/transgenic allele phenotypes, and mouse-human ortholog mappings. Unlike Europe PMC and Perplexity which return papers, MGI returns structured curated records — so it complements rather than substitutes for literature search. Excluded from the MCP server (mirroring `get_myvariant_annotations`); only available via the chat API.
 
 ### External MCP server tools (proxied)
 
