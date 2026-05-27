@@ -491,6 +491,35 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "search_mgi",
+        "category": "general",
+        "description": "Search Jackson Lab Mouse Genome Informatics (MGI) for curated mouse gene → phenotype annotations (MP ontology), knockout/transgenic allele phenotypes, and human-mouse ortholog mappings. Returns structured records (not papers). Complements search_scientific_literature — use it for mouse KO / phenotype / MP-ontology / ortholog questions.",
+        "parameters": {
+            "query": {
+                "type": "string",
+                "description": "Gene symbol (human or mouse), phenotype term, or MGI ID, depending on query_type.",
+                "required": True,
+            },
+            "query_type": {
+                "type": "string",
+                "description": "What to look up: 'gene_phenotypes' (gene → MP phenotype terms + alleles), 'phenotype_genes' (MP term → genes), 'allele' (allele details), or 'ortholog' (mouse-human ortholog mapping).",
+                "enum": ["gene_phenotypes", "phenotype_genes", "allele", "ortholog"],
+                "default": "gene_phenotypes",
+            },
+            "species": {
+                "type": "string",
+                "description": "Species of the input query: 'mouse' or 'human' (used to set ortholog lookup direction). Default 'mouse'.",
+                "enum": ["mouse", "human"],
+                "default": "mouse",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum records to return (default 25, max 100).",
+                "default": 25,
+            },
+        },
+    },
+    {
         "name": "create_phewas_plot",
         "category": "general",
         "description": "Create a PheWAS (Phenome-Wide Association Study) plot showing all phenotype associations for a variant. Returns a base64-encoded PNG image with phenotypes grouped by category on the X-axis and -log10(p-value) on the Y-axis.",
@@ -1106,6 +1135,20 @@ def register_mcp_tools(
             """Search the web for general information."""
             return await executor.web_search(
                 query, max_results, include_domains, exclude_domains
+            )
+
+    if "search_mgi" not in _disabled:
+
+        @mcp.tool()
+        async def search_mgi(
+            query: str,
+            query_type: str = "gene_phenotypes",
+            species: str = "mouse",
+            max_results: int = 25,
+        ) -> dict:
+            """Search Jackson Lab MGI for curated mouse phenotypes, alleles, and orthologs."""
+            return await executor.search_mgi(
+                query, query_type, species, max_results
             )
 
     @mcp.tool()
