@@ -17,6 +17,7 @@ dependencies = [
     "sse-starlette==3.4.1",
     "pydantic==2.13.3",
     "ddgs==9.14.1",
+    "google-auth[requests]==2.49.0",
 ]
 
 [project.optional-dependencies]
