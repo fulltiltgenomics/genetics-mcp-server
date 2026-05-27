@@ -10,6 +10,7 @@ import traceback
 from collections import defaultdict
 from typing import Any
 from urllib.parse import quote, urlencode
+from xml.sax.saxutils import quoteattr
 
 import httpx
 import matplotlib
@@ -2099,6 +2100,350 @@ class ToolExecutor:
                 logger.warning(f"Tavily search failed, falling back to DuckDuckGo: {e}")
 
         return await self._search_duckduckgo(query, min(max_results, 10))
+
+    # -------------------------------------------------------------------------
+    # MGI / MouseMine
+    # -------------------------------------------------------------------------
+
+    # MouseMine InterMine endpoint — JSON-encoded PathQuery results.
+    # Templates would be friendlier but pin us to JAX-named templates that
+    # change over releases. Inline PathQuery XML keeps this self-contained.
+    _MOUSEMINE_URL = "https://www.mousemine.org/mousemine/service/query/results"
+    _MGI_MARKER_URL = "https://www.informatics.jax.org/marker"
+    _MGI_ALLELE_URL = "https://www.informatics.jax.org/allele"
+
+    async def search_mgi(
+        self,
+        query: str,
+        query_type: str = "gene_phenotypes",
+        species: str = "mouse",
+        max_results: int = 25,
+    ) -> dict[str, Any]:
+        """Search MGI (Mouse Genome Informatics) via MouseMine for curated
+        mouse phenotypes, alleles, and human-mouse orthologs.
+        """
+        size = max(1, min(max_results, 100))
+        try:
+            if query_type == "gene_phenotypes":
+                results = await self._mgi_gene_phenotypes(query, size)
+            elif query_type == "phenotype_genes":
+                results = await self._mgi_phenotype_genes(query, size)
+            elif query_type == "allele":
+                results = await self._mgi_allele(query, size)
+            elif query_type == "ortholog":
+                results = await self._mgi_ortholog(query, species, size)
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown query_type: {query_type}",
+                }
+
+            # _mgi_* helpers may surface an upstream HTTP error as a dict
+            if isinstance(results, dict) and results.get("_error"):
+                return {"success": False, "error": results["_error"]}
+
+            return {
+                "success": True,
+                "query": query,
+                "query_type": query_type,
+                "returned": len(results),
+                "results": results,
+                "source": "mgi",
+            }
+        except Exception as e:
+            logger.error(
+                f"Error in search_mgi({query!r}, type={query_type}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def _mousemine_query(
+        self, path_query_xml: str, size: int
+    ) -> dict[str, Any]:
+        """Execute a MouseMine PathQuery and return the parsed JSON body.
+
+        Returns the raw InterMine response dict on success, or a sentinel
+        {'_error': '...'} dict on HTTP failure so the caller can surface the
+        error without raising.
+        """
+        params = {
+            "query": path_query_xml,
+            "format": "json",
+            "size": str(size),
+        }
+        resp = await self.client.get(
+            self._MOUSEMINE_URL, params=params, timeout=20.0
+        )
+        if resp.status_code != 200:
+            # truncate body to keep error messages bounded
+            body = (resp.text or "")[:200]
+            return {"_error": f"MouseMine HTTP {resp.status_code}: {body}"}
+        return resp.json()
+
+    @staticmethod
+    def _marker_url(mgi_id: str | None) -> str | None:
+        if not mgi_id:
+            return None
+        return f"{ToolExecutor._MGI_MARKER_URL}/{mgi_id}"
+
+    @staticmethod
+    def _allele_url(mgi_id: str | None) -> str | None:
+        if not mgi_id:
+            return None
+        return f"{ToolExecutor._MGI_ALLELE_URL}/{mgi_id}"
+
+    async def _mgi_gene_phenotypes(
+        self, gene_symbol: str, size: int
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Look up MP phenotype terms and alleles for a gene symbol.
+
+        MouseMine attaches MP annotations to genotypes that involve an allele
+        of the gene. We aggregate per-gene so a single gene row carries its
+        phenotype term set and allele list.
+        """
+        # gene -> MP annotations through genotypes; also pull allele identifiers
+        pheno_xml = (
+            '<query name="" model="genomic" '
+            'view="Gene.primaryIdentifier Gene.symbol Gene.name '
+            'Gene.alleles.genotypes.phenotypeTerms.identifier '
+            'Gene.alleles.genotypes.phenotypeTerms.name '
+            'Gene.alleles.primaryIdentifier Gene.alleles.symbol '
+            'Gene.alleles.name">'
+            f'<constraint path="Gene.symbol" op="=" value={quoteattr(gene_symbol)}/>'
+            '<constraint path="Gene.organism.shortName" op="=" '
+            'value="M. musculus"/>'
+            "</query>"
+        )
+        data = await self._mousemine_query(pheno_xml, size * 50)
+        if "_error" in data:
+            return data
+
+        rows = data.get("results", [])
+        # the view above produces one row per (gene, allele, MP term);
+        # collapse by gene
+        by_gene: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            mgi_id = r[0]
+            symbol = r[1]
+            name = r[2]
+            mp_id = r[3]
+            mp_term = r[4]
+            allele_id = r[5]
+            allele_symbol = r[6]
+            allele_name = r[7]
+
+            entry = by_gene.setdefault(
+                mgi_id or symbol,
+                {
+                    "mgi_id": mgi_id,
+                    "symbol": symbol,
+                    "name": name,
+                    "phenotype_terms": [],
+                    "alleles": [],
+                    "url": self._marker_url(mgi_id),
+                },
+            )
+            if mp_id and not any(
+                p["mp_id"] == mp_id for p in entry["phenotype_terms"]
+            ):
+                entry["phenotype_terms"].append({"mp_id": mp_id, "term": mp_term})
+            if allele_id and not any(
+                a["mgi_id"] == allele_id for a in entry["alleles"]
+            ):
+                entry["alleles"].append({
+                    "mgi_id": allele_id,
+                    "symbol": allele_symbol,
+                    "name": allele_name,
+                    "url": self._allele_url(allele_id),
+                })
+
+        return list(by_gene.values())[:size]
+
+    async def _mgi_phenotype_genes(
+        self, term_query: str, size: int
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Look up genes annotated to an MP term (identifier or term name)."""
+        # distinguish MP:NNNNNNN identifier from a free-text term name
+        is_mp_id = term_query.upper().startswith("MP:")
+        if is_mp_id:
+            term_constraint = (
+                '<constraint path="OntologyAnnotation.ontologyTerm.identifier" '
+                f'op="=" value={quoteattr(term_query.upper())}/>'
+            )
+        else:
+            # InterMine string-substring match is LIKE with * wildcards;
+            # wrap with * on both sides for case-insensitive substring search
+            term_constraint = (
+                '<constraint path="OntologyAnnotation.ontologyTerm.name" '
+                f'op="LIKE" value={quoteattr(f"*{term_query}*")}/>'
+            )
+
+        # MP annotations in MouseMine are attached to Genotype subjects; we
+        # traverse subject.alleles.feature to reach the annotated gene. If this
+        # path ever returns empty in practice, the alternative to try is
+        # OntologyAnnotation.subject.featureGenotypes.feature.
+        xml = (
+            '<query name="" model="genomic" '
+            'view="OntologyAnnotation.ontologyTerm.identifier '
+            'OntologyAnnotation.ontologyTerm.name '
+            'OntologyAnnotation.subject.alleles.feature.primaryIdentifier '
+            'OntologyAnnotation.subject.alleles.feature.symbol '
+            'OntologyAnnotation.subject.alleles.feature.name">'
+            f"{term_constraint}"
+            '<constraint path="OntologyAnnotation.ontologyTerm" type="MPTerm"/>'
+            '<constraint path="OntologyAnnotation.subject" type="Genotype"/>'
+            "</query>"
+        )
+        data = await self._mousemine_query(xml, size * 20)
+        if "_error" in data:
+            return data
+
+        rows = data.get("results", [])
+        by_gene: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            mp_id = r[0]
+            mp_term = r[1]
+            mgi_id = r[2]
+            symbol = r[3]
+            name = r[4]
+            if not mgi_id:
+                continue
+            entry = by_gene.setdefault(
+                mgi_id,
+                {
+                    "mgi_id": mgi_id,
+                    "symbol": symbol,
+                    "name": name,
+                    "phenotype_terms": [],
+                    "url": self._marker_url(mgi_id),
+                },
+            )
+            if mp_id and not any(
+                p["mp_id"] == mp_id for p in entry["phenotype_terms"]
+            ):
+                entry["phenotype_terms"].append({"mp_id": mp_id, "term": mp_term})
+
+        return list(by_gene.values())[:size]
+
+    async def _mgi_allele(
+        self, allele_query: str, size: int
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Look up allele details by MGI allele ID or symbol."""
+        is_mgi_id = allele_query.upper().startswith("MGI:")
+        constraint_path = (
+            "Allele.primaryIdentifier" if is_mgi_id else "Allele.symbol"
+        )
+        constraint_value = allele_query.upper() if is_mgi_id else allele_query
+
+        xml = (
+            '<query name="" model="genomic" '
+            'view="Allele.primaryIdentifier Allele.symbol Allele.name '
+            'Allele.alleleType Allele.feature.primaryIdentifier '
+            'Allele.feature.symbol Allele.feature.name '
+            'Allele.genotypes.phenotypeTerms.identifier '
+            'Allele.genotypes.phenotypeTerms.name">'
+            f'<constraint path="{constraint_path}" op="=" '
+            f'value={quoteattr(constraint_value)}/>'
+            "</query>"
+        )
+        data = await self._mousemine_query(xml, size * 50)
+        if "_error" in data:
+            return data
+
+        rows = data.get("results", [])
+        by_allele: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            allele_id = r[0]
+            allele_symbol = r[1]
+            allele_name = r[2]
+            allele_type = r[3]
+            gene_id = r[4]
+            gene_symbol = r[5]
+            gene_name = r[6]
+            mp_id = r[7]
+            mp_term = r[8]
+
+            entry = by_allele.setdefault(
+                allele_id or allele_symbol,
+                {
+                    "mgi_id": gene_id,
+                    "symbol": gene_symbol,
+                    "name": gene_name,
+                    "alleles": [{
+                        "mgi_id": allele_id,
+                        "symbol": allele_symbol,
+                        "name": allele_name,
+                        "allele_type": allele_type,
+                        "url": self._allele_url(allele_id),
+                    }],
+                    "phenotype_terms": [],
+                    "url": self._marker_url(gene_id),
+                },
+            )
+            if mp_id and not any(
+                p["mp_id"] == mp_id for p in entry["phenotype_terms"]
+            ):
+                entry["phenotype_terms"].append({"mp_id": mp_id, "term": mp_term})
+
+        return list(by_allele.values())[:size]
+
+    async def _mgi_ortholog(
+        self, gene_symbol: str, species: str, size: int
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Look up mouse-human orthologs of a gene symbol.
+
+        species='human' means the input is a human gene and we want mouse
+        orthologs; species='mouse' is the inverse direction.
+        """
+        source_organism = "H. sapiens" if species == "human" else "M. musculus"
+        xml = (
+            '<query name="" model="genomic" '
+            'view="Gene.primaryIdentifier Gene.symbol Gene.name '
+            'Gene.homologues.homologue.primaryIdentifier '
+            'Gene.homologues.homologue.symbol '
+            'Gene.homologues.homologue.name '
+            'Gene.homologues.homologue.organism.shortName">'
+            f'<constraint path="Gene.symbol" op="=" value={quoteattr(gene_symbol)}/>'
+            f'<constraint path="Gene.organism.shortName" op="=" '
+            f'value="{source_organism}"/>'
+            "</query>"
+        )
+        data = await self._mousemine_query(xml, size * 10)
+        if "_error" in data:
+            return data
+
+        rows = data.get("results", [])
+        by_gene: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            mgi_id = r[0]
+            symbol = r[1]
+            name = r[2]
+            ortho_id = r[3]
+            ortho_symbol = r[4]
+            ortho_name = r[5]
+            ortho_organism = r[6]
+
+            entry = by_gene.setdefault(
+                mgi_id or symbol,
+                {
+                    "mgi_id": mgi_id,
+                    "symbol": symbol,
+                    "name": name,
+                    "orthologs": [],
+                    "url": self._marker_url(mgi_id),
+                },
+            )
+            if ortho_id and not any(
+                o["mgi_id"] == ortho_id for o in entry["orthologs"]
+            ):
+                entry["orthologs"].append({
+                    "mgi_id": ortho_id,
+                    "symbol": ortho_symbol,
+                    "name": ortho_name,
+                    "organism": ortho_organism,
+                })
+
+        return list(by_gene.values())[:size]
 
     # -------------------------------------------------------------------------
     # Helper Methods
