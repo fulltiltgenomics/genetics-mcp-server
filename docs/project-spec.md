@@ -389,10 +389,18 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|
 | `REQUIRE_AUTH` | Require `X-Goog-Authenticated-User-Email` header (`true`/`false`) |
 | `MCP_API_KEY` | Comma-separated bearer tokens for MCP server SSE/HTTP transport auth |
+| `ALLOWED_EMAILS` | Comma-separated email allow-list for Google Identity Token (JWT) bearer auth |
+| `ALLOWED_EMAIL_DOMAINS` | Comma-separated email-domain allow-list for Google Identity Token (JWT) bearer auth (default: `finngen.fi`) |
 
 Tokens can be supplied either as an `Authorization: Bearer XXX` header or as a `?token=XXX` query parameter. The query parameter is useful for clients that don't support custom headers (e.g., claude.ai). When both are present, the Bearer header takes precedence.
 
-Per-user API tokens are also supported: users create tokens via the chat API (`POST /chat/v1/tokens`), which are validated alongside `MCP_API_KEY` in the MCP server's bearer auth middleware. Tokens are stored as SHA-256 hashes in the LLM config SQLite DB.
+The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes each presented token through three branches in order, mirroring the results-api implementation:
+
+1. **`MCP_API_KEY` shared secret** — constant-time compare against each configured value
+2. **Google Identity Token (JWT)** — if the token contains `.` it is treated as a JWT and validated via `google.oauth2.id_token.verify_oauth2_token` using a lazily-initialized singleton `google.auth.transport.requests.Request` (for JWKS caching). The payload must have `email_verified == True`; the email must be in `ALLOWED_EMAILS` or its domain in `ALLOWED_EMAIL_DOMAINS` (otherwise 401/403). Identity is set to the verified email.
+3. **Per-user API token** — fall back to validating against the local LLM config DB (SHA-256 hashed) or via the chat-backend `/v1/tokens/validate` endpoint. Users create tokens via the chat API (`POST /chat/v1/tokens`).
+
+In deployment, `ALLOWED_EMAILS` and `ALLOWED_EMAIL_DOMAINS` are sourced from the shared `bearer-auth-allowed` Kubernetes ConfigMap (defined in `genetics-results-suite/k8s/configs/`), which is also consumed by results-api so both services share an identical allow-list.
 
 ### Admin page
 
