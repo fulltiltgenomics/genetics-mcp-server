@@ -349,3 +349,224 @@ class TestBearerAuthMiddleware:
 
         assert len(call_log) == 0, "Inner app should NOT have been called"
         assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_healthz_bypasses_auth(self, wrapped_app):
+        """/healthz must return 200 OK without any credentials."""
+        app, call_log = wrapped_app
+        scope = self._make_scope()
+        scope["path"] = "/healthz"
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called for healthz"
+        assert any(
+            m.get("type") == "http.response.start" and m.get("status") == 200
+            for m in messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_token_path_accepted(self, monkeypatch):
+        """Non-JWT, non-API-key token should be validated via _validate_user_token."""
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        seen: list[str] = []
+
+        def fake_validator(token: str) -> bool:
+            seen.append(token)
+            return token == "good-user-token"
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", fake_validator
+        )
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        app = _wrap_with_bearer_auth(inner_app, [self.VALID_KEY])
+        scope = self._make_scope(headers=self._bearer_header("good-user-token"))
+
+        messages = await self._collect_response(app, scope)
+
+        assert seen == ["good-user-token"]
+        assert len(call_log) == 1
+        assert not messages
+
+
+class _StubSettings:
+    """Minimal stand-in for Settings used by the JWT branch."""
+
+    def __init__(self, allowed_emails=None, allowed_email_domains=None):
+        self.allowed_emails = set(allowed_emails or [])
+        self.allowed_email_domains = set(allowed_email_domains or [])
+
+
+class TestBearerAuthJWT:
+    """Tests for the Google Identity Token (JWT) branch of bearer auth."""
+
+    VALID_KEY = "test-secret-key-123"
+    # any string containing a dot routes to the JWT branch; signature is mocked
+    JWT_TOKEN = "header.payload.signature"
+
+    @staticmethod
+    def _make_scope(*, headers=None, query_string=b"", scope_type="http"):
+        return {
+            "type": scope_type,
+            "headers": headers or [],
+            "query_string": query_string,
+            "client": ("127.0.0.1", 12345),
+        }
+
+    @staticmethod
+    def _bearer_header(token: str) -> list[tuple[bytes, bytes]]:
+        return [(b"authorization", f"Bearer {token}".encode())]
+
+    @staticmethod
+    async def _collect_response(app, scope):
+        messages: list[dict] = []
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+        return messages
+
+    def _build_app(self, monkeypatch, *, verify_result, settings):
+        """Build an auth-wrapped ASGI app with mocked JWT verification + settings."""
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        # short-circuit user-token path so unexpected fallback would not silently pass
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
+        )
+
+        # avoid touching the real Google transport
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._get_google_request", lambda: object()
+        )
+
+        # inject deterministic settings for allow-list checks
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server.get_settings", lambda: settings
+        )
+
+        # mock the lazy import target: google.oauth2.id_token.verify_oauth2_token
+        import google.oauth2.id_token as _id_token_mod
+
+        def fake_verify(token, request):
+            if isinstance(verify_result, Exception):
+                raise verify_result
+            return verify_result
+
+        monkeypatch.setattr(_id_token_mod, "verify_oauth2_token", fake_verify)
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        app = _wrap_with_bearer_auth(inner_app, [self.VALID_KEY])
+        return app, call_log
+
+    @pytest.mark.asyncio
+    async def test_valid_jwt_allowed_domain_passes(self, monkeypatch):
+        """Valid JWT whose email matches an allowed domain should pass through."""
+        payload = {"email": "alice@finngen.fi", "email_verified": True}
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result=payload,
+            settings=_StubSettings(allowed_email_domains={"finngen.fi"}),
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_valid_jwt_allowed_email_overrides_domain(self, monkeypatch):
+        """Email in allowed_emails should pass even when domain is not allowed."""
+        payload = {"email": "bob@other.org", "email_verified": True}
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result=payload,
+            settings=_StubSettings(
+                allowed_emails={"bob@other.org"},
+                allowed_email_domains={"finngen.fi"},
+            ),
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_valid_jwt_disallowed_domain_and_email_rejected(self, monkeypatch):
+        """JWT with disallowed domain and not in allowed_emails should be 401."""
+        payload = {"email": "eve@evil.com", "email_verified": True}
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result=payload,
+            settings=_StubSettings(allowed_email_domains={"finngen.fi"}),
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_jwt_email_not_verified_rejected(self, monkeypatch):
+        """JWT with email_verified=False must be rejected with 401."""
+        payload = {"email": "alice@finngen.fi", "email_verified": False}
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result=payload,
+            settings=_StubSettings(allowed_email_domains={"finngen.fi"}),
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_invalid_jwt_signature_rejected(self, monkeypatch):
+        """ValueError from verify_oauth2_token (bad signature/expired) → 401."""
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result=ValueError("Token expired or invalid signature"),
+            settings=_StubSettings(allowed_email_domains={"finngen.fi"}),
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_jwt_without_email_rejected(self, monkeypatch):
+        """JWT payload missing 'email' must be rejected with 401."""
+        payload = {"email_verified": True}
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result=payload,
+            settings=_StubSettings(allowed_email_domains={"finngen.fi"}),
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
