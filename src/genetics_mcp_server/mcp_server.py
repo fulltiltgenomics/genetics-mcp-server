@@ -15,6 +15,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -104,6 +105,21 @@ if external_servers:
             logger.error(f"Failed to connect to external MCP server {server_url}: {e}")
 
 
+# lazily initialized Google auth transport for JWKS caching
+_google_request = None
+_google_request_lock = threading.Lock()
+
+
+def _get_google_request():
+    global _google_request
+    if _google_request is None:
+        with _google_request_lock:
+            if _google_request is None:
+                from google.auth.transport import requests as google_requests
+                _google_request = google_requests.Request()
+    return _google_request
+
+
 def _validate_user_token(token: str) -> bool:
     """Validate a user API token via chat backend or local DB."""
     # try local DB first (works when both services share the same filesystem)
@@ -144,6 +160,30 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
     def _token_is_valid(token: str) -> bool:
         if any(hmac.compare_digest(token, key) for key in api_keys):
             return True
+
+        # route by token format: JWTs have dots, user tokens don't
+        if "." in token:
+            from google.oauth2 import id_token
+            try:
+                payload = id_token.verify_oauth2_token(token, _get_google_request())
+            except ValueError as e:
+                logger.warning("invalid bearer token: %s", e)
+                return False
+            if not payload.get("email_verified", False):
+                logger.warning("Email not verified")
+                return False
+            email = payload.get("email")
+            if not email:
+                logger.warning("Token does not contain email")
+                return False
+            domain = email.split("@")[-1] if "@" in email else ""
+            settings = get_settings()
+            if email not in settings.allowed_emails and domain not in settings.allowed_email_domains:
+                logger.warning("Email domain not allowed: %s", email)
+                return False
+            logger.info("authenticated JWT user: %s", email)
+            return True
+
         return _validate_user_token(token)
 
     async def auth_middleware(scope, receive, send):
