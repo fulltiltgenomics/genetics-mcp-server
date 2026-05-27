@@ -76,7 +76,7 @@ Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQ
 
 Results from meta-analysis datasets whose `dataset_id` begins with `finngen_ukbb` or `finngen_mvp_ukbb` are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data. (`list_datasets` flags this in the description field.)
 
-Pseudo credible sets are approximate credible sets constructed from GWAS summary statistics and LD information, without formal statistical fine-mapping (like SuSiE or FINEMAP). Each set is built around a lead variant from a GWAS locus.
+Pseudo credible sets are approximate credible sets constructed from GWAS summary statistics and LD information, without formal statistical fine-mapping (like SuSiE or FINEMAP). Each set is built around a lead variant from a GWAS locus. **All pseudo credible sets are computed using the FinnGen LD reference panel**, regardless of the meta-analysis dataset they come from.
 
 **Membership criteria** — a variant is included if any of these hold (relative to the lead variant):
 1. It is the lead variant itself
