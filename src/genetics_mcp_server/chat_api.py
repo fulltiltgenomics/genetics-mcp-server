@@ -237,6 +237,23 @@ async def list_tools(user: str | None = Depends(auth_required)) -> list[dict[str
     return TOOL_DEFINITIONS
 
 
+@app.get("/chat/v1/schema")
+async def get_schema(
+    table: str | None = None,
+    user: str | None = Depends(auth_required),
+) -> dict[str, Any]:
+    """proxy to genetics-results-db /schema so the browser can fetch the BigQuery
+    view catalog (resources + tables) without needing a separate URL or env var.
+    reuses the executor's httpx client and BIGQUERY_API_URL."""
+    service = get_llm_service()
+    if not service.executor:
+        raise HTTPException(status_code=503, detail="Tool executor not initialized")
+    result = await service.executor.get_bigquery_schema(table=table)
+    if not result.get("success"):
+        raise HTTPException(status_code=502, detail=result.get("error", "schema fetch failed"))
+    return result["schema"]
+
+
 @app.post("/chat/v1/chat")
 async def stream_chat(
     request: ChatRequest,
