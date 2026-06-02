@@ -250,7 +250,9 @@ async def get_schema(
         raise HTTPException(status_code=503, detail="Tool executor not initialized")
     result = await service.executor.get_bigquery_schema(table=table)
     if not result.get("success"):
-        raise HTTPException(status_code=502, detail=result.get("error", "schema fetch failed"))
+        # 503 when the db service is simply unreachable (down/restarting), 502 for other upstream errors
+        status = 503 if result.get("unreachable") else 502
+        raise HTTPException(status_code=status, detail=result.get("error", "schema fetch failed"))
     return result["schema"]
 
 

@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 # generic error message returned to clients
 INTERNAL_ERROR_MSG = "Internal server error. Check server logs for details."
 
+# returned when an upstream service (genetics API / BigQuery db) can't be connected to,
+# as opposed to a genuine internal error — lets callers and the UI show something actionable
+UPSTREAM_UNREACHABLE_MSG = (
+    "The genetics data service is currently unreachable (connection failed). "
+    "It may be down or restarting — please try again shortly."
+)
+# marker header on the synthetic response so callers can distinguish 'unreachable'
+# from a real upstream 503
+_UNREACHABLE_HEADER = "x-fg-upstream-unreachable"
+
 # variant classifications for counting coding and loss-of-function variants
 CODING_VARIANTS = {
     "missense_variant",
@@ -56,6 +66,25 @@ LOF_VARIANTS = {
 }
 
 
+class _ResilientAsyncClient(httpx.AsyncClient):
+    """httpx client that converts upstream connection failures into a synthetic 503
+    response carrying a clear message. All get/post/etc. funnel through request(), so
+    every tool surfaces 'service unreachable' instead of an opaque internal error (or an
+    uncaught exception in methods without a try/except) when the API/db is simply down."""
+
+    async def request(self, method, url, **kwargs):  # type: ignore[override]
+        try:
+            return await super().request(method, url, **kwargs)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            logger.warning(f"upstream unreachable: {method} {url}: {e}")
+            return httpx.Response(
+                status_code=503,
+                text=UPSTREAM_UNREACHABLE_MSG,
+                headers={_UNREACHABLE_HEADER: "1"},
+                request=httpx.Request(method, url),
+            )
+
+
 class ToolExecutor:
     """Executes MCP tools by making HTTP calls to the genetics API."""
 
@@ -77,7 +106,7 @@ class ToolExecutor:
         # authenticate to results-api with shared secret if configured
         api_secret = os.environ.get("INTERNAL_API_SECRET", "")
         headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
-        self.client = httpx.AsyncClient(timeout=30.0, headers=headers)
+        self.client = _ResilientAsyncClient(timeout=30.0, headers=headers)
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion
@@ -316,6 +345,8 @@ class ToolExecutor:
             resp = await self.client.get(f"{self.bigquery_url}/schema", params=params)
             if resp.status_code == 200:
                 return {"success": True, "schema": resp.json()}
+            if resp.headers.get(_UNREACHABLE_HEADER):
+                return {"success": False, "error": UPSTREAM_UNREACHABLE_MSG, "unreachable": True}
             return {
                 "success": False,
                 "error": f"HTTP {resp.status_code}: {resp.text}",
