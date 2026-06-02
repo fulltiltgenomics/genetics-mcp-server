@@ -48,6 +48,8 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `search_genes` | Look up gene symbols and genomic positions |
 | `lookup_variants_by_rsid` | Convert rsIDs to variant IDs (chr:pos:ref:alt format) |
 | `lookup_phenotype_names` | Batch translate phenotype codes to human-readable names |
+| `get_gene_group_members` | Enumerate member genes of an HGNC gene group / family by `group_id` or `group_name`, returning symbols + genomic coordinates (olfactory receptors are included and dominate large families like GPCRs). Calls the API (`GET /api/v1/gene_group/members`), not BigQuery |
+| `normalize_gene_symbols` | Resolve gene symbols / aliases / previous symbols to current approved HGNC symbols (exact, not fuzzy); returns mappings + unresolved inputs. Calls the API (`GET /api/v1/gene/normalize`), not BigQuery |
 
 ### Credible set tools (fine-mapped GWAS results)
 
@@ -104,7 +106,9 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `query_bigquery` | Execute custom SQL against genetics views (fallback for queries specialized tools cannot handle) |
 | `get_bigquery_schema` | Get schema for BigQuery views before writing queries. Accepts optional `table` parameter to get just one table's schema. Returns resource metadata with aliases, column descriptions, allowed filter values, and example SQL queries |
 
-BigQuery contains multiple tables beyond just credible sets — including exome/burden test results, colocalization, and more. The `get_bigquery_schema` tool discovers all available tables. Views include a derived `resource` column that maps dataset names to resource identifiers (e.g., `FinnGen_R13` → `finngen`, `UKB_PPP` → `ukbb`, `Open_Targets_25.12` → `open_targets`). This allows filtering by `WHERE resource = 'finngen'` instead of matching dataset names directly. The schema response includes resource metadata with human-readable labels and aliases to help agents map user intent to correct filter values (e.g., "bipex" → `resource = 'bipex2'`). Collection resources like eQTL Catalogue are collapsed into summaries rather than listing hundreds of individual IDs.
+BigQuery contains multiple tables beyond just credible sets — including exome/burden test results, colocalization, and more. The `get_bigquery_schema` tool discovers all available tables.
+
+A `gene_annotations` BigQuery table/view (built in `genetics-results-db`) is also exposed via `get_bigquery_schema` and is the `query_bigquery` surface for cis/trans QTL filtering — JOIN its gene coordinates to `colocalization_v` instead of hand-typing coordinate literals — and for any-group gene enumeration. This stands apart from the two specialized gene tools (`get_gene_group_members`, `normalize_gene_symbols`), which call the API and do **not** read this table. Single source of truth split: the specialized tools resolve gene groups/symbols via the API; BigQuery's `gene_annotations` stands alone as the surface for SQL JOINs and ad-hoc enumeration. Views include a derived `resource` column that maps dataset names to resource identifiers (e.g., `FinnGen_R13` → `finngen`, `UKB_PPP` → `ukbb`, `Open_Targets_25.12` → `open_targets`). This allows filtering by `WHERE resource = 'finngen'` instead of matching dataset names directly. The schema response includes resource metadata with human-readable labels and aliases to help agents map user intent to correct filter values (e.g., "bipex" → `resource = 'bipex2'`). Collection resources like eQTL Catalogue are collapsed into summaries rather than listing hundreds of individual IDs.
 
 ### External search tools
 
@@ -172,7 +176,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, create_phewas_plot |
+| `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_bigquery, get_bigquery_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |

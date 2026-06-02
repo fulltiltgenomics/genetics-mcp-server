@@ -1898,6 +1898,87 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
+    async def get_gene_group_members(
+        self,
+        group_id: int | None = None,
+        group_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Enumerate the member genes of an HGNC gene group by id or name."""
+        # exactly one of group_id/group_name is required
+        provided = sum(x is not None for x in (group_id, group_name))
+        if provided != 1:
+            return {
+                "success": False,
+                "error": "Provide exactly one of 'group_id' or 'group_name'",
+            }
+
+        params: dict[str, Any] = (
+            {"group_id": group_id} if group_id is not None else {"group_name": group_name}
+        )
+
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/v1/gene_group/members", params=params
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                count = data.get("count", 0)
+                result: dict[str, Any] = {
+                    "success": True,
+                    "group_id": data.get("group_id"),
+                    "group_name": data.get("group_name"),
+                    "count": count,
+                    "members": data.get("members", []),
+                }
+                if not count:
+                    # the API loaded but has no members for this group yet (gene-group
+                    # files may not be loaded) — not an error, just nothing to return
+                    result["message"] = (
+                        "Gene group has no members yet; gene-group data may not be loaded."
+                    )
+                return result
+            if resp.status_code == 404:
+                queried = f"group_id={group_id}" if group_id is not None else f"group_name={group_name!r}"
+                return {"success": False, "error": f"Unknown gene group ({queried})"}
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in get_gene_group_members(group_id={group_id}, group_name={group_name!r}): "
+                f"{e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def normalize_gene_symbols(self, symbols: list[str]) -> dict[str, Any]:
+        """Resolve previous/alias gene symbols to current approved HGNC symbols."""
+        cleaned = [s.strip() for s in (symbols or []) if s and s.strip()]
+        if not cleaned:
+            return {
+                "success": False,
+                "error": "Provide a non-empty list of gene symbols",
+            }
+
+        # gene symbols never contain commas, so comma-join is a safe query encoding
+        joined = ",".join(cleaned)
+
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/v1/gene/normalize", params={"symbols": joined}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "success": True,
+                    "mappings": data.get("mappings", []),
+                    "unresolved": data.get("unresolved", []),
+                }
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in normalize_gene_symbols(symbols={cleaned}): "
+                f"{e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
     # -------------------------------------------------------------------------
     # External Search Tools
     # -------------------------------------------------------------------------
