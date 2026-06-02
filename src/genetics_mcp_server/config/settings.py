@@ -1,6 +1,7 @@
 """Configuration settings for genetics MCP server."""
 
 import os
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 
@@ -189,13 +190,19 @@ class Settings:
         return disabled
 
 
-# models that reject the temperature parameter
-_MODELS_WITHOUT_TEMPERATURE = {"claude-opus-4-7"}
+# Claude Opus deprecated the temperature parameter starting with 4.7;
+# assume every Opus from that version onward (4.7+, 5.x, …) rejects it.
+_OPUS_TEMPERATURE_FLOOR = (4, 7)
+_OPUS_VERSION_RE = re.compile(r"claude-opus-(\d+)-(\d+)")
 
 
 def model_rejects_temperature(model: str) -> bool:
     """Check if a model doesn't support the temperature parameter."""
-    return any(name in model for name in _MODELS_WITHOUT_TEMPERATURE)
+    match = _OPUS_VERSION_RE.search(model)
+    if match:
+        version = (int(match.group(1)), int(match.group(2)))
+        return version >= _OPUS_TEMPERATURE_FLOOR
+    return False
 
 
 @lru_cache
