@@ -766,6 +766,24 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             },
         },
     },
+    {
+        "name": "normalize_gene_symbols",
+        "category": "general",
+        "description": (
+            "Resolve input gene symbols / aliases / previous symbols to their current "
+            "approved HGNC symbol (exact match, not fuzzy). Useful to clean up a gene "
+            "list before querying. Returns mappings + any unresolved inputs. "
+            "Served by the API."
+        ),
+        "parameters": {
+            "symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Gene symbols, aliases, or previous symbols to resolve to current approved HGNC symbols.",
+                "required": True,
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -1138,6 +1156,11 @@ def register_mcp_tools(
     ) -> dict:
         """Enumerate member genes of an HGNC gene group/family (e.g. all GPCRs) with their coordinates. Provide exactly one of group_id or group_name."""
         return await executor.get_gene_group_members(group_id, group_name)
+
+    @mcp.tool()
+    async def normalize_gene_symbols(symbols: list[str]) -> dict:
+        """Resolve gene symbols/aliases/previous symbols to current approved HGNC symbols (exact match). Returns mappings plus any unresolved inputs."""
+        return await executor.normalize_gene_symbols(symbols)
 
     if "search_scientific_literature" not in _disabled:
 
