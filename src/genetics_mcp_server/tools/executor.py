@@ -1948,6 +1948,37 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
+    async def normalize_gene_symbols(self, symbols: list[str]) -> dict[str, Any]:
+        """Resolve previous/alias gene symbols to current approved HGNC symbols."""
+        cleaned = [s.strip() for s in (symbols or []) if s and s.strip()]
+        if not cleaned:
+            return {
+                "success": False,
+                "error": "Provide a non-empty list of gene symbols",
+            }
+
+        # gene symbols never contain commas, so comma-join is a safe query encoding
+        joined = ",".join(cleaned)
+
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/v1/gene/normalize", params={"symbols": joined}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {
+                    "success": True,
+                    "mappings": data.get("mappings", []),
+                    "unresolved": data.get("unresolved", []),
+                }
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in normalize_gene_symbols(symbols={cleaned}): "
+                f"{e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
     # -------------------------------------------------------------------------
     # External Search Tools
     # -------------------------------------------------------------------------
