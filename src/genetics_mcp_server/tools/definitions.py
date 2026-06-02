@@ -743,6 +743,29 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             },
         },
     },
+    {
+        "name": "get_gene_group_members",
+        "category": "general",
+        "description": (
+            "Enumerate the member genes of an HGNC gene group / family (e.g. all GPCRs), "
+            "returning gene symbols together with their genomic coordinates. "
+            "Identify the group by exactly ONE of group_id (HGNC gene-group ID) or "
+            "group_name (HGNC gene-group name); provide one, not both. "
+            "NOTE: olfactory receptors are included and dominate large families like GPCRs, "
+            "so member counts for such families are large. "
+            "Results come from HGNC gene-group data served by the API."
+        ),
+        "parameters": {
+            "group_id": {
+                "type": "integer",
+                "description": "HGNC gene-group ID. Provide exactly one of group_id or group_name.",
+            },
+            "group_name": {
+                "type": "string",
+                "description": "HGNC gene-group / family name (e.g. 'G protein-coupled receptors'). Provide exactly one of group_id or group_name.",
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -1107,6 +1130,14 @@ def register_mcp_tools(
         return await executor.get_genes_in_region(
             chr, start, end, gene_type, gencode_version
         )
+
+    @mcp.tool()
+    async def get_gene_group_members(
+        group_id: int | None = None,
+        group_name: str | None = None,
+    ) -> dict:
+        """Enumerate member genes of an HGNC gene group/family (e.g. all GPCRs) with their coordinates. Provide exactly one of group_id or group_name."""
+        return await executor.get_gene_group_members(group_id, group_name)
 
     if "search_scientific_literature" not in _disabled:
 
