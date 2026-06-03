@@ -226,6 +226,35 @@ class TestMessageEndpoints:
         assert response.status_code == 200
         assert response.json()["content_json"] == content_json
 
+    def test_save_message_with_tool_results_json(self, client_with_auth):
+        """Test that tool_results_json round-trips through save and get."""
+        create_resp = client_with_auth.post("/chat/v1/chat/sessions", json={})
+        session_id = create_resp.json()["id"]
+
+        content_json = '[{"type": "tool_use", "id": "tu_1", "name": "x", "input": {}}]'
+        tool_results_json = (
+            '[{"type": "tool_result", "tool_use_id": "tu_1", "content": "{\\"rows\\": 5}"}]'
+        )
+        response = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={
+                "id": "msg-1",
+                "role": "assistant",
+                "content": "Done",
+                "content_json": content_json,
+                "tool_results_json": tool_results_json,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["tool_results_json"] == tool_results_json
+
+        # round-trips through GET session detail
+        detail = client_with_auth.get(f"/chat/v1/chat/sessions/{session_id}")
+        assert detail.status_code == 200
+        msg = detail.json()["messages"][0]
+        assert msg["tool_results_json"] == tool_results_json
+
     def test_save_message_invalid_role(self, client_with_auth):
         """Test that invalid role is rejected."""
         create_resp = client_with_auth.post("/chat/v1/chat/sessions", json={})

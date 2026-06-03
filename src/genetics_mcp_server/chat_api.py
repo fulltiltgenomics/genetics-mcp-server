@@ -340,7 +340,11 @@ async def stream_chat(
                     yield {
                         "event": "message",
                         "data": json.dumps(
-                            {"type": "done", "message_content": chunk.message_content}
+                            {
+                                "type": "done",
+                                "message_content": chunk.message_content,
+                                "tool_results": chunk.tool_results,
+                            }
                         ),
                     }
 
