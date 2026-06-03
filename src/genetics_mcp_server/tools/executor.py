@@ -1902,6 +1902,7 @@ class ToolExecutor:
         self,
         group_id: int | None = None,
         group_name: str | None = None,
+        exclude_olfactory: bool = True,
     ) -> dict[str, Any]:
         """Enumerate the member genes of an HGNC gene group by id or name."""
         # exactly one of group_id/group_name is required
@@ -1915,6 +1916,9 @@ class ToolExecutor:
         params: dict[str, Any] = (
             {"group_id": group_id} if group_id is not None else {"group_name": group_name}
         )
+        # default to excluding olfactory receptors: they are GPCRs that dominate
+        # large families by sheer count and are rarely the analysis target
+        params["exclude_olfactory"] = exclude_olfactory
 
         try:
             resp = await self.client.get(
@@ -1927,6 +1931,7 @@ class ToolExecutor:
                     "success": True,
                     "group_id": data.get("group_id"),
                     "group_name": data.get("group_name"),
+                    "exclude_olfactory": data.get("exclude_olfactory", exclude_olfactory),
                     "count": count,
                     "members": data.get("members", []),
                 }

@@ -53,9 +53,9 @@ class TestGetGeneGroupMembers:
         assert result["members"] == json_data["members"]
         # message only present when there are no members
         assert "message" not in result
-        # request used the group_id param, not group_name
+        # request used the group_id param, not group_name; olfactory excluded by default
         _, kwargs = mock_get.call_args
-        assert kwargs["params"] == {"group_id": 588}
+        assert kwargs["params"] == {"group_id": 588, "exclude_olfactory": True}
 
     async def test_success_by_group_name(self):
         json_data = {
@@ -75,7 +75,22 @@ class TestGetGeneGroupMembers:
         assert result["success"] is True
         assert result["count"] == 1
         _, kwargs = mock_get.call_args
-        assert kwargs["params"] == {"group_name": "Solute carriers"}
+        assert kwargs["params"] == {
+            "group_name": "Solute carriers",
+            "exclude_olfactory": True,
+        }
+
+    async def test_exclude_olfactory_false_passed_through(self):
+        json_data = {"group_id": 139, "group_name": "GPCRs", "count": 0, "members": []}
+        mock = _mock_response(json_data=json_data)
+        with patch.object(
+            self.executor.client, "get", new_callable=AsyncMock, return_value=mock
+        ) as mock_get:
+            await self.executor.get_gene_group_members(
+                group_id=139, exclude_olfactory=False
+            )
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"group_id": 139, "exclude_olfactory": False}
 
     async def test_neither_arg_makes_no_api_call(self):
         with patch.object(

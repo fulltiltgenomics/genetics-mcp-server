@@ -751,9 +751,14 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "returning gene symbols together with their genomic coordinates. "
             "Identify the group by exactly ONE of group_id (HGNC gene-group ID) or "
             "group_name (HGNC gene-group name); provide one, not both. "
-            "NOTE: olfactory receptors are included and dominate large families like GPCRs, "
-            "so member counts for such families are large. "
-            "Results come from HGNC gene-group data served by the API."
+            "By default olfactory receptors are EXCLUDED (exclude_olfactory=true): they are "
+            "GPCRs that dominate large families like GPCRs by sheer count and are rarely the "
+            "analysis target. Set exclude_olfactory=false to get the full membership. "
+            "Results come from HGNC gene-group data served by the API. "
+            "TIP: for BigQuery analyses joining a whole gene group (e.g. cis-pQTL "
+            "colocalizations for all GPCRs), prefer filtering gene_annotations_v directly "
+            "on gene_group_ids/gene_group_names rather than enumerating members here — see "
+            "the get_bigquery_schema example for gene_annotations_v."
         ),
         "parameters": {
             "group_id": {
@@ -763,6 +768,14 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "group_name": {
                 "type": "string",
                 "description": "HGNC gene-group / family name (e.g. 'G protein-coupled receptors'). Provide exactly one of group_id or group_name.",
+            },
+            "exclude_olfactory": {
+                "type": "boolean",
+                "description": (
+                    "Exclude olfactory receptors (default true). They are GPCRs that dominate "
+                    "large families by count; set false to include them in the full membership."
+                ),
+                "default": True,
             },
         },
     },
@@ -1153,9 +1166,12 @@ def register_mcp_tools(
     async def get_gene_group_members(
         group_id: int | None = None,
         group_name: str | None = None,
+        exclude_olfactory: bool = True,
     ) -> dict:
-        """Enumerate member genes of an HGNC gene group/family (e.g. all GPCRs) with their coordinates. Provide exactly one of group_id or group_name."""
-        return await executor.get_gene_group_members(group_id, group_name)
+        """Enumerate member genes of an HGNC gene group/family (e.g. all GPCRs) with their coordinates. Provide exactly one of group_id or group_name. Olfactory receptors are excluded by default (exclude_olfactory=true)."""
+        return await executor.get_gene_group_members(
+            group_id, group_name, exclude_olfactory
+        )
 
     @mcp.tool()
     async def normalize_gene_symbols(symbols: list[str]) -> dict:

@@ -48,7 +48,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `search_genes` | Look up gene symbols and genomic positions |
 | `lookup_variants_by_rsid` | Convert rsIDs to variant IDs (chr:pos:ref:alt format) |
 | `lookup_phenotype_names` | Batch translate phenotype codes to human-readable names |
-| `get_gene_group_members` | Enumerate member genes of an HGNC gene group / family by `group_id` or `group_name`, returning symbols + genomic coordinates (olfactory receptors are included and dominate large families like GPCRs). Calls the API (`GET /api/v1/gene_group/members`), not BigQuery |
+| `get_gene_group_members` | Enumerate member genes of an HGNC gene group / family by `group_id` or `group_name`, returning symbols + genomic coordinates. Olfactory receptors are **excluded by default** (`exclude_olfactory=true`) since they are GPCRs that dominate large families by count; pass `exclude_olfactory=false` for full membership. Calls the API (`GET /api/v1/gene_group/members`), not BigQuery. For whole-group BigQuery joins (e.g. cis-pQTL colocalizations for all GPCRs), prefer filtering `gene_annotations_v` on `gene_group_ids`/`gene_group_names` directly |
 | `normalize_gene_symbols` | Resolve gene symbols / aliases / previous symbols to current approved HGNC symbols (exact, not fuzzy); returns mappings + unresolved inputs. Calls the API (`GET /api/v1/gene/normalize`), not BigQuery |
 
 ### Credible set tools (fine-mapped GWAS results)
@@ -315,6 +315,8 @@ Each skill has:
 - `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
 **Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
+
+**Advertisement gated on availability**: `launch_subagents` is advertised to the LLM only when the subagent service actually initialized (`self.subagent_service is not None`), not merely when `ENABLE_SUBAGENTS` is set. The service requires a live Anthropic client + executor in addition to the flag, so `_stream_anthropic()` adds `launch_subagents` to the effective `disabled_tools` whenever the service is absent. This single source of truth prevents the LLM from seeing a tool that would return "subagent service isn't available" on call.
 
 **Cost and token tracking**: `SubagentResult` accumulates `input_tokens` and `output_tokens` across all iterations of a subagent's agentic loop. After `launch_subagents` completes, `llm_service.py` sums tokens across all subagent results and logs an aggregated cost estimate using the same `estimate_cost()` function as the main agent.
 

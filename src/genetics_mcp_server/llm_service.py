@@ -350,11 +350,21 @@ class LLMService:
         # add tool definitions if enabled
         tool_definitions = None
         if enable_tools and settings.mcp_enabled:
+            # single source of truth: never advertise launch_subagents unless the
+            # subagent service actually initialized. settings.disabled_tools gates
+            # only on the enable_subagents flag, but the service also requires a
+            # live anthropic client + executor; advertising a tool the service
+            # can't run is what produced the confusing "subagent service isn't
+            # available" error when a call came back.
+            disabled = set(settings.disabled_tools)
+            if self.subagent_service is None:
+                disabled.add("launch_subagents")
+
             # get local tools filtered by profile
             tool_definitions = get_anthropic_tools(
                 custom_tool_descriptions,
                 tool_profile=tool_profile,
-                disabled_tools=settings.disabled_tools,
+                disabled_tools=disabled,
             )
             local_count = len(tool_definitions)
 
