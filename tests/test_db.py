@@ -187,15 +187,45 @@ class TestChatHistoryDB:
         messages = chat_history_db.get_messages(session.id)
         assert messages[0].literature_backend == "perplexity"
 
-    def test_add_message_upsert(self, chat_history_db):
-        """Test that adding a message with same ID updates it."""
+    def test_add_message_with_tool_results_json(self, chat_history_db):
+        """Test adding an assistant message with persisted tool_result blocks."""
         session = chat_history_db.create_session("user@example.com")
-        chat_history_db.add_message(session.id, "msg1", "user", "Hello")
-        chat_history_db.add_message(session.id, "msg1", "user", "Updated Hello")
+        tool_results_json = (
+            '[{"type": "tool_result", "tool_use_id": "tu_1", "content": "{\\"rows\\": 5}"}]'
+        )
+        msg = chat_history_db.add_message(
+            session.id, "msg1", "assistant", "Done",
+            content_json='[{"type": "tool_use", "id": "tu_1", "name": "x", "input": {}}]',
+            tool_results_json=tool_results_json,
+        )
+
+        assert msg.tool_results_json == tool_results_json
+
+        # verify it persists when retrieved
+        messages = chat_history_db.get_messages(session.id)
+        assert messages[0].tool_results_json == tool_results_json
+
+    def test_add_message_upsert(self, chat_history_db):
+        """Test that adding a message with same ID updates it (incl. tool_results_json)."""
+        session = chat_history_db.create_session("user@example.com")
+        chat_history_db.add_message(
+            session.id, "msg1", "assistant", "Hello", tool_results_json='[{"a": 1}]'
+        )
+        chat_history_db.add_message(
+            session.id, "msg1", "assistant", "Updated Hello", tool_results_json='[{"a": 2}]'
+        )
 
         messages = chat_history_db.get_messages(session.id)
         assert len(messages) == 1
         assert messages[0].content == "Updated Hello"
+        assert messages[0].tool_results_json == '[{"a": 2}]'
+
+    def test_tool_results_json_defaults_none_for_old_messages(self, chat_history_db):
+        """Messages saved without tool results have tool_results_json = None (back-compat)."""
+        session = chat_history_db.create_session("user@example.com")
+        chat_history_db.add_message(session.id, "msg1", "user", "Hello")
+        messages = chat_history_db.get_messages(session.id)
+        assert messages[0].tool_results_json is None
 
     def test_get_messages(self, chat_history_db):
         """Test retrieving messages for a session."""

@@ -84,6 +84,23 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
     return result
 
 
+def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
+    """Add a cache_control breakpoint to the last block of the last message.
+
+    Mutates `messages` in place. Normalizes a plain-string content into a single
+    text block so the breakpoint can attach. No-op for an empty message list.
+    """
+    if not messages:
+        return
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+        last["content"] = content
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+
+
 @dataclass
 class StreamChunk:
     """A chunk from the LLM stream."""
@@ -92,6 +109,8 @@ class StreamChunk:
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
+    # tool_result blocks for this turn, for persistence (only set when type="done")
+    tool_results: list[dict[str, Any]] | None = None
     # image fields (only set when type="image")
     image_format: str | None = None
     image_alt: str | None = None
@@ -331,6 +350,15 @@ class LLMService:
             [msg for msg in messages if msg["role"] != "system"]
         )
 
+        # cache the replayed conversation history: mark the last content block of
+        # the last message with a cache_control breakpoint. This is the 3rd of
+        # Anthropic's 4 allowed breakpoints (system prompt and tool definitions use
+        # the other two). It offsets the larger replayed payload now that tool
+        # results are persisted and replayed. Caveats: ephemeral cache TTL is ~5 min,
+        # and the cache lookback window means very long tool-heavy single turns may
+        # not hit. Caching is most valuable for resumes and rapid follow-ups.
+        _mark_history_cache_breakpoint(anthropic_messages)
+
         # prepare request parameters
         request_params: dict[str, Any] = {
             "model": model,
@@ -408,6 +436,9 @@ class LLMService:
 
             # collect all content blocks for persistence
             all_content_blocks: list[dict[str, Any]] = []
+            # collect tool_result blocks across iterations for persistence, so resumed
+            # conversations replay the actual tool data and not just the prose summary
+            all_tool_results: list[dict[str, Any]] = []
 
             while iteration < max_iterations:
                 iteration += 1
@@ -620,6 +651,8 @@ class LLMService:
                         {"type": "tool_result", "tool_use_id": tool_use.id, "content": result_json}
                     )
 
+                all_tool_results.extend(tool_results)
+
                 # continue conversation with tool results
                 request_params["messages"] = [
                     *request_params["messages"],
@@ -639,7 +672,11 @@ class LLMService:
                 f"total_cost=${total_cost:.4f}"
             )
 
-            yield StreamChunk(type="done", message_content=all_content_blocks)
+            yield StreamChunk(
+                type="done",
+                message_content=all_content_blocks,
+                tool_results=all_tool_results or None,
+            )
 
         except asyncio.TimeoutError:
             logger.error("Anthropic streaming timed out after 300s")

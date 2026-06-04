@@ -95,6 +95,10 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
 
 **Key distinction**: These are heuristic groupings based on LD and association strength. PIPs from pseudo credible sets should be interpreted with more caution than those from formal fine-mapping.
 
+**Membership is NOT the same as LD.** A variant is a member of a credible set ONLY if it is actually returned as a member by `get_credible_set_by_id` (or appears in the `credible_sets_v` rows for that `cs_id`). The r² thresholds above are how membership is *computed* — use them as a sanity check, never as a substitute. In particular, a variant in *partial* LD with the lead (e.g. r² ≈ 0.4–0.6) is NOT a member; describe it as "in partial LD with the lead", never as "a member of the credible set". When in doubt, verify with `get_credible_set_by_id` before calling anything a member.
+
+**Re-query; do not answer from memory.** For questions about how many credible sets are in a region, which variants are members, or whether a variant is a lead, derive the answer from a fresh authoritative call (`get_credible_set_by_id`, `get_credible_sets_by_variant`, `get_credible_sets_by_gene`, or a BigQuery `COUNT`) — not from an earlier summary or a list you curated earlier in the conversation. This is especially important when resuming an earlier conversation: do not treat a previously hand-selected subset (e.g. "the top N leads") as complete. If the user cites an external source (e.g. a paper) that conflicts with what you said earlier, re-query the data before conceding or correcting.
+
 For BigQuery queries, always call get_bigquery_schema first to discover all available tables and their columns.
 The database contains tables for credible sets, colocalization, exome/burden test results, and more.
 Use fully qualified view names (e.g., `genetics_results.credible_sets_v`). Views include a `resource` column for filtering by data source.

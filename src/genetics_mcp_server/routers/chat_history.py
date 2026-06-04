@@ -68,6 +68,7 @@ class MessageResponse(BaseModel):
     content_json: Optional[str] = None  # JSON string of full message content blocks
     literature_backend: Optional[str] = None  # europepmc or perplexity
     tool_profile: Optional[str] = None  # api, bigquery, rag, or None (all)
+    tool_results_json: Optional[str] = None  # JSON string of tool_result blocks for this assistant turn
 
 
 class SessionDetailResponse(BaseModel):
@@ -97,6 +98,7 @@ class MessageSaveRequest(BaseModel):
     content_json: Optional[str] = Field(None, description="JSON string of full message content blocks")
     literature_backend: Optional[str] = Field(None, description="Literature search backend: europepmc or perplexity")
     tool_profile: Optional[str] = Field(None, description="Tool profile: api, bigquery, rag, or null (all)")
+    tool_results_json: Optional[str] = Field(None, description="JSON string of tool_result blocks for this assistant turn")
 
 
 class MessageRatingRequest(BaseModel):
@@ -261,6 +263,7 @@ async def get_session(
                 content_json=msg.content_json,
                 literature_backend=msg.literature_backend,
                 tool_profile=msg.tool_profile,
+                tool_results_json=msg.tool_results_json,
             )
             for msg in messages
         ],
@@ -401,6 +404,7 @@ async def save_message(
         request.content_json,
         request.literature_backend,
         request.tool_profile,
+        request.tool_results_json,
     )
 
     return MessageResponse(
@@ -412,6 +416,7 @@ async def save_message(
         content_json=msg.content_json,
         literature_backend=msg.literature_backend,
         tool_profile=msg.tool_profile,
+        tool_results_json=msg.tool_results_json,
     )
 
 
