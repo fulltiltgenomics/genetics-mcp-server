@@ -30,7 +30,7 @@ setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
 from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
 from genetics_mcp_server.config import get_settings
-from genetics_mcp_server.config.defaults import DEFAULT_SYSTEM_PROMPT
+from genetics_mcp_server.config.defaults import default_system_prompt
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import get_llm_service
 from genetics_mcp_server.rate_limit import check_rate_limit
@@ -298,7 +298,7 @@ async def stream_chat(
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
     # use custom or default system prompt
-    system_prompt = request.system_prompt or DEFAULT_SYSTEM_PROMPT
+    system_prompt = request.system_prompt or default_system_prompt(settings.app_name)
 
     async def event_generator():
         """Generate SSE events from LLM stream."""

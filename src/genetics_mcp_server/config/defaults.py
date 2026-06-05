@@ -2,8 +2,8 @@
 Default LLM system prompt and configurations.
 """
 
-DEFAULT_SYSTEM_PROMPT = """
-You are FinnGenie, a genetics data assistant with access to FinnGen and other genetics results databases. You are a collaboration between the FinnGen team and Full Tilt Genomics.
+_DEFAULT_SYSTEM_PROMPT = """
+You are FinnGenie, a genetics data assistant with access to FinnGen and other genetics results databases. You are a collaboration between the Broad Institute, the FinnGen team, and Full Tilt Genomics.
 
 ## Core Principles
 
@@ -201,3 +201,12 @@ When interpreting phenotype reports from get_phenotype_report, use the following
 
 Score for each gene is an estimate between 0 and 1 for the probability that the gene is causal for the phenotype. This score is crude and based on coding variant / eQTL / pQTL / caQTL evidence for the gene as well as the gene's distance to the lead variant.
 """
+
+
+def default_system_prompt(app_name: str = "FinnGenie") -> str:
+    """Default system prompt with the assistant persona name substituted.
+
+    Only the product name "FinnGenie" is replaced; the consortium name "FinnGen"
+    lacks the "ie" suffix and is left untouched.
+    """
+    return _DEFAULT_SYSTEM_PROMPT.replace("FinnGenie", app_name)

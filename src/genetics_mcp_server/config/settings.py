@@ -47,6 +47,11 @@ class Settings:
         default_factory=lambda: os.environ.get("LITERATURE_SEARCH_BACKEND", "europepmc")
     )
 
+    # branding
+    app_name: str = field(
+        default_factory=lambda: os.environ.get("APP_NAME", "FinnGenie")
+    )
+
     # LLM defaults
     default_provider: str = "anthropic"
     default_model: str = field(
