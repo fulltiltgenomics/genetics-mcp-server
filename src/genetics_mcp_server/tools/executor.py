@@ -107,6 +107,10 @@ class ToolExecutor:
         api_secret = os.environ.get("INTERNAL_API_SECRET", "")
         headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
         self.client = _ResilientAsyncClient(timeout=30.0, headers=headers)
+        # separate client for third-party calls: carries no default auth so the
+        # internal API secret is never leaked to external services (e.g. MouseMine,
+        # myvariant.info). Per-call auth (Perplexity, Tavily) is passed explicitly.
+        self.external_client = _ResilientAsyncClient(timeout=30.0)
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion
@@ -251,8 +255,9 @@ class ToolExecutor:
         return f"{url}?{urlencode(query)}"
 
     async def close(self):
-        """Close the HTTP client."""
+        """Close the HTTP clients."""
         await self.client.aclose()
+        await self.external_client.aclose()
 
     # -------------------------------------------------------------------------
     # BigQuery Tools
@@ -892,7 +897,7 @@ class ToolExecutor:
             # window = 2 * distance + 1000000 (API bug workaround)
             window = 2 * distance + 1_000_000
 
-            resp = await self.client.get(
+            resp = await self.external_client.get(
                 "https://api.finngen.fi/api/ld",
                 params={
                     "variant": variant1,
@@ -960,7 +965,7 @@ class ToolExecutor:
             except ValueError as e:
                 return {"success": False, "error": str(e)}
 
-            resp = await self.client.get(
+            resp = await self.external_client.get(
                 "https://api.finngen.fi/api/ld",
                 params={
                     "variant": variant,
@@ -2051,7 +2056,7 @@ class ToolExecutor:
         )
 
         try:
-            resp = await self.client.get(url, timeout=15.0)
+            resp = await self.external_client.get(url, timeout=15.0)
             if resp.status_code == 200:
                 data = resp.json()
                 results = self._format_literature_results(
@@ -2133,7 +2138,7 @@ class ToolExecutor:
             "Content-Type": "application/json",
         }
 
-        resp = await self.client.post(
+        resp = await self.external_client.post(
             "https://api.perplexity.ai/chat/completions",
             json=payload,
             headers=headers,
@@ -2288,7 +2293,7 @@ class ToolExecutor:
             "format": "json",
             "size": str(size),
         }
-        resp = await self.client.get(
+        resp = await self.external_client.get(
             self._MOUSEMINE_URL, params=params, timeout=20.0
         )
         if resp.status_code != 200:
@@ -2877,7 +2882,7 @@ class ToolExecutor:
         if exclude_domains:
             payload["exclude_domains"] = exclude_domains
 
-        resp = await self.client.post(
+        resp = await self.external_client.post(
             "https://api.tavily.com/search", json=payload, timeout=20.0
         )
 
@@ -2961,7 +2966,7 @@ class ToolExecutor:
                     return {"success": False, "error": str(e)}
 
                 url = f"{base_url}/variant/{quote(hgvs_id, safe='')}"
-                resp = await self.client.get(url, params=params, timeout=15.0)
+                resp = await self.external_client.get(url, params=params, timeout=15.0)
 
                 if resp.status_code == 404:
                     return {"success": True, "variant": variant, "found": False, "annotations": {}}
@@ -2997,7 +3002,7 @@ class ToolExecutor:
                     "assembly": "hg38",
                 }
 
-                resp = await self.client.post(
+                resp = await self.external_client.post(
                     url,
                     data=post_data,
                     headers={"content-type": "application/x-www-form-urlencoded"},

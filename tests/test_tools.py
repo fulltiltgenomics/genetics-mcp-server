@@ -944,7 +944,7 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.search_mgi(query="Trp53", query_type="gene_phenotypes")
 
         assert result["success"] is True
@@ -976,7 +976,7 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.search_mgi(
                 query="MP:0001262", query_type="phenotype_genes"
             )
@@ -1011,7 +1011,7 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.search_mgi(
                 query="MGI:1857436", query_type="allele"
             )
@@ -1046,7 +1046,7 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.search_mgi(
                 query="Trp53", query_type="ortholog", species="mouse"
             )
@@ -1064,7 +1064,7 @@ class TestSearchMGI:
         from unittest.mock import AsyncMock, patch
 
         mock = self._mock_response(json_data={"results": []})
-        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.search_mgi(query="Xyz123", query_type="gene_phenotypes")
 
         assert result["success"] is True
@@ -1076,7 +1076,7 @@ class TestSearchMGI:
         from unittest.mock import AsyncMock, patch
 
         mock = self._mock_response(status_code=500, text="MouseMine is down")
-        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.search_mgi(query="Trp53")
 
         assert result["success"] is False
@@ -1091,7 +1091,7 @@ class TestSearchMGI:
         import httpx
 
         with patch.object(
-            self.executor.client,
+            self.executor.external_client,
             "get",
             new_callable=AsyncMock,
             side_effect=httpx.TimeoutException("timed out"),
