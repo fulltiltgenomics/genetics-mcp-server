@@ -2323,17 +2323,23 @@ class ToolExecutor:
         of the gene. We aggregate per-gene so a single gene row carries its
         phenotype term set and allele list.
         """
-        # gene -> MP annotations through genotypes; also pull allele identifiers
+        # gene -> MP annotations through genotypes; also pull allele identifiers.
+        # MouseMine no longer exposes Genotype.phenotypeTerms; MP terms are now
+        # reached via Genotype.ontologyAnnotations.ontologyTerm, and the MPTerm
+        # type constraint keeps disease (DOID) annotations out of the phenotype
+        # set. Mouse is selected by NCBI taxon id (10090) because its organism
+        # shortName is "M. musculus/domesticus", not "M. musculus".
         pheno_xml = (
             '<query name="" model="genomic" '
             'view="Gene.primaryIdentifier Gene.symbol Gene.name '
-            'Gene.alleles.genotypes.phenotypeTerms.identifier '
-            'Gene.alleles.genotypes.phenotypeTerms.name '
+            'Gene.alleles.genotypes.ontologyAnnotations.ontologyTerm.identifier '
+            'Gene.alleles.genotypes.ontologyAnnotations.ontologyTerm.name '
             'Gene.alleles.primaryIdentifier Gene.alleles.symbol '
             'Gene.alleles.name">'
             f'<constraint path="Gene.symbol" op="=" value={quoteattr(gene_symbol)}/>'
-            '<constraint path="Gene.organism.shortName" op="=" '
-            'value="M. musculus"/>'
+            '<constraint path="Gene.organism.taxonId" op="=" value="10090"/>'
+            '<constraint path="Gene.alleles.genotypes.ontologyAnnotations'
+            '.ontologyTerm" type="MPTerm"/>'
             "</query>"
         )
         data = await self._mousemine_query(pheno_xml, size * 50)
@@ -2457,15 +2463,20 @@ class ToolExecutor:
         )
         constraint_value = allele_query.upper() if is_mgi_id else allele_query
 
+        # MP terms hang off Genotype.ontologyAnnotations.ontologyTerm (the old
+        # Genotype.phenotypeTerms field is gone); the MPTerm type constraint
+        # keeps disease (DOID) annotations out of the phenotype set.
         xml = (
             '<query name="" model="genomic" '
             'view="Allele.primaryIdentifier Allele.symbol Allele.name '
             'Allele.alleleType Allele.feature.primaryIdentifier '
             'Allele.feature.symbol Allele.feature.name '
-            'Allele.genotypes.phenotypeTerms.identifier '
-            'Allele.genotypes.phenotypeTerms.name">'
+            'Allele.genotypes.ontologyAnnotations.ontologyTerm.identifier '
+            'Allele.genotypes.ontologyAnnotations.ontologyTerm.name">'
             f'<constraint path="{constraint_path}" op="=" '
             f'value={quoteattr(constraint_value)}/>'
+            '<constraint path="Allele.genotypes.ontologyAnnotations'
+            '.ontologyTerm" type="MPTerm"/>'
             "</query>"
         )
         data = await self._mousemine_query(xml, size * 50)
@@ -2517,7 +2528,10 @@ class ToolExecutor:
         species='human' means the input is a human gene and we want mouse
         orthologs; species='mouse' is the inverse direction.
         """
-        source_organism = "H. sapiens" if species == "human" else "M. musculus"
+        # Select the source organism by NCBI taxon id (human 9606, mouse 10090)
+        # rather than shortName, since mouse's shortName is "M. musculus/
+        # domesticus" and an "M. musculus" match returns nothing.
+        source_taxon = "9606" if species == "human" else "10090"
         xml = (
             '<query name="" model="genomic" '
             'view="Gene.primaryIdentifier Gene.symbol Gene.name '
@@ -2526,8 +2540,8 @@ class ToolExecutor:
             'Gene.homologues.homologue.name '
             'Gene.homologues.homologue.organism.shortName">'
             f'<constraint path="Gene.symbol" op="=" value={quoteattr(gene_symbol)}/>'
-            f'<constraint path="Gene.organism.shortName" op="=" '
-            f'value="{source_organism}"/>'
+            f'<constraint path="Gene.organism.taxonId" op="=" '
+            f'value="{source_taxon}"/>'
             "</query>"
         )
         data = await self._mousemine_query(xml, size * 10)
