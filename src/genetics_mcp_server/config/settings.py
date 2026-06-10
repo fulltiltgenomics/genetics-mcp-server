@@ -59,7 +59,15 @@ class Settings:
     )
     fast_model: str = "claude-haiku-4-5"
     max_tokens: int = 8192
-    temperature: float = 0.3
+    # temperature is off by default; many current models (Fable, Opus 4.7+)
+    # reject it. set TEMPERATURE to opt in for models that still support it.
+    temperature: float | None = field(
+        default_factory=lambda: (
+            float(os.environ["TEMPERATURE"])
+            if os.environ.get("TEMPERATURE", "").strip()
+            else None
+        )
+    )
 
     # MCP settings
     mcp_enabled: bool = True
@@ -197,12 +205,16 @@ class Settings:
 
 # Claude Opus deprecated the temperature parameter starting with 4.7;
 # assume every Opus from that version onward (4.7+, 5.x, …) rejects it.
+# Claude Fable models don't support temperature at all.
 _OPUS_TEMPERATURE_FLOOR = (4, 7)
 _OPUS_VERSION_RE = re.compile(r"claude-opus-(\d+)-(\d+)")
+_FABLE_RE = re.compile(r"claude-fable-")
 
 
 def model_rejects_temperature(model: str) -> bool:
     """Check if a model doesn't support the temperature parameter."""
+    if _FABLE_RE.search(model):
+        return True
     match = _OPUS_VERSION_RE.search(model)
     if match:
         version = (int(match.group(1)), int(match.group(2)))

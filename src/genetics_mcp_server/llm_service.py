@@ -302,13 +302,15 @@ class LLMService:
 
         try:
             logger.info(f"Streaming OpenAI chat with model {model}")
-            stream = await self.openai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                max_tokens=settings.max_tokens,
-                temperature=settings.temperature,
-            )
+            openai_params: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "max_tokens": settings.max_tokens,
+            }
+            if settings.temperature is not None:
+                openai_params["temperature"] = settings.temperature
+            stream = await self.openai_client.chat.completions.create(**openai_params)
 
             accumulated_text = ""
             async for chunk in stream:
@@ -365,8 +367,9 @@ class LLMService:
             "messages": anthropic_messages,
             "max_tokens": settings.max_tokens,
         }
-        # some models (e.g. claude-opus-4-7) don't support temperature
-        if not model_rejects_temperature(model):
+        # temperature is off by default; only send it when explicitly
+        # configured and the model supports it (Fable and Opus 4.7+ reject it)
+        if settings.temperature is not None and not model_rejects_temperature(model):
             request_params["temperature"] = settings.temperature
 
         if system_prompt:
