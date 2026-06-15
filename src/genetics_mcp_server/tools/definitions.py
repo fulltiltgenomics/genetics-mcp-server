@@ -71,8 +71,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "window": {
                 "type": "integer",
-                "description": "Window size in bp around gene (default 100000)",
-                "default": 100000,
+                "description": "Flank in bp added on each side of the gene body (default 500000). A wide window is used because the strongest signal attributed to a gene can sit far from its body — e.g. a long-range regulatory variant several hundred kb upstream. Narrow it only when you specifically want signals inside or immediately around the gene.",
+                "default": 500000,
             },
             "resource": {
                 "type": "string",
@@ -210,7 +210,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_asm_qtl_by_gene",
         "category": "api",
-        "description": "Get allele-specific methylation QTL (ASM-QTL) data for variants in a gene. Returns associations between sequence variants and CpG/MDS methylation rates where the gene has the most severe consequence.",
+        "description": "Get allele-specific methylation QTL (ASM-QTL) data for variants near a gene. Returns associations between sequence variants and CpG/MDS methylation rates for variants within the gene body ± window, selected by genomic coordinates (not by most-severe-consequence attribution, which misses nearby regulatory variants).",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -220,6 +220,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "resources": {
                 "type": "string",
                 "description": "Comma-separated resources: 'decode_cpg' (CpG methylation), 'decode_mds' (MDS methylation). Omit to search all.",
+            },
+            "window": {
+                "type": "integer",
+                "description": "Flank in bp added on each side of the gene body (default 500000).",
+                "default": 500000,
             },
         },
     },
@@ -1001,7 +1006,7 @@ def register_mcp_tools(
     @mcp.tool()
     async def get_credible_sets_by_gene(
         gene: str,
-        window: int = 100000,
+        window: int = 500000,
         resource: str | None = None,
         data_types: str | None = None,
         summarize: bool = True,
@@ -1072,9 +1077,10 @@ def register_mcp_tools(
     async def get_asm_qtl_by_gene(
         gene: str,
         resources: str | None = None,
+        window: int = 500000,
     ) -> dict:
-        """Get ASM-QTL data for variants in a gene."""
-        return await executor.get_asm_qtl_by_gene(gene, resources)
+        """Get ASM-QTL data for variants near a gene."""
+        return await executor.get_asm_qtl_by_gene(gene, resources, window)
 
     @mcp.tool()
     async def get_gene_disease_associations(gene: str) -> dict:

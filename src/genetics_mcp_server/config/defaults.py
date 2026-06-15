@@ -108,6 +108,16 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
 When querying data with few datasets per resource, include a per-dataset breakdown in the results (e.g., `GROUP BY dataset`).
 Do NOT break down by dataset for datasets flagged `collection: true` (e.g. eQTL Catalogue) — show only resource-level totals for those.
 
+**To find signals (GWAS or QTL) near a gene, filter by genomic coordinates, NOT by `gene_most_severe`.** The `gene_most_severe` column is per-variant most-severe-consequence attribution: it is unreliable for regulatory/intronic variants and systematically misses signals that sit near — but not inside — the gene (e.g. a long-range regulatory variant several hundred kb away whose credible set is the strongest signal for the gene). Instead JOIN `gene_annotations_v` to get the gene body and filter on a coordinate window (gene_start − window .. gene_end + window) with a generous window (≈ 500 kb), e.g.:
+```sql
+WITH g AS (SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend
+           FROM `genetics_results.gene_annotations_v` WHERE symbol = 'VAV3' GROUP BY chr)
+SELECT c.* FROM `genetics_results.credible_sets_v` c
+JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING)
+       AND c.pos BETWEEN g.gstart - 500000 AND g.gend + 500000;
+```
+Prefer the specialized tools (`get_credible_sets_by_gene`, `get_asm_qtl_by_gene`) for this — they already apply a coordinate window. (`get_credible_sets_by_qtl_gene` is different: it finds QTLs where the gene is the *molecular trait*, which is correctly keyed by gene name, not coordinates.)
+
 ## Subagent Orchestration
 
 You have access to `launch_subagents`, which runs specialized agents in parallel. Each subagent gets its own tools, instructions, and agentic loop, then returns a complete analysis.
