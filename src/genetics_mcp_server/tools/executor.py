@@ -106,7 +106,7 @@ class ToolExecutor:
         # authenticate to results-api with shared secret if configured
         api_secret = os.environ.get("INTERNAL_API_SECRET", "")
         headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
-        self.client = _ResilientAsyncClient(timeout=30.0, headers=headers)
+        self.client = _ResilientAsyncClient(timeout=300.0, headers=headers)
         # separate client for third-party calls: carries no default auth so the
         # internal API secret is never leaked to external services (e.g. MouseMine,
         # myvariant.info). Per-call auth (Perplexity, Tavily) is passed explicitly.
@@ -294,7 +294,7 @@ class ToolExecutor:
             resp = await self.client.post(
                 f"{self.bigquery_url}/query",
                 json={"sql": download_sql, "max_rows": fetch_max, "dry_run": dry_run},
-                timeout=120.0,
+                timeout=300.0,
             )
             if resp.status_code != 200:
                 return {
@@ -783,7 +783,7 @@ class ToolExecutor:
             resp = await self.client.get(
                 f"{self.base_url}/v1/exome_results_by_phenotype/{resource}/{phenotype}",
                 params={"format": "json"},
-                timeout=60.0,
+                timeout=300.0,
             )
             if resp.status_code == 200:
                 results = resp.json()
@@ -1119,7 +1119,7 @@ class ToolExecutor:
                     f"{self.base_url}/v1/variant_annotation/{source}",
                     params={"format": "json"},
                     json={"variants": variants},
-                    timeout=60.0,
+                    timeout=300.0,
                 )
             else:
                 # GET endpoint for single variant, region, or gene
@@ -1127,7 +1127,7 @@ class ToolExecutor:
                 resp = await self.client.get(
                     f"{self.base_url}/v1/variant_annotation/{source}",
                     params=params,
-                    timeout=60.0,
+                    timeout=300.0,
                 )
 
             if resp.status_code == 200:
@@ -1185,7 +1185,7 @@ class ToolExecutor:
                 f"{self.base_url}/v1/summary_stats/{resource}/{data_type}",
                 params={"format": "json"},
                 json={"variants": normalized, "phenotypes": phenotypes},
-                timeout=60.0,
+                timeout=300.0,
             )
             if resp.status_code == 200:
                 results = resp.json()
