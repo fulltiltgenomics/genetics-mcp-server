@@ -10,6 +10,7 @@ persistence (resumed conversations carry the data) and backward compatibility
 from genetics_mcp_server.llm_service import (
     _mark_history_cache_breakpoint,
     _sanitize_tool_blocks,
+    _strip_tool_use_markers,
 )
 
 
@@ -85,6 +86,72 @@ class TestSanitizeToolBlocks:
         out = _sanitize_tool_blocks(messages)
         kept_uses = {b["id"] for b in out[0]["content"] if b.get("type") == "tool_use"}
         assert kept_uses == {"a"}
+
+
+class TestStripToolUseMarkers:
+    """The '*[Using tool: ...]*' markers are display-only. They must be removed from
+    replayed assistant content so the model never learns to imitate them as prose
+    instead of emitting real tool_use blocks (the fabrication failure mode)."""
+
+    def test_strips_marker_from_string_content(self):
+        messages = [
+            {"role": "assistant", "content": "*[Using tool: get_variant_annotations; variant: 8:1:C:T]*\n\nThe answer is 42."},
+        ]
+        out = _strip_tool_use_markers(messages)
+        assert "Using tool" not in out[0]["content"]
+        assert "The answer is 42." in out[0]["content"]
+
+    def test_strips_multiline_marker_with_sql(self):
+        """Marker params can span lines (SQL) — DOTALL + non-greedy must still match."""
+        text = (
+            "*[Using tool: query_bigquery; sql: SELECT a, b\nFROM t\nWHERE x = '1:2:C:T'\nLIMIT 200]*"
+            "\n\n## Result\nrows: 0"
+        )
+        out = _strip_tool_use_markers([{"role": "assistant", "content": text}])
+        assert "Using tool" not in out[0]["content"]
+        assert "## Result" in out[0]["content"]
+
+    def test_strips_marker_from_text_block(self):
+        messages = [{
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "*[Using tool: x; a: b]*\n\nreal prose"},
+                {"type": "tool_use", "id": "a", "name": "x", "input": {}},
+            ],
+        }]
+        out = _strip_tool_use_markers(messages)
+        text_blocks = [b for b in out[0]["content"] if b.get("type") == "text"]
+        assert text_blocks[0]["text"] == "real prose"
+        # real tool_use is untouched
+        assert any(b.get("type") == "tool_use" for b in out[0]["content"])
+
+    def test_marker_only_text_block_dropped(self):
+        messages = [{
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "*[Using tool: x; a: b]*"},
+                {"type": "tool_use", "id": "a", "name": "x", "input": {}},
+            ],
+        }]
+        out = _strip_tool_use_markers(messages)
+        assert all(b.get("type") != "text" for b in out[0]["content"])
+        assert any(b.get("type") == "tool_use" for b in out[0]["content"])
+
+    def test_marker_only_string_falls_back_to_original(self):
+        """Never emit empty content — a turn that was nothing but a marker keeps
+        its original content rather than becoming an empty (API-invalid) message."""
+        messages = [{"role": "assistant", "content": "*[Using tool: x; a: b]*"}]
+        out = _strip_tool_use_markers(messages)
+        assert out[0]["content"] != ""
+
+    def test_user_and_string_messages_untouched(self):
+        messages = [
+            {"role": "user", "content": "*[Using tool: x]* (user typed this, leave it)"},
+            {"role": "assistant", "content": "no markers here"},
+        ]
+        out = _strip_tool_use_markers(messages)
+        assert out[0]["content"] == "*[Using tool: x]* (user typed this, leave it)"
+        assert out[1]["content"] == "no markers here"
 
 
 class TestMarkHistoryCacheBreakpoint:

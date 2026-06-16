@@ -231,8 +231,9 @@ class SubagentService:
                     "max_tokens": max_tokens,
                     "system": instructions,
                 }
-                # some models (e.g. claude-opus-4-7) don't support temperature
-                if not model_rejects_temperature(model):
+                # temperature is off by default; only send it when explicitly
+                # configured and the model supports it (Fable and Opus 4.7+ reject it)
+                if settings.temperature is not None and not model_rejects_temperature(model):
                     request_params["temperature"] = settings.temperature
                 if tool_definitions:
                     request_params["tools"] = tool_definitions

@@ -10,6 +10,7 @@ import csv
 import io
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -27,6 +28,53 @@ from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
 
 logger = logging.getLogger(__name__)
+
+
+# matches the display-only tool-use marker injected during streaming (see the
+# StreamChunk emitted in _stream_anthropic). non-greedy up to the closing ']*' so
+# an embedded ']' in params (e.g. SQL) doesn't truncate the match; DOTALL because
+# params can span multiple lines.
+_TOOL_USE_MARKER_RE = re.compile(r"\*\[Using tool:.*?\]\*", re.DOTALL)
+
+
+def _strip_tool_use_markers(messages: list[dict]) -> list[dict]:
+    """Remove '*[Using tool: ...]*' display markers from replayed assistant content.
+
+    The markers are injected purely for live UI display, but get persisted into the
+    stored assistant content. When fed back as plain text on replay, the model can
+    imitate the notation — writing the marker as prose instead of emitting a real
+    tool_use block, then fabricating the result. Stripping them before the history
+    reaches the model removes that failure mode regardless of what the client sends.
+    Operates only on assistant turns; real tool_use blocks are left untouched.
+    """
+    result = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            result.append(msg)
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            stripped = _TOOL_USE_MARKER_RE.sub("", content).strip()
+            # never emit empty content; fall back to the original if the turn was
+            # somehow nothing but markers
+            result.append({**msg, "content": stripped or content})
+        elif isinstance(content, list):
+            new_blocks = []
+            for b in content:
+                if (
+                    isinstance(b, dict)
+                    and b.get("type") == "text"
+                    and isinstance(b.get("text"), str)
+                ):
+                    text = _TOOL_USE_MARKER_RE.sub("", b["text"]).strip()
+                    if text:  # drop blocks that were nothing but markers
+                        new_blocks.append({**b, "text": text})
+                else:
+                    new_blocks.append(b)
+            result.append({**msg, "content": new_blocks})
+        else:
+            result.append(msg)
+    return result
 
 
 def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
@@ -302,13 +350,15 @@ class LLMService:
 
         try:
             logger.info(f"Streaming OpenAI chat with model {model}")
-            stream = await self.openai_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                max_tokens=settings.max_tokens,
-                temperature=settings.temperature,
-            )
+            openai_params: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "max_tokens": settings.max_tokens,
+            }
+            if settings.temperature is not None:
+                openai_params["temperature"] = settings.temperature
+            stream = await self.openai_client.chat.completions.create(**openai_params)
 
             accumulated_text = ""
             async for chunk in stream:
@@ -344,10 +394,14 @@ class LLMService:
         settings = get_settings()
         model = model or settings.default_model
 
-        # convert messages to Anthropic format, stripping orphaned tool_use
+        # convert messages to Anthropic format: first strip the display-only
+        # '*[Using tool: ...]*' markers from replayed assistant text (so the model
+        # never learns to imitate them as prose), then strip orphaned tool_use
         # blocks that were persisted without matching tool_result messages
         anthropic_messages = _sanitize_tool_blocks(
-            [msg for msg in messages if msg["role"] != "system"]
+            _strip_tool_use_markers(
+                [msg for msg in messages if msg["role"] != "system"]
+            )
         )
 
         # cache the replayed conversation history: mark the last content block of
@@ -365,8 +419,9 @@ class LLMService:
             "messages": anthropic_messages,
             "max_tokens": settings.max_tokens,
         }
-        # some models (e.g. claude-opus-4-7) don't support temperature
-        if not model_rejects_temperature(model):
+        # temperature is off by default; only send it when explicitly
+        # configured and the model supports it (Fable and Opus 4.7+ reject it)
+        if settings.temperature is not None and not model_rejects_temperature(model):
             request_params["temperature"] = settings.temperature
 
         if system_prompt:

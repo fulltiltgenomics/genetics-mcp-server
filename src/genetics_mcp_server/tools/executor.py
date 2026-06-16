@@ -426,7 +426,7 @@ class ToolExecutor:
     async def get_credible_sets_by_gene(
         self,
         gene: str,
-        window: int = 100000,
+        window: int = 500000,
         resource: str | None = None,
         data_types: str | None = None,
         summarize: bool = True,
@@ -718,20 +718,32 @@ class ToolExecutor:
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_asm_qtl_by_gene(
-        self, gene: str, resources: str | None = None
+        self, gene: str, resources: str | None = None, window: int = 500000
     ) -> dict[str, Any]:
-        """Get ASM-QTL data for variants in a gene via BigQuery."""
+        """Get ASM-QTL data for variants near a gene via BigQuery.
+
+        Selects variants by genomic coordinates (gene body ± window) rather than
+        by `gene_most_severe`: most-severe-consequence attribution is unreliable
+        for regulatory variants and misses signals that sit near — but not inside —
+        the gene. Gene coordinates come from `gene_annotations_v`.
+        """
         dataset_filter = ""
         if resources:
             ds_map = {"decode_cpg": "deCODE_asmQTL_CpG", "decode_mds": "deCODE_asmQTL_MDS"}
             datasets = [ds_map.get(r.strip(), r.strip()) for r in resources.split(",")]
             quoted = ", ".join(f"'{d}'" for d in datasets)
-            dataset_filter = f" AND dataset IN ({quoted})"
+            dataset_filter = f" AND a.dataset IN ({quoted})"
 
         sql = (
-            f"SELECT * FROM asm_qtl_v "
-            f"WHERE gene_most_severe = '{gene}'{dataset_filter} "
-            f"ORDER BY mlog10p DESC LIMIT 500"
+            f"WITH g AS ("
+            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
+            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
+            f") "
+            f"SELECT a.* FROM `genetics_results.asm_qtl_v` a "
+            f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
+            f"AND a.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"WHERE TRUE{dataset_filter} "
+            f"ORDER BY a.mlog10p DESC LIMIT 500"
         )
         result = await self.query_bigquery(sql, max_rows=500)
         if result.get("success"):
