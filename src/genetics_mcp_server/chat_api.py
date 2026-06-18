@@ -158,6 +158,11 @@ class ChatRequest(BaseModel):
         False,
         description="Secret chat mode - messages are not logged or persisted.",
     )
+    session_id: str | None = Field(
+        None,
+        description="Client conversation id. Logged (id only, never content) so distinct "
+        "conversations can be counted, including secret ones.",
+    )
 
 
 class ChatStatusResponse(BaseModel):
@@ -313,6 +318,7 @@ async def stream_chat(
                 tool_profile=request.tool_profile,
                 secret=request.secret,
                 user=user,
+                session_id=request.session_id,
             ):
                 if chunk.type == "text":
                     yield {

@@ -295,6 +295,7 @@ class LLMService:
         tool_profile: str | None = None,
         secret: bool = False,
         user: str | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -312,6 +313,7 @@ class LLMService:
                 "rag" = general+RAG external tools.
             secret: If True, suppress detailed logging to avoid persisting chat content.
             user: Authenticated user email for logging.
+            session_id: Client conversation id, logged (id only) to count distinct conversations.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -325,7 +327,7 @@ class LLMService:
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile, secret, user,
+                literature_backend, tool_profile, secret, user, session_id,
             ):
                 yield chunk
         else:
@@ -386,6 +388,7 @@ class LLMService:
         tool_profile: str | None = None,
         secret: bool = False,
         user: str | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -478,7 +481,7 @@ class LLMService:
                 )
 
         try:
-            log_prefix = f"[user={user or 'unknown'}] "
+            log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
             if secret:
                 logger.info(f"{log_prefix}Streaming Anthropic secret chat with model {model}")
             else:
