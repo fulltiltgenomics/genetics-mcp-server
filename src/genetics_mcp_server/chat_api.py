@@ -32,7 +32,7 @@ from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_p
 from genetics_mcp_server.config import get_settings
 from genetics_mcp_server.config.defaults import default_system_prompt
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
-from genetics_mcp_server.llm_service import get_llm_service
+from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
 from genetics_mcp_server.rate_limit import check_rate_limit
 from genetics_mcp_server.rate_limit import configure as configure_rate_limit
 from genetics_mcp_server.routers import (
@@ -49,6 +49,14 @@ logger = logging.getLogger(__name__)
 def _classify_error(e: Exception) -> str:
     """Map exceptions to safe, user-facing error messages."""
     name = type(e).__name__
+    # Overload/internal errors can arrive mid-stream as a base APIStatusError
+    # with status_code=200, so the real type is read from the error body.
+    err_type = anthropic_error_type(e)
+    if name == "OverloadedError" or err_type == "overloaded_error":
+        return (
+            "Claude is temporarily overloaded due to high demand. We retried "
+            "automatically but it's still unavailable. Please wait a moment and resend."
+        )
     if name == "RateLimitError":
         return "Rate limit exceeded. Please wait a moment and try again."
     if name in ("AuthenticationError", "PermissionDeniedError"):
@@ -59,13 +67,13 @@ def _classify_error(e: Exception) -> str:
         return "Could not connect to the LLM service. Please try again later."
     if name in ("BadRequestError", "UnprocessableEntityError"):
         return "Invalid request sent to LLM service."
-    if name == "InternalServerError":
-        return "External LLM service returned an internal error. Please try again."
+    if name == "InternalServerError" or err_type in ("api_error", "internal_server_error"):
+        return "Claude had a temporary upstream error. Please try again."
     if name == "APIStatusError":
         status = getattr(e, "status_code", None)
         if status and status >= 500:
-            return "External LLM service returned an internal error. Please try again."
-        return "External LLM service error. Please try again."
+            return "Claude had a temporary upstream error. Please try again."
+        return "The LLM service returned an unexpected error. Please try again."
     return "An internal server error occurred. Please try again."
 
 

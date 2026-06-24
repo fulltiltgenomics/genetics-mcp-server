@@ -30,6 +30,21 @@ from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
 logger = logging.getLogger(__name__)
 
 
+def anthropic_error_type(e: Exception) -> str | None:
+    """Extract Anthropic's in-stream error type (e.g. 'overloaded_error', 'api_error').
+
+    Errors that arrive mid-stream surface as a base APIStatusError carrying the
+    streaming HTTP status (200, since the connection itself succeeded), so
+    e.status_code is unreliable for these. The real type lives in the error body.
+    """
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and isinstance(err.get("type"), str):
+            return err["type"]
+    return None
+
+
 # matches the display-only tool-use marker injected during streaming (see the
 # StreamChunk emitted in _stream_anthropic). non-greedy up to the closing ']*' so
 # an embedded ']' in params (e.g. SQL) doesn't truncate the match; DOTALL because
@@ -517,8 +532,14 @@ class LLMService:
                         break
                     except Exception as e:
                         from anthropic import APIConnectionError, APIStatusError
-                        is_retryable = isinstance(e, APIConnectionError) or (
-                            isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529)
+                        # mid-stream overload/internal errors arrive as a base
+                        # APIStatusError with status_code=200, so also match on the
+                        # error type carried in the body.
+                        err_type = anthropic_error_type(e)
+                        is_retryable = (
+                            isinstance(e, APIConnectionError)
+                            or (isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529))
+                            or err_type in ("overloaded_error", "api_error", "internal_server_error")
                         )
                         if not is_retryable or attempt >= max_retries:
                             raise
