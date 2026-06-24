@@ -129,6 +129,14 @@ class Settings:
     max_attachment_size: int = field(
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENT_SIZE", "52428800"))  # 50MB
     )
+    # cap on a single user message: typed text length (excludes attachments) and
+    # number of attachment blocks (image/document) per message
+    max_message_chars: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_MESSAGE_CHARS", "50000"))
+    )
+    max_attachments_per_message: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
+    )
 
     # admin page
     enable_admin_page: bool = field(

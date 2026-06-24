@@ -172,6 +172,45 @@ class TestChatEndpoint:
         # should either reject the provider or fall back
         assert response.status_code in [200, 400, 422]
 
+    def test_chat_rejects_too_long_message(self, test_client):
+        """Typed text over the limit is rejected with 413."""
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [{"role": "user", "content": "x" * 50001}],
+                "enable_tools": False,
+            },
+        )
+
+        assert response.status_code == 413
+
+    def test_chat_excludes_attachments_from_length(self, test_client):
+        """A large data-file attachment block does not count toward the text limit."""
+        big_file_block = {"type": "text", "text": "[File: data.tsv]\n" + ("a\tb\n" * 100000)}
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [{"role": "user", "content": [big_file_block, {"type": "text", "text": "analyze"}]}],
+                "enable_tools": False,
+            },
+        )
+
+        # not a 413 (size) error; may be 200/400 depending on provider availability
+        assert response.status_code != 413
+
+    def test_chat_rejects_too_many_attachments(self, test_client):
+        """More than the allowed attachment blocks per message is rejected with 413."""
+        blocks = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}} for _ in range(11)]
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [{"role": "user", "content": blocks}],
+                "enable_tools": False,
+            },
+        )
+
+        assert response.status_code == 413
+
     def test_chat_stream_emits_usage_event(self, test_client):
         """Test that a usage StreamChunk is emitted as an SSE event with usage data."""
         usage_payload = {

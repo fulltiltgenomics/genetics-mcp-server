@@ -77,6 +77,62 @@ def _classify_error(e: Exception) -> str:
     return "An internal server error occurred. Please try again."
 
 
+# prefix the frontend uses to inline data-file attachments as text blocks
+_FILE_BLOCK_PREFIX = "[File: "
+
+
+def _validate_latest_message(messages: list["ChatMessage"]) -> None:
+    """Enforce per-message limits on the newest user message.
+
+    Caps typed text length (attachment blocks are excluded — bulk data should be
+    uploaded as a file) and the number of attachment blocks. Raises HTTP 413.
+    History/assistant turns are not re-validated; only the message being sent now.
+    """
+    settings = get_settings()
+    latest = next((m for m in reversed(messages) if m.role == "user"), None)
+    if latest is None:
+        return
+
+    content = latest.content
+    if isinstance(content, str):
+        text_len, attachment_count = len(content), 0
+    else:
+        # The frontend inlines data-file attachments (TSV/CSV/Excel) as text blocks
+        # prefixed with "[File: <name>]" and images as image blocks. Both are
+        # attachments and are excluded from the typed-text length, but counted.
+        text_blocks = [
+            b for b in content if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        file_text_blocks = [
+            b for b in text_blocks if str(b.get("text", "")).startswith(_FILE_BLOCK_PREFIX)
+        ]
+        text_len = sum(
+            len(b.get("text", "")) for b in text_blocks if b not in file_text_blocks
+        )
+        attachment_count = len(file_text_blocks) + sum(
+            1
+            for b in content
+            if isinstance(b, dict) and b.get("type") in ("image", "document")
+        )
+
+    if text_len > settings.max_message_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Message too long ({text_len} characters, limit "
+                f"{settings.max_message_chars}). For large data, upload a TSV/CSV file instead."
+            ),
+        )
+    if attachment_count > settings.max_attachments_per_message:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Too many attachments ({attachment_count}, limit "
+                f"{settings.max_attachments_per_message} per message)."
+            ),
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
@@ -294,6 +350,9 @@ async def stream_chat(
             status_code=429,
             detail=f"Rate limit exceeded ({limit_reason}). Please try again later.",
         )
+
+    # enforce per-message size limits before any model call
+    _validate_latest_message(request.messages)
 
     # validate provider
     if provider == "anthropic" and not service.anthropic_client:
