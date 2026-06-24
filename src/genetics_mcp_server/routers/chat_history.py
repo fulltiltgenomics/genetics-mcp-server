@@ -9,13 +9,14 @@ Provides endpoints for:
 - Uploading and managing file attachments
 """
 
+import io
 import logging
 import os
 import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -158,6 +159,25 @@ def get_attachment_type(mime_type: str, filename: str) -> str | None:
     # fallback to extension
     ext = Path(filename).suffix.lower()
     return EXTENSION_TO_TYPE.get(ext)
+
+
+def excel_to_tsv(content: bytes) -> str:
+    """Convert an Excel workbook (.xlsx/.xls) to TSV text.
+
+    Excel is a binary format, so it must be decoded to text before the model
+    can read it. Reads every sheet; with more than one, each is prefixed with a
+    "# Sheet: <name>" header so the model can tell them apart.
+    """
+    import polars as pl
+
+    # sheet_id=0 returns all sheets as {name: DataFrame}
+    sheets = pl.read_excel(io.BytesIO(content), sheet_id=0)
+    multi = len(sheets) > 1
+    parts = []
+    for name, df in sheets.items():
+        body = df.write_csv(separator="\t")
+        parts.append(f"# Sheet: {name}\n{body}" if multi else body)
+    return "\n".join(parts)
 
 
 # --- Session Endpoints ---
@@ -549,6 +569,18 @@ async def upload_attachment(
             detail=f"File too large. Maximum size: {settings.max_attachment_size // (1024*1024)}MB"
         )
 
+    # parse Excel to TSV up front so a bad file fails before anything is written
+    parsed_tsv: str | None = None
+    if file_type == "excel":
+        try:
+            parsed_tsv = excel_to_tsv(content)
+        except Exception as e:
+            logger.warning(f"Failed to parse Excel attachment {file.filename}: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail="Could not read this Excel file. Please re-save it or upload as CSV/TSV.",
+            )
+
     # generate unique ID and storage path
     attachment_id = str(uuid.uuid4())
     storage_dir = Path(settings.attachment_storage_path) / session_id
@@ -558,10 +590,15 @@ async def upload_attachment(
     safe_filename = Path(file.filename or "attachment").name
     storage_path = storage_dir / f"{attachment_id}_{safe_filename}"
 
-    # write file to disk
+    # write file to disk (original bytes preserved; parsed TSV stored as a sidecar)
+    text_path: str | None = None
     try:
         with open(storage_path, "wb") as f:
             f.write(content)
+        if parsed_tsv is not None:
+            text_path = f"{storage_path}.tsv"
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(parsed_tsv)
     except Exception as e:
         logger.error(f"Failed to write attachment file: {e}")
         raise HTTPException(status_code=500, detail="Failed to save file")
@@ -575,6 +612,7 @@ async def upload_attachment(
         mime_type=file.content_type or "application/octet-stream",
         file_size=file_size,
         storage_path=str(storage_path),
+        text_path=text_path,
     )
 
     logger.info(f"Attachment uploaded: {attachment_id} ({safe_filename}) to session {session_id}")
@@ -631,9 +669,15 @@ async def list_attachments(
 async def get_attachment(
     session_id: str,
     attachment_id: str,
+    as_: str | None = Query(default=None, alias="as"),
     user: str = Depends(auth_required),
 ):
-    """Download a file attachment."""
+    """Download a file attachment.
+
+    With ``?as=text`` the model-ready text representation is returned instead of
+    the raw bytes: parsed TSV for Excel, the original text for TSV/CSV. Clients
+    should inline this (not the raw file) so the model receives readable text.
+    """
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -647,6 +691,24 @@ async def get_attachment(
     attachment = db.get_attachment(attachment_id, session_id)
     if attachment is None:
         raise HTTPException(status_code=404, detail="Attachment not found")
+
+    if as_ == "text":
+        # parsed sidecar for Excel; tsv/csv are already text and served as-is
+        if attachment.text_path and os.path.exists(attachment.text_path):
+            return FileResponse(
+                path=attachment.text_path,
+                filename=f"{attachment.file_name}.tsv",
+                media_type="text/tab-separated-values",
+            )
+        if attachment.file_type == "tsv" and os.path.exists(attachment.storage_path):
+            return FileResponse(
+                path=attachment.storage_path,
+                filename=attachment.file_name,
+                media_type="text/tab-separated-values",
+            )
+        raise HTTPException(
+            status_code=415, detail="No text representation available for this attachment"
+        )
 
     # verify file exists
     if not os.path.exists(attachment.storage_path):
@@ -684,10 +746,12 @@ async def delete_attachment(
     if attachment is None:
         raise HTTPException(status_code=404, detail="Attachment not found")
 
-    # delete file from disk
+    # delete file from disk (and the parsed sidecar, if any)
     try:
         if os.path.exists(attachment.storage_path):
             os.remove(attachment.storage_path)
+        if attachment.text_path and os.path.exists(attachment.text_path):
+            os.remove(attachment.text_path)
     except Exception as e:
         logger.error(f"Failed to delete attachment file: {e}")
 

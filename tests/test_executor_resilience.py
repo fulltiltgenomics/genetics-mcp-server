@@ -8,9 +8,9 @@ import httpx
 
 from genetics_mcp_server.tools import ToolExecutor
 from genetics_mcp_server.tools.executor import (
+    _UNREACHABLE_HEADER,
     UPSTREAM_UNREACHABLE_MSG,
     _ResilientAsyncClient,
-    _UNREACHABLE_HEADER,
 )
 
 # port 1 is privileged/unused — connection is refused immediately

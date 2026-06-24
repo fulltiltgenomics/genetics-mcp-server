@@ -54,6 +54,7 @@ class ChatAttachment:
     file_size: int
     storage_path: str
     created_at: datetime
+    text_path: str | None = None  # parsed text/TSV representation (excel files)
 
 
 class ChatHistoryDB(object, metaclass=Singleton):
@@ -155,6 +156,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
         session_columns = {row[1] for row in cursor.fetchall()}
         if "shared" not in session_columns:
             cursor.execute("ALTER TABLE chat_sessions ADD COLUMN shared BOOLEAN DEFAULT 0")
+
+        # migrations: add columns to chat_attachments if they don't exist
+        cursor.execute("PRAGMA table_info(chat_attachments)")
+        attachment_columns = {row[1] for row in cursor.fetchall()}
+        if "text_path" not in attachment_columns:
+            cursor.execute("ALTER TABLE chat_attachments ADD COLUMN text_path TEXT")
 
         self._conn.commit()
 
@@ -406,15 +413,16 @@ class ChatHistoryDB(object, metaclass=Singleton):
         mime_type: str,
         file_size: int,
         storage_path: str,
+        text_path: str | None = None,
     ) -> ChatAttachment:
         """Add an attachment to a session."""
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            INSERT INTO chat_attachments (id, session_id, file_name, file_type, mime_type, file_size, storage_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO chat_attachments (id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (attachment_id, session_id, file_name, file_type, mime_type, file_size, storage_path),
+            (attachment_id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path),
         )
         self._conn.commit()
         return ChatAttachment(
@@ -426,6 +434,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             file_size=file_size,
             storage_path=storage_path,
             created_at=datetime.now(),
+            text_path=text_path,
         )
 
     def get_attachment(self, attachment_id: str, session_id: str) -> ChatAttachment | None:
@@ -433,7 +442,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT id, session_id, file_name, file_type, mime_type, file_size, storage_path, created_at
+            SELECT id, session_id, file_name, file_type, mime_type, file_size, storage_path, created_at, text_path
             FROM chat_attachments
             WHERE id = ? AND session_id = ?
             """,
@@ -449,7 +458,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT id, session_id, file_name, file_type, mime_type, file_size, storage_path, created_at
+            SELECT id, session_id, file_name, file_type, mime_type, file_size, storage_path, created_at, text_path
             FROM chat_attachments
             WHERE session_id = ?
             ORDER BY created_at ASC
@@ -653,6 +662,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             file_size=row["file_size"],
             storage_path=row["storage_path"],
             created_at=datetime.fromisoformat(row["created_at"]),
+            text_path=row["text_path"],
         )
 
     def _row_to_session(self, row: sqlite3.Row) -> ChatSession:

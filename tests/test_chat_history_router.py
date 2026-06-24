@@ -600,3 +600,109 @@ class TestShareAndForkEndpoints:
         app.dependency_overrides.clear()
 
         assert response.status_code == 404
+
+
+def _make_xlsx(sheets: dict[str, list[list]]) -> bytes:
+    """Build an in-memory .xlsx from {sheet_name: rows} for tests."""
+    import io
+
+    import xlsxwriter
+
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+    for name, rows in sheets.items():
+        ws = wb.add_worksheet(name)
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                ws.write(r, c, val)
+    wb.close()
+    return buf.getvalue()
+
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+class TestAttachmentEndpoints:
+    """Tests for file attachment upload/download, focused on Excel parsing."""
+
+    @pytest.fixture
+    def tmp_storage(self, tmp_path, monkeypatch):
+        # redirect attachment storage to a temp dir for the duration of a test
+        from genetics_mcp_server.config import get_settings
+
+        settings = get_settings()
+        monkeypatch.setattr(settings, "attachment_storage_path", str(tmp_path))
+        return tmp_path
+
+    def _create_session(self, client) -> str:
+        return client.post("/chat/v1/chat/sessions", json={}).json()["id"]
+
+    def test_excel_upload_parses_to_tsv(self, client_with_auth, tmp_storage):
+        session_id = self._create_session(client_with_auth)
+        xlsx = _make_xlsx({"results": [["gene", "trait"], ["BRCA1", "cancer"], ["TP53", "cancer"]]})
+
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("data.xlsx", xlsx, _XLSX_MIME)},
+        )
+        assert resp.status_code == 200
+        att = resp.json()
+        assert att["type"] == "excel"
+
+        # raw download still returns the original spreadsheet bytes
+        raw = client_with_auth.get(
+            f"/chat/v1/chat/sessions/{session_id}/attachments/{att['id']}"
+        )
+        assert raw.status_code == 200
+        assert raw.content == xlsx
+
+        # ?as=text returns the model-ready parsed TSV
+        text = client_with_auth.get(
+            f"/chat/v1/chat/sessions/{session_id}/attachments/{att['id']}?as=text"
+        )
+        assert text.status_code == 200
+        assert "gene\ttrait" in text.text
+        assert "BRCA1\tcancer" in text.text
+
+    def test_multi_sheet_excel_includes_sheet_headers(self, client_with_auth, tmp_storage):
+        session_id = self._create_session(client_with_auth)
+        xlsx = _make_xlsx(
+            {
+                "genes": [["gene"], ["BRCA1"]],
+                "variants": [["rsid"], ["rs123"]],
+            }
+        )
+        att = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("multi.xlsx", xlsx, _XLSX_MIME)},
+        ).json()
+
+        text = client_with_auth.get(
+            f"/chat/v1/chat/sessions/{session_id}/attachments/{att['id']}?as=text"
+        ).text
+        assert "# Sheet: genes" in text
+        assert "# Sheet: variants" in text
+
+    def test_invalid_excel_rejected_and_nothing_stored(self, client_with_auth, tmp_storage):
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("bad.xlsx", b"this is not a spreadsheet", _XLSX_MIME)},
+        )
+        assert resp.status_code == 400
+        # the bad upload left no files behind
+        assert not any((tmp_storage / session_id).glob("*")) if (tmp_storage / session_id).exists() else True
+
+    def test_tsv_as_text_returns_original(self, client_with_auth, tmp_storage):
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("data.tsv", b"a\tb\n1\t2\n", "text/tab-separated-values")},
+        )
+        att = resp.json()
+        assert att["type"] == "tsv"
+        text = client_with_auth.get(
+            f"/chat/v1/chat/sessions/{session_id}/attachments/{att['id']}?as=text"
+        )
+        assert text.status_code == 200
+        assert text.text == "a\tb\n1\t2\n"
