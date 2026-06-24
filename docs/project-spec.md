@@ -222,6 +222,7 @@ src/genetics_mcp_server/
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
 │   ├── analyze_conversations.py # conversation history analysis and eval extraction
+│   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
