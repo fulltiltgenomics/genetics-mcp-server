@@ -4,6 +4,9 @@ Usage:
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/chat_history.db
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --no-llm
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --start-from 2026-03-01
+    python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --start-from 2026-03-01 --until 2026-04-01
+    python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --refresh-quality  # re-run quality eval, keep topic cache
+    python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --no-cache         # recompute everything
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --output-dir ./analysis_output
 
 Analyzes conversations for:
@@ -62,6 +65,28 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
         conn.close()
 
     return sessions, messages
+
+
+# ---------------------------------------------------------------------------
+# Robust JSON extraction from LLM text
+# ---------------------------------------------------------------------------
+
+def extract_first_json(text: str):
+    """Parse the first complete JSON value (object or array) in text.
+
+    Models sometimes emit the JSON followed by a second object or trailing prose
+    (which makes a plain json.loads raise "Extra data"). raw_decode parses one
+    value from the first opening bracket and ignores anything after it.
+    """
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+                return obj
+            except json.JSONDecodeError:
+                continue  # this bracket didn't start valid JSON; try the next
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +206,77 @@ def categorize_by_keywords(text: str) -> tuple[str, float]:
 
 
 # ---------------------------------------------------------------------------
+# Cost tracking (real, from API token usage)
+# ---------------------------------------------------------------------------
+
+# USD per million tokens, (input, output). Keep in sync with model defaults below.
+MODEL_PRICING = {
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+}
+# fall back to Sonnet-tier pricing for unknown models so cost isn't silently understated
+DEFAULT_PRICING = (3.0, 15.0)
+
+
+@dataclass
+class CostTracker:
+    """Accumulates real token usage from API responses and computes USD cost."""
+
+    # model -> {"input": tokens, "output": tokens, "calls": n}
+    usage: dict[str, dict[str, int]] = None
+
+    def __post_init__(self):
+        if self.usage is None:
+            self.usage = {}
+
+    @staticmethod
+    def _as_int(value) -> int:
+        # only count genuine integer token fields; ignore None and test mocks
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def add(self, model: str, response_usage) -> None:
+        inp = self._as_int(getattr(response_usage, "input_tokens", 0))
+        out = self._as_int(getattr(response_usage, "output_tokens", 0))
+        # cached reads/writes still cost (reduced); count them as input for a conservative estimate
+        inp += self._as_int(getattr(response_usage, "cache_read_input_tokens", 0))
+        inp += self._as_int(getattr(response_usage, "cache_creation_input_tokens", 0))
+        if inp == 0 and out == 0:
+            return
+        rec = self.usage.setdefault(model, {"input": 0, "output": 0, "calls": 0})
+        rec["input"] += inp
+        rec["output"] += out
+        rec["calls"] += 1
+
+    def model_cost(self, model: str) -> float:
+        rec = self.usage[model]
+        in_price, out_price = MODEL_PRICING.get(model, DEFAULT_PRICING)
+        return rec["input"] / 1e6 * in_price + rec["output"] / 1e6 * out_price
+
+    def total_cost(self) -> float:
+        return sum(self.model_cost(m) for m in self.usage)
+
+    def summary_lines(self) -> list[str]:
+        lines = []
+        for model, rec in self.usage.items():
+            priced = "" if model in MODEL_PRICING else " (default pricing)"
+            lines.append(
+                f"- {model}{priced}: {rec['calls']} calls, "
+                f"{rec['input']:,} in + {rec['output']:,} out tokens "
+                f"= ${self.model_cost(model):.4f}"
+            )
+        lines.append(f"- **Total cost**: ${self.total_cost():.4f}")
+        return lines
+
+
+# ---------------------------------------------------------------------------
 # LLM-based topic categorization
 # ---------------------------------------------------------------------------
 
 async def categorize_with_llm(
     session_first_messages: list[dict[str, str]],
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-haiku-4-5-20251001",
+    cost_tracker: "CostTracker | None" = None,
 ) -> dict[str, dict]:
     """Categorize conversations using Anthropic API.
 
@@ -218,11 +308,12 @@ async def categorize_with_llm(
                 max_tokens=2000,
                 messages=[{"role": "user", "content": prompt}],
             )
+            if cost_tracker is not None:
+                cost_tracker.add(model, response.usage)
             text = response.content[0].text
-            # extract JSON from response (may have markdown fences)
-            json_match = re.search(r"\[.*\]", text, re.DOTALL)
-            if json_match:
-                classifications = json.loads(json_match.group())
+            # extract JSON from response (may have markdown fences / trailing data)
+            classifications = extract_first_json(text)
+            if isinstance(classifications, list):
                 for c in classifications:
                     results[c["id"]] = {
                         "topic": c["topic"],
@@ -252,10 +343,33 @@ async def categorize_with_llm(
 # LLM-based quality evaluation
 # ---------------------------------------------------------------------------
 
+def _elide_message(content: str, per_msg_max: int = 8000) -> str:
+    """Elide the middle of an over-long message, keeping head and tail.
+
+    The genetics assistant's answers are structured as: intro -> large inline
+    tool-output table/data-dump -> interpretation & conclusion. Naively keeping
+    only the head discards the conclusion, which is exactly what the quality
+    evaluator needs to see. Keeping head + tail preserves both the question
+    framing and the closing synthesis while eliding the bulky table middle.
+    """
+    if len(content) <= per_msg_max:
+        return content
+    head = per_msg_max // 2
+    tail = per_msg_max - head
+    elided = len(content) - per_msg_max
+    return f"{content[:head]}\n[... {elided} chars elided ...]\n{content[-tail:]}"
+
+
 def _format_conversation_for_eval(
-    session_id: str, messages: pl.DataFrame, max_chars: int = 15000,
+    session_id: str, messages: pl.DataFrame, max_chars: int = 120000,
 ) -> str:
-    """Format a conversation for LLM quality evaluation, truncating if needed."""
+    """Format a conversation for LLM quality evaluation, eliding if needed.
+
+    Modern Claude context windows are large, so the budget is generous; the
+    goal is to never hide the assistant's final answer behind tool-output
+    tables. Over-long individual messages are middle-elided (head + tail) and
+    the total budget is large enough that whole later turns are rarely dropped.
+    """
     session_msgs = messages.filter(
         pl.col("session_id") == session_id
     ).sort("created_at")
@@ -264,10 +378,7 @@ def _format_conversation_for_eval(
     total_len = 0
     for row in session_msgs.iter_rows(named=True):
         role = row["role"].upper()
-        content = row["content"]
-        # truncate individual long messages (e.g. huge tool outputs)
-        if len(content) > 3000:
-            content = content[:3000] + "\n[... truncated ...]"
+        content = _elide_message(row["content"])
         part = f"[{role}]\n{content}\n"
         total_len += len(part)
         if total_len > max_chars:
@@ -281,11 +392,12 @@ def _format_conversation_for_eval(
 async def evaluate_quality_with_llm(
     session_ids: list[str],
     messages: pl.DataFrame,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-6",
+    cost_tracker: "CostTracker | None" = None,
 ) -> dict[str, dict]:
     """Evaluate conversation quality using Anthropic API.
 
-    Sends full conversations (truncated to ~15K chars) one at a time.
+    Sends full conversations (middle-elided to ~120K chars) one at a time.
 
     Returns:
         dict mapping session_id to quality assessment dict
@@ -310,16 +422,17 @@ async def evaluate_quality_with_llm(
         try:
             response = await client.messages.create(
                 model=model,
-                max_tokens=500,
+                max_tokens=1000,
                 messages=[{"role": "user", "content": prompt}],
             )
+            if cost_tracker is not None:
+                cost_tracker.add(model, response.usage)
             text = response.content[0].text
-            json_match = re.search(r"\{.*\}", text, re.DOTALL)
-            if json_match:
-                assessment = json.loads(json_match.group())
+            assessment = extract_first_json(text)
+            if isinstance(assessment, dict):
                 results[sid] = assessment
         except Exception as e:
-            print(f"  Quality eval failed for {sid[:8]}...: {e}", file=sys.stderr)
+            print(f"  Quality eval failed for {sid}: {e}", file=sys.stderr)
 
         if (idx + 1) % 20 == 0 or idx + 1 == total:
             print(f"  Evaluated {idx + 1}/{total} conversations...", file=sys.stderr)
@@ -334,6 +447,7 @@ async def evaluate_quality_with_llm(
 @dataclass
 class ConversationMetrics:
     session_id: str
+    created_at: str = ""  # session start timestamp, for time-series plotting
     user_rating: int | None = None
     thumbs_up_count: int = 0
     thumbs_down_count: int = 0
@@ -376,7 +490,19 @@ def compute_success_score(m: ConversationMetrics) -> float:
             q = int(m.llm_quality_score)
         except (ValueError, TypeError):
             q = 3
-        return round((q - 1) / 4.0, 3)
+        score = (q - 1) / 4.0
+
+        # the 1-5 quality_score is the primary signal, but fold in the binary
+        # verdicts so a clearly-answered conversation isn't dragged down (and a
+        # clearly-unanswered one isn't propped up) by a borderline numeric score
+        if m.llm_answered == "yes":
+            score += 0.05
+        elif m.llm_answered == "no":
+            score -= 0.1
+        if m.llm_concluded == "no":
+            score -= 0.05
+
+        return round(max(0.0, min(1.0, score)), 3)
 
     # heuristic fallback
     score = 0.5
@@ -474,6 +600,7 @@ def compute_all_metrics(
 
         m = ConversationMetrics(
             session_id=sid,
+            created_at=str(row.get("created_at") or ""),
             user_rating=row.get("rating"),
             thumbs_up_count=row.get("thumbs_up_count") or 0,
             thumbs_down_count=row.get("thumbs_down_count") or 0,
@@ -612,6 +739,7 @@ def generate_report(
     sessions: pl.DataFrame,
     messages: pl.DataFrame,
     tool_stats: pl.DataFrame,
+    cost_tracker: "CostTracker | None" = None,
 ) -> str:
     """Generate a markdown analysis report."""
     lines = ["# Conversation Analysis Report\n"]
@@ -691,7 +819,7 @@ def generate_report(
         lines.append("|---------|------:|-------|------:|---------------|")
         for m in heavy[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id[:8]}... | {m.total_tool_calls} | "
+            lines.append(f"| {m.session_id} | {m.total_tool_calls} | "
                          f"{m.topic} | {m.success_score:.2f} | {msg_preview} |")
     else:
         lines.append("None found.\n")
@@ -705,7 +833,7 @@ def generate_report(
         lines.append("|---------|------:|-------|------:|---------------|")
         for m in sorted(unsuccessful, key=lambda m: m.success_score)[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id[:8]}... | {m.success_score:.2f} | "
+            lines.append(f"| {m.session_id} | {m.success_score:.2f} | "
                          f"{m.topic} | {m.total_tool_calls} | {msg_preview} |")
     else:
         lines.append("No unsuccessful conversations found.\n")
@@ -747,12 +875,7 @@ def generate_report(
     lines.append("| User | Sessions |")
     lines.append("|------|--------:|")
     for row in user_session_counts.head(10).iter_rows(named=True):
-        user_id = row["user_id"]
-        # anonymize email
-        if "@" in user_id:
-            local, domain = user_id.split("@", 1)
-            user_id = f"{local[:3]}...@{domain}"
-        lines.append(f"| {user_id} | {row['len']} |")
+        lines.append(f"| {row['user_id']} | {row['len']} |")
     lines.append("")
 
     # --- LLM quality evaluation summary ---
@@ -796,10 +919,11 @@ def generate_report(
         lines.append("| Session | LLM Score | Topic | Tools | Answered | Issues |")
         lines.append("|---------|----------:|-------|------:|----------|--------|")
         for m in low_quality:
-            issues_str = "; ".join(m.llm_issues[:2]) if m.llm_issues else ""
-            lines.append(f"| {m.session_id[:8]}... | {m.llm_quality_score} | "
+            issues_str = "; ".join(m.llm_issues) if m.llm_issues else ""
+            issues_str = issues_str.replace("|", "/").replace("\n", " ")
+            lines.append(f"| {m.session_id} | {m.llm_quality_score} | "
                          f"{m.topic} | {m.total_tool_calls} | {m.llm_answered} | "
-                         f"{issues_str[:60]} |")
+                         f"{issues_str} |")
         lines.append("")
 
     # --- improvement recommendations ---
@@ -832,6 +956,14 @@ def generate_report(
                      f"(avg {avg_heavy_tools:.0f}) - consider optimizing tool strategies")
 
     lines.append("")
+
+    # --- API cost (real, from token usage this run) ---
+    if cost_tracker is not None and cost_tracker.usage:
+        lines.append("## API Cost (this run)\n")
+        lines.append("Real cost from token usage; cached results from prior runs are free.\n")
+        lines.extend(cost_tracker.summary_lines())
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -847,10 +979,25 @@ async def main():
     parser.add_argument("--output-dir", default=None, help="Directory for output files")
     parser.add_argument("--no-llm", action="store_true",
                         help="Use keyword categorization instead of LLM")
-    parser.add_argument("--model", default="claude-sonnet-4-20250514",
-                        help="Anthropic model for categorization")
+    parser.add_argument("--topic-model", default="claude-haiku-4-5-20251001",
+                        help="Anthropic model for topic classification (cheap task)")
+    parser.add_argument("--quality-model", default="claude-sonnet-4-6",
+                        help="Anthropic model for quality evaluation (judge task)")
     parser.add_argument("--start-from", default=None,
                         help="Only include sessions created on or after this date (YYYY-MM-DD)")
+    parser.add_argument("--until", default=None,
+                        help="Only include sessions created before this date, exclusive (YYYY-MM-DD)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Ignore cached topic AND quality results; recompute "
+                             "everything via the LLM (overwrites the cache). Use after "
+                             "changing prompts or the truncation/eval logic.")
+    parser.add_argument("--refresh-quality", action="store_true",
+                        help="Ignore only the cached quality assessments and re-run "
+                             "them (keeps the cheap topic cache). Use to apply the "
+                             "truncation fix without re-classifying topics.")
+    parser.add_argument("--report-file", default=None,
+                        help="Also write the stdout report (GitHub-flavored markdown) "
+                             "to this file (default: <output-dir>/report.md)")
     parser.add_argument("--report-only", action="store_true",
                         help="Only print the report, skip eval export")
     args = parser.parse_args()
@@ -865,11 +1012,15 @@ async def main():
     print("Loading data...", file=sys.stderr)
     sessions, messages = load_data(args.db)
 
-    if args.start_from:
-        sessions = sessions.filter(pl.col("created_at") >= args.start_from)
+    if args.start_from or args.until:
+        if args.start_from:
+            sessions = sessions.filter(pl.col("created_at") >= args.start_from)
+        if args.until:
+            sessions = sessions.filter(pl.col("created_at") < args.until)
         session_ids = sessions.select("id").to_series().to_list()
         messages = messages.filter(pl.col("session_id").is_in(session_ids))
-        print(f"  Filtered to sessions from {args.start_from}", file=sys.stderr)
+        print(f"  Filtered to sessions in range "
+              f"[{args.start_from or '-inf'}, {args.until or '+inf'})", file=sys.stderr)
 
     print(f"  {sessions.height} sessions, {messages.height} messages", file=sys.stderr)
 
@@ -903,6 +1054,10 @@ async def main():
     topics_cache = cache_dir / "topics.json"
     quality_cache = cache_dir / "quality.json"
 
+    # tracks real API cost from token usage; only reflects this run's live calls
+    # (cached topic/quality results incur no new cost)
+    cost_tracker = CostTracker()
+
     if args.no_llm:
         print("  Using keyword categorization...", file=sys.stderr)
         topics = {}
@@ -914,17 +1069,19 @@ async def main():
                 "brief_reason": f"keyword match (confidence={confidence:.1f})",
             }
     else:
-        # load cached topic classifications
+        # load cached topic classifications (unless cache is bypassed)
         cached_topics = {}
-        if topics_cache.exists():
+        if topics_cache.exists() and not args.no_cache:
             cached_topics = json.loads(topics_cache.read_text())
             print(f"  Loaded {len(cached_topics)} cached topic classifications", file=sys.stderr)
 
         uncached_msgs = [m for m in session_first_msgs if m["id"] not in cached_topics]
         if uncached_msgs:
             print(f"  Using LLM categorization for {len(uncached_msgs)} sessions "
-                  f"(model={args.model})...", file=sys.stderr)
-            new_topics = await categorize_with_llm(uncached_msgs, model=args.model)
+                  f"(model={args.topic_model})...", file=sys.stderr)
+            new_topics = await categorize_with_llm(
+                uncached_msgs, model=args.topic_model, cost_tracker=cost_tracker,
+            )
             cached_topics.update(new_topics)
             cache_dir.mkdir(parents=True, exist_ok=True)
             topics_cache.write_text(json.dumps(cached_topics, indent=2))
@@ -939,9 +1096,9 @@ async def main():
 
     # --- LLM quality evaluation ---
     if not args.no_llm:
-        # load cached quality assessments
+        # load cached quality assessments (unless cache is bypassed)
         cached_quality: dict[str, dict] = {}
-        if quality_cache.exists():
+        if quality_cache.exists() and not (args.no_cache or args.refresh_quality):
             cached_quality = json.loads(quality_cache.read_text())
             print(f"  Loaded {len(cached_quality)} cached quality assessments", file=sys.stderr)
 
@@ -950,7 +1107,8 @@ async def main():
             print(f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)...",
                   file=sys.stderr)
             new_assessments = await evaluate_quality_with_llm(
-                session_ids, messages, model=args.model,
+                session_ids, messages, model=args.quality_model,
+                cost_tracker=cost_tracker,
             )
             cached_quality.update(new_assessments)
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -964,10 +1122,19 @@ async def main():
     success_dist = Counter(m.success_label for m in all_metrics)
     print(f"  Success: {dict(success_dist)}", file=sys.stderr)
 
+    if cost_tracker.usage:
+        print(f"  API cost this run: ${cost_tracker.total_cost():.4f}", file=sys.stderr)
+
     # --- generate report ---
     print("Generating report...", file=sys.stderr)
-    report = generate_report(all_metrics, sessions, messages, tool_stats)
+    report = generate_report(all_metrics, sessions, messages, tool_stats, cost_tracker)
     print(report)
+
+    # also write the report (stdout content) to a markdown file
+    report_path = Path(args.report_file) if args.report_file else output_dir / "report.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report + "\n")
+    print(f"  Wrote report to {report_path}", file=sys.stderr)
 
     # --- export eval dataset ---
     if not args.report_only:

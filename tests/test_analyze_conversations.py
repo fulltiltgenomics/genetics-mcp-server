@@ -436,7 +436,8 @@ class TestQualityEvaluation:
         apply_quality_assessments(metrics, assessments)
 
         assert metrics[0].llm_quality_score == 4
-        assert metrics[0].success_score == 0.75  # (4-1)/4
+        # (4-1)/4 = 0.75 base, +0.05 for answered="yes"
+        assert metrics[0].success_score == 0.8
         assert metrics[0].success_label == "successful"
         # s2 should be unchanged (no assessment)
         assert metrics[1].llm_quality_score is None
@@ -449,6 +450,20 @@ class TestQualityEvaluation:
         # without LLM score this would be penalized as abandoned
         score = compute_success_score(m)
         assert score == 1.0
+
+    def test_binary_flags_adjust_quality_score(self):
+        # answered=no and concluded=no pull a middling quality_score down
+        m = ConversationMetrics(
+            session_id="s1", llm_quality_score=3,
+            llm_answered="no", llm_concluded="no",
+        )
+        # (3-1)/4 = 0.5 base, -0.1 (answered=no) -0.05 (concluded=no)
+        assert compute_success_score(m) == 0.35
+        # answered=yes nudges it up
+        m2 = ConversationMetrics(
+            session_id="s2", llm_quality_score=3, llm_answered="yes",
+        )
+        assert compute_success_score(m2) == 0.55
 
     def test_user_rating_still_takes_priority(self):
         m = ConversationMetrics(
