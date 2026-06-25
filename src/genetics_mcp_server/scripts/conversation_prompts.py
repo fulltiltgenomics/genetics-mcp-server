@@ -31,6 +31,40 @@ Messages:
 {messages}
 """
 
+# fixed taxonomy for grouping detailed, per-conversation quality issues into
+# recurring underlying problems. each detailed issue from the judge is mapped to
+# exactly one of these so the report can count real patterns instead of unique strings.
+ISSUE_CATEGORIES = [
+    ("incomplete_answer", "Answered only part of the question or omitted requested detail"),
+    ("missed_data_source", "Failed to use or find available data; claimed no data when data exists; queried the wrong source"),
+    ("inaccurate_claim", "Stated something factually wrong, misleading, or unsupported"),
+    ("fabrication", "Invented data, results, numbers, citations, or tool output that was not actually returned"),
+    ("inefficient_tool_use", "Redundant, repeated, or unnecessary tool calls"),
+    ("tool_failure_handling", "A tool errored or returned nothing and the assistant gave up or failed to recover"),
+    ("misunderstood_question", "Misinterpreted what the user was actually asking"),
+    ("no_conclusion", "Did not synthesize results into a clear answer; left the conversation hanging"),
+    ("missing_interpretation", "Returned raw data or tables without interpreting them for the user"),
+    ("formatting_readability", "Poor formatting or hard to read; dumped raw tables"),
+    ("overcautious", "Unnecessarily refused, hedged, or added excessive caveats"),
+    ("other", "A genuine issue that does not fit any category above"),
+]
+
+ISSUE_CATEGORIZATION_PROMPT = """\
+You are grouping individual quality issues found across a genetics AI assistant's
+conversations into recurring underlying problem categories.
+
+Assign each issue below to exactly ONE category from this list:
+{categories}
+
+Each issue is prefixed with a numeric ID. Respond with a JSON array, one object
+per issue, using only category names from the list above:
+[{{"id": 0, "category": "..."}}]
+If an issue genuinely fits none of the categories, use "other".
+
+Issues:
+{issues}
+"""
+
 QUALITY_ASSESSMENT_PROMPT = """\
 You are evaluating the quality of an AI genetics assistant's conversation.
 

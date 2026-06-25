@@ -13,6 +13,7 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     apply_quality_assessments,
     build_session_tool_stats,
     categorize_by_keywords,
+    categorize_issues_with_llm,
     categorize_with_llm,
     compute_all_metrics,
     compute_success_score,
@@ -334,6 +335,47 @@ class TestGenerateReport:
         assert "## Tool Usage Patterns" in report
         assert "Total sessions**: 3" in report
 
+    def test_issue_categories_aggregated(self, sample_db):
+        sessions, messages = load_data(sample_db)
+        tool_stats = build_session_tool_stats(messages)
+        topics = {
+            "s1": {"topic": "gene_lookup", "complexity": 1, "brief_reason": ""},
+            "s2": {"topic": "variant_interpretation", "complexity": 1, "brief_reason": ""},
+            "s3": {"topic": "literature_search", "complexity": 1, "brief_reason": ""},
+        }
+        metrics = compute_all_metrics(sessions, messages, tool_stats, topics)
+        # give two conversations distinct raw issues that share a category
+        metrics[0].llm_quality_score = 2
+        metrics[0].llm_issues = ["did not query exome data despite it being available"]
+        metrics[1].llm_quality_score = 3
+        metrics[1].llm_issues = ["ignored the available eQTL dataset for this gene"]
+        issue_categories = {
+            "did not query exome data despite it being available": "missed_data_source",
+            "ignored the available eQTL dataset for this gene": "missed_data_source",
+        }
+        report = generate_report(metrics, sessions, messages, tool_stats,
+                                 issue_categories=issue_categories)
+
+        # both distinct raw issues collapse to one category with count 2
+        assert "Most common issue categories" in report
+        assert "| missed_data_source | 2 |" in report
+
+    def test_raw_issues_fallback_without_categories(self, sample_db):
+        sessions, messages = load_data(sample_db)
+        tool_stats = build_session_tool_stats(messages)
+        topics = {
+            "s1": {"topic": "gene_lookup", "complexity": 1, "brief_reason": ""},
+            "s2": {"topic": "variant_interpretation", "complexity": 1, "brief_reason": ""},
+            "s3": {"topic": "literature_search", "complexity": 1, "brief_reason": ""},
+        }
+        metrics = compute_all_metrics(sessions, messages, tool_stats, topics)
+        metrics[0].llm_quality_score = 2
+        metrics[0].llm_issues = ["some specific issue"]
+        # no issue_categories passed -> falls back to raw issue frequency
+        report = generate_report(metrics, sessions, messages, tool_stats)
+        assert "Most common issues" in report
+        assert "some specific issue" in report
+
 
 # ---------------------------------------------------------------------------
 # Eval export test
@@ -402,6 +444,55 @@ class TestLLMCategorization:
         assert "s1" in result
         # should fall back to keyword categorization
         assert result["s1"]["brief_reason"] == "keyword fallback"
+
+
+# ---------------------------------------------------------------------------
+# Issue categorization tests
+# ---------------------------------------------------------------------------
+
+class TestIssueCategorization:
+    @pytest.mark.asyncio
+    async def test_maps_issues_to_categories(self):
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps([
+            {"id": 0, "category": "missed_data_source"},
+            {"id": 1, "category": "inefficient_tool_use"},
+        ]))]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result = await categorize_issues_with_llm(
+                ["did not query exome data", "made 12 redundant tool calls"],
+            )
+
+        assert result["did not query exome data"] == "missed_data_source"
+        assert result["made 12 redundant tool calls"] == "inefficient_tool_use"
+
+    @pytest.mark.asyncio
+    async def test_unknown_category_coerced_to_other(self):
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text=json.dumps([
+            {"id": 0, "category": "totally_made_up"},
+        ]))]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result = await categorize_issues_with_llm(["some issue"])
+
+        assert result["some issue"] == "other"
+
+    @pytest.mark.asyncio
+    async def test_api_error_falls_back_to_other(self):
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result = await categorize_issues_with_llm(["issue a", "issue b"])
+
+        # every input still gets a category even when the call fails
+        assert result == {"issue a": "other", "issue b": "other"}
 
 
 # ---------------------------------------------------------------------------

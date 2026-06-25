@@ -344,6 +344,71 @@ async def categorize_with_llm(
 
 
 # ---------------------------------------------------------------------------
+# LLM-based issue categorization
+# ---------------------------------------------------------------------------
+
+async def categorize_issues_with_llm(
+    issues: list[str],
+    model: str = "claude-haiku-4-5-20251001",
+    cost_tracker: "CostTracker | None" = None,
+) -> dict[str, str]:
+    """Map detailed free-text quality issues onto a fixed taxonomy.
+
+    The judge emits one detailed issue string per problem, so raw issues almost
+    never recur verbatim. This groups them into recurring categories so the
+    report can surface the real underlying problems.
+
+    Args:
+        issues: distinct issue strings to categorize.
+
+    Returns:
+        dict mapping each issue string to a category name (always "other" at
+        worst, so every input gets a category even if the LLM call fails).
+    """
+    import anthropic
+
+    from .conversation_prompts import ISSUE_CATEGORIES, ISSUE_CATEGORIZATION_PROMPT
+
+    valid = {c for c, _ in ISSUE_CATEGORIES}
+    categories_text = "\n".join(f"- {c}: {d}" for c, d in ISSUE_CATEGORIES)
+    client = anthropic.AsyncAnthropic()
+    results: dict[str, str] = {}
+    batch_size = 40
+
+    for i in range(0, len(issues), batch_size):
+        batch = issues[i:i + batch_size]
+        issues_text = "\n".join(f"[{j}] {issue[:300]}" for j, issue in enumerate(batch))
+        prompt = ISSUE_CATEGORIZATION_PROMPT.format(
+            categories=categories_text, issues=issues_text,
+        )
+
+        try:
+            response = await client.messages.create(
+                model=model,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            if cost_tracker is not None:
+                cost_tracker.add(model, response.usage)
+            parsed = extract_first_json(response.content[0].text)
+            if isinstance(parsed, list):
+                for obj in parsed:
+                    idx = obj.get("id")
+                    cat = obj.get("category", "other")
+                    if isinstance(idx, int) and 0 <= idx < len(batch):
+                        results[batch[idx]] = cat if cat in valid else "other"
+        except Exception as e:
+            print(f"  Issue categorization failed for batch {i // batch_size + 1}: {e}",
+                  file=sys.stderr)
+
+        # anything the LLM didn't assign (or a failed batch) falls back to "other"
+        for issue in batch:
+            results.setdefault(issue, "other")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # LLM-based quality evaluation
 # ---------------------------------------------------------------------------
 
@@ -478,6 +543,7 @@ class ConversationMetrics:
     llm_efficient: str = ""
     llm_concluded: str = ""
     llm_issues: list[str] | None = None
+    llm_issue_categories: list[str] | None = None
 
 
 def compute_success_score(m: ConversationMetrics) -> float:
@@ -746,6 +812,7 @@ def generate_report(
     messages: pl.DataFrame,
     tool_stats: pl.DataFrame,
     cost_tracker: "CostTracker | None" = None,
+    issue_categories: dict[str, str] | None = None,
 ) -> str:
     """Generate a markdown analysis report."""
     lines = ["# Conversation Analysis Report\n"]
@@ -908,19 +975,40 @@ def generate_report(
 
         lines.append("")
 
-        # most common issues
+        # most common issues: raw issue strings are too detailed to recur, so we
+        # group them into a fixed taxonomy (issue_categories) to surface the real
+        # underlying problems instead of a list of count-1 unique strings
         all_issues: list[str] = []
         for m in evaluated:
             if m.llm_issues:
                 all_issues.extend(m.llm_issues)
         if all_issues:
-            issue_freq = Counter(all_issues)
-            lines.append("### Most common issues\n")
-            lines.append("| Issue | Count |")
-            lines.append("|-------|------:|")
-            for issue, count in issue_freq.most_common(15):
-                lines.append(f"| {issue} | {count} |")
-            lines.append("")
+            if issue_categories:
+                cat_counter = Counter(issue_categories.get(i, "other") for i in all_issues)
+                # shortest raw issue per category as a representative example
+                examples: dict[str, str] = {}
+                for i in all_issues:
+                    c = issue_categories.get(i, "other")
+                    if c not in examples or len(i) < len(examples[c]):
+                        examples[c] = i
+                lines.append("### Most common issue categories\n")
+                lines.append("| Category | Count | % | Example |")
+                lines.append("|----------|------:|--:|---------|")
+                for cat, count in cat_counter.most_common():
+                    ex = examples.get(cat, "")[:100].replace("|", "/").replace("\n", " ")
+                    pct = count / len(all_issues) * 100
+                    lines.append(f"| {cat} | {count} | {pct:.0f} | {ex} |")
+            else:
+                # no categorization available (e.g. --no-llm): raw frequency
+                issue_freq = Counter(all_issues)
+                lines.append("### Most common issues\n")
+                lines.append("| Issue | Count |")
+                lines.append("|-------|------:|")
+                for issue, count in issue_freq.most_common(15):
+                    iss = issue[:120].replace("|", "/").replace("\n", " ")
+                    lines.append(f"| {iss} | {count} |")
+            lines.append(f"\n*{len(all_issues)} issues across "
+                         f"{len(evaluated)} evaluated conversations.*\n")
 
         # lowest quality conversations
         low_quality = sorted(evaluated, key=lambda m: m.llm_quality_score)[:10]
@@ -1132,6 +1220,41 @@ async def main():
         apply_quality_assessments(all_metrics, cached_quality)
         print(f"  {len(cached_quality)} conversations evaluated", file=sys.stderr)
 
+    # --- categorize detailed issues into recurring problem categories ---
+    # raw judge issues are too specific to recur, so we map them onto a fixed
+    # taxonomy with a cheap separate pass (cached by issue text, reuses the
+    # quality cache above untouched)
+    issue_categories: dict[str, str] = {}
+    if not args.no_llm:
+        distinct_issues = sorted({
+            issue for m in all_metrics if m.llm_issues for issue in m.llm_issues
+        })
+        if distinct_issues:
+            issue_cat_cache = cache_dir / "issue_categories.json"
+            cached_cats: dict[str, str] = {}
+            if issue_cat_cache.exists() and not args.no_cache:
+                cached_cats = json.loads(issue_cat_cache.read_text())
+                print(f"  Loaded {len(cached_cats)} cached issue categories", file=sys.stderr)
+
+            uncategorized = [t for t in distinct_issues if t not in cached_cats]
+            if uncategorized:
+                print(f"Categorizing {len(uncategorized)} distinct issues "
+                      f"(model={args.topic_model})...", file=sys.stderr)
+                new_cats = await categorize_issues_with_llm(
+                    uncategorized, model=args.topic_model, cost_tracker=cost_tracker,
+                )
+                cached_cats.update(new_cats)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                issue_cat_cache.write_text(json.dumps(cached_cats, indent=2))
+            issue_categories = cached_cats
+
+            # persist per-conversation categories for downstream use / plotting
+            for m in all_metrics:
+                if m.llm_issues:
+                    m.llm_issue_categories = sorted({
+                        issue_categories.get(i, "other") for i in m.llm_issues
+                    })
+
     success_dist = Counter(m.success_label for m in all_metrics)
     print(f"  Success: {dict(success_dist)}", file=sys.stderr)
 
@@ -1140,7 +1263,8 @@ async def main():
 
     # --- generate report ---
     print("Generating report...", file=sys.stderr)
-    report = generate_report(all_metrics, sessions, messages, tool_stats, cost_tracker)
+    report = generate_report(all_metrics, sessions, messages, tool_stats, cost_tracker,
+                             issue_categories=issue_categories)
     print(report)
 
     # also write the report (stdout content) to a markdown file
