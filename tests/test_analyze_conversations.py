@@ -263,6 +263,9 @@ class TestBuildSessionToolStats:
         s1_stats = stats.filter(pl.col("session_id") == "s1")
         assert s1_stats.height == 1
         assert s1_stats["total_tool_calls"].item() == 3  # search_genes, get_credible_sets, get_gene_expression
+        # m2 calls 2 tools, m4 calls 1 -> peak in a single message is 2
+        assert "max_tools_in_message" in stats.columns
+        assert s1_stats["max_tools_in_message"].item() == 2
 
     def test_empty_messages(self):
         messages = pl.DataFrame({

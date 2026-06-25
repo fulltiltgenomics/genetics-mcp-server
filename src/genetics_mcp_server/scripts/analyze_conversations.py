@@ -123,14 +123,18 @@ def build_session_tool_stats(messages: pl.DataFrame) -> pl.DataFrame:
             "tool_count": pl.Series([], dtype=pl.Int64),
             "unique_tools": pl.Series([], dtype=pl.Int64),
             "tool_sequence": pl.Series([], dtype=pl.Utf8),
+            "max_tools_in_message": pl.Series([], dtype=pl.Int64),
         })
 
     tool_df = pl.DataFrame(rows)
 
-    # aggregate per session
+    # aggregate per session; max_tools_in_message flags excessive tool use within a
+    # single assistant turn, which a session-wide total can't (a long conversation
+    # legitimately accrues many calls spread across many messages)
     session_tools = tool_df.group_by("session_id").agg(
         pl.col("tool_calls").flatten().alias("all_tools"),
         pl.col("tool_count").sum().alias("total_tool_calls"),
+        pl.col("tool_count").max().alias("max_tools_in_message"),
     ).with_columns(
         pl.col("all_tools").list.n_unique().alias("unique_tools"),
         pl.col("all_tools").list.join(" -> ").alias("tool_sequence"),
@@ -455,6 +459,7 @@ class ConversationMetrics:
     user_messages: int = 0
     assistant_messages: int = 0
     total_tool_calls: int = 0
+    max_tools_in_message: int = 0
     unique_tools: int = 0
     has_error_response: bool = False
     reached_conclusion: bool = True
@@ -608,6 +613,7 @@ def compute_all_metrics(
             user_messages=row.get("user_messages") or 0,
             assistant_messages=row.get("assistant_messages") or 0,
             total_tool_calls=row.get("total_tool_calls") or 0,
+            max_tools_in_message=row.get("max_tools_in_message") or 0,
             unique_tools=row.get("unique_tools") or 0,
             has_error_response=sid in error_sessions,
             topic=topic_info.get("topic", "general_genetics"),
@@ -811,16 +817,19 @@ def generate_report(
     lines.append("")
 
     # --- high tool-use sessions ---
-    lines.append("## Sessions with Excessive Tool Use (>10 calls)\n")
-    heavy = sorted([m for m in metrics if m.total_tool_calls > 10],
-                   key=lambda m: m.total_tool_calls, reverse=True)
+    # flag excessive tool use within a single message, not session totals: a long
+    # conversation with many messages can legitimately accrue many calls
+    lines.append("## Sessions with Excessive Tool Use (>10 calls in a single message)\n")
+    heavy = sorted([m for m in metrics if m.max_tools_in_message > 10],
+                   key=lambda m: m.max_tools_in_message, reverse=True)
     if heavy:
-        lines.append("| Session | Tools | Topic | Score | First Message |")
-        lines.append("|---------|------:|-------|------:|---------------|")
+        lines.append("| Session | Max in msg | Total tools | Topic | Score | First Message |")
+        lines.append("|---------|-----------:|------------:|-------|------:|---------------|")
         for m in heavy[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id} | {m.total_tool_calls} | "
-                         f"{m.topic} | {m.success_score:.2f} | {msg_preview} |")
+            lines.append(f"| {m.session_id} | {m.max_tools_in_message} | "
+                         f"{m.total_tool_calls} | {m.topic} | {m.success_score:.2f} | "
+                         f"{msg_preview} |")
     else:
         lines.append("None found.\n")
     lines.append("")
@@ -951,9 +960,9 @@ def generate_report(
                      f"{', '.join(t for t, _ in ut_freq.most_common(5))}")
 
     if heavy:
-        avg_heavy_tools = sum(m.total_tool_calls for m in heavy) / len(heavy)
-        lines.append(f"- {len(heavy)} sessions used >10 tool calls "
-                     f"(avg {avg_heavy_tools:.0f}) - consider optimizing tool strategies")
+        avg_heavy_tools = sum(m.max_tools_in_message for m in heavy) / len(heavy)
+        lines.append(f"- {len(heavy)} sessions made >10 tool calls in a single message "
+                     f"(avg peak {avg_heavy_tools:.0f}) - consider optimizing tool strategies")
 
     lines.append("")
 
@@ -979,10 +988,14 @@ async def main():
     parser.add_argument("--output-dir", default=None, help="Directory for output files")
     parser.add_argument("--no-llm", action="store_true",
                         help="Use keyword categorization instead of LLM")
-    parser.add_argument("--topic-model", default="claude-haiku-4-5-20251001",
-                        help="Anthropic model for topic classification (cheap task)")
-    parser.add_argument("--quality-model", default="claude-sonnet-4-6",
-                        help="Anthropic model for quality evaluation (judge task)")
+    parser.add_argument("--topic-model",
+                        default=os.getenv("ANALYZE_TOPIC_MODEL", "claude-haiku-4-5-20251001"),
+                        help="Anthropic model for topic classification (cheap task). "
+                             "Defaults to $ANALYZE_TOPIC_MODEL if set.")
+    parser.add_argument("--quality-model",
+                        default=os.getenv("ANALYZE_QUALITY_MODEL", "claude-sonnet-4-6"),
+                        help="Anthropic model for quality evaluation (judge task). "
+                             "Defaults to $ANALYZE_QUALITY_MODEL if set.")
     parser.add_argument("--start-from", default=None,
                         help="Only include sessions created on or after this date (YYYY-MM-DD)")
     parser.add_argument("--until", default=None,
