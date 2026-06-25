@@ -33,7 +33,6 @@ Plots produced (one figure, stacked panels):
 
 import argparse
 import json
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -89,44 +88,38 @@ def load_metrics(path: Path) -> list[dict]:
 
 
 def load_from_db(db_path: Path) -> list[dict]:
-    """Read analysis records from the chat_history SQLite DB (read-only).
+    """Read analysis records from the chat_history SQLite DB.
 
-    Joins each conversation_analysis row with its deduplicated
-    conversation_issue categories. ``created_at`` is taken from the persisted
-    ``metrics_json`` blob (the session start timestamp the plots key on).
+    Delegates to ``ChatHistoryDB.list_all_analysis_rows()`` (read-only in spirit)
+    so the PNG and the frontend Quality-plots tab share one authoritative DB-read
+    path and cannot drift. ``created_at`` therefore comes from the native
+    ``chat_sessions.created_at`` column (always present), not the metrics_json
+    blob — so conversations whose stored metrics lacked a created_at are now kept
+    rather than silently dropped.
+
+    The DB returns ``issue_categories`` per conversation; ``analysis_timeseries``
+    reads ``llm_issue_categories``, so we map that one key. The other keys
+    (created_at, llm_quality_score, llm_disposition, success_label) already match.
     """
-    uri = f"file:{db_path}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(
-            "SELECT session_id, llm_quality_score, success_label, "
-            "llm_disposition, metrics_json FROM conversation_analysis"
-        ).fetchall()
-        issues: dict[str, list[str]] = {}
-        for r in conn.execute(
-            "SELECT DISTINCT session_id, category FROM conversation_issue"
-        ):
-            issues.setdefault(r["session_id"], []).append(r["category"])
-    finally:
-        conn.close()
+    from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+    from genetics_mcp_server.db.singleton import Singleton
 
-    records = []
-    for row in rows:
-        blob = {}
-        if row["metrics_json"]:
-            try:
-                blob = json.loads(row["metrics_json"])
-            except (ValueError, TypeError):
-                blob = {}
-        records.append({
-            "created_at": blob.get("created_at", ""),
+    # clear any singleton so we open this specific db_path (same dance the
+    # analyzer does), not whatever instance an earlier import created
+    if ChatHistoryDB in Singleton._instances:
+        del Singleton._instances[ChatHistoryDB]
+    db = ChatHistoryDB(str(db_path))
+
+    return [
+        {
+            "created_at": row["created_at"],
             "llm_quality_score": row["llm_quality_score"],
             "success_label": row["success_label"],
             "llm_disposition": row["llm_disposition"],
-            "llm_issue_categories": issues.get(row["session_id"], []),
-        })
-    return records
+            "llm_issue_categories": row["issue_categories"],
+        }
+        for row in db.list_all_analysis_rows()
+    ]
 
 
 # ---------------------------------------------------------------------------

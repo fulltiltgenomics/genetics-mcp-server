@@ -198,3 +198,55 @@ class TestStaleOrMissing:
 
         all_ids = chat_history_db.get_stale_or_missing_session_ids(force=True, analyzer_version=1)
         assert set(all_ids) == {s1.id, s2.id}
+
+
+class TestPlotLoadFromDbDelegates:
+    """plot_conversation_scores.load_from_db must use the one authoritative
+    DB-read path (list_all_analysis_rows) and feed build_all_series correctly."""
+
+    def test_load_from_db_maps_keys_and_keeps_undated_metrics(self, chat_history_db):
+        from genetics_mcp_server.scripts import analysis_timeseries as ats
+        from genetics_mcp_server.scripts.plot_conversation_scores import load_from_db
+
+        s = chat_history_db.create_session("user@example.com")
+        # native chat_sessions.created_at is the authoritative date the plots key
+        # on; force it so the assertion is deterministic
+        _set_updated_at(chat_history_db, s.id, "2026-01-10T12:00:00")
+        chat_history_db._conn.execute(
+            "UPDATE chat_sessions SET created_at = ? WHERE id = ?",
+            ("2026-01-10T12:00:00", s.id),
+        )
+        chat_history_db._conn.commit()
+        # metrics_json deliberately has no created_at: the old metrics_json-based
+        # path dropped this row; the unified path must keep it via chat_sessions
+        chat_history_db.upsert_analysis(
+            FakeMetrics(
+                session_id=s.id,
+                llm_quality_score=4,
+                success_label="successful",
+                llm_disposition="good_answer",
+                llm_issue_categories=["hallucination"],
+            ),
+            analyzer_version=1, source_updated_at=None, message_count=2,
+        )
+
+        records = load_from_db(chat_history_db.db_path)
+        assert len(records) == 1
+        r = records[0]
+        # keys the plotter / analysis_timeseries consume
+        assert set(r) >= {
+            "created_at", "llm_quality_score", "llm_disposition",
+            "success_label", "llm_issue_categories",
+        }
+        assert r["created_at"] == "2026-01-10T12:00:00"
+        assert r["llm_quality_score"] == 4
+        assert r["success_label"] == "successful"
+        assert r["llm_disposition"] == "good_answer"
+        # issue_categories -> llm_issue_categories mapping
+        assert r["llm_issue_categories"] == ["hallucination"]
+
+        # records flow through to all four panels without error
+        series = ats.build_all_series(records, window=7, min_n=1)
+        assert series["meta"]["empty"] is False
+        assert series["meta"]["total"] == 1
+        assert series["meta"]["scored"] == 1
