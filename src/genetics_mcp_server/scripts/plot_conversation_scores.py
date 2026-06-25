@@ -21,11 +21,11 @@ Plots produced (one figure, stacked panels):
    "how is the score distribution moving".
 2. Rolling mean score + volume - single trend line for average quality (1..5)
    with the daily conversation volume as faint bars for context.
-3. Rolling success-rate         - share of conversations labelled successful /
-   neutral / unsuccessful over time.
-4. Non-quality outcome counts   - count of technical-failure / out-of-scope /
-   unfinished / weird conversations over time (these are excluded from the
-   score panels on purpose, so they get their own view).
+3. Disposition mix             - one line per success_label bucket (successful /
+   neutral / unsuccessful / technical_failure / out_of_scope / unfinished /
+   weird_or_unclear / unknown) as a share of all conversations over time.
+4. Issue category mix          - one line per issue taxonomy category as a share
+   of all issues over time (which underlying problems dominate).
 
 Other ways to track "how well we're doing over time" are described in the
 module docstring of the report and in the project notes; this script implements
@@ -44,7 +44,8 @@ import numpy as np
 matplotlib.use("Agg")  # headless: write files, no display needed
 import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.ticker import MaxNLocator  # noqa: E402
+
+from .conversation_prompts import ISSUE_CATEGORIES  # noqa: E402
 
 SCORES = [1, 2, 3, 4, 5]
 # colourblind-friendly red->green ramp for scores 1..5
@@ -55,18 +56,31 @@ SCORE_COLORS = {
     4: "#91cf60",
     5: "#1a9850",
 }
-LABEL_COLORS = {
+
+# every success_label bucket (quality labels + non-quality disposition buckets +
+# unknown), plotted together as a share of all conversations. distinct colours so
+# none collide on one axis.
+DISPOSITION_LABELS = [
+    "successful", "neutral", "unsuccessful",
+    "technical_failure", "out_of_scope", "unfinished", "weird_or_unclear",
+    "unknown",
+]
+DISPOSITION_COLORS = {
     "successful": "#1a9850",
     "neutral": "#fee08b",
     "unsuccessful": "#d73027",
-}
-# non-quality disposition buckets (their own report sections), plotted as counts over time
-OUTCOME_LABELS = ["technical_failure", "out_of_scope", "unfinished", "weird_or_unclear"]
-OUTCOME_COLORS = {
-    "technical_failure": "#d73027",
+    "technical_failure": "#762a83",
     "out_of_scope": "#4575b4",
     "unfinished": "#999999",
     "weird_or_unclear": "#fc8d59",
+    "unknown": "#000000",
+}
+
+# the fixed issue taxonomy (imported so it stays in sync with the analyzer),
+# each category given a distinct colour from a 20-colour qualitative map
+ISSUE_CATEGORY_NAMES = [c for c, _ in ISSUE_CATEGORIES]
+ISSUE_CATEGORY_COLORS = {
+    name: plt.cm.tab20(i % 20) for i, name in enumerate(ISSUE_CATEGORY_NAMES)
 }
 
 
@@ -225,61 +239,80 @@ def panel_mean_and_volume(ax, records, grid, window, min_n):
     ax.legend(loc="upper left", fontsize=8, frameon=False)
 
 
-def panel_success_rate(ax, records, grid, window, min_n):
-    """Rolling share of successful / neutral / unsuccessful labels."""
-    labels = ["successful", "neutral", "unsuccessful"]
-    xs = []
-    series = {lab: [] for lab in labels}
-    for day, win in rolling_window(records, grid, window):
-        # use all records that have a success_label (label exists for every record)
-        labelled = [r for r in win if r.get("success_label") in labels]
-        n = len(labelled)
-        xs.append(day)
-        if n < min_n:
-            for lab in labels:
-                series[lab].append(np.nan)
-            continue
-        for lab in labels:
-            cnt = sum(1 for r in labelled if r["success_label"] == lab)
-            series[lab].append(100.0 * cnt / n)
+def panel_disposition_shares(ax, records, grid, window, min_n):
+    """One line per disposition bucket: rolling share of ALL conversations.
 
-    for lab in labels:
-        ax.plot(xs, series[lab], label=lab, color=LABEL_COLORS[lab], lw=2)
-    ax.set_ylabel("share of conversations (%)")
-    ax.set_title("Success label rate over time")
-    ax.set_ylim(0, 100)
-    ax.legend(loc="upper left", ncol=3, fontsize=8, frameon=False)
-    ax.grid(True, alpha=0.3)
-
-
-def panel_outcome_counts(ax, records, grid, window):
-    """Rolling count of each non-quality outcome bucket within a centered window.
-
-    These conversations (technical failures, out-of-scope / unfinished / weird
-    requests) are excluded from the quality score on purpose, so they get their
-    own count-over-time view rather than appearing in the score panels.
+    Covers every success_label (successful/neutral/unsuccessful plus the
+    non-quality buckets technical_failure/out_of_scope/unfinished/weird and
+    unknown). Shares keep small buckets visible despite successful dominating.
     """
     xs = []
-    series = {lab: [] for lab in OUTCOME_LABELS}
+    series = {lab: [] for lab in DISPOSITION_LABELS}
     for day, win in rolling_window(records, grid, window):
+        n = len(win)
         xs.append(day)
-        for lab in OUTCOME_LABELS:
-            series[lab].append(sum(1 for r in win if r.get("success_label") == lab))
+        if n < min_n:
+            for lab in DISPOSITION_LABELS:
+                series[lab].append(np.nan)
+            continue
+        counts = {lab: 0 for lab in DISPOSITION_LABELS}
+        for r in win:
+            lab = r.get("success_label")
+            if lab in counts:
+                counts[lab] += 1
+        for lab in DISPOSITION_LABELS:
+            series[lab].append(100.0 * counts[lab] / n)
 
-    any_data = False
-    for lab in OUTCOME_LABELS:
-        if any(series[lab]):
-            any_data = True
-        ax.plot(xs, series[lab], label=lab, color=OUTCOME_COLORS[lab], lw=2)
-    ax.set_ylabel(f"conversations in {window}-day window")
-    ax.set_title("Non-quality outcomes over time "
-                 "(technical failures / out of scope / unfinished / weird)")
-    ax.set_ylim(bottom=0)
-    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    for lab in DISPOSITION_LABELS:
+        # skip buckets with no data so the legend stays meaningful
+        if all(np.isnan(v) or v == 0 for v in series[lab]):
+            continue
+        ax.plot(xs, series[lab], label=lab, color=DISPOSITION_COLORS[lab], lw=2)
+    ax.set_ylabel("share of all conversations (%)")
+    ax.set_title(f"Disposition mix over time ({window}-day centered window)")
+    ax.set_ylim(0, 100)
     ax.legend(loc="upper left", ncol=4, fontsize=8, frameon=False)
     ax.grid(True, alpha=0.3)
+
+
+def panel_issue_category_shares(ax, records, grid, window, min_n):
+    """One line per issue category: rolling share of all issues in the window.
+
+    Issues come from each conversation's llm_issue_categories (the fixed
+    taxonomy, deduplicated per conversation). Shows which underlying problems
+    dominate over time rather than absolute volume.
+    """
+    xs = []
+    series = {c: [] for c in ISSUE_CATEGORY_NAMES}
+    for day, win in rolling_window(records, grid, window):
+        instances = [c for r in win for c in (r.get("llm_issue_categories") or [])]
+        total = len(instances)
+        xs.append(day)
+        if total < min_n:
+            for c in ISSUE_CATEGORY_NAMES:
+                series[c].append(np.nan)
+            continue
+        counts = {c: 0 for c in ISSUE_CATEGORY_NAMES}
+        for c in instances:
+            if c in counts:
+                counts[c] += 1
+        for c in ISSUE_CATEGORY_NAMES:
+            series[c].append(100.0 * counts[c] / total)
+
+    any_data = False
+    for c in ISSUE_CATEGORY_NAMES:
+        if all(np.isnan(v) or v == 0 for v in series[c]):
+            continue
+        any_data = True
+        ax.plot(xs, series[c], label=c, color=ISSUE_CATEGORY_COLORS[c], lw=2)
+    ax.set_ylabel("share of issues (%)")
+    ax.set_title(f"Issue category mix over time ({window}-day window, "
+                 "deduped per conversation)")
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="upper left", ncol=3, fontsize=7, frameon=False)
+    ax.grid(True, alpha=0.3)
     if not any_data:
-        ax.text(0.5, 0.5, "no non-quality outcomes in range",
+        ax.text(0.5, 0.5, "no issues in range",
                 transform=ax.transAxes, ha="center", va="center", color="#888888")
 
 
@@ -328,8 +361,8 @@ def main():
     fig, axes = plt.subplots(4, 1, figsize=(13, 17), sharex=True)
     panel_score_shares(axes[0], ts, grid, args.window, args.min_n)
     panel_mean_and_volume(axes[1], ts, grid, args.window, args.min_n)
-    panel_success_rate(axes[2], ts, grid, args.window, args.min_n)
-    panel_outcome_counts(axes[3], ts, grid, args.window)
+    panel_disposition_shares(axes[2], ts, grid, args.window, args.min_n)
+    panel_issue_category_shares(axes[3], ts, grid, args.window, args.min_n)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
