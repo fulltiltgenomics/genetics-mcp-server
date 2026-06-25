@@ -27,6 +27,13 @@ class ChatSession:
     comment: str | None
     phenotype_code: str | None
     shared: bool = False
+    # analysis fields populated only by list_all_sessions (LEFT JOIN); None/0
+    # for sessions without an analysis row or for callers that don't query it
+    disposition: str | None = None
+    llm_quality_score: int | None = None  # the "LLM rating", 1-5 or None
+    success_label: str | None = None
+    issue_count: int = 0
+    issue_categories: list[str] | None = None  # distinct categories for the session
 
 
 @dataclass
@@ -530,11 +537,33 @@ class ChatHistoryDB(object, metaclass=Singleton):
         date_from: str | None = None,
         date_to: str | None = None,
         session_id_filter: str | None = None,
+        disposition: str | None = None,
+        rating: int | None = None,
+        success_label: str | None = None,
+        min_issues: int | None = None,
     ) -> tuple[list[ChatSession], int]:
         """List all sessions across all users with optional filters.
 
-        Returns (sessions, total_count) for pagination.
+        Joins conversation_analysis so each returned ChatSession carries its
+        analysis fields (disposition, llm_quality_score, success_label,
+        issue_count, issue_categories). Sessions without an analysis row are
+        still returned with NULL/empty analysis fields.
+
+        Optional analysis filters (default None = no filter):
+          disposition: exact match on llm_disposition
+          rating: exact match on llm_quality_score (1-5)
+          success_label: exact match on success_label
+          min_issues: keep only sessions whose issue_count >= this value
+
+        Returns (sessions, total_count) for pagination. The total count
+        applies the same filters as the page query.
         """
+        # issue_count is a scalar so it filters in WHERE without a GROUP BY;
+        # keeping it a correlated subquery preserves the simple count/paginate shape
+        issue_count_expr = (
+            "(SELECT COUNT(*) FROM conversation_issue ci WHERE ci.session_id = s.id)"
+        )
+
         conditions = []
         params: list = []
 
@@ -550,12 +579,29 @@ class ChatHistoryDB(object, metaclass=Singleton):
         if session_id_filter:
             conditions.append("s.id LIKE ?")
             params.append(f"%{session_id_filter}%")
+        if disposition is not None:
+            conditions.append("a.llm_disposition = ?")
+            params.append(disposition)
+        if rating is not None:
+            conditions.append("a.llm_quality_score = ?")
+            params.append(rating)
+        if success_label is not None:
+            conditions.append("a.success_label = ?")
+            params.append(success_label)
+        if min_issues is not None:
+            conditions.append(f"{issue_count_expr} >= ?")
+            params.append(min_issues)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
         cursor = self._conn.cursor()
         cursor.execute(
-            f"SELECT COUNT(*) as cnt FROM chat_sessions s {where}",
+            f"""
+            SELECT COUNT(*) as cnt
+            FROM chat_sessions s
+            LEFT JOIN conversation_analysis a ON a.session_id = s.id
+            {where}
+            """,
             params,
         )
         total = cursor.fetchone()["cnt"]
@@ -563,8 +609,15 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute(
             f"""
             SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
-                   s.rating, s.comment, s.phenotype_code, s.shared
+                   s.rating, s.comment, s.phenotype_code, s.shared,
+                   a.llm_disposition AS disposition,
+                   a.llm_quality_score AS llm_quality_score,
+                   a.success_label AS success_label,
+                   {issue_count_expr} AS issue_count,
+                   (SELECT GROUP_CONCAT(DISTINCT category)
+                    FROM conversation_issue ci WHERE ci.session_id = s.id) AS issue_categories
             FROM chat_sessions s
+            LEFT JOIN conversation_analysis a ON a.session_id = s.id
             {where}
             ORDER BY s.updated_at DESC
             LIMIT ? OFFSET ?
@@ -573,6 +626,44 @@ class ChatHistoryDB(object, metaclass=Singleton):
         )
         sessions = [self._row_to_session(row) for row in cursor.fetchall()]
         return sessions, total
+
+    def list_all_analysis_rows(self) -> list[dict]:
+        """Return raw per-conversation analysis rows for the quality plots.
+
+        One row per session that has an analysis row, ordered by created_at.
+        Each row carries: session_id, created_at, llm_quality_score,
+        llm_disposition, success_label, and issue_categories (a list of
+        distinct category strings, empty when the session has no issues).
+        Aggregation is left to the client (no GROUP BY here).
+        """
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            SELECT s.id AS session_id, s.created_at AS created_at,
+                   a.llm_quality_score AS llm_quality_score,
+                   a.llm_disposition AS llm_disposition,
+                   a.success_label AS success_label,
+                   (SELECT GROUP_CONCAT(DISTINCT category)
+                    FROM conversation_issue ci WHERE ci.session_id = s.id) AS issue_categories
+            FROM conversation_analysis a
+            JOIN chat_sessions s ON s.id = a.session_id
+            ORDER BY s.created_at ASC
+            """
+        )
+        rows = []
+        for row in cursor.fetchall():
+            cats = row["issue_categories"]
+            rows.append(
+                {
+                    "session_id": row["session_id"],
+                    "created_at": row["created_at"],
+                    "llm_quality_score": row["llm_quality_score"],
+                    "llm_disposition": row["llm_disposition"],
+                    "success_label": row["success_label"],
+                    "issue_categories": cats.split(",") if cats else [],
+                }
+            )
+        return rows
 
     def get_session_any_user(self, session_id: str) -> ChatSession | None:
         """Get a session by ID without user ownership check (admin use)."""
@@ -817,6 +908,10 @@ class ChatHistoryDB(object, metaclass=Singleton):
         )
 
     def _row_to_session(self, row: sqlite3.Row) -> ChatSession:
+        keys = row.keys()
+        # GROUP_CONCAT returns a comma-joined string; surface it as a list on
+        # the dataclass so callers get a ready-to-serialize array
+        cats = row["issue_categories"] if "issue_categories" in keys else None
         return ChatSession(
             id=row["id"],
             user_id=row["user_id"],
@@ -827,6 +922,11 @@ class ChatHistoryDB(object, metaclass=Singleton):
             comment=row["comment"],
             phenotype_code=row["phenotype_code"],
             shared=bool(row["shared"]) if row["shared"] is not None else False,
+            disposition=row["disposition"] if "disposition" in keys else None,
+            llm_quality_score=row["llm_quality_score"] if "llm_quality_score" in keys else None,
+            success_label=row["success_label"] if "success_label" in keys else None,
+            issue_count=row["issue_count"] if "issue_count" in keys else 0,
+            issue_categories=cats.split(",") if cats else [],
         )
 
     def _row_to_message(self, row: sqlite3.Row) -> ChatMessageRecord:

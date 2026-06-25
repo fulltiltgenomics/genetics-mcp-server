@@ -231,6 +231,13 @@ class TestAdminDBMethods:
             data = seeded_db.get_usage_analytics(period)
             assert isinstance(data, list)
 
+    def test_list_all_sessions_default_filters_unset(self, seeded_db):
+        """New analysis filter params default to None and don't drop rows."""
+        sessions, total = seeded_db.list_all_sessions(
+            disposition=None, rating=None, success_label=None, min_issues=None
+        )
+        assert total == 3
+
     def test_list_all_user_comments(self):
         """list_all_user_comments returns all comments ordered by created_at DESC."""
         if LLMConfigDB in Singleton._instances:
@@ -420,3 +427,124 @@ class TestAdminFeedbackEndpoint:
         # no overlap between pages
         all_comments = [i["comment"] for i in data_p1["items"] + data_p2["items"] + data_p3["items"]]
         assert len(all_comments) == len(set(all_comments))
+
+
+class TestAdminSessionsAnalysisJoin:
+    """DB-level tests for the conversation_analysis join in list_all_sessions
+    and for list_all_analysis_rows (task genetics-results-suite-w8o.5)."""
+
+    @pytest.fixture
+    def analyzed_db(self, test_db):
+        """Three sessions; two carry analysis rows, one is left unanalyzed."""
+        s1 = test_db.create_session("alice@example.com")
+        s2 = test_db.create_session("bob@example.com")
+        s3 = test_db.create_session("carol@example.com")
+
+        test_db.upsert_analysis(
+            {
+                "session_id": s1.id,
+                "llm_quality_score": 5,
+                "success_label": "successful",
+                "llm_disposition": "answered",
+                "llm_issue_categories": ["hallucination", "tone"],
+            },
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=4,
+        )
+        test_db.upsert_analysis(
+            {
+                "session_id": s2.id,
+                "llm_quality_score": 2,
+                "success_label": "unsuccessful",
+                "llm_disposition": "refused",
+                "llm_issue_categories": ["refusal"],
+            },
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
+        )
+        return test_db, s1.id, s2.id, s3.id
+
+    def test_analysis_fields_joined(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        sessions, total = db.list_all_sessions()
+        assert total == 3
+        by_id = {s.id: s for s in sessions}
+        assert by_id[s1].disposition == "answered"
+        assert by_id[s1].llm_quality_score == 5
+        assert by_id[s1].success_label == "successful"
+        assert by_id[s1].issue_count == 2
+        assert set(by_id[s1].issue_categories) == {"hallucination", "tone"}
+
+    def test_unanalyzed_session_has_null_analysis(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        sessions, _ = db.list_all_sessions()
+        by_id = {s.id: s for s in sessions}
+        assert by_id[s3].disposition is None
+        assert by_id[s3].llm_quality_score is None
+        assert by_id[s3].success_label is None
+        assert by_id[s3].issue_count == 0
+        assert by_id[s3].issue_categories == []
+
+    def test_filter_disposition(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        sessions, total = db.list_all_sessions(disposition="answered")
+        assert total == 1
+        assert sessions[0].id == s1
+
+    def test_filter_rating(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        sessions, total = db.list_all_sessions(rating=2)
+        assert total == 1
+        assert sessions[0].id == s2
+
+    def test_filter_success_label(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        sessions, total = db.list_all_sessions(success_label="successful")
+        assert total == 1
+        assert sessions[0].id == s1
+
+    def test_filter_min_issues(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        # >=2 keeps only s1 (2 issues); s2 has 1, s3 has 0
+        sessions, total = db.list_all_sessions(min_issues=2)
+        assert total == 1
+        assert sessions[0].id == s1
+        # >=1 keeps s1 and s2
+        sessions, total = db.list_all_sessions(min_issues=1)
+        assert total == 2
+
+    def test_filter_total_respects_pagination(self, analyzed_db):
+        """The total must reflect filters even when a page is sliced."""
+        db, s1, s2, s3 = analyzed_db
+        sessions, total = db.list_all_sessions(min_issues=1, limit=1, offset=0)
+        assert total == 2
+        assert len(sessions) == 1
+
+    def test_filters_compose_with_user_filter(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        sessions, total = db.list_all_sessions(
+            user_filter="alice", success_label="successful"
+        )
+        assert total == 1
+        assert sessions[0].id == s1
+        # composing with a non-matching user yields nothing
+        _, total = db.list_all_sessions(
+            user_filter="bob", success_label="successful"
+        )
+        assert total == 0
+
+    def test_list_all_analysis_rows(self, analyzed_db):
+        db, s1, s2, s3 = analyzed_db
+        rows = db.list_all_analysis_rows()
+        # only analyzed sessions appear
+        assert {r["session_id"] for r in rows} == {s1, s2}
+        by_id = {r["session_id"]: r for r in rows}
+        assert by_id[s1]["llm_quality_score"] == 5
+        assert by_id[s1]["llm_disposition"] == "answered"
+        assert by_id[s1]["success_label"] == "successful"
+        assert set(by_id[s1]["issue_categories"]) == {"hallucination", "tone"}
+        assert by_id[s2]["issue_categories"] == ["refusal"]
+        # ordered by created_at ascending
+        assert "created_at" in rows[0]
