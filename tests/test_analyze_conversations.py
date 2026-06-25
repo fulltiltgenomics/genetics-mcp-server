@@ -9,6 +9,7 @@ import pytest
 
 from genetics_mcp_server.scripts.analyze_conversations import (
     ConversationMetrics,
+    _attachment_note,
     _format_conversation_for_eval,
     apply_quality_assessments,
     build_session_tool_stats,
@@ -511,6 +512,38 @@ class TestQualityEvaluation:
         _, messages = load_data(sample_db)
         text = _format_conversation_for_eval("s1", messages, max_chars=100)
         assert "truncated" in text
+
+    def test_attachment_note_from_content_json(self):
+        cj = json.dumps({"attachments": [
+            {"id": "x", "name": "PANSINUSITIS.tsv", "size": 67386, "type": "tsv"},
+        ]})
+        note = _attachment_note(cj)
+        assert "PANSINUSITIS.tsv" in note
+        assert "tsv" in note
+        assert "67386 bytes" in note
+
+    def test_attachment_note_empty_cases(self):
+        assert _attachment_note(None) == ""
+        assert _attachment_note("") == ""
+        assert _attachment_note("not json") == ""
+        assert _attachment_note(json.dumps({"attachments": []})) == ""
+        assert _attachment_note(json.dumps({"other": 1})) == ""
+
+    def test_format_includes_attachment_note(self):
+        # a user turn with an attachment recorded only in content_json
+        messages = pl.DataFrame({
+            "session_id": ["s9", "s9"],
+            "role": ["user", "assistant"],
+            "content": ["what do you think about the results?", "Here is the analysis."],
+            "created_at": ["2026-01-01 10:00:00", "2026-01-01 10:00:01"],
+            "content_json": [
+                json.dumps({"attachments": [
+                    {"name": "results.tsv", "size": 1000, "type": "tsv"}]}),
+                None,
+            ],
+        })
+        text = _format_conversation_for_eval("s9", messages)
+        assert "User attached file(s): results.tsv" in text
 
     def test_apply_quality_assessments(self):
         metrics = [

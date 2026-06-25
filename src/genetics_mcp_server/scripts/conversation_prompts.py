@@ -68,6 +68,13 @@ Issues:
 QUALITY_ASSESSMENT_PROMPT = """\
 You are evaluating the quality of an AI genetics assistant's conversation.
 
+Users may attach files (uploaded TSVs, images, etc.). An attachment is shown as a
+line like "[User attached file(s): NAME (type, size)]". The assistant had access to
+the FULL contents of any attached file even though those contents are not reproduced
+below. So when a user references "the results" or "the file" and an attachment is
+present, the assistant is NOT fabricating by analyzing it — treat the attached data
+as legitimately available context, not invented.
+
 Given the conversation below, assess:
 1. Did the assistant answer the user's question? (yes/partially/no)
 2. Was the information accurate and relevant? (yes/mostly/no)

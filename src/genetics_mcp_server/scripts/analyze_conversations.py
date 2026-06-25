@@ -429,6 +429,33 @@ def _elide_message(content: str, per_msg_max: int = 8000) -> str:
     return f"{content[:head]}\n[... {elided} chars elided ...]\n{content[-tail:]}"
 
 
+def _attachment_note(content_json: str | None) -> str:
+    """Describe any files attached to a message, from its content_json.
+
+    Attachments (uploaded TSVs, images, etc.) are recorded only in the message's
+    content_json, not in the plain `content` the judge would otherwise see. Without
+    this note the evaluator can't tell a file was provided and wrongly flags the
+    assistant's analysis of it as fabricated.
+    """
+    if not content_json:
+        return ""
+    try:
+        data = json.loads(content_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    attachments = data.get("attachments") if isinstance(data, dict) else None
+    if not attachments:
+        return ""
+    descs = []
+    for a in attachments:
+        name = a.get("name", "file")
+        typ = a.get("type", "")
+        size = a.get("size")
+        size_str = f", {size} bytes" if isinstance(size, int) else ""
+        descs.append(f"{name} ({typ}{size_str})")
+    return "[User attached file(s): " + "; ".join(descs) + "]"
+
+
 def _format_conversation_for_eval(
     session_id: str, messages: pl.DataFrame, max_chars: int = 120000,
 ) -> str:
@@ -448,7 +475,9 @@ def _format_conversation_for_eval(
     for row in session_msgs.iter_rows(named=True):
         role = row["role"].upper()
         content = _elide_message(row["content"])
-        part = f"[{role}]\n{content}\n"
+        note = _attachment_note(row.get("content_json"))
+        body = f"{note}\n{content}" if note else content
+        part = f"[{role}]\n{body}\n"
         total_len += len(part)
         if total_len > max_chars:
             parts.append("[... conversation truncated for length ...]")
