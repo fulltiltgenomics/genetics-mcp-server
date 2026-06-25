@@ -4,6 +4,7 @@ SQLite service for chat history persistence.
 Stores chat sessions and messages with support for ratings and comments.
 """
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -75,6 +76,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # WAL lets the nightly analysis job read/write without blocking live chat writers
+        conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
     @property
@@ -162,6 +165,48 @@ class ChatHistoryDB(object, metaclass=Singleton):
         attachment_columns = {row[1] for row in cursor.fetchall()}
         if "text_path" not in attachment_columns:
             cursor.execute("ALTER TABLE chat_attachments ADD COLUMN text_path TEXT")
+
+        # cache of nightly conversation analysis results, keyed by session
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_analysis (
+                session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                analyzed_at TIMESTAMP,
+                analyzer_version INTEGER,
+                source_updated_at TIMESTAMP,
+                message_count INTEGER,
+                user_rating INTEGER,
+                llm_quality_score INTEGER,
+                success_label TEXT,
+                llm_disposition TEXT,
+                topic TEXT,
+                complexity INTEGER,
+                metrics_json TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversation_analysis_analyzed_at
+            ON conversation_analysis(analyzed_at)
+        """)
+
+        # issue categories normalized to one row each so filtering and the
+        # issue-mix plot are plain SQL GROUP BY rather than JSON parsing
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_issue (
+                session_id TEXT REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                category TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversation_issue_session
+            ON conversation_issue(session_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conversation_issue_category
+            ON conversation_issue(category)
+        """)
 
         self._conn.commit()
 
@@ -651,6 +696,112 @@ class ChatHistoryDB(object, metaclass=Singleton):
             }
             for row in cursor.fetchall()
         ]
+
+    def upsert_analysis(
+        self,
+        metrics: object,
+        analyzer_version: int,
+        source_updated_at: str | datetime | None,
+        message_count: int,
+    ) -> None:
+        """Persist analysis for one session: one conversation_analysis row plus
+        its conversation_issue rows, replacing any prior rows for the session.
+
+        ``metrics`` is a ConversationMetrics instance or a dict with the same
+        fields. The whole write is a single short transaction so it does not
+        block live chat writers (no LLM calls or loops happen under the lock).
+        """
+        m = metrics if isinstance(metrics, dict) else vars(metrics)
+
+        session_id = m["session_id"]
+        issue_categories = m.get("llm_issue_categories") or []
+        if isinstance(source_updated_at, datetime):
+            source_updated_at = source_updated_at.isoformat()
+
+        metrics_json = json.dumps(m, default=str)
+
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO conversation_analysis (
+                session_id, analyzed_at, analyzer_version, source_updated_at,
+                message_count, user_rating, llm_quality_score, success_label,
+                llm_disposition, topic, complexity, metrics_json
+            )
+            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                analyzed_at = CURRENT_TIMESTAMP,
+                analyzer_version = excluded.analyzer_version,
+                source_updated_at = excluded.source_updated_at,
+                message_count = excluded.message_count,
+                user_rating = excluded.user_rating,
+                llm_quality_score = excluded.llm_quality_score,
+                success_label = excluded.success_label,
+                llm_disposition = excluded.llm_disposition,
+                topic = excluded.topic,
+                complexity = excluded.complexity,
+                metrics_json = excluded.metrics_json
+            """,
+            (
+                session_id,
+                analyzer_version,
+                source_updated_at,
+                message_count,
+                m.get("user_rating"),
+                m.get("llm_quality_score"),
+                m.get("success_label"),
+                m.get("llm_disposition"),
+                m.get("topic"),
+                m.get("complexity"),
+                metrics_json,
+            ),
+        )
+
+        # replace the session's issue rows wholesale to keep them in sync
+        cursor.execute(
+            "DELETE FROM conversation_issue WHERE session_id = ?", (session_id,)
+        )
+        if issue_categories:
+            cursor.executemany(
+                "INSERT INTO conversation_issue (session_id, category) VALUES (?, ?)",
+                [(session_id, category) for category in issue_categories],
+            )
+
+        self._conn.commit()
+
+    def get_analysis_map(self) -> dict[str, dict]:
+        """Return a session_id -> analysis-row dict map for fast lookup."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT * FROM conversation_analysis")
+        return {row["session_id"]: dict(row) for row in cursor.fetchall()}
+
+    def get_stale_or_missing_session_ids(
+        self, force: bool, analyzer_version: int
+    ) -> list[str]:
+        """Return session ids needing (re)analysis.
+
+        A session is stale when it has no analysis row, its chat_sessions
+        updated_at is newer than its analyzed_at (conversation continued), or
+        its analyzer_version differs from the current one. ``force`` selects
+        every session regardless.
+        """
+        cursor = self._conn.cursor()
+        if force:
+            cursor.execute("SELECT id FROM chat_sessions")
+            return [row["id"] for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT s.id
+            FROM chat_sessions s
+            LEFT JOIN conversation_analysis a ON a.session_id = s.id
+            WHERE a.session_id IS NULL
+               OR s.updated_at > a.analyzed_at
+               OR a.analyzer_version != ?
+            """,
+            (analyzer_version,),
+        )
+        return [row["id"] for row in cursor.fetchall()]
 
     def _row_to_attachment(self, row: sqlite3.Row) -> ChatAttachment:
         return ChatAttachment(
