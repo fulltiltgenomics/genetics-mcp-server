@@ -106,13 +106,26 @@ exactly one:
   context/attachments, so there is no well-formed question to answer.
 
 Scoring rule for quality_score (1-5): score ONLY how well the assistant performed at
-what it could control.
+what it could control. Use the FULL 1-5 scale and discriminate — do NOT default to 5.
+Reserve 5 for genuinely excellent answers; if there is ANY notable shortcoming, use 4
+or lower. Calibrate against these anchors:
+- 5 = excellent: fully and correctly answered, efficient, clearly synthesized; a domain
+  expert would not meaningfully improve it.
+- 4 = good: answered well but with a minor flaw (a small omission, some verbosity, a
+  slightly inefficient tool path, a caveat that should have been stated).
+- 3 = adequate/mixed: only partially answered, or has notable gaps; some real value but
+  leaves a knowledgeable user wanting more.
+- 2 = poor: largely failed to address the question, or significant inaccuracy/confusion,
+  though some relevant content exists.
+- 1 = very poor: did not answer, fundamentally wrong, or unusable.
+Apply the anchors regardless of disposition, with these adjustments:
 - Do NOT lower the score because the user's request was out_of_scope, unfinished, or
-  weird_or_unclear — if the assistant handled such a case gracefully, that is a HIGH
-  score.
-- For technical_failure, a low score is appropriate (the user was not served), even
-  though it is not the assistant's fault.
-- For agent_failure, score low. For good_answer, score high.
+  weird_or_unclear — if the assistant handled it gracefully (clearly stated the limit
+  and pointed elsewhere where possible), that is a 4 or 5.
+- For technical_failure, a low score (1-2) is appropriate because the user was not
+  served, even though it is not the assistant's fault.
+- For agent_failure, score 1-2. For good_answer, score by the anchors above — most good
+  answers with any minor flaw are a 4, not a 5.
 
 Then assess:
 1. Did the assistant answer the user's question? (yes/partially/no)

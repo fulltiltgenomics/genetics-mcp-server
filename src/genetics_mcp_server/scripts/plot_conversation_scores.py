@@ -23,6 +23,9 @@ Plots produced (one figure, stacked panels):
    with the daily conversation volume as faint bars for context.
 3. Rolling success-rate         - share of conversations labelled successful /
    neutral / unsuccessful over time.
+4. Non-quality outcome counts   - count of technical-failure / out-of-scope /
+   unfinished / weird conversations over time (these are excluded from the
+   score panels on purpose, so they get their own view).
 
 Other ways to track "how well we're doing over time" are described in the
 module docstring of the report and in the project notes; this script implements
@@ -41,6 +44,7 @@ import numpy as np
 matplotlib.use("Agg")  # headless: write files, no display needed
 import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 SCORES = [1, 2, 3, 4, 5]
 # colourblind-friendly red->green ramp for scores 1..5
@@ -55,6 +59,14 @@ LABEL_COLORS = {
     "successful": "#1a9850",
     "neutral": "#fee08b",
     "unsuccessful": "#d73027",
+}
+# non-quality disposition buckets (their own report sections), plotted as counts over time
+OUTCOME_LABELS = ["technical_failure", "out_of_scope", "unfinished", "weird_or_unclear"]
+OUTCOME_COLORS = {
+    "technical_failure": "#d73027",
+    "out_of_scope": "#4575b4",
+    "unfinished": "#999999",
+    "weird_or_unclear": "#fc8d59",
 }
 
 
@@ -240,6 +252,37 @@ def panel_success_rate(ax, records, grid, window, min_n):
     ax.grid(True, alpha=0.3)
 
 
+def panel_outcome_counts(ax, records, grid, window):
+    """Rolling count of each non-quality outcome bucket within a centered window.
+
+    These conversations (technical failures, out-of-scope / unfinished / weird
+    requests) are excluded from the quality score on purpose, so they get their
+    own count-over-time view rather than appearing in the score panels.
+    """
+    xs = []
+    series = {lab: [] for lab in OUTCOME_LABELS}
+    for day, win in rolling_window(records, grid, window):
+        xs.append(day)
+        for lab in OUTCOME_LABELS:
+            series[lab].append(sum(1 for r in win if r.get("success_label") == lab))
+
+    any_data = False
+    for lab in OUTCOME_LABELS:
+        if any(series[lab]):
+            any_data = True
+        ax.plot(xs, series[lab], label=lab, color=OUTCOME_COLORS[lab], lw=2)
+    ax.set_ylabel(f"conversations in {window}-day window")
+    ax.set_title("Non-quality outcomes over time "
+                 "(technical failures / out of scope / unfinished / weird)")
+    ax.set_ylim(bottom=0)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc="upper left", ncol=4, fontsize=8, frameon=False)
+    ax.grid(True, alpha=0.3)
+    if not any_data:
+        ax.text(0.5, 0.5, "no non-quality outcomes in range",
+                transform=ax.transAxes, ha="center", va="center", color="#888888")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -282,10 +325,11 @@ def main():
 
     grid = daily_grid(dates[0], dates[-1])
 
-    fig, axes = plt.subplots(3, 1, figsize=(13, 13), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(13, 17), sharex=True)
     panel_score_shares(axes[0], ts, grid, args.window, args.min_n)
     panel_mean_and_volume(axes[1], ts, grid, args.window, args.min_n)
     panel_success_rate(axes[2], ts, grid, args.window, args.min_n)
+    panel_outcome_counts(axes[3], ts, grid, args.window)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
