@@ -135,8 +135,20 @@ def rolling_window(
 # Plot panels
 # ---------------------------------------------------------------------------
 
+# dispositions that are not agent-quality failures; excluded from the score trend
+# so out-of-scope / unfinished / weird / technical conversations don't skew it.
+# empty disposition (pre-disposition metrics.json) is kept for backward compatibility.
+_NON_QUALITY_DISPOSITIONS = {
+    "technical_failure", "out_of_scope", "unfinished", "weird_or_unclear",
+}
+
+
 def _scored(records: list[dict]) -> list[dict]:
-    return [r for r in records if isinstance(r.get("llm_quality_score"), int)]
+    return [
+        r for r in records
+        if isinstance(r.get("llm_quality_score"), int)
+        and r.get("llm_disposition", "") not in _NON_QUALITY_DISPOSITIONS
+    ]
 
 
 def panel_score_shares(ax, records, grid, window, min_n):

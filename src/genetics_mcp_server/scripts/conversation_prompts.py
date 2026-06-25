@@ -67,6 +67,20 @@ Issues:
 
 QUALITY_ASSESSMENT_PROMPT = """\
 You are evaluating the quality of an AI genetics assistant's conversation.
+Today's date is {today}.
+
+IMPORTANT — what you can and cannot verify:
+- You are shown the assistant's rendered messages, but NOT the raw output the data
+  tools returned. The assistant queries REAL genetics databases (FinnGen, GWAS
+  summary stats, BigQuery, etc.). Specific, precise figures (sample sizes, variant
+  counts, p-values) and recent dates are therefore EXPECTED and are almost always
+  real tool output.
+- Do NOT label something fabricated or hallucinated just because it is precise,
+  unusual, or because you personally cannot verify it. Only call out fabrication
+  when there is clear internal evidence (e.g. the assistant contradicts itself, or
+  claims a tool result it never called). When unsure, assume the data are real.
+- Dates in 2025 or early 2026 are in the PAST relative to today's date above; they
+  are not "future dates" and are not evidence of hallucination.
 
 Users may attach files (uploaded TSVs, images, etc.). An attachment is shown as a
 line like "[User attached file(s): NAME (type, size)]". The assistant had access to
@@ -75,14 +89,39 @@ below. So when a user references "the results" or "the file" and an attachment i
 present, the assistant is NOT fabricating by analyzing it — treat the attached data
 as legitimately available context, not invented.
 
-Given the conversation below, assess:
+First, classify the conversation's DISPOSITION (what kind of outcome it was). Pick
+exactly one:
+- good_answer: the assistant gave a good, complete answer to an answerable question.
+- agent_failure: the question was answerable with the assistant's tools/data, but the
+  assistant failed to answer it well (wrong, incomplete, gave up, ignored available data).
+- technical_failure: a technical/infrastructure problem prevented a good answer
+  (connection interrupted, backend/tool returned errors or empty results). NOT the
+  assistant's fault, but the user was not served.
+- out_of_scope: the user asked for something the system genuinely does not have or
+  cannot do (e.g. data not available, an action outside its capabilities). Judge this
+  by whether the request is answerable AT ALL, not by whether you can verify the data.
+- unfinished: the conversation simply stops — the user asked something and did not
+  continue — with no failure by the assistant.
+- weird_or_unclear: the user's message is unclear, malformed, or appears to be missing
+  context/attachments, so there is no well-formed question to answer.
+
+Scoring rule for quality_score (1-5): score ONLY how well the assistant performed at
+what it could control.
+- Do NOT lower the score because the user's request was out_of_scope, unfinished, or
+  weird_or_unclear — if the assistant handled such a case gracefully, that is a HIGH
+  score.
+- For technical_failure, a low score is appropriate (the user was not served), even
+  though it is not the assistant's fault.
+- For agent_failure, score low. For good_answer, score high.
+
+Then assess:
 1. Did the assistant answer the user's question? (yes/partially/no)
 2. Was the information accurate and relevant? (yes/mostly/no)
 3. Were tool calls efficient (no unnecessary calls)? (yes/mostly/no)
 4. Did the conversation reach a natural conclusion? (yes/no)
 
 Respond with JSON:
-{{"answered": "yes|partially|no", "accurate": "yes|mostly|no", "efficient": "yes|mostly|no", "concluded": "yes|no", "quality_score": 1-5, "issues": ["list of problems if any"]}}
+{{"disposition": "good_answer|agent_failure|technical_failure|out_of_scope|unfinished|weird_or_unclear", "answered": "yes|partially|no", "accurate": "yes|mostly|no", "efficient": "yes|mostly|no", "concluded": "yes|no", "quality_score": 1-5, "issues": ["list of problems if any"]}}
 
 Conversation:
 {conversation}

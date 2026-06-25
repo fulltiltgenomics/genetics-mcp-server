@@ -21,6 +21,7 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     evaluate_quality_with_llm,
     export_eval_dataset,
     generate_report,
+    label_from_disposition,
     label_success,
     load_data,
     parse_tool_calls,
@@ -598,6 +599,47 @@ class TestQualityEvaluation:
         )
         score = compute_success_score(m)
         assert score == 0.0  # user rating wins
+
+
+class TestDisposition:
+    def test_label_from_disposition_non_quality(self):
+        # non-quality dispositions keep their own label regardless of score
+        for disp in ["technical_failure", "out_of_scope", "unfinished", "weird_or_unclear"]:
+            assert label_from_disposition(disp, 0.1) == disp
+            assert label_from_disposition(disp, 0.9) == disp
+
+    def test_label_from_disposition_quality(self):
+        # good_answer / agent_failure (and empty fallback) collapse to score-based
+        assert label_from_disposition("good_answer", 0.9) == "successful"
+        assert label_from_disposition("agent_failure", 0.1) == "unsuccessful"
+        assert label_from_disposition("", 0.5) == "neutral"
+
+    def test_out_of_scope_not_unsuccessful_despite_low_score(self):
+        # a low-scored but out-of-scope conversation must NOT be labelled unsuccessful
+        metrics = [ConversationMetrics(session_id="s1", user_messages=1)]
+        apply_quality_assessments(metrics, {
+            "s1": {"quality_score": 1, "answered": "no", "disposition": "out_of_scope",
+                   "issues": []},
+        })
+        assert metrics[0].llm_disposition == "out_of_scope"
+        assert metrics[0].success_label == "out_of_scope"
+        assert metrics[0].success_label not in {"successful", "neutral", "unsuccessful"}
+
+    def test_technical_failure_labelled_separately(self):
+        metrics = [ConversationMetrics(session_id="s1", user_messages=1)]
+        apply_quality_assessments(metrics, {
+            "s1": {"quality_score": 1, "answered": "no",
+                   "disposition": "technical_failure", "issues": []},
+        })
+        assert metrics[0].success_label == "technical_failure"
+
+    def test_agent_failure_still_unsuccessful(self):
+        metrics = [ConversationMetrics(session_id="s1", user_messages=1)]
+        apply_quality_assessments(metrics, {
+            "s1": {"quality_score": 1, "answered": "no",
+                   "disposition": "agent_failure", "issues": ["gave up"]},
+        })
+        assert metrics[0].success_label == "unsuccessful"
 
     @pytest.mark.asyncio
     async def test_evaluate_quality_with_llm(self):

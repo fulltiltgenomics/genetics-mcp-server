@@ -521,6 +521,33 @@ pytest
 pytest --cov=src/genetics_mcp_server  # with coverage
 ```
 
+## Conversation Analysis
+
+`scripts/analyze_conversations.py` is an offline tool that reads the chat-history
+SQLite DB and produces a markdown report (`report.md`), an eval dataset, and
+`metrics.json` (consumed by `plot_conversation_scores.py` for quality-over-time plots).
+
+- **Models** (env-overridable): topic classification uses Haiku
+  (`$ANALYZE_TOPIC_MODEL`), the quality judge uses Sonnet (`$ANALYZE_QUALITY_MODEL`).
+  CLI flags `--topic-model` / `--quality-model` override the env defaults.
+- **LLM-as-judge** evaluates each conversation. The judge is given today's date and
+  is told it cannot see raw tool output, so it must not flag real (precise, recent)
+  data as fabricated. Attachments (stored only in a message's `content_json`) are
+  surfaced to the judge so file-based questions aren't mistaken for fabrication.
+- **Disposition** classifies each conversation's outcome: `good_answer`,
+  `agent_failure`, `technical_failure`, `out_of_scope`, `unfinished`,
+  `weird_or_unclear`. Only `good_answer`/`agent_failure` count toward the
+  **agent-quality** metric (successful/neutral/unsuccessful). `technical_failure`
+  keeps a low score but buckets separately (infra ≠ agent); out-of-scope / unfinished
+  / weird requests are not penalized. This keeps the quality trend measuring only
+  conversations the agent could have done well at.
+- **Issue categorization**: the judge's detailed per-conversation issues are mapped
+  onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a cheap Haiku
+  pass so the report surfaces recurring problems instead of count-1 unique strings.
+- **Caching**: topic, quality, and issue-category results are cached under
+  `<output-dir>/.cache/`. After changing the judge prompt or scoring, re-run with
+  `--refresh-quality` (re-judge, keep topic cache) or `--no-cache` (recompute all).
+
 ## Development Workflow
 
 - **Issue tracking**: beads (`bd`) tracks epics and tasks in `.beads/`, synced with git

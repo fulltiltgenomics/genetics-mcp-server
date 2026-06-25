@@ -26,6 +26,7 @@ import sqlite3
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -504,6 +505,8 @@ async def evaluate_quality_with_llm(
 
     from .conversation_prompts import QUALITY_ASSESSMENT_PROMPT
 
+    # give the judge today's date so it stops treating real recent dates as "future"
+    today = date.today().isoformat()
     client = anthropic.AsyncAnthropic()
     results = {}
     total = len(session_ids)
@@ -515,7 +518,9 @@ async def evaluate_quality_with_llm(
         if len(conversation_text.strip()) < 20:
             continue
 
-        prompt = QUALITY_ASSESSMENT_PROMPT.format(conversation=conversation_text)
+        prompt = QUALITY_ASSESSMENT_PROMPT.format(
+            conversation=conversation_text, today=today,
+        )
 
         try:
             response = await client.messages.create(
@@ -571,6 +576,7 @@ class ConversationMetrics:
     llm_accurate: str = ""
     llm_efficient: str = ""
     llm_concluded: str = ""
+    llm_disposition: str = ""
     llm_issues: list[str] | None = None
     llm_issue_categories: list[str] | None = None
 
@@ -635,6 +641,21 @@ def compute_success_score(m: ConversationMetrics) -> float:
     return round(max(0.0, min(1.0, score)), 3)
 
 
+# labels that reflect the agent's own quality (the only ones counted in the
+# quality average/trend). dispositions outside the agent's control get their own
+# labels so they bucket separately and are excluded from the quality metric.
+QUALITY_RELEVANT_LABELS = {"successful", "neutral", "unsuccessful"}
+
+# dispositions that are NOT the agent failing to answer an answerable question.
+# each maps to its own report bucket; none counts toward the agent-quality average.
+NON_QUALITY_DISPOSITIONS = {
+    "technical_failure",
+    "out_of_scope",
+    "unfinished",
+    "weird_or_unclear",
+}
+
+
 def label_success(score: float) -> str:
     if score >= 0.7:
         return "successful"
@@ -642,6 +663,18 @@ def label_success(score: float) -> str:
         return "neutral"
     else:
         return "unsuccessful"
+
+
+def label_from_disposition(disposition: str, score: float) -> str:
+    """Derive the report bucket from the judge's disposition.
+
+    good_answer/agent_failure (and the no-LLM fallback) collapse to the usual
+    score-based successful/neutral/unsuccessful. The other dispositions keep
+    their own label so they bucket separately and stay out of the quality metric.
+    """
+    if disposition in NON_QUALITY_DISPOSITIONS:
+        return disposition
+    return label_success(score)
 
 
 def compute_all_metrics(
@@ -741,10 +774,13 @@ def apply_quality_assessments(
             m.llm_accurate = qa.get("accurate", "")
             m.llm_efficient = qa.get("efficient", "")
             m.llm_concluded = qa.get("concluded", "")
+            m.llm_disposition = qa.get("disposition", "")
             m.llm_issues = qa.get("issues")
-            # recompute score now that LLM quality is available
+            # recompute score now that LLM quality is available, then let the
+            # disposition decide the bucket (out_of_scope/unfinished/weird/technical
+            # don't fold into the successful/neutral/unsuccessful quality labels)
             m.success_score = compute_success_score(m)
-            m.success_label = label_success(m.success_score)
+            m.success_label = label_from_disposition(m.llm_disposition, m.success_score)
 
 
 # ---------------------------------------------------------------------------
@@ -866,16 +902,40 @@ def generate_report(
     lines.append("")
 
     # --- success breakdown ---
+    # the quality metric reflects only conversations the agent could have done well
+    # at (good_answer/agent_failure). technical failures and out-of-scope / unfinished
+    # / weird requests bucket separately and are excluded from the quality average.
     lines.append("## Success Breakdown\n")
+    quality_metrics = [m for m in metrics if m.success_label in QUALITY_RELEVANT_LABELS]
     success_counts = Counter(m.success_label for m in metrics)
+
+    lines.append(f"**Agent quality** (of {len(quality_metrics)} answerable conversations; "
+                 "excludes technical failures and out-of-scope / unfinished / weird):\n")
+    denom = len(quality_metrics) or 1
     for label in ["successful", "neutral", "unsuccessful"]:
         count = success_counts.get(label, 0)
-        pct = count / len(metrics) * 100
+        pct = count / denom * 100
         lines.append(f"- **{label}**: {count} ({pct:.1f}%)")
+    if quality_metrics:
+        avg_score = sum(m.success_score for m in quality_metrics) / len(quality_metrics)
+        lines.append(f"\nAverage agent-quality score: {avg_score:.3f}")
     lines.append("")
 
-    avg_score = sum(m.success_score for m in metrics) / len(metrics)
-    lines.append(f"Average success score: {avg_score:.3f}\n")
+    # disposition buckets that are NOT counted in the quality metric above
+    lines.append("**Other outcomes** (not counted in agent quality):\n")
+    other_labels = [
+        ("technical_failure", "Technical failures (low score, infra not agent)"),
+        ("out_of_scope", "Out of scope (we can't provide it)"),
+        ("unfinished", "Unfinished (user stopped)"),
+        ("weird_or_unclear", "Weird / unclear question"),
+        ("unknown", "Unclassified (no LLM disposition)"),
+    ]
+    for label, desc in other_labels:
+        count = success_counts.get(label, 0)
+        if count:
+            pct = count / len(metrics) * 100
+            lines.append(f"- **{desc}**: {count} ({pct:.1f}%)")
+    lines.append("")
 
     # --- topic distribution ---
     lines.append("## Topic Distribution\n")
@@ -930,8 +990,11 @@ def generate_report(
         lines.append("None found.\n")
     lines.append("")
 
-    # --- unsuccessful conversations ---
+    # --- unsuccessful conversations (genuine agent failures only) ---
     lines.append("## Unsuccessful Conversations\n")
+    lines.append("Genuine agent failures only — the question was answerable but the "
+                 "assistant did not answer it well. Technical failures and out-of-scope "
+                 "/ unfinished / weird requests are in their own sections below.\n")
     unsuccessful = [m for m in metrics if m.success_label == "unsuccessful"]
     if unsuccessful:
         lines.append("| Session | Score | Topic | Tools | First Message |")
@@ -943,6 +1006,32 @@ def generate_report(
     else:
         lines.append("No unsuccessful conversations found.\n")
     lines.append("")
+
+    # --- disposition buckets (not agent-quality failures) ---
+    for label, title, blurb in [
+        ("technical_failure", "Technical Failures",
+         "Infrastructure/backend problems (connection drops, empty tool errors), not "
+         "the agent's fault. Low score, but excluded from the agent-quality metric."),
+        ("out_of_scope", "Out of Scope",
+         "User asked for data or actions the system genuinely cannot provide. Not "
+         "penalized in the quality metric."),
+        ("unfinished", "Unfinished Conversations",
+         "User stopped without a failure by the assistant. Not penalized."),
+        ("weird_or_unclear", "Weird / Unclear Questions",
+         "Unclear or malformed request (e.g. missing attachment). Not penalized."),
+    ]:
+        bucket = [m for m in metrics if m.success_label == label]
+        if not bucket:
+            continue
+        lines.append(f"## {title}\n")
+        lines.append(f"{blurb}\n")
+        lines.append("| Session | Topic | Tools | First Message |")
+        lines.append("|---------|-------|------:|---------------|")
+        for m in sorted(bucket, key=lambda m: m.session_id)[:20]:
+            msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
+            lines.append(f"| {m.session_id} | {m.topic} | {m.total_tool_calls} | "
+                         f"{msg_preview} |")
+        lines.append("")
 
     # --- tool profile analysis ---
     lines.append("## Tool Profile Usage\n")
@@ -988,8 +1077,21 @@ def generate_report(
     if evaluated:
         lines.append("## LLM Quality Evaluation\n")
         lines.append(f"- **Evaluated**: {len(evaluated)}/{len(metrics)} conversations")
-        avg_q = sum(m.llm_quality_score for m in evaluated) / len(evaluated)
-        lines.append(f"- **Average quality score**: {avg_q:.1f}/5\n")
+
+        # disposition breakdown (what kind of outcome each conversation was)
+        disp_counts = Counter(m.llm_disposition or "unclassified" for m in evaluated)
+        disp_parts = ", ".join(f"{v}: {c}" for v, c in disp_counts.most_common())
+        lines.append(f"- **Disposition**: {disp_parts}")
+
+        # headline quality score over answerable conversations only (good_answer /
+        # agent_failure), so out-of-scope / unfinished / weird / technical don't skew it
+        answerable = [m for m in evaluated if m.success_label in QUALITY_RELEVANT_LABELS]
+        if answerable:
+            avg_q = sum(m.llm_quality_score for m in answerable) / len(answerable)
+            lines.append(f"- **Average quality score** (answerable only, n={len(answerable)}): "
+                         f"{avg_q:.1f}/5\n")
+        else:
+            lines.append("")
 
         # breakdown by answered/accurate/efficient
         for field, label in [
@@ -1039,9 +1141,10 @@ def generate_report(
             lines.append(f"\n*{len(all_issues)} issues across "
                          f"{len(evaluated)} evaluated conversations.*\n")
 
-        # lowest quality conversations
-        low_quality = sorted(evaluated, key=lambda m: m.llm_quality_score)[:10]
-        lines.append("### Lowest quality conversations\n")
+        # lowest quality conversations: answerable ones only, so genuine agent
+        # weaknesses surface rather than technical/out-of-scope/unfinished cases
+        low_quality = sorted(answerable, key=lambda m: m.llm_quality_score)[:10]
+        lines.append("### Lowest quality conversations (answerable only)\n")
         lines.append("| Session | LLM Score | Topic | Tools | Answered | Issues |")
         lines.append("|---------|----------:|-------|------:|----------|--------|")
         for m in low_quality:
@@ -1055,16 +1158,19 @@ def generate_report(
     # --- improvement recommendations ---
     lines.append("## Improvement Recommendations\n")
 
-    # topics with low success (below overall average)
-    overall_avg = sum(m.success_score for m in metrics) / len(metrics)
-    for topic, count in topic_counts.most_common():
-        if count < 5:
-            continue
-        topic_ms = [m for m in metrics if m.topic == topic]
-        avg_s = sum(m.success_score for m in topic_ms) / len(topic_ms)
-        if avg_s < overall_avg - 0.05:
-            lines.append(f"- **{topic}** has below-average score ({avg_s:.2f} vs "
-                         f"{overall_avg:.2f} overall) across {count} sessions")
+    # topics with low success (below overall average); computed over answerable
+    # conversations only so out-of-scope/technical buckets don't distort topic scores
+    if quality_metrics:
+        overall_avg = sum(m.success_score for m in quality_metrics) / len(quality_metrics)
+        for topic, count in topic_counts.most_common():
+            topic_ms = [m for m in quality_metrics if m.topic == topic]
+            if len(topic_ms) < 5:
+                continue
+            avg_s = sum(m.success_score for m in topic_ms) / len(topic_ms)
+            if avg_s < overall_avg - 0.05:
+                lines.append(f"- **{topic}** has below-average score ({avg_s:.2f} vs "
+                             f"{overall_avg:.2f} overall) across {len(topic_ms)} "
+                             "answerable sessions")
 
     # tools that appear in unsuccessful conversations
     unsuccessful_tools: list[str] = []
