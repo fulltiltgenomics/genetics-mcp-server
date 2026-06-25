@@ -34,6 +34,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# bumping this invalidates every cached analysis: any conversation_analysis row
+# whose analyzer_version differs from this value is treated as missing and gets
+# recomputed by the LLM on the next run (e.g. after changing prompts or scoring).
+ANALYZER_VERSION = 1
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -758,6 +763,60 @@ def compute_all_metrics(
     return results
 
 
+# ---------------------------------------------------------------------------
+# DB-backed cache (conversation_analysis / conversation_issue tables)
+# ---------------------------------------------------------------------------
+
+def _is_cached(row: dict | None) -> bool:
+    """A session counts as cached only if it has a current-version analysis row."""
+    return bool(row) and row.get("analyzer_version") == ANALYZER_VERSION
+
+
+def cached_topic_and_quality(
+    analysis_map: dict[str, dict],
+) -> tuple[dict[str, dict], dict[str, dict], dict[str, list[str]]]:
+    """Reconstruct topic / quality / issue-category inputs from stored analysis rows.
+
+    Each conversation_analysis row stores the full ConversationMetrics dict in
+    metrics_json, so previously-analyzed sessions can be replayed through the
+    same pipeline (compute_all_metrics + apply_quality_assessments) without any
+    LLM calls. Only rows at the current ANALYZER_VERSION are treated as cached.
+    """
+    topics: dict[str, dict] = {}
+    quality: dict[str, dict] = {}
+    issue_cats: dict[str, list[str]] = {}
+
+    for sid, row in analysis_map.items():
+        if not _is_cached(row):
+            continue
+        try:
+            m = json.loads(row.get("metrics_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            m = {}
+
+        topics[sid] = {
+            "topic": m.get("topic", "general_genetics"),
+            "complexity": m.get("complexity", 2),
+            "brief_reason": m.get("topic_reason", ""),
+        }
+        # only replay a quality assessment if the cached run actually judged it;
+        # an unjudged session has no llm_quality_score and must not get a fake one
+        if m.get("llm_quality_score") is not None:
+            quality[sid] = {
+                "quality_score": m.get("llm_quality_score"),
+                "answered": m.get("llm_answered", ""),
+                "accurate": m.get("llm_accurate", ""),
+                "efficient": m.get("llm_efficient", ""),
+                "concluded": m.get("llm_concluded", ""),
+                "disposition": m.get("llm_disposition", ""),
+                "issues": m.get("llm_issues") or [],
+            }
+        if m.get("llm_issue_categories"):
+            issue_cats[sid] = list(m["llm_issue_categories"])
+
+    return topics, quality, issue_cats
+
+
 def apply_quality_assessments(
     metrics: list[ConversationMetrics],
     assessments: dict[str, dict],
@@ -1243,11 +1302,11 @@ async def main():
     parser.add_argument("--until", default=None,
                         help="Only include sessions created before this date, exclusive (YYYY-MM-DD)")
     parser.add_argument("--no-cache", action="store_true",
-                        help="Ignore cached topic AND quality results; recompute "
+                        help="Ignore the DB-cached topic AND quality results; recompute "
                              "everything via the LLM (overwrites the cache). Use after "
                              "changing prompts or the truncation/eval logic.")
     parser.add_argument("--refresh-quality", action="store_true",
-                        help="Ignore only the cached quality assessments and re-run "
+                        help="Ignore only the DB-cached quality assessments and re-run "
                              "them (keeps the cheap topic cache). Use to apply the "
                              "truncation fix without re-classifying topics.")
     parser.add_argument("--report-file", default=None,
@@ -1304,10 +1363,38 @@ async def main():
         for row in first_messages.iter_rows(named=True)
     ]
 
-    # cache paths for LLM results
+    # flat sidecar map (issue text -> taxonomy category); the per-session results
+    # themselves now live in the SQLite conversation_analysis / conversation_issue
+    # tables, not under .cache/
     cache_dir = output_dir / ".cache"
-    topics_cache = cache_dir / "topics.json"
-    quality_cache = cache_dir / "quality.json"
+    issue_cat_cache = cache_dir / "issue_categories.json"
+
+    # DB-backed analysis cache: read prior results to skip recompute, write new
+    # results back. open the same DB we loaded the conversations from.
+    from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+    from genetics_mcp_server.db.singleton import Singleton
+
+    if ChatHistoryDB in Singleton._instances:
+        del Singleton._instances[ChatHistoryDB]
+    analysis_db = ChatHistoryDB(args.db)
+    analysis_map = analysis_db.get_analysis_map()
+
+    # the raw stored updated_at per session, passed unchanged to upsert_analysis so
+    # staleness comparisons (a string compare against analyzed_at) stay consistent
+    updated_at_by_session = {
+        row["id"]: row.get("updated_at")
+        for row in sessions.iter_rows(named=True)
+    }
+
+    # reconstruct topic + quality inputs for already-analyzed sessions so they
+    # don't hit the LLM again. --no-cache discards them entirely; --refresh-quality
+    # keeps the cheap topic cache but drops cached judgments so they're re-judged.
+    cached_topics_db, cached_quality_db, _ = (
+        ({}, {}, {}) if args.no_cache
+        else cached_topic_and_quality(analysis_map)
+    )
+    if args.refresh_quality:
+        cached_quality_db = {}
 
     # tracks real API cost from token usage; only reflects this run's live calls
     # (cached topic/quality results incur no new cost)
@@ -1324,10 +1411,8 @@ async def main():
                 "brief_reason": f"keyword match (confidence={confidence:.1f})",
             }
     else:
-        # load cached topic classifications (unless cache is bypassed)
-        cached_topics = {}
-        if topics_cache.exists() and not args.no_cache:
-            cached_topics = json.loads(topics_cache.read_text())
+        cached_topics = dict(cached_topics_db)
+        if cached_topics:
             print(f"  Loaded {len(cached_topics)} cached topic classifications", file=sys.stderr)
 
         uncached_msgs = [m for m in session_first_msgs if m["id"] not in cached_topics]
@@ -1338,8 +1423,6 @@ async def main():
                 uncached_msgs, model=args.topic_model, cost_tracker=cost_tracker,
             )
             cached_topics.update(new_topics)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            topics_cache.write_text(json.dumps(cached_topics, indent=2))
         topics = cached_topics
 
     topic_dist = Counter(v["topic"] for v in topics.values())
@@ -1351,10 +1434,8 @@ async def main():
 
     # --- LLM quality evaluation ---
     if not args.no_llm:
-        # load cached quality assessments (unless cache is bypassed)
-        cached_quality: dict[str, dict] = {}
-        if quality_cache.exists() and not (args.no_cache or args.refresh_quality):
-            cached_quality = json.loads(quality_cache.read_text())
+        cached_quality: dict[str, dict] = dict(cached_quality_db)
+        if cached_quality:
             print(f"  Loaded {len(cached_quality)} cached quality assessments", file=sys.stderr)
 
         session_ids = [m.session_id for m in all_metrics if m.session_id not in cached_quality]
@@ -1366,8 +1447,6 @@ async def main():
                 cost_tracker=cost_tracker,
             )
             cached_quality.update(new_assessments)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            quality_cache.write_text(json.dumps(cached_quality, indent=2))
         else:
             print("  All quality assessments cached, skipping LLM calls", file=sys.stderr)
 
@@ -1391,7 +1470,6 @@ async def main():
             issue for m in all_metrics if m.llm_issues for issue in m.llm_issues
         })
         if distinct_issues:
-            issue_cat_cache = cache_dir / "issue_categories.json"
             cached_cats: dict[str, str] = {}
             if issue_cat_cache.exists() and not args.no_cache:
                 cached_cats = json.loads(issue_cat_cache.read_text())
@@ -1419,6 +1497,19 @@ async def main():
     success_dist = Counter(m.success_label for m in all_metrics)
     print(f"  Success: {dict(success_dist)}", file=sys.stderr)
 
+    # --- persist results to the SQLite analysis cache ---
+    # one short transaction per session; source_updated_at is the raw stored
+    # chat_sessions.updated_at (NOT reformatted to ISO 'T') so the staleness
+    # comparison against analyzed_at stays a consistent string compare.
+    for m in all_metrics:
+        analysis_db.upsert_analysis(
+            m,
+            ANALYZER_VERSION,
+            source_updated_at=updated_at_by_session.get(m.session_id),
+            message_count=m.total_messages,
+        )
+    print(f"  Persisted {len(all_metrics)} analyses to the DB cache", file=sys.stderr)
+
     if cost_tracker.usage:
         print(f"  API cost this run: ${cost_tracker.total_cost():.4f}", file=sys.stderr)
 
@@ -1439,12 +1530,15 @@ async def main():
         print("Exporting eval dataset...", file=sys.stderr)
         export_eval_dataset(all_metrics, messages, output_dir)
 
-    # --- save metrics as JSON ---
-    metrics_path = output_dir / "metrics.json"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with open(metrics_path, "w") as f:
-        json.dump([asdict(m) for m in all_metrics], f, indent=2, default=str)
-    print(f"  Wrote metrics to {metrics_path}", file=sys.stderr)
+    # --- save metrics as JSON (local-dev only) ---
+    # the DB cache is now the source of truth; metrics.json is a convenience
+    # export for the PNG plot script, written only when --output-dir is given
+    if args.output_dir:
+        metrics_path = output_dir / "metrics.json"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with open(metrics_path, "w") as f:
+            json.dump([asdict(m) for m in all_metrics], f, indent=2, default=str)
+        print(f"  Wrote metrics to {metrics_path}", file=sys.stderr)
 
     print("\nDone!", file=sys.stderr)
 

@@ -524,8 +524,11 @@ pytest --cov=src/genetics_mcp_server  # with coverage
 ## Conversation Analysis
 
 `scripts/analyze_conversations.py` is an offline tool that reads the chat-history
-SQLite DB and produces a markdown report (`report.md`), an eval dataset, and
-`metrics.json` (consumed by `plot_conversation_scores.py` for quality-over-time plots).
+SQLite DB, persists per-conversation analysis results back into that DB (the
+`conversation_analysis` / `conversation_issue` tables), and produces a markdown
+report (`report.md`) plus an eval dataset. With `--output-dir` it also writes a
+local-dev `metrics.json` (consumed by `plot_conversation_scores.py` for
+quality-over-time plots).
 
 - **Models** (env-overridable): topic classification uses Haiku
   (`$ANALYZE_TOPIC_MODEL`), the quality judge uses Sonnet (`$ANALYZE_QUALITY_MODEL`).
@@ -546,9 +549,16 @@ SQLite DB and produces a markdown report (`report.md`), an eval dataset, and
 - **Issue categorization**: the judge's detailed per-conversation issues are mapped
   onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a cheap Haiku
   pass so the report surfaces recurring problems instead of count-1 unique strings.
-- **Caching**: topic, quality, and issue-category results are cached under
-  `<output-dir>/.cache/`. After changing the judge prompt or scoring, re-run with
-  `--refresh-quality` (re-judge, keep topic cache) or `--no-cache` (recompute all).
+- **Caching**: per-session topic + quality + derived results are persisted to the
+  `conversation_analysis` / `conversation_issue` SQLite tables (with the full
+  `ConversationMetrics` blob in `metrics_json`) and read back via `get_analysis_map`
+  so already-analyzed sessions skip the LLM. A session is treated as cached only if
+  its row's `analyzer_version` equals the module-level `ANALYZER_VERSION` (bumping
+  that constant invalidates every cached analysis). `source_updated_at` is stored as
+  the raw `chat_sessions.updated_at` string so staleness comparisons stay consistent.
+  After changing the judge prompt or scoring, re-run with `--refresh-quality`
+  (re-judge, keep topic cache) or `--no-cache` (recompute all). The issue text →
+  taxonomy-category map remains a small flat sidecar at `<output-dir>/.cache/issue_categories.json`.
 
 ## Development Workflow
 

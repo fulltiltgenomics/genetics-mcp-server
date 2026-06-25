@@ -2,17 +2,20 @@
 
 import json
 import sqlite3
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import polars as pl
 import pytest
 
+import genetics_mcp_server.scripts.analyze_conversations as ac
 from genetics_mcp_server.scripts.analyze_conversations import (
     ConversationMetrics,
     _attachment_note,
     _format_conversation_for_eval,
     apply_quality_assessments,
     build_session_tool_stats,
+    cached_topic_and_quality,
     categorize_by_keywords,
     categorize_issues_with_llm,
     categorize_with_llm,
@@ -705,3 +708,175 @@ class TestDateFilter:
 
         assert filtered_sessions.height == 2  # s2 and s3
         assert filtered_messages.height == 4  # m5-m8
+
+
+# ---------------------------------------------------------------------------
+# Cached-row reconstruction (pure helper)
+# ---------------------------------------------------------------------------
+
+class TestCachedTopicAndQuality:
+    def test_reconstructs_only_current_version_rows(self):
+        m_current = ConversationMetrics(
+            session_id="s1", topic="gene_lookup", complexity=3, topic_reason="gene",
+            llm_quality_score=4, llm_answered="yes", llm_disposition="good_answer",
+            llm_issues=["x"], llm_issue_categories=["other"],
+        )
+        analysis_map = {
+            "s1": {
+                "analyzer_version": ac.ANALYZER_VERSION,
+                "metrics_json": json.dumps(vars(m_current)),
+            },
+            # stale version: must be treated as not cached
+            "s2": {
+                "analyzer_version": ac.ANALYZER_VERSION + 1,
+                "metrics_json": json.dumps({"topic": "x", "llm_quality_score": 2}),
+            },
+        }
+        topics, quality, issue_cats = cached_topic_and_quality(analysis_map)
+
+        assert set(topics) == {"s1"}
+        assert topics["s1"]["topic"] == "gene_lookup"
+        assert topics["s1"]["complexity"] == 3
+        assert quality["s1"]["quality_score"] == 4
+        assert quality["s1"]["disposition"] == "good_answer"
+        assert issue_cats["s1"] == ["other"]
+        # stale-version row excluded entirely
+        assert "s2" not in topics and "s2" not in quality
+
+    def test_unjudged_session_has_no_quality_entry(self):
+        m = ConversationMetrics(session_id="s1", topic="gene_lookup")  # no llm score
+        analysis_map = {
+            "s1": {
+                "analyzer_version": ac.ANALYZER_VERSION,
+                "metrics_json": json.dumps(vars(m)),
+            },
+        }
+        topics, quality, _ = cached_topic_and_quality(analysis_map)
+        assert "s1" in topics
+        assert "s1" not in quality  # must not fabricate a judgment
+
+
+# ---------------------------------------------------------------------------
+# DB-backed cache: end-to-end main() behavior
+# ---------------------------------------------------------------------------
+
+def _patch_llm():
+    """Patch the three network-calling LLM helpers with counting AsyncMocks.
+
+    topic + issue mocks return per-input results; quality returns a judgment for
+    every requested session so each conversation gets a quality score.
+    """
+    async def fake_topics(msgs, **kw):
+        return {m["id"]: {"topic": "gene_lookup", "complexity": 1,
+                          "brief_reason": "t"} for m in msgs}
+
+    async def fake_quality(session_ids, messages, **kw):
+        return {sid: {"quality_score": 4, "answered": "yes", "accurate": "yes",
+                      "efficient": "yes", "concluded": "yes",
+                      "disposition": "good_answer", "issues": ["some issue"]}
+                for sid in session_ids}
+
+    async def fake_issue_cats(issues, **kw):
+        return {i: "other" for i in issues}
+
+    return (
+        patch.object(ac, "categorize_with_llm", AsyncMock(side_effect=fake_topics)),
+        patch.object(ac, "evaluate_quality_with_llm", AsyncMock(side_effect=fake_quality)),
+        patch.object(ac, "categorize_issues_with_llm", AsyncMock(side_effect=fake_issue_cats)),
+    )
+
+
+async def _run_main(db_path, extra_args=None):
+    """Run analyze_conversations.main() against db_path with LLM mocked.
+
+    Returns (topic_mock, quality_mock) so tests can assert recompute happened or
+    was skipped.
+    """
+    from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+    from genetics_mcp_server.db.singleton import Singleton
+
+    # a fresh DB instance each run so the singleton doesn't pin a stale path
+    if ChatHistoryDB in Singleton._instances:
+        del Singleton._instances[ChatHistoryDB]
+
+    topic_p, quality_p, issue_p = _patch_llm()
+    argv = ["analyze_conversations", "--db", db_path, "--report-only"]
+    if extra_args:
+        argv += extra_args
+    with patch.object(sys, "argv", argv), topic_p as tm, quality_p as qm, issue_p:
+        await ac.main()
+    return tm, qm
+
+
+def _analysis_rows(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT session_id, analyzer_version, source_updated_at, message_count, "
+            "llm_quality_score, success_label, topic FROM conversation_analysis"
+        ).fetchall()
+        issues = conn.execute(
+            "SELECT session_id, category FROM conversation_issue"
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows, issues
+
+
+class TestDBBackedCache:
+    @pytest.mark.asyncio
+    async def test_results_written_to_db(self, sample_db):
+        await _run_main(sample_db)
+
+        rows, issues = _analysis_rows(sample_db)
+        assert len(rows) == 3  # one analysis row per session
+        by_sid = {r[0]: r for r in rows}
+        # every row stored at the current analyzer version
+        assert all(r[1] == ac.ANALYZER_VERSION for r in rows)
+        # source_updated_at is the raw stored chat_sessions.updated_at (space, not 'T')
+        assert by_sid["s1"][2] == "2025-12-10"
+        assert "T" not in (by_sid["s1"][2] or "")
+        # message_count and quality persisted
+        assert by_sid["s1"][3] == 4  # s1 has 4 messages
+        assert by_sid["s1"][4] == 4  # llm_quality_score from the mock
+        # normalized issue rows written
+        assert all(cat == "other" for _, cat in issues)
+        assert len(issues) == 3  # each session got one "some issue" -> one category
+
+    @pytest.mark.asyncio
+    async def test_second_run_skips_llm_recompute(self, sample_db):
+        await _run_main(sample_db)
+        # second run: every session already analyzed at the current version
+        tm, qm = await _run_main(sample_db)
+        # no session needs topic classification or quality judging
+        assert tm.call_count == 0
+        assert qm.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_no_cache_forces_recompute(self, sample_db):
+        await _run_main(sample_db)
+        tm, qm = await _run_main(sample_db, ["--no-cache"])
+        # --no-cache discards the DB cache, so the LLM is invoked again
+        assert tm.call_count == 1  # one batched topic call
+        assert qm.call_count == 1  # one quality call (covering all sessions)
+
+    @pytest.mark.asyncio
+    async def test_refresh_quality_recomputes_only_quality(self, sample_db):
+        await _run_main(sample_db)
+        tm, qm = await _run_main(sample_db, ["--refresh-quality"])
+        # topics stay cached, quality is re-judged
+        assert tm.call_count == 0
+        assert qm.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_version_bump_invalidates_cache(self, sample_db):
+        await _run_main(sample_db)
+        # simulate a new analyzer version: old rows must be treated as missing
+        bumped = ac.ANALYZER_VERSION + 1
+        with patch.object(ac, "ANALYZER_VERSION", bumped):
+            tm, qm = await _run_main(sample_db)
+            assert tm.call_count == 1
+            assert qm.call_count == 1
+            rows, _ = _analysis_rows(sample_db)
+            # rows rewritten at the bumped version
+            assert all(r[1] == bumped for r in rows)
