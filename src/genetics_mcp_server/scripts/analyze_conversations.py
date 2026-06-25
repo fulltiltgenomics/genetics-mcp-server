@@ -783,6 +783,25 @@ def apply_quality_assessments(
             m.success_label = label_from_disposition(m.llm_disposition, m.success_score)
 
 
+def mark_unscored_unknown(metrics: list[ConversationMetrics]) -> int:
+    """Label conversations with no quality judgment as 'unknown'.
+
+    A conversation the judge skipped (no llm_quality_score) and that also has no
+    user rating carries no quality signal at all — leaving it on a heuristic
+    successful/neutral/unsuccessful label would silently fold it into the quality
+    metric. Labelling it 'unknown' keeps it honestly separate.
+
+    Only call this when LLM evaluation ran; in --no-llm mode the heuristic labels
+    are the intended output. Returns the number of conversations relabelled.
+    """
+    n = 0
+    for m in metrics:
+        if m.llm_quality_score is None and m.user_rating is None:
+            m.success_label = "unknown"
+            n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
 # Eval dataset export
 # ---------------------------------------------------------------------------
@@ -928,7 +947,7 @@ def generate_report(
         ("out_of_scope", "Out of scope (we can't provide it)"),
         ("unfinished", "Unfinished (user stopped)"),
         ("weird_or_unclear", "Weird / unclear question"),
-        ("unknown", "Unclassified (no LLM disposition)"),
+        ("unknown", "Unknown (no quality judgment — judge skipped, unrated)"),
     ]
     for label, desc in other_labels:
         count = success_counts.get(label, 0)
@@ -1354,6 +1373,13 @@ async def main():
 
         apply_quality_assessments(all_metrics, cached_quality)
         print(f"  {len(cached_quality)} conversations evaluated", file=sys.stderr)
+
+        # conversations the judge skipped (and with no user rating) have no quality
+        # signal — label them 'unknown' instead of a heuristic successful/neutral
+        unknown_n = mark_unscored_unknown(all_metrics)
+        if unknown_n:
+            print(f"  {unknown_n} conversations had no quality judgment "
+                  "→ labelled 'unknown'", file=sys.stderr)
 
     # --- categorize detailed issues into recurring problem categories ---
     # raw judge issues are too specific to recur, so we map them onto a fixed

@@ -540,7 +540,9 @@ SQLite DB and produces a markdown report (`report.md`), an eval dataset, and
   **agent-quality** metric (successful/neutral/unsuccessful). `technical_failure`
   keeps a low score but buckets separately (infra ≠ agent); out-of-scope / unfinished
   / weird requests are not penalized. This keeps the quality trend measuring only
-  conversations the agent could have done well at.
+  conversations the agent could have done well at. Conversations the judge skipped
+  (no quality score) and with no user rating are labelled `unknown` rather than given
+  a heuristic label, so they stay out of the quality metric.
 - **Issue categorization**: the judge's detailed per-conversation issues are mapped
   onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a cheap Haiku
   pass so the report surfaces recurring problems instead of count-1 unique strings.

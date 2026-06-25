@@ -24,6 +24,7 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     label_from_disposition,
     label_success,
     load_data,
+    mark_unscored_unknown,
     parse_tool_calls,
 )
 
@@ -640,6 +641,23 @@ class TestDisposition:
                    "disposition": "agent_failure", "issues": ["gave up"]},
         })
         assert metrics[0].success_label == "unsuccessful"
+
+    def test_mark_unscored_unknown(self):
+        metrics = [
+            # judged -> keeps its disposition-derived label
+            ConversationMetrics(session_id="s1", llm_quality_score=5,
+                                success_label="successful"),
+            # no LLM score, no rating -> unknown
+            ConversationMetrics(session_id="s2", success_label="neutral"),
+            # no LLM score but has a user rating -> rating is a real signal, keep it
+            ConversationMetrics(session_id="s3", user_rating=4,
+                                success_label="successful"),
+        ]
+        n = mark_unscored_unknown(metrics)
+        assert n == 1
+        assert metrics[0].success_label == "successful"
+        assert metrics[1].success_label == "unknown"
+        assert metrics[2].success_label == "successful"
 
     @pytest.mark.asyncio
     async def test_evaluate_quality_with_llm(self):
