@@ -7,6 +7,7 @@ Usage:
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --start-from 2026-03-01 --until 2026-04-01
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --refresh-quality  # re-run quality eval, keep topic cache
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --no-cache         # recompute everything
+    python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --force            # reanalyze every conversation from scratch (e.g. after analysis-code changes)
     python -m genetics_mcp_server.scripts.analyze_conversations --db /path/to/db --output-dir ./analysis_output
 
 Analyzes conversations for:
@@ -1309,6 +1310,11 @@ async def main():
                         help="Ignore only the DB-cached quality assessments and re-run "
                              "them (keeps the cheap topic cache). Use to apply the "
                              "truncation fix without re-classifying topics.")
+    parser.add_argument("--force", action="store_true",
+                        help="Reanalyze every conversation from scratch, e.g. when the "
+                             "analysis code changed. Recomputes topics AND quality for all "
+                             "in-range sessions and overwrites their cached rows. --force "
+                             "wins over --refresh-quality (it already recomputes everything).")
     parser.add_argument("--report-file", default=None,
                         help="Also write the stdout report (GitHub-flavored markdown) "
                              "to this file (default: <output-dir>/report.md)")
@@ -1394,6 +1400,39 @@ async def main():
         else cached_topic_and_quality(analysis_map)
     )
     if args.refresh_quality:
+        cached_quality_db = {}
+
+    # staleness-based selection: ask the DB which sessions actually need
+    # (re)analysis — missing rows, continued conversations (chat_sessions.updated_at
+    # advanced past analyzed_at), or analyzer_version mismatches. --force selects
+    # every session. We intersect with the in-range session set so --start-from /
+    # --until still act as a filter on top of staleness, then drop the stale ones
+    # from the cached maps so they fall through to the LLM. Non-stale sessions keep
+    # their cache (no LLM work) but still flow into the report via the same maps,
+    # so the report stays a full summary of all in-range conversations.
+    in_range_ids = set(updated_at_by_session)
+    stale_ids = set(
+        analysis_db.get_stale_or_missing_session_ids(
+            force=args.force, analyzer_version=ANALYZER_VERSION
+        )
+    ) & in_range_ids
+    if stale_ids:
+        print(f"  {len(stale_ids)} of {len(in_range_ids)} in-range sessions are stale "
+              "(missing / continued / version-bumped) and will be reanalyzed",
+              file=sys.stderr)
+    # force the stale ones to recompute by evicting their cached topic + quality.
+    # --force already cleared both maps when it set no_cache-equivalent behavior
+    # below, but for the non-force path this is the surgical, minimal-work eviction.
+    for sid in stale_ids:
+        cached_topics_db.pop(sid, None)
+        cached_quality_db.pop(sid, None)
+
+    # --force is a superset of --no-cache for the selected range: discard all cached
+    # topic + quality so every in-range session is recomputed from scratch and its
+    # row overwritten. This also makes --force win over --refresh-quality (topics
+    # are recomputed too, not just quality).
+    if args.force:
+        cached_topics_db = {}
         cached_quality_db = {}
 
     # tracks real API cost from token usage; only reflects this run's live calls

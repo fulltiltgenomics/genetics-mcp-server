@@ -556,8 +556,20 @@ quality-over-time plots).
   its row's `analyzer_version` equals the module-level `ANALYZER_VERSION` (bumping
   that constant invalidates every cached analysis). `source_updated_at` is stored as
   the raw `chat_sessions.updated_at` string so staleness comparisons stay consistent.
+- **Staleness-based selection**: the nightly run does minimal LLM work by asking the DB
+  (`get_stale_or_missing_session_ids`) which in-range sessions actually need (re)analysis —
+  ones with no row, a continued conversation (`chat_sessions.updated_at` advanced past
+  `conversation_analysis.analyzed_at`), or an `analyzer_version` mismatch. Only those are
+  evicted from the reconstructed topic/quality cache and sent to the LLM; unchanged,
+  current-version sessions are skipped but still flow into the report (the report always
+  aggregates the full in-range set, cached + freshly judged). `--start-from` / `--until`
+  intersect with the stale set as an additional date filter. Because `upsert_analysis`
+  writes `analyzed_at = CURRENT_TIMESTAMP`, a re-judged continued conversation is no
+  longer stale on the next run (a future `updated_at` would correctly stay stale).
   After changing the judge prompt or scoring, re-run with `--refresh-quality`
-  (re-judge, keep topic cache) or `--no-cache` (recompute all). The issue text →
+  (re-judge, keep topic cache), `--no-cache` (recompute all), or `--force` (reanalyze
+  every conversation from scratch — a superset of `--no-cache` for the selected range;
+  `--force` wins over `--refresh-quality` since it recomputes topics too). The issue text →
   taxonomy-category map remains a small flat sidecar at `<output-dir>/.cache/issue_categories.json`.
 
 ## Development Workflow

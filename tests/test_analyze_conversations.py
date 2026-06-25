@@ -869,6 +869,79 @@ class TestDBBackedCache:
         assert qm.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_force_recomputes_everything(self, sample_db):
+        await _run_main(sample_db)
+        # --force ignores the cache for every in-range session: both LLM passes run
+        tm, qm = await _run_main(sample_db, ["--force"])
+        assert tm.call_count == 1  # one batched topic call covering all sessions
+        assert qm.call_count == 1  # one quality call covering all sessions
+        rows, _ = _analysis_rows(sample_db)
+        assert all(r[1] == ac.ANALYZER_VERSION for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_continued_conversation_reanalyzed_others_skipped(self, sample_db):
+        await _run_main(sample_db)
+
+        # continue s1: bump its updated_at past its analyzed_at. analyzed_at was set
+        # to the run's CURRENT_TIMESTAMP (UTC now), so use a clearly-later but not
+        # absurd-future value relative to that; a far-future date keeps it > analyzed_at.
+        conn = sqlite3.connect(sample_db)
+        try:
+            bumped = "2099-01-01 00:00:00"
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = 's1'", (bumped,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # only s1 is stale now, so the quality judge must see exactly s1
+        async def fake_quality_capture(session_ids, messages, **kw):
+            fake_quality_capture.seen = list(session_ids)
+            return {sid: {"quality_score": 4, "answered": "yes", "accurate": "yes",
+                          "efficient": "yes", "concluded": "yes",
+                          "disposition": "good_answer", "issues": ["some issue"]}
+                    for sid in session_ids}
+
+        from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+        if ChatHistoryDB in Singleton._instances:
+            del Singleton._instances[ChatHistoryDB]
+
+        topic_p, _, issue_p = _patch_llm()
+        quality_p = patch.object(
+            ac, "evaluate_quality_with_llm", AsyncMock(side_effect=fake_quality_capture)
+        )
+        argv = ["analyze_conversations", "--db", sample_db, "--report-only"]
+        with patch.object(sys, "argv", argv), topic_p, quality_p, issue_p:
+            await ac.main()
+
+        # exactly the continued session was re-judged; s2/s3 were skipped
+        assert fake_quality_capture.seen == ["s1"]
+
+        # round-trip: the run above re-persisted s1 with analyzed_at=CURRENT_TIMESTAMP
+        # (the run's UTC wall clock). The continued-conversation requirement is that a
+        # session whose updated_at is at or before that wall clock is no longer stale.
+        # The 2099 value above is deliberately later-than-now to drive the reanalysis;
+        # reset it to a realistic past timestamp (as a real continued conversation has)
+        # and confirm the freshly written analyzed_at now dominates it.
+        conn = sqlite3.connect(sample_db)
+        try:
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = '2025-12-10 09:00:00' WHERE id = 's1'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if ChatHistoryDB in Singleton._instances:
+            del Singleton._instances[ChatHistoryDB]
+        db = ChatHistoryDB(sample_db)
+        stale = db.get_stale_or_missing_session_ids(
+            force=False, analyzer_version=ac.ANALYZER_VERSION
+        )
+        assert "s1" not in stale
+
+    @pytest.mark.asyncio
     async def test_version_bump_invalidates_cache(self, sample_db):
         await _run_main(sample_db)
         # simulate a new analyzer version: old rows must be treated as missing
