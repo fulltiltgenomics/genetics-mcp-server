@@ -1,9 +1,14 @@
 """Plot evaluated conversation quality over time from analyze_conversations output.
 
-Consumes the ``metrics.json`` produced by
-``genetics_mcp_server.scripts.analyze_conversations`` (which now includes each
-session's ``created_at`` and ``llm_quality_score``) and renders time-series
-plots of how well the assistant is doing.
+Reads per-conversation analysis either from the SQLite ``conversation_analysis``
+/ ``conversation_issue`` tables (``--db``, the nightly-job source of truth) or
+from the local-dev ``metrics.json`` produced by
+``genetics_mcp_server.scripts.analyze_conversations`` (``--metrics``), and renders
+time-series plots of how well the assistant is doing.
+
+All rolling-window aggregation lives in ``analysis_timeseries`` so the PNG here
+and the frontend Quality-plots tab share one source of truth and cannot drift;
+this module only renders the series it returns.
 
 Daily conversation counts are noisy (some days have few or zero conversations),
 so every series is smoothed with a centered sliding time window (``--window``
@@ -11,31 +16,25 @@ days) rather than plotted per raw day.
 
 Usage:
     python -m genetics_mcp_server.scripts.plot_conversation_scores \
-        --metrics /mnt/disks/data/eval/analysis_output/metrics.json
+        --db /mnt/disks/data/chat_history.db
     python -m genetics_mcp_server.scripts.plot_conversation_scores \
-        --metrics .../metrics.json --window 14 --out scores_over_time.png
+        --metrics /mnt/disks/data/eval/analysis_output/metrics.json --window 14
 
 Plots produced (one figure, stacked panels):
 1. Per-score share over time   - one line per quality score (1..5), each the
-   rolling share of conversations with that score. Directly answers
-   "how is the score distribution moving".
+   rolling share of conversations with that score.
 2. Rolling mean score + volume - single trend line for average quality (1..5)
-   with the daily conversation volume as faint bars for context.
-3. Disposition mix             - one line per success_label bucket (successful /
-   neutral / unsuccessful / technical_failure / out_of_scope / unfinished /
-   weird_or_unclear / unknown) as a share of all conversations over time.
+   with the conversation volume as faint bars for context.
+3. Disposition mix             - one line per success_label bucket as a share of
+   all conversations over time.
 4. Issue category mix          - one line per issue taxonomy category as a share
-   of all issues over time (which underlying problems dominate).
-
-Other ways to track "how well we're doing over time" are described in the
-module docstring of the report and in the project notes; this script implements
-the three most useful as a starting point.
+   of all issues over time (deduped per conversation).
 """
 
 import argparse
 import json
+import sqlite3
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import matplotlib
@@ -45,9 +44,13 @@ matplotlib.use("Agg")  # headless: write files, no display needed
 import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .conversation_prompts import ISSUE_CATEGORIES  # noqa: E402
+from . import analysis_timeseries as ats  # noqa: E402
+from .analysis_timeseries import (  # noqa: E402
+    DISPOSITION_LABELS,
+    ISSUE_CATEGORY_NAMES,
+    SCORES,
+)
 
-SCORES = [1, 2, 3, 4, 5]
 # colourblind-friendly red->green ramp for scores 1..5
 SCORE_COLORS = {
     1: "#d73027",
@@ -57,14 +60,6 @@ SCORE_COLORS = {
     5: "#1a9850",
 }
 
-# every success_label bucket (quality labels + non-quality disposition buckets +
-# unknown), plotted together as a share of all conversations. distinct colours so
-# none collide on one axis.
-DISPOSITION_LABELS = [
-    "successful", "neutral", "unsuccessful",
-    "technical_failure", "out_of_scope", "unfinished", "weird_or_unclear",
-    "unknown",
-]
 DISPOSITION_COLORS = {
     "successful": "#1a9850",
     "neutral": "#fee08b",
@@ -76,9 +71,7 @@ DISPOSITION_COLORS = {
     "unknown": "#000000",
 }
 
-# the fixed issue taxonomy (imported so it stays in sync with the analyzer),
-# each category given a distinct colour from a 20-colour qualitative map
-ISSUE_CATEGORY_NAMES = [c for c, _ in ISSUE_CATEGORIES]
+# distinct colour per issue category from a 20-colour qualitative map
 ISSUE_CATEGORY_COLORS = {
     name: plt.cm.tab20(i % 20) for i, name in enumerate(ISSUE_CATEGORY_NAMES)
 }
@@ -88,23 +81,6 @@ ISSUE_CATEGORY_COLORS = {
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _parse_date(value: str):
-    """Parse a session created_at string into a date; None if unparseable."""
-    if not value:
-        return None
-    text = str(value).strip()
-    # accept "YYYY-MM-DD HH:MM:SS", ISO, or bare date
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text[: len(fmt) + 4], fmt).date()
-        except ValueError:
-            continue
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
-    except ValueError:
-        return None
-
-
 def load_metrics(path: Path) -> list[dict]:
     records = json.loads(path.read_text())
     if not isinstance(records, list):
@@ -112,93 +88,62 @@ def load_metrics(path: Path) -> list[dict]:
     return records
 
 
-def extract_timeseries(records: list[dict]) -> tuple[list, list[dict]]:
-    """Return (dates, records) for records that have a parseable date.
+def load_from_db(db_path: Path) -> list[dict]:
+    """Read analysis records from the chat_history SQLite DB (read-only).
 
-    Each returned record is the original dict plus a parsed ``_date`` field.
+    Joins each conversation_analysis row with its deduplicated
+    conversation_issue categories. ``created_at`` is taken from the persisted
+    ``metrics_json`` blob (the session start timestamp the plots key on).
     """
-    out = []
-    skipped_no_date = 0
-    for r in records:
-        d = _parse_date(r.get("created_at", ""))
-        if d is None:
-            skipped_no_date += 1
-            continue
-        out.append({**r, "_date": d})
-    if skipped_no_date:
-        print(f"  Skipped {skipped_no_date} records with no/unparseable created_at "
-              "(re-run analyze_conversations to populate it)", file=sys.stderr)
-    out.sort(key=lambda r: r["_date"])
-    return [r["_date"] for r in out], out
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT session_id, llm_quality_score, success_label, "
+            "llm_disposition, metrics_json FROM conversation_analysis"
+        ).fetchall()
+        issues: dict[str, list[str]] = {}
+        for r in conn.execute(
+            "SELECT DISTINCT session_id, category FROM conversation_issue"
+        ):
+            issues.setdefault(r["session_id"], []).append(r["category"])
+    finally:
+        conn.close()
+
+    records = []
+    for row in rows:
+        blob = {}
+        if row["metrics_json"]:
+            try:
+                blob = json.loads(row["metrics_json"])
+            except (ValueError, TypeError):
+                blob = {}
+        records.append({
+            "created_at": blob.get("created_at", ""),
+            "llm_quality_score": row["llm_quality_score"],
+            "success_label": row["success_label"],
+            "llm_disposition": row["llm_disposition"],
+            "llm_issue_categories": issues.get(row["session_id"], []),
+        })
+    return records
 
 
 # ---------------------------------------------------------------------------
-# Sliding-window smoothing
+# Plot panels (render-only; all aggregation comes from analysis_timeseries)
 # ---------------------------------------------------------------------------
 
-def daily_grid(min_date, max_date) -> list:
-    days = (max_date - min_date).days
-    return [min_date + timedelta(days=i) for i in range(days + 1)]
+def _arr(values):
+    """None -> nan float array so matplotlib breaks the line at empty windows
+    (the series carry JSON-friendly None; matplotlib draws gaps for nan)."""
+    return np.array([np.nan if v is None else v for v in values], dtype=float)
 
 
-def rolling_window(
-    records: list[dict], grid: list, window_days: int,
-):
-    """For each day in grid, yield (day, records_in_window).
-
-    The window is centered: [day - w//2, day + w//2] inclusive, where
-    w = window_days. Sparse days borrow neighbours so lines don't go jerky.
-    """
-    half = window_days // 2
-    dates = np.array([(r["_date"] - grid[0]).days for r in records])
-    for day in grid:
-        center = (day - grid[0]).days
-        mask = (dates >= center - half) & (dates <= center + half)
-        yield day, [records[i] for i in np.nonzero(mask)[0]]
-
-
-# ---------------------------------------------------------------------------
-# Plot panels
-# ---------------------------------------------------------------------------
-
-# dispositions that are not agent-quality failures; excluded from the score trend
-# so out-of-scope / unfinished / weird / technical conversations don't skew it.
-# empty disposition (pre-disposition metrics.json) is kept for backward compatibility.
-_NON_QUALITY_DISPOSITIONS = {
-    "technical_failure", "out_of_scope", "unfinished", "weird_or_unclear",
-}
-
-
-def _scored(records: list[dict]) -> list[dict]:
-    return [
-        r for r in records
-        if isinstance(r.get("llm_quality_score"), int)
-        and r.get("llm_disposition", "") not in _NON_QUALITY_DISPOSITIONS
-    ]
-
-
-def panel_score_shares(ax, records, grid, window, min_n):
-    """One line per score (1..5): rolling share of conversations with that score."""
-    xs = []
-    shares = {s: [] for s in SCORES}
-    for day, win in rolling_window(records, grid, window):
-        scored = _scored(win)
-        n = len(scored)
-        xs.append(day)
-        if n < min_n:
-            for s in SCORES:
-                shares[s].append(np.nan)
-            continue
-        counts = {s: 0 for s in SCORES}
-        for r in scored:
-            sc = r["llm_quality_score"]
-            if sc in counts:
-                counts[sc] += 1
-        for s in SCORES:
-            shares[s].append(100.0 * counts[s] / n)
-
+def panel_score_shares(ax, data, window):
+    xs = [ats.parse_date(d) for d in data["dates"]]
     for s in SCORES:
-        ax.plot(xs, shares[s], label=f"score {s}", color=SCORE_COLORS[s], lw=2)
+        ax.plot(xs, _arr(data["series"][str(s)]), label=f"score {s}",
+                color=SCORE_COLORS[s], lw=2)
     ax.set_ylabel("share of conversations (%)")
     ax.set_title(f"Quality score distribution over time ({window}-day centered window)")
     ax.set_ylim(0, 100)
@@ -206,24 +151,11 @@ def panel_score_shares(ax, records, grid, window, min_n):
     ax.grid(True, alpha=0.3)
 
 
-def panel_mean_and_volume(ax, records, grid, window, min_n):
-    """Rolling mean quality score (left axis) + conversation volume bars (right)."""
-    xs, means, los, his, vols = [], [], [], [], []
-    for day, win in rolling_window(records, grid, window):
-        scored = _scored(win)
-        xs.append(day)
-        vols.append(len(scored))
-        if len(scored) < min_n:
-            means.append(np.nan)
-            los.append(np.nan)
-            his.append(np.nan)
-            continue
-        vals = np.array([r["llm_quality_score"] for r in scored], dtype=float)
-        mean = vals.mean()
-        sem = vals.std(ddof=1) / np.sqrt(len(vals)) if len(vals) > 1 else 0.0
-        means.append(mean)
-        los.append(mean - 1.96 * sem)
-        his.append(mean + 1.96 * sem)
+def panel_mean_and_volume(ax, data, window):
+    xs = [ats.parse_date(d) for d in data["dates"]]
+    means = _arr(data["series"]["mean"])
+    los, his = _arr(data["ci_low"]), _arr(data["ci_high"])
+    vols = data["volume"]
 
     ax_v = ax.twinx()
     ax_v.bar(xs, vols, width=1.0, color="#999999", alpha=0.25, label="conversations in window")
@@ -239,35 +171,14 @@ def panel_mean_and_volume(ax, records, grid, window, min_n):
     ax.legend(loc="upper left", fontsize=8, frameon=False)
 
 
-def panel_disposition_shares(ax, records, grid, window, min_n):
-    """One line per disposition bucket: rolling share of ALL conversations.
-
-    Covers every success_label (successful/neutral/unsuccessful plus the
-    non-quality buckets technical_failure/out_of_scope/unfinished/weird and
-    unknown). Shares keep small buckets visible despite successful dominating.
-    """
-    xs = []
-    series = {lab: [] for lab in DISPOSITION_LABELS}
-    for day, win in rolling_window(records, grid, window):
-        n = len(win)
-        xs.append(day)
-        if n < min_n:
-            for lab in DISPOSITION_LABELS:
-                series[lab].append(np.nan)
-            continue
-        counts = {lab: 0 for lab in DISPOSITION_LABELS}
-        for r in win:
-            lab = r.get("success_label")
-            if lab in counts:
-                counts[lab] += 1
-        for lab in DISPOSITION_LABELS:
-            series[lab].append(100.0 * counts[lab] / n)
-
+def panel_disposition_shares(ax, data, window):
+    xs = [ats.parse_date(d) for d in data["dates"]]
     for lab in DISPOSITION_LABELS:
+        vals = data["series"][lab]
         # skip buckets with no data so the legend stays meaningful
-        if all(np.isnan(v) or v == 0 for v in series[lab]):
+        if all(v is None or v == 0 for v in vals):
             continue
-        ax.plot(xs, series[lab], label=lab, color=DISPOSITION_COLORS[lab], lw=2)
+        ax.plot(xs, _arr(vals), label=lab, color=DISPOSITION_COLORS[lab], lw=2)
     ax.set_ylabel("share of all conversations (%)")
     ax.set_title(f"Disposition mix over time ({window}-day centered window)")
     ax.set_ylim(0, 100)
@@ -275,36 +186,15 @@ def panel_disposition_shares(ax, records, grid, window, min_n):
     ax.grid(True, alpha=0.3)
 
 
-def panel_issue_category_shares(ax, records, grid, window, min_n):
-    """One line per issue category: rolling share of all issues in the window.
-
-    Issues come from each conversation's llm_issue_categories (the fixed
-    taxonomy, deduplicated per conversation). Shows which underlying problems
-    dominate over time rather than absolute volume.
-    """
-    xs = []
-    series = {c: [] for c in ISSUE_CATEGORY_NAMES}
-    for day, win in rolling_window(records, grid, window):
-        instances = [c for r in win for c in (r.get("llm_issue_categories") or [])]
-        total = len(instances)
-        xs.append(day)
-        if total < min_n:
-            for c in ISSUE_CATEGORY_NAMES:
-                series[c].append(np.nan)
-            continue
-        counts = {c: 0 for c in ISSUE_CATEGORY_NAMES}
-        for c in instances:
-            if c in counts:
-                counts[c] += 1
-        for c in ISSUE_CATEGORY_NAMES:
-            series[c].append(100.0 * counts[c] / total)
-
+def panel_issue_category_shares(ax, data, window):
+    xs = [ats.parse_date(d) for d in data["dates"]]
     any_data = False
     for c in ISSUE_CATEGORY_NAMES:
-        if all(np.isnan(v) or v == 0 for v in series[c]):
+        vals = data["series"][c]
+        if all(v is None or v == 0 for v in vals):
             continue
         any_data = True
-        ax.plot(xs, series[c], label=c, color=ISSUE_CATEGORY_COLORS[c], lw=2)
+        ax.plot(xs, _arr(vals), label=c, color=ISSUE_CATEGORY_COLORS[c], lw=2)
     ax.set_ylabel("share of issues (%)")
     ax.set_title(f"Issue category mix over time ({window}-day window, "
                  "deduped per conversation)")
@@ -322,13 +212,18 @@ def panel_issue_category_shares(ax, records, grid, window, min_n):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot evaluated conversation quality over time from "
-                    "analyze_conversations metrics.json.",
+        description="Plot evaluated conversation quality over time from the "
+                    "conversation_analysis DB tables or analyze_conversations "
+                    "metrics.json.",
     )
-    parser.add_argument("--metrics", required=True,
-                        help="Path to metrics.json from analyze_conversations")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--db",
+                     help="Path to chat_history.db (reads conversation_analysis "
+                          "/ conversation_issue, read-only)")
+    src.add_argument("--metrics",
+                     help="Path to metrics.json from analyze_conversations")
     parser.add_argument("--out", default=None,
-                        help="Output image path (default: <metrics dir>/scores_over_time.png)")
+                        help="Output image path (default: <source dir>/scores_over_time.png)")
     parser.add_argument("--window", type=int, default=7,
                         help="Sliding window width in days, centered (default: 7)")
     parser.add_argument("--min-n", type=int, default=3,
@@ -336,33 +231,45 @@ def main():
                              "(below this the line breaks instead of spiking; default: 3)")
     args = parser.parse_args()
 
-    metrics_path = Path(args.metrics)
-    if not metrics_path.exists():
-        print(f"Error: metrics file not found: {metrics_path}", file=sys.stderr)
-        sys.exit(1)
+    if args.db:
+        source_path = Path(args.db)
+        if not source_path.exists():
+            print(f"Error: db file not found: {source_path}", file=sys.stderr)
+            sys.exit(1)
+        records = load_from_db(source_path)
+    else:
+        source_path = Path(args.metrics)
+        if not source_path.exists():
+            print(f"Error: metrics file not found: {source_path}", file=sys.stderr)
+            sys.exit(1)
+        records = load_metrics(source_path)
 
-    records = load_metrics(metrics_path)
-    dates, ts = extract_timeseries(records)
-    if not ts:
+    series = ats.build_all_series(records, window=args.window, min_n=args.min_n)
+    meta = series["meta"]
+
+    if meta["skipped_no_date"]:
+        print(f"  Skipped {meta['skipped_no_date']} records with no/unparseable "
+              "created_at (re-run analyze_conversations to populate it)",
+              file=sys.stderr)
+
+    if meta["empty"]:
         print("Error: no records with a parseable created_at — re-run "
-              "analyze_conversations so metrics.json includes session dates.",
+              "analyze_conversations so the analysis includes session dates.",
               file=sys.stderr)
         sys.exit(1)
 
-    n_scored = len(_scored(ts))
-    print(f"  {len(ts)} dated conversations, {n_scored} with an LLM quality score, "
-          f"{dates[0]} to {dates[-1]}", file=sys.stderr)
+    n_scored = meta["scored"]
+    print(f"  {meta['total']} dated conversations, {n_scored} with an LLM quality "
+          f"score, {meta['date_min']} to {meta['date_max']}", file=sys.stderr)
     if n_scored == 0:
         print("Warning: no llm_quality_score values — score panels will be empty. "
               "Run analyze_conversations without --no-llm.", file=sys.stderr)
 
-    grid = daily_grid(dates[0], dates[-1])
-
     fig, axes = plt.subplots(4, 1, figsize=(13, 17), sharex=True)
-    panel_score_shares(axes[0], ts, grid, args.window, args.min_n)
-    panel_mean_and_volume(axes[1], ts, grid, args.window, args.min_n)
-    panel_disposition_shares(axes[2], ts, grid, args.window, args.min_n)
-    panel_issue_category_shares(axes[3], ts, grid, args.window, args.min_n)
+    panel_score_shares(axes[0], series["score_share"], args.window)
+    panel_mean_and_volume(axes[1], series["mean_and_volume"], args.window)
+    panel_disposition_shares(axes[2], series["disposition_mix"], args.window)
+    panel_issue_category_shares(axes[3], series["issue_category_mix"], args.window)
 
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
     axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
@@ -374,7 +281,7 @@ def main():
     )
     fig.tight_layout(rect=(0, 0, 1, 0.99))
 
-    out_path = Path(args.out) if args.out else metrics_path.parent / "scores_over_time.png"
+    out_path = Path(args.out) if args.out else source_path.parent / "scores_over_time.png"
     fig.savefig(out_path, dpi=130)
     print(f"  Wrote plot to {out_path}", file=sys.stderr)
 
