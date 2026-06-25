@@ -8,7 +8,7 @@ When REQUIRE_AUTH=false (dev mode), any user can access.
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from genetics_mcp_server.auth import admin_required
@@ -33,6 +33,11 @@ class AdminSessionItem(BaseModel):
     phenotype_code: Optional[str] = None
     message_count: int = 0
     preview: Optional[str] = None
+    disposition: Optional[str] = None
+    issue_count: int = 0
+    issue_categories: list[str] = []
+    llm_rating: Optional[int] = None
+    success_label: Optional[str] = None
 
 
 class AdminSessionListResponse(BaseModel):
@@ -73,6 +78,19 @@ class UsageAnalyticsResponse(BaseModel):
     data: list[UsageDataPoint]
 
 
+class QualityRow(BaseModel):
+    session_id: str
+    created_at: str
+    llm_quality_score: Optional[int] = None
+    llm_disposition: Optional[str] = None
+    success_label: Optional[str] = None
+    issue_categories: list[str] = []
+
+
+class QualityAnalyticsResponse(BaseModel):
+    rows: list[QualityRow]
+
+
 class FeedbackItem(BaseModel):
     user: str
     comment: str
@@ -101,9 +119,33 @@ async def list_all_sessions(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     session_id: Optional[str] = None,
+    disposition: Optional[str] = None,
+    rating: Optional[str] = Query(
+        None,
+        description="LLM rating filter. '1'..'5' filters that exact score; "
+        "'NA' filters to unrated sessions (no llm_quality_score).",
+    ),
+    success_label: Optional[str] = None,
+    min_issues: Optional[int] = None,
     admin_user: str = Depends(admin_required),
 ):
     """List all sessions across all users with optional filters."""
+    # rating is a string so the unrated/"NA" case is expressible as a value;
+    # "1".."5" map to the exact-score DB filter, "NA" maps to the unrated filter
+    rating_value: Optional[int] = None
+    unrated = False
+    if rating is not None:
+        if rating.upper() == "NA":
+            unrated = True
+        else:
+            try:
+                rating_value = int(rating)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="rating must be an integer 1-5 or 'NA'",
+                )
+
     db = get_chat_history_db()
     sessions, total = db.list_all_sessions(
         limit=limit,
@@ -112,6 +154,11 @@ async def list_all_sessions(
         date_from=date_from,
         date_to=date_to,
         session_id_filter=session_id,
+        disposition=disposition,
+        rating=rating_value,
+        success_label=success_label,
+        min_issues=min_issues,
+        unrated=unrated,
     )
 
     items = []
@@ -129,6 +176,11 @@ async def list_all_sessions(
             phenotype_code=s.phenotype_code,
             message_count=len(messages),
             preview=preview[:100] if preview else None,
+            disposition=s.disposition,
+            issue_count=s.issue_count,
+            issue_categories=s.issue_categories or [],
+            llm_rating=s.llm_quality_score,
+            success_label=s.success_label,
         ))
 
     return AdminSessionListResponse(
@@ -188,6 +240,20 @@ async def get_usage_analytics(
         period=period,
         data=[UsageDataPoint(**d) for d in data],
     )
+
+
+@router.get("/admin/analytics/quality", response_model=QualityAnalyticsResponse)
+async def get_quality_analytics(
+    admin_user: str = Depends(admin_required),
+):
+    """Return raw per-conversation analysis rows for the Quality plots tab.
+
+    Aggregation (rolling windows, score shares, etc.) is done client-side, so
+    this endpoint just surfaces the unaggregated rows ordered by created_at.
+    """
+    db = get_chat_history_db()
+    rows = db.list_all_analysis_rows()
+    return QualityAnalyticsResponse(rows=[QualityRow(**r) for r in rows])
 
 
 @router.get("/admin/feedback", response_model=FeedbackListResponse)

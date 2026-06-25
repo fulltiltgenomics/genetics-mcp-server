@@ -62,6 +62,137 @@ def admin_client(seeded_db):
     app.dependency_overrides.clear()
 
 
+@pytest.fixture
+def analyzed_admin_client(test_db):
+    """Admin client over a DB with analysis rows on two of three sessions.
+
+    s1: rating 5, successful, answered, 2 issues (hallucination, tone)
+    s2: rating 2, unsuccessful, refused, 1 issue (refusal)
+    s3: unanalyzed (NA rating, no issues)
+    """
+    from genetics_mcp_server.config.settings import get_settings
+
+    s1 = test_db.create_session("alice@example.com")
+    s2 = test_db.create_session("bob@example.com")
+    s3 = test_db.create_session("carol@example.com")
+    for s in (s1, s2, s3):
+        test_db.add_message(s.id, f"msg-{s.id}", "user", "hello")
+
+    test_db.upsert_analysis(
+        {
+            "session_id": s1.id,
+            "llm_quality_score": 5,
+            "success_label": "successful",
+            "llm_disposition": "answered",
+            "llm_issue_categories": ["hallucination", "tone"],
+        },
+        analyzer_version=1,
+        source_updated_at=None,
+        message_count=2,
+    )
+    test_db.upsert_analysis(
+        {
+            "session_id": s2.id,
+            "llm_quality_score": 2,
+            "success_label": "unsuccessful",
+            "llm_disposition": "refused",
+            "llm_issue_categories": ["refusal"],
+        },
+        analyzer_version=1,
+        source_updated_at=None,
+        message_count=2,
+    )
+
+    async def mock_admin():
+        return "admin@example.com"
+
+    app.dependency_overrides[admin_required] = mock_admin
+
+    with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
+        get_settings.cache_clear()
+        with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db):
+            with TestClient(app) as client:
+                yield client, s1.id, s2.id, s3.id
+        get_settings.cache_clear()
+
+    app.dependency_overrides.clear()
+
+
+class TestAdminSessionsAnalysisFields:
+    """HTTP-level coverage of the analysis fields + filters on /admin/sessions."""
+
+    def test_analysis_fields_exposed(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        data = client.get("/chat/v1/admin/sessions").json()
+        by_id = {s["id"]: s for s in data["sessions"]}
+
+        assert by_id[s1]["disposition"] == "answered"
+        assert by_id[s1]["llm_rating"] == 5
+        assert by_id[s1]["success_label"] == "successful"
+        assert by_id[s1]["issue_count"] == 2
+        assert set(by_id[s1]["issue_categories"]) == {"hallucination", "tone"}
+
+        # unanalyzed session surfaces NA/empty defaults
+        assert by_id[s3]["disposition"] is None
+        assert by_id[s3]["llm_rating"] is None
+        assert by_id[s3]["success_label"] is None
+        assert by_id[s3]["issue_count"] == 0
+        assert by_id[s3]["issue_categories"] == []
+
+    def test_filter_disposition(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        data = client.get("/chat/v1/admin/sessions?disposition=answered").json()
+        assert data["total"] == 1
+        assert data["sessions"][0]["id"] == s1
+
+    def test_filter_success_label(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        data = client.get("/chat/v1/admin/sessions?success_label=unsuccessful").json()
+        assert data["total"] == 1
+        assert data["sessions"][0]["id"] == s2
+
+    def test_filter_min_issues(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        assert client.get("/chat/v1/admin/sessions?min_issues=2").json()["total"] == 1
+        assert client.get("/chat/v1/admin/sessions?min_issues=1").json()["total"] == 2
+
+    def test_filter_rating_numeric(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        data = client.get("/chat/v1/admin/sessions?rating=5").json()
+        assert data["total"] == 1
+        assert data["sessions"][0]["id"] == s1
+
+    def test_filter_rating_na(self, analyzed_admin_client):
+        """rating=NA filters to unrated sessions (s3 has no analysis row)."""
+        client, s1, s2, s3 = analyzed_admin_client
+        data = client.get("/chat/v1/admin/sessions?rating=NA").json()
+        assert data["total"] == 1
+        assert data["sessions"][0]["id"] == s3
+
+    def test_filter_rating_invalid(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        resp = client.get("/chat/v1/admin/sessions?rating=bogus")
+        assert resp.status_code == 400
+
+
+class TestAdminQualityAnalytics:
+
+    def test_quality_rows(self, analyzed_admin_client):
+        client, s1, s2, s3 = analyzed_admin_client
+        resp = client.get("/chat/v1/admin/analytics/quality")
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        # only analyzed sessions appear
+        assert {r["session_id"] for r in rows} == {s1, s2}
+        by_id = {r["session_id"]: r for r in rows}
+        assert by_id[s1]["llm_quality_score"] == 5
+        assert by_id[s1]["llm_disposition"] == "answered"
+        assert by_id[s1]["success_label"] == "successful"
+        assert set(by_id[s1]["issue_categories"]) == {"hallucination", "tone"}
+        assert by_id[s2]["issue_categories"] == ["refusal"]
+        assert "created_at" in by_id[s1]
+
+
 class TestAdminSessions:
 
     def test_list_all_sessions(self, admin_client):
@@ -504,6 +635,32 @@ class TestAdminSessionsAnalysisJoin:
         sessions, total = db.list_all_sessions(success_label="successful")
         assert total == 1
         assert sessions[0].id == s1
+
+    def test_filter_unrated(self, analyzed_db):
+        """unrated=True keeps sessions with no llm_quality_score (the 'NA' case):
+        an unanalyzed session, or an analyzed one whose score is NULL."""
+        db, s1, s2, s3 = analyzed_db
+        # s3 has no analysis row at all -> NULL score
+        sessions, total = db.list_all_sessions(unrated=True)
+        assert total == 1
+        assert sessions[0].id == s3
+        # an analyzed session with a NULL quality score also counts as unrated
+        s4 = db.create_session("dave@example.com")
+        db.upsert_analysis(
+            {
+                "session_id": s4.id,
+                "llm_quality_score": None,
+                "success_label": "unknown",
+                "llm_disposition": "out_of_scope",
+                "llm_issue_categories": [],
+            },
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
+        )
+        sessions, total = db.list_all_sessions(unrated=True)
+        assert total == 2
+        assert {s.id for s in sessions} == {s3, s4.id}
 
     def test_filter_min_issues(self, analyzed_db):
         db, s1, s2, s3 = analyzed_db

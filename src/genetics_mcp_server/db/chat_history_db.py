@@ -541,6 +541,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         rating: int | None = None,
         success_label: str | None = None,
         min_issues: int | None = None,
+        unrated: bool = False,
     ) -> tuple[list[ChatSession], int]:
         """List all sessions across all users with optional filters.
 
@@ -554,6 +555,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
           rating: exact match on llm_quality_score (1-5)
           success_label: exact match on success_label
           min_issues: keep only sessions whose issue_count >= this value
+          unrated: keep only sessions with no llm_quality_score (NULL); this is
+            the "NA" rating case — a session with no analysis row OR an analysis
+            row whose llm_quality_score is NULL. Mutually exclusive with `rating`.
 
         Returns (sessions, total_count) for pagination. The total count
         applies the same filters as the page query.
@@ -585,6 +589,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         if rating is not None:
             conditions.append("a.llm_quality_score = ?")
             params.append(rating)
+        if unrated:
+            conditions.append("a.llm_quality_score IS NULL")
         if success_label is not None:
             conditions.append("a.success_label = ?")
             params.append(success_label)
