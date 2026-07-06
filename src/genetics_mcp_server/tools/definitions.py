@@ -229,6 +229,69 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_open_chromatin_by_variant",
+        "category": "api",
+        "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks overlapping a variant's position. Answers 'in which cell types/tissues/conditions is this variant's region of open/accessible chromatin?'. Returns overlapping accessible regions labeled by cell_type, tissue, life_stage and condition (resting/stimulated/AD/control) so cell-type specificity can be reported. This is a peak ATLAS (measured accessibility across brain, heart, immune and body-wide contexts) — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Variant as chr:pos:ref:alt or chr:pos (e.g., '1:1000500:A:G' or '1:1000500'); only chromosome and position are used for overlap",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'marderstein' (fetal+adult brain/heart scATAC), 'li_brain_atac' (adult brain), 'catlas' (body-wide adult), 'epimap' (bulk chromHMM regulatory states), 'calderon_immune' (stimulation-responsive immune), 'rosmap_brain' (aged/AD brain). Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_open_chromatin_by_region",
+        "category": "api",
+        "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks overlapping a genomic region. Answers 'in which cell types/tissues/conditions is this region of open/accessible chromatin?'. Returns overlapping accessible regions labeled by cell_type, tissue, life_stage and condition. This is a peak ATLAS of measured accessibility — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
+        "parameters": {
+            "chrom": {
+                "type": "string",
+                "description": "Chromosome (e.g., '1', 'chr1', 'X')",
+                "required": True,
+            },
+            "start": {
+                "type": "integer",
+                "description": "Region start position (1-based, inclusive)",
+                "required": True,
+            },
+            "end": {
+                "type": "integer",
+                "description": "Region end position (1-based, inclusive)",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'marderstein', 'li_brain_atac', 'catlas', 'epimap', 'calderon_immune', 'rosmap_brain'. Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_open_chromatin_by_gene",
+        "category": "api",
+        "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory/enhancer peaks). Answers 'in which cell types/tissues/conditions is the chromatin around this gene open/accessible?'. Returns accessible regions labeled by cell_type, tissue, life_stage and condition. This is a peak ATLAS of measured accessibility — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol (e.g., 'PCSK9')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'marderstein', 'li_brain_atac', 'catlas', 'epimap', 'calderon_immune', 'rosmap_brain'. Omit to search all.",
+            },
+            "window": {
+                "type": "integer",
+                "description": "Flank in bp added on each side of the gene body (default 500000).",
+                "default": 500000,
+            },
+        },
+    },
+    {
         "name": "get_gene_disease_associations",
         "category": "api",
         "description": "Get Mendelian/rare disease gene-disease relationships from ClinGen/GENCC. Use ONLY for rare disease genetics questions, NOT for GWAS/common variant associations.",
@@ -1081,6 +1144,33 @@ def register_mcp_tools(
     ) -> dict:
         """Get ASM-QTL data for variants near a gene."""
         return await executor.get_asm_qtl_by_gene(gene, resources, window)
+
+    @mcp.tool()
+    async def get_open_chromatin_by_variant(
+        variant: str,
+        resources: str | None = None,
+    ) -> dict:
+        """Get open-chromatin atlas peaks overlapping a variant's position."""
+        return await executor.get_open_chromatin_by_variant(variant, resources)
+
+    @mcp.tool()
+    async def get_open_chromatin_by_region(
+        chrom: str,
+        start: int,
+        end: int,
+        resources: str | None = None,
+    ) -> dict:
+        """Get open-chromatin atlas peaks overlapping a genomic region."""
+        return await executor.get_open_chromatin_by_region(chrom, start, end, resources)
+
+    @mcp.tool()
+    async def get_open_chromatin_by_gene(
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+    ) -> dict:
+        """Get open-chromatin atlas peaks near a gene."""
+        return await executor.get_open_chromatin_by_gene(gene, resources, window)
 
     @mcp.tool()
     async def get_gene_disease_associations(gene: str) -> dict:
