@@ -292,6 +292,43 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_variant_effect_by_variant",
+        "category": "api",
+        "description": "Get in-silico PREDICTED variant effect on chromatin accessibility for a variant. Answers 'is this variant predicted to disrupt chromatin accessibility, how strongly, and in which cell types?'. Returns per-model, per-cell-type predicted scores: ChromBPNet (model=chrombpnet) gives the predicted accessibility effect (score/mlog10p/quantile_rank/is_significant) in specific cell_type/tissue contexts; FLARE (model=flare) gives a pan-context regulatory score (cell_type/tissue may be null). These are MODEL PREDICTIONS — distinct from measured caqtl (accessibility QTL) and open_chromatin (measured accessibility atlas).",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Variant as chr:pos:ref:alt or chr:pos (e.g., '1:1000500:A:G' or '1:1000500')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'marderstein' (Marderstein/Kundaje 2026 ChromBPNet + FLARE predictions). Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_variant_effect_by_gene",
+        "category": "api",
+        "description": "Get in-silico PREDICTED variant effects on chromatin accessibility for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'how strongly and in which cell types are this gene's variants predicted to affect chromatin accessibility?'. Returns per-model, per-cell-type predicted-effect rows: ChromBPNet (model=chrombpnet) predicted accessibility effect in specific cell_type/tissue contexts; FLARE (model=flare) pan-context regulatory score (cell_type/tissue may be null). These are MODEL PREDICTIONS — distinct from measured caqtl (accessibility QTL) and open_chromatin (measured accessibility atlas).",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol (e.g., 'PCSK9')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'marderstein' (Marderstein/Kundaje 2026 ChromBPNet + FLARE predictions). Omit to search all.",
+            },
+            "window": {
+                "type": "integer",
+                "description": "Flank in bp added on each side of the gene body (default 500000).",
+                "default": 500000,
+            },
+        },
+    },
+    {
         "name": "get_gene_disease_associations",
         "category": "api",
         "description": "Get Mendelian/rare disease gene-disease relationships from ClinGen/GENCC. Use ONLY for rare disease genetics questions, NOT for GWAS/common variant associations.",
@@ -1171,6 +1208,23 @@ def register_mcp_tools(
     ) -> dict:
         """Get open-chromatin atlas peaks near a gene."""
         return await executor.get_open_chromatin_by_gene(gene, resources, window)
+
+    @mcp.tool()
+    async def get_variant_effect_by_variant(
+        variant: str,
+        resources: str | None = None,
+    ) -> dict:
+        """Get in-silico predicted variant effect on chromatin accessibility for a variant."""
+        return await executor.get_variant_effect_by_variant(variant, resources)
+
+    @mcp.tool()
+    async def get_variant_effect_by_gene(
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+    ) -> dict:
+        """Get in-silico predicted variant effects on chromatin accessibility near a gene."""
+        return await executor.get_variant_effect_by_gene(gene, resources, window)
 
     @mcp.tool()
     async def get_gene_disease_associations(gene: str) -> dict:

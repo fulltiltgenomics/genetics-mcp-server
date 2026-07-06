@@ -826,6 +826,67 @@ class ToolExecutor:
             }
         return result
 
+    async def get_variant_effect_by_variant(
+        self, variant: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get in-silico predicted variant effect on chromatin accessibility via the results-api.
+
+        Returns per-model (chrombpnet/flare) per-cell-type predicted scores for the variant.
+        FLARE scores are pan-context (cell_type may be null); ChromBPNet scores are per context.
+        """
+        params: dict[str, Any] = {"format": "json"}
+        if resources:
+            # list value -> repeated query params, which the API's list[str] Query expects
+            params["resources"] = [r.strip() for r in resources.split(",")]
+        resp = await self.client.get(
+            f"{self.base_url}/v1/variant_effect/variant/{variant}", params=params
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "variant": variant, "results": results,
+                "_download_data": {"results": results, "filename": f"{variant}_variant_effect.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_variant_effect_by_gene(
+        self, gene: str, resources: str | None = None, window: int = 500000
+    ) -> dict[str, Any]:
+        """Get in-silico predicted variant effects on chromatin accessibility near a gene via BigQuery.
+
+        Variants are selected by genomic coordinates (gene body ± window) against
+        `variant_effect_v` — the table is variant-indexed (single `pos`), so a point-position
+        overlap is used, not `gene_most_severe` attribution, so nearby regulatory variants are
+        not missed. Gene coordinates come from `gene_annotations_v`; resources are filtered on
+        the view's derived `resource` column. Rows carry per-model (chrombpnet/flare) predicted
+        scores so the agent can summarize how strongly and in which cell types accessibility is
+        predicted to be affected (FLARE is pan-context, so cell_type may be null).
+        """
+        resource_filter = ""
+        if resources:
+            rlist = [r.strip() for r in resources.split(",")]
+            quoted = ", ".join(f"'{r}'" for r in rlist)
+            resource_filter = f" AND a.resource IN ({quoted})"
+
+        sql = (
+            f"WITH g AS ("
+            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
+            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
+            f") "
+            f"SELECT a.* FROM `genetics_results.variant_effect_v` a "
+            f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
+            f"AND a.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"WHERE TRUE{resource_filter} "
+            f"ORDER BY a.mlog10p DESC LIMIT 500"
+        )
+        result = await self.query_bigquery(sql, max_rows=500)
+        if result.get("success"):
+            return {
+                "success": True, "gene": gene, "results": result.get("rows", []),
+                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_variant_effect.tsv"},
+            }
+        return result
+
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:
         """Get gene-disease associations."""
         resp = await self.client.get(
