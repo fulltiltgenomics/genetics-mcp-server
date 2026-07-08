@@ -111,6 +111,9 @@ class ToolExecutor:
         # internal API secret is never leaked to external services (e.g. MouseMine,
         # myvariant.info). Per-call auth (Perplexity, Tavily) is passed explicitly.
         self.external_client = _ResilientAsyncClient(timeout=30.0)
+        # lazily-fetched universe of expression resources (e.g. gtex, hpa), used to
+        # tell "gene absent from this resource" apart from "resource unavailable"
+        self._expression_resources: list[str] | None = None
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion
@@ -676,6 +679,23 @@ class ToolExecutor:
     # Gene Data Tools
     # -------------------------------------------------------------------------
 
+    async def _get_expression_resources(self) -> list[str]:
+        """Fetch (and cache) the full set of expression resources the API serves.
+
+        Used to distinguish "gene not covered by a resource" from "resource
+        unavailable" in get_gene_expression. Returns [] on failure so the caller
+        degrades gracefully (it just omits the coverage annotation)."""
+        if self._expression_resources is None:
+            try:
+                resp = await self.client.get(f"{self.base_url}/v1/resources")
+                resp.raise_for_status()
+                self._expression_resources = [
+                    e["resource"] for e in resp.json().get("expression", [])
+                ]
+            except Exception:
+                self._expression_resources = []
+        return self._expression_resources
+
     async def get_gene_expression(self, gene: str) -> dict[str, Any]:
         """Get tissue expression for a gene."""
         resp = await self.client.get(
@@ -683,10 +703,21 @@ class ToolExecutor:
         )
         if resp.status_code == 200:
             results = resp.json()
-            return {
+            out: dict[str, Any] = {
                 "success": True, "gene": gene, "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_expression.tsv"},
             }
+            # Annotate which expression resources returned no rows for this gene, so a
+            # zero-coverage resource (e.g. HPA lacks IHC data for many genes) is not
+            # mistaken for the resource being unavailable. The endpoint merges all
+            # resources and silently omits those with no matching rows.
+            expected = await self._get_expression_resources()
+            if expected:
+                returned = {r.get("resource") for r in results}
+                no_data = sorted(r for r in expected if r not in returned)
+                if no_data:
+                    out["resources_with_no_data"] = no_data
+            return out
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_asm_qtl_by_variant(
