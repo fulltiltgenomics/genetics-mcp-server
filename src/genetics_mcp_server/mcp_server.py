@@ -120,6 +120,78 @@ def _get_google_request():
     return _google_request
 
 
+# PyJWKClient instances keyed by JWKS URI. the client caches the fetched JWK set
+# internally (lifespan-bounded), so reusing it avoids refetching on every request.
+_jwks_clients: dict = {}
+_jwks_clients_lock = threading.Lock()
+
+
+def _get_jwks_client(jwks_uri: str):
+    client = _jwks_clients.get(jwks_uri)
+    if client is None:
+        with _jwks_clients_lock:
+            client = _jwks_clients.get(jwks_uri)
+            if client is None:
+                import jwt
+                client = jwt.PyJWKClient(jwks_uri)
+                _jwks_clients[jwks_uri] = client
+    return client
+
+
+def _email_allowed(email: str, settings) -> bool:
+    """Shared allow-list check used by every JWT bearer path."""
+    domain = email.split("@")[-1] if "@" in email else ""
+    return email in settings.allowed_emails or domain in settings.allowed_email_domains
+
+
+def _validate_keycloak_token(token: str, settings) -> bool:
+    """Validate a Keycloak-issued OAuth 2.1 access token.
+
+    Verifies the RS256 signature against Keycloak's JWKS, then the issuer,
+    audience and expiry claims, and finally the shared email allow-list.
+    Any failure — bad signature, wrong iss/aud, expired, or a JWKS fetch
+    error — returns False so the caller can fall through to the Google
+    id_token path. never raises, so a network hiccup yields 401 not 500.
+    """
+    import jwt
+
+    jwks_uri = settings.resolved_oauth_jwks_uri
+    if not jwks_uri:
+        return False
+
+    try:
+        signing_key = _get_jwks_client(jwks_uri).get_signing_key_from_jwt(token)
+        # audience may be a string or list in the token; PyJWT accepts either
+        # and checks membership against the expected resource url.
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=settings.oauth_resource_url,
+            issuer=settings.oauth_issuer,
+            options={"verify_aud": True, "verify_exp": True},
+        )
+    except Exception as e:
+        logger.debug("Keycloak token validation failed: %s", e)
+        return False
+
+    # keycloak exposes email when the client has the email scope/mapper;
+    # fall back to preferred_username only when it is itself an email.
+    email = payload.get("email")
+    if not email:
+        username = payload.get("preferred_username", "")
+        if "@" in username:
+            email = username
+    if not email:
+        logger.warning("Keycloak token does not contain an email")
+        return False
+    if not _email_allowed(email, settings):
+        logger.warning("Keycloak email not allowed: %s", email)
+        return False
+    logger.info("authenticated Keycloak user: %s", email)
+    return True
+
+
 def _validate_user_token(token: str) -> bool:
     """Validate a user API token via chat backend or local DB."""
     # try local DB first (works when both services share the same filesystem)
@@ -163,6 +235,14 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
 
         # route by token format: JWTs have dots, user tokens don't
         if "." in token:
+            settings = get_settings()
+
+            # oauth resource-server path: trust Keycloak-issued access tokens.
+            # tried first (when enabled) so a valid Keycloak token short-circuits;
+            # otherwise we fall through to the Google id_token check below.
+            if getattr(settings, "oauth_enabled", False) and _validate_keycloak_token(token, settings):
+                return True
+
             from google.oauth2 import id_token
             try:
                 payload = id_token.verify_oauth2_token(token, _get_google_request())
@@ -176,9 +256,7 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             if not email:
                 logger.warning("Token does not contain email")
                 return False
-            domain = email.split("@")[-1] if "@" in email else ""
-            settings = get_settings()
-            if email not in settings.allowed_emails and domain not in settings.allowed_email_domains:
+            if not _email_allowed(email, settings):
                 logger.warning("Email domain not allowed: %s", email)
                 return False
             logger.info("authenticated JWT user: %s", email)

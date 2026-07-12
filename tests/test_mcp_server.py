@@ -625,3 +625,208 @@ class TestBearerAuthJWT:
 
         assert len(call_log) == 0
         assert any(m.get("status") == 401 for m in messages)
+
+
+class _KeycloakSettings:
+    """Stub Settings for the Keycloak (OAuth resource-server) branch."""
+
+    ISSUER = "https://kc.example.org/realms/genetics"
+    RESOURCE_URL = "https://mcp.example.org"
+
+    def __init__(self, allowed_emails=None, allowed_email_domains=None):
+        self.allowed_emails = set(allowed_emails or [])
+        self.allowed_email_domains = set(allowed_email_domains or [])
+        self.oauth_enabled = True
+        self.oauth_issuer = self.ISSUER
+        self.oauth_resource_url = self.RESOURCE_URL
+        self.resolved_oauth_jwks_uri = f"{self.ISSUER}/protocol/openid-connect/certs"
+
+
+class TestBearerAuthKeycloak:
+    """Tests for the Keycloak access-token branch.
+
+    Uses a self-signed RS256 key pair; the JWKS client is mocked to return
+    the public key so no real Keycloak is required.
+    """
+
+    _key_cache: dict = {}
+
+    @classmethod
+    def _keys(cls):
+        if not cls._key_cache:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            cls._key_cache["private"] = key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ).decode()
+            cls._key_cache["public"] = (
+                key.public_key()
+                .public_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                .decode()
+            )
+        return cls._key_cache["private"], cls._key_cache["public"]
+
+    def _make_token(self, **overrides):
+        import time
+
+        import jwt
+
+        private_pem, _ = self._keys()
+        claims = {
+            "iss": _KeycloakSettings.ISSUER,
+            "aud": _KeycloakSettings.RESOURCE_URL,
+            "exp": int(time.time()) + 3600,
+            "email": "alice@finngen.fi",
+        }
+        claims.update(overrides)
+        claims = {k: v for k, v in claims.items() if v is not None}
+        return jwt.encode(claims, private_pem, algorithm="RS256")
+
+    @pytest.fixture(autouse=True)
+    def _mock_jwks(self, monkeypatch):
+        """Return the self-signed public key from the JWKS client."""
+        import types
+
+        _, public_pem = self._keys()
+
+        class _Client:
+            def get_signing_key_from_jwt(self, token):
+                return types.SimpleNamespace(key=public_pem)
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._get_jwks_client", lambda uri: _Client()
+        )
+
+    def test_valid_token_allowed_domain(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        assert _validate_keycloak_token(self._make_token(), settings) is True
+
+    def test_allowed_email_overrides_domain(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_emails={"bob@other.org"})
+        token = self._make_token(email="bob@other.org")
+        assert _validate_keycloak_token(token, settings) is True
+
+    def test_disallowed_email_rejected(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        token = self._make_token(email="eve@evil.com")
+        assert _validate_keycloak_token(token, settings) is False
+
+    def test_wrong_audience_rejected(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        token = self._make_token(aud="https://someone-else")
+        assert _validate_keycloak_token(token, settings) is False
+
+    def test_audience_as_list_accepted(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        token = self._make_token(aud=["account", _KeycloakSettings.RESOURCE_URL])
+        assert _validate_keycloak_token(token, settings) is True
+
+    def test_wrong_issuer_rejected(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        token = self._make_token(iss="https://evil-idp")
+        assert _validate_keycloak_token(token, settings) is False
+
+    def test_expired_token_rejected(self):
+        import time
+
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        token = self._make_token(exp=int(time.time()) - 10)
+        assert _validate_keycloak_token(token, settings) is False
+
+    def test_preferred_username_email_fallback(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        # drop the explicit email claim so the preferred_username fallback runs
+        token = self._make_token(email=None, preferred_username="carol@finngen.fi")
+        assert _validate_keycloak_token(token, settings) is True
+
+    def test_no_email_rejected(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        # preferred_username that is not an email must not satisfy the allow-list
+        token = self._make_token(email=None, preferred_username="carol")
+        assert _validate_keycloak_token(token, settings) is False
+
+    def test_jwks_fetch_error_returns_false(self, monkeypatch):
+        """A JWKS network error must yield False, never raise (so caller 401s)."""
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        def _boom(uri):
+            raise RuntimeError("network down")
+
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._get_jwks_client", _boom)
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        assert _validate_keycloak_token(self._make_token(), settings) is False
+
+    @pytest.mark.asyncio
+    async def test_valid_keycloak_token_via_middleware(self, monkeypatch):
+        """End-to-end: a valid Keycloak token reaches the inner app without hitting Google."""
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
+        )
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server.get_settings",
+            lambda: _KeycloakSettings(allowed_email_domains={"finngen.fi"}),
+        )
+
+        # google path must not be needed; make it fail loudly if reached
+        import google.oauth2.id_token as _id_token_mod
+
+        def _fail(token, request):
+            raise AssertionError(
+                "Google id_token path should not run for a valid Keycloak token"
+            )
+
+        monkeypatch.setattr(_id_token_mod, "verify_oauth2_token", _fail)
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        app = _wrap_with_bearer_auth(inner_app, ["unused-key"])
+        token = self._make_token()
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+        }
+
+        messages: list[dict] = []
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
