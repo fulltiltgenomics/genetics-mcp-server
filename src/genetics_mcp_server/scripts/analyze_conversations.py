@@ -139,7 +139,7 @@ def build_session_tool_stats(messages: pl.DataFrame) -> pl.DataFrame:
     # single assistant turn, which a session-wide total can't (a long conversation
     # legitimately accrues many calls spread across many messages)
     session_tools = tool_df.group_by("session_id").agg(
-        pl.col("tool_calls").flatten().alias("all_tools"),
+        pl.col("tool_calls").list.explode(keep_nulls=False, empty_as_null=False).alias("all_tools"),
         pl.col("tool_count").sum().alias("total_tool_calls"),
         pl.col("tool_count").max().alias("max_tools_in_message"),
     ).with_columns(
