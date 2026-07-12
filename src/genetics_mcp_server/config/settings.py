@@ -161,6 +161,32 @@ class Settings:
         }
     )
 
+    # OAuth 2.1 resource server (optional): trust Keycloak-issued access tokens
+    # as a fourth bearer-validation path. inert unless both issuer and resource
+    # url are set. token validation reuses allowed_emails / allowed_email_domains.
+    oauth_issuer: str | None = field(
+        default_factory=lambda: os.environ.get("OAUTH_ISSUER") or None
+    )
+    oauth_resource_url: str | None = field(
+        default_factory=lambda: os.environ.get("OAUTH_RESOURCE_URL") or None
+    )
+    oauth_jwks_uri: str | None = field(
+        default_factory=lambda: os.environ.get("OAUTH_JWKS_URI") or None
+    )
+
+    @property
+    def oauth_enabled(self) -> bool:
+        return bool(self.oauth_issuer and self.oauth_resource_url)
+
+    @property
+    def resolved_oauth_jwks_uri(self) -> str | None:
+        # keycloak exposes its JWKS at a fixed path relative to the realm issuer
+        if self.oauth_jwks_uri:
+            return self.oauth_jwks_uri
+        if self.oauth_issuer:
+            return f"{self.oauth_issuer.rstrip('/')}/protocol/openid-connect/certs"
+        return None
+
     @property
     def admin_users_list(self) -> list[str]:
         if not self.admin_users:
