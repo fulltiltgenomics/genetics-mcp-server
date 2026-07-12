@@ -830,3 +830,156 @@ class TestBearerAuthKeycloak:
 
         assert len(call_log) == 1
         assert not any(m.get("status") == 401 for m in messages)
+
+
+class _OAuthDisabledSettings:
+    """Stub Settings with oauth disabled (no issuer/resource configured)."""
+
+    def __init__(self):
+        self.allowed_emails = set()
+        self.allowed_email_domains = set()
+        self.oauth_enabled = False
+        self.oauth_issuer = None
+        self.oauth_resource_url = None
+        self.resolved_oauth_jwks_uri = None
+
+
+class TestOAuthMetadataDiscovery:
+    """Tests for RFC 9728 protected-resource metadata and WWW-Authenticate."""
+
+    @staticmethod
+    async def _collect_response(app, scope):
+        messages: list[dict] = []
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            messages.append(message)
+
+        await app(scope, receive, send)
+        return messages
+
+    def _build_app(self, monkeypatch, settings):
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
+        )
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server.get_settings", lambda: settings
+        )
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        return _wrap_with_bearer_auth(inner_app, ["some-key"]), call_log
+
+    @staticmethod
+    def _get_json(messages):
+        import json
+
+        body = next(m["body"] for m in messages if m.get("type") == "http.response.body")
+        return json.loads(body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ],
+    )
+    async def test_metadata_served_when_oauth_enabled(self, monkeypatch, path):
+        app, call_log = self._build_app(monkeypatch, _KeycloakSettings())
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+        }
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "metadata must be served without hitting the inner app"
+        assert any(
+            m.get("type") == "http.response.start" and m.get("status") == 200
+            for m in messages
+        )
+        payload = self._get_json(messages)
+        assert payload["resource"] == _KeycloakSettings.RESOURCE_URL
+        assert payload["authorization_servers"] == [_KeycloakSettings.ISSUER]
+        assert payload["bearer_methods_supported"] == ["header"]
+        assert payload["scopes_supported"] == ["openid", "email", "profile"]
+
+    @pytest.mark.asyncio
+    async def test_metadata_not_served_when_oauth_disabled(self, monkeypatch):
+        app, call_log = self._build_app(monkeypatch, _OAuthDisabledSettings())
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/.well-known/oauth-protected-resource",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+        }
+
+        messages = await self._collect_response(app, scope)
+
+        # with no credentials the request falls through to the normal 401 path,
+        # and no metadata is emitted
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+        assert not any(m.get("status") == 200 for m in messages)
+
+    @staticmethod
+    def _www_authenticate(messages):
+        start = next(m for m in messages if m.get("type") == "http.response.start")
+        for name, value in start["headers"]:
+            if name == b"www-authenticate":
+                return value.decode()
+        return None
+
+    @pytest.mark.asyncio
+    async def test_401_includes_www_authenticate_when_oauth_enabled(self, monkeypatch):
+        app, call_log = self._build_app(monkeypatch, _KeycloakSettings())
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+        }
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+        expected = (
+            f'Bearer resource_metadata="{_KeycloakSettings.RESOURCE_URL}'
+            '/.well-known/oauth-protected-resource"'
+        )
+        assert self._www_authenticate(messages) == expected
+
+    @pytest.mark.asyncio
+    async def test_401_has_no_www_authenticate_when_oauth_disabled(self, monkeypatch):
+        app, call_log = self._build_app(monkeypatch, _OAuthDisabledSettings())
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+        }
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+        assert self._www_authenticate(messages) is None

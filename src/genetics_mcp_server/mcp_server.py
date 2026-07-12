@@ -12,6 +12,7 @@ Environment Variables:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -269,6 +270,17 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             await _send_healthz(send)
             return
 
+        # RFC 9728 protected-resource metadata: served without auth so MCP clients
+        # can discover the Keycloak authorization server before obtaining a token.
+        if scope["type"] == "http" and scope.get("method") == "GET" and scope.get("path") in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ):
+            settings = get_settings()
+            if getattr(settings, "oauth_enabled", False):
+                await _send_oauth_metadata(send, settings)
+                return
+
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization", b"").decode()
@@ -307,11 +319,36 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             "body": b'{"status":"ok"}',
         })
 
+    async def _send_oauth_metadata(send, settings):
+        body = json.dumps({
+            "resource": settings.oauth_resource_url,
+            "authorization_servers": [settings.oauth_issuer],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["openid", "email", "profile"],
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
+
     async def _send_401(send):
+        headers = [(b"content-type", b"application/json")]
+        # point clients at the RFC 9728 metadata document so they can discover the AS
+        settings = get_settings()
+        if getattr(settings, "oauth_enabled", False) and settings.oauth_resource_url:
+            metadata_url = f"{settings.oauth_resource_url.rstrip('/')}/.well-known/oauth-protected-resource"
+            headers.append(
+                (b"www-authenticate", f'Bearer resource_metadata="{metadata_url}"'.encode())
+            )
         await send({
             "type": "http.response.start",
             "status": 401,
-            "headers": [(b"content-type", b"application/json")],
+            "headers": headers,
         })
         await send({
             "type": "http.response.body",
