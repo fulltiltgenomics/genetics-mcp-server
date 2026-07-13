@@ -12,6 +12,7 @@ Environment Variables:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -120,6 +121,78 @@ def _get_google_request():
     return _google_request
 
 
+# PyJWKClient instances keyed by JWKS URI. the client caches the fetched JWK set
+# internally (lifespan-bounded), so reusing it avoids refetching on every request.
+_jwks_clients: dict = {}
+_jwks_clients_lock = threading.Lock()
+
+
+def _get_jwks_client(jwks_uri: str):
+    client = _jwks_clients.get(jwks_uri)
+    if client is None:
+        with _jwks_clients_lock:
+            client = _jwks_clients.get(jwks_uri)
+            if client is None:
+                import jwt
+                client = jwt.PyJWKClient(jwks_uri)
+                _jwks_clients[jwks_uri] = client
+    return client
+
+
+def _email_allowed(email: str, settings) -> bool:
+    """Shared allow-list check used by every JWT bearer path."""
+    domain = email.split("@")[-1] if "@" in email else ""
+    return email in settings.allowed_emails or domain in settings.allowed_email_domains
+
+
+def _validate_keycloak_token(token: str, settings) -> bool:
+    """Validate a Keycloak-issued OAuth 2.1 access token.
+
+    Verifies the RS256 signature against Keycloak's JWKS, then the issuer,
+    audience and expiry claims, and finally the shared email allow-list.
+    Any failure — bad signature, wrong iss/aud, expired, or a JWKS fetch
+    error — returns False so the caller can fall through to the Google
+    id_token path. never raises, so a network hiccup yields 401 not 500.
+    """
+    import jwt
+
+    jwks_uri = settings.resolved_oauth_jwks_uri
+    if not jwks_uri:
+        return False
+
+    try:
+        signing_key = _get_jwks_client(jwks_uri).get_signing_key_from_jwt(token)
+        # audience may be a string or list in the token; PyJWT accepts either
+        # and checks membership against the expected resource url.
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=settings.oauth_resource_url,
+            issuer=settings.oauth_issuer,
+            options={"verify_aud": True, "verify_exp": True},
+        )
+    except Exception as e:
+        logger.debug("Keycloak token validation failed: %s", e)
+        return False
+
+    # keycloak exposes email when the client has the email scope/mapper;
+    # fall back to preferred_username only when it is itself an email.
+    email = payload.get("email")
+    if not email:
+        username = payload.get("preferred_username", "")
+        if "@" in username:
+            email = username
+    if not email:
+        logger.warning("Keycloak token does not contain an email")
+        return False
+    if not _email_allowed(email, settings):
+        logger.warning("Keycloak email not allowed: %s", email)
+        return False
+    logger.info("authenticated Keycloak user: %s", email)
+    return True
+
+
 def _validate_user_token(token: str) -> bool:
     """Validate a user API token via chat backend or local DB."""
     # try local DB first (works when both services share the same filesystem)
@@ -163,6 +236,14 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
 
         # route by token format: JWTs have dots, user tokens don't
         if "." in token:
+            settings = get_settings()
+
+            # oauth resource-server path: trust Keycloak-issued access tokens.
+            # tried first (when enabled) so a valid Keycloak token short-circuits;
+            # otherwise we fall through to the Google id_token check below.
+            if getattr(settings, "oauth_enabled", False) and _validate_keycloak_token(token, settings):
+                return True
+
             from google.oauth2 import id_token
             try:
                 payload = id_token.verify_oauth2_token(token, _get_google_request())
@@ -176,9 +257,7 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             if not email:
                 logger.warning("Token does not contain email")
                 return False
-            domain = email.split("@")[-1] if "@" in email else ""
-            settings = get_settings()
-            if email not in settings.allowed_emails and domain not in settings.allowed_email_domains:
+            if not _email_allowed(email, settings):
                 logger.warning("Email domain not allowed: %s", email)
                 return False
             logger.info("authenticated JWT user: %s", email)
@@ -190,6 +269,17 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         if scope["type"] == "http" and scope.get("path") == "/healthz":
             await _send_healthz(send)
             return
+
+        # RFC 9728 protected-resource metadata: served without auth so MCP clients
+        # can discover the Keycloak authorization server before obtaining a token.
+        if scope["type"] == "http" and scope.get("method") == "GET" and scope.get("path") in (
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+        ):
+            settings = get_settings()
+            if getattr(settings, "oauth_enabled", False):
+                await _send_oauth_metadata(send, settings)
+                return
 
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers", []))
@@ -229,11 +319,36 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             "body": b'{"status":"ok"}',
         })
 
+    async def _send_oauth_metadata(send, settings):
+        body = json.dumps({
+            "resource": settings.oauth_resource_url,
+            "authorization_servers": [settings.oauth_issuer],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["openid", "email", "profile"],
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
+
     async def _send_401(send):
+        headers = [(b"content-type", b"application/json")]
+        # point clients at the RFC 9728 metadata document so they can discover the AS
+        settings = get_settings()
+        if getattr(settings, "oauth_enabled", False) and settings.oauth_resource_url:
+            metadata_url = f"{settings.oauth_resource_url.rstrip('/')}/.well-known/oauth-protected-resource"
+            headers.append(
+                (b"www-authenticate", f'Bearer resource_metadata="{metadata_url}"'.encode())
+            )
         await send({
             "type": "http.response.start",
             "status": 401,
-            "headers": [(b"content-type", b"application/json")],
+            "headers": headers,
         })
         await send({
             "type": "http.response.body",

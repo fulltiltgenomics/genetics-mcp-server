@@ -410,16 +410,20 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|
 | `REQUIRE_AUTH` | Require `X-Goog-Authenticated-User-Email` header (`true`/`false`) |
 | `MCP_API_KEY` | Comma-separated bearer tokens for MCP server SSE/HTTP transport auth |
-| `ALLOWED_EMAILS` | Comma-separated email allow-list for Google Identity Token (JWT) bearer auth |
-| `ALLOWED_EMAIL_DOMAINS` | Comma-separated email-domain allow-list for Google Identity Token (JWT) bearer auth (default: `finngen.fi`) |
+| `ALLOWED_EMAILS` | Comma-separated email allow-list shared by all JWT bearer paths (Google Identity Token and Keycloak) |
+| `ALLOWED_EMAIL_DOMAINS` | Comma-separated email-domain allow-list shared by all JWT bearer paths (default: `finngen.fi`) |
+| `OAUTH_ISSUER` | Keycloak realm issuer URL; enables the OAuth resource-server bearer path when set together with `OAUTH_RESOURCE_URL` |
+| `OAUTH_RESOURCE_URL` | Expected `aud` claim (this server's canonical URL) for Keycloak access tokens |
+| `OAUTH_JWKS_URI` | Override for the JWKS endpoint; defaults to `<OAUTH_ISSUER>/protocol/openid-connect/certs` |
 
 Tokens can be supplied either as an `Authorization: Bearer XXX` header or as a `?token=XXX` query parameter. The query parameter is useful for clients that don't support custom headers (e.g., claude.ai). When both are present, the Bearer header takes precedence.
 
-The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes each presented token through three branches in order, mirroring the results-api implementation:
+The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes each presented token through four branches in order, mirroring the results-api implementation:
 
 1. **`MCP_API_KEY` shared secret** — constant-time compare against each configured value
-2. **Google Identity Token (JWT)** — if the token contains `.` it is treated as a JWT and validated via `google.oauth2.id_token.verify_oauth2_token` using a lazily-initialized singleton `google.auth.transport.requests.Request` (for JWKS caching). The payload must have `email_verified == True`; the email must be in `ALLOWED_EMAILS` or its domain in `ALLOWED_EMAIL_DOMAINS` (otherwise 401/403). Identity is set to the verified email.
-3. **Per-user API token** — fall back to validating against the local LLM config DB (SHA-256 hashed) or via the chat-backend `/v1/tokens/validate` endpoint. Users create tokens via the chat API (`POST /chat/v1/tokens`).
+2. **Keycloak OAuth access token (JWT)** — only attempted when `OAUTH_ISSUER` and `OAUTH_RESOURCE_URL` are both set (`settings.oauth_enabled`). If the token contains `.` it is verified with PyJWT against Keycloak's JWKS (fetched and cached via a per-URI singleton `jwt.PyJWKClient`): RS256 signature, `iss == OAUTH_ISSUER`, `aud` includes `OAUTH_RESOURCE_URL` (string or list), and `exp` not expired. The email is taken from the `email` claim (falling back to `preferred_username` only when it is itself an email) and checked against the same `ALLOWED_EMAILS` / `ALLOWED_EMAIL_DOMAINS` allow-list. Any failure (wrong iss/aud/signature, expired, or a JWKS network error) is non-fatal and **falls through** to branch 3 rather than 500-ing.
+3. **Google Identity Token (JWT)** — if the token contains `.` it is validated via `google.oauth2.id_token.verify_oauth2_token` using a lazily-initialized singleton `google.auth.transport.requests.Request` (for JWKS caching). The payload must have `email_verified == True`; the email must satisfy the same allow-list (otherwise 401/403). Identity is set to the verified email.
+4. **Per-user API token** — fall back to validating against the local LLM config DB (SHA-256 hashed) or via the chat-backend `/v1/tokens/validate` endpoint. Users create tokens via the chat API (`POST /chat/v1/tokens`).
 
 In deployment, `ALLOWED_EMAILS` and `ALLOWED_EMAIL_DOMAINS` are sourced from the shared `bearer-auth-allowed` Kubernetes ConfigMap (defined in `genetics-results-suite/k8s/configs/`), which is also consumed by results-api so both services share an identical allow-list.
 

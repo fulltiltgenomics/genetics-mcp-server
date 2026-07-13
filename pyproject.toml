@@ -19,6 +19,7 @@ dependencies = [
     "ddgs==9.14.1",
     "google-auth[requests]==2.49.0",
     "fastexcel==0.20.2",
+    "pyjwt[crypto]==2.11.0",
 ]
 
 [project.optional-dependencies]
