@@ -21,6 +21,7 @@ Analyzes conversations for:
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -34,6 +35,8 @@ import polars as pl
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger("analyze_conversations")
 
 # bumping this invalidates every cached analysis: any conversation_analysis row
 # whose analyzer_version differs from this value is treated as missing and gets
@@ -332,8 +335,7 @@ async def categorize_with_llm(
                         "brief_reason": c.get("brief_reason", ""),
                     }
         except Exception as e:
-            print(f"  LLM categorization failed for batch {i // batch_size + 1}: {e}",
-                  file=sys.stderr)
+            logger.error(f"LLM categorization failed for batch {i // batch_size + 1}: {e}")
             # fall back to keyword for this batch
             for m in batch:
                 topic, _ = categorize_by_keywords(m["text"])
@@ -344,8 +346,8 @@ async def categorize_with_llm(
                 }
 
         if i + batch_size < len(session_first_messages):
-            print(f"  Categorized {min(i + batch_size, len(session_first_messages))}"
-                  f"/{len(session_first_messages)} sessions...", file=sys.stderr)
+            logger.info(f"  Categorized {min(i + batch_size, len(session_first_messages))}"
+                        f"/{len(session_first_messages)} sessions...")
 
     return results
 
@@ -405,8 +407,7 @@ async def categorize_issues_with_llm(
                     if isinstance(idx, int) and 0 <= idx < len(batch):
                         results[batch[idx]] = cat if cat in valid else "other"
         except Exception as e:
-            print(f"  Issue categorization failed for batch {i // batch_size + 1}: {e}",
-                  file=sys.stderr)
+            logger.error(f"Issue categorization failed for batch {i // batch_size + 1}: {e}")
 
         # anything the LLM didn't assign (or a failed batch) falls back to "other"
         for issue in batch:
@@ -541,10 +542,10 @@ async def evaluate_quality_with_llm(
             if isinstance(assessment, dict):
                 results[sid] = assessment
         except Exception as e:
-            print(f"  Quality eval failed for {sid}: {e}", file=sys.stderr)
+            logger.error(f"Quality eval failed for {sid}: {e}")
 
         if (idx + 1) % 20 == 0 or idx + 1 == total:
-            print(f"  Evaluated {idx + 1}/{total} conversations...", file=sys.stderr)
+            logger.info(f"  Evaluated {idx + 1}/{total} conversations...")
 
     return results
 
@@ -929,7 +930,7 @@ def export_eval_dataset(
     eval_path = output_dir / "eval_dataset.json"
     with open(eval_path, "w") as f:
         json.dump(eval_cases, f, indent=2, default=str)
-    print(f"  Wrote {len(eval_cases)} eval cases to {eval_path}", file=sys.stderr)
+    logger.info(f"  Wrote {len(eval_cases)} eval cases to {eval_path}")
 
     # write individual transcripts for interesting cases
     transcripts_dir = output_dir / "transcripts"
@@ -943,7 +944,7 @@ def export_eval_dataset(
                 role_label = "**User**" if turn["role"] == "user" else "**Assistant**"
                 f.write(f"### {role_label}\n\n{turn['content']}\n\n---\n\n")
 
-    print(f"  Wrote {len(eval_cases)} transcripts to {transcripts_dir}", file=sys.stderr)
+    logger.info(f"  Wrote {len(eval_cases)} transcripts to {transcripts_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -1322,14 +1323,21 @@ async def main():
                         help="Only print the report, skip eval export")
     args = parser.parse_args()
 
+    # progress goes to stderr so stdout stays pipeable for the report; the level prefix
+    # keeps log collectors from reading progress as failures, since GKE tags every line a
+    # container writes to stderr as ERROR regardless of content
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr
+    )
+
     if not os.path.exists(args.db):
-        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        logger.error(f"database not found: {args.db}")
         sys.exit(1)
 
     output_dir = Path(args.output_dir) if args.output_dir else Path(args.db).parent / "analysis_output"
 
     # --- load data ---
-    print("Loading data...", file=sys.stderr)
+    logger.info("Loading data...")
     sessions, messages = load_data(args.db)
 
     if args.start_from or args.until:
@@ -1339,21 +1347,21 @@ async def main():
             sessions = sessions.filter(pl.col("created_at") < args.until)
         session_ids = sessions.select("id").to_series().to_list()
         messages = messages.filter(pl.col("session_id").is_in(session_ids))
-        print(f"  Filtered to sessions in range "
-              f"[{args.start_from or '-inf'}, {args.until or '+inf'})", file=sys.stderr)
+        logger.info(f"  Filtered to sessions in range "
+                    f"[{args.start_from or '-inf'}, {args.until or '+inf'})")
 
-    print(f"  {sessions.height} sessions, {messages.height} messages", file=sys.stderr)
+    logger.info(f"  {sessions.height} sessions, {messages.height} messages")
 
     # --- parse tool usage ---
-    print("Parsing tool usage...", file=sys.stderr)
+    logger.info("Parsing tool usage...")
     tool_stats = build_session_tool_stats(messages)
     sessions_with_tools = tool_stats.height
     total_tool_calls = tool_stats.select(pl.col("total_tool_calls").sum()).item() if sessions_with_tools > 0 else 0
-    print(f"  {sessions_with_tools} sessions used tools, "
-          f"{total_tool_calls} total tool calls", file=sys.stderr)
+    logger.info(f"  {sessions_with_tools} sessions used tools, "
+                f"{total_tool_calls} total tool calls")
 
     # --- categorize ---
-    print("Categorizing conversations...", file=sys.stderr)
+    logger.info("Categorizing conversations...")
 
     # build first-user-message list
     first_messages = (
@@ -1417,9 +1425,8 @@ async def main():
         )
     ) & in_range_ids
     if stale_ids:
-        print(f"  {len(stale_ids)} of {len(in_range_ids)} in-range sessions are stale "
-              "(missing / continued / version-bumped) and will be reanalyzed",
-              file=sys.stderr)
+        logger.info(f"  {len(stale_ids)} of {len(in_range_ids)} in-range sessions are stale "
+                    "(missing / continued / version-bumped) and will be reanalyzed")
     # force the stale ones to recompute by evicting their cached topic + quality.
     # --force already cleared both maps when it set no_cache-equivalent behavior
     # below, but for the non-force path this is the surgical, minimal-work eviction.
@@ -1440,7 +1447,7 @@ async def main():
     cost_tracker = CostTracker()
 
     if args.no_llm:
-        print("  Using keyword categorization...", file=sys.stderr)
+        logger.info("  Using keyword categorization...")
         topics = {}
         for m in session_first_msgs:
             topic, confidence = categorize_by_keywords(m["text"])
@@ -1452,12 +1459,12 @@ async def main():
     else:
         cached_topics = dict(cached_topics_db)
         if cached_topics:
-            print(f"  Loaded {len(cached_topics)} cached topic classifications", file=sys.stderr)
+            logger.info(f"  Loaded {len(cached_topics)} cached topic classifications")
 
         uncached_msgs = [m for m in session_first_msgs if m["id"] not in cached_topics]
         if uncached_msgs:
-            print(f"  Using LLM categorization for {len(uncached_msgs)} sessions "
-                  f"(model={args.topic_model})...", file=sys.stderr)
+            logger.info(f"  Using LLM categorization for {len(uncached_msgs)} sessions "
+                        f"(model={args.topic_model})...")
             new_topics = await categorize_with_llm(
                 uncached_msgs, model=args.topic_model, cost_tracker=cost_tracker,
             )
@@ -1465,39 +1472,38 @@ async def main():
         topics = cached_topics
 
     topic_dist = Counter(v["topic"] for v in topics.values())
-    print(f"  Topics: {dict(topic_dist.most_common())}", file=sys.stderr)
+    logger.info(f"  Topics: {dict(topic_dist.most_common())}")
 
     # --- compute metrics ---
-    print("Computing success metrics...", file=sys.stderr)
+    logger.info("Computing success metrics...")
     all_metrics = compute_all_metrics(sessions, messages, tool_stats, topics)
 
     # --- LLM quality evaluation ---
     if not args.no_llm:
         cached_quality: dict[str, dict] = dict(cached_quality_db)
         if cached_quality:
-            print(f"  Loaded {len(cached_quality)} cached quality assessments", file=sys.stderr)
+            logger.info(f"  Loaded {len(cached_quality)} cached quality assessments")
 
         session_ids = [m.session_id for m in all_metrics if m.session_id not in cached_quality]
         if session_ids:
-            print(f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)...",
-                  file=sys.stderr)
+            logger.info(f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)...")
             new_assessments = await evaluate_quality_with_llm(
                 session_ids, messages, model=args.quality_model,
                 cost_tracker=cost_tracker,
             )
             cached_quality.update(new_assessments)
         else:
-            print("  All quality assessments cached, skipping LLM calls", file=sys.stderr)
+            logger.info("  All quality assessments cached, skipping LLM calls")
 
         apply_quality_assessments(all_metrics, cached_quality)
-        print(f"  {len(cached_quality)} conversations evaluated", file=sys.stderr)
+        logger.info(f"  {len(cached_quality)} conversations evaluated")
 
         # conversations the judge skipped (and with no user rating) have no quality
         # signal — label them 'unknown' instead of a heuristic successful/neutral
         unknown_n = mark_unscored_unknown(all_metrics)
         if unknown_n:
-            print(f"  {unknown_n} conversations had no quality judgment "
-                  "→ labelled 'unknown'", file=sys.stderr)
+            logger.info(f"  {unknown_n} conversations had no quality judgment "
+                        "→ labelled 'unknown'")
 
     # --- categorize detailed issues into recurring problem categories ---
     # raw judge issues are too specific to recur, so we map them onto a fixed
@@ -1512,12 +1518,12 @@ async def main():
             cached_cats: dict[str, str] = {}
             if issue_cat_cache.exists() and not args.no_cache:
                 cached_cats = json.loads(issue_cat_cache.read_text())
-                print(f"  Loaded {len(cached_cats)} cached issue categories", file=sys.stderr)
+                logger.info(f"  Loaded {len(cached_cats)} cached issue categories")
 
             uncategorized = [t for t in distinct_issues if t not in cached_cats]
             if uncategorized:
-                print(f"Categorizing {len(uncategorized)} distinct issues "
-                      f"(model={args.topic_model})...", file=sys.stderr)
+                logger.info(f"Categorizing {len(uncategorized)} distinct issues "
+                            f"(model={args.topic_model})...")
                 new_cats = await categorize_issues_with_llm(
                     uncategorized, model=args.topic_model, cost_tracker=cost_tracker,
                 )
@@ -1534,7 +1540,7 @@ async def main():
                     })
 
     success_dist = Counter(m.success_label for m in all_metrics)
-    print(f"  Success: {dict(success_dist)}", file=sys.stderr)
+    logger.info(f"  Success: {dict(success_dist)}")
 
     # --- persist results to the SQLite analysis cache ---
     # one short transaction per session; source_updated_at is the raw stored
@@ -1547,13 +1553,13 @@ async def main():
             source_updated_at=updated_at_by_session.get(m.session_id),
             message_count=m.total_messages,
         )
-    print(f"  Persisted {len(all_metrics)} analyses to the DB cache", file=sys.stderr)
+    logger.info(f"  Persisted {len(all_metrics)} analyses to the DB cache")
 
     if cost_tracker.usage:
-        print(f"  API cost this run: ${cost_tracker.total_cost():.4f}", file=sys.stderr)
+        logger.info(f"  API cost this run: ${cost_tracker.total_cost():.4f}")
 
     # --- generate report ---
-    print("Generating report...", file=sys.stderr)
+    logger.info("Generating report...")
     report = generate_report(all_metrics, sessions, messages, tool_stats, cost_tracker,
                              issue_categories=issue_categories)
     print(report)
@@ -1562,11 +1568,11 @@ async def main():
     report_path = Path(args.report_file) if args.report_file else output_dir / "report.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report + "\n")
-    print(f"  Wrote report to {report_path}", file=sys.stderr)
+    logger.info(f"  Wrote report to {report_path}")
 
     # --- export eval dataset ---
     if not args.report_only:
-        print("Exporting eval dataset...", file=sys.stderr)
+        logger.info("Exporting eval dataset...")
         export_eval_dataset(all_metrics, messages, output_dir)
 
     # --- save metrics as JSON (local-dev only) ---
@@ -1577,9 +1583,9 @@ async def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         with open(metrics_path, "w") as f:
             json.dump([asdict(m) for m in all_metrics], f, indent=2, default=str)
-        print(f"  Wrote metrics to {metrics_path}", file=sys.stderr)
+        logger.info(f"  Wrote metrics to {metrics_path}")
 
-    print("\nDone!", file=sys.stderr)
+    logger.info("Done!")
 
 
 if __name__ == "__main__":
