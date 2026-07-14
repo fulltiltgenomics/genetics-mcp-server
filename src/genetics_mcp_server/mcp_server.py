@@ -228,7 +228,7 @@ def _validate_user_token(token: str) -> bool:
 def _wrap_with_bearer_auth(app, api_keys: list[str]):
     """Wrap an ASGI app with bearer token authentication middleware."""
     import hmac
-    from urllib.parse import parse_qs
+    from urllib.parse import parse_qs, urlsplit, urlunsplit
 
     def _token_is_valid(token: str) -> bool:
         if any(hmac.compare_digest(token, key) for key in api_keys):
@@ -341,7 +341,12 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         # point clients at the RFC 9728 metadata document so they can discover the AS
         settings = get_settings()
         if getattr(settings, "oauth_enabled", False) and settings.oauth_resource_url:
-            metadata_url = f"{settings.oauth_resource_url.rstrip('/')}/.well-known/oauth-protected-resource"
+            # RFC 9728: the well-known segment is inserted between host and path, not appended
+            # after it — so https://host/mcp maps to https://host/.well-known/oauth-protected-resource/mcp
+            _r = urlsplit(settings.oauth_resource_url)
+            metadata_url = urlunsplit(
+                (_r.scheme, _r.netloc, f"/.well-known/oauth-protected-resource{_r.path.rstrip('/')}", "", "")
+            )
             headers.append(
                 (b"www-authenticate", f'Bearer resource_metadata="{metadata_url}"'.encode())
             )

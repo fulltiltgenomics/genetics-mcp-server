@@ -631,7 +631,7 @@ class _KeycloakSettings:
     """Stub Settings for the Keycloak (OAuth resource-server) branch."""
 
     ISSUER = "https://kc.example.org/realms/genetics"
-    RESOURCE_URL = "https://mcp.example.org"
+    RESOURCE_URL = "https://mcp.example.org/mcp"
 
     def __init__(self, allowed_emails=None, allowed_email_domains=None):
         self.allowed_emails = set(allowed_emails or [])
@@ -960,9 +960,11 @@ class TestOAuthMetadataDiscovery:
 
         assert len(call_log) == 0
         assert any(m.get("status") == 401 for m in messages)
+        # RFC 9728: well-known inserted between host and path (…/.well-known/…/mcp),
+        # not appended after the /mcp path
         expected = (
-            f'Bearer resource_metadata="{_KeycloakSettings.RESOURCE_URL}'
-            '/.well-known/oauth-protected-resource"'
+            'Bearer resource_metadata='
+            '"https://mcp.example.org/.well-known/oauth-protected-resource/mcp"'
         )
         assert self._www_authenticate(messages) == expected
 
