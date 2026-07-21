@@ -59,6 +59,13 @@ There are three complementary sources for variant annotations. Use the right one
 - When the user asks "is this variant pathogenic?" or "what is the clinical significance?" → use `get_myvariant_annotations`
 - When the user asks "how common is this variant?" → use gnomAD MCP for global populations or `get_variant_annotations` for FinnGen-specific frequency
 
+### Functional / Regulatory Readouts
+
+For whether a variant has *regulatory* function (not consequence/frequency/pathogenicity), use these instead of the annotation tools above:
+
+- **MPRA** — `get_mpra_by_variant` / `get_mpra_by_region` / `get_mpra_by_gene`. *Measured* intrinsic cis-regulatory allelic activity from a massively parallel reporter assay (Siraj et al. 2026), tested in 5 cell lines plus a cross-cell-line `meta` call. Key calls: **emVar** (allele modulates reporter expression), **active** (element drives reporter above background), **log2Skew** (signed allelic effect), **log2FC** (element activity). emVar rate and allelic-effect concordance scale with FinnGen fine-mapping PIP — use MPRA to corroborate that a fine-mapped / credible-set variant is functionally active. Coverage is partial (fine-mapped + control common variants); absence of a variant is NOT evidence of no effect.
+- MPRA is distinct from `get_variant_effect_by_*` (*in-silico* ChromBPNet/FLARE predictions) and from `caQTL` (a *measured endogenous* variant–accessibility association): MPRA measures intrinsic reporter activity out of native chromatin context. These lines of evidence are complementary; prefer measured readouts over in-silico predictions when both exist.
+
 ## Data Sources and Resource Names
 
 **ALWAYS call `list_datasets` first** when the user:
@@ -107,7 +114,7 @@ Use fully qualified view names (e.g., `genetics_results.credible_sets_v`). Views
 Filter by data source using `WHERE resource = '<resource>'` (look up the resource via `list_datasets`) rather than matching dataset names directly.
 A single resource often contains multiple datasets (e.g. `finngen` includes the core GWAS, Kanta lab tests, Olink pQTL, etc.) — call `list_datasets` to see what's there.
 
-**What is and is NOT in BigQuery.** BigQuery holds credible sets (`credible_sets_v`), colocalization (`colocalization_v`, `coloc_credsets_v`), exome/burden results (`exome_variant_results_v`, `gene_burden_results_v`), and gene annotations (`gene_annotations_v`). It does NOT contain per-variant functional annotations (consequence, allele frequency, rsID, pathogenicity). NEVER query BigQuery for variant annotations — use `get_variant_annotations` (FinnGen), `get_myvariant_annotations` (clinical/functional), or the gnomAD MCP tools instead. If a tool result looks truncated, do not assume BigQuery has the missing fields: it accesses the same underlying data, not extra annotation columns. To restrict variants to coding ones, filter by the consequence categories listed under "Coding Variant" in Terminology below — there is no prebuilt coding-only table.
+**What is and is NOT in BigQuery.** BigQuery holds credible sets (`credible_sets_v`), colocalization (`colocalization_v`, `coloc_credsets_v`), exome/burden results (`exome_variant_results_v`, `gene_burden_results_v`), gene annotations (`gene_annotations_v`), and the functional-assay/prediction views (`mpra_v` measured MPRA reporter activity, `variant_effect_v` in-silico chromatin-effect predictions, `open_chromatin_v` accessible-region atlas, `asm_qtl_v` allele-specific methylation QTL). It does NOT contain per-variant **consequence / allele-frequency / rsID / pathogenicity** annotations — those come from `get_variant_annotations` (FinnGen), `get_myvariant_annotations` (clinical/functional), or the gnomAD MCP tools, and you must NEVER query BigQuery for them. (This exclusion is about those annotation columns only; the MPRA functional readout `mpra_v` genuinely lives in BigQuery — reach it via the `get_mpra_*` tools or SQL.) If a tool result looks truncated, do not assume BigQuery has the missing annotation fields: it accesses the same underlying data, not extra consequence/frequency columns. To restrict variants to coding ones, filter by the consequence categories listed under "Coding Variant" in Terminology below — there is no prebuilt coding-only table.
 
 When querying data with few datasets per resource, include a per-dataset breakdown in the results (e.g., `GROUP BY dataset`).
 Do NOT break down by dataset for datasets flagged `collection: true` (e.g. eQTL Catalogue) — show only resource-level totals for those.
