@@ -918,6 +918,85 @@ class ToolExecutor:
             }
         return result
 
+    async def get_mpra_by_variant(
+        self, variant: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get measured MPRA cis-regulatory allelic activity for a variant via the results-api.
+
+        Returns LONG rows (one per cell_line, incl. 'meta') with emVar/active/log2Skew/log2FC —
+        measured intrinsic allelic activity, distinct from in-silico variant_effect predictions.
+        """
+        params: dict[str, Any] = {"format": "json"}
+        if resources:
+            # list value -> repeated query params, which the API's list[str] Query expects
+            params["resources"] = [r.strip() for r in resources.split(",")]
+        resp = await self.client.get(
+            f"{self.base_url}/v1/mpra/variant/{variant}", params=params
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "variant": variant, "results": results,
+                "_download_data": {"results": results, "filename": f"{variant}_mpra.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_mpra_by_region(
+        self, chrom: str, start: int, end: int, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get measured MPRA cis-regulatory allelic activity for variants in a region via the results-api."""
+        params: dict[str, Any] = {"format": "json"}
+        if resources:
+            params["resources"] = [r.strip() for r in resources.split(",")]
+        resp = await self.client.get(
+            f"{self.base_url}/v1/mpra/region/{chrom}/{start}/{end}", params=params
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "region": f"{chrom}:{start}-{end}", "results": results,
+                "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_mpra.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_mpra_by_gene(
+        self, gene: str, resources: str | None = None, window: int = 500000
+    ) -> dict[str, Any]:
+        """Get measured MPRA cis-regulatory allelic activity near a gene via BigQuery.
+
+        Mirrors get_variant_effect_by_gene: mpra is variant-indexed (single `pos`), so variants
+        are selected by coordinate overlap (gene body ± window) against `mpra_v`, not
+        `gene_most_severe` attribution, so nearby regulatory variants are not missed. Gene
+        coordinates come from `gene_annotations_v`; resources are filtered on the view's derived
+        `resource` column. Rows are LONG (one per variant per cell_line, incl. 'meta') carrying
+        emVar/active/log2Skew/log2FC so the agent can summarize which variants are functionally
+        active and how strongly; ordered by allelic-skew significance.
+        """
+        resource_filter = ""
+        if resources:
+            rlist = [r.strip() for r in resources.split(",")]
+            quoted = ", ".join(f"'{r}'" for r in rlist)
+            resource_filter = f" AND a.resource IN ({quoted})"
+
+        sql = (
+            f"WITH g AS ("
+            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
+            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
+            f") "
+            f"SELECT a.* FROM `genetics_results.mpra_v` a "
+            f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
+            f"AND a.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"WHERE TRUE{resource_filter} "
+            f"ORDER BY a.log2Skew_mlog10p DESC LIMIT 500"
+        )
+        result = await self.query_bigquery(sql, max_rows=500)
+        if result.get("success"):
+            return {
+                "success": True, "gene": gene, "results": result.get("rows", []),
+                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_mpra.tsv"},
+            }
+        return result
+
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:
         """Get gene-disease associations."""
         resp = await self.client.get(

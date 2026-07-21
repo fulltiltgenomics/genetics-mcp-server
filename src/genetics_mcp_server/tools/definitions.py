@@ -329,6 +329,69 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_mpra_by_variant",
+        "category": "api",
+        "description": "Get MEASURED cis-regulatory allelic activity for a variant from a massively parallel reporter assay (MPRA; Siraj et al. 2026). Answers 'does this variant's allele actually change reporter/enhancer activity, and in which cell lines?'. Returns one LONG row per cell_line: cell_line is 'meta' (cross-cell-line meta-analysis summary) or one of K562/HEPG2/SKNSH/HCT116/A549. Key calls per row: emVar (allele modulates reporter expression — allelic skew significant), active (element drives reporter above background); plus log2Skew (signed allelic effect log2(alt/ref), positive = alt drives higher expression), log2FC (element activity), log2Skew_mlog10p/log2FC_mlog10p (significance), mean_RNA_ref/alt (per-line reporter levels). MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL. emVar rate and allelic-effect concordance scale with FinnGen fine-mapping PIP, so this corroborates that a fine-mapped/credible-set variant is functionally active. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Variant as chr:pos:ref:alt or chr:pos (e.g., '1:1000500:A:G' or '1:1000500')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'siraj_mpra' (Siraj et al. 2026 MPRA of 221K fine-mapped + 86K control variants in 5 cell lines). Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_mpra_by_region",
+        "category": "api",
+        "description": "Get MEASURED cis-regulatory allelic MPRA activity (Siraj et al. 2026) for variants overlapping a genomic region. Answers 'which variants in this region have allele-modulating (emVar) or active regulatory elements, and in which cell lines?'. Returns LONG rows (one per variant per cell_line): cell_line is 'meta' (cross-cell-line summary) or one of K562/HEPG2/SKNSH/HCT116/A549; emVar (allelic skew significant — the key call), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2FC (element activity), *_mlog10p significance, mean_RNA_ref/alt. MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL; emVar rate/effect concordance scale with FinnGen fine-mapping PIP. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
+        "parameters": {
+            "chrom": {
+                "type": "string",
+                "description": "Chromosome (e.g., '1', 'chr1', 'X')",
+                "required": True,
+            },
+            "start": {
+                "type": "integer",
+                "description": "Region start position (1-based, inclusive)",
+                "required": True,
+            },
+            "end": {
+                "type": "integer",
+                "description": "Region end position (1-based, inclusive)",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'siraj_mpra'. Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_mpra_by_gene",
+        "category": "api",
+        "description": "Get MEASURED cis-regulatory allelic MPRA activity (Siraj et al. 2026) for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'which of this gene's variants actually modulate reporter/enhancer activity (emVar), how strongly, and in which cell lines?'. Returns LONG rows (one per variant per cell_line): cell_line is 'meta' (cross-cell-line summary) or one of K562/HEPG2/SKNSH/HCT116/A549; emVar (allelic skew significant — the key call), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2FC (element activity), *_mlog10p significance, mean_RNA_ref/alt. MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL; emVar rate/effect concordance scale with FinnGen fine-mapping PIP, so this corroborates functionally active fine-mapped variants. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol (e.g., 'PCSK9')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'siraj_mpra'. Omit to search all.",
+            },
+            "window": {
+                "type": "integer",
+                "description": "Flank in bp added on each side of the gene body (default 500000).",
+                "default": 500000,
+            },
+        },
+    },
+    {
         "name": "get_gene_disease_associations",
         "category": "api",
         "description": "Get Mendelian/rare disease gene-disease relationships from ClinGen/GENCC. Use ONLY for rare disease genetics questions, NOT for GWAS/common variant associations.",
@@ -1225,6 +1288,33 @@ def register_mcp_tools(
     ) -> dict:
         """Get in-silico predicted variant effects on chromatin accessibility near a gene."""
         return await executor.get_variant_effect_by_gene(gene, resources, window)
+
+    @mcp.tool()
+    async def get_mpra_by_variant(
+        variant: str,
+        resources: str | None = None,
+    ) -> dict:
+        """Get measured MPRA cis-regulatory allelic activity (emVar/active/log2Skew) for a variant."""
+        return await executor.get_mpra_by_variant(variant, resources)
+
+    @mcp.tool()
+    async def get_mpra_by_region(
+        chrom: str,
+        start: int,
+        end: int,
+        resources: str | None = None,
+    ) -> dict:
+        """Get measured MPRA cis-regulatory allelic activity for variants overlapping a region."""
+        return await executor.get_mpra_by_region(chrom, start, end, resources)
+
+    @mcp.tool()
+    async def get_mpra_by_gene(
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+    ) -> dict:
+        """Get measured MPRA cis-regulatory allelic activity for variants near a gene."""
+        return await executor.get_mpra_by_gene(gene, resources, window)
 
     @mcp.tool()
     async def get_gene_disease_associations(gene: str) -> dict:
