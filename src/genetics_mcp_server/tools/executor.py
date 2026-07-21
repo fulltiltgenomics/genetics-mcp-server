@@ -997,6 +997,64 @@ class ToolExecutor:
             }
         return result
 
+    async def get_mpra_pip_concordance_by_gene(
+        self,
+        gene: str,
+        window: int = 500000,
+        resource: str = "finngen",
+        min_pip: float = 0.1,
+    ) -> dict[str, Any]:
+        """Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls.
+
+        Serves the regulatory-buffering signal (Kanai et al.): whether high-PIP fine-mapped
+        variants near a gene actually show measured cis-regulatory allelic activity in MPRA.
+        Joins credible_sets_v (fine-mapped, filtered to `resource`, pip >= min_pip) to the MPRA
+        meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt `variant` key — both
+        views use the same variant convention (X=23), so the string join is exact. The meta row
+        is used for the core call because it carries the cross-cell-line emVar/log2Skew summary.
+        Distinct from get_mpra_by_gene, which returns MPRA rows without the PIP cross-reference.
+
+        Equivalent raw BigQuery join a user could run via query_bigquery:
+
+            WITH g AS (
+              SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend
+              FROM `genetics_results.gene_annotations_v`
+              WHERE symbol = 'PCSK9' GROUP BY chr
+            )
+            SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type,
+                   m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort
+            FROM `genetics_results.credible_sets_v` c
+            JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING)
+              AND c.pos BETWEEN g.gstart - 500000 AND g.gend + 500000
+            JOIN `genetics_results.mpra_v` m
+              ON m.variant = c.variant AND m.cell_line = 'meta'
+            WHERE c.resource = 'finngen' AND c.pip >= 0.1
+            ORDER BY m.emVar DESC, c.pip DESC
+        """
+        sql = (
+            f"WITH g AS ("
+            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
+            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
+            f") "
+            f"SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type, "
+            f"c.mlog10p AS gwas_mlog10p, c.beta, "
+            f"m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort "
+            f"FROM `genetics_results.credible_sets_v` c "
+            f"JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING) "
+            f"AND c.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"JOIN `genetics_results.mpra_v` m "
+            f"ON m.variant = c.variant AND m.cell_line = 'meta' "
+            f"WHERE c.resource = '{resource}' AND c.pip >= {min_pip} "
+            f"ORDER BY m.emVar DESC, c.pip DESC LIMIT 500"
+        )
+        result = await self.query_bigquery(sql, max_rows=500)
+        if result.get("success"):
+            return {
+                "success": True, "gene": gene, "results": result.get("rows", []),
+                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_mpra_pip_concordance.tsv"},
+            }
+        return result
+
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:
         """Get gene-disease associations."""
         resp = await self.client.get(

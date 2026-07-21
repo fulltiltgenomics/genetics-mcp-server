@@ -392,6 +392,33 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_mpra_pip_concordance_by_gene",
+        "category": "api",
+        "description": "Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls for variants near a gene — the core regulatory-buffering check (Kanai et al.): do high-PIP (credibly causal) fine-mapped variants actually show measured cis-regulatory allelic activity (emVar) in MPRA? BigQuery-joins credible_sets_v (FinnGen fine-mapped, filtered to resource + pip>=min_pip) to the MPRA cross-cell-line meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt variant key. Per matched variant returns: FinnGen PIP, cs_id, trait, data_type, GWAS mlog10p/beta, and the meta MPRA call — emVar (allele modulates reporter expression), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2Skew_mlog10p (skew significance), log2FC (element activity), cohort. Ordered emVar then PIP. This corroborates whether fine-mapped variants are FUNCTIONALLY active in a reporter assay — MPRA measures intrinsic cis-regulatory allelic activity, distinct from in-silico variant_effect predictions and endogenous eQTL/caQTL. Distinct from get_mpra_by_gene, which returns MPRA rows WITHOUT the PIP cross-reference. FinnGen-credible-set-based and meta-row-based by default; MPRA coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants).",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol (e.g., 'PCSK9')",
+                "required": True,
+            },
+            "window": {
+                "type": "integer",
+                "description": "Flank in bp added on each side of the gene body (default 500000).",
+                "default": 500000,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Fine-mapping resource in credible_sets_v to cross-reference (default 'finngen').",
+                "default": "finngen",
+            },
+            "min_pip": {
+                "type": "number",
+                "description": "Minimum posterior inclusion probability (PIP) to include, so results focus on credibly causal variants (default 0.1).",
+                "default": 0.1,
+            },
+        },
+    },
+    {
         "name": "get_gene_disease_associations",
         "category": "api",
         "description": "Get Mendelian/rare disease gene-disease relationships from ClinGen/GENCC. Use ONLY for rare disease genetics questions, NOT for GWAS/common variant associations.",
@@ -1315,6 +1342,16 @@ def register_mcp_tools(
     ) -> dict:
         """Get measured MPRA cis-regulatory allelic activity for variants near a gene."""
         return await executor.get_mpra_by_gene(gene, resources, window)
+
+    @mcp.tool()
+    async def get_mpra_pip_concordance_by_gene(
+        gene: str,
+        window: int = 500000,
+        resource: str = "finngen",
+        min_pip: float = 0.1,
+    ) -> dict:
+        """Cross-reference FinnGen fine-mapped credible-set PIP against measured MPRA emVar calls near a gene."""
+        return await executor.get_mpra_pip_concordance_by_gene(gene, window, resource, min_pip)
 
     @mcp.tool()
     async def get_gene_disease_associations(gene: str) -> dict:
