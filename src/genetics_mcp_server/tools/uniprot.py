@@ -5,6 +5,8 @@ without a ToolExecutor; the executor exposes thin delegating tool methods.
 """
 
 import logging
+import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -20,6 +22,7 @@ _MAX_REDIRECTS = 5
 # must not overwrite when it is re-applied to the hop: UniProt answers a merged
 # accession with `?from={requested}` and that is the only staleness signal there is
 _SERVER_OWNED_PARAMS = frozenset({"from"})
+_CACHE_MAXSIZE = 512
 
 
 def _is_error(data: Any) -> bool:
@@ -34,6 +37,75 @@ def _is_error(data: Any) -> bool:
     return isinstance(data, dict) and "_error" in data
 
 
+def _copy_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Detached copy of a response meta dict, safe to hand to a caller.
+
+    A cached entry is returned to every hit, so without this they would all share one
+    mutable dict (and one mutable `headers` dict inside it) and a caller annotating its
+    own copy would rewrite what the next hit sees. Everything else in meta is an
+    immutable str/int/None, so a two-level copy is deep enough.
+    """
+    return {**meta, "headers": dict(meta["headers"])}
+
+
+class _TTLCache:
+    """Time-limited store with FIFO eviction, keyed by fully-qualified request URL.
+
+    Entries hold an absolute deadline rather than an insertion time so the ttl is a
+    property of the write, not of the cache: the cache outlives any one UniProtClient
+    while the ttl comes from that client's injected Settings.
+    """
+
+    _MISS = object()
+
+    def __init__(
+        self,
+        maxsize: int = _CACHE_MAXSIZE,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        # the clock is injected so expiry is unit testable without sleeping, and
+        # defaults to monotonic so a wall-clock step cannot void or extend a ttl
+        self._clock = clock
+        self._maxsize = maxsize
+        self._entries: dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Any:
+        """The cached value, or `_TTLCache._MISS` — a stored value may itself be falsy."""
+        entry = self._entries.get(key)
+        if entry is None:
+            return self._MISS
+        expires_at, value = entry
+        if self._clock() >= expires_at:
+            del self._entries[key]
+            return self._MISS
+        return value
+
+    def set(self, key: str, value: Any, ttl: float) -> None:
+        # a non-positive ttl (UNIPROT_CACHE_TTL=0) turns caching off rather than storing
+        # entries that are already expired when they land
+        if ttl <= 0:
+            return
+        # re-insert instead of overwriting in place: a refreshed entry gets a new
+        # deadline, so it belongs at the back of the eviction queue as well
+        self._entries.pop(key, None)
+        self._entries[key] = (self._clock() + ttl, value)
+        while len(self._entries) > self._maxsize:
+            # dicts iterate in insertion order, so the first key is the oldest write
+            del self._entries[next(iter(self._entries))]
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+# module level, not per UniProtClient: a client is built from a ToolExecutor, and
+# ToolExecutor is instantiated independently by LLMService, by the standalone MCP server
+# and by the analyze_variants CLI, so a per-instance cache would be per-executor.
+# Subagents do share the main agent's executor today (LLMService hands its own to
+# SubagentService), but nothing in that API requires it, and a per-instance cache would
+# silently stop being shared the moment any caller builds its own executor.
+_CACHE = _TTLCache()
+
+
 class UniProtClient:
     """Async client for UniProtKB and the EBI Proteins API."""
 
@@ -44,6 +116,7 @@ class UniProtClient:
         self._client = client
         self._uniprot_url = settings.uniprot_api_url.rstrip("/")
         self._ebi_url = settings.ebi_proteins_api_url.rstrip("/")
+        self._cache_ttl = settings.uniprot_cache_ttl
         self._ebi_host = httpx.URL(self._ebi_url).host
         # a redirect may only be followed to an origin this deployment already talks to.
         # Derived from the configured URLs rather than hardcoded so a self-hosted mirror
@@ -89,7 +162,10 @@ class UniProtClient:
         UniProt reports the result total in the x-total-results header and the
         pagination cursor in Link, neither of which appear in the body, so anything
         needing those goes through here. Every request funnels through this one method
-        so the TTL cache can wrap it in a single place.
+        so the TTL cache can wrap it in a single place: successful responses are served
+        from the process-wide `_CACHE` for `settings.uniprot_cache_ttl` seconds, keyed
+        on the full request URL, and the returned body must not be mutated because
+        later hits share it. Error sentinels are never cached.
 
         `path` is either a query-free path relative to the base host, with all query
         data passed via `params`, or an absolute http(s) URL used verbatim — the latter
@@ -111,6 +187,14 @@ class UniProtClient:
         is a protocol error like any other and the tool methods' try/except owns it.
         """
         url = self._build_url(path, params, base)
+        # keyed on the fully-qualified URL, which _build_url has already folded `params`
+        # into: keying on the bare path would collide across field projections of the
+        # same accession and serve a body missing the fields the caller asked for
+        cache_key = str(url)
+        cached = _CACHE.get(cache_key)
+        if cached is not _TTLCache._MISS:
+            body, meta = cached
+            return body, _copy_meta(meta)
         origin = url
         # the initial request's full query, which for an absolute `path` also covers the
         # query that URL already carried; re-applied to every hop so field projection
@@ -186,7 +270,7 @@ class UniProtClient:
             return self._error_sentinel(resp, url), meta
 
         try:
-            return resp.json(), meta
+            body = resp.json()
         except ValueError:
             # UniProt serves an HTML placeholder page when its REST tier is unavailable,
             # which would otherwise surface as an opaque JSON decode error
@@ -196,6 +280,21 @@ class UniProtClient:
                 "_error": f"{label} returned a non-JSON response",
                 "_status": resp.status_code,
             }, meta
+
+        # only successes are stored: a 404, a synthetic 503 from _ResilientAsyncClient, a
+        # refused or exhausted redirect and an HTML placeholder page are all transient or
+        # input-dependent, and pinning any of them for a day would outlast the condition
+        # that caused it. Every one of those paths returns above, so the _is_error check
+        # is a guard on the invariant rather than the mechanism enforcing it — it keeps
+        # "no sentinel is ever cached" checkable here instead of by auditing five returns.
+        # meta is cached alongside the body because a hit has no live response to rebuild
+        # it from, and dropping it would make a cached call lose x-total-results, the Link
+        # cursor and redirected_from, i.e. behave differently from an uncached one. The
+        # body is handed out by reference (copying a full entry on every hit would defeat
+        # the cache), so callers must treat it as read-only.
+        if not _is_error(body):
+            _CACHE.set(cache_key, (body, _copy_meta(meta)), self._cache_ttl)
+        return body, meta
 
     @staticmethod
     def _meta(resp: httpx.Response, origin: httpx.URL, redirected: bool) -> dict[str, Any]:
