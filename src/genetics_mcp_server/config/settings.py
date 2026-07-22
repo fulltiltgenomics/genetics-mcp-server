@@ -93,6 +93,23 @@ class Settings:
         )
     )
 
+    # UniProt REST API (protein entries, search, sequences)
+    uniprot_api_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "UNIPROT_API_URL", "https://rest.uniprot.org"
+        )
+    )
+    # EBI Proteins API, used for protein-position-to-genome coordinate mapping
+    ebi_proteins_api_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "EBI_PROTEINS_API_URL", "https://www.ebi.ac.uk/proteins/api"
+        )
+    )
+    # UniProt entries change at most weekly, so a long TTL is safe
+    uniprot_cache_ttl: int = field(
+        default_factory=lambda: int(os.environ.get("UNIPROT_CACHE_TTL", "86400"))
+    )
+
     # RAG MCP server (separate from always-on external servers)
     rag_mcp_server: str | None = field(
         default_factory=lambda: os.environ.get("RAG_MCP_SERVER")
