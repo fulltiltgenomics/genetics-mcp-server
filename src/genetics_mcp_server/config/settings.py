@@ -178,6 +178,21 @@ class Settings:
         }
     )
 
+    # CORS: the frontend sends credentialed requests, and browsers reject a
+    # wildcard Access-Control-Allow-Origin on those, so origins must be explicit.
+    # only relevant in dev — in prod the frontend and this API share an origin
+    # behind the reverse proxy and no CORS preflight happens.
+    cors_origins: list[str] = field(
+        default_factory=lambda: [
+            o.strip()
+            for o in os.environ.get(
+                "CORS_ORIGINS",
+                "http://localhost:3000,http://127.0.0.1:3000",
+            ).split(",")
+            if o.strip()
+        ]
+    )
+
     # OAuth 2.1 resource server (optional): trust Keycloak-issued access tokens
     # as a fourth bearer-validation path. inert unless both issuer and resource
     # url are set. token validation reuses allowed_emails / allowed_email_domains.

@@ -431,6 +431,18 @@ All configuration is via environment variables (`.env` file supported):
 | `DOWNLOAD_STORAGE_PATH` | Path for tool result download files | `/mnt/disks/data/downloads` |
 | `DOWNLOAD_TTL_SECONDS` | TTL for download files in seconds | `2592000` (30 days) |
 
+### CORS
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CORS_ORIGINS` | Comma-separated origins allowed to call the chat API from a browser | `http://localhost:3000,http://127.0.0.1:3000` |
+
+The frontend calls the chat API with `withCredentials: true`, and browsers reject a wildcard
+`Access-Control-Allow-Origin` on credentialed requests, so origins are listed explicitly
+(`settings.cors_origins`, applied in `chat_api.py`). This only matters in dev, where the frontend
+runs on its own origin; in prod the frontend and chat API share an origin behind the reverse proxy,
+so no cross-origin request is made.
+
 ### Authentication (optional)
 
 | Variable | Description |
