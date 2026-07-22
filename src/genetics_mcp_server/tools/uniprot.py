@@ -5,6 +5,7 @@ without a ToolExecutor; the executor exposes thin delegating tool methods.
 """
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -23,6 +24,17 @@ _MAX_REDIRECTS = 5
 # accession with `?from={requested}` and that is the only staleness signal there is
 _SERVER_OWNED_PARAMS = frozenset({"from"})
 _CACHE_MAXSIZE = 512
+
+# UniProtKB accession syntax. Fully anchored and alphanumeric-only, which is also what
+# makes it safe to interpolate a match into a request path: _build_url's quote() leaves
+# dot segments alone, so an unvalidated identifier could climb out of /uniprotkb/.
+_ACCESSION_RE = re.compile(
+    r"^[OPQ][0-9][A-Z0-9]{3}[0-9]$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$"
+)
+# identity only: resolve answers "which protein is this", and the full entry (TTN's runs
+# to megabytes) is fetched by the annotation tools that actually need it
+_RESOLVE_FIELDS = "accession,id,protein_name,gene_names,organism_name"
+_MAX_ALTERNATIVES = 5
 
 
 def _is_error(data: Any) -> bool:
@@ -46,6 +58,108 @@ def _copy_meta(meta: dict[str, Any]) -> dict[str, Any]:
     immutable str/int/None, so a two-level copy is deep enough.
     """
     return {**meta, "headers": dict(meta["headers"])}
+
+
+def _is_reviewed(entry: dict[str, Any]) -> bool:
+    return str(entry.get("entryType") or "").startswith("UniProtKB reviewed")
+
+
+def _gene_names(entry: dict[str, Any]) -> list[str]:
+    """Gene symbols of an entry, approved name first, then what TrEMBL offers instead."""
+    names: list[str] = []
+    for gene in entry.get("genes") or []:
+        primary = (gene.get("geneName") or {}).get("value")
+        if primary:
+            names.append(primary)
+            continue
+        # unreviewed entries often carry no approved symbol at all
+        for key in ("synonyms", "orfNames", "orderedLocusNames"):
+            values = [item.get("value") for item in gene.get(key) or [] if item.get("value")]
+            if values:
+                names.extend(values)
+                break
+    return list(dict.fromkeys(names))
+
+
+def _protein_name(entry: dict[str, Any]) -> str | None:
+    description = entry.get("proteinDescription") or {}
+    recommended = ((description.get("recommendedName") or {}).get("fullName") or {}).get("value")
+    if recommended:
+        return recommended
+    # TrEMBL entries have no curated recommended name, only the submitter's
+    for key in ("submissionNames", "alternativeNames"):
+        for item in description.get(key) or []:
+            value = (item.get("fullName") or {}).get("value")
+            if value:
+                return value
+    return None
+
+
+def _entry_summary(entry: dict[str, Any]) -> dict[str, Any]:
+    """Identity block for one entry, built fresh: response bodies are shared by the cache."""
+    organism = entry.get("organism") or {}
+    return {
+        "accession": entry.get("primaryAccession"),
+        "entry_name": entry.get("uniProtkbId"),
+        "protein_name": _protein_name(entry),
+        "gene_names": _gene_names(entry),
+        "organism": organism.get("scientificName"),
+        "taxon_id": organism.get("taxonId"),
+        "reviewed": _is_reviewed(entry),
+    }
+
+
+def _inactive_result(accession: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Resolution result for an entry UniProt answers 200 for but has withdrawn.
+
+    DEMERGED and DELETED entries carry no gene names and no sequence, so flattening one
+    would produce a plausible-looking empty protein.
+    """
+    reason = entry.get("inactiveReason") or {}
+    reason_type = reason.get("inactiveReasonType") or "INACTIVE"
+    replaced_by = list(reason.get("mergeDemergeTo") or [])
+    advice = (
+        f"resolve one of {', '.join(replaced_by)} instead"
+        if replaced_by
+        else "it has no replacement in UniProtKB"
+    )
+    return {
+        "query": accession,
+        "input_kind": "accession",
+        **_entry_summary(entry),
+        # deliberately not the requested accession: nothing downstream may go on to
+        # annotate a dead identifier
+        "accession": None,
+        "match_basis": "accession",
+        "ambiguous": True,
+        "alternatives": [],
+        "inactive": True,
+        "inactive_reason": reason_type,
+        "replaced_by": replaced_by,
+        "warning": f"{accession} is not an active UniProtKB entry ({reason_type}); {advice}",
+    }
+
+
+def _quoted_term(value: str) -> str:
+    """A search term quoted so hyphens, colons and spaces cannot act as query syntax."""
+    return '"{}"'.format(value.replace("\\", "\\\\").replace('"', '\\"'))
+
+
+def _reviewed_first(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Swiss-Prot ahead of TrEMBL, relevance order preserved within each group.
+
+    Only bites with reviewed_only=False: gene:PRSS55 answers with the curated Q6UWB4 plus
+    three TrEMBL fragments, and relevance order alone need not put the curated one first.
+    """
+    return sorted(results, key=lambda entry: not _is_reviewed(entry))
+
+
+def _total_results(meta: dict[str, Any], fallback: int) -> int:
+    raw = (meta.get("headers") or {}).get("x-total-results")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return fallback
 
 
 class _TTLCache:
@@ -295,6 +409,135 @@ class UniProtClient:
         if not _is_error(body):
             _CACHE.set(cache_key, (body, _copy_meta(meta)), self._cache_ttl)
         return body, meta
+
+    async def resolve(
+        self,
+        query: str,
+        organism_id: int | None = 9606,
+        reviewed_only: bool = True,
+    ) -> dict[str, Any]:
+        """Work out which protein an agent-supplied gene symbol or accession refers to.
+
+        Returns `{query, input_kind, accession, entry_name, protein_name, gene_names,
+        organism, taxon_id, reviewed, match_basis, ambiguous, alternatives}`, or an error
+        sentinel (test it with `_is_error`) when nothing matched or the request failed.
+
+        An accession input is reported with the gene names of the entry it actually names,
+        so an accession that is not the protein the caller meant is visible in the very
+        same result — Q92626 supplied where TPO was intended comes back as PXDN_HUMAN
+        rather than being annotated as if it were thyroid peroxidase. Withdrawn entries
+        additionally carry `inactive`, `inactive_reason` and `replaced_by`, and an
+        accession merged into another one carries `stale_accession`.
+
+        A symbol is matched through three tiers: an exact gene-name match, then any gene
+        name or synonym, then free text; it also reports `total_matches`. `ambiguous` is
+        true unless the exact tier matched exactly one entry, which is the only outcome
+        that pins a symbol to one protein.
+        """
+        text = (query or "").strip()
+        if not text:
+            return {
+                "_error": "UniProt: empty query, nothing to resolve",
+                "_status": None,
+                "_no_match": True,
+            }
+        # matched before the value reaches _resolve_accession, which interpolates it into
+        # a request path; a symbol never reaches a path at all
+        candidate = text.upper()
+        if _ACCESSION_RE.match(candidate):
+            return await self._resolve_accession(candidate)
+        return await self._resolve_symbol(text, organism_id, reviewed_only)
+
+    async def _resolve_accession(self, accession: str) -> dict[str, Any]:
+        body, meta = await self._get_with_meta(
+            f"/uniprotkb/{accession}", params={"fields": _RESOLVE_FIELDS}
+        )
+        if _is_error(body):
+            return body
+        if body.get("entryType") == "Inactive":
+            return _inactive_result(accession, body)
+
+        result = {
+            "query": accession,
+            "input_kind": "accession",
+            **_entry_summary(body),
+            "match_basis": "accession",
+            "ambiguous": False,
+            "alternatives": [],
+        }
+        # a merged accession answers 303 and _get_with_meta follows it, so the entry in
+        # hand is already the live one and `?from=` on the final URL is the only trace
+        # that the caller's accession is stale. meta["redirected_from"] is not that
+        # signal: the legacy /uniprot/ -> /uniprotkb/ 301 sets it on current accessions.
+        merged_from = httpx.URL(meta.get("url") or "").params.get("from")
+        if merged_from:
+            result["stale_accession"] = merged_from
+            result["warning"] = (
+                f"{merged_from} is a secondary accession merged into {result['accession']}"
+            )
+        return result
+
+    async def _resolve_symbol(
+        self, symbol: str, organism_id: int | None, reviewed_only: bool
+    ) -> dict[str, Any]:
+        try:
+            scope = f" AND organism_id:{int(organism_id)}" if organism_id else ""
+        except (TypeError, ValueError):
+            return {
+                "_error": f"UniProt: organism_id must be a taxon id, got {organism_id!r}",
+                "_status": None,
+            }
+        if reviewed_only:
+            scope += " AND reviewed:true"
+        term = _quoted_term(symbol)
+        # most precise tier first: gene_exact is the only one that cannot match another
+        # gene's synonym, and free text is the tier that ranks thrombopoietin (TPO_HUMAN,
+        # gene THPO) second behind the real TPO
+        tiers = (
+            (f"gene_exact:{term}{scope}", "gene_exact_reviewed"),
+            (f"gene:{term}{scope}", "gene_synonym_reviewed"),
+            (f"{term}{scope}", "text_search"),
+        )
+
+        exact_total: int | None = None
+        for tier_query, match_basis in tiers:
+            body, meta = await self._get_with_meta(
+                "/uniprotkb/search",
+                params={
+                    "query": tier_query,
+                    "fields": _RESOLVE_FIELDS,
+                    "size": _MAX_ALTERNATIVES + 1,
+                },
+            )
+            if _is_error(body):
+                return body
+            hits = _reviewed_first(body.get("results") or [])
+            total = _total_results(meta, len(hits))
+            if exact_total is None:
+                exact_total = total
+            if not hits:
+                continue
+            return {
+                "query": symbol,
+                "input_kind": "symbol",
+                **_entry_summary(hits[0]),
+                "match_basis": match_basis,
+                "ambiguous": exact_total != 1,
+                # within the tier that answered, so a fallback tier's count does not read
+                # as agreement about the symbol
+                "total_matches": total,
+                "alternatives": [_entry_summary(hit) for hit in hits[1:]],
+            }
+
+        return {
+            "_error": (
+                f"UniProt: no entry matched gene symbol '{symbol}'"
+                f"{' in organism ' + str(organism_id) if organism_id else ''}"
+                f"{' among reviewed entries' if reviewed_only else ''}"
+            ),
+            "_status": None,
+            "_no_match": True,
+        }
 
     @staticmethod
     def _meta(resp: httpx.Response, origin: httpx.URL, redirected: bool) -> dict[str, Any]:

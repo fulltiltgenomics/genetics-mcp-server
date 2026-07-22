@@ -218,7 +218,7 @@ src/genetics_mcp_server/
 │   ├── __init__.py
 │   ├── definitions.py   # tool definitions (shared)
 │   ├── executor.py      # tool execution via HTTP
-│   ├── uniprot.py       # UniProtKB / EBI Proteins API client (process-wide TTL cache)
+│   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
 │   └── phewas_categories.py  # PheWAS plot category mappings
 ├── subagent.py             # parallel subagent service
 ├── scripts/
