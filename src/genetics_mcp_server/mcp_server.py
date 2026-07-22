@@ -79,8 +79,17 @@ api_url = os.environ.get("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 executor = ToolExecutor(api_base_url=api_url)
 
 _settings = get_settings()
-# literature search is only available via the chat backend (uses Perplexity API)
-_mcp_disabled = _settings.disabled_tools | {"search_scientific_literature", "web_search", "get_myvariant_annotations", "search_mgi"}
+# literature search is only available via the chat backend (uses Perplexity API);
+# the UniProt tools are chat-backend only by product decision, not a technical limit
+_mcp_disabled = _settings.disabled_tools | {
+    "search_scientific_literature",
+    "web_search",
+    "get_myvariant_annotations",
+    "search_mgi",
+    "get_protein_annotations",
+    "map_protein_variants",
+    "search_uniprot",
+}
 register_mcp_tools(mcp, executor, disabled_tools=_mcp_disabled)
 
 logger.info(f"Registered MCP tools. API URL: {api_url}")

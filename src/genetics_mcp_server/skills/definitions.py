@@ -53,7 +53,14 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         ),
         instruction_file="literature_review.md",
         tool_categories={"general"},
-        extra_tools=["search_scientific_literature", "web_search", "search_mgi"],
+        extra_tools=[
+            "search_scientific_literature",
+            "web_search",
+            "search_mgi",
+            "get_protein_annotations",
+            "map_protein_variants",
+            "search_uniprot",
+        ],
     ),
     "bigquery_analysis": SkillDefinition(
         name="bigquery_analysis",

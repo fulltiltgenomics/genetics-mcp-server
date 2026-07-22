@@ -159,6 +159,24 @@ Available tools (after exclusions):
 
 The `get_myvariant_annotations` tool queries myvariant.info for clinical and functional variant annotations not available from gnomAD MCP or the local API. Provides ClinVar clinical significance, CADD deleteriousness scores, functional predictions (SIFT, PolyPhen2, MutationTaster), cancer annotations (COSMIC, CIViC), and dbSNP rsIDs. Excluded from the MCP server — only available via the chat API. gnomAD population frequency fields are excluded by default to avoid overlap with gnomAD MCP.
 
+#### UniProt (native tools, chat-backend only)
+
+Three tools give the agent direct protein-level annotation, replacing the `web_search(include_domains=['rest.uniprot.org'])` fallback that returned UniProt's JavaScript placeholder page and the parametric-memory recall that produced wrong accessions.
+
+| Tool | Description |
+|------|-------------|
+| `get_protein_annotations` | Full UniProtKB entry for a protein resolved from a gene symbol or accession: metadata, residue-level features (domains, active/binding/metal sites, signal peptides, PTMs), sequence, isoforms, and cross-references. `include` selects result sections, `feature_types` filters features, `residue_range` restricts them to a region. Chat-backend only — excluded from MCP server |
+| `map_protein_variants` | Map protein-level variant notation (e.g. `['P70A', 'G393A', 'R438H', 'W873C']` with `query='TPO'`) to genomic coordinates and rsIDs via the EBI Proteins API coordinate mapping. Chat-backend only — excluded from MCP server |
+| `search_uniprot` | Search UniProtKB by free text, keyword, or organism when the target protein is not yet known; `reviewed_only`, `fields`, `size`, and `count_only` control the result set. Chat-backend only — excluded from MCP server |
+
+**Client layer** (`tools/uniprot.py`): `UniProtClient` wraps both `https://rest.uniprot.org` (entries, search, sequences) and `https://www.ebi.ac.uk/proteins/api` (protein↔genome coordinate mapping) over the shared `httpx.AsyncClient`. It owns:
+
+- **Identifier resolution** — a gene symbol is matched through three tiers (exact gene name → any gene name/synonym → free text); an accession-shaped input that does not resolve is retried as a symbol, because `P2RY12`, `B4GAT1`, `B3GNT2` and the `H2AC*`/`H2BC*` histone families are simultaneously valid accession patterns and gene symbols. Merged (secondary) and withdrawn accessions are reported as `stale_accession` / `inactive` rather than silently followed.
+- **A resolution block on every result** — `accession`, `entry_name`, `protein_name`, `gene_names`, `organism`, `taxon_id`, `reviewed`, `match_basis`, `ambiguous`, `alternatives`. This makes a mis-resolved protein visible in the same result (an accession supplied for the wrong protein comes back with the gene names it actually names), and the system prompt requires the agent to check it before quoting any annotation.
+- **A process-wide TTL cache** (`UNIPROT_CACHE_TTL`, default 24 h, monotonic-clock deadlines, LRU-bounded). UniProt releases at most weekly, so a long TTL is safe; setting the TTL to `0` disables caching.
+
+**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and they are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them.
+
 #### Open Targets Platform MCP
 
 | Tool | Description |
@@ -383,6 +401,14 @@ All configuration is via environment variables (`.env` file supported):
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MYVARIANT_API_URL` | myvariant.info API base URL | `https://myvariant.info/v1` |
+
+### UniProt (optional, chat-backend only)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `UNIPROT_API_URL` | UniProt REST API base URL (entries, search, sequences) | `https://rest.uniprot.org` |
+| `EBI_PROTEINS_API_URL` | EBI Proteins API base URL (protein↔genome coordinate mapping) | `https://www.ebi.ac.uk/proteins/api` |
+| `UNIPROT_CACHE_TTL` | TTL in seconds for cached UniProt responses; `0` disables caching | `86400` (24 h) |
 
 ### Search tools (optional)
 

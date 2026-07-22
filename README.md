@@ -29,6 +29,9 @@ All environment variables are optional but needed for each type of functionality
 | `TAVILY_API_KEY` | Tavily API key (for web search) | - |
 | `EXTERNAL_MCP_SERVERS` | Comma-separated URLs of external MCP servers to proxy (e.g. gnomAD, Open Targets) | - |
 | `RAG_MCP_SERVER` | URL of [genetics-rag-service](https://github.com/ykjain/genetics-rag-service) server | - |
+| `UNIPROT_API_URL` | UniProt REST API base URL (protein annotations, chat only) | `https://rest.uniprot.org` |
+| `EBI_PROTEINS_API_URL` | EBI Proteins API base URL (protein-to-genome mapping, chat only) | `https://www.ebi.ac.uk/proteins/api` |
+| `UNIPROT_CACHE_TTL` | TTL in seconds for cached UniProt responses (`0` disables) | `86400` |
 
 
 ### MCP Server

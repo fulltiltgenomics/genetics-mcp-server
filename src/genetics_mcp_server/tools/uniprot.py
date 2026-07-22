@@ -31,6 +31,11 @@ _CACHE_MAXSIZE = 512
 _ACCESSION_RE = re.compile(
     r"^[OPQ][0-9][A-Z0-9]{3}[0-9]$|^[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2}$"
 )
+# Lucene wildcards, which survive _quoted_term because UniProt's parser honours them
+# inside a quoted phrase and does NOT honour a backslash escape (verified live:
+# gene:"*" and gene:"\*" both return every reviewed human entry). A gene symbol or
+# accession never contains either character, so removing them is lossless for real input.
+_WILDCARD_RE = re.compile(r"[*?]")
 # identity only: resolve answers "which protein is this", and the full entry (TTN's runs
 # to megabytes) is fetched by the annotation tools that actually need it
 _RESOLVE_FIELDS = "accession,id,protein_name,gene_names,organism_name"
@@ -109,7 +114,7 @@ def _entry_summary(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _inactive_result(accession: str, entry: dict[str, Any]) -> dict[str, Any]:
+def _inactive_result(accession: str, entry: dict[str, Any], reviewed_only: bool) -> dict[str, Any]:
     """Resolution result for an entry UniProt answers 200 for but has withdrawn.
 
     DEMERGED and DELETED entries carry no gene names and no sequence, so flattening one
@@ -138,6 +143,21 @@ def _inactive_result(accession: str, entry: dict[str, Any]) -> dict[str, Any]:
         "replaced_by": replaced_by,
         "warning": f"{accession} is not an active UniProtKB entry ({reason_type}); {advice}",
     }
+
+
+def _organism_taxon(organism_id: Any) -> int | None:
+    """`organism_id` as a positive taxon id, or None for "any organism".
+
+    Raises TypeError/ValueError on anything else. The explicit positivity check is what
+    makes organism_id=-1 fail the same way organism_id='abc' does: int() accepts it
+    happily and UniProt answers the resulting query with a raw HTTP 400.
+    """
+    if organism_id is None:
+        return None
+    taxon = int(organism_id)
+    if taxon <= 0:
+        raise ValueError(f"taxon id must be positive, got {taxon}")
+    return taxon
 
 
 def _quoted_term(value: str) -> str:
@@ -418,44 +438,112 @@ class UniProtClient:
     ) -> dict[str, Any]:
         """Work out which protein an agent-supplied gene symbol or accession refers to.
 
-        Returns `{query, input_kind, accession, entry_name, protein_name, gene_names,
-        organism, taxon_id, reviewed, match_basis, ambiguous, alternatives}`, or an error
-        sentinel (test it with `_is_error`) when nothing matched or the request failed.
+        Both result shapes share `{query, input_kind, accession, entry_name, protein_name,
+        gene_names, organism, taxon_id, reviewed, match_basis, ambiguous, alternatives,
+        reviewed_only}`; on failure an error sentinel is returned instead (test it with
+        `_is_error`), carrying `_no_match` whenever the input simply matched nothing.
+        `reviewed_only` echoes the argument, because the `_reviewed` suffix on a
+        match_basis names the tier that answered and not whether a reviewed:true clause
+        was actually sent.
+
+        input_kind 'accession' adds `stale_accession` when the caller's accession has been
+        merged into another, and `inactive`/`inactive_reason`/`replaced_by` when UniProt
+        has withdrawn it. input_kind 'symbol' adds `total_matches` and, when an
+        accession-shaped input had to be reinterpreted, `accession_interpretation`.
 
         An accession input is reported with the gene names of the entry it actually names,
         so an accession that is not the protein the caller meant is visible in the very
         same result — Q92626 supplied where TPO was intended comes back as PXDN_HUMAN
-        rather than being annotated as if it were thyroid peroxidase. Withdrawn entries
-        additionally carry `inactive`, `inactive_reason` and `replaced_by`, and an
-        accession merged into another one carries `stale_accession`.
+        rather than being annotated as if it were thyroid peroxidase.
 
         A symbol is matched through three tiers: an exact gene-name match, then any gene
-        name or synonym, then free text; it also reports `total_matches`. `ambiguous` is
-        true unless the exact tier matched exactly one entry, which is the only outcome
-        that pins a symbol to one protein.
+        name or synonym, then free text. `ambiguous` is true unless the exact tier matched
+        exactly one entry, which is the only outcome that pins a symbol to one protein.
+
+        Accession syntax and gene symbols overlap — P2RY12, B4GAT1, B3GNT2, R3HDM1 and the
+        whole H2AC*/H2BC* histone families are all valid accession patterns — so an
+        accession reading that does not hold up is retried as a symbol; see
+        `_resolve_accession`. Isoform identifiers (P07202-2) are deliberately NOT accession
+        shaped and fall through to the symbol ladder, where free text still finds the
+        parent entry. Lucene wildcards are stripped from `query` before anything else: they
+        survive quoting, and `*` alone would otherwise "resolve" to all 20k human entries.
         """
-        text = (query or "").strip()
+        text = _WILDCARD_RE.sub("", query or "").strip()
         if not text:
             return {
                 "_error": "UniProt: empty query, nothing to resolve",
                 "_status": None,
                 "_no_match": True,
             }
+        try:
+            taxon_id = _organism_taxon(organism_id)
+        except (TypeError, ValueError):
+            return {
+                "_error": f"UniProt: organism_id must be a positive taxon id, got {organism_id!r}",
+                "_status": None,
+            }
         # matched before the value reaches _resolve_accession, which interpolates it into
         # a request path; a symbol never reaches a path at all
         candidate = text.upper()
         if _ACCESSION_RE.match(candidate):
-            return await self._resolve_accession(candidate)
-        return await self._resolve_symbol(text, organism_id, reviewed_only)
+            return await self._resolve_accession(candidate, taxon_id, reviewed_only)
+        return await self._resolve_symbol(text, taxon_id, reviewed_only)
 
-    async def _resolve_accession(self, accession: str) -> dict[str, Any]:
+    async def _resolve_accession(
+        self, accession: str, organism_id: int | None, reviewed_only: bool
+    ) -> dict[str, Any]:
+        """Resolve an accession-shaped input, retrying it as a gene symbol if it fails.
+
+        The regex is right — it admits every valid accession and nothing malformed — but
+        real HGNC symbols land inside that syntax, so matching it is not proof the caller
+        meant an accession. Three signals say the accession reading is wrong, and each
+        costs nothing extra to observe because the entry fetch already happened: UniProt
+        404s, the entry is withdrawn, or its organism is not the one that was asked for.
+        Only those three trigger the retry, so an ordinary accession lookup stays at one
+        request; a colliding symbol costs a second one, which the TTL cache then absorbs.
+
+        Free text is excluded from the retry: it matches on description prose, which is no
+        evidence that an accession-shaped token is a gene symbol, and accepting it would
+        let an unrelated entry displace a correct accession answer.
+        """
         body, meta = await self._get_with_meta(
             f"/uniprotkb/{accession}", params={"fields": _RESOLVE_FIELDS}
         )
         if _is_error(body):
-            return body
+            if body.get("_status") != 404:
+                return body
+            return await self._as_symbol(
+                accession,
+                organism_id,
+                reviewed_only,
+                outcome={"outcome": "not_found"},
+                rejected=f"{accession} is not a UniProtKB accession",
+                on_failure={
+                    "_error": (
+                        f"UniProt: '{accession}' matched no UniProtKB entry — it is neither "
+                        f"a known accession nor a gene symbol"
+                        f"{' in organism ' + str(organism_id) if organism_id else ''}"
+                        f"{' among reviewed entries' if reviewed_only else ''}"
+                    ),
+                    "_status": 404,
+                    "_no_match": True,
+                },
+            )
+
         if body.get("entryType") == "Inactive":
-            return _inactive_result(accession, body)
+            inactive = _inactive_result(accession, body)
+            return await self._as_symbol(
+                accession,
+                organism_id,
+                reviewed_only,
+                outcome={
+                    "outcome": "inactive",
+                    "inactive_reason": inactive["inactive_reason"],
+                    "replaced_by": list(inactive["replaced_by"]),
+                },
+                rejected=inactive["warning"],
+                on_failure=inactive,
+            )
 
         result = {
             "query": accession,
@@ -464,6 +552,7 @@ class UniProtClient:
             "match_basis": "accession",
             "ambiguous": False,
             "alternatives": [],
+            "reviewed_only": reviewed_only,
         }
         # a merged accession answers 303 and _get_with_meta follows it, so the entry in
         # hand is already the live one and `?from=` on the final URL is the only trace
@@ -475,29 +564,78 @@ class UniProtClient:
             result["warning"] = (
                 f"{merged_from} is a secondary accession merged into {result['accession']}"
             )
+
+        if organism_id is not None and result["taxon_id"] != organism_id:
+            # B4GAT1 is both a human gene and a Drosophila persimilis accession; without
+            # this the fruit fly entry came back as an unambiguous answer to a human query
+            mismatch = (
+                f"accession {accession} is {result['organism']} (taxon {result['taxon_id']}), "
+                f"not the requested organism {organism_id}"
+            )
+            result["taxon_mismatch"] = True
+            result["ambiguous"] = True
+            result["warning"] = f"{result['warning']}; {mismatch}" if merged_from else mismatch
+            return await self._as_symbol(
+                accession,
+                organism_id,
+                reviewed_only,
+                outcome={
+                    "outcome": "organism_mismatch",
+                    "accession": result["accession"],
+                    "entry_name": result["entry_name"],
+                    "organism": result["organism"],
+                    "taxon_id": result["taxon_id"],
+                },
+                rejected=mismatch,
+                on_failure=result,
+            )
+        return result
+
+    async def _as_symbol(
+        self,
+        accession: str,
+        organism_id: int | None,
+        reviewed_only: bool,
+        outcome: dict[str, Any],
+        rejected: str,
+        on_failure: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Retry a failed accession reading as a gene symbol, keeping both interpretations.
+
+        Returns `on_failure` unchanged when the symbol ladder finds nothing either, so a
+        genuinely dead or genuinely foreign accession still reports as itself.
+        """
+        result = await self._resolve_symbol(
+            accession, organism_id, reviewed_only, allow_text=False
+        )
+        if _is_error(result):
+            return on_failure
+        # the discarded reading is preserved rather than dropped: the caller may well have
+        # meant the accession, and this is the only place that says what it would have been
+        result["accession_interpretation"] = {"queried_as": accession, **outcome}
+        result["warning"] = f"{rejected}; resolved as a gene symbol instead"
         return result
 
     async def _resolve_symbol(
-        self, symbol: str, organism_id: int | None, reviewed_only: bool
+        self,
+        symbol: str,
+        organism_id: int | None,
+        reviewed_only: bool,
+        allow_text: bool = True,
     ) -> dict[str, Any]:
-        try:
-            scope = f" AND organism_id:{int(organism_id)}" if organism_id else ""
-        except (TypeError, ValueError):
-            return {
-                "_error": f"UniProt: organism_id must be a taxon id, got {organism_id!r}",
-                "_status": None,
-            }
+        scope = f" AND organism_id:{organism_id}" if organism_id is not None else ""
         if reviewed_only:
             scope += " AND reviewed:true"
         term = _quoted_term(symbol)
         # most precise tier first: gene_exact is the only one that cannot match another
         # gene's synonym, and free text is the tier that ranks thrombopoietin (TPO_HUMAN,
         # gene THPO) second behind the real TPO
-        tiers = (
+        tiers = [
             (f"gene_exact:{term}{scope}", "gene_exact_reviewed"),
             (f"gene:{term}{scope}", "gene_synonym_reviewed"),
-            (f"{term}{scope}", "text_search"),
-        )
+        ]
+        if allow_text:
+            tiers.append((f"{term}{scope}", "text_search"))
 
         exact_total: int | None = None
         for tier_query, match_basis in tiers:
@@ -522,11 +660,13 @@ class UniProtClient:
                 "input_kind": "symbol",
                 **_entry_summary(hits[0]),
                 "match_basis": match_basis,
+                # judged on the exact tier alone, so a fallback tier answering does not
+                # read as agreement about the symbol
                 "ambiguous": exact_total != 1,
-                # within the tier that answered, so a fallback tier's count does not read
-                # as agreement about the symbol
+                # counted within the tier that answered
                 "total_matches": total,
                 "alternatives": [_entry_summary(hit) for hit in hits[1:]],
+                "reviewed_only": reviewed_only,
             }
 
         return {
@@ -634,3 +774,738 @@ class UniProtClient:
         if location:
             sentinel["_location"] = location
         return sentinel
+
+    async def fetch_batch(
+        self,
+        accessions: list[str] | str,
+        fields: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch many entries in one round trip, in chunks of 100 (the endpoint's limit).
+
+        Serves table-building over a gene list — a 167-gene zymogen feature table is
+        currently curated by hand — where one request per accession is both slow and, via
+        the per-entry error paths, easy to lose rows in silently.
+
+        `missing` is the point of the result shape: an accession UniProt did not answer
+        for is reported by name rather than dropped, so a table can never quietly come
+        back short. `invalid` holds inputs that are not accession-shaped at all (a gene
+        symbol among the accessions), which must go through `resolve` first.
+        """
+        requested = [
+            token
+            for token in dict.fromkeys(
+                (item or "").strip().upper() for item in _as_list(accessions)
+            )
+            if token
+        ]
+        valid = [item for item in requested if _ACCESSION_RE.match(item)]
+        invalid = [item for item in requested if not _ACCESSION_RE.match(item)]
+
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for start in range(0, len(valid), _BATCH_SIZE):
+            chunk = valid[start : start + _BATCH_SIZE]
+            params: dict[str, Any] = {"accessions": ",".join(chunk)}
+            if fields:
+                params["fields"] = fields
+            body = await self._get("/uniprotkb/accessions", params=params)
+            if _is_error(body):
+                errors.append({**body, "accessions": chunk})
+                continue
+            results.extend(body.get("results") or [])
+
+        found: set[str] = set()
+        for entry in results:
+            primary = entry.get("primaryAccession")
+            if primary:
+                found.add(primary)
+            # a requested secondary accession is answered under its primary, so without
+            # this it would be reported missing while its entry is right there
+            found.update(entry.get("secondaryAccessions") or [])
+
+        return {
+            "requested": requested,
+            "invalid": invalid,
+            "results": results,
+            "count": len(results),
+            "missing": [item for item in valid if item not in found],
+            "errors": errors,
+        }
+
+    async def get_protein_annotations(
+        self,
+        query: str,
+        organism_id: int | None = None,
+        include: list[str] | str | None = None,
+        feature_types: list[str] | str | None = None,
+        residue_range: Any = None,
+    ) -> dict[str, Any]:
+        """Flattened annotations for whichever protein `query` actually resolves to.
+
+        The result always carries a `resolution` block — the full `resolve` answer,
+        including its warnings, alternatives and ambiguity flag — so protein data can
+        never reach a caller without saying which protein it is. Nothing is annotated
+        when resolution produced no live accession (a withdrawn entry), because a
+        plausible-looking empty protein is worse than an error.
+
+        `include` selects the sections too large to return unasked: 'features' (per
+        residue, TTN alone has thousands), 'sequence' and 'isoforms'. Passing
+        `feature_types` or `residue_range` implies 'features', since asking to filter
+        features is asking for them.
+
+        A list `query` is a table request (the 167-gene zymogen case) and answers with a
+        flat `results` row per input, each row carrying its own identity and match_basis
+        so a table can never attribute a row to the wrong protein.
+        """
+        sections = {item.strip().lower() for item in _as_list(include) if item}
+        wants_features = bool(feature_types) or residue_range is not None or "features" in sections
+        fields = _ENTRY_FIELDS
+        if wants_features:
+            fields = f"{fields},{_feature_fields(feature_types)}"
+
+        if isinstance(query, (list, tuple, set, frozenset)):
+            return await self._annotate_batch(
+                list(query), organism_id, fields, wants_features, feature_types, residue_range
+            )
+
+        resolution = await self.resolve(query, organism_id=organism_id)
+        if _is_error(resolution):
+            return {**resolution, "query": query}
+        accession = resolution.get("accession")
+        if not accession:
+            return {
+                "_error": (
+                    f"UniProt: '{query}' resolved to no annotatable entry"
+                    f"{': ' + resolution['warning'] if resolution.get('warning') else ''}"
+                ),
+                "_status": None,
+                "resolution": resolution,
+            }
+
+        body = await self._get(f"/uniprotkb/{accession}", params={"fields": fields})
+        if _is_error(body):
+            return {**body, "resolution": resolution}
+
+        result: dict[str, Any] = {
+            "success": True,
+            "resolution": resolution,
+            "accession": accession,
+            "entry": flatten_entry(body),
+        }
+        if wants_features:
+            result["features"] = flatten_features(
+                body.get("features"), feature_types=feature_types, residue_range=residue_range
+            )
+            result["feature_filter"] = {
+                "feature_types": _as_list(feature_types) or None,
+                "residue_range": list(_residue_range(residue_range) or ()) or None,
+            }
+        if "sequence" in sections:
+            result["sequence"] = (body.get("sequence") or {}).get("value")
+        if "isoforms" in sections:
+            result["isoforms"] = _isoforms(body)
+        return result
+
+    async def map_protein_variants(
+        self,
+        variants: list[str] | str,
+        query: str,
+        organism_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Map protein-level variants onto genomic coordinates, one resolution for all.
+
+        Each variant string carries its own expected residue ('P70A', 'p.Pro70Ala'), so
+        the residue agreement check is part of the input and cannot be skipped by an
+        omitted argument. A bare position ('70') is accepted and simply reports no
+        expectation to check against.
+
+        Coordinates are never suppressed on disagreement: the mapping is returned with
+        `agrees: false` plus the evidence that explains it — sequence length, isoform
+        count and any sequence-conflict or VAR_SEQ feature over that residue. P07202
+        position 70 is exactly that case (Pro at chr2:1,433,466-1,433,468 with a
+        sequence conflict at the same residue).
+        """
+        resolution = await self.resolve(query, organism_id=organism_id)
+        if _is_error(resolution):
+            return {**resolution, "query": query}
+        accession = resolution.get("accession")
+        if not accession:
+            return {
+                "_error": (
+                    f"UniProt: '{query}' resolved to no mappable entry"
+                    f"{': ' + resolution['warning'] if resolution.get('warning') else ''}"
+                ),
+                "_status": None,
+                "resolution": resolution,
+            }
+
+        entry = await self._get(
+            f"/uniprotkb/{accession}",
+            params={"fields": f"accession,sequence,cc_alternative_products,{_CONFLICT_FIELDS}"},
+        )
+        entry = {} if _is_error(entry) else entry
+
+        mapped: list[dict[str, Any]] = []
+        for raw in _as_list(variants):
+            variant: dict[str, Any] = {"variant": raw}
+            try:
+                position, expected_aa = parse_protein_variant(raw)
+            except ValueError as exc:
+                variant["_error"] = str(exc)
+                mapped.append(variant)
+                continue
+            variant["position"] = position
+            variant["expected_aa"] = expected_aa
+            body = await self._get_coordinates(accession, position)
+            if _is_error(body):
+                variant["_error"] = body["_error"]
+                variant["_status"] = body.get("_status")
+                mapped.append(variant)
+                continue
+            locations = body.get("locations") if isinstance(body, dict) else body
+            rows = collapse_transcripts(locations, expected_aa=expected_aa)
+            variant["locations"] = rows
+            variant["agrees"] = (
+                None
+                if expected_aa is None or not rows
+                else all(row.get("agrees") for row in rows)
+            )
+            if variant["agrees"] is False:
+                variant["disagreement_evidence"] = _disagreement_evidence(entry, position)
+            mapped.append(variant)
+
+        return {
+            "success": True,
+            "resolution": resolution,
+            "accession": accession,
+            "variants": mapped,
+        }
+
+    async def search_uniprot(
+        self,
+        query: str | None = None,
+        keyword: str | None = None,
+        organism_id: int | None = None,
+        reviewed_only: bool = True,
+        fields: list[str] | str | None = None,
+        size: int | None = None,
+        count_only: bool = False,
+    ) -> dict[str, Any]:
+        """Search UniProtKB, reporting the query that was actually sent.
+
+        `resolution` here answers the same question as it does for a single protein: what
+        was searched for, in which organism, over reviewed entries or not. Without it a
+        count is a bare number with no way to tell what it counted.
+
+        `count_only` reads the x-total-results header rather than paging the hits
+        (keyword:KW-0865 AND organism_id:9606 AND reviewed:true -> 215).
+        """
+        try:
+            taxon_id = _organism_taxon(organism_id)
+        except (TypeError, ValueError):
+            return {
+                "_error": f"UniProt: organism_id must be a positive taxon id, got {organism_id!r}",
+                "_status": None,
+            }
+
+        clauses: list[str] = []
+        text = _WILDCARD_RE.sub("", query or "").strip()
+        if text:
+            clauses.append(text)
+        if keyword:
+            clauses.append(f"keyword:{_keyword_term(keyword)}")
+        if taxon_id is not None:
+            clauses.append(f"organism_id:{taxon_id}")
+        if reviewed_only:
+            clauses.append("reviewed:true")
+        if not clauses:
+            return {
+                "_error": "UniProt: a search needs at least a query or a keyword",
+                "_status": None,
+            }
+        query_sent = " AND ".join(clauses)
+        resolution = {
+            "query_sent": query_sent,
+            "query": query,
+            "keyword": keyword,
+            "organism_id": taxon_id,
+            "reviewed_only": reviewed_only,
+            "match_basis": "search",
+        }
+
+        params: dict[str, Any] = {
+            "query": query_sent,
+            "fields": ",".join(str(item) for item in _as_list(fields)) or _RESOLVE_FIELDS,
+            # a count still needs a request; one hit is the smallest page that is
+            # certainly accepted, and the total comes from the header either way
+            "size": 1 if count_only else max(1, min(int(size or _DEFAULT_SEARCH_SIZE), 500)),
+        }
+        body, meta = await self._get_with_meta("/uniprotkb/search", params=params)
+        if _is_error(body):
+            return {**body, "resolution": resolution}
+
+        hits = _reviewed_first(body.get("results") or [])
+        total = _total_results(meta, len(hits))
+        if count_only:
+            return {"success": True, "resolution": resolution, "count": total}
+        return {
+            "success": True,
+            "resolution": resolution,
+            "count": total,
+            "returned": len(hits),
+            "results": [_entry_summary(hit) for hit in hits],
+        }
+
+    async def _get_coordinates(self, accession: str, position: int) -> Any:
+        """EBI genomic coordinates for one residue of one accession.
+
+        Built as an absolute URL because the endpoint's path segment is
+        `{accession}:{position}` and _build_url percent-encodes the colon, which EBI
+        answers with a 400. Both parts are therefore re-checked here: the accession
+        against the same anchored, alphanumeric-only pattern resolve uses, and the
+        position as an int, so neither can carry path syntax.
+        """
+        if not _ACCESSION_RE.match(accession):
+            return {"_error": f"EBI Proteins API: not an accession: {accession!r}", "_status": None}
+        return await self._get(f"{self._ebi_url}/coordinates/location/{accession}:{int(position)}")
+
+    async def _annotate_batch(
+        self,
+        queries: list[Any],
+        organism_id: int | None,
+        fields: str,
+        wants_features: bool,
+        feature_types: list[str] | str | None,
+        residue_range: Any,
+    ) -> dict[str, Any]:
+        """Annotate a list of inputs as one table of rows.
+
+        Accession-shaped inputs skip resolution and go through fetch_batch, because the
+        entry that comes back states its own identity — the same evidence resolve would
+        have produced, at a hundredth of the requests. Symbols still resolve one at a
+        time, since only the gene_exact ladder can pin a symbol to a single protein.
+
+        Every row carries its own `query`, `match_basis` and full identity, so the table
+        says per row which protein answered for which input; an input that resolved to
+        nothing is listed in `unresolved` rather than dropped, so the table cannot come
+        back quietly short.
+        """
+        requested: dict[str, str] = {}
+        basis: dict[str, dict[str, Any]] = {}
+        unresolved: list[dict[str, Any]] = []
+        for item in queries:
+            text = _WILDCARD_RE.sub("", str(item or "")).strip()
+            if not text:
+                continue
+            candidate = text.upper()
+            if _ACCESSION_RE.match(candidate):
+                requested.setdefault(candidate, text)
+                basis.setdefault(
+                    candidate, {"query": text, "match_basis": "accession", "ambiguous": False}
+                )
+                continue
+            resolution = await self.resolve(text, organism_id=organism_id)
+            if _is_error(resolution) or not resolution.get("accession"):
+                unresolved.append(
+                    {
+                        "query": text,
+                        "error": (
+                            resolution.get("_error")
+                            or resolution.get("warning")
+                            or "resolved to no live UniProtKB entry"
+                        ),
+                    }
+                )
+                continue
+            accession = resolution["accession"]
+            requested.setdefault(accession, text)
+            basis.setdefault(
+                accession,
+                {
+                    "query": text,
+                    "match_basis": resolution.get("match_basis"),
+                    "ambiguous": resolution.get("ambiguous"),
+                    "warning": resolution.get("warning"),
+                },
+            )
+
+        batch = await self.fetch_batch(list(requested), fields=fields)
+        by_accession: dict[str, dict[str, Any]] = {}
+        for entry in batch["results"]:
+            accession = entry.get("primaryAccession")
+            if accession:
+                by_accession[accession] = entry
+            for secondary in entry.get("secondaryAccessions") or []:
+                by_accession.setdefault(secondary, entry)
+
+        rows: list[dict[str, Any]] = []
+        for accession, text in requested.items():
+            entry = by_accession.get(accession)
+            if entry is None:
+                unresolved.append({"query": text, "error": f"{accession} returned no entry"})
+                continue
+            row = {**basis.get(accession, {"query": text}), **flatten_entry(entry)}
+            if wants_features:
+                row["features"] = flatten_features(
+                    entry.get("features"), feature_types=feature_types, residue_range=residue_range
+                )
+            rows.append(row)
+
+        return {
+            "success": True,
+            "results": rows,
+            "count": len(rows),
+            "unresolved": unresolved,
+            "errors": batch["errors"],
+        }
+
+
+# UniProtKB accessions endpoint limit, verified live
+_BATCH_SIZE = 100
+_DEFAULT_SEARCH_SIZE = 25
+# everything flatten_entry reads, and nothing else: a full TTN entry is megabytes
+_ENTRY_FIELDS = (
+    "accession,id,protein_name,gene_names,organism_name,"
+    "cc_function,cc_subcellular_location,keyword,sequence,cc_alternative_products"
+)
+_CONFLICT_FIELDS = "ft_conflict,ft_var_seq"
+# UniProt return-field name per supported feature type, so a per-residue request over a
+# titin-sized entry asks for the domains it wants rather than the whole feature table
+_FEATURE_FIELDS: dict[str, str] = {
+    "active site": "ft_act_site",
+    "propeptide": "ft_propep",
+    "signal": "ft_signal",
+    "domain": "ft_domain",
+    "modified residue": "ft_mod_res",
+    "topological domain": "ft_topo_dom",
+    "sequence conflict": "ft_conflict",
+    "alternative sequence": "ft_var_seq",
+}
+# the same type under the names the two APIs and the flag files use: UniProtKB JSON says
+# "Modified residue", the EBI payloads say "modified residue", and the flag-file codes
+# (MOD_RES, VAR_SEQ) are what a curator types
+_FEATURE_ALIASES: dict[str, str] = {
+    "act site": "active site",
+    "propep": "propeptide",
+    "signal peptide": "signal",
+    "mod res": "modified residue",
+    "topo dom": "topological domain",
+    "conflict": "sequence conflict",
+    "var seq": "alternative sequence",
+    "varseq": "alternative sequence",
+    "splice variant": "alternative sequence",
+}
+_AA3_TO_1: dict[str, str] = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "SEC": "U", "PYL": "O", "ASX": "B", "GLX": "Z", "XAA": "X",
+    "TER": "*", "STOP": "*",
+}
+_AA1 = frozenset("ACDEFGHIKLMNPQRSTVWYUOBZX*")
+# 'P70A', 'p.Pro70Ala', 'Pro70Ala', '70'; the reference residue is optional only so a
+# bare position stays usable, never so a caller can drop it from a full variant string
+_VARIANT_RE = re.compile(
+    r"^(?:p\.)?(?P<ref>[A-Za-z]{3}|[A-Za-z*])?\s*(?P<pos>\d+)\s*(?P<alt>[A-Za-z]{3}|[A-Za-z*=])?$"
+)
+
+
+def _as_list(value: Any) -> list[Any]:
+    """A scalar, a sequence or None as a list — tool arguments arrive as any of the three."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    return [value]
+
+
+def _normalize_feature_type(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("_", " ")
+    text = re.sub(r"\s+", " ", text)
+    return _FEATURE_ALIASES.get(text, text)
+
+
+def _feature_fields(feature_types: Any) -> str:
+    """UniProt return fields covering `feature_types`, or all supported types."""
+    wanted = {_normalize_feature_type(item) for item in _as_list(feature_types)}
+    fields = [field for key, field in _FEATURE_FIELDS.items() if not wanted or key in wanted]
+    # an unrecognised type would otherwise project no feature fields at all and look like
+    # "this protein has no such features" instead of "that is not a type I know"
+    return ",".join(fields or _FEATURE_FIELDS.values())
+
+
+def _keyword_term(keyword: str) -> str:
+    """A keyword as UniProt indexes it: the KW- identifier bare, a keyword name quoted."""
+    text = str(keyword).strip()
+    return text.upper() if re.match(r"^KW-\d+$", text, re.IGNORECASE) else _quoted_term(text)
+
+
+def _residue_range(value: Any) -> tuple[int, int] | None:
+    """`residue_range` as an inclusive (start, end), accepting 70, (1, 100) and '1-100'."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = [part for part in re.split(r"[-:.\s]+", value.strip()) if part]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(part) for part in value]
+    else:
+        parts = [str(value)]
+    if not parts:
+        return None
+    try:
+        bounds = [int(part) for part in parts[:2]]
+    except (TypeError, ValueError):
+        raise ValueError(f"residue_range must be numeric, got {value!r}") from None
+    start, end = (bounds * 2)[:2]
+    return (start, end) if start <= end else (end, start)
+
+
+def one_letter_aa(value: Any) -> str | None:
+    """'Pro' or 'P' as 'P'; None when it is neither. Three-letter input is what the EBI
+    coordinates endpoint reports and one-letter is what a variant string carries, so the
+    two can only be compared after both pass through here."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) == 1:
+        return text.upper() if text.upper() in _AA1 else None
+    return _AA3_TO_1.get(text.upper())
+
+
+def _evidence(feature: dict[str, Any]) -> list[str]:
+    """Evidence codes of a feature, from either API's spelling of them."""
+    codes: list[str] = []
+    for item in (feature.get("evidences") or feature.get("evidence") or []):
+        if not isinstance(item, dict):
+            continue
+        code = item.get("evidenceCode") or item.get("code")
+        if not code:
+            continue
+        source, ref = item.get("source"), item.get("id")
+        codes.append(f"{code}|{source}:{ref}" if source and ref else str(code))
+    return codes
+
+
+def _position(node: Any) -> int | None:
+    if isinstance(node, dict):
+        value = node.get("value", node.get("position"))
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(node)
+    except (TypeError, ValueError):
+        return None
+
+
+def _feature_bounds(feature: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Start and end of a feature, over the three location shapes in play: UniProtKB's
+    start/end, the EBI's begin/end, and the single-residue position of both."""
+    location = feature.get("location") or {}
+    if "position" in location:
+        point = _position(location.get("position"))
+        return point, point
+    start = _position(location.get("start", location.get("begin")))
+    end = _position(location.get("end"))
+    return start, end if end is not None else start
+
+
+def flatten_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """A UniProtKB entry as the compact record a model can actually read.
+
+    Identity comes from _entry_summary, so a flattened entry says which protein it is in
+    the same fields resolution does. Built fresh rather than edited in place: entry
+    bodies are shared by the response cache.
+    """
+    entry = entry or {}
+    functions: list[str] = []
+    locations: list[str] = []
+    for comment in entry.get("comments") or []:
+        kind = str(comment.get("commentType") or "").upper()
+        if kind == "FUNCTION":
+            functions.extend(
+                text.get("value") for text in comment.get("texts") or [] if text.get("value")
+            )
+        elif kind == "SUBCELLULAR LOCATION":
+            for item in comment.get("subcellularLocations") or []:
+                value = (item.get("location") or {}).get("value")
+                if value:
+                    locations.append(value)
+    sequence = entry.get("sequence") or {}
+    return {
+        **_entry_summary(entry),
+        "function": " ".join(functions) or None,
+        "subcellular_location": list(dict.fromkeys(locations)),
+        "keywords": [kw.get("name") for kw in entry.get("keywords") or [] if kw.get("name")],
+        "sequence_length": sequence.get("length"),
+        "isoform_count": len(_isoforms(entry)) or 1,
+    }
+
+
+def _isoforms(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Isoforms of an entry, from its ALTERNATIVE PRODUCTS comment."""
+    isoforms: list[dict[str, Any]] = []
+    for comment in (entry or {}).get("comments") or []:
+        if str(comment.get("commentType") or "").upper() != "ALTERNATIVE PRODUCTS":
+            continue
+        for isoform in comment.get("isoforms") or []:
+            isoforms.append(
+                {
+                    "name": (isoform.get("name") or {}).get("value"),
+                    "ids": list(isoform.get("isoformIds") or []),
+                    "sequence_status": isoform.get("isoformSequenceStatus"),
+                }
+            )
+    return isoforms
+
+
+def flatten_features(
+    features: list[dict[str, Any]] | None,
+    feature_types: list[str] | str | None = None,
+    residue_range: Any = None,
+) -> list[dict[str, Any]]:
+    """Sequence features as flat {type, start, end, description, evidence} rows.
+
+    `feature_types` matches a type under any of its spellings (MOD_RES, 'modified
+    residue', 'Modified residue'); `residue_range` keeps every feature OVERLAPPING the
+    range rather than only those contained in it, because a TTN Ig domain spanning the
+    residue of interest is precisely what the question is about, and an active site at a
+    single residue must survive a range query that brackets it.
+    """
+    wanted = {_normalize_feature_type(item) for item in _as_list(feature_types)}
+    bounds = _residue_range(residue_range)
+    rows: list[dict[str, Any]] = []
+    for feature in features or []:
+        if not isinstance(feature, dict):
+            continue
+        kind = feature.get("type")
+        if wanted and _normalize_feature_type(kind) not in wanted:
+            continue
+        start, end = _feature_bounds(feature)
+        if bounds is not None:
+            if start is None or end is None:
+                continue
+            if end < bounds[0] or start > bounds[1]:
+                continue
+        description = feature.get("description")
+        if not description and feature.get("original"):
+            variation = ", ".join(str(item) for item in _as_list(feature.get("variation")))
+            description = f"{feature['original']} -> {variation}" if variation else None
+        rows.append(
+            {
+                "type": kind,
+                "start": start,
+                "end": end,
+                "description": description or None,
+                "evidence": _evidence(feature),
+            }
+        )
+    return rows
+
+
+def parse_protein_variant(variant: str) -> tuple[int, str | None]:
+    """A protein variant string as (position, expected_aa in one-letter form).
+
+    Accepts 'P70A', 'p.Pro70Ala', 'Pro70Ala' and a bare '70'. The expected residue is
+    read out of the caller's own string and never taken from a separate parameter, so a
+    mapping cannot be run with the residue check silently skipped — an omitted residue is
+    visible in the input itself, as a bare position.
+
+    Raises ValueError on anything else, including a reference that is not an amino acid.
+    """
+    text = str(variant or "").strip()
+    match = _VARIANT_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"cannot parse protein variant {variant!r}; expected forms like "
+            f"'P70A', 'p.Pro70Ala' or a bare position '70'"
+        )
+    position = int(match.group("pos"))
+    if position <= 0:
+        raise ValueError(f"protein position must be positive, got {position}")
+    ref = match.group("ref")
+    if ref is None:
+        return position, None
+    expected = one_letter_aa(ref)
+    if expected is None:
+        raise ValueError(f"{ref!r} in {variant!r} is not an amino acid")
+    return position, expected
+
+
+def collapse_transcripts(
+    locations: list[dict[str, Any]] | None,
+    expected_aa: str | None = None,
+) -> list[dict[str, Any]]:
+    """Collapse the EBI coordinates rows for one residue into distinct genomic intervals.
+
+    The endpoint answers with one row per Ensembl transcript — P07202 residue 70 returns
+    dozens — and they overwhelmingly agree. Taking the first would hide the case where
+    they do not, so rows are grouped by (chromosome, geneStart, geneEnd, aminoAcids) and
+    every transcript that voted for an interval is listed on it.
+
+    With `expected_aa`, each interval reports `agrees` against the residue the EBI places
+    there. A disagreement never removes the coordinates: the row keeps them and gains the
+    overlapping sequence-conflict and VAR_SEQ features the payload carries, which is what
+    explains a mismatch at a residue like P07202:70.
+    """
+    expected = one_letter_aa(expected_aa)
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in locations or []:
+        if not isinstance(row, dict):
+            continue
+        amino_acids = row.get("aminoAcids")
+        key = (row.get("chromosome"), row.get("geneStart"), row.get("geneEnd"), amino_acids)
+        entry = grouped.get(key)
+        if entry is None:
+            observed = one_letter_aa(amino_acids)
+            entry = {
+                "chromosome": row.get("chromosome"),
+                "gene_start": row.get("geneStart"),
+                "gene_end": row.get("geneEnd"),
+                "strand": "reverse" if row.get("reverseStrand") else "forward",
+                "assembly": row.get("assemblyName"),
+                "protein_start": row.get("proteinStart"),
+                "protein_end": row.get("proteinEnd"),
+                "amino_acids": amino_acids,
+                "amino_acid": observed,
+                "expected_aa": expected,
+                "agrees": None if expected is None else observed == expected,
+                "genes": [],
+                "transcripts": [],
+            }
+            if expected is not None and observed != expected:
+                position = row.get("proteinStart") or row.get("proteinEnd")
+                entry["conflicting_features"] = flatten_features(
+                    row.get("features"),
+                    feature_types=["sequence conflict", "VAR_SEQ"],
+                    residue_range=(position, row.get("proteinEnd") or position)
+                    if position
+                    else None,
+                )
+            grouped[key] = entry
+        for source, target in (("ensemblTranscriptId", "transcripts"), ("ensemblGeneId", "genes")):
+            value = row.get(source)
+            if value and value not in entry[target]:
+                entry[target].append(value)
+    return list(grouped.values())
+
+
+def _disagreement_evidence(entry: dict[str, Any], position: int) -> dict[str, Any]:
+    """What to show when the mapped residue is not the one the caller expected.
+
+    Length and isoform count first, because the commonest cause is a position numbered
+    against a different isoform, then any curated conflict over that exact residue.
+    """
+    return {
+        "sequence_length": ((entry or {}).get("sequence") or {}).get("length"),
+        "isoform_count": len(_isoforms(entry)) or 1,
+        "features": flatten_features(
+            (entry or {}).get("features"),
+            feature_types=["sequence conflict", "VAR_SEQ"],
+            residue_range=(position, position),
+        ),
+    }

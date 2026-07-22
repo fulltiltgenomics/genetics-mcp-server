@@ -206,11 +206,38 @@ class TestMCPDisabledTools:
         Guards against accidental removal of the search_mgi entry from
         mcp_server.py:82 since search_mgi calls require chat-backend wiring
         (MouseMine + result truncation) not present in plain MCP clients.
+
+        The UniProt tools (get_protein_annotations, map_protein_variants,
+        search_uniprot) are chat-backend only by explicit requirement: they
+        must stay defined for the chat backend but never reach standalone
+        MCP clients.
         """
         from genetics_mcp_server import mcp_server
 
         assert "search_mgi" in mcp_server._mcp_disabled
         assert "get_myvariant_annotations" in mcp_server._mcp_disabled
+
+        names = {t["name"] for t in TOOL_DEFINITIONS}
+        for tool_name in ("get_protein_annotations", "map_protein_variants", "search_uniprot"):
+            assert tool_name in names, f"Expected tool '{tool_name}' not found in TOOL_DEFINITIONS"
+            assert tool_name in mcp_server._mcp_disabled, (
+                f"'{tool_name}' is chat-backend only and must stay in _mcp_disabled"
+            )
+
+    def test_uniprot_tools_excluded_from_mcp_when_disabled(self):
+        # mirror pattern for the chat-backend-only UniProt tools
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        uniprot_tools = {"get_protein_annotations", "map_protein_variants", "search_uniprot"}
+
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools=uniprot_tools)
+
+        registered = self._registered_names(mcp)
+        assert not (uniprot_tools & registered)
 
 
 @pytest.mark.integration

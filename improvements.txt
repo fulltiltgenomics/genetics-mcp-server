@@ -1,0 +1,61 @@
+## <short title>
+- type: bug | question | feature | idea
+- observation: what you saw (ideally a session id / report section / example)
+- desired: what you'd want instead, or the question
+- priority: must / should / nice  (optional)
+
+## 0accb524-e9b5-42a1-a45a-31ba9d39e048
+- type: agent
+- observation: the user has a specific result for which she wants to check the sample size for. but the tool only gets info on a dataset it has access to without checking if that result is from that dataset. also, analysis says "The assistant fabricated a specific sample size (3,561) and detailed dataset metadata that appears invented" but that's not true, the numbers are real
+- desired: the agent should check from which dataset the exact result the user is referring to is from, if any. also, the analyst shouldn't claim that the numbers appear invented when they're not
+
+## 5a7e6bca-8858-441b-b71b-6a1310fc4c51
+- type: analysis
+- observation: the chat says connection was interrupted and this is flagged as an unsuccessful conversation
+- desired: this should not count as an unsuccessful conversation in a sense. it should be in a "technical failures" category. in the regular unsuccessful conversations category we want to include only cases where the agent failed to provide a good answer given that no technical problems occurred. still, this should get a low score because of the technical failure
+
+## 0c743b30-0508-43b9-8de6-1bd3451c6759
+- type: analysis
+- observation: the chat looks fine to me, just the user just asked for something we didn't have access to and didn't continue the conversation
+- desired: this should not count as an unsuccessful conversation or get a low rating. let's have a new category "unfinished conversations" for these kinds of cases where clearly the user just stopped
+
+## b1111dc2-234a-4372-a7fb-2f5fd7497aa5
+- type: analysis
+- observation: categorized as unsuccessful
+- desired: this should be in "technical failures" category because of "The backend appears to be returning empty errors right now". could also be in "unfinished conversations" but really the reason the user didn't continue is technical failure. still should get a low score
+
+## f188d3a6-d799-40c8-8472-dfe53e54ebae
+- type: analysis
+- observation: categorized as unsuccessful
+- desired: this should be in "technical failures" category looking at the end of the conversation. still should get a low score
+
+## f443736b-40b8-4ee4-89bd-5377d0baf87e
+- type: analysis
+- observation: categorized as unsuccessful. the chat outcome looks fine to me, the user just asks odd questions. categorized as "data_source_question"
+- desired: this should not count as an unsuccessful conversation or get a low score. also let's have a new "out of scope" category where these kinds of conversations should go
+
+## 57112573-0fec-4554-8210-8b6edfd8bdf9
+- type: analysis/agent
+- observation: the user asks about data that the agent doesn't have access to. categorized unsuccessful
+- desired: in this case, the agent should tell up front that 1) the agent doesn't have access to details of stratified counts 2) for detailed endpoint/phenotype counts the user can go to risteys and 3) the agent is unable to do that as the data in risteys are loaded dynamically. the conversation should be categorized as "out of scope" and should not get a low score
+
+## 4cb6439a-3f6e-46a0-ac2c-85b3b395f4c5
+- type: analysis
+- observation: categorized as unsuccessful. also the analysis says "The variant count appears fabricated/unreliable: the assistant cites ‘21,331,644 imputed variants’ and oddly precise statistics with a ‘December 2025 data statistics update’ that is suspicious and likely hallucinated" but the data are real!
+- desired: the conversation is fine, just the second question is something the agent cannot know but gives excellent pointers. should be "out of scope" and should not get a low score. the analysis shouldn't claim the data are fabricated
+
+## ef4f8fe8-6f1a-4f51-9f7c-bd7946f4f7e4
+- type: analysis
+- observation: categorized as unsuccessful. also analysis claims "Cannot verify the specific figures returned; several values appear suspicious or fabricated (e.g., future dates like 2025-12-15 for scRNA-seq/scATAC datasets, oddly precise participant/control counts)" - that's not a future date and the figures are good
+- desired: the conversation is fine, I'm not sure what the user even asks. If you agree, this should be "out of scope", otherwise the answer is fine and should not get a low score. the analysis shouldn't claim a "future date" or that figures seem off because they are real
+
+## 0122366c-751e-42ee-99b6-4b550e7e0039
+- type: analysis
+- observation: categorized as unsuccessful
+- desired: the user asks a weird question or forgets to include attachments. Should be in a new category "weird questions" and not get a low score
+
+## 44bf749b-e474-42b8-8244-3166041363e3
+- type: agent/api/bigquery
+- observation: the agent says results are truncated, then tries to bigquery without realizing annotations are not there, then says has all 579 variants already but those might be truncated
+- desired: file a beads issue in ../*db that we should add variant annotations into bigquery. file a beads issue in ../*api that we should add a filter so we can query only coding variants (list of coding variant categories should be somewhere). help instruct the agent precisely on what is and is not in bigquery so it doesn't go there for data that's not there
+

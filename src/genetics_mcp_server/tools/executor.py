@@ -22,6 +22,7 @@ from genetics_mcp_server.tools.phewas_categories import (
     categorize_phenotype,
     get_category_color,
 )
+from genetics_mcp_server.tools.uniprot import UniProtClient
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,11 @@ class ToolExecutor:
         # internal API secret is never leaked to external services (e.g. MouseMine,
         # myvariant.info). Per-call auth (Perplexity, Tavily) is passed explicitly.
         self.external_client = _ResilientAsyncClient(timeout=30.0)
+        # shares external_client so UniProt/EBI outages arrive as the synthetic 503
+        # rather than raising, and so no internal auth header is ever sent to them
+        from genetics_mcp_server.config.settings import get_settings
+
+        self.uniprot = UniProtClient(self.external_client, get_settings())
         # lazily-fetched universe of expression resources (e.g. gtex, hpa), used to
         # tell "gene absent from this resource" apart from "resource unavailable"
         self._expression_resources: list[str] | None = None
@@ -3376,3 +3382,108 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"myvariant.info error: {e}", exc_info=True)
             return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # -------------------------------------------------------------------------
+    # UniProt / EBI Proteins
+    # -------------------------------------------------------------------------
+
+    # the logic lives in tools/uniprot.py; these exist because llm_service dispatches
+    # tools with getattr(self.executor, tool_name). Each returns the client's result
+    # unchanged apart from an optional download hint, so the resolution block it
+    # carries — which protein was actually resolved — always reaches the agent.
+
+    # a search wider than this is a table, not an answer: the rows go to a TSV link
+    # instead of into the context
+    _UNIPROT_DOWNLOAD_THRESHOLD = 25
+
+    @staticmethod
+    def _uniprot_download_hint(
+        result: dict[str, Any], filename: str, min_rows: int = 1
+    ) -> dict[str, Any]:
+        """Attach a _download_data hint for the row list in a UniProt tool result."""
+        if not isinstance(result, dict) or not result.get("success"):
+            return result
+        rows = result.get("results")
+        if (
+            isinstance(rows, list)
+            and len(rows) >= min_rows
+            and all(isinstance(r, dict) for r in rows)
+        ):
+            result["_download_data"] = {"results": rows, "filename": filename}
+        return result
+
+    async def get_protein_annotations(
+        self,
+        query: str | list[str],
+        organism_id: int = 9606,
+        include: list[str] | None = None,
+        feature_types: list[str] | None = None,
+        residue_range: str | None = None,
+    ) -> dict[str, Any]:
+        """Get UniProt annotations for a gene symbol, an accession, or a batch of them."""
+        try:
+            result = await self.uniprot.get_protein_annotations(
+                query,
+                organism_id=organism_id,
+                include=include,
+                feature_types=feature_types,
+                residue_range=residue_range,
+            )
+        except Exception as e:
+            logger.error(
+                f"Error in get_protein_annotations({query!r}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+        # a batch of accessions is a table (the 167-gene zymogen case); one protein is not
+        if isinstance(query, list):
+            return self._uniprot_download_hint(result, "protein_annotations.tsv")
+        return result
+
+    async def map_protein_variants(
+        self,
+        variants: list[str],
+        query: str,
+        organism_id: int = 9606,
+    ) -> dict[str, Any]:
+        """Map protein-level variants (e.g. P70A) to genomic coordinates."""
+        try:
+            return await self.uniprot.map_protein_variants(
+                variants, query, organism_id=organism_id
+            )
+        except Exception as e:
+            logger.error(
+                f"Error in map_protein_variants({query!r}, {variants!r}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def search_uniprot(
+        self,
+        query: str | None = None,
+        keyword: str | None = None,
+        organism_id: int = 9606,
+        reviewed_only: bool = True,
+        fields: list[str] | None = None,
+        size: int = 25,
+        count_only: bool = False,
+    ) -> dict[str, Any]:
+        """Search UniProtKB by free text or keyword, or count the matches."""
+        try:
+            result = await self.uniprot.search_uniprot(
+                query=query,
+                keyword=keyword,
+                organism_id=organism_id,
+                reviewed_only=reviewed_only,
+                fields=fields,
+                size=size,
+                count_only=count_only,
+            )
+        except Exception as e:
+            logger.error(
+                f"Error in search_uniprot({query!r}, keyword={keyword!r}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+        return self._uniprot_download_hint(
+            result, "uniprot_search.tsv", min_rows=self._UNIPROT_DOWNLOAD_THRESHOLD
+        )

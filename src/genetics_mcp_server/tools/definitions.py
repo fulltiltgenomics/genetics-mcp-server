@@ -715,6 +715,135 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_protein_annotations",
+        "category": "general",
+        "description": """Get curated protein annotations from UniProt: residue-level features (active sites, binding sites, domains, disulfide bonds, signal peptides, PTMs), function and subcellular location comments, cross-references, and optionally the amino-acid sequence.
+
+ALWAYS prefer a gene symbol over an accession. Do NOT pass an accession you remember — remembered accessions are frequently wrong and will silently annotate the wrong protein. Pass query='PRSS55', not query='Q7Z5A4'. Only pass an accession the user supplied or that a previous tool result returned.
+
+Every result carries a resolution block naming the protein that was actually annotated (accession, entry name, protein name, gene names, organism, reviewed status, whether the match was ambiguous). Read it before citing anything: if it names a protein other than the one you meant, the annotations are not about your protein.
+
+Examples:
+- Catalytic triad of a serine protease: get_protein_annotations(query='PRSS55', feature_types=['ACT_SITE', 'BINDING'])
+- Domain layout of a huge protein: get_protein_annotations(query='TTN', include=['features'], feature_types=['DOMAIN'])
+- Function plus sequence: get_protein_annotations(query='TPO', include=['function', 'sequence'])
+- Just the features in one region: get_protein_annotations(query='TTN', feature_types=['DOMAIN'], residue_range='1-2000')
+
+Do NOT use this tool for protein-position → genomic-coordinate mapping — use map_protein_variants. Do NOT use it to find which proteins share a property — use search_uniprot.""",
+        "parameters": {
+            "query": {
+                "type": "string",
+                "description": "Gene symbol (strongly preferred, e.g. 'TPO', 'PRSS55'), UniProt entry name, or accession. Never supply an accession recalled from memory when a gene symbol is available.",
+                "required": True,
+            },
+            "organism_id": {
+                "type": "integer",
+                "description": "NCBI taxon ID to restrict symbol resolution to (default 9606, human). Use 10090 for mouse. Pass null to search all organisms.",
+                "default": 9606,
+            },
+            "include": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Annotation sections to return (default ['features', 'function']). 'sequence' returns the full amino-acid sequence and can be very large for proteins like TTN.",
+                "enum": ["features", "function", "sequence", "xrefs"],
+                "default": ["features", "function"],
+            },
+            "feature_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "UniProt feature-type keys to keep, e.g. ['ACT_SITE', 'BINDING', 'DOMAIN', 'DISULFID', 'SIGNAL', 'MOD_RES', 'VARIANT']. Omit for all feature types. Essential for large proteins.",
+            },
+            "residue_range": {
+                "type": "string",
+                "description": "Restrict features to a residue window of the canonical sequence, as 'start-end' in 1-based protein coordinates (e.g. '1-2000').",
+            },
+        },
+    },
+    {
+        "name": "map_protein_variants",
+        "category": "general",
+        "description": """Map protein-level variants (amino-acid substitutions such as 'P70A') onto genomic coordinates, using UniProt's curated genomic coordinate mapping. Returns, per variant, the genome position, reference and alternate alleles, the codon, the transcript/exon context, and any matching curated UniProt VARIANT annotation (including disease association and dbSNP rsID when UniProt records one).
+
+This is the tool for "what is the rs ID / genomic position of this amino-acid change?". Do NOT guess candidate genomic coordinates and test them one at a time — that approach has failed here before. Do NOT use get_variant_annotations or get_myvariant_annotations first: they take genomic coordinates, which is exactly what this tool produces. Feed the coordinates or rsIDs it returns into those tools afterwards for allele frequencies and clinical significance.
+
+Canonical example — four thyroid peroxidase substitutions in one call:
+  map_protein_variants(variants=['P70A', 'G393A', 'R438H', 'W873C'], query='TPO')
+
+Pass the gene symbol, not an accession you remember. A wrong accession maps every variant against the wrong sequence and produces confidently wrong coordinates. Accepted variant notations: 'P70A', 'Pro70Ala', 'p.Pro70Ala'. The position is a 1-based residue index into the canonical UniProt sequence.
+
+Every result carries a resolution block naming the protein the variants were mapped against, plus a per-variant check that the reference amino acid matches that sequence. A reference mismatch means the variant is not on this isoform (or not on this protein) — do not report its coordinates as if it were.""",
+        "parameters": {
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Amino-acid substitutions, e.g. ['P70A', 'G393A', 'R438H', 'W873C']. One-letter ('P70A'), three-letter ('Pro70Ala') and HGVS protein ('p.Pro70Ala') notation all accepted. Batch them in a single call rather than one call per variant.",
+                "required": True,
+            },
+            "query": {
+                "type": "string",
+                "description": "Gene symbol of the protein the variants belong to (strongly preferred, e.g. 'TPO'), or a UniProt accession the user supplied. Never an accession recalled from memory.",
+                "required": True,
+            },
+            "organism_id": {
+                "type": "integer",
+                "description": "NCBI taxon ID for symbol resolution (default 9606, human). Genomic coordinate mapping is only available for organisms UniProt maps to a reference genome.",
+                "default": 9606,
+            },
+        },
+    },
+    {
+        "name": "search_uniprot",
+        "category": "general",
+        "description": """Search UniProtKB with its native query syntax to find the set of proteins matching a property — a keyword, a family, a subcellular location, a function. Returns one summary row per entry (accession, entry name, protein name, gene names, organism, reviewed status) plus whatever extra fields you request.
+
+Use this when the question is "which proteins ...?" rather than "what about this protein?" (that is get_protein_annotations).
+
+Examples:
+- Count reviewed human proteins with a keyword: search_uniprot(keyword='KW-0865', count_only=True)
+- Enumerate them with lengths: search_uniprot(keyword='KW-0865', fields='accession,id,gene_names,length', size=100)
+- Free-text plus a structured clause: search_uniprot(query='thyroid peroxidase AND family:peroxidase')
+- Non-human: search_uniprot(query='gene:Tpo', organism_id=10090)
+
+`query` is passed to UniProt as-is, so field clauses (gene:, family:, cc_scl_term:, ec:, length:[100 TO 200]) and boolean operators work. organism_id and reviewed_only are added as separate clauses — do not also write them into `query`.
+
+Do NOT use this to look up a protein you can already name; resolving a gene symbol is what get_protein_annotations and map_protein_variants do for you. Never cite a UniProt accession from memory — if you need one, get it from this tool's output.""",
+        "parameters": {
+            "query": {
+                "type": "string",
+                "description": "UniProtKB query string, free text or native field syntax (e.g. 'family:peroxidase', 'cc_scl_term:SL-0173 AND length:[500 TO *]'). Provide query or keyword or both.",
+            },
+            "keyword": {
+                "type": "string",
+                "description": "UniProt keyword ID (e.g. 'KW-0865') or keyword name, added as a keyword: clause. Provide query or keyword or both.",
+            },
+            "organism_id": {
+                "type": "integer",
+                "description": "NCBI taxon ID restricting the search (default 9606, human). Pass null to search all organisms.",
+                "default": 9606,
+            },
+            "reviewed_only": {
+                "type": "boolean",
+                "description": "Restrict to reviewed Swiss-Prot entries (default true). Set false to include unreviewed TrEMBL entries, which are far more numerous and not manually curated.",
+                "default": True,
+            },
+            "fields": {
+                "type": "string",
+                "description": "Comma-separated UniProt return fields (default 'accession,id,protein_name,gene_names,organism_name'). Add e.g. 'length,cc_function,ft_act_site' for more per-entry detail.",
+                "default": "accession,id,protein_name,gene_names,organism_name",
+            },
+            "size": {
+                "type": "integer",
+                "description": "Maximum entries to return (default 25, max 500). Use count_only first when the set may be large.",
+                "default": 25,
+            },
+            "count_only": {
+                "type": "boolean",
+                "description": "Return only the total number of matching entries, no rows. Cheap way to size a query before enumerating it.",
+                "default": False,
+            },
+        },
+    },
+    {
         "name": "create_phewas_plot",
         "category": "general",
         "description": "Create a PheWAS (Phenome-Wide Association Study) plot showing all phenotype associations for a variant. Returns a base64-encoded PNG image with phenotypes grouped by category on the X-axis and -log10(p-value) on the Y-axis.",
@@ -1496,6 +1625,49 @@ def register_mcp_tools(
             """Search Jackson Lab MGI for curated mouse phenotypes, alleles, and orthologs."""
             return await executor.search_mgi(
                 query, query_type, species, max_results
+            )
+
+    if "get_protein_annotations" not in _disabled:
+
+        @mcp.tool()
+        async def get_protein_annotations(
+            query: str,
+            organism_id: int | None = 9606,
+            include: list[str] | None = None,
+            feature_types: list[str] | None = None,
+            residue_range: str | None = None,
+        ) -> dict:
+            """Get UniProt protein annotations (residue features, function, sequence). Pass a gene symbol, not a remembered accession."""
+            return await executor.get_protein_annotations(
+                query, organism_id, include, feature_types, residue_range
+            )
+
+    if "map_protein_variants" not in _disabled:
+
+        @mcp.tool()
+        async def map_protein_variants(
+            variants: list[str],
+            query: str,
+            organism_id: int | None = 9606,
+        ) -> dict:
+            """Map amino-acid substitutions (e.g. ['P70A','R438H'] in TPO) to genomic coordinates and rsIDs via UniProt."""
+            return await executor.map_protein_variants(variants, query, organism_id)
+
+    if "search_uniprot" not in _disabled:
+
+        @mcp.tool()
+        async def search_uniprot(
+            query: str | None = None,
+            keyword: str | None = None,
+            organism_id: int | None = 9606,
+            reviewed_only: bool = True,
+            fields: str = "accession,id,protein_name,gene_names,organism_name",
+            size: int = 25,
+            count_only: bool = False,
+        ) -> dict:
+            """Search UniProtKB for the set of proteins matching a keyword, family, location or free-text query."""
+            return await executor.search_uniprot(
+                query, keyword, organism_id, reviewed_only, fields, size, count_only
             )
 
     @mcp.tool()
