@@ -785,8 +785,8 @@ class ToolExecutor:
         result = await self.query_bigquery(sql, max_rows=500)
         if result.get("success"):
             return {
-                "success": True, "gene": gene, "results": result.get("results", []),
-                "_download_data": {"results": result.get("results", []), "filename": f"{gene}_asm_qtl.tsv"},
+                "success": True, "gene": gene, "results": result.get("rows", []),
+                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_asm_qtl.tsv"},
             }
         return result
 
