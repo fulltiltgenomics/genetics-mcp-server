@@ -252,6 +252,7 @@ class UniProtClient:
         self._ebi_url = settings.ebi_proteins_api_url.rstrip("/")
         self._cache_ttl = settings.uniprot_cache_ttl
         self._ebi_host = httpx.URL(self._ebi_url).host
+        self._uniprot_host = httpx.URL(self._uniprot_url).host
         # a redirect may only be followed to an origin this deployment already talks to.
         # Derived from the configured URLs rather than hardcoded so a self-hosted mirror
         # keeps working; with the default https configuration this refuses both
@@ -304,23 +305,29 @@ class UniProtClient:
         `path` is either a query-free path relative to the base host, with all query
         data passed via `params`, or an absolute http(s) URL used verbatim — the latter
         so a server-supplied cursor from the Link header can be replayed as-is. Both
-        `base` and an absolute `path` choose the host that is contacted and neither is
-        validated, so both must only ever receive a configured value or a URL this
-        upstream itself handed back, never a tool argument. Redirect targets, by
-        contrast, ARE validated: every hop is pinned to `self._allowed_origins`.
+        `base` and an absolute `path` choose the host that is contacted, and both are
+        pinned to `self._allowed_origins`, the same check every redirect hop passes: the
+        guarantee is structural, not a trusted-callers-only convention, so a server-
+        supplied Link cursor — the same trust class as a Location header — can never
+        reach a host the deployment does not already talk to.
 
         On failure the sentinel may carry, besides `_status`, `_location` and the
-        redirect-specific markers `_redirect_refused` (a hop that would have left the
-        configured origins, or a Location that cannot be turned into a URL) and
-        `_redirect_limit` (the hop budget ran out), so neither has to be told from an
-        ordinary redirect response by matching on the message text. `_status` is None on
-        a refusal raised before any response was returned.
+        origin markers `_origin_refused` (the initial URL was outside the configured
+        origins), `_redirect_refused` (a hop that would have left them, or a Location that
+        cannot be turned into a URL) and `_redirect_limit` (the hop budget ran out), so
+        none has to be told from an ordinary redirect response by matching on the message
+        text. `_status` is None on a refusal raised before any response was returned.
 
         A Location so malformed that httpx cannot even parse it (a bad port, say) still
         raises RemoteProtocolError, exactly as httpx's own redirect following does; that
         is a protocol error like any other and the tool methods' try/except owns it.
         """
         url = self._build_url(path, params, base)
+        # pin the URL the request STARTS at, not just the redirect hops: `base` and an
+        # absolute `path` (a replayed Link cursor) choose the host without passing through
+        # the hop loop's origin check, and must be held to the same allowed origins
+        if self._origin(url) not in self._allowed_origins:
+            return self._refused_origin(url)
         # keyed on the fully-qualified URL, which _build_url has already folded `params`
         # into: keying on the bare path would collide across field projections of the
         # same accession and serve a body missing the fields the caller asked for
@@ -349,14 +356,17 @@ class UniProtClient:
                     headers={"Accept": "application/json"},
                     follow_redirects=False,
                 )
-            except (httpx.InvalidURL, ValueError) as exc:
+            except httpx.InvalidURL as exc:
                 # httpx parses Location and builds the redirect request even when
                 # follow_redirects is False (it fills response.next_request), so a
                 # Location it cannot turn into a URL — `javascript:...`, `mailto:...` —
-                # raises out of THIS call, from the previous hop's response, never from
-                # the join below. httpx behaves identically with follow_redirects=True,
-                # so this is not a regression from hand-rolling the loop, but an
-                # InvalidURL reaching a tool method as an opaque failure is not useful.
+                # raises out of THIS call, from this call's own response before it is
+                # returned, never from the join below. httpx behaves identically with
+                # follow_redirects=True, so this is not a regression from hand-rolling the
+                # loop, but an InvalidURL reaching a tool method as an opaque failure is
+                # not useful. Only InvalidURL is caught: it derives from Exception, not
+                # ValueError, so a wider clause would only risk relabelling an unrelated
+                # transport ValueError as an unusable redirect location.
                 return self._unusable_location(url, origin, exc, redirected)
             # a blank Location is as absent as a missing one; left as-is it resolves to
             # the current path and burns the whole hop budget on a nonsense URL
@@ -371,7 +381,7 @@ class UniProtClient:
                     "_status": resp.status_code,
                     "_location": location,
                     "_redirect_limit": True,
-                }, self._meta(resp, origin, redirected=True)
+                }, self._meta(resp, origin, redirected)
             try:
                 target = url.join(location)
             except (httpx.InvalidURL, ValueError):
@@ -379,11 +389,11 @@ class UniProtClient:
                 # test double returning a hand-built httpx.Response
                 return self._refused_redirect(
                     url, resp, location, "an unparseable location"
-                ), self._meta(resp, origin, redirected=True)
+                ), self._meta(resp, origin, redirected)
             if self._origin(target) not in self._allowed_origins:
                 return self._refused_redirect(
                     url, resp, location, "an origin outside the configured UniProt and EBI APIs"
-                ), self._meta(resp, origin, redirected=True)
+                ), self._meta(resp, origin, redirected)
             # re-apply the original query, which httpx's own redirect following would
             # drop, then hand back the parameters the redirect target owns: without the
             # restore a caller-supplied `from` would clobber UniProt's own `?from=`,
@@ -720,8 +730,39 @@ class UniProtClient:
         return url.scheme, url.host, url.port
 
     def _label(self, url: httpx.URL) -> str:
-        """Which upstream an error came from, since `base` also serves the EBI host."""
-        return "EBI Proteins API" if url.host == self._ebi_host else "UniProt"
+        """Which upstream an error came from, since `base` also serves the EBI host.
+
+        UniProt is the default so a self-hosted mirror pointing both settings URLs at one
+        host does not label every message 'EBI Proteins API'; only a host that is the EBI
+        host and not also the UniProt host is named as EBI.
+        """
+        if url.host == self._ebi_host and self._ebi_host != self._uniprot_host:
+            return "EBI Proteins API"
+        return "UniProt"
+
+    def _refused_origin(self, url: httpx.URL) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Sentinel for an initial request URL outside the configured origins.
+
+        The redirect loop pins every hop; this pins the URL the request STARTS at, so
+        that neither `base`, an absolute `path`, nor a server-supplied Link cursor
+        replayed as one can reach a host the deployment does not already talk to. No
+        request is made, so there is no status or header to report.
+        """
+        label = self._label(url)
+        logger.warning(f"{label}: refused a request to an origin outside the configured APIs: {url}")
+        return {
+            "_error": (
+                f"{label} refused a request to an origin outside the configured "
+                f"UniProt and EBI APIs"
+            ),
+            "_status": None,
+            "_origin_refused": True,
+        }, {
+            "status": None,
+            "headers": {},
+            "url": str(url),
+            "redirected_from": None,
+        }
 
     def _refused_redirect(
         self, url: httpx.URL, resp: httpx.Response, location: str, reason: str
