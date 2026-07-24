@@ -401,6 +401,131 @@ class TestUniProtPureFunctions:
         uniprot.collapse_transcripts(LOCATIONS_P07202_70, expected_aa="P")
         assert json.dumps(LOCATIONS_P07202_70, sort_keys=True) == before
 
+    # -- _genomic_hgvs ---------------------------------------------------------
+
+    def test_genomic_hgvs_snv(self):
+        hgvs, norm = uniprot._genomic_hgvs("12:40340400:G:A")
+        assert hgvs == "NC_000012.12:g.40340400G>A"
+        assert norm == "12:40340400:G:A"
+
+    def test_genomic_hgvs_chr_prefix_and_lowercase_alleles(self):
+        hgvs, norm = uniprot._genomic_hgvs("chr19:55014977:t:g")
+        assert hgvs == "NC_000019.10:g.55014977T>G"
+        assert norm == "19:55014977:T:G"
+
+    def test_genomic_hgvs_mitochondrial_alias(self):
+        hgvs, _ = uniprot._genomic_hgvs("M:100:A:G")
+        assert hgvs.startswith("NC_012920.1:g.100")
+
+    def test_genomic_hgvs_rejects_indel(self):
+        with pytest.raises(ValueError, match="not an SNV"):
+            uniprot._genomic_hgvs("16:20349765:T:TTCTGCCAGA")
+
+    def test_genomic_hgvs_rejects_unknown_chromosome(self):
+        with pytest.raises(ValueError, match="unknown GRCh38 chromosome"):
+            uniprot._genomic_hgvs("99:1:A:G")
+
+    def test_genomic_hgvs_rejects_garbage(self):
+        with pytest.raises(ValueError, match="cannot parse genomic variant"):
+            uniprot._genomic_hgvs("rs34637584")
+
+    # -- variation payload flattening ------------------------------------------
+
+    _VARIATION_ENTRY = {
+        "accession": "Q5S007",
+        "entryName": "LRRK2_HUMAN",
+        "geneName": "LRRK2",
+        "proteinName": "Leucine-rich repeat serine/threonine-protein kinase 2",
+        "proteinExistence": "Evidence at protein level",
+        "features": [
+            {
+                "type": "VARIANT",
+                "begin": "2019",
+                "end": "2019",
+                "wildType": "G",
+                "mutatedType": "S",
+                "consequenceType": "missense",
+                "ftId": "VAR_024958",
+                "clinicalSignificances": [{"type": "Pathogenic", "sources": ["ClinVar"]}],
+                "association": [{"name": "Autosomal dominant Parkinson disease 8"}],
+                "populationFrequencies": [
+                    {"populationName": "AF", "frequency": 0.0004, "source": "gnomAD"}
+                ],
+                "locations": [{"loc": "p.Gly2019Ser", "seqId": "Q5S007", "source": "UniProt"}],
+                "xrefs": [{"name": "dbSNP", "id": "rs34637584"}],
+            }
+        ],
+    }
+    _VARIATION_TREMBL = {
+        "accession": "A0ACI8UJW1",
+        "entryName": "A0ACI8UJW1_HUMAN",
+        "proteinExistence": "Predicted",
+        "features": [],
+    }
+
+    def test_variation_entry_predicted_by_protein_existence(self):
+        assert uniprot._variation_entry_is_predicted(self._VARIATION_TREMBL) is True
+
+    def test_variation_entry_predicted_by_mnemonic_matching_accession(self):
+        # no proteinExistence, but entryName == accession + _HUMAN marks TrEMBL
+        entry = {"accession": "A0ACI8RH96", "entryName": "A0ACI8RH96_HUMAN"}
+        assert uniprot._variation_entry_is_predicted(entry) is True
+
+    def test_variation_entry_reviewed_swissprot(self):
+        assert uniprot._variation_entry_is_predicted(self._VARIATION_ENTRY) is False
+
+    def test_variation_entry_isoform_stays_reviewed(self):
+        entry = {"accession": "Q9HCN6-2", "entryName": "GPVI_HUMAN"}
+        assert uniprot._variation_entry_is_predicted(entry) is False
+
+    def test_flatten_variation_entry_extracts_effect(self):
+        rows = uniprot._flatten_variation_entry(self._VARIATION_ENTRY)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["gene"] == "LRRK2"
+        assert row["protein_change"] == "p.Gly2019Ser"
+        assert row["consequence"] == "missense"
+        assert row["wild_type_aa"] == "G" and row["variant_aa"] == "S"
+        assert row["clinical_significance"] == ["Pathogenic"]
+        assert row["diseases"] == ["Autosomal dominant Parkinson disease 8"]
+        assert row["xrefs"]["dbSNP"] == "rs34637584"
+        assert row["reviewed"] is True and row["canonical"] is True
+
+    def test_flatten_variation_entry_stop_gained_overrides_consequence(self):
+        entry = {
+            "accession": "Q10981",
+            "entryName": "FUT2_HUMAN",
+            "features": [
+                {
+                    "type": "VARIANT",
+                    "begin": "154",
+                    "wildType": "W",
+                    "mutatedType": "*",
+                    "consequenceType": "missense",
+                    "locations": [{"loc": "p.Trp154Ter"}],
+                }
+            ],
+        }
+        assert uniprot._flatten_variation_entry(entry)[0]["consequence"] == "stop_gained"
+
+    def test_flatten_features_natural_variant_carries_change(self):
+        feature = {
+            "type": "Natural variant",
+            "location": {"start": {"value": 2019}, "end": {"value": 2019}},
+            "description": "in PARK8; dbSNP:rs34637584",
+            "featureId": "VAR_024958",
+            "alternativeSequence": {"originalSequence": "G", "alternativeSequences": ["S"]},
+            "featureCrossReferences": [{"database": "dbSNP", "id": "rs34637584"}],
+        }
+        row = uniprot.flatten_features([feature], feature_types="variant")[0]
+        assert row["original_aa"] == "G" and row["variant_aa"] == "S"
+        assert row["dbsnp"] == "rs34637584"
+        assert row["feature_id"] == "VAR_024958"
+
+    def test_flatten_features_variant_alias_projects_field(self):
+        # the tool-facing type 'variant' must reach the UniProt ft_variant projection
+        assert "ft_variant" in uniprot._feature_fields(["variant"])
+
     # -- _TTLCache -------------------------------------------------------------
 
     def test_cache_hit_before_expiry(self):
@@ -733,3 +858,103 @@ class TestUniProtToolMethods:
             result = await self.executor.search_uniprot(query="family:(")
 
         _assert_failed(result, status=400)
+
+    async def test_variant_protein_effect_maps_snv_reviewed_only(self):
+        variation_body = [
+            {
+                "accession": "A0ACI8UJW1",
+                "entryName": "A0ACI8UJW1_HUMAN",
+                "proteinExistence": "Predicted",
+                "features": [{"type": "VARIANT", "begin": "2019", "wildType": "G",
+                              "mutatedType": "S", "locations": [{"loc": "p.Gly2019Ser"}]}],
+            },
+            {
+                "accession": "Q5S007",
+                "entryName": "LRRK2_HUMAN",
+                "geneName": "LRRK2",
+                "proteinExistence": "Evidence at protein level",
+                "features": [{
+                    "type": "VARIANT", "begin": "2019", "wildType": "G", "mutatedType": "S",
+                    "consequenceType": "missense", "ftId": "VAR_024958",
+                    "clinicalSignificances": [{"type": "Pathogenic"}],
+                    "association": [{"name": "Autosomal dominant Parkinson disease 8"}],
+                    "locations": [{"loc": "p.Gly2019Ser"}],
+                    "xrefs": [{"name": "dbSNP", "id": "rs34637584"}],
+                }],
+            },
+        ]
+
+        def resolver(url):
+            if "/variation/hgvs/" in url:
+                return _resp(variation_body)
+            return None
+
+        patcher, calls = self._patch_get(resolver)
+        with patcher:
+            result = await self.executor.get_variant_protein_effect(["12:40340400:G:A"])
+
+        assert result["success"] is True and result["assembly"] == "GRCh38"
+        # the request carries the GRCh38 RefSeq HGVS (URL-encoded '>')
+        assert any("NC_000012.12" in c for c in calls)
+        effects = result["results"][0]["effects"]
+        # the TrEMBL Predicted entry is dropped; only the reviewed one is reported
+        assert [e["accession"] for e in effects] == ["Q5S007"]
+        row = effects[0]
+        assert row["protein_change"] == "p.Gly2019Ser"
+        assert row["clinical_significance"] == ["Pathogenic"]
+        assert row["xrefs"]["dbSNP"] == "rs34637584"
+
+    async def test_variant_protein_effect_noncoding_returns_note(self):
+        def resolver(url):
+            if "/variation/hgvs/" in url:
+                return _resp([])  # endpoint answers a non-coding SNV with an empty list
+            return None
+
+        patcher, _calls = self._patch_get(resolver)
+        with patcher:
+            result = await self.executor.get_variant_protein_effect(["3:56815721:T:C"])
+
+        row = result["results"][0]
+        assert "effects" not in row
+        assert "no curated protein consequence" in row["note"]
+
+    async def test_variant_protein_effect_indel_notes_without_request(self):
+        def resolver(url):
+            raise AssertionError(f"a non-SNV must not hit the network: {url}")
+
+        patcher, calls = self._patch_get(resolver)
+        with patcher:
+            result = await self.executor.get_variant_protein_effect(["16:20349765:T:TTCTGCCAGA"])
+
+        assert calls == []
+        assert "not an SNV" in result["results"][0]["note"]
+
+    async def test_map_protein_variants_attaches_curated_variant(self):
+        entry_with_variant = {
+            **ENTRY_P07202,
+            "features": [{
+                "type": "Natural variant",
+                "location": {"start": {"value": 70}, "end": {"value": 70}},
+                "description": "in a disease; dbSNP:rs777",
+                "featureId": "VAR_000070",
+                "alternativeSequence": {"originalSequence": "P", "alternativeSequences": ["A"]},
+                "featureCrossReferences": [{"database": "dbSNP", "id": "rs777"}],
+            }],
+        }
+
+        def resolver(url):
+            if "ebi.ac.uk" in url:
+                return _resp({"locations": LOCATIONS_P07202_70})
+            if "P07202" in url:
+                return _resp(entry_with_variant)
+            return None
+
+        patcher, calls = self._patch_get(resolver)
+        with patcher:
+            result = await self.executor.map_protein_variants(variants=["P70A"], query="P07202")
+
+        # the entry fetch must request ft_variant, else there is nothing to attach
+        assert any("ft_variant" in c for c in calls)
+        curated = result["variants"][0]["curated_variants"]
+        assert curated[0]["dbsnp"] == "rs777"
+        assert curated[0]["original_aa"] == "P" and curated[0]["variant_aa"] == "A"

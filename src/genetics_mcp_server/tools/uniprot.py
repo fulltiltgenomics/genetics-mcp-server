@@ -41,6 +41,26 @@ _WILDCARD_RE = re.compile(r"[*?]")
 _RESOLVE_FIELDS = "accession,id,protein_name,gene_names,organism_name"
 _MAX_ALTERNATIVES = 5
 
+# GRCh38 RefSeq accessions per chromosome — the versioned NC_ identifiers the EBI
+# variation/hgvs endpoint keys genomic HGVS on. Build-specific (the version suffix is
+# GRCh38.p14) and pinned here so a chr:pos:ref:alt is only ever mapped against GRCh38;
+# a bare '12' has no assembly and guessing one would silently answer for the wrong build.
+_GRCH38_REFSEQ: dict[str, str] = {
+    "1": "NC_000001.11", "2": "NC_000002.12", "3": "NC_000003.12", "4": "NC_000004.12",
+    "5": "NC_000005.10", "6": "NC_000006.12", "7": "NC_000007.14", "8": "NC_000008.11",
+    "9": "NC_000009.12", "10": "NC_000010.11", "11": "NC_000011.10", "12": "NC_000012.12",
+    "13": "NC_000013.11", "14": "NC_000014.9", "15": "NC_000015.10", "16": "NC_000016.10",
+    "17": "NC_000017.11", "18": "NC_000018.10", "19": "NC_000019.10", "20": "NC_000020.11",
+    "21": "NC_000021.9", "22": "NC_000022.11", "X": "NC_000023.11", "Y": "NC_000024.10",
+    "MT": "NC_012920.1",
+}
+# chr:pos:ref:alt, the variant id every other tool here already speaks. A leading 'chr'
+# and 'M'/'MT'/'23'/'24' aliases are normalised in _genomic_hgvs, not matched here.
+_GENOMIC_VARIANT_RE = re.compile(
+    r"^(?P<chr>[0-9A-Za-z]+):(?P<pos>\d+):(?P<ref>[ACGTN]+):(?P<alt>[ACGTN]+)$",
+    re.IGNORECASE,
+)
+
 
 def _is_error(data: Any) -> bool:
     """True when `data` is the sentinel returned by UniProtClient._get on failure.
@@ -982,9 +1002,13 @@ class UniProtClient:
 
         entry = await self._get(
             f"/uniprotkb/{accession}",
-            params={"fields": f"accession,sequence,cc_alternative_products,{_CONFLICT_FIELDS}"},
+            params={
+                "fields": f"accession,sequence,cc_alternative_products,"
+                f"{_CONFLICT_FIELDS},ft_variant"
+            },
         )
         entry = {} if _is_error(entry) else entry
+        curated = flatten_features(entry.get("features"), feature_types="variant")
 
         mapped: list[dict[str, Any]] = []
         for raw in _as_list(variants):
@@ -1013,6 +1037,9 @@ class UniProtClient:
             )
             if variant["agrees"] is False:
                 variant["disagreement_evidence"] = _disagreement_evidence(entry, position)
+            matches = [c for c in curated if c.get("start") == position]
+            if matches:
+                variant["curated_variants"] = matches
             mapped.append(variant)
 
         return {
@@ -1021,6 +1048,59 @@ class UniProtClient:
             "accession": accession,
             "variants": mapped,
         }
+
+    async def get_variant_protein_effect(
+        self, variants: list[str] | str
+    ) -> dict[str, Any]:
+        """Map genomic coding SNVs onto their curated UniProt protein consequence.
+
+        The direction map_protein_variants does not cover: a genomic `chr:pos:ref:alt`
+        (or the coordinate an rsID lookup already produced) in, the amino-acid change and
+        UniProt/ClinVar variant annotation out. Each SNV becomes a GRCh38 RefSeq genomic
+        HGVS and is looked up through the EBI Proteins variation/hgvs endpoint, so the
+        residue change, disease association, clinical significance and population
+        frequency are curated values, not inferred from the reference sequence.
+
+        Only the reviewed (Swiss-Prot) protein and its isoforms are reported; the TrEMBL
+        predicted entries the endpoint also returns are dropped. A variant with no coding
+        consequence (intronic, intergenic, or simply unannotated) comes back with an
+        explicit note rather than an empty result that reads as a failed call, and a
+        non-SNV allele is reported as unsupported rather than silently mapped to nothing.
+        """
+        results: list[dict[str, Any]] = []
+        for raw in _as_list(variants):
+            row: dict[str, Any] = {"variant": raw}
+            try:
+                hgvs, normalised = _genomic_hgvs(raw)
+            except ValueError as exc:
+                row["note"] = str(exc)
+                results.append(row)
+                continue
+            row["normalized"] = normalised
+            row["genomic_hgvs"] = hgvs
+            body = await self._get(f"{self._ebi_url}/variation/hgvs/{hgvs}")
+            if _is_error(body):
+                row["_error"] = body["_error"]
+                row["_status"] = body.get("_status")
+                results.append(row)
+                continue
+            entries = body if isinstance(body, list) else []
+            effects = [
+                effect
+                for entry in entries
+                if isinstance(entry, dict) and not _variation_entry_is_predicted(entry)
+                for effect in _flatten_variation_entry(entry)
+            ]
+            effects.sort(key=lambda e: (not e.get("canonical"), str(e.get("accession") or "")))
+            if effects:
+                row["effects"] = effects
+            else:
+                row["note"] = (
+                    "no curated protein consequence for this variant in UniProt "
+                    "(non-coding, or not annotated on a reviewed entry)"
+                )
+            results.append(row)
+        return {"success": True, "assembly": "GRCh38", "results": results}
 
     async def search_uniprot(
         self,
@@ -1221,6 +1301,7 @@ _FEATURE_FIELDS: dict[str, str] = {
     "topological domain": "ft_topo_dom",
     "sequence conflict": "ft_conflict",
     "alternative sequence": "ft_var_seq",
+    "natural variant": "ft_variant",
 }
 # the same type under the names the two APIs and the flag files use: UniProtKB JSON says
 # "Modified residue", the EBI payloads say "modified residue", and the flag-file codes
@@ -1235,6 +1316,8 @@ _FEATURE_ALIASES: dict[str, str] = {
     "var seq": "alternative sequence",
     "varseq": "alternative sequence",
     "splice variant": "alternative sequence",
+    "variant": "natural variant",
+    "variants": "natural variant",
 }
 _AA3_TO_1: dict[str, str] = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -1436,16 +1519,173 @@ def flatten_features(
         if not description and feature.get("original"):
             variation = ", ".join(str(item) for item in _as_list(feature.get("variation")))
             description = f"{feature['original']} -> {variation}" if variation else None
+        row = {
+            "type": kind,
+            "start": start,
+            "end": end,
+            "description": description or None,
+            "evidence": _evidence(feature),
+        }
+        if _normalize_feature_type(kind) == "natural variant":
+            row.update(_variant_change(feature))
+        rows.append(row)
+    return rows
+
+
+def _variant_change(feature: dict[str, Any]) -> dict[str, Any]:
+    """The residue change and cross-references of a Natural variant feature.
+
+    The `alternativeSequence` shape is UniProtKB's ('originalSequence' plus a list of
+    'alternativeSequences'); `original`/`variation` is the EBI Proteins spelling of the
+    same thing, already folded into `description` above but repeated here as structured
+    fields. The dbSNP identifier a curator recorded lives in `featureCrossReferences`,
+    which is what turns a residue change into something the genomic tools can look up.
+    """
+    alt = feature.get("alternativeSequence") or {}
+    original = alt.get("originalSequence") or feature.get("original")
+    variants = _as_list(alt.get("alternativeSequences")) or _as_list(feature.get("variation"))
+    xrefs: dict[str, str] = {}
+    for ref in feature.get("featureCrossReferences") or feature.get("xrefs") or []:
+        if not isinstance(ref, dict):
+            continue
+        database, identifier = ref.get("database") or ref.get("name"), ref.get("id")
+        if database and identifier:
+            xrefs.setdefault(str(database), str(identifier))
+    change: dict[str, Any] = {}
+    if original is not None:
+        change["original_aa"] = original
+    if variants:
+        change["variant_aa"] = variants if len(variants) > 1 else variants[0]
+    if feature.get("featureId") or feature.get("ftId"):
+        change["feature_id"] = feature.get("featureId") or feature.get("ftId")
+    if xrefs.get("dbSNP"):
+        change["dbsnp"] = xrefs["dbSNP"]
+    if xrefs:
+        change["xrefs"] = xrefs
+    return change
+
+
+def _genomic_hgvs(variant: str) -> tuple[str, str]:
+    """A `chr:pos:ref:alt` GRCh38 variant as (RefSeq genomic HGVS, normalised id).
+
+    Only SNVs are converted: the EBI variation/hgvs endpoint answers indels and MNVs
+    unreliably (an insertion HGVS that is valid but unnormalised comes back empty, which
+    reads as 'no consequence' when it means 'not looked up'). A non-SNV therefore raises
+    with a message the tool surfaces as a per-variant note rather than a silent empty.
+
+    Raises ValueError on an unparseable id, an unknown chromosome, or a non-SNV allele.
+    """
+    match = _GENOMIC_VARIANT_RE.match(str(variant or "").strip())
+    if not match:
+        raise ValueError(
+            f"cannot parse genomic variant {variant!r}; expected 'chr:pos:ref:alt' "
+            f"such as '12:40340400:G:A'"
+        )
+    chrom = match.group("chr").upper()
+    if chrom.startswith("CHR"):
+        chrom = chrom[3:]
+    chrom = {"M": "MT", "23": "X", "24": "Y"}.get(chrom, chrom)
+    refseq = _GRCH38_REFSEQ.get(chrom)
+    if refseq is None:
+        raise ValueError(f"unknown GRCh38 chromosome {match.group('chr')!r} in {variant!r}")
+    ref, alt = match.group("ref").upper(), match.group("alt").upper()
+    if len(ref) != 1 or len(alt) != 1:
+        raise ValueError(
+            f"{variant!r} is not an SNV; genomic protein-effect mapping here supports "
+            f"single-nucleotide substitutions only"
+        )
+    normalised = f"{chrom}:{match.group('pos')}:{ref}:{alt}"
+    return f"{refseq}:g.{match.group('pos')}{ref}>{alt}", normalised
+
+
+def _flatten_variation_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """The protein-consequence rows of one EBI variation/hgvs entry.
+
+    One entry is one protein (the canonical accession or a specific isoform); each of its
+    features is the consequence of the queried genomic change on that sequence. `wildType`
+    /`mutatedType` are authoritative for the residue change — `consequenceType` mislabels
+    a stop as 'missense' — so a stop is recognised from a '*' mutatedType here.
+    """
+    accession = entry.get("accession")
+    reviewed = not _variation_entry_is_predicted(entry)
+    rows: list[dict[str, Any]] = []
+    for feature in entry.get("features") or []:
+        if not isinstance(feature, dict):
+            continue
+        wild, mutated = feature.get("wildType"), feature.get("mutatedType")
+        consequence = feature.get("consequenceType")
+        if mutated == "*" or (isinstance(mutated, str) and mutated.upper() in {"*", "TER", "STOP"}):
+            consequence = "stop_gained"
+        protein_change = None
+        for location in feature.get("locations") or []:
+            loc = location.get("loc") if isinstance(location, dict) else None
+            if isinstance(loc, str) and loc.startswith("p."):
+                protein_change = loc
+                break
         rows.append(
             {
-                "type": kind,
-                "start": start,
-                "end": end,
-                "description": description or None,
-                "evidence": _evidence(feature),
+                "accession": accession,
+                "entry_name": entry.get("entryName"),
+                "gene": entry.get("geneName"),
+                "protein_name": entry.get("proteinName"),
+                "reviewed": reviewed,
+                "canonical": bool(accession) and "-" not in str(accession),
+                "position": _position(feature.get("begin")),
+                "wild_type_aa": wild,
+                "variant_aa": mutated,
+                "protein_change": protein_change,
+                "consequence": consequence,
+                "clinical_significance": [
+                    sig.get("type")
+                    for sig in feature.get("clinicalSignificances") or []
+                    if isinstance(sig, dict) and sig.get("type")
+                ],
+                "diseases": [
+                    assoc.get("name")
+                    for assoc in feature.get("association") or []
+                    if isinstance(assoc, dict) and assoc.get("name")
+                ],
+                "population_frequencies": [
+                    {
+                        "source": freq.get("source"),
+                        "population": freq.get("populationName"),
+                        "frequency": freq.get("frequency"),
+                    }
+                    for freq in feature.get("populationFrequencies") or []
+                    if isinstance(freq, dict)
+                ],
+                "xrefs": _variation_xrefs(feature),
+                "feature_id": feature.get("ftId"),
             }
         )
     return rows
+
+
+def _variation_entry_is_predicted(entry: dict[str, Any]) -> bool:
+    """True for an unreviewed (TrEMBL) variation entry.
+
+    The variation payload carries no reviewed flag, so two signals stand in: a 'Predicted'
+    proteinExistence, and a mnemonic entryName equal to the accession (Swiss-Prot names are
+    always alphabetic — LRRK2_HUMAN — while TrEMBL reuses the accession, A0ACI8UJW1_HUMAN).
+    """
+    if str(entry.get("proteinExistence") or "").strip().lower() == "predicted":
+        return True
+    accession = str(entry.get("accession") or "")
+    entry_name = str(entry.get("entryName") or "")
+    base = accession.split("-", 1)[0]
+    return bool(base) and entry_name.upper().startswith(base.upper())
+
+
+def _variation_xrefs(feature: dict[str, Any]) -> dict[str, str]:
+    """First identifier per database from a variation feature's xref list (dbSNP, ClinVar)."""
+    xrefs: dict[str, str] = {}
+    for ref in feature.get("xrefs") or []:
+        if not isinstance(ref, dict):
+            continue
+        name, identifier = ref.get("name"), ref.get("id")
+        if name and identifier:
+            xrefs.setdefault(str(name), str(identifier))
+    return xrefs
 
 
 def parse_protein_variant(variant: str) -> tuple[int, str | None]:
