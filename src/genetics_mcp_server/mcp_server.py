@@ -88,6 +88,7 @@ _mcp_disabled = _settings.disabled_tools | {
     "search_mgi",
     "get_protein_annotations",
     "map_protein_variants",
+    "get_variant_protein_effect",
     "search_uniprot",
 }
 register_mcp_tools(mcp, executor, disabled_tools=_mcp_disabled)

@@ -792,6 +792,31 @@ Every result carries a resolution block naming the protein the variants were map
         },
     },
     {
+        "name": "get_variant_protein_effect",
+        "category": "general",
+        "description": """Map genomic coding variants onto their curated UniProt protein consequence. This is the genomic→protein direction: feed a `chr:pos:ref:alt` variant and get back the amino-acid change plus UniProt's curated annotation for it — disease association, clinical significance, population frequency and dbSNP/ClinVar cross-references.
+
+This is the tool for "what does this coding variant do to the protein, and what is known about it?". Use it instead of asserting an amino-acid change (e.g. G2019S) from memory: the residue change, disease link and clinical significance all come from UniProt/ClinVar, not from the reference sequence or recall.
+
+Canonical example:
+  get_variant_protein_effect(variants=['12:40340400:G:A'])  → LRRK2 p.Gly2019Ser, missense, ClinVar Pathogenic, Parkinson disease 8 (PARK8), gnomAD AF.
+
+Batch variants in one call. Assembly is GRCh38 (variant ids are matched against the GRCh38 RefSeq chromosomes). Only reviewed (Swiss-Prot) entries and their isoforms are reported; canonical first.
+
+Scope and limits:
+- Single-nucleotide substitutions only. An indel or MNV comes back with a note that it is unsupported here — do not read that as "no effect". For those, use map_protein_variants (protein→genomic) or get_myvariant_annotations.
+- A variant with no coding consequence (intronic, intergenic, or simply not annotated on a reviewed entry) returns an explicit note, not an error.
+- Already have an amino-acid change and want its genomic coordinate/rsID instead? That is the opposite direction — use map_protein_variants.""",
+        "parameters": {
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Genomic SNVs as 'chr:pos:ref:alt' on GRCh38, e.g. ['12:40340400:G:A', '19:55014977:T:G']. A leading 'chr' is accepted. Batch them in a single call.",
+                "required": True,
+            },
+        },
+    },
+    {
         "name": "search_uniprot",
         "category": "general",
         "description": """Search UniProtKB with its native query syntax to find the set of proteins matching a property — a keyword, a family, a subcellular location, a function. Returns one summary row per entry (accession, entry name, protein name, gene names, organism, reviewed status) plus whatever extra fields you request.
@@ -1652,6 +1677,13 @@ def register_mcp_tools(
         ) -> dict:
             """Map amino-acid substitutions (e.g. ['P70A','R438H'] in TPO) to genomic coordinates and rsIDs via UniProt."""
             return await executor.map_protein_variants(variants, query, organism_id)
+
+    if "get_variant_protein_effect" not in _disabled:
+
+        @mcp.tool()
+        async def get_variant_protein_effect(variants: list[str]) -> dict:
+            """Map genomic coding SNVs (e.g. ['12:40340400:G:A'], GRCh38) to the amino-acid change and curated UniProt/ClinVar annotation."""
+            return await executor.get_variant_protein_effect(variants)
 
     if "search_uniprot" not in _disabled:
 

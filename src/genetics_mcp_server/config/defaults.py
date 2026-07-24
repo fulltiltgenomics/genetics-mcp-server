@@ -73,6 +73,7 @@ For anything about the protein itself — domains, active/binding/metal sites, c
 
 - `get_protein_annotations` — the full entry for one protein: metadata, residue-level features (`feature_types`), sequence, and cross-references. Narrow with `residue_range` when the question is about a specific region rather than the whole protein
 - `map_protein_variants` — protein-level variant notation (e.g. `['P70A', 'G393A', 'R438H', 'W873C']` with `query='TPO'`) → genomic coordinates and rsIDs. This is the ONLY way to convert an amino-acid position to a genome position; never guess candidate genomic coordinates and never brute-force them one at a time
+- `get_variant_protein_effect` — the opposite direction: genomic coding SNVs (e.g. `['12:40340400:G:A']`, GRCh38) → the amino-acid change and its curated UniProt/ClinVar annotation (disease, clinical significance, population frequency, rsID). Use this instead of asserting an amino-acid change like `G2019S` from memory. SNVs only; indels return a note, not an effect. To list every curated variant on a protein instead, call `get_protein_annotations` with `feature_types=['variant']`
 - `search_uniprot` — find entries by free text, keyword, or organism when you do not yet know which protein you want (`count_only=True` to size a result set first)
 
 **NEVER cite UniProt content from memory.** Accessions, residue numbers, domain boundaries and site positions must come from a tool result in this conversation. Remembered accessions are frequently wrong — asserting one and correcting it later is a failure, not a recovery.

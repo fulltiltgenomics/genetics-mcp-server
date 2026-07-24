@@ -3457,6 +3457,21 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
+    async def get_variant_protein_effect(
+        self,
+        variants: list[str] | str,
+    ) -> dict[str, Any]:
+        """Map genomic coding SNVs (e.g. 12:40340400:G:A) to their UniProt protein effect."""
+        try:
+            result = await self.uniprot.get_variant_protein_effect(variants)
+        except Exception as e:
+            logger.error(
+                f"Error in get_variant_protein_effect({variants!r}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+        return self._uniprot_download_hint(result, "variant_protein_effect.tsv")
+
     async def search_uniprot(
         self,
         query: str | None = None,
