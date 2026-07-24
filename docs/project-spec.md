@@ -105,12 +105,12 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 
 | Tool | Description |
 |------|-------------|
-| `query_bigquery` | Execute custom SQL against genetics views (fallback for queries specialized tools cannot handle) |
-| `get_bigquery_schema` | Get schema for BigQuery views before writing queries. Accepts optional `table` parameter to get just one table's schema. Returns resource metadata with aliases, column descriptions, allowed filter values, and example SQL queries |
+| `query_database` | Execute custom SQL against genetics views (fallback for queries specialized tools cannot handle) |
+| `get_database_schema` | Get schema for BigQuery views before writing queries. Accepts optional `table` parameter to get just one table's schema. Returns resource metadata with aliases, column descriptions, allowed filter values, and example SQL queries |
 
-BigQuery contains multiple tables beyond just credible sets — including exome/burden test results, colocalization, and more. The `get_bigquery_schema` tool discovers all available tables.
+BigQuery contains multiple tables beyond just credible sets — including exome/burden test results, colocalization, and more. The `get_database_schema` tool discovers all available tables.
 
-A `gene_annotations` BigQuery table/view (built in `genetics-results-db`) is also exposed via `get_bigquery_schema` and is the `query_bigquery` surface for cis/trans QTL filtering — JOIN its gene coordinates to `colocalization_v` instead of hand-typing coordinate literals — and for any-group gene enumeration. This stands apart from the two specialized gene tools (`get_gene_group_members`, `normalize_gene_symbols`), which call the API and do **not** read this table. **Coordinate windows, not `gene_most_severe`, for "near a gene" queries**: when finding signals (GWAS or QTL) physically near a gene in BigQuery, JOIN `gene_annotations_v` for the gene body and filter on a coordinate window (≈ 500 kb), rather than filtering by `gene_most_severe`. The latter is per-variant most-severe-consequence attribution — unreliable for regulatory variants and prone to both missing nearby signals and mis-attributing distant ones. `get_asm_qtl_by_gene` now selects by this coordinate window, and the system prompt instructs the LLM to do the same for ad-hoc SQL. (`get_credible_sets_by_qtl_gene` is the exception: it finds QTLs where the gene is the *molecular trait*, correctly keyed by gene name.) Single source of truth split: the specialized tools resolve gene groups/symbols via the API; BigQuery's `gene_annotations` stands alone as the surface for SQL JOINs and ad-hoc enumeration. Views include a derived `resource` column that maps dataset names to resource identifiers (e.g., `FinnGen_R13` → `finngen`, `UKB_PPP` → `ukbb`, `Open_Targets_25.12` → `open_targets`). This allows filtering by `WHERE resource = 'finngen'` instead of matching dataset names directly. The schema response includes resource metadata with human-readable labels and aliases to help agents map user intent to correct filter values (e.g., "bipex" → `resource = 'bipex2'`). Collection resources like eQTL Catalogue are collapsed into summaries rather than listing hundreds of individual IDs.
+A `gene_annotations` BigQuery table/view (built in `genetics-results-db`) is also exposed via `get_database_schema` and is the `query_database` surface for cis/trans QTL filtering — JOIN its gene coordinates to `colocalization_v` instead of hand-typing coordinate literals — and for any-group gene enumeration. This stands apart from the two specialized gene tools (`get_gene_group_members`, `normalize_gene_symbols`), which call the API and do **not** read this table. **Coordinate windows, not `gene_most_severe`, for "near a gene" queries**: when finding signals (GWAS or QTL) physically near a gene in BigQuery, JOIN `gene_annotations_v` for the gene body and filter on a coordinate window (≈ 500 kb), rather than filtering by `gene_most_severe`. The latter is per-variant most-severe-consequence attribution — unreliable for regulatory variants and prone to both missing nearby signals and mis-attributing distant ones. `get_asm_qtl_by_gene` now selects by this coordinate window, and the system prompt instructs the LLM to do the same for ad-hoc SQL. (`get_credible_sets_by_qtl_gene` is the exception: it finds QTLs where the gene is the *molecular trait*, correctly keyed by gene name.) Single source of truth split: the specialized tools resolve gene groups/symbols via the API; BigQuery's `gene_annotations` stands alone as the surface for SQL JOINs and ad-hoc enumeration. Views include a derived `resource` column that maps dataset names to resource identifiers (e.g., `FinnGen_R13` → `finngen`, `UKB_PPP` → `ukbb`, `Open_Targets_25.12` → `open_targets`). This allows filtering by `WHERE resource = 'finngen'` instead of matching dataset names directly. The schema response includes resource metadata with human-readable labels and aliases to help agents map user intent to correct filter values (e.g., "bipex" → `resource = 'bipex2'`). Collection resources like eQTL Catalogue are collapsed into summaries rather than listing hundreds of individual IDs.
 
 ### External search tools
 
@@ -200,7 +200,7 @@ Each tool has a `category` field in its definition:
 |----------|-------------|
 | `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
-| `bigquery` | BigQuery SQL tools: query_bigquery, get_bigquery_schema |
+| `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |
 
 ### Profile behavior
@@ -327,7 +327,7 @@ The subagent system enables the main agent to launch parallel specialized agents
 **Skills** define subagent capabilities:
 - `genetics_data_extraction` — API tools for GWAS, QTL, credible sets, etc.
 - `literature_review` — scientific literature and web search
-- `bigquery_analysis` — complex SQL queries against the genetics database
+- `database_analysis` — complex SQL queries against the genetics database
 - `variant_list_analysis` — analyze multiple variants for shared patterns
 - `data_analysis` — Python script execution for custom analysis and visualizations
 

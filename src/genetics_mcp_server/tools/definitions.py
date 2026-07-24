@@ -394,7 +394,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_mpra_pip_concordance_by_gene",
         "category": "api",
-        "description": "Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls for variants near a gene — the core regulatory-buffering check (Kanai et al.): do high-PIP (credibly causal) fine-mapped variants actually show measured cis-regulatory allelic activity (emVar) in MPRA? BigQuery-joins credible_sets_v (FinnGen fine-mapped, filtered to resource + pip>=min_pip) to the MPRA cross-cell-line meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt variant key. Per matched variant returns: FinnGen PIP, cs_id, trait, data_type, GWAS mlog10p/beta, and the meta MPRA call — emVar (allele modulates reporter expression), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2Skew_mlog10p (skew significance), log2FC (element activity), cohort. Ordered emVar then PIP. This corroborates whether fine-mapped variants are FUNCTIONALLY active in a reporter assay — MPRA measures intrinsic cis-regulatory allelic activity, distinct from in-silico variant_effect predictions and endogenous eQTL/caQTL. Distinct from get_mpra_by_gene, which returns MPRA rows WITHOUT the PIP cross-reference. FinnGen-credible-set-based and meta-row-based by default; MPRA coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants).",
+        "description": "Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls for variants near a gene — the core regulatory-buffering check (Kanai et al.): do high-PIP (credibly causal) fine-mapped variants actually show measured cis-regulatory allelic activity (emVar) in MPRA? Joins credible_sets_v (FinnGen fine-mapped, filtered to resource + pip>=min_pip) to the MPRA cross-cell-line meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt variant key. Per matched variant returns: FinnGen PIP, cs_id, trait, data_type, GWAS mlog10p/beta, and the meta MPRA call — emVar (allele modulates reporter expression), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2Skew_mlog10p (skew significance), log2FC (element activity), cohort. Ordered emVar then PIP. This corroborates whether fine-mapped variants are FUNCTIONALLY active in a reporter assay — MPRA measures intrinsic cis-regulatory allelic activity, distinct from in-silico variant_effect predictions and endogenous eQTL/caQTL. Distinct from get_mpra_by_gene, which returns MPRA rows WITHOUT the PIP cross-reference. FinnGen-credible-set-based and meta-row-based by default; MPRA coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants).",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -441,7 +441,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_exome_results_by_gene",
         "category": "api",
-        "description": "Get rare variant burden test results for a gene. Returns individual variant-level association statistics from exome sequencing across available resources (genebass/UKBB filtered to p<1e-4, IBD exome containing only exome-wide significant variants). Use this for single-gene queries. For batch queries across many genes, use BigQuery instead (call get_bigquery_schema to find the exome results table). For full individual-trait results, use get_exome_results_by_phenotype.",
+        "description": "Get rare variant burden test results for a gene. Returns individual variant-level association statistics from exome sequencing across available resources (genebass/UKBB filtered to p<1e-4, IBD exome containing only exome-wide significant variants). Use this for single-gene queries. For batch queries across many genes, use the database instead (call get_database_schema to find the exome results table). For full individual-trait results, use get_exome_results_by_phenotype.",
         "parameters": {
             "gene": {"type": "string", "description": "Gene symbol or comma-separated list of gene symbols", "required": True},
         },
@@ -1104,10 +1104,10 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "GPCRs that dominate large families like GPCRs by sheer count and are rarely the "
             "analysis target. Set exclude_olfactory=false to get the full membership. "
             "Results come from HGNC gene-group data served by the API. "
-            "TIP: for BigQuery analyses joining a whole gene group (e.g. cis-pQTL "
+            "TIP: for database analyses joining a whole gene group (e.g. cis-pQTL "
             "colocalizations for all GPCRs), prefer filtering gene_annotations_v directly "
             "on gene_group_ids/gene_group_names rather than enumerating members here — see "
-            "the get_bigquery_schema example for gene_annotations_v."
+            "the get_database_schema example for gene_annotations_v."
         ),
         "parameters": {
             "group_id": {
@@ -1151,20 +1151,20 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
 # BigQuery tools for advanced queries
 BIGQUERY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
-        "name": "query_bigquery",
+        "name": "query_database",
         "category": "bigquery",
-        "description": """Execute a SQL query against the genetics BigQuery database.
+        "description": """Execute a SQL query against the genetics database.
 
 For simple single-gene or single-variant lookups, prefer specialized tools (get_credible_sets_by_gene, get_credible_sets_by_variant, etc.).
 
-**USE BIGQUERY when the question involves:**
+**USE the database when the question involves:**
 - Aggregations across many phenotypes, genes, or variants
 - Complex filtering (e.g., "LoF variants with PIP > 0.05 AND MAF < 0.05 across all traits")
 - Cross-referencing between data types (e.g., fine-mapping results vs. burden test results)
 - Batch queries over many genes/variants that would require many individual API calls
 - Custom statistical summaries or counts
 
-**IMPORTANT: Always call get_bigquery_schema FIRST** to discover all available tables and their columns. The database contains more tables than just credible sets — including exome/burden test results and other data types.
+**IMPORTANT: Always call get_database_schema FIRST** to discover all available tables and their columns. The database contains more tables than just credible sets — including exome/burden test results and other data types.
 
 Use fully qualified view names (e.g., `genetics_results.credible_sets_v`).
 Views include a `resource` column (finngen, ukbb, open_targets, etc.) for filtering by data source.
@@ -1174,7 +1174,7 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
         "parameters": {
             "sql": {
                 "type": "string",
-                "description": "SQL query to execute. Use fully qualified view names (e.g., genetics_results.credible_sets_v). Call get_bigquery_schema first to discover available tables. Always include LIMIT clause.",
+                "description": "SQL query to execute. Use fully qualified view names (e.g., genetics_results.credible_sets_v). Call get_database_schema first to discover available tables. Always include LIMIT clause.",
                 "required": True,
             },
             "max_rows": {
@@ -1190,9 +1190,9 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
         },
     },
     {
-        "name": "get_bigquery_schema",
+        "name": "get_database_schema",
         "category": "bigquery",
-        "description": "Get schema for BigQuery tables. **Always call this before query_bigquery** to discover available data. Returns resource descriptions with aliases, table/column metadata with allowed filter values, and example SQL queries. Optionally pass a table name to get schema for just that table.",
+        "description": "Get schema for database tables. **Always call this before query_database** to discover available data. Returns resource descriptions with aliases, table/column metadata with allowed filter values, and example SQL queries. Optionally pass a table name to get schema for just that table.",
         "parameters": {
             "table": {
                 "type": "string",
@@ -1213,7 +1213,7 @@ Use this when the question requires multiple independent data gathering or analy
 Available skills:
 - **genetics_data_extraction**: Extract genetics data (GWAS, QTL, credible sets, gene expression, LD, etc.)
 - **literature_review**: Search scientific literature and web for relevant publications
-- **bigquery_analysis**: Run complex SQL queries against the genetics database
+- **database_analysis**: Run complex SQL queries against the genetics database
 - **data_analysis**: Execute Python scripts for statistical analysis or custom visualizations
 - **variant_list_analysis**: Analyze a list of variants for phenotype, QTL, and tissue patterns""",
         "parameters": {
@@ -1226,7 +1226,7 @@ Available skills:
                     "properties": {
                         "skill": {
                             "type": "string",
-                            "description": "Skill name (genetics_data_extraction, literature_review, bigquery_analysis, data_analysis, variant_list_analysis)",
+                            "description": "Skill name (genetics_data_extraction, literature_review, database_analysis, data_analysis, variant_list_analysis)",
                         },
                         "query": {
                             "type": "string",
@@ -1782,15 +1782,15 @@ def register_mcp_tools(
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()
-    async def query_bigquery(
+    async def query_database(
         sql: str,
         max_rows: int = 1000,
         dry_run: bool = False,
     ) -> dict:
-        """Execute SQL against genetics BigQuery. Call get_bigquery_schema first to discover available tables."""
-        return await executor.query_bigquery(sql, max_rows, dry_run)
+        """Execute SQL against the genetics database. Call get_database_schema first to discover available tables."""
+        return await executor.query_database(sql, max_rows, dry_run)
 
     @mcp.tool()
-    async def get_bigquery_schema(table: str | None = None) -> dict:
-        """Get schema for BigQuery tables. Always call this before writing queries. Pass a table name to get just that table's schema."""
-        return await executor.get_bigquery_schema(table)
+    async def get_database_schema(table: str | None = None) -> dict:
+        """Get schema for database tables. Always call this before writing queries. Pass a table name to get just that table's schema."""
+        return await executor.get_database_schema(table)

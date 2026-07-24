@@ -317,7 +317,7 @@ async def get_schema(
     service = get_llm_service()
     if not service.executor:
         raise HTTPException(status_code=503, detail="Tool executor not initialized")
-    result = await service.executor.get_bigquery_schema(table=table)
+    result = await service.executor.get_database_schema(table=table)
     if not result.get("success"):
         # 503 when the db service is simply unreachable (down/restarting), 502 for other upstream errors
         status = 503 if result.get("unreachable") else 502

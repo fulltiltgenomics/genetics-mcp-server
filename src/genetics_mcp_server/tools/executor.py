@@ -280,7 +280,7 @@ class ToolExecutor:
         stripped = stripped.rstrip(';').rstrip()
         return stripped, stripped != sql.strip().rstrip(';').rstrip()
 
-    async def query_bigquery(
+    async def query_database(
         self,
         sql: str,
         max_rows: int = 1000,
@@ -341,10 +341,10 @@ class ToolExecutor:
 
             return result
         except Exception as e:
-            logger.error(f"Error in query_bigquery: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error in query_database: {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
-    async def get_bigquery_schema(self, table: str | None = None) -> dict[str, Any]:
+    async def get_database_schema(self, table: str | None = None) -> dict[str, Any]:
         """Get schema information for the BigQuery tables."""
         if not self.bigquery_url:
             return {
@@ -366,7 +366,7 @@ class ToolExecutor:
                 "error": f"HTTP {resp.status_code}: {resp.text}",
             }
         except Exception as e:
-            logger.error(f"Error in get_bigquery_schema: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error in get_database_schema: {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
     # -------------------------------------------------------------------------
@@ -782,7 +782,7 @@ class ToolExecutor:
             f"WHERE TRUE{dataset_filter} "
             f"ORDER BY a.mlog10p DESC LIMIT 500"
         )
-        result = await self.query_bigquery(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=500)
         if result.get("success"):
             return {
                 "success": True, "gene": gene, "results": result.get("rows", []),
@@ -855,7 +855,7 @@ class ToolExecutor:
             f"WHERE TRUE{resource_filter} "
             f"ORDER BY a.tissue, a.cell_type, a.peak_start LIMIT 500"
         )
-        result = await self.query_bigquery(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=500)
         if result.get("success"):
             return {
                 "success": True, "gene": gene, "results": result.get("rows", []),
@@ -916,7 +916,7 @@ class ToolExecutor:
             f"WHERE TRUE{resource_filter} "
             f"ORDER BY a.mlog10p DESC LIMIT 500"
         )
-        result = await self.query_bigquery(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=500)
         if result.get("success"):
             return {
                 "success": True, "gene": gene, "results": result.get("rows", []),
@@ -995,7 +995,7 @@ class ToolExecutor:
             f"WHERE TRUE{resource_filter} "
             f"ORDER BY a.log2Skew_mlog10p DESC LIMIT 500"
         )
-        result = await self.query_bigquery(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=500)
         if result.get("success"):
             return {
                 "success": True, "gene": gene, "results": result.get("rows", []),
@@ -1020,7 +1020,7 @@ class ToolExecutor:
         is used for the core call because it carries the cross-cell-line emVar/log2Skew summary.
         Distinct from get_mpra_by_gene, which returns MPRA rows without the PIP cross-reference.
 
-        Equivalent raw BigQuery join a user could run via query_bigquery:
+        Equivalent raw BigQuery join a user could run via query_database:
 
             WITH g AS (
               SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend
@@ -1053,7 +1053,7 @@ class ToolExecutor:
             f"WHERE c.resource = '{resource}' AND c.pip >= {min_pip} "
             f"ORDER BY m.emVar DESC, c.pip DESC LIMIT 500"
         )
-        result = await self.query_bigquery(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=500)
         if result.get("success"):
             return {
                 "success": True, "gene": gene, "results": result.get("rows", []),

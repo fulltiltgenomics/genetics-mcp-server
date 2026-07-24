@@ -40,10 +40,10 @@ async def test_resilient_client_passes_through_real_responses():
         await client.aclose()
 
 
-async def test_get_bigquery_schema_flags_unreachable():
+async def test_get_database_schema_flags_unreachable():
     executor = ToolExecutor(bigquery_api_url=UNREACHABLE_URL)
     try:
-        result = await executor.get_bigquery_schema()
+        result = await executor.get_database_schema()
         assert result["success"] is False
         assert result.get("unreachable") is True
         assert result["error"] == UPSTREAM_UNREACHABLE_MSG

@@ -42,7 +42,7 @@ class TestSkillDefinitions:
         desc = get_skill_descriptions()
         assert "genetics_data_extraction" in desc
         assert "literature_review" in desc
-        assert "bigquery_analysis" in desc
+        assert "database_analysis" in desc
         assert "data_analysis" in desc
 
     def test_skill_categories_are_valid(self):

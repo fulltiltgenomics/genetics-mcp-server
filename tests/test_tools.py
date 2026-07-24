@@ -831,7 +831,7 @@ class TestToolDefinitions:
 
         assert "search_phenotypes" in names  # general
         assert "get_credible_sets_by_gene" in names  # api
-        assert "query_bigquery" in names  # bigquery
+        assert "query_database" in names  # bigquery
 
         total = len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS) + len(SUBAGENT_TOOL_DEFINITIONS)
         assert len(tools) == total
@@ -843,7 +843,7 @@ class TestToolDefinitions:
 
         assert "search_phenotypes" in names  # general
         assert "get_credible_sets_by_gene" in names  # api
-        assert "query_bigquery" not in names  # bigquery excluded
+        assert "query_database" not in names  # bigquery excluded
 
     def test_get_anthropic_tools_bigquery_profile(self):
         """BigQuery profile returns general + bigquery tools only."""
@@ -851,8 +851,8 @@ class TestToolDefinitions:
         names = {t["name"] for t in tools}
 
         assert "search_phenotypes" in names  # general
-        assert "query_bigquery" in names  # bigquery
-        assert "get_bigquery_schema" in names  # bigquery
+        assert "query_database" in names  # bigquery
+        assert "get_database_schema" in names  # bigquery
         assert "get_credible_sets_by_gene" not in names  # api excluded
 
     def test_get_anthropic_tools_rag_profile(self):
@@ -863,7 +863,7 @@ class TestToolDefinitions:
         assert "search_phenotypes" in names  # general
         assert "web_search" in names  # general
         assert "get_credible_sets_by_gene" not in names  # api excluded
-        assert "query_bigquery" not in names  # bigquery excluded
+        assert "query_database" not in names  # bigquery excluded
 
     def test_get_anthropic_tools_unknown_profile_returns_general_only(self):
         """Unknown profile falls back to general tools only."""
@@ -872,7 +872,7 @@ class TestToolDefinitions:
 
         assert "search_phenotypes" in names  # general
         assert "get_credible_sets_by_gene" not in names
-        assert "query_bigquery" not in names
+        assert "query_database" not in names
 
     def test_general_tools_present_in_all_profiles(self):
         """General tools should appear in every profile."""

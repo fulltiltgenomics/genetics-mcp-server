@@ -104,7 +104,7 @@ class TestStripToolUseMarkers:
     def test_strips_multiline_marker_with_sql(self):
         """Marker params can span lines (SQL) — DOTALL + non-greedy must still match."""
         text = (
-            "*[Using tool: query_bigquery; sql: SELECT a, b\nFROM t\nWHERE x = '1:2:C:T'\nLIMIT 200]*"
+            "*[Using tool: query_database; sql: SELECT a, b\nFROM t\nWHERE x = '1:2:C:T'\nLIMIT 200]*"
             "\n\n## Result\nrows: 0"
         )
         out = _strip_tool_use_markers([{"role": "assistant", "content": text}])

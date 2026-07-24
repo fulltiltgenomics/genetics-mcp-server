@@ -62,14 +62,14 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
             "search_uniprot",
         ],
     ),
-    "bigquery_analysis": SkillDefinition(
-        name="bigquery_analysis",
+    "database_analysis": SkillDefinition(
+        name="database_analysis",
         description=(
-            "Run complex SQL queries against the genetics BigQuery database. "
+            "Run complex SQL queries against the genetics database. "
             "Use for cross-dataset comparisons, aggregations, or queries that "
             "specialized API tools cannot handle."
         ),
-        instruction_file="bigquery_analysis.md",
+        instruction_file="database_analysis.md",
         tool_categories={"general", "bigquery"},
     ),
     "variant_list_analysis": SkillDefinition(
