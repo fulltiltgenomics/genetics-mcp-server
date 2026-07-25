@@ -212,10 +212,11 @@ def _add_include_in_response(result: dict, value: str) -> dict:
     return {"INCLUDE_IN_RESPONSE": value, **{k: v for k, v in result.items() if k != "INCLUDE_IN_RESPONSE"}}
 
 
-def _process_download_hints(result: dict) -> dict:
+def _process_download_hints(result: dict, owner: str | None = None) -> dict:
     """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links.
 
-    Uses relative URLs so links work regardless of deployment domain.
+    Uses relative URLs so links work regardless of deployment domain. `owner` binds the
+    stored file to the user who ran the query so nobody else can fetch it by id.
     """
     if not isinstance(result, dict) or not result.get("success"):
         return result
@@ -236,7 +237,7 @@ def _process_download_hints(result: dict) -> dict:
             if tsv_bytes:
                 filename = download_info.get("filename", "results.tsv")
                 store = get_download_store()
-                download_id = store.store(tsv_bytes, filename)
+                download_id = store.store(tsv_bytes, filename, owner=owner)
                 url = f"/chat/v1/downloads/{download_id}"
                 link = f"\U0001f4e5 [Download full results as TSV]({url})"
                 return _add_include_in_response(result, link)
@@ -708,7 +709,7 @@ class LLMService:
                         result["note"] = "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
 
                     # convert download hints into INCLUDE_IN_RESPONSE links
-                    result = _process_download_hints(result)
+                    result = _process_download_hints(result, owner=user)
 
                     result_json = json.dumps(result)
 

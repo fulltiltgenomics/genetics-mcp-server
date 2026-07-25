@@ -451,12 +451,11 @@ async def health_check():
 
 
 @app.get("/chat/v1/downloads/{download_id}")
-@is_public
-async def download_file(download_id: str):
-    """Serve a stored download file (TSV)."""
+async def download_file(download_id: str, user: str | None = Depends(auth_required)):
+    """Serve a stored download file (TSV), to the user who generated it."""
     logger.info(f"Download requested: {download_id}")
     store = get_download_store()
-    result = store.get(download_id)
+    result = store.get(download_id, requester=user)
     if result is None:
         logger.error(f"Download failed (404): {download_id}")
         raise HTTPException(status_code=404, detail=EXPIRED_MESSAGE)

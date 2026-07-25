@@ -17,6 +17,9 @@ class DownloadMetadata:
     filename: str
     content_type: str
     created_at: float
+    # owner defaults to None for entries written before downloads were bound to a user;
+    # those stay readable by any authenticated caller until they age out of the TTL
+    owner: str | None = None
 
 
 class DownloadStore:
@@ -27,7 +30,13 @@ class DownloadStore:
         self._ttl_seconds = ttl_seconds
         os.makedirs(storage_path, exist_ok=True)
 
-    def store(self, data: bytes, filename: str, content_type: str = "text/tab-separated-values") -> str:
+    def store(
+        self,
+        data: bytes,
+        filename: str,
+        content_type: str = "text/tab-separated-values",
+        owner: str | None = None,
+    ) -> str:
         """Store download data and return a unique ID."""
         download_id = uuid.uuid4().hex
         data_path = os.path.join(self._storage_path, f"{download_id}.tsv")
@@ -37,6 +46,7 @@ class DownloadStore:
             filename=filename,
             content_type=content_type,
             created_at=time.time(),
+            owner=owner,
         )
 
         with open(data_path, "wb") as f:
@@ -47,8 +57,13 @@ class DownloadStore:
         logger.info(f"Stored download {download_id}: {filename} ({len(data)} bytes)")
         return download_id
 
-    def get(self, download_id: str) -> tuple[bytes, str, str] | None:
-        """Retrieve download by ID. Returns (data, filename, content_type) or None."""
+    def get(self, download_id: str, requester: str | None = None) -> tuple[bytes, str, str] | None:
+        """Retrieve download by ID. Returns (data, filename, content_type) or None.
+
+        When the entry records an owner, only that user may read it — the id alone used to be
+        the entire authorization, so any logged-in user holding a leaked or shared link could
+        read another user's query results for the full 30-day TTL.
+        """
         # validate ID to prevent path traversal
         if not download_id.isalnum():
             logger.error(f"Download request with invalid ID: {download_id}")
@@ -66,6 +81,12 @@ class DownloadStore:
                 meta = DownloadMetadata(**json.load(f))
         except (json.JSONDecodeError, TypeError, KeyError):
             logger.error(f"Corrupt metadata for download {download_id}")
+            return None
+
+        if meta.owner is not None and meta.owner != requester:
+            logger.warning(
+                f"Download {download_id} requested by {requester!r}, owned by {meta.owner!r}"
+            )
             return None
 
         elapsed = time.time() - meta.created_at
