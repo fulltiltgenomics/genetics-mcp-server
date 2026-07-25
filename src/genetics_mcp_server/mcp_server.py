@@ -240,6 +240,17 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
     import hmac
     from urllib.parse import parse_qs, urlsplit, urlunsplit
 
+    _allow_query_token = os.environ.get("MCP_ALLOW_QUERY_TOKEN", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if _allow_query_token:
+        logger.warning(
+            "MCP_ALLOW_QUERY_TOKEN is set: bearer tokens accepted in the URL query string, "
+            "where they are captured by upstream request logs and Referer headers"
+        )
+
     def _token_is_valid(token: str) -> bool:
         if any(hmac.compare_digest(token, key) for key in api_keys):
             return True
@@ -301,8 +312,12 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                     if scope["type"] == "http":
                         await _send_401(send)
                         return
-            else:
-                # fall back to query string ?token= parameter
+            elif _allow_query_token:
+                # Credentials in a URL end up in places request headers do not: the GKE load
+                # balancer's request logs (upstream of the auth-gateway's token= redaction),
+                # browser history, and Referer on any outbound link. Off by default now; set
+                # MCP_ALLOW_QUERY_TOKEN=true only for a client that genuinely cannot send the
+                # Authorization header.
                 query_string = scope.get("query_string", b"").decode()
                 params = parse_qs(query_string)
                 token_values = params.get("token", [])
@@ -315,6 +330,10 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                     if scope["type"] == "http":
                         await _send_401(send)
                         return
+            else:
+                if scope["type"] == "http":
+                    await _send_401(send)
+                    return
 
         await app(scope, receive, send)
 
