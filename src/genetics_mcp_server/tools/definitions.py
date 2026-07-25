@@ -623,8 +623,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "These two backends are distinct APIs, not interchangeable labels for the same source:\n"
             "- 'europepmc' backend: queries the Europe PMC API, which indexes PubMed, Europe PMC, bioRxiv, and medRxiv. Returns structured paper records.\n"
             "- 'perplexity' backend: queries the Perplexity AI API, which searches a broader configured set of scientific web domains and returns an AI-generated summary with citations.\n"
-            "When reporting results to the user, name the backend that was actually queried (the 'source' field in the response: 'europepmc' or 'perplexity'). "
-            "Do NOT invent hybrid labels like 'PubMed/Europe PMC' or 'Perplexity/PubMed' — PubMed etc. are content indexed by the europepmc backend, not separate backends."
+            "When reporting results to the user, name the backend that was actually queried: the 'backend' field in the response, which is authoritative. "
+            "The server may override the requested backend, in which case the response also carries a 'backend_note' — the 'backend' field still wins. "
+            "Do NOT invent hybrid labels like 'PubMed/Europe PMC' or 'Perplexity/PubMed' — PubMed etc. are content indexed by the europepmc backend, not separate backends. "
+            "Perplexity hits carry bibliographic metadata (authors, journal) looked up in Europe PMC where a PMID/DOI/PMCID was available; that is recorded per record in 'metadata_source' and does not change which backend was searched."
         ),
         "parameters": {
             "query": {
@@ -652,7 +654,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "Which API to query for this call (NOT the underlying content source). "
                     "'europepmc' = call the Europe PMC API (which indexes PubMed/Europe PMC/bioRxiv/medRxiv); returns structured paper records. "
                     "'perplexity' = call the Perplexity AI API (broader scientific web); returns AI-generated summary with citations. "
-                    "Exactly one backend is queried per call. Defaults to server configuration."
+                    "Exactly one backend is queried per call. Defaults to server configuration, which may also override this argument — "
+                    "always read the 'backend' field of the response to see which API actually ran."
                 ),
                 "enum": ["europepmc", "perplexity"],
             },

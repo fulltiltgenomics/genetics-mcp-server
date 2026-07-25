@@ -810,10 +810,26 @@ class LLMService:
                 return {"success": False, "error": f"Unknown tool: {tool_name}"}
 
             # inject literature_backend for search_scientific_literature if specified
+            requested_backend = None
             if tool_name == "search_scientific_literature" and literature_backend:
+                requested_backend = tool_input.get("backend")
                 tool_input = {**tool_input, "backend": literature_backend}
 
-            return await method(**tool_input)
+            result = await method(**tool_input)
+
+            # without this the model reports the backend it asked for, not the one that ran
+            if (
+                requested_backend
+                and isinstance(result, dict)
+                and requested_backend.lower() != literature_backend.lower()
+            ):
+                result["backend_note"] = (
+                    f"The requested '{requested_backend}' backend was overridden by the server "
+                    f"configuration: this call queried the '{literature_backend}' backend. "
+                    f"Report '{literature_backend}' as the backend for these results."
+                )
+
+            return result
 
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}")

@@ -418,7 +418,7 @@ class TestLiteratureSearch:
     async def test_search_scientific_literature(self):
         """Test searching scientific literature via Europe PMC."""
         result = await self.executor.search_scientific_literature(
-            "APOE Alzheimer", max_results=5
+            "APOE Alzheimer", max_results=5, backend="europepmc"
         )
 
         assert result["success"] is True
@@ -432,6 +432,7 @@ class TestLiteratureSearch:
             "BRCA1 breast cancer",
             max_results=5,
             include_preprints=False,
+            backend="europepmc",
         )
 
         assert result["success"] is True
@@ -442,6 +443,7 @@ class TestLiteratureSearch:
             "type 2 diabetes genetics",
             max_results=5,
             date_range="last_year",
+            backend="europepmc",
         )
 
         assert result["success"] is True
