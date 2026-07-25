@@ -1,0 +1,11 @@
+# keep local secrets and caches out of the build context / published image.
+# this repo has a real .env checked out locally (gitignored) — it must never be copied in.
+.env
+.env.*
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.beads/
