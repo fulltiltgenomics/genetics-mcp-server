@@ -374,15 +374,41 @@ class TestBearerAuthMiddleware:
         return messages
 
     @pytest.mark.asyncio
-    async def test_query_param_token_accepted(self, wrapped_app):
-        """Valid token via ?token= query param should reach the inner app."""
+    async def test_query_param_token_rejected_by_default(self, wrapped_app):
+        """A token in the URL is not accepted unless MCP_ALLOW_QUERY_TOKEN opts in.
+
+        Credentials in a query string are captured by upstream request logs and Referer
+        headers, so the fallback is off by default.
+        """
         app, call_log = wrapped_app
         scope = self._make_scope(query_string=f"token={self.VALID_KEY}".encode())
 
         messages = await self._collect_response(app, scope)
 
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_query_param_token_accepted_when_opted_in(self, monkeypatch):
+        """With MCP_ALLOW_QUERY_TOKEN set, a valid ?token= reaches the inner app."""
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        monkeypatch.setenv("MCP_ALLOW_QUERY_TOKEN", "true")
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
+        )
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        app = _wrap_with_bearer_auth(inner_app, [self.VALID_KEY])
+        scope = self._make_scope(query_string=f"token={self.VALID_KEY}".encode())
+
+        messages = await self._collect_response(app, scope)
+
         assert len(call_log) == 1, "Inner app should have been called"
-        # no 401 response messages expected
         assert not messages
 
     @pytest.mark.asyncio

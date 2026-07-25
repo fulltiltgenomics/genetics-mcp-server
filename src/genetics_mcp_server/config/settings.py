@@ -178,6 +178,19 @@ class Settings:
         }
     )
 
+    # OAuth client id(s) a Google Identity Token must be addressed to (its `aud` claim).
+    # google.oauth2.id_token.verify_oauth2_token skips audience verification entirely when
+    # this is None, which means ANY Google-signed id_token belonging to an allow-listed email
+    # is accepted — including one minted for an unrelated third-party app the user signed
+    # into. Set GOOGLE_TOKEN_AUDIENCE to the client id issued for programmatic access here.
+    google_token_audience: list[str] = field(
+        default_factory=lambda: [
+            a.strip()
+            for a in os.environ.get("GOOGLE_TOKEN_AUDIENCE", "").split(",")
+            if a.strip()
+        ]
+    )
+
     # CORS: the frontend sends credentialed requests, and browsers reject a
     # wildcard Access-Control-Allow-Origin on those, so origins must be explicit.
     # only relevant in dev — in prod the frontend and this API share an origin

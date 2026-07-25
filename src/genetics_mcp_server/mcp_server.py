@@ -155,6 +155,27 @@ def _email_allowed(email: str, settings) -> bool:
     return email in settings.allowed_emails or domain in settings.allowed_email_domains
 
 
+def _audience_allowed(payload: dict, settings) -> bool:
+    """Check a verified Google Identity Token was actually addressed to this service.
+
+    verify_oauth2_token skips the `aud` claim when no audience is passed, so without this
+    any Google-signed id_token carrying an allow-listed email is accepted — including one
+    issued to an unrelated application. Inert until GOOGLE_TOKEN_AUDIENCE is configured, so
+    existing programmatic clients keep working until the deployment sets it.
+    """
+    expected = getattr(settings, "google_token_audience", None)
+    if not expected:
+        logger.warning(
+            "GOOGLE_TOKEN_AUDIENCE is not set: accepting a Google id_token without verifying "
+            "it was issued for this service"
+        )
+        return True
+    if payload.get("aud") not in expected:
+        logger.warning("Google token audience not allowed: %s", payload.get("aud"))
+        return False
+    return True
+
+
 def _validate_keycloak_token(token: str, settings) -> bool:
     """Validate a Keycloak-issued OAuth 2.1 access token.
 
@@ -270,6 +291,8 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                 payload = id_token.verify_oauth2_token(token, _get_google_request())
             except ValueError as e:
                 logger.warning("invalid bearer token: %s", e)
+                return False
+            if not _audience_allowed(payload, settings):
                 return False
             if not payload.get("email_verified", False):
                 logger.warning("Email not verified")
