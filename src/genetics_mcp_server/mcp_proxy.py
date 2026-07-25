@@ -7,6 +7,7 @@ and creates wrapper functions that forward calls.
 
 import asyncio
 import json
+import keyword
 import logging
 import os
 import sys
@@ -293,35 +294,48 @@ def _json_type_to_python(json_type: str, is_required: bool = True) -> str:
     return py_type
 
 
-def _build_function_signature(input_schema: dict) -> tuple[list[str], list[str]]:
+def _is_safe_identifier(name: str) -> bool:
+    """A name is only safe to interpolate into generated source if it is a bare identifier."""
+    return bool(name) and name.isidentifier() and not keyword.iskeyword(name)
+
+
+def _build_function_signature(input_schema: dict) -> tuple[list[str], list[str], list[Any]]:
     """
     Build function parameter strings from JSON schema.
 
+    Everything interpolated into the generated source is either a validated identifier or a
+    fixed type name from _json_type_to_python's table. Default *values* are never rendered as
+    source — they are passed through the `_defaults` list and referenced by index — because a
+    remote server controls them and `{default}` would otherwise be executed as Python.
+
     Returns:
-        Tuple of (required_params, optional_params) as strings
+        Tuple of (required_params, optional_params, defaults) — defaults is the list the
+        generated source indexes into, and must be bound as `_defaults` in the exec namespace.
+
+    Raises:
+        ValueError: if the schema declares a property name that is not a bare identifier.
     """
     properties = input_schema.get("properties", {})
     required = set(input_schema.get("required", []))
 
     required_params = []
     optional_params = []
+    defaults: list[Any] = []
 
     for param_name, param_info in properties.items():
+        if not _is_safe_identifier(param_name):
+            raise ValueError(f"unsafe parameter name from remote server: {param_name!r}")
+
         param_type = param_info.get("type", "string")
         py_type = _json_type_to_python(param_type, param_name in required)
 
         if param_name in required:
             required_params.append(f"{param_name}: {py_type}")
         else:
-            default = param_info.get("default")
-            if default is None:
-                optional_params.append(f"{param_name}: {py_type} = None")
-            elif isinstance(default, str):
-                optional_params.append(f"{param_name}: {py_type} = {default!r}")
-            else:
-                optional_params.append(f"{param_name}: {py_type} = {default}")
+            defaults.append(param_info.get("default"))
+            optional_params.append(f"{param_name}: {py_type} = _defaults[{len(defaults) - 1}]")
 
-    return required_params, optional_params
+    return required_params, optional_params, defaults
 
 
 def register_proxy_tools(mcp, proxy_client: MCPProxyClient, exclude_tools: set[str] | None = None):
@@ -351,24 +365,40 @@ def register_proxy_tools(mcp, proxy_client: MCPProxyClient, exclude_tools: set[s
         description = tool.get("description", f"Proxy tool: {original_name}")
         input_schema = tool.get("inputSchema", {})
 
-        # build function with proper type hints using exec
-        required_params, optional_params = _build_function_signature(input_schema)
+        # the tool name, its parameter names, its description and its defaults all come from
+        # the remote server. Only validated identifiers may reach the generated source; the
+        # description and the upstream tool name are bound into the namespace and attached
+        # afterwards, so no remote string can close the docstring or the string literal and
+        # have the remainder executed as Python.
+        if not _is_safe_identifier(prefixed_name):
+            logger.error(f"Skipping proxy tool with unsafe name: {prefixed_name!r}")
+            continue
+
+        try:
+            required_params, optional_params, defaults = _build_function_signature(input_schema)
+        except ValueError as e:
+            logger.error(f"Skipping proxy tool {prefixed_name}: {e}")
+            continue
+
         all_params = required_params + optional_params
         params_str = ", ".join(all_params) if all_params else ""
 
-        # create the function code
         func_code = f'''
 async def {prefixed_name}({params_str}) -> dict:
-    """{description}"""
     kwargs = {{k: v for k, v in locals().items() if v is not None}}
-    return await _proxy_client.call_tool("{original_name}", kwargs)
+    return await _proxy_client.call_tool(_original_name, kwargs)
 '''
 
-        # execute in a namespace with the proxy_client
-        namespace = {"_proxy_client": proxy_client, "Any": Any}
+        namespace = {
+            "_proxy_client": proxy_client,
+            "_original_name": original_name,
+            "_defaults": defaults,
+            "Any": Any,
+        }
         try:
             exec(func_code, namespace)
             proxy_func = namespace[prefixed_name]
+            proxy_func.__doc__ = description
 
             # register using decorator
             mcp.tool()(proxy_func)
