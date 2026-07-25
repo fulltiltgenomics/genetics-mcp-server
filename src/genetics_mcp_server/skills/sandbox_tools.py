@@ -14,14 +14,12 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_INTERPRETERS = {"python3", "Rscript", "bash"}
 
-# environment variables to strip from script execution
-_SENSITIVE_ENV_PREFIXES = (
-    "ANTHROPIC_",
-    "OPENAI_",
-    "TAVILY_",
-    "PERPLEXITY_",
-    "MCP_API_KEY",
-    "GOOGLE_",
+# Environment passed to model-authored scripts, as an allow-list. This was previously a
+# deny-list of key prefixes, which missed INTERNAL_API_SECRET (the credential that
+# authenticates as "mcp-tool" to results-api) along with the internal service URLs — every
+# variable nobody thought to add stayed exposed. Anything not named here is dropped.
+_ALLOWED_ENV_KEYS = frozenset(
+    {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TZ", "TERM", "PWD", "SHELL", "USER"}
 )
 
 
@@ -45,14 +43,8 @@ def _validate_path(path: str, allowed_paths: list[str]) -> Path:
 
 
 def _make_safe_env() -> dict[str, str]:
-    """Create an environment dict with sensitive variables removed."""
-    env = dict(os.environ)
-    keys_to_remove = [
-        k for k in env if any(k.startswith(prefix) for prefix in _SENSITIVE_ENV_PREFIXES)
-    ]
-    for k in keys_to_remove:
-        del env[k]
-    return env
+    """Build the script environment from an allow-list, so nothing leaks by omission."""
+    return {k: v for k, v in os.environ.items() if k in _ALLOWED_ENV_KEYS}
 
 
 async def read_file(path: str, allowed_paths: list[str]) -> dict[str, Any]:
