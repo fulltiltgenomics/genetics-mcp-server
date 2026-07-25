@@ -576,8 +576,8 @@ report (`report.md`) plus an eval dataset. With `--output-dir` it also writes a
 local-dev `metrics.json` (consumed by `plot_conversation_scores.py` for
 quality-over-time plots).
 
-- **Models** (env-overridable): topic classification uses Haiku
-  (`$ANALYZE_TOPIC_MODEL`), the quality judge uses Sonnet (`$ANALYZE_QUALITY_MODEL`).
+- **Models** (env-overridable): both topic classification (`$ANALYZE_TOPIC_MODEL`)
+  and the quality judge (`$ANALYZE_QUALITY_MODEL`) default to Opus 5.
   CLI flags `--topic-model` / `--quality-model` override the env defaults.
 - **LLM-as-judge** evaluates each conversation. The judge is given today's date and
   is told it cannot see raw tool output, so it must not flag real (precise, recent)

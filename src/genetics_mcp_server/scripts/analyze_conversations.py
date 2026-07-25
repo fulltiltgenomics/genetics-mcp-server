@@ -225,12 +225,14 @@ def categorize_by_keywords(text: str) -> tuple[str, float]:
 
 # USD per million tokens, (input, output). Keep in sync with model defaults below.
 MODEL_PRICING = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0),
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-sonnet-4-6": (3.0, 15.0),
 }
-# fall back to Sonnet-tier pricing for unknown models so cost isn't silently understated
-DEFAULT_PRICING = (3.0, 15.0)
+# fall back to Opus-tier pricing for unknown models so cost isn't silently understated
+DEFAULT_PRICING = (5.0, 25.0)
 
 
 @dataclass
@@ -289,7 +291,7 @@ class CostTracker:
 
 async def categorize_with_llm(
     session_first_messages: list[dict[str, str]],
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-opus-5",
     cost_tracker: "CostTracker | None" = None,
 ) -> dict[str, dict]:
     """Categorize conversations using Anthropic API.
@@ -358,7 +360,7 @@ async def categorize_with_llm(
 
 async def categorize_issues_with_llm(
     issues: list[str],
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-opus-5",
     cost_tracker: "CostTracker | None" = None,
 ) -> dict[str, str]:
     """Map detailed free-text quality issues onto a fixed taxonomy.
@@ -498,7 +500,7 @@ def _format_conversation_for_eval(
 async def evaluate_quality_with_llm(
     session_ids: list[str],
     messages: pl.DataFrame,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-opus-5",
     cost_tracker: "CostTracker | None" = None,
 ) -> dict[str, dict]:
     """Evaluate conversation quality using Anthropic API.
@@ -1292,11 +1294,11 @@ async def main():
     parser.add_argument("--no-llm", action="store_true",
                         help="Use keyword categorization instead of LLM")
     parser.add_argument("--topic-model",
-                        default=os.getenv("ANALYZE_TOPIC_MODEL", "claude-haiku-4-5-20251001"),
-                        help="Anthropic model for topic classification (cheap task). "
+                        default=os.getenv("ANALYZE_TOPIC_MODEL", "claude-opus-5"),
+                        help="Anthropic model for topic classification. "
                              "Defaults to $ANALYZE_TOPIC_MODEL if set.")
     parser.add_argument("--quality-model",
-                        default=os.getenv("ANALYZE_QUALITY_MODEL", "claude-sonnet-4-6"),
+                        default=os.getenv("ANALYZE_QUALITY_MODEL", "claude-opus-5"),
                         help="Anthropic model for quality evaluation (judge task). "
                              "Defaults to $ANALYZE_QUALITY_MODEL if set.")
     parser.add_argument("--start-from", default=None,

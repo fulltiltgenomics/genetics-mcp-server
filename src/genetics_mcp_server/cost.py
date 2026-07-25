@@ -1,9 +1,10 @@
 """Estimate API call cost from Anthropic token usage."""
 
-# pricing per million tokens (USD) as of 2025
+# pricing per million tokens (USD)
 # format: model_prefix -> (input, output, cache_read, cache_creation)
+# Opus is priced for Opus 4.5 and later (Opus 5 is $5/$25); pre-4.5 Opus was $15/$75.
 _PRICING: dict[str, tuple[float, float, float, float]] = {
-    "claude-opus":   (15.0, 75.0, 1.50, 18.75),
+    "claude-opus":   (5.0,  25.0, 0.50, 6.25),
     "claude-sonnet": (3.0,  15.0, 0.30, 3.75),
     "claude-haiku":  (0.80, 4.0,  0.08, 1.0),
 }

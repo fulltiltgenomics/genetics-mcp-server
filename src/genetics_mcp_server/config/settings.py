@@ -55,7 +55,7 @@ class Settings:
     # LLM defaults
     default_provider: str = "anthropic"
     default_model: str = field(
-        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-sonnet-4-6")
+        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-opus-5")
     )
     fast_model: str = "claude-haiku-4-5"
     max_tokens: int = 8192
@@ -273,7 +273,8 @@ class Settings:
 # assume every Opus from that version onward (4.7+, 5.x, …) rejects it.
 # Claude Fable models don't support temperature at all.
 _OPUS_TEMPERATURE_FLOOR = (4, 7)
-_OPUS_VERSION_RE = re.compile(r"claude-opus-(\d+)-(\d+)")
+# minor version is optional: Opus 5 and later ship as "claude-opus-5", not "claude-opus-5-0"
+_OPUS_VERSION_RE = re.compile(r"claude-opus-(\d+)(?:-(\d+))?")
 _FABLE_RE = re.compile(r"claude-fable-")
 
 
@@ -283,7 +284,7 @@ def model_rejects_temperature(model: str) -> bool:
         return True
     match = _OPUS_VERSION_RE.search(model)
     if match:
-        version = (int(match.group(1)), int(match.group(2)))
+        version = (int(match.group(1)), int(match.group(2) or 0))
         return version >= _OPUS_TEMPERATURE_FLOOR
     return False
 

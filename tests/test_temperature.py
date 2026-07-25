@@ -15,6 +15,8 @@ from genetics_mcp_server.config import settings as settings_module
         ("claude-fable-7", True),
         ("claude-opus-4-7", True),
         ("claude-opus-4-8", True),
+        ("claude-opus-5", True),
+        ("claude-opus-6", True),
         ("claude-opus-4-6", False),
         ("claude-sonnet-4-6", False),
         ("claude-haiku-4-5", False),
