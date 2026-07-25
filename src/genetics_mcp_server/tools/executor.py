@@ -2324,7 +2324,7 @@ class ToolExecutor:
         """Search scientific literature via Europe PMC or Perplexity."""
         selected_backend = (
             backend
-            or os.environ.get("LITERATURE_SEARCH_BACKEND", "europepmc")
+            or os.environ.get("LITERATURE_SEARCH_BACKEND", "perplexity")
         ).lower()
 
         if selected_backend == "perplexity":
@@ -2333,23 +2333,29 @@ class ToolExecutor:
                 logger.error("Perplexity backend requested but PERPLEXITY_API_KEY not configured")
                 return {
                     "success": False,
+                    "backend": "perplexity",
                     "error": "Literature search with Perplexity is currently unavailable (API key not configured)",
                 }
             try:
-                return await self._search_perplexity_literature(
+                result = await self._search_perplexity_literature(
                     query, max_results, perplexity_api_key, include_preprints, date_range
                 )
             except Exception as e:
                 logger.error(f"Perplexity search failed: {e}")
                 return {
                     "success": False,
+                    "backend": "perplexity",
                     "error": f"Literature search with Perplexity is currently unavailable: {e}",
                 }
+        else:
+            result = await self._search_europepmc_literature(
+                query, max_results, include_preprints, date_range
+            )
 
-        # europepmc backend
-        return await self._search_europepmc_literature(
-            query, max_results, include_preprints, date_range
-        )
+        # the caller-supplied `backend` argument may have been overridden upstream, so the
+        # response states which API was actually queried rather than which one was asked for
+        result["backend"] = selected_backend
+        return result
 
     async def _search_europepmc_literature(
         self,
@@ -2467,7 +2473,9 @@ class ToolExecutor:
 
         if resp.status_code == 200:
             data = resp.json()
-            return self._format_perplexity_literature_results(data, query, max_results)
+            formatted = self._format_perplexity_literature_results(data, query, max_results)
+            await self._hydrate_literature_metadata(formatted["results"])
+            return formatted
 
         raise Exception(f"Perplexity API error: HTTP {resp.status_code}")
 
@@ -2481,31 +2489,43 @@ class ToolExecutor:
         import re
 
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        citations = data.get("citations", [])
+        search_results = data.get("search_results") or []
+        citations = data.get("citations") or []
+        # search_results carries title/date/snippet per hit; citations is a bare URL list
+        entries = search_results or [{"url": url} for url in citations]
 
         results = []
-        for i, url in enumerate(citations[:max_results]):
-            # extract DOI/PMID from URL if possible
+        for entry in entries[:max_results]:
+            url = entry.get("url") or ""
+
+            # extract DOI/PMID/PMCID from URL if possible
             doi = None
             pmid = None
+            pmcid = None
             if "doi.org/" in url:
                 doi = url.split("doi.org/")[-1]
             if "pubmed.ncbi.nlm.nih.gov/" in url:
                 match = re.search(r"/(\d+)", url)
                 if match:
                     pmid = match.group(1)
+            match = re.search(r"(PMC\d+)", url)
+            if match:
+                pmcid = match.group(1)
 
             is_preprint = "biorxiv.org" in url or "medrxiv.org" in url
+            date = entry.get("date") or ""
 
             results.append({
-                "title": "",
+                "title": entry.get("title") or "",
                 "authors": "",
                 "journal": "",
-                "year": "",
-                "abstract": "",
+                "year": date[:4],
+                "abstract": entry.get("snippet") or "",
                 "doi": doi,
                 "pmid": pmid,
+                "pmcid": pmcid,
                 "source": "perplexity",
+                "metadata_source": "perplexity",
                 "is_preprint": is_preprint,
                 "url": url,
             })
@@ -2513,12 +2533,71 @@ class ToolExecutor:
         return {
             "success": True,
             "query": query,
-            "total_found": len(citations),
+            "total_found": len(entries),
             "returned": len(results),
             "results": results,
             "summary": content,
             "source": "perplexity",
         }
+
+    async def _hydrate_literature_metadata(self, results: list[dict]) -> None:
+        """Fill in authors/journal/title for Perplexity hits that carry a PMID, DOI or PMCID.
+
+        Perplexity returns no bibliographic metadata beyond a title, so records are looked up
+        in Europe PMC in one batched query. Best-effort: the hits stay usable if it fails.
+        """
+        clauses = []
+        for record in results:
+            if record.get("pmid"):
+                clauses.append(f"EXT_ID:{record['pmid']}")
+            elif record.get("doi"):
+                clauses.append(f'DOI:"{record["doi"]}"')
+            elif record.get("pmcid"):
+                clauses.append(f"PMCID:{record['pmcid']}")
+
+        if not clauses:
+            return
+
+        url = (
+            f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+            f"?query={quote(' OR '.join(clauses))}"
+            f"&format=json"
+            f"&pageSize={len(clauses)}"
+            f"&resultType=core"
+        )
+
+        try:
+            resp = await self.external_client.get(url, timeout=15.0)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Literature metadata hydration skipped: Europe PMC HTTP {resp.status_code}"
+                )
+                return
+            records = resp.json().get("resultList", {}).get("result", [])
+        except Exception as e:
+            logger.warning(f"Literature metadata hydration failed: {e}")
+            return
+
+        by_id: dict[str, dict] = {}
+        for raw, paper in zip(records, self._format_literature_results(records)):
+            for key in (raw.get("pmid"), (raw.get("doi") or "").lower(), raw.get("pmcid")):
+                if key:
+                    by_id[key] = paper
+
+        for record in results:
+            match = (
+                by_id.get(record.get("pmid") or "")
+                or by_id.get((record.get("doi") or "").lower())
+                or by_id.get(record.get("pmcid") or "")
+            )
+            if not match:
+                continue
+            for field in ("title", "authors", "journal", "year", "abstract"):
+                if match.get(field):
+                    record[field] = match[field]
+            record["doi"] = record.get("doi") or match.get("doi")
+            record["pmid"] = record.get("pmid") or match.get("pmid")
+            record["metadata_source"] = "europepmc"
 
     async def web_search(
         self,

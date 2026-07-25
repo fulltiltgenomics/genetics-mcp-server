@@ -44,7 +44,7 @@ class Settings:
         default_factory=lambda: os.environ.get("PERPLEXITY_API_KEY")
     )
     literature_search_backend: str = field(
-        default_factory=lambda: os.environ.get("LITERATURE_SEARCH_BACKEND", "europepmc")
+        default_factory=lambda: os.environ.get("LITERATURE_SEARCH_BACKEND", "perplexity")
     )
 
     # branding

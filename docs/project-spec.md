@@ -119,6 +119,10 @@ The external search tools split into two conceptually distinct families:
 - **Literature backends** (`search_scientific_literature`): query a paper-indexing API — either `europepmc` (covers PubMed, Europe PMC, bioRxiv, medRxiv) or `perplexity` (broader scientific web). Exactly one backend is queried per call; "backend" is the API hit, not the content source indexed.
 - **Structured curated databases** (`search_mgi`): query a curated biological database that returns structured records (genes, phenotypes, alleles, orthologs) rather than papers. Complements — does not replace — the literature backends.
 
+**Backend selection** resolves in this order, first match wins: the request-level `literature_backend` in the chat API body (the web UI always sends it, defaulting to `perplexity`), which `LLMService._execute_tool` injects over whatever the model asked for; then the model's own `backend` tool argument; then `LITERATURE_SEARCH_BACKEND`; then the built-in default `perplexity`. Because the request-level value silently replaces the model's choice, every response carries a `backend` field naming the API that actually ran — this field, not the requested argument, is what the model must report — and an overridden call additionally carries a `backend_note` stating the substitution. (Before this was added, the model reported the backend it had requested and confabulated hybrid labels around the mismatch.)
+
+**Perplexity result metadata**: the Sonar response gives a `search_results` list (title, date, snippet, url) plus a prose `summary`; it carries no authors or journal. Records that expose a PMID, DOI or PMCID in their URL are therefore hydrated in one batched Europe PMC lookup (`_hydrate_literature_metadata`) filling authors/journal/year/title/abstract, so citations can be rendered as author-year markdown links. Hydration is best-effort — a Europe PMC failure leaves the Perplexity-supplied title/year/snippet intact. Each record reports `source: perplexity` (the API searched) and `metadata_source` (`perplexity` or `europepmc`, where the bibliographic details came from); hydration never changes which backend was searched.
+
 | Tool | Description |
 |------|-------------|
 | `search_scientific_literature` | Search PubMed/bioRxiv via Europe PMC or Perplexity |
@@ -418,7 +422,7 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|
 | `TAVILY_API_KEY` | Tavily API key for web search |
 | `PERPLEXITY_API_KEY` | Perplexity API key for literature search |
-| `LITERATURE_SEARCH_BACKEND` | Backend: `europepmc` (default) or `perplexity` |
+| `LITERATURE_SEARCH_BACKEND` | Backend when the caller specifies none: `perplexity` (default) or `europepmc` |
 
 ### Database and storage
 
