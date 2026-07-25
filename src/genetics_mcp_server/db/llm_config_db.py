@@ -65,6 +65,8 @@ class UserApiToken:
     created_at: datetime
     last_used_at: datetime | None
     is_active: bool
+    # rolling idle deadline; None means expiry is disabled for this token
+    expires_at: datetime | None = None
 
 
 class LLMConfigDB(object, metaclass=Singleton):
@@ -266,8 +268,9 @@ class LLMConfigDB(object, metaclass=Singleton):
 
         # tokens were originally issued with no expiry, so a leaked one stayed valid forever
         # unless the user noticed and revoked it. Added by migration rather than in the CREATE
-        # above so existing databases pick it up; pre-existing rows keep a NULL expires_at and
-        # are treated as non-expiring so this does not lock anyone out on deploy.
+        # above so existing databases pick it up. expires_at holds a *rolling* deadline that
+        # every successful validation pushes forward (see validate_api_token), so a token in
+        # regular use never expires while an abandoned one does.
         cursor.execute("PRAGMA table_info(user_api_tokens)")
         if "expires_at" not in {row["name"] for row in cursor.fetchall()}:
             cursor.execute("ALTER TABLE user_api_tokens ADD COLUMN expires_at TIMESTAMP")
@@ -548,15 +551,31 @@ class LLMConfigDB(object, metaclass=Singleton):
     def _hash_token(token: str) -> str:
         return hashlib.sha256(token.encode()).hexdigest()
 
+    @staticmethod
+    def _idle_ttl_days() -> int:
+        """Days of inactivity after which a token expires. 0 disables expiry entirely."""
+        return int(os.environ.get("API_TOKEN_TTL_DAYS", "90"))
+
+    @staticmethod
+    def _as_utc(value: str) -> datetime:
+        """Parse a stored timestamp as UTC. SQLite's CURRENT_TIMESTAMP is naive UTC."""
+        parsed = datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _utc_stamp(value: datetime) -> str:
+        """Format as SQLite's own CURRENT_TIMESTAMP does, so the column stays sortable."""
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     def create_api_token(self, user_id: str, name: str | None = None) -> tuple[int, str]:
         """Create a new API token. Returns (token_id, plaintext_token)."""
         plaintext = secrets.token_urlsafe(32)
         token_hash = self._hash_token(plaintext)
         token_prefix = plaintext[:8]
 
-        ttl_days = int(os.environ.get("API_TOKEN_TTL_DAYS", "90"))
+        ttl_days = self._idle_ttl_days()
         expires_at = (
-            (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+            self._utc_stamp(datetime.now(timezone.utc) + timedelta(days=ttl_days))
             if ttl_days > 0
             else None
         )
@@ -577,7 +596,8 @@ class LLMConfigDB(object, metaclass=Singleton):
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, token_prefix, name, created_at, last_used_at, is_active
+            SELECT id, user_id, token_prefix, name, created_at, last_used_at,
+                   is_active, expires_at
             FROM user_api_tokens
             WHERE user_id = ?
             ORDER BY created_at DESC
@@ -590,13 +610,14 @@ class LLMConfigDB(object, metaclass=Singleton):
                 user_id=row["user_id"],
                 token_prefix=row["token_prefix"],
                 name=row["name"],
-                created_at=datetime.fromisoformat(row["created_at"]),
+                created_at=self._as_utc(row["created_at"]),
                 last_used_at=(
-                    datetime.fromisoformat(row["last_used_at"])
-                    if row["last_used_at"]
-                    else None
+                    self._as_utc(row["last_used_at"]) if row["last_used_at"] else None
                 ),
                 is_active=bool(row["is_active"]),
+                expires_at=(
+                    self._as_utc(row["expires_at"]) if row["expires_at"] else None
+                ),
             )
             for row in cursor.fetchall()
         ]
@@ -612,11 +633,17 @@ class LLMConfigDB(object, metaclass=Singleton):
         return cursor.rowcount > 0
 
     def validate_api_token(self, token: str) -> str | None:
-        """Validate a token and return user_id if valid, else None."""
+        """Validate a token and return user_id if valid, else None.
+
+        Expiry is an *idle* deadline, not an absolute one: a token dies
+        API_TOKEN_TTL_DAYS after its last use, and every successful validation pushes the
+        deadline forward. A token in regular use therefore never expires, while an abandoned
+        or leaked-and-unnoticed one stops working without the user having to rotate it.
+        """
         token_hash = self._hash_token(token)
         cursor = self._conn.cursor()
         cursor.execute(
-            "SELECT id, user_id, expires_at FROM user_api_tokens "
+            "SELECT id, user_id, created_at, last_used_at, expires_at FROM user_api_tokens "
             "WHERE token_hash = ? AND is_active = 1",
             (token_hash,),
         )
@@ -624,19 +651,27 @@ class LLMConfigDB(object, metaclass=Singleton):
         if row is None:
             return None
 
-        # NULL expires_at = issued before token expiry existed; treated as non-expiring
-        if row["expires_at"]:
-            expires_at = datetime.fromisoformat(row["expires_at"])
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at <= datetime.now(timezone.utc):
-                logger.info("rejected expired API token id=%s", row["id"])
+        ttl_days = self._idle_ttl_days()
+        now = datetime.now(timezone.utc)
+
+        if ttl_days > 0:
+            if row["expires_at"]:
+                deadline = self._as_utc(row["expires_at"])
+            else:
+                # issued before expiry existed: derive the deadline from the last activity we
+                # know about, so an actively-used legacy token is not killed on first contact
+                last_activity = row["last_used_at"] or row["created_at"]
+                deadline = self._as_utc(last_activity) + timedelta(days=ttl_days)
+            if deadline <= now:
+                logger.info("rejected idle-expired API token id=%s", row["id"])
                 return None
 
-        # update last_used_at
+        new_expires_at = (
+            self._utc_stamp(now + timedelta(days=ttl_days)) if ttl_days > 0 else None
+        )
         cursor.execute(
-            "UPDATE user_api_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (row["id"],),
+            "UPDATE user_api_tokens SET last_used_at = ?, expires_at = ? WHERE id = ?",
+            (self._utc_stamp(now), new_expires_at, row["id"]),
         )
         self._conn.commit()
         return row["user_id"]

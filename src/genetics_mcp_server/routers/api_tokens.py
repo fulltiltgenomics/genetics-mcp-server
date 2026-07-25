@@ -37,6 +37,8 @@ class TokenResponse(BaseModel):
     created_at: str
     last_used_at: Optional[str]
     is_active: bool
+    # rolling idle deadline: pushed forward on every use, null when expiry is disabled
+    expires_at: Optional[str] = None
 
 
 @router.post("/tokens", response_model=TokenCreateResponse)
@@ -78,6 +80,7 @@ async def list_tokens(user: str = Depends(auth_required)):
             created_at=t.created_at.isoformat(),
             last_used_at=t.last_used_at.isoformat() if t.last_used_at else None,
             is_active=t.is_active,
+            expires_at=t.expires_at.isoformat() if t.expires_at else None,
         )
         for t in tokens
     ]

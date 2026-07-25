@@ -1,5 +1,6 @@
 """Unit tests for database layer."""
 
+from datetime import datetime, timedelta, timezone
 
 
 class TestChatHistoryDB:
@@ -543,3 +544,95 @@ class TestLLMConfigDB:
         settings = llm_config_db.get_user_settings("user@example.com")
         # deleted settings should not appear
         assert "backend" not in settings
+
+
+class TestUserApiTokenExpiry:
+    """Tests for the idle (rolling) expiry on per-user API tokens.
+
+    Expiry is measured from a token's last use, so a token in regular use never expires
+    while an abandoned one does. `expires_at` is rewritten on every successful validation.
+    """
+
+    @staticmethod
+    def _set_last_activity(db, token_id: int, days_ago: int):
+        """Backdate a token as if it had last been used `days_ago` days ago."""
+        stamp = db._utc_stamp(datetime.now(timezone.utc) - timedelta(days=days_ago))
+        cursor = db._conn.cursor()
+        cursor.execute(
+            "UPDATE user_api_tokens SET last_used_at = ?, created_at = ?, expires_at = NULL "
+            "WHERE id = ?",
+            (stamp, stamp, token_id),
+        )
+        db._conn.commit()
+
+    def test_fresh_token_validates(self, llm_config_db, monkeypatch):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        _, plaintext = llm_config_db.create_api_token("user@example.com")
+
+        assert llm_config_db.validate_api_token(plaintext) == "user@example.com"
+
+    def test_use_pushes_the_deadline_forward(self, llm_config_db, monkeypatch):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token("user@example.com")
+
+        # 89 days idle: still inside the window, and using it should reset the clock
+        self._set_last_activity(llm_config_db, token_id, 89)
+        assert llm_config_db.validate_api_token(plaintext) == "user@example.com"
+
+        expires_at = next(
+            t.expires_at
+            for t in llm_config_db.list_api_tokens("user@example.com")
+            if t.id == token_id
+        )
+        remaining = expires_at - datetime.now(timezone.utc)
+        assert timedelta(days=89) < remaining <= timedelta(days=90)
+
+    def test_idle_token_expires(self, llm_config_db, monkeypatch):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token("user@example.com")
+
+        self._set_last_activity(llm_config_db, token_id, 91)
+        assert llm_config_db.validate_api_token(plaintext) is None
+
+    def test_legacy_token_without_expires_at_is_judged_on_last_use(
+        self, llm_config_db, monkeypatch
+    ):
+        """Rows predating the expiry column must not be killed off if still in active use."""
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token("user@example.com")
+
+        # created long ago but used yesterday — an actively-used legacy token
+        cursor = llm_config_db._conn.cursor()
+        cursor.execute(
+            "UPDATE user_api_tokens SET created_at = ?, last_used_at = ?, expires_at = NULL "
+            "WHERE id = ?",
+            (
+                llm_config_db._utc_stamp(datetime.now(timezone.utc) - timedelta(days=400)),
+                llm_config_db._utc_stamp(datetime.now(timezone.utc) - timedelta(days=1)),
+                token_id,
+            ),
+        )
+        llm_config_db._conn.commit()
+
+        assert llm_config_db.validate_api_token(plaintext) == "user@example.com"
+
+    def test_ttl_zero_disables_expiry(self, llm_config_db, monkeypatch):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "0")
+        token_id, plaintext = llm_config_db.create_api_token("user@example.com")
+
+        self._set_last_activity(llm_config_db, token_id, 5000)
+        assert llm_config_db.validate_api_token(plaintext) == "user@example.com"
+
+        expires_at = next(
+            t.expires_at
+            for t in llm_config_db.list_api_tokens("user@example.com")
+            if t.id == token_id
+        )
+        assert expires_at is None
+
+    def test_revoked_token_stays_invalid(self, llm_config_db, monkeypatch):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token("user@example.com")
+        llm_config_db.revoke_api_token("user@example.com", token_id)
+
+        assert llm_config_db.validate_api_token(plaintext) is None
