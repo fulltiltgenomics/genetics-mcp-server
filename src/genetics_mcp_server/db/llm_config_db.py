@@ -6,14 +6,18 @@ of who changed what, when, and why.
 """
 
 import hashlib
+import logging
+import os
 import secrets
 import sqlite3
 import threading
 from collections import defaultdict as dd
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from .singleton import Singleton
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -259,6 +263,14 @@ class LLMConfigDB(object, metaclass=Singleton):
             ON user_api_tokens(token_hash, is_active)
         """
         )
+
+        # tokens were originally issued with no expiry, so a leaked one stayed valid forever
+        # unless the user noticed and revoked it. Added by migration rather than in the CREATE
+        # above so existing databases pick it up; pre-existing rows keep a NULL expires_at and
+        # are treated as non-expiring so this does not lock anyone out on deploy.
+        cursor.execute("PRAGMA table_info(user_api_tokens)")
+        if "expires_at" not in {row["name"] for row in cursor.fetchall()}:
+            cursor.execute("ALTER TABLE user_api_tokens ADD COLUMN expires_at TIMESTAMP")
 
         self._conn.commit()
 
@@ -542,13 +554,20 @@ class LLMConfigDB(object, metaclass=Singleton):
         token_hash = self._hash_token(plaintext)
         token_prefix = plaintext[:8]
 
+        ttl_days = int(os.environ.get("API_TOKEN_TTL_DAYS", "90"))
+        expires_at = (
+            (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+            if ttl_days > 0
+            else None
+        )
+
         cursor = self._conn.cursor()
         cursor.execute(
             """
-            INSERT INTO user_api_tokens (user_id, token_hash, token_prefix, name)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO user_api_tokens (user_id, token_hash, token_prefix, name, expires_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, token_hash, token_prefix, name),
+            (user_id, token_hash, token_prefix, name, expires_at),
         )
         self._conn.commit()
         return cursor.lastrowid, plaintext
@@ -597,12 +616,22 @@ class LLMConfigDB(object, metaclass=Singleton):
         token_hash = self._hash_token(token)
         cursor = self._conn.cursor()
         cursor.execute(
-            "SELECT id, user_id FROM user_api_tokens WHERE token_hash = ? AND is_active = 1",
+            "SELECT id, user_id, expires_at FROM user_api_tokens "
+            "WHERE token_hash = ? AND is_active = 1",
             (token_hash,),
         )
         row = cursor.fetchone()
         if row is None:
             return None
+
+        # NULL expires_at = issued before token expiry existed; treated as non-expiring
+        if row["expires_at"]:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
+                logger.info("rejected expired API token id=%s", row["id"])
+                return None
 
         # update last_used_at
         cursor.execute(
