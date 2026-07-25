@@ -1,5 +1,6 @@
 """FastAPI dependencies for authentication."""
 
+import hmac
 import logging
 import os
 
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 # when True, require X-Goog-Authenticated-User-Email header (set by IAP or oauth2-proxy)
 _require_auth = os.environ.get("REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
+_internal_api_secret = os.environ.get("INTERNAL_API_SECRET", "")
 
 
 def is_public_endpoint(request: Request) -> bool:
@@ -31,9 +33,16 @@ async def auth_required(request: Request) -> str | None:
     if is_public_endpoint(request):
         return None
 
-    # allow internal MCP tool calls
-    if request.headers.get("X-Internal-MCP-Call") == "true":
-        return "mcp-tool"
+    # internal service-to-service calls authenticate with the shared secret. This used to
+    # accept a bare `X-Internal-MCP-Call: true` request header, which any client could send —
+    # full authentication for anyone the auth-gateway forgot to strip it for. Nothing in the
+    # stack ever sent that header; the real internal callers all use the bearer secret.
+    if _internal_api_secret:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer ") and hmac.compare_digest(
+            auth_header[7:], _internal_api_secret
+        ):
+            return "mcp-tool"
 
     user = get_authenticated_user(request)
     if user is None:

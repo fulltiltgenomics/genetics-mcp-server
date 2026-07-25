@@ -102,9 +102,11 @@ class TokenValidateRequest(BaseModel):
 @router.post("/tokens/validate")
 async def validate_token(body: TokenValidateRequest, request: Request):
     """Validate a token and return the user_id. Internal use only."""
-    # only allow internal callers
-    is_internal = request.headers.get("X-Internal-MCP-Call") == "true"
-    if not is_internal and _internal_api_secret:
+    # only allow internal callers. The `X-Internal-MCP-Call: true` header used to be accepted
+    # here as an alternative — a client-suppliable header is not an authenticator, and no
+    # caller ever sent it, so the shared secret is now the only way in.
+    is_internal = False
+    if _internal_api_secret:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             is_internal = hmac.compare_digest(auth_header[7:], _internal_api_secret)
