@@ -600,8 +600,10 @@ class LLMService:
                 # emit tool-use indicators to stream
                 for tool_use in tool_uses:
                     effective_input = dict(tool_use.input)
-                    if tool_use.name == "search_scientific_literature" and literature_backend:
-                        effective_input["backend"] = literature_backend
+                    if tool_use.name == "search_scientific_literature":
+                        effective_input.pop("backend", None)
+                        if literature_backend:
+                            effective_input["backend"] = literature_backend
                     if secret:
                         logger.info(f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)")
                     else:
@@ -809,27 +811,14 @@ class LLMService:
             if method is None:
                 return {"success": False, "error": f"Unknown tool: {tool_name}"}
 
-            # inject literature_backend for search_scientific_literature if specified
-            requested_backend = None
-            if tool_name == "search_scientific_literature" and literature_backend:
-                requested_backend = tool_input.get("backend")
-                tool_input = {**tool_input, "backend": literature_backend}
+            # the literature backend is the user's choice, never the model's: the tool exposes no
+            # `backend` argument, and any value the model invents is discarded here
+            if tool_name == "search_scientific_literature":
+                tool_input = {k: v for k, v in tool_input.items() if k != "backend"}
+                if literature_backend:
+                    tool_input["backend"] = literature_backend
 
-            result = await method(**tool_input)
-
-            # without this the model reports the backend it asked for, not the one that ran
-            if (
-                requested_backend
-                and isinstance(result, dict)
-                and requested_backend.lower() != literature_backend.lower()
-            ):
-                result["backend_note"] = (
-                    f"The requested '{requested_backend}' backend was overridden by the server "
-                    f"configuration: this call queried the '{literature_backend}' backend. "
-                    f"Report '{literature_backend}' as the backend for these results."
-                )
-
-            return result
+            return await method(**tool_input)
 
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}")

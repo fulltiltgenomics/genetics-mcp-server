@@ -9,6 +9,7 @@ import pytest
 
 from genetics_mcp_server.llm_service import LLMService
 from genetics_mcp_server.tools import ToolExecutor
+from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS
 from genetics_mcp_server.tools.executor import _ResilientAsyncClient
 
 PERPLEXITY_RESPONSE = {
@@ -207,8 +208,8 @@ class TestPerplexityMetadata:
         assert record["title"] == "Genetic variants associated with platelet count"
 
 
-class TestBackendOverrideNote:
-    """The model must learn when its requested backend was overridden."""
+class TestBackendIsCallerControlled:
+    """The backend is the user's setting; the model cannot select or influence it."""
 
     @pytest.fixture
     def service(self, monkeypatch):
@@ -218,7 +219,15 @@ class TestBackendOverrideNote:
         monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
         return service
 
-    async def test_note_added_when_overridden(self, service):
+    def test_tool_exposes_no_backend_parameter(self):
+        """A backend argument in the schema is what let the model ask for europepmc."""
+        tool = next(
+            t for t in TOOL_DEFINITIONS if t["name"] == "search_scientific_literature"
+        )
+        assert "backend" not in tool["parameters"]
+
+    async def test_model_supplied_backend_is_discarded(self, service):
+        """A hallucinated backend argument must not reach the executor."""
         result = await service._execute_tool(
             "search_scientific_literature",
             {"query": "platelet count", "backend": "europepmc"},
@@ -227,27 +236,25 @@ class TestBackendOverrideNote:
         await service.executor.close()
 
         assert result["backend"] == "perplexity"
-        assert "backend_note" in result
-        assert "'perplexity'" in result["backend_note"]
 
-    async def test_no_note_when_model_agrees(self, service):
-        result = await service._execute_tool(
-            "search_scientific_literature",
-            {"query": "platelet count", "backend": "perplexity"},
-            literature_backend="perplexity",
-        )
-        await service.executor.close()
-
-        assert result["backend"] == "perplexity"
-        assert "backend_note" not in result
-
-    async def test_no_note_when_model_omitted_backend(self, service):
+    async def test_user_choice_selects_europepmc(self, service):
         result = await service._execute_tool(
             "search_scientific_literature",
             {"query": "platelet count"},
-            literature_backend="perplexity",
+            literature_backend="europepmc",
+        )
+        await service.executor.close()
+
+        assert result["backend"] == "europepmc"
+
+    async def test_falls_back_to_perplexity_without_user_choice(self, service, monkeypatch):
+        monkeypatch.delenv("LITERATURE_SEARCH_BACKEND", raising=False)
+
+        result = await service._execute_tool(
+            "search_scientific_literature",
+            {"query": "platelet count", "backend": "europepmc"},
+            literature_backend=None,
         )
         await service.executor.close()
 
         assert result["backend"] == "perplexity"
-        assert "backend_note" not in result
