@@ -86,3 +86,48 @@ class TestCredibleSetIdentity:
 
     def test_empty_input(self):
         assert _summarize([]) == {"n_cs": 0, "cs": {}}
+
+
+class TestSummaryCounts:
+    """The counts block answers "how many X" without walking the credible-set list.
+
+    It has to sit before `cs` in the dict, since that list is what truncation eats.
+    """
+
+    def test_counts_precede_the_credible_set_list(self):
+        summary = _summarize([_row("chr5-1-2_1", "l1.CD4_T", 100, 0.9, 40.0)])
+        keys = list(summary)
+        assert keys.index("counts") < keys.index("cs")
+
+    def test_caqtl_counts_peaks_from_trait_original(self):
+        """trait is the linked gene on the QTL-gene endpoint; the peak is trait_original."""
+        summary = _summarize([
+            _row("chr5-1-2_1", "l1.CD4_T", 100, 0.9, 40.0),
+            _row("chr5-1-2_1", "l1.NK", 100, 0.8, 30.0),
+            _row("chr5-1-2_1", "l1.NK", 200, 0.2, 10.0),
+        ])
+        counts = summary["counts"]["caQTL"]
+        assert counts["n_credible_sets"] == 2
+        assert counts["n_associations"] == 3
+        assert counts["n_variants"] == 2
+        assert counts["n_cell_types"] == 2
+        assert counts["n_peaks"] == 1
+        assert counts["n_traits"] == 1
+
+    def test_counts_are_per_data_type(self):
+        summary = _summarize([
+            _row("chr5-1-2_1", "l1.CD4_T", 100, 0.9, 40.0),
+            _row("ENSG1_L1", "monocyte", 200, 0.9, 20.0,
+                 dataset="QTD000034", data_type="eQTL", trait="IL7R",
+                 resource="eqtl_catalogue"),
+        ])
+        assert summary["counts"]["caQTL"]["n_credible_sets"] == 1
+        assert summary["counts"]["eQTL"]["n_credible_sets"] == 1
+        assert "n_peaks" not in summary["counts"]["eQTL"]
+
+    def test_null_cell_type_is_not_counted_as_a_cell_type(self):
+        summary = _summarize([
+            _row("chr1:1-2_1", "NA", 1000, 0.9, 40.0, dataset="FinnGen_R13",
+                 data_type="GWAS", trait="K11_IBD_STRICT"),
+        ])
+        assert "n_cell_types" not in summary["counts"]["GWAS"]

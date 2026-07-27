@@ -84,7 +84,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "summarize": {
                 "type": "boolean",
-                "description": "If true, return credible set-level summary instead of variant-level data.",
+                "description": (
+                    "If true, return credible set-level summary instead of variant-level "
+                    "data. The summary carries a `counts` block with the per-data-type "
+                    "totals (credible sets, associations, variants, traits, cell types, and "
+                    "peaks for caQTL) — read those for any 'how many' question rather than "
+                    "counting the listed credible sets, which may be truncated."
+                ),
                 "default": True,
             },
         },
@@ -109,7 +115,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "summarize": {
                 "type": "boolean",
-                "description": "If true, return credible set-level summary instead of variant-level data.",
+                "description": (
+                    "If true, return credible set-level summary instead of variant-level "
+                    "data. The summary carries a `counts` block with the per-data-type "
+                    "totals (credible sets, associations, variants, traits, cell types, and "
+                    "peaks for caQTL) — read those for any 'how many' question rather than "
+                    "counting the listed credible sets, which may be truncated."
+                ),
                 "default": True,
             },
         },
@@ -198,7 +210,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "If true (the default), return credible set-level summary instead of "
                     "variant-level data. Keep it true for counting questions: the variant-level "
                     "result for a well-studied gene runs to millions of characters and is cut off "
-                    "before you see all of it."
+                    "before you see all of it. The summary carries a `counts` block with the "
+                    "per-data-type totals (credible sets, associations, variants, traits, cell "
+                    "types, and peaks for caQTL) — read those for any 'how many' question rather "
+                    "than counting the listed credible sets, which may be truncated."
                 ),
                 "default": True,
             },

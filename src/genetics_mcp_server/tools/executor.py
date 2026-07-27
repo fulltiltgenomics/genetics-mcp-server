@@ -3228,7 +3228,58 @@ class ToolExecutor:
             )
 
         total_cs = sum(len(cs_list) for cs_list in grouped.values())
-        return {"n_cs": total_cs, "cs": grouped}
+        return {
+            "n_cs": total_cs,
+            "counts": self._summary_counts(df, grouped),
+            "cs": grouped,
+        }
+
+    @staticmethod
+    def _summary_counts(df, grouped: dict[str, list]) -> dict[str, dict[str, int]]:
+        """Per-data-type distinct counts, derived from the full variant-level frame.
+
+        Placed before `cs` in the returned dict so it survives truncation: "how many
+        peaks / cell types / associations" then has a definitive answer even when the
+        per-credible-set list is cut off, instead of the model counting whatever rows
+        happened to fit and reporting that as the total.
+        """
+        import polars as pl
+
+        def _n_distinct(frame, column: str) -> int | None:
+            if column not in frame.columns:
+                return None
+            return frame[column].drop_nulls().n_unique()
+
+        counts: dict[str, dict[str, int]] = {}
+        for data_type, cs_list in grouped.items():
+            predicate = (
+                pl.col("data_type").is_null()
+                if data_type == "unknown"
+                else pl.col("data_type") == data_type
+            )
+            sub = df.filter(predicate)
+
+            variant_cols = [c for c in ("chr", "pos", "ref", "alt") if c in sub.columns]
+            entry: dict[str, int | None] = {
+                "n_credible_sets": len(cs_list),
+                # variant-level row count: what an equivalent BigQuery COUNT(*) returns
+                "n_associations": sub.height,
+                "n_variants": (
+                    sub.select(variant_cols).unique().height
+                    if len(variant_cols) == 4
+                    else None
+                ),
+                "n_traits": _n_distinct(sub, "trait"),
+                "n_cell_types": _n_distinct(sub, "cell_type"),
+                "n_datasets": _n_distinct(sub, "dataset"),
+            }
+            if data_type == "caQTL":
+                # the caQTL molecular trait is a chromatin peak. trait_original holds the
+                # peak id on every endpoint, while credible_sets_by_qtl_gene remaps trait
+                # to the linked gene, so the peak count must come from trait_original
+                entry["n_peaks"] = _n_distinct(sub, "trait_original")
+            counts[data_type] = {k: v for k, v in entry.items() if v}
+        return counts
 
     def _build_date_filter(self, date_range: str) -> str:
         """Build Europe PMC date filter clause."""
