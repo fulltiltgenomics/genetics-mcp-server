@@ -309,6 +309,9 @@ reasoning-heavy turn can exhaust the budget mid-sentence. Ignoring `stop_reason`
 indistinguishable from a completed answer: the loop broke, `done` was emitted, and the
 client persisted a truncated response with no error and no marker.
 
+Both loops send the same continuation instruction, `CONTINUE_TRUNCATED_PROMPT` in
+`config/defaults.py`.
+
 `thinking` is set explicitly to `{"type": "adaptive", "display": "summarized"}` for models
 that support it (`model_supports_adaptive_thinking()` in `settings.py`; the 4.6 generation
 and later) rather than relying on per-model defaults — Opus 5 thinks when the parameter is
@@ -384,6 +387,15 @@ Each skill has:
 **Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
 
 **Advertisement gated on availability**: `launch_subagents` is advertised to the LLM only when the subagent service actually initialized (`self.subagent_service is not None`), not merely when `ENABLE_SUBAGENTS` is set. The service requires a live Anthropic client + executor in addition to the flag, so `_stream_anthropic()` adds `launch_subagents` to the effective `disabled_tools` whenever the service is absent. This single source of truth prevents the LLM from seeing a tool that would return "subagent service isn't available" on call.
+
+**Report truncation**: the subagent loop applies the same `stop_reason` handling as the main
+chat loop (see "Turn termination and truncation"). A report stopped by the output cap is
+resumed up to `MAX_CONTINUATIONS` times, with the carried-over text prepended so the report
+reads as one piece. If it is still incomplete, `SubagentResult.truncated` is set, a
+`[TRUNCATED: ...]` marker is appended to the output, and the flag is passed through
+`run_subagents()` into the tool result — so the main agent knows it is reasoning over
+partial findings instead of treating a fragment as the subagent's complete answer.
+`skill.max_tokens` covers thinking as well as report text.
 
 **Cost and token tracking**: `SubagentResult` accumulates `input_tokens` and `output_tokens` across all iterations of a subagent's agentic loop. After `launch_subagents` completes, `llm_service.py` sums tokens across all subagent results and logs an aggregated cost estimate using the same `estimate_cost()` function as the main agent.
 

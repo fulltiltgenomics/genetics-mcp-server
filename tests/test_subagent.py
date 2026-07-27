@@ -513,6 +513,7 @@ class TestTokenAccumulation:
         settings.enable_script_execution = False
         settings.disabled_tools = set()
         settings.subagent_allowed_paths_list = []
+        settings.max_continuations = 3
         return settings
 
     def _make_message(self, text="done", tool_uses=None, input_tokens=100, output_tokens=50):
@@ -928,3 +929,109 @@ class TestSubagentIdInResults:
         assert result["success"] is True
         assert result["results"][0]["subagent_id"] == "sa-1"
         assert result["results"][1]["subagent_id"] == "sa-2"
+
+
+class TestSubagentTruncation:
+    """A report stopped by max_tokens must not be returned as complete findings."""
+
+    def _settings(self, max_continuations=3, subagent_model=""):
+        settings = MagicMock()
+        settings.subagent_model = subagent_model
+        settings.fast_model = "claude-haiku-4-5"
+        settings.temperature = None
+        settings.mcp_max_result_size = 50000
+        settings.subagent_timeout = 120
+        settings.subagent_script_timeout = 30
+        settings.enable_subagents = True
+        settings.enable_script_execution = False
+        settings.disabled_tools = set()
+        settings.subagent_allowed_paths_list = []
+        settings.max_continuations = max_continuations
+        return settings
+
+    def _message(self, text, stop_reason):
+        block = MagicMock()
+        block.type = "text"
+        block.text = text
+        block.model_dump.return_value = {"type": "text", "text": text}
+        msg = MagicMock()
+        msg.content = [block]
+        msg.stop_reason = stop_reason
+        msg.usage.input_tokens = 100
+        msg.usage.output_tokens = 50
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_truncated_report_is_continued(self):
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            side_effect=[
+                self._message("first half", "max_tokens"),
+                self._message(" second half", "end_turn"),
+            ]
+        )
+        service = SubagentService(mock_client, MagicMock())
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            mock_settings.return_value = self._settings()
+            result = await service._run_subagent(get_skill("literature_review"), "q")
+
+        assert result.success is True
+        assert result.truncated is False
+        assert result.output == "first half second half"
+
+        # the resume request must end on a user turn: a trailing assistant message
+        # is a prefill, which Opus 4.6+ rejects
+        resume_messages = mock_client.messages.create.await_args_list[1].kwargs["messages"]
+        assert resume_messages[-1]["role"] == "user"
+        assert resume_messages[-2]["role"] == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_truncation_is_bounded_and_marked(self):
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            side_effect=[self._message(f"part{i} ", "max_tokens") for i in range(3)]
+        )
+        service = SubagentService(mock_client, MagicMock())
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            mock_settings.return_value = self._settings(max_continuations=2)
+            result = await service._run_subagent(get_skill("literature_review"), "q")
+
+        assert result.truncated is True
+        assert "[TRUNCATED:" in result.output
+        # initial turn + 2 continuations, then it gives up
+        assert mock_client.messages.create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_thinking_set_only_for_supporting_models(self):
+        for model, expected in [("claude-opus-5", True), ("claude-haiku-4-5", False)]:
+            mock_client = MagicMock()
+            mock_client.messages.create = AsyncMock(
+                return_value=self._message("done", "end_turn")
+            )
+            service = SubagentService(mock_client, MagicMock())
+
+            with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+                mock_settings.return_value = self._settings(subagent_model=model)
+                await service._run_subagent(get_skill("literature_review"), "q")
+
+            params = mock_client.messages.create.await_args.kwargs
+            assert ("thinking" in params) is expected, model
+
+    @pytest.mark.asyncio
+    async def test_truncated_flag_reaches_the_main_agent(self):
+        """The main agent sees the flag in the tool result, not just in the log."""
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            side_effect=[self._message("cut ", "max_tokens")] * 4
+        )
+        service = SubagentService(mock_client, MagicMock())
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            mock_settings.return_value = self._settings(max_continuations=3)
+            payload = await service.run_subagents(
+                [{"skill": "literature_review", "query": "q"}]
+            )
+
+        assert payload["results"][0]["truncated"] is True

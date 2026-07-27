@@ -24,7 +24,8 @@ class SkillDefinition:
     tool_categories: set[str]
     extra_tools: list[str] = field(default_factory=list)
     model: str | None = None
-    max_tokens: int = 4096
+    # covers thinking as well as the report text, so leave room for both
+    max_tokens: int = 8192
     max_iterations: int = 10
     allow_file_read: bool = False
     allow_script_exec: bool = False

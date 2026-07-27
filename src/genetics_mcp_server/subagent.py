@@ -11,7 +11,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from genetics_mcp_server.config import get_settings, model_rejects_temperature
+from genetics_mcp_server.config import (
+    get_settings,
+    model_rejects_temperature,
+    model_supports_adaptive_thinking,
+)
+from genetics_mcp_server.config.defaults import CONTINUE_TRUNCATED_PROMPT
 from genetics_mcp_server.mcp_proxy import (
     execute_external_tool,
     get_external_anthropic_tools,
@@ -72,6 +77,10 @@ class SubagentResult:
     output_tokens: int = 0
     success: bool = True
     error: str | None = None
+    # the report hit the output cap and could not be finished within
+    # max_continuations. Surfaced to the main agent so it doesn't treat a cut-off
+    # report as the subagent's complete findings.
+    truncated: bool = False
 
 
 class SubagentService:
@@ -168,6 +177,7 @@ class SubagentService:
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
                     "error": result.error,
+                    "truncated": result.truncated,
                 })
 
         return {"success": True, "results": processed}
@@ -213,6 +223,11 @@ class SubagentService:
         total_input_tokens = 0
         total_output_tokens = 0
         final_text = ""
+        # text carried over from turns the output cap cut short, so a continued
+        # report reads as one piece rather than only its last fragment
+        truncated_prefix = ""
+        continuations = 0
+        truncated = False
 
         logger.info(
             f"Subagent '{skill.name}' [{subagent_id}] starting: model={model}, "
@@ -235,6 +250,11 @@ class SubagentService:
                 # configured and the model supports it (Fable and Opus 4.7+ reject it)
                 if settings.temperature is not None and not model_rejects_temperature(model):
                     request_params["temperature"] = settings.temperature
+                # explicit for the same reason as the main chat loop: Opus 5 thinks when
+                # this is unset while 4.8/4.7 do not, and max_tokens covers thinking and
+                # visible text together, so the default silently narrows the report budget
+                if model_supports_adaptive_thinking(model):
+                    request_params["thinking"] = {"type": "adaptive"}
                 if tool_definitions:
                     request_params["tools"] = tool_definitions
 
@@ -254,9 +274,40 @@ class SubagentService:
                     elif block.type == "tool_use":
                         tool_uses.append(block)
 
-                final_text = "\n".join(text_parts)
+                final_text = truncated_prefix + "\n".join(text_parts)
 
                 if not tool_uses:
+                    # a report stopped by the output cap has no tool_use blocks, so this
+                    # loop used to return the fragment as the subagent's complete findings
+                    if getattr(message, "stop_reason", None) == "max_tokens":
+                        if continuations < settings.max_continuations:
+                            continuations += 1
+                            logger.info(
+                                f"Subagent '{skill.name}' [{subagent_id}] report hit "
+                                f"max_tokens; continuing "
+                                f"({continuations}/{settings.max_continuations})"
+                            )
+                            truncated_prefix = final_text
+                            messages = [
+                                *messages,
+                                {
+                                    "role": "assistant",
+                                    "content": [
+                                        b.model_dump(exclude_none=True) for b in message.content
+                                    ],
+                                },
+                                {"role": "user", "content": CONTINUE_TRUNCATED_PROMPT},
+                            ]
+                            continue
+                        truncated = True
+                        logger.warning(
+                            f"Subagent '{skill.name}' [{subagent_id}] report still "
+                            f"truncated after {continuations} continuation(s)"
+                        )
+                        final_text += (
+                            "\n\n[TRUNCATED: this report reached the output token limit "
+                            "and is incomplete.]"
+                        )
                     break
 
                 # execute tools
@@ -312,6 +363,7 @@ class SubagentService:
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
                 success=True,
+                truncated=truncated,
             )
 
         except Exception as e:
@@ -329,6 +381,7 @@ class SubagentService:
                 output_tokens=total_output_tokens,
                 success=False,
                 error=str(e),
+                truncated=truncated,
             )
 
     def _get_tool_definitions(self, skill: SkillDefinition) -> list[dict[str, Any]]:

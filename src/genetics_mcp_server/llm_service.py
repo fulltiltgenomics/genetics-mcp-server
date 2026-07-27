@@ -20,6 +20,7 @@ from genetics_mcp_server.config import (
     model_rejects_temperature,
     model_supports_adaptive_thinking,
 )
+from genetics_mcp_server.config.defaults import CONTINUE_TRUNCATED_PROMPT
 from genetics_mcp_server.cost import estimate_cost, get_context_window
 from genetics_mcp_server.download_store import get_download_store
 from genetics_mcp_server.mcp_proxy import (
@@ -173,11 +174,6 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
 # missed before a stalled stream is declared dead.
 _THINKING_KEEPALIVE_SECONDS = 10.0
 
-_CONTINUE_PROMPT = (
-    "Your previous message was cut off because it reached the output token limit. "
-    "Continue from exactly where it stopped. Do not repeat text you already wrote, "
-    "do not restart the response, and do not mention the interruption."
-)
 
 
 @dataclass
@@ -712,7 +708,7 @@ class LLMService:
                             "role": "assistant",
                             "content": [b.model_dump(exclude_none=True) for b in message.content],
                         },
-                        {"role": "user", "content": _CONTINUE_PROMPT},
+                        {"role": "user", "content": CONTINUE_TRUNCATED_PROMPT},
                     ]
                     continue
 

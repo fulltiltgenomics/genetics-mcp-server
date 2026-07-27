@@ -256,3 +256,13 @@ def default_system_prompt(app_name: str = "FinnGenie") -> str:
     lacks the "ie" suffix and is left untouched.
     """
     return _DEFAULT_SYSTEM_PROMPT.replace("FinnGenie", app_name)
+
+
+# Sent as a user turn after a turn stopped on `stop_reason: max_tokens`. It has to be
+# a user turn: a trailing assistant message is a prefill, which Opus 4.6+ rejects.
+# Shared by the chat loop and the subagent loop.
+CONTINUE_TRUNCATED_PROMPT = (
+    "Your previous message was cut off because it reached the output token limit. "
+    "Continue from exactly where it stopped. Do not repeat text you already wrote, "
+    "do not restart the response, and do not mention the interruption."
+)
