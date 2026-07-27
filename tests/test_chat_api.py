@@ -276,6 +276,47 @@ class TestChatEndpoint:
         done_events = [e for e in events if e.get("type") == "done"]
         assert len(done_events) == 1
 
+    def test_chat_stream_forwards_thinking_keepalive(self, test_client):
+        """A thinking chunk reaches the client so a long reasoning phase keeps the
+        stream alive; it must carry no reasoning content."""
+
+        async def mock_stream(**kwargs):
+            yield StreamChunk(type="thinking")
+            yield StreamChunk(type="text", content="answer")
+            yield StreamChunk(
+                type="done",
+                message_content=[{"type": "text", "text": "answer"}],
+            )
+
+        with patch(
+            "genetics_mcp_server.chat_api.get_llm_service"
+        ) as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                },
+            )
+
+        assert response.status_code == 200
+        events = []
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                data_str = line[len("data:"):].strip()
+                if data_str:
+                    events.append(json.loads(data_str))
+
+        thinking_events = [e for e in events if e.get("type") == "thinking"]
+        assert len(thinking_events) == 1
+        assert thinking_events[0] == {"type": "thinking"}
+
 
 class TestChatEndpointProviders:
     """Tests for chat endpoint provider configuration."""

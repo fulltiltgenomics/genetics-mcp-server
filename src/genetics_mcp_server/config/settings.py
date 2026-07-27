@@ -58,7 +58,18 @@ class Settings:
         default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-opus-5")
     )
     fast_model: str = "claude-haiku-4-5"
-    max_tokens: int = 8192
+    # caps thinking + visible text together, and is a ceiling rather than a
+    # reservation (only generated tokens are billed). Kept well inside the
+    # 5-minute per-iteration timeout in llm_service; turns that need more room
+    # are continued across iterations instead of being given a larger single cap.
+    max_tokens: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_TOKENS", "16384"))
+    )
+    # how many times a turn cut short by max_tokens may be resumed before the
+    # truncation is reported to the user. Bounds a model that always runs long.
+    max_continuations: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_CONTINUATIONS", "3"))
+    )
     # temperature is off by default; many current models (Fable, Opus 4.7+)
     # reject it. set TEMPERATURE to opt in for models that still support it.
     temperature: float | None = field(
@@ -288,7 +299,13 @@ class Settings:
 _OPUS_TEMPERATURE_FLOOR = (4, 7)
 # minor version is optional: Opus 5 and later ship as "claude-opus-5", not "claude-opus-5-0"
 _OPUS_VERSION_RE = re.compile(r"claude-opus-(\d+)(?:-(\d+))?")
+_SONNET_VERSION_RE = re.compile(r"claude-sonnet-(\d+)(?:-(\d+))?")
 _FABLE_RE = re.compile(r"claude-fable-")
+_MYTHOS_RE = re.compile(r"claude-mythos-")
+
+# adaptive thinking arrived with the 4.6 generation. Earlier models only accept
+# the (now removed) budget_tokens form, so sending them adaptive is a 400.
+_ADAPTIVE_THINKING_FLOOR = (4, 6)
 
 
 def model_rejects_temperature(model: str) -> bool:
@@ -299,6 +316,18 @@ def model_rejects_temperature(model: str) -> bool:
     if match:
         version = (int(match.group(1)), int(match.group(2) or 0))
         return version >= _OPUS_TEMPERATURE_FLOOR
+    return False
+
+
+def model_supports_adaptive_thinking(model: str) -> bool:
+    """Check if a model accepts `thinking={"type": "adaptive"}`."""
+    if _FABLE_RE.search(model) or _MYTHOS_RE.search(model):
+        return True
+    for pattern in (_OPUS_VERSION_RE, _SONNET_VERSION_RE):
+        match = pattern.search(model)
+        if match:
+            version = (int(match.group(1)), int(match.group(2) or 0))
+            return version >= _ADAPTIVE_THINKING_FLOOR
     return False
 
 

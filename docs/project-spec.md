@@ -293,6 +293,29 @@ src/genetics_mcp_server/
 2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
 
+### Turn termination and truncation
+
+`_stream_anthropic()` decides whether to keep looping from two signals, not one:
+
+- **`tool_use` blocks present** — execute the tools and continue the loop, as before.
+- **`stop_reason == "max_tokens"` with no tool_use blocks** — the turn was cut off by the
+  output cap. The partial assistant turn is fed back followed by a user turn asking it to
+  resume (a *trailing assistant* message would be a prefill, which Opus 4.6+ rejects), up
+  to `MAX_CONTINUATIONS` times. Only if it is still truncated after that does the stream
+  append a visible "cut short by the output token limit" notice.
+
+This matters because `max_tokens` bounds thinking *and* visible text together, so a
+reasoning-heavy turn can exhaust the budget mid-sentence. Ignoring `stop_reason` made that
+indistinguishable from a completed answer: the loop broke, `done` was emitted, and the
+client persisted a truncated response with no error and no marker.
+
+`thinking` is set explicitly to `{"type": "adaptive", "display": "summarized"}` for models
+that support it (`model_supports_adaptive_thinking()` in `settings.py`; the 4.6 generation
+and later) rather than relying on per-model defaults — Opus 5 thinks when the parameter is
+unset while 4.8/4.7 do not, so leaving it off makes the token budget depend on which model
+happens to be configured. Thinking blocks are streamed as keepalives but deliberately not
+persisted in `message_content`: they are only replayable to the model that produced them.
+
 ### SSE event types
 
 The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON object with a `type` field:
@@ -300,6 +323,7 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 | Event type | Description | Key payload fields |
 |------------|-------------|--------------------|
 | `content` | Streamed text token from the LLM response | `content` (string) |
+| `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
 | `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
 | `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
 | `error` | Error message from the backend | `content` (error string) |
@@ -426,6 +450,8 @@ All configuration is via environment variables (`.env` file supported):
 | `OPENAI_API_KEY` | OpenAI API key | - |
 | `DEFAULT_MODEL` | Default chat model | `claude-opus-5` |
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
+| `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
+| `MAX_CONTINUATIONS` | How many times a turn stopped by `stop_reason: max_tokens` is resumed before the truncation is reported to the user | `3` |
 | `APP_NAME` | Product/brand name substituted into the assistant persona system prompt | `FinnGenie` |
 
 ### myvariant.info (optional, chat-backend only)

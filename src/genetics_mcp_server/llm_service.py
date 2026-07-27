@@ -11,10 +11,15 @@ import io
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
-from genetics_mcp_server.config import get_settings, model_rejects_temperature
+from genetics_mcp_server.config import (
+    get_settings,
+    model_rejects_temperature,
+    model_supports_adaptive_thinking,
+)
 from genetics_mcp_server.cost import estimate_cost, get_context_window
 from genetics_mcp_server.download_store import get_download_store
 from genetics_mcp_server.mcp_proxy import (
@@ -164,11 +169,22 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
         content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
 
 
+# comfortably under the client's 90s inactivity timeout, so several ticks are
+# missed before a stalled stream is declared dead.
+_THINKING_KEEPALIVE_SECONDS = 10.0
+
+_CONTINUE_PROMPT = (
+    "Your previous message was cut off because it reached the output token limit. "
+    "Continue from exactly where it stopped. Do not repeat text you already wrote, "
+    "do not restart the response, and do not mention the interruption."
+)
+
+
 @dataclass
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "done", "image", "usage"
+    type: str  # "text", "thinking", "done", "image", "usage"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -489,6 +505,14 @@ class LLMService:
         if settings.temperature is not None and not model_rejects_temperature(model):
             request_params["temperature"] = settings.temperature
 
+        # be explicit rather than relying on the per-model default: Opus 5 thinks
+        # when `thinking` is unset while 4.8/4.7 do not, so leaving it off makes
+        # the token budget depend on which model is configured. Summarized display
+        # is what lets thinking progress reach the client at all — see the
+        # keepalive in the stream loop below.
+        if model_supports_adaptive_thinking(model):
+            request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
+
         if system_prompt:
             # use structured format with cache_control for prompt caching
             request_params["system"] = [
@@ -559,6 +583,8 @@ class LLMService:
             # collect tool_result blocks across iterations for persistence, so resumed
             # conversations replay the actual tool data and not just the prose summary
             all_tool_results: list[dict[str, Any]] = []
+            continuations = 0
+            truncated = False
 
             while iteration < max_iterations:
                 iteration += 1
@@ -571,9 +597,24 @@ class LLMService:
                         # 5 min timeout per iteration to prevent indefinite hangs
                         async with asyncio.timeout(300):
                             async with self.anthropic_client.messages.stream(**request_params) as stream:
-                                async for text in stream.text_stream:
-                                    text_yielded_this_attempt = True
-                                    yield StreamChunk(type="text", content=text)
+                                last_keepalive = 0.0
+                                async for event in stream:
+                                    if event.type != "content_block_delta":
+                                        continue
+                                    delta = event.delta
+                                    if delta.type == "text_delta":
+                                        text_yielded_this_attempt = True
+                                        yield StreamChunk(type="text", content=delta.text)
+                                    elif delta.type == "thinking_delta":
+                                        # thinking deltas never reach text_stream, so a long
+                                        # reasoning phase reads as a dead connection to the
+                                        # client's inactivity timer. Tick occasionally to keep
+                                        # the stream alive; the event itself is the signal, so
+                                        # the reasoning text stays out of the payload.
+                                        now = time.monotonic()
+                                        if now - last_keepalive >= _THINKING_KEEPALIVE_SECONDS:
+                                            last_keepalive = now
+                                            yield StreamChunk(type="thinking")
 
                                 message = await stream.get_final_message()
                         break
@@ -616,7 +657,7 @@ class LLMService:
                     f"{log_prefix}API call iteration={iteration} model={model} "
                     f"input_tokens={input_tok} output_tokens={output_tok} "
                     f"cache_read={cache_read} cache_create={cache_create} "
-                    f"cost=${iter_cost:.4f}"
+                    f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
                 )
 
                 # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
@@ -635,12 +676,46 @@ class LLMService:
                     }),
                 )
 
-                # add this iteration's content blocks
+                # add this iteration's content blocks. Thinking blocks are deliberately
+                # not persisted: they are only replayable to the model that produced them,
+                # and the sanitizers that rewrite stored turns don't know about them.
                 for block in message.content:
+                    if block.type in ("thinking", "redacted_thinking"):
+                        continue
                     all_content_blocks.append(block.model_dump(exclude_none=True))
 
                 # check for tool use
                 tool_uses = [b for b in message.content if b.type == "tool_use"]
+
+                # a turn cut off by the output cap carries no tool_use blocks, so the loop
+                # would otherwise break and report it as a completed answer. Resume it
+                # instead. Guarded on tool_uses being empty: continuing a turn that holds
+                # an unanswered tool_use would send an unpaired block back.
+                if not tool_uses and message.stop_reason == "max_tokens":
+                    if continuations >= settings.max_continuations:
+                        truncated = True
+                        logger.warning(
+                            f"{log_prefix}Turn still truncated after "
+                            f"{continuations} continuation(s); giving up"
+                        )
+                        break
+                    continuations += 1
+                    logger.info(
+                        f"{log_prefix}Turn hit max_tokens; continuing "
+                        f"({continuations}/{settings.max_continuations})"
+                    )
+                    # the partial turn has to be followed by a user turn — a trailing
+                    # assistant message is a prefill, which Opus 4.6+ rejects outright.
+                    request_params["messages"] = [
+                        *request_params["messages"],
+                        {
+                            "role": "assistant",
+                            "content": [b.model_dump(exclude_none=True) for b in message.content],
+                        },
+                        {"role": "user", "content": _CONTINUE_PROMPT},
+                    ]
+                    continue
+
                 if not tool_uses or not self.executor:
                     break
 
@@ -775,6 +850,11 @@ class LLMService:
                     {"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in message.content]},
                     {"role": "user", "content": tool_results},
                 ]
+
+            if truncated:
+                notice = "\n\n---\n*Response was cut short by the output token limit.*\n"
+                yield StreamChunk(type="text", content=notice)
+                all_content_blocks.append({"type": "text", "text": notice})
 
             if iteration >= max_iterations:
                 yield StreamChunk(type="text", content="\n\n*[Max tool iterations reached]*\n")

@@ -335,6 +335,7 @@ async def stream_chat(
 
     The response is a stream of JSON objects:
     - {"type": "content", "content": "text chunk"}
+    - {"type": "thinking"}  (keepalive while the model reasons; no content)
     - {"type": "done", "message_content": [...]}
     - {"type": "error", "error": "message"}
     """
@@ -403,6 +404,13 @@ async def stream_chat(
                             "image_format": chunk.image_format or "png",
                             "image_alt": chunk.image_alt or "Generated image",
                         }),
+                    }
+                elif chunk.type == "thinking":
+                    # keepalive only: carries no reasoning content, and exists so a long
+                    # thinking phase doesn't read as a stalled stream to the client
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({"type": "thinking"}),
                     }
                 elif chunk.type == "usage":
                     yield {
