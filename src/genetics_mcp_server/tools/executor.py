@@ -3145,46 +3145,57 @@ class ToolExecutor:
         if df.is_empty():
             return {"n_cs": 0, "cs": {}}
 
-        lead_variant_cols = [
-            "cs_size",
-            "resource",
-            "data_type",
-            "cell_type",
-            "trait",
-            "chr",
-            "pos",
-            "ref",
-            "alt",
-            "mlog10p",
-            "beta",
-            "se",
-            "pip",
-            "aaf",
-            "most_severe",
-            "gene_most_severe",
+        # A cs_id identifies a credible set only WITHIN one dataset's fine-mapping run of
+        # one trait in one cell type; it is not globally unique. caQTL cs_ids are derived
+        # from the peak, so the same one recurs in every cell type the peak was tested in
+        # (IL7R: 46 distinct cs_ids but 129 real credible sets), and eQTL Catalogue cs_ids
+        # like ENSG00000187608_L1 recur across QTD studies. Grouping on cs_id alone merged
+        # those into one row each, undercounting credible sets by up to 4x and silently
+        # dropping whole cell types from the summary (13 -> 9 for IL7R caQTL).
+        key_cols = [
+            c for c in ("resource", "dataset", "trait", "cell_type") if c in df.columns
         ]
-        lead_variants = df.group_by("cs_id").agg(
+        key_cols.append("cs_id")
+
+        lead_variant_cols = [
+            c
+            for c in (
+                "cs_size",
+                "resource",
+                "data_type",
+                "cell_type",
+                "trait",
+                "chr",
+                "pos",
+                "ref",
+                "alt",
+                "mlog10p",
+                "beta",
+                "se",
+                "pip",
+                "aaf",
+                "most_severe",
+                "gene_most_severe",
+            )
+            if c not in key_cols
+        ]
+
+        # both aggregations in one pass: joining them would have to match on nullable key
+        # columns (cell_type is null for GWAS), where null != null drops rows
+        result = df.group_by(key_cols).agg(
             [
                 pl.col(c)
                 .sort_by(["pip", "mlog10p"], descending=[True, True], nulls_last=True)
                 .first()
                 for c in lead_variant_cols
             ]
-        )
-
-        # aggregate stats from all variants in each credible set
-        cs_stats = df.group_by("cs_id").agg(
-            [
+            + [
                 pl.col("aaf").min().alias("min_aaf"),
                 pl.col("aaf").max().alias("max_aaf"),
                 pl.col("most_severe").is_in(CODING_VARIANTS).sum().alias("n_coding"),
                 pl.col("most_severe").is_in(LOF_VARIANTS).sum().alias("n_lof"),
             ]
-        )
-
-        result = lead_variants.join(cs_stats, on="cs_id").sort(
-            "mlog10p", descending=True, nulls_last=True
-        )
+        ).sort("mlog10p", descending=True, nulls_last=True)
 
         # group by data_type
         grouped: dict[str, list] = {}
