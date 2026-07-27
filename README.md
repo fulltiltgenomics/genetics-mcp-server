@@ -24,9 +24,12 @@ All environment variables are optional but needed for each type of functionality
 |----------|-------------|---------|
 | `GENETICS_API_URL` | Base URL for [genetics-results-api](https://github.com/fulltiltgenomics/genetics-results-api) server | `http://0.0.0.0:2000/api` |
 | `BIGQUERY_API_URL` | Base URL for [genetics-results-db](https://github.com/fulltiltgenomics/genetics-results-db) server | - |
+| `INTERNAL_API_SECRET` | Shared secret sent as a bearer token on every call to `GENETICS_API_URL` and `BIGQUERY_API_URL`, for deployments where those services require internal auth | - |
 | `ANTHROPIC_API_KEY` | Anthropic API key (for chat) | - |
 | `OPENAI_API_KEY` | OpenAI API key (for chat) | - |
+| `PERPLEXITY_API_KEY` | Perplexity API key (for literature search, the default backend) | - |
 | `TAVILY_API_KEY` | Tavily API key (for web search) | - |
+| `MCP_API_KEY` | Comma-separated bearer tokens; required to start the MCP server on a remote transport | - |
 | `EXTERNAL_MCP_SERVERS` | Comma-separated URLs of external MCP servers to proxy (e.g. gnomAD, Open Targets) | - |
 | `RAG_MCP_SERVER` | URL of [genetics-rag-service](https://github.com/ykjain/genetics-rag-service) server | - |
 | `UNIPROT_API_URL` | UniProt REST API base URL (protein annotations, chat only) | `https://rest.uniprot.org` |
@@ -41,7 +44,9 @@ cd src
 export GENETICS_API_URL=https://.../api
 # stdio transport
 python -m genetics_mcp_server.mcp_server
-# streamable http
+# streamable http (or --transport sse); MCP_API_KEY is mandatory for remote
+# transports — the server refuses to start unauthenticated
+export MCP_API_KEY=...
 python -m genetics_mcp_server.mcp_server --transport streamable-http --port 8080 --host 0.0.0.0
 ```
 

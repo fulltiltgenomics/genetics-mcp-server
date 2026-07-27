@@ -23,7 +23,7 @@ variant	beta	se	pvalue
 2:21263900:A:G	0.12	0.03	2e-6
 ```
 
-Dash-separated variants (`1-154453788-C-T`) and `chr` prefixes (`chr1:154453788:C:T`) are also accepted.
+Any CPRA separator is accepted (`:` `-` `_` `|` `/` `\`, so `1-154453788-C-T` works), as is a `chr` prefix (`chr1:154453788:C:T`). Chromosome `23` is treated as `X`. A single line of space-separated variants is split into one variant per line.
 
 ## What it does
 
@@ -42,6 +42,8 @@ For each input variant, the tool:
 | **Tissue enrichment** | For each tissue, how many input variants have any eQTL in that tissue. |
 | **pQTL summary** | Total number of input variants with any pQTL. |
 | **Variant-gene mapping** | Nearest protein-coding gene for each input variant. |
+
+The GWAS, pQTL, eQTL and caQTL rows also carry the `resource` and `dataset` values they were seen in (comma-joined when more than one). Those four are the only data types aggregated: an sQTL credible set still counts its variant in `n_variants_with_cs`, but produces no aggregation row of its own.
 
 ## Usage
 
@@ -65,7 +67,7 @@ python -m genetics_mcp_server.scripts.analyze_variants variants.txt --pretty
 python -m genetics_mcp_server.scripts.analyze_variants variants.txt --resource finngen
 ```
 
-Requires `GENETICS_API_URL` environment variable (defaults to `http://localhost:2000/api`).
+Requires `GENETICS_API_URL` environment variable (defaults to `http://0.0.0.0:2000/api`), and `INTERNAL_API_SECRET` if the API requires it.
 
 ### MCP tool
 
@@ -82,16 +84,16 @@ JSON with the following structure:
   "n_variants_with_cs": 8,
   "input_has_betas": true,
   "gwas_phenotypes": [
-    {"trait": "T2D", "name": "Type 2 diabetes", "n_variants": 5, "n_consistent": 4, "n_inconsistent": 1}
+    {"trait": "T2D", "name": "Type 2 diabetes", "resource": "finngen", "dataset": "FinnGen_R13", "n_variants": 5, "n_consistent": 4, "n_inconsistent": 1}
   ],
   "pqtl_genes": [
-    {"gene": "PCSK9", "n_variants": 3, "n_consistent": 2, "n_inconsistent": 1}
+    {"gene": "PCSK9", "resource": "ukbb", "dataset": "UKB_PPP", "n_variants": 3, "n_consistent": 2, "n_inconsistent": 1}
   ],
   "eqtl_genes": [
-    {"gene": "SORT1", "tissue": "liver", "n_variants": 4, "n_consistent": 3, "n_inconsistent": 1}
+    {"gene": "SORT1", "tissue": "liver", "resource": "...", "dataset": "...", "n_variants": 4, "n_consistent": 3, "n_inconsistent": 1}
   ],
   "caqtl_tissues": [
-    {"tissue": "liver", "n_variants": 2}
+    {"tissue": "liver", "resource": "...", "dataset": "...", "n_variants": 2}
   ],
   "tissue_enrichment": [
     {"tissue": "liver", "n_eqtl_variants": 6}
@@ -103,4 +105,4 @@ JSON with the following structure:
 }
 ```
 
-Direction consistency fields (`n_consistent`, `n_inconsistent`) are only present when input betas are provided.
+Direction consistency fields (`n_consistent`, `n_inconsistent`) are only present when input betas are provided. `resource` and `dataset` are comma-joined lists of every value seen for that row, so they are empty strings when the upstream rows carry neither. `distance` is `-1` when no nearest gene was returned for a variant.

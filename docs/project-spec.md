@@ -16,7 +16,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 
 - **Standalone MCP Server**: Connects to Claude Desktop, Cursor, or any MCP client via stdio, SSE or streamable HTTP
 - **LLM Chat API**: FastAPI service with streaming responses, supporting Anthropic and OpenAI providers
-- **Genetics data tools**: Comprehensive access to GWAS, QTL, colocalization, expression, Mendelian disease data, LD, visualizations, and BigQuery for advanced queries
+- **Genetics data tools**: Comprehensive access to GWAS, QTL, colocalization, expression, Mendelian disease data, LD, protein annotation, regulatory/functional genomics (open-chromatin atlases, allele-specific methylation, predicted variant effects, MPRA reporter activity), visualizations, and BigQuery for advanced queries
 - **Literature and web search**: Integration with Europe PMC, Perplexity, Tavily, and DuckDuckGo
 - **External MCP server proxying**: Aggregate tools from remote MCP servers (e.g., gnomAD, Open Targets Platform)
 - **Optional IAP/oauth2-proxy authentication**: Protect the chat API via `X-Goog-Authenticated-User-Email` header
@@ -61,7 +61,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_credible_sets_by_variant` | Find associations containing a specific variant |
 | `get_credible_sets_by_phenotype` | Get all GWAS associations for a phenotype |
 | `get_credible_set_by_id` | Get all variants in a specific credible set |
-| `get_credible_sets_by_qtl_gene` | Get QTL associations where a gene is the molecular trait. Also the correct tool for **gene-based caQTL** questions: a caQTL trait is a chromatin peak, and the underlying `all_cs_qtl_file` resolves the Open4Gene peak-to-gene link (cell-type-matched), so `trait` holds the linked gene symbol while `trait_original`/`cs_id` keep the peak id. Peak-vs-gene coordinate matching is NOT a substitute — linked peaks sit up to ~1 Mb away and most peaks near a gene are not linked to it |
+| `get_credible_sets_by_qtl_gene` | Get QTL associations where a gene is the molecular trait. `summarize` defaults to **true** (credible set-level), like the sibling credible-set tools — see Architecture decision 7. Also the correct tool for **gene-based caQTL** questions: a caQTL trait is a chromatin peak, and the underlying `all_cs_qtl_file` resolves the Open4Gene peak-to-gene link (cell-type-matched), so `trait` holds the linked gene symbol while `trait_original`/`cs_id` keep the peak id. Peak-vs-gene coordinate matching is NOT a substitute — linked peaks sit up to ~1 Mb away and most peaks near a gene are not linked to it |
 | `get_credible_sets_stats` | Get summary statistics of credible sets for a dataset |
 
 ### Gene data tools
@@ -72,16 +72,29 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_gene_disease_associations` | Get Mendelian disease relationships from ClinGen/GENCC |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
 | `get_exome_results_by_phenotype` | Get exome variant results for a specific phenotype across all genes (genebass and IBD) |
-| `get_gene_based_results` | Get gene-level burden test results from genebass and SCHEMA |
+| `get_gene_based_results` | Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA |
 | `get_nearest_genes` | Get genes nearest to a variant position |
 | `get_genes_in_region` | Get all genes in a genomic region |
+
+### Regulatory and functional genomics tools
+
+Four evidence types that must not be conflated, because a user question about "regulatory effect" maps to a different one depending on wording: a measured accessibility **atlas** (`open_chromatin`), an accessibility **QTL** (caQTL, reached through the credible-set tools above), an **in-silico prediction** (`variant_effect`), and a **measured reporter assay** (`mpra`). Each tool description states which it is. The gene-keyed variants all select by genomic coordinates (gene body ± `window`, default **500 kb**) rather than by `gene_most_severe`, since most-severe-consequence attribution misses exactly the nearby regulatory variants these datasets are about.
+
+| Tool | Description |
+|------|-------------|
+| `get_asm_qtl_by_variant` | Allele-specific methylation QTL (ASM-QTL) for a variant: associations with CpG/MDS methylation rates, effect sizes, methylation rate on reference vs alternative haplotype, primary/secondary variant rank. `resources`: `decode_cpg`, `decode_mds` |
+| `get_asm_qtl_by_gene` | ASM-QTL for variants near a gene (gene body ± `window`) |
+| `get_open_chromatin_by_variant`, `get_open_chromatin_by_region`, `get_open_chromatin_by_gene` | Measured open-chromatin **atlas** peaks (scATAC/snATAC/bulk-ATAC/chromHMM) overlapping a variant position, a region, or a gene's window, labelled by `cell_type`, `tissue`, `life_stage` and `condition` so cell-type specificity can be reported. `resources`: `marderstein`, `li_brain_atac`, `catlas`, `epimap`, `calderon_immune`, `rosmap_brain` |
+| `get_variant_effect_by_variant`, `get_variant_effect_by_gene` | In-silico **predicted** variant effect on chromatin accessibility: ChromBPNet (`model=chrombpnet`) per cell type/tissue with `score`/`mlog10p`/`quantile_rank`/`is_significant`, FLARE (`model=flare`) as a pan-context score with null cell type. `resources`: `marderstein` |
+| `get_mpra_by_variant`, `get_mpra_by_region`, `get_mpra_by_gene` | **Measured** cis-regulatory allelic activity from a massively parallel reporter assay (Siraj et al. 2026). One long row per `cell_line` — `meta` (cross-cell-line meta-analysis) or K562/HEPG2/SKNSH/HCT116/A549 — carrying `emVar` (allele modulates reporter expression), `active`, `log2Skew` (signed allelic effect), `log2FC`, and their `*_mlog10p`. Coverage is partial (fine-mapped GTEx/UKBB/BBJ plus control common variants), so absence ≠ no effect. `resources`: `siraj_mpra` |
+| `get_mpra_pip_concordance_by_gene` | Joins FinnGen fine-mapped credible sets (`credible_sets_v`, filtered to `resource` + `pip >= min_pip`, default 0.1) to the MPRA cross-cell-line meta row on the shared variant key, for variants near a gene — the regulatory-buffering check of whether credibly causal variants are measurably active. Ordered `emVar` then PIP. Distinct from `get_mpra_by_gene`, which returns MPRA rows without the PIP cross-reference |
 
 ### Other genetics tools
 
 | Tool | Description |
 |------|-------------|
 | `get_colocalization` | Find traits sharing causal signals at a variant |
-| `get_phenotype_report` | Get detailed markdown report for a phenotype |
+| `get_phenotype_report` | Get detailed markdown report for a phenotype. Disabled by default — enable with `ENABLE_PHENOTYPE_REPORT` |
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
@@ -181,7 +194,7 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 - **A process-wide TTL cache** (`UNIPROT_CACHE_TTL`, default 24 h, monotonic-clock deadlines, LRU-bounded). UniProt releases at most weekly, so a long TTL is safe; setting the TTL to `0` disables caching.
 - **Genomic-HGVS variant effect** — `get_variant_protein_effect` converts each `chr:pos:ref:alt` into a GRCh38 RefSeq genomic HGVS (`NC_0000NN.V:g.<pos><ref>><alt>`, from a pinned per-chromosome accession table) and looks it up through the EBI `variation/hgvs` endpoint. The assembly is pinned to GRCh38 — a variant id carries no build, and guessing one would silently answer for the wrong genome. Reviewed entries are distinguished from the TrEMBL predicted entries the endpoint also returns by their Swiss-Prot mnemonic `entryName` and non-`Predicted` protein existence.
 
-**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and they are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them.
+**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
 
 #### Open Targets Platform MCP
 
@@ -202,7 +215,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, search_mgi, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |
@@ -248,7 +261,9 @@ src/genetics_mcp_server/
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
 │   ├── analyze_conversations.py # conversation history analysis and eval extraction
+│   ├── analysis_timeseries.py  # shared rolling-window aggregation used by both renderers
 │   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
+│   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -395,12 +410,23 @@ All configuration is via environment variables (`.env` file supported):
 | `GENETICS_API_URL` | Base URL of the genetics REST API |
 | `BIGQUERY_API_URL` | Base URL of the BigQuery proxy API |
 
+### Upstream service access (optional)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GENETICS_PUBLIC_API_URL` | Externally reachable base URL used when building download links shown to users; falls back to `GENETICS_API_URL`, which in a cluster is an internal address | `GENETICS_API_URL` |
+| `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy, for deployments where those services require internal auth. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info | - |
+| `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
+
 ### LLM providers (for chat API)
 
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Anthropic API key for Claude |
-| `OPENAI_API_KEY` | OpenAI API key |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ANTHROPIC_API_KEY` | Anthropic API key for Claude | - |
+| `OPENAI_API_KEY` | OpenAI API key | - |
+| `DEFAULT_MODEL` | Default chat model | `claude-opus-5` |
+| `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
+| `APP_NAME` | Product/brand name substituted into the assistant persona system prompt | `FinnGenie` |
 
 ### myvariant.info (optional, chat-backend only)
 
@@ -454,14 +480,17 @@ so no cross-origin request is made.
 | Variable | Description |
 |----------|-------------|
 | `REQUIRE_AUTH` | Require `X-Goog-Authenticated-User-Email` header (`true`/`false`) |
-| `MCP_API_KEY` | Comma-separated bearer tokens for MCP server SSE/HTTP transport auth |
+| `MCP_API_KEY` | Comma-separated bearer tokens for MCP server SSE/HTTP transport auth. **Required** for those transports: `main()` exits with an error rather than starting an unauthenticated remote server |
+| `MCP_ALLOW_QUERY_TOKEN` | Also accept the token in a `?token=XXX` query parameter (`true`/`false`, default `false`) |
+| `API_TOKEN_TTL_DAYS` | Days of inactivity after which a per-user API token expires; every use pushes the deadline out again. `0` disables expiry. Does not apply to `MCP_API_KEY` (default `90`) |
+| `GOOGLE_TOKEN_AUDIENCE` | Comma-separated OAuth client ids a Google Identity Token's `aud` must be one of. Unset means the audience is not checked at all |
 | `ALLOWED_EMAILS` | Comma-separated email allow-list shared by all JWT bearer paths (Google Identity Token and Keycloak) |
 | `ALLOWED_EMAIL_DOMAINS` | Comma-separated email-domain allow-list shared by all JWT bearer paths (default: `finngen.fi`) |
 | `OAUTH_ISSUER` | Keycloak realm issuer URL; enables the OAuth resource-server bearer path when set together with `OAUTH_RESOURCE_URL` |
 | `OAUTH_RESOURCE_URL` | Expected `aud` claim (this server's canonical URL) for Keycloak access tokens |
 | `OAUTH_JWKS_URI` | Override for the JWKS endpoint; defaults to `<OAUTH_ISSUER>/protocol/openid-connect/certs` |
 
-Tokens can be supplied either as an `Authorization: Bearer XXX` header or as a `?token=XXX` query parameter. The query parameter is useful for clients that don't support custom headers (e.g., claude.ai). When both are present, the Bearer header takes precedence.
+Tokens are supplied as an `Authorization: Bearer XXX` header. A `?token=XXX` query parameter is also accepted, but only when `MCP_ALLOW_QUERY_TOKEN` is set — off by default, because a credential in a URL is captured where request headers are not: the GKE load balancer's request logs (upstream of the auth-gateway's `token=` redaction), browser history, and the `Referer` header of any outbound link. Enable it only for a client that genuinely cannot set the header (e.g. claude.ai). The query parameter is consulted only when no Bearer header is present, so the header always takes precedence, and a request with neither gets 401.
 
 The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes each presented token through four branches in order, mirroring the results-api implementation:
 
@@ -514,7 +543,10 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `EXTERNAL_MCP_SERVERS` | Comma-separated URLs of always-on external MCP servers (gnomAD, Open Targets) |
 | `EXTERNAL_MCP_EXCLUDE_TOOLS` | Tool names to exclude from proxying |
 | `ENABLE_CREDIBLE_SETS_STATS` | Enable `get_credible_sets_stats` tool (default `false`) |
+| `ENABLE_PHENOTYPE_REPORT` | Enable `get_phenotype_report` tool (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
+
+These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which the MCP server, the chat API and the subagents all read, so a disabled tool is invisible on every surface rather than only unregistered on one.
 
 Default external servers:
 - gnomAD: `https://gnomad-mcp-dpsnoyqx6q-uc.a.run.app`
@@ -558,14 +590,24 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_mcp_server.py` | MCP server initialization and tool registration |
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
+| `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_db.py` | Database operations |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
+| `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
 | `test_phewas_categories.py` | PheWAS category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint |
+| `test_bigquery_gene_tools.py` | BigQuery-backed gene tools |
+| `test_gene_group_tools.py` | Gene group membership and symbol normalization |
+| `test_literature_search.py` | Literature backend selection, Perplexity metadata hydration |
+| `test_myvariant.py` | myvariant.info annotation tool |
+| `test_uniprot.py` | UniProt client: resolution tiers, TTL cache, variant effect |
+| `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
+| `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
+| `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 
