@@ -637,9 +637,14 @@ class ToolExecutor:
         gene: str,
         data_types: str | None = None,
         resource: str | None = None,
-        summarize: bool = False,
+        summarize: bool = True,
     ) -> dict[str, Any]:
-        """Get QTL credible sets where gene is the molecular trait."""
+        """Get QTL credible sets where gene is the molecular trait.
+
+        Defaults to the credible set-level summary, matching the sibling credible-set tools:
+        the variant-level result for a well-studied gene exceeds the tool-result size cap by
+        more than an order of magnitude and gets truncated to a positional prefix.
+        """
         try:
             params: dict[str, Any] = {}
             if data_types:

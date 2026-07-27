@@ -161,7 +161,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_qtl_gene",
         "category": "api",
-        "description": "Get QTL associations where a gene is the molecular trait (target). Returns variants ANYWHERE in the genome that affect expression/splicing/protein levels of the gene. Different from get_credible_sets_by_gene which finds variants NEAR a gene.",
+        "description": (
+            "Get QTL associations where a gene is the molecular trait (target). Returns variants "
+            "ANYWHERE in the genome that affect expression/splicing/protein levels of the gene. "
+            "Different from get_credible_sets_by_gene which finds variants NEAR a gene. "
+            "**This is also the correct tool for gene-based caQTL questions.** A caQTL trait is a "
+            "chromatin ACCESSIBILITY PEAK, not a gene, so 'caQTL for gene X' means variants "
+            "affecting peaks LINKED to X. This tool already resolves that link (Open4Gene "
+            "peak-to-gene, cell-type-matched): for caQTL rows `trait` is the linked gene symbol "
+            "and `trait_original` / `cs_id` hold the peak id (chr-start-end). Do NOT fall back to "
+            "matching peak coordinates against the gene's position — linked peaks sit up to ~1 Mb "
+            "away and most peaks near a gene are not linked to it."
+        ),
         "parameters": {
             "gene": {
                 "type": "string",
@@ -170,7 +181,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "data_types": {
                 "type": "string",
-                "description": "Comma-separated QTL types: 'eQTL', 'pQTL', 'sQTL', 'caQTL'. Default returns all.",
+                "description": (
+                    "Comma-separated QTL types: 'eQTL', 'pQTL', 'sQTL', 'caQTL'. Case-insensitive. "
+                    "Default returns all, which for a well-studied gene can be thousands of rows "
+                    "that get truncated before you see them — always set this when you only care "
+                    "about one type."
+                ),
             },
             "resource": {
                 "type": "string",
@@ -178,8 +194,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "summarize": {
                 "type": "boolean",
-                "description": "If true, return credible set-level summary.",
-                "default": False,
+                "description": (
+                    "If true (the default), return credible set-level summary instead of "
+                    "variant-level data. Keep it true for counting questions: the variant-level "
+                    "result for a well-studied gene runs to millions of characters and is cut off "
+                    "before you see all of it."
+                ),
+                "default": True,
             },
         },
     },
@@ -1390,9 +1411,14 @@ def register_mcp_tools(
         gene: str,
         data_types: str | None = None,
         resource: str | None = None,
-        summarize: bool = False,
+        summarize: bool = True,
     ) -> dict:
-        """Get QTL associations where a gene is the molecular trait."""
+        """Get QTL associations where a gene is the molecular trait.
+
+        Also answers gene-based caQTL questions: a caQTL trait is a chromatin peak, and this
+        resolves the Open4Gene peak-to-gene link (cell-type-matched), returning the linked gene
+        symbol in `trait` and the peak id in `trait_original` / `cs_id`.
+        """
         return await executor.get_credible_sets_by_qtl_gene(
             gene, data_types, resource, summarize
         )

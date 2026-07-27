@@ -8,9 +8,11 @@ persistence (resumed conversations carry the data) and backward compatibility
 """
 
 from genetics_mcp_server.llm_service import (
+    _count_result_items,
     _mark_history_cache_breakpoint,
     _sanitize_tool_blocks,
     _strip_tool_use_markers,
+    _truncation_notice,
 )
 
 
@@ -172,3 +174,39 @@ class TestMarkHistoryCacheBreakpoint:
         messages = []
         _mark_history_cache_breakpoint(messages)
         assert messages == []
+
+
+class TestTruncationNotice:
+    """The notice appended when a tool result exceeds mcp_max_result_size.
+
+    Truncation keeps an ordered prefix, so the notice has to say the invisible part is
+    not a random sample and block absence/count conclusions drawn from what survives.
+    """
+
+    def test_counts_summarized_credible_sets(self):
+        """The summarized shape has n_cs/cs, not results; its count used to be lost."""
+        result = {"n_cs": 159, "cs": {"pQTL": [{}, {}], "caQTL": [{}]}}
+        assert _count_result_items(result) == 159
+        assert "159 total items" in _truncation_notice(result)
+
+    def test_counts_cs_groups_without_n_cs(self):
+        assert _count_result_items({"cs": {"pQTL": [{}, {}], "caQTL": [{}]}}) == 3
+
+    def test_counts_variant_level_and_query_shapes(self):
+        assert _count_result_items({"results": [1, 2, 3]}) == 3
+        assert _count_result_items({"rows": [1, 2], "total_rows": 500}) == 500
+        assert _count_result_items({"rows": [1, 2]}) == 2
+
+    def test_unknown_shape_degrades_without_a_count(self):
+        assert _count_result_items({"foo": 1}) is None
+        assert _count_result_items("not a dict") is None
+        notice = _truncation_notice({"foo": 1})
+        assert "a larger result" in notice
+        assert "total items" not in notice
+
+    def test_notice_warns_against_absence_and_count_conclusions(self):
+        notice = _truncation_notice({"results": [1]})
+        assert "TRUNCATED" in notice
+        assert "ORDERED" in notice
+        assert "absent" in notice
+        assert "summarize=true" in notice

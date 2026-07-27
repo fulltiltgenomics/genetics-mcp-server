@@ -212,6 +212,52 @@ def _add_include_in_response(result: dict, value: str) -> dict:
     return {"INCLUDE_IN_RESPONSE": value, **{k: v for k, v in result.items() if k != "INCLUDE_IN_RESPONSE"}}
 
 
+def _count_result_items(result: Any) -> int | None:
+    """Best-effort total item count for a tool result, for the truncation notice.
+
+    Covers the shapes the data tools actually return: `results` (variant-level rows),
+    `rows` with `total_rows` (query_database), and `n_cs`/`cs` (the credible-set
+    summaries). Counting only `results` used to silently drop the count for summarized
+    credible sets, leaving the model with no idea how much it was missing.
+    """
+    if not isinstance(result, dict):
+        return None
+    if isinstance(result.get("n_cs"), int):
+        return result["n_cs"]
+    if isinstance(result.get("results"), list):
+        return len(result["results"])
+    if isinstance(result.get("total_rows"), int):
+        return result["total_rows"]
+    if isinstance(result.get("rows"), list):
+        return len(result["rows"])
+    if isinstance(result.get("cs"), dict):
+        return sum(len(v) for v in result["cs"].values() if isinstance(v, list))
+    return None
+
+
+def _truncation_notice(result: Any) -> str:
+    """Warning appended to an over-long tool result.
+
+    Spells out that what survives is an ordered PREFIX, not a sample: the underlying data
+    is sorted (by significance, or by chromosome and position), so whatever ranks lowest is
+    what got cut. Without this the model reads the visible portion as the whole answer and
+    concludes that missing categories do not exist -- which is exactly how an IL7R caQTL
+    query, truncated after its chromosome-1 pQTL rows, was reported as having no caQTL data
+    at all when it in fact had 3,058 associations.
+    """
+    total = _count_result_items(result)
+    scope = f"{total} total items" if total else "a larger result"
+    return (
+        f"\n\n[TRUNCATED: this is the beginning of {scope}, cut off mid-structure. "
+        "The data is ORDERED, so the rows you cannot see are not a random sample -- entire "
+        "categories (data types, resources, cell types, chromosomes) may be missing from the "
+        "visible part. Do NOT use this result to count anything, to list what exists, or to "
+        "conclude that something is absent. Re-run the tool with narrower arguments "
+        "(e.g. data_types, resource) or with summarize=true, or use the download link above "
+        "for the complete data.]"
+    )
+
+
 def _process_download_hints(result: dict, owner: str | None = None) -> dict:
     """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links.
 
@@ -714,20 +760,8 @@ class LLMService:
                     result_json = json.dumps(result)
 
                     if len(result_json) > settings.mcp_max_result_size:
-                        total_count = None
-                        if (
-                            isinstance(result, dict)
-                            and "results" in result
-                            and isinstance(result["results"], list)
-                        ):
-                            total_count = len(result["results"])
-
                         truncated_json = result_json[: settings.mcp_max_result_size - 1000]
-                        if total_count:
-                            warning = f"\n\n[TRUNCATED: Showing partial data from {total_count} total results. Try adding filters.]"
-                        else:
-                            warning = "\n\n[TRUNCATED: Response too large. Try more specific filters.]"
-                        result_json = truncated_json + warning
+                        result_json = truncated_json + _truncation_notice(result)
 
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": tool_use.id, "content": result_json}
