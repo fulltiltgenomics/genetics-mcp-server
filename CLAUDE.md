@@ -27,6 +27,33 @@ QUALITY CODING RULES
 6. This should often be your first step in understanding a task.
 
 
+# Documentation ownership
+
+Changing a path on the left makes the doc on the right wrong until it is updated in
+the same commit. `scripts/check-doc-drift.sh` warns (never blocks) on commits that
+violate this; it runs from the `pre-commit` hook.
+
+| changed path | doc to update | what to check |
+|---|---|---|
+| `src/genetics_mcp_server/tools/definitions.py` | `docs/project-spec.md` | the "Available tools" tables, tool profile categories |
+| `src/genetics_mcp_server/tools/executor.py` | `docs/project-spec.md`, `docs/variant-list-analysis.md` | tool execution, truncation and download handling; the variant-list doc when `analyze_variant_list` changes |
+| `src/genetics_mcp_server/routers/**` | `docs/project-spec.md` | admin endpoint list, API token endpoints, admin access rules |
+| `src/genetics_mcp_server/config/**` | `docs/project-spec.md`, `.env.example` | env-var tables, default prompts; every new variable in `.env.example` |
+| `src/genetics_mcp_server/auth/**`, `mcp_server.py`, `mcp_proxy.py` | `docs/project-spec.md`, `README.md` | bearer auth branches, `MCP_API_KEY` being mandatory on remote transports, `MCP_ALLOW_QUERY_TOKEN` gating, external MCP proxying |
+| `src/genetics_mcp_server/scripts/analyze_variants.py` | `docs/variant-list-analysis.md` | CLI flags, input format, output JSON shape |
+
+A doc is stale the moment it *enumerates* something the code no longer matches.
+Counts and lists rot silently — tool tables, endpoint lists, env-var tables — so
+re-derive them from the code rather than trusting them.
+
+
+# Cross-repo documentation
+
+`genetics-results-suite` is the spec of record for the suite as a whole; this repo
+documents only itself. Adding or changing an **MCP tool** here therefore also
+requires updating that repo's `docs/project-spec.md`, not just the docs here.
+
+
 # Software Development Behavior Guidelines
 
 1. Don't guess and do things which you are not certain about. Ask the user instead.
