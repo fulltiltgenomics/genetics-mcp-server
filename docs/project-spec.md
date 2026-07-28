@@ -319,6 +319,15 @@ unset while 4.8/4.7 do not, so leaving it off makes the token budget depend on w
 happens to be configured. Thinking blocks are streamed as keepalives but deliberately not
 persisted in `message_content`: they are only replayable to the model that produced them.
 
+Short structured calls go the other way and turn thinking **off**: session-title
+generation (`routers/chat_history.py`) and every `analyze_conversations.py` call
+produce a title or a JSON object, so reasoning would only eat the token budget — a
+50-token title has no room for it. `model_rejects_disabled_thinking()` guards the
+opt-out, since Fable and Mythos always think and 400 on `{"type": "disabled"}`.
+Responses on those paths are read by concatenating `text` blocks, never
+`content[0]`, which on a thinking-capable model is a `ThinkingBlock` with no
+`.text` — that mismatch is what broke the nightly analysis job on Opus 5.
+
 ### SSE event types
 
 The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON object with a `type` field:
@@ -667,12 +676,13 @@ quality-over-time plots).
 - **Models** (env-overridable): both topic classification (`$ANALYZE_TOPIC_MODEL`)
   and the quality judge (`$ANALYZE_QUALITY_MODEL`) default to Opus 5.
   CLI flags `--topic-model` / `--quality-model` override the env defaults.
-- **Thinking is off** on every analysis call (`thinking={"type": "disabled"}`): the
-  output is a JSON object, so reasoning tokens only add cost and latency. Opus 5
-  thinks by default, so opting out has to be explicit. Responses are read with
-  `response_text()`, which concatenates the `text` blocks instead of indexing
-  `content[0]` — a thinking-capable model leads with a `ThinkingBlock` that has no
-  `.text`, which is what broke the nightly job when it moved to Opus 5.
+- **Thinking is off** on every analysis call (`thinking_off_kwargs()`): the output is
+  a JSON object, so reasoning tokens only add cost and latency. Opus 5 thinks by
+  default, so opting out has to be explicit — and Fable/Mythos reject the opt-out,
+  hence the model check. Responses are read with `response_text()`, which
+  concatenates the `text` blocks instead of indexing `content[0]` — a thinking-capable
+  model leads with a `ThinkingBlock` that has no `.text`, which is what broke the
+  nightly job when it moved to Opus 5.
 - **LLM-as-judge** evaluates each conversation. The judge is given today's date and
   is told it cannot see raw tool output, so it must not flag real (precise, recent)
   data as fabricated. Attachments (stored only in a message's `content_json`) are

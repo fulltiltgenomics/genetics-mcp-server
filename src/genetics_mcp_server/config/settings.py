@@ -331,6 +331,18 @@ def model_supports_adaptive_thinking(model: str) -> bool:
     return False
 
 
+def model_rejects_disabled_thinking(model: str) -> bool:
+    """Check if a model rejects `thinking={"type": "disabled"}`.
+
+    Fable and Mythos always think, so asking them to stop is a 400 — the only
+    way to keep a call thinking-free there is to omit the parameter entirely
+    (which still thinks; those models just cannot be turned off). Everything
+    else accepts `disabled`, though on Opus 5 only at effort `high` or below —
+    callers that raise effort above that must not disable thinking.
+    """
+    return bool(_FABLE_RE.search(model) or _MYTHOS_RE.search(model))
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Get cached settings instance."""

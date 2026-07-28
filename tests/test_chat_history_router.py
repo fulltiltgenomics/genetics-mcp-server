@@ -2,7 +2,7 @@
 
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -706,3 +706,58 @@ class TestAttachmentEndpoints:
         )
         assert text.status_code == 200
         assert text.text == "a\tb\n1\t2\n"
+
+
+class TestGenerateTitle:
+    """The title call must survive models that emit thinking blocks."""
+
+    @staticmethod
+    def _session_with_message(client):
+        session_id = client.post("/chat/v1/chat/sessions", json={}).json()["id"]
+        client.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={"id": "msg-1", "role": "user", "content": "What does APOE do?"},
+        )
+        return session_id
+
+    @staticmethod
+    def _mock_anthropic(blocks):
+        response = MagicMock()
+        response.content = blocks
+        response.stop_reason = "end_turn"
+        client = MagicMock()
+        client.messages.create = MagicMock(return_value=response)
+        return client
+
+    def test_leading_thinking_block_is_skipped(self, client_with_auth):
+        session_id = self._session_with_message(client_with_auth)
+        anthropic_client = self._mock_anthropic([
+            MagicMock(type="thinking", thinking="pondering..."),
+            MagicMock(type="text", text='"APOE Gene Function"'),
+        ])
+
+        with patch("anthropic.Anthropic", return_value=anthropic_client):
+            resp = client_with_auth.post(
+                f"/chat/v1/chat/sessions/{session_id}/generate-title"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["title"] == "APOE Gene Function"
+        # a 3-6 word title needs no reasoning, and thinking would eat max_tokens
+        kwargs = anthropic_client.messages.create.call_args.kwargs
+        assert kwargs["thinking"] == {"type": "disabled"}
+
+    def test_text_free_response_falls_back_to_first_message(self, client_with_auth):
+        """All budget spent on thinking must not store an empty title."""
+        session_id = self._session_with_message(client_with_auth)
+        anthropic_client = self._mock_anthropic([
+            MagicMock(type="thinking", thinking="pondering..."),
+        ])
+
+        with patch("anthropic.Anthropic", return_value=anthropic_client):
+            resp = client_with_auth.post(
+                f"/chat/v1/chat/sessions/{session_id}/generate-title"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["title"] == "What does APOE do?"

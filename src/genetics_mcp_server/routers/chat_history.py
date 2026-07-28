@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from genetics_mcp_server.auth import auth_required
-from genetics_mcp_server.config import get_settings
+from genetics_mcp_server.config import get_settings, model_rejects_disabled_thinking
 from genetics_mcp_server.db import get_chat_history_db
 
 logger = logging.getLogger(__name__)
@@ -497,6 +497,13 @@ async def generate_title(
 
         settings = get_settings()
         client = Anthropic(api_key=settings.anthropic_api_key)
+        # a 3-6 word title needs no reasoning, and max_tokens covers thinking and
+        # visible text together — 50 tokens of thinking would leave nothing for the
+        # title. Models that think by default (Opus 5) have to be told explicitly.
+        thinking_kwargs = (
+            {} if model_rejects_disabled_thinking(settings.fast_model)
+            else {"thinking": {"type": "disabled"}}
+        )
         response = client.messages.create(
             model=settings.fast_model,
             max_tokens=50,
@@ -506,8 +513,18 @@ async def generate_title(
                     "content": f"Generate a very short title (3-6 words) for this chat conversation. Return only the title, no quotes or explanation.\n\nConversation:\n{conversation_text}",
                 }
             ],
+            **thinking_kwargs,
         )
-        title = response.content[0].text.strip().strip('"\'')
+        # never index content[0]: a thinking-capable model leads with a block that
+        # has no .text
+        title = "".join(
+            b.text for b in response.content if b.type == "text"
+        ).strip().strip('"\'')
+        if not title:
+            # e.g. the whole budget went to thinking on a model that can't be
+            # turned off — fall back to the first user message rather than
+            # storing an empty title
+            raise ValueError(f"model returned no title text (stop_reason={response.stop_reason})")
 
         # save title to database
         db.update_session(session_id, user, title=title)
