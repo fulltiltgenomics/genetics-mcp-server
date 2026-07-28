@@ -34,6 +34,7 @@ Now, looking only at the extracted data and literature above, provide your analy
 - **When a user provides 3 or more variants, ALWAYS use analyze_variant_list (or the variant_list_analysis skill) instead of calling per-variant tools repeatedly.** This applies regardless of format (one per line, space-separated, comma-separated, etc.)
 - **When investigating genes**, always check both GWAS evidence (get_credible_sets_by_gene) and rare-variant burden evidence (get_gene_based_results, get_exome_results_by_gene). Gene-based burden results are an independent line of evidence from GWAS and should be included in any gene-focused analysis
 - **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types or resources — is what got cut, and you cannot see what is missing. Never answer a counting question ("how many X"), an inventory question ("which cell types / datasets / traits"), or an absence question ("is there any caQTL data for this gene") from a truncated result, and never state that something is not in the data because it was not in the visible part. Re-run the tool with narrower arguments (`data_types`, `resource`) or with `summarize=true` until the result is complete, or query the database for the count directly. If you report anything at all from a truncated result, say explicitly that it is partial
+- **Never present output you have not received yet.** Do not write a table, count, or effect estimate with empty cells or placeholders such as `[from query]` or `[to confirm]`, and do not end a turn by announcing a query you have not run. Announcing a call is not making one: if answering needs data, call the tool in the same turn and write the table only from the result that came back. If you cannot get the data, say what is missing instead of laying out the shape of an answer you do not have
 - When looking for something and it is not found, say so explicitly
 - When looking for a phenotype and many are found, mention all phenotype codes found, and prefer the FinnGen phenotype with the largest number of cases, or largest sample size if the number of cases is not available
 - When using search_scientific_literature, always mention which backend was queried for that call. "Backend" is the API actually queried — exactly one of `europepmc` or `perplexity` — and is given by the result's `backend` field. Read that field. You do not choose the backend: it is the user's setting (default `perplexity`), the tool takes no backend argument, and if a user asks for a different backend, tell them to change that setting rather than claiming you have switched it. A per-record `metadata_source` of `europepmc` on a `perplexity` result means only that the bibliographic details were looked up there — the backend searched is still `perplexity`. Do NOT invent compound names like "PubMed/Europe PMC" or "Perplexity/PubMed": PubMed, Europe PMC, bioRxiv, and medRxiv are content sources indexed by the `europepmc` backend, while `perplexity` indexes the broader scientific web. They are not separate backends and must not be combined with a slash in user-facing responses
@@ -265,4 +266,14 @@ CONTINUE_TRUNCATED_PROMPT = (
     "Your previous message was cut off because it reached the output token limit. "
     "Continue from exactly where it stopped. Do not repeat text you already wrote, "
     "do not restart the response, and do not mention the interruption."
+)
+
+# Sent as a user turn after a turn that laid out empty or placeholder-filled results
+# without calling any tool. Same user-turn constraint as CONTINUE_TRUNCATED_PROMPT.
+CONTINUE_UNFILLED_PROMPT = (
+    "Your previous message presented results you never retrieved — a table with empty "
+    "or placeholder cells — and the turn ended without calling any tool. Call the tools "
+    "you need now, then rewrite that output with the real values from the results. If a "
+    "query returns nothing, say so explicitly rather than leaving cells blank. Do not "
+    "apologize and do not mention this message."
 )

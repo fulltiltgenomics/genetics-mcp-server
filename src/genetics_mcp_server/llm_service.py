@@ -20,7 +20,10 @@ from genetics_mcp_server.config import (
     model_rejects_temperature,
     model_supports_adaptive_thinking,
 )
-from genetics_mcp_server.config.defaults import CONTINUE_TRUNCATED_PROMPT
+from genetics_mcp_server.config.defaults import (
+    CONTINUE_TRUNCATED_PROMPT,
+    CONTINUE_UNFILLED_PROMPT,
+)
 from genetics_mcp_server.cost import estimate_cost, get_context_window
 from genetics_mcp_server.download_store import get_download_store
 from genetics_mcp_server.mcp_proxy import (
@@ -56,6 +59,68 @@ def anthropic_error_type(e: Exception) -> str | None:
 # an embedded ']' in params (e.g. SQL) doesn't truncate the match; DOTALL because
 # params can span multiple lines.
 _TOOL_USE_MARKER_RE = re.compile(r"\*\[Using tool:.*?\]\*", re.DOTALL)
+
+# a cell the model wrote as a stand-in for data it never fetched, e.g. "*[from query]*"
+_PLACEHOLDER_CELL_RE = re.compile(
+    r"\[\s*(?:from (?:the )?quer(?:y|ies)|to confirm|to be confirmed|pending|tbd"
+    r"|placeholder)\b[^\]]*\]",
+    re.I,
+)
+# a markdown header separator: "|---|---:|" and friends
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+
+
+def _cell_is_data(cell: str) -> bool:
+    """True if a table cell carries a real value rather than a stand-in.
+
+    A markdown link is data — citation tables are full of them — so only blanks,
+    explicit placeholders and bare dashes count as unfilled.
+    """
+    value = cell.strip().strip("*").strip()
+    if not value or value in {"-", "--", "—", "–", "...", "…", "?", "N/A", "TBD"}:
+        return False
+    return not _PLACEHOLDER_CELL_RE.fullmatch(value)
+
+
+def _has_unfilled_output(text: str) -> bool:
+    """True if the text lays out results the model never obtained.
+
+    Two shapes, both observed in stored conversations: placeholder cells, and a
+    column-label header with no data under it. The first column is excluded from the
+    row check because it holds the row label, which the model fills in from the
+    question itself — "| CHRM4 | | |" is still an empty row.
+
+    A body-less table only counts from three columns up. Two-column tables are the
+    shape the model also uses for a single labelled value ("| Result | 0 rows |"),
+    where the header row is the data and nothing is missing.
+
+    This keys on the artifact rather than on "let me pull the rows" phrasing: measured
+    over the stored history, the phrasing also ends many turns that are correctly
+    waiting on the user ("paste your gene list and I'll run it"), where resuming would
+    answer on the user's behalf.
+    """
+    if _PLACEHOLDER_CELL_RE.search(text):
+        return True
+
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if not _TABLE_SEPARATOR_RE.match(line):
+            continue
+        columns = len(line.strip().strip("|").split("|"))
+        data_cells: list[str] = []
+        rows = 0
+        for row in lines[i + 1:]:
+            if not row.strip().startswith("|"):
+                break  # end of this table; a later table is judged on its own
+            rows += 1
+            data_cells.extend(row.strip().strip("|").split("|")[1:])
+        if rows == 0:
+            if columns >= 3:
+                return True
+            continue
+        if columns >= 2 and not any(_cell_is_data(cell) for cell in data_cells):
+            return True
+    return False
 
 
 def _strip_tool_use_markers(messages: list[dict]) -> list[dict]:
@@ -581,6 +646,7 @@ class LLMService:
             all_tool_results: list[dict[str, Any]] = []
             continuations = 0
             truncated = False
+            unfilled = False
 
             while iteration < max_iterations:
                 iteration += 1
@@ -709,6 +775,42 @@ class LLMService:
                             "content": [b.model_dump(exclude_none=True) for b in message.content],
                         },
                         {"role": "user", "content": CONTINUE_TRUNCATED_PROMPT},
+                    ]
+                    continue
+
+                # a turn that ends normally after laying out empty or placeholder
+                # results, having called no tool at all, is the model announcing a
+                # query it never ran. The loop would report the placeholders as the
+                # answer, leaving the user to repeat the request to get the rows.
+                # Resume it instead, bounded by the same continuation budget.
+                if (
+                    not tool_uses
+                    and self.executor
+                    and not all_tool_results
+                    and message.stop_reason == "end_turn"
+                    and _has_unfilled_output(
+                        "".join(b.text for b in message.content if b.type == "text")
+                    )
+                ):
+                    if continuations >= settings.max_continuations:
+                        unfilled = True
+                        logger.warning(
+                            f"{log_prefix}Turn still presented unfilled results after "
+                            f"{continuations} continuation(s); giving up"
+                        )
+                        break
+                    continuations += 1
+                    logger.info(
+                        f"{log_prefix}Turn presented unfilled results with no tool call; "
+                        f"continuing ({continuations}/{settings.max_continuations})"
+                    )
+                    request_params["messages"] = [
+                        *request_params["messages"],
+                        {
+                            "role": "assistant",
+                            "content": [b.model_dump(exclude_none=True) for b in message.content],
+                        },
+                        {"role": "user", "content": CONTINUE_UNFILLED_PROMPT},
                     ]
                     continue
 
@@ -849,6 +951,14 @@ class LLMService:
 
             if truncated:
                 notice = "\n\n---\n*Response was cut short by the output token limit.*\n"
+                yield StreamChunk(type="text", content=notice)
+                all_content_blocks.append({"type": "text", "text": notice})
+
+            if unfilled:
+                notice = (
+                    "\n\n---\n*The results above were left unfilled — the query was not "
+                    "run. Ask again to retry.*\n"
+                )
                 yield StreamChunk(type="text", content=notice)
                 all_content_blocks.append({"type": "text", "text": notice})
 

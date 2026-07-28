@@ -295,7 +295,7 @@ src/genetics_mcp_server/
 
 ### Turn termination and truncation
 
-`_stream_anthropic()` decides whether to keep looping from two signals, not one:
+`_stream_anthropic()` decides whether to keep looping from three signals, not one:
 
 - **`tool_use` blocks present** — execute the tools and continue the loop, as before.
 - **`stop_reason == "max_tokens"` with no tool_use blocks** — the turn was cut off by the
@@ -303,14 +303,31 @@ src/genetics_mcp_server/
   resume (a *trailing assistant* message would be a prefill, which Opus 4.6+ rejects), up
   to `MAX_CONTINUATIONS` times. Only if it is still truncated after that does the stream
   append a visible "cut short by the output token limit" notice.
+- **`stop_reason == "end_turn"`, no tool_use blocks, no tool ran all turn, and the text
+  presents unfilled results** — the model announced a query it never made and tabled up
+  placeholders in place of the answer. Resumed the same way with
+  `CONTINUE_UNFILLED_PROMPT`, sharing the `MAX_CONTINUATIONS` budget; if it keeps coming
+  back unfilled, a "results above were left unfilled" notice is appended.
+
+`_has_unfilled_output()` decides the third case from the artifact — placeholder cells such
+as `*[from query]*`, or a column-label header with no data under it — never from "let me
+pull the rows" phrasing. Over the stored chat history the phrasing fires on five times as
+many turns, mostly ones that correctly stop to wait for the user ("paste your gene list and
+I'll run it"), where resuming would answer on the user's behalf. Markdown links count as
+data (citation tables are full of them), and a two-column header-only table is left alone
+because that is also how a single labelled value is written (`| Result | 0 rows |`). The
+system prompt carries the matching rule against presenting output that was never retrieved;
+the loop guard is the backstop for when the model writes one anyway.
 
 This matters because `max_tokens` bounds thinking *and* visible text together, so a
 reasoning-heavy turn can exhaust the budget mid-sentence. Ignoring `stop_reason` made that
 indistinguishable from a completed answer: the loop broke, `done` was emitted, and the
 client persisted a truncated response with no error and no marker.
 
-Both loops send the same continuation instruction, `CONTINUE_TRUNCATED_PROMPT` in
-`config/defaults.py`.
+Both loops send the same continuation instruction for the `max_tokens` case,
+`CONTINUE_TRUNCATED_PROMPT` in `config/defaults.py`. The unfilled-results guard is chat-only:
+a subagent's report goes back to the main agent, which can challenge it, rather than to a
+user reading a table.
 
 `thinking` is set explicitly to `{"type": "adaptive", "display": "summarized"}` for models
 that support it (`model_supports_adaptive_thinking()` in `settings.py`; the 4.6 generation
