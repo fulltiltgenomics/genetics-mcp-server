@@ -667,6 +667,12 @@ quality-over-time plots).
 - **Models** (env-overridable): both topic classification (`$ANALYZE_TOPIC_MODEL`)
   and the quality judge (`$ANALYZE_QUALITY_MODEL`) default to Opus 5.
   CLI flags `--topic-model` / `--quality-model` override the env defaults.
+- **Thinking is off** on every analysis call (`thinking={"type": "disabled"}`): the
+  output is a JSON object, so reasoning tokens only add cost and latency. Opus 5
+  thinks by default, so opting out has to be explicit. Responses are read with
+  `response_text()`, which concatenates the `text` blocks instead of indexing
+  `content[0]` — a thinking-capable model leads with a `ThinkingBlock` that has no
+  `.text`, which is what broke the nightly job when it moved to Opus 5.
 - **LLM-as-judge** evaluates each conversation. The judge is given today's date and
   is told it cannot see raw tool output, so it must not flag real (precise, recent)
   data as fabricated. Attachments (stored only in a message's `content_json`) are
@@ -681,8 +687,9 @@ quality-over-time plots).
   (no quality score) and with no user rating are labelled `unknown` rather than given
   a heuristic label, so they stay out of the quality metric.
 - **Issue categorization**: the judge's detailed per-conversation issues are mapped
-  onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a cheap Haiku
-  pass so the report surfaces recurring problems instead of count-1 unique strings.
+  onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a separate
+  cheap pass (batched, on the topic model) so the report surfaces recurring problems
+  instead of count-1 unique strings.
 - **Caching**: per-session topic + quality + derived results are persisted to the
   `conversation_analysis` / `conversation_issue` SQLite tables (with the full
   `ConversationMetrics` blob in `metrics_json`) and read back via `get_analysis_map`

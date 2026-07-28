@@ -31,6 +31,22 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     parse_tool_calls,
 )
 
+
+def mock_llm_response(payload, *, leading_thinking: bool = False):
+    """Mock a Messages API response whose blocks carry a .type, like the SDK's.
+
+    Thinking-capable models can put a ThinkingBlock (no .text) first, so the
+    mocks have to be block-type aware or they hide that failure mode.
+    """
+    blocks = []
+    if leading_thinking:
+        blocks.append(MagicMock(type="thinking", thinking="pondering..."))
+    blocks.append(MagicMock(type="text", text=json.dumps(payload)))
+    response = MagicMock()
+    response.content = blocks
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -419,11 +435,10 @@ class TestExportEvalDataset:
 class TestLLMCategorization:
     @pytest.mark.asyncio
     async def test_successful_categorization(self):
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps([
+        mock_response = mock_llm_response([
             {"id": "s1", "topic": "gene_lookup", "complexity": 1, "brief_reason": "gene query"},
             {"id": "s2", "topic": "variant_interpretation", "complexity": 2, "brief_reason": "variant"},
-        ]))]
+        ])
 
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
@@ -436,6 +451,23 @@ class TestLLMCategorization:
 
         assert result["s1"]["topic"] == "gene_lookup"
         assert result["s2"]["topic"] == "variant_interpretation"
+        # thinking is off: these calls only need a JSON object back
+        assert mock_client.messages.create.await_args.kwargs["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.asyncio
+    async def test_leading_thinking_block_is_skipped(self):
+        """A ThinkingBlock ahead of the answer must not break parsing."""
+        mock_response = mock_llm_response(
+            [{"id": "s1", "topic": "gene_lookup", "complexity": 1, "brief_reason": "gene query"}],
+            leading_thinking=True,
+        )
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result = await categorize_with_llm([{"id": "s1", "text": "What about BRCA1?"}])
+
+        assert result["s1"]["topic"] == "gene_lookup"
 
     @pytest.mark.asyncio
     async def test_fallback_on_api_error(self):
@@ -459,11 +491,10 @@ class TestLLMCategorization:
 class TestIssueCategorization:
     @pytest.mark.asyncio
     async def test_maps_issues_to_categories(self):
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps([
+        mock_response = mock_llm_response([
             {"id": 0, "category": "missed_data_source"},
             {"id": 1, "category": "inefficient_tool_use"},
-        ]))]
+        ])
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
@@ -477,10 +508,9 @@ class TestIssueCategorization:
 
     @pytest.mark.asyncio
     async def test_unknown_category_coerced_to_other(self):
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps([
+        mock_response = mock_llm_response([
             {"id": 0, "category": "totally_made_up"},
-        ]))]
+        ])
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
@@ -664,11 +694,10 @@ class TestDisposition:
 
     @pytest.mark.asyncio
     async def test_evaluate_quality_with_llm(self):
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text=json.dumps({
+        mock_response = mock_llm_response({
             "answered": "yes", "accurate": "yes", "efficient": "yes",
             "concluded": "yes", "quality_score": 5, "issues": [],
-        }))]
+        })
 
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
@@ -692,6 +721,35 @@ class TestDisposition:
 
         assert "s1" in result
         assert result["s1"]["quality_score"] == 5
+        assert mock_client.messages.create.await_args.kwargs["thinking"] == {"type": "disabled"}
+
+    @pytest.mark.asyncio
+    async def test_evaluate_quality_skips_leading_thinking_block(self):
+        """Regression: judging a conversation on a thinking-capable model."""
+        mock_response = mock_llm_response({
+            "answered": "yes", "accurate": "yes", "efficient": "yes",
+            "concluded": "yes", "quality_score": 4, "issues": [],
+        }, leading_thinking=True)
+
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        messages = pl.DataFrame({
+            "id": ["m1", "m2"],
+            "session_id": ["s1", "s1"],
+            "role": ["user", "assistant"],
+            "content": ["What about BRCA1?", "BRCA1 is a tumor suppressor gene."],
+            "created_at": ["2025-01-01", "2025-01-01"],
+            "thumbs_up": [None, None],
+            "content_json": [None, None],
+            "literature_backend": [None, None],
+            "tool_profile": [None, None],
+        })
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result = await evaluate_quality_with_llm(["s1"], messages)
+
+        assert result["s1"]["quality_score"] == 4
 
 
 # ---------------------------------------------------------------------------

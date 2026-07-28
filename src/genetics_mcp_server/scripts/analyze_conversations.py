@@ -99,6 +99,21 @@ def extract_first_json(text: str):
     return None
 
 
+# thinking is disabled on every analysis call below (see THINKING_OFF), but a
+# response can still lead with a non-text block, so never index content[0]:
+# on thinking-capable models that block is a ThinkingBlock with no .text.
+def response_text(response) -> str:
+    """Concatenate the text blocks of a Messages API response."""
+    return "".join(b.text for b in response.content if b.type == "text")
+
+
+# These are structured-extraction and judging calls whose whole output is a JSON
+# object, so reasoning tokens buy nothing but cost and latency. Opus 5 thinks by
+# default, so opting out has to be explicit (accepted at effort `high` or below,
+# which is the default).
+THINKING_OFF = {"type": "disabled"}
+
+
 # ---------------------------------------------------------------------------
 # Tool usage parsing
 # ---------------------------------------------------------------------------
@@ -322,11 +337,12 @@ async def categorize_with_llm(
             response = await client.messages.create(
                 model=model,
                 max_tokens=2000,
+                thinking=THINKING_OFF,
                 messages=[{"role": "user", "content": prompt}],
             )
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
-            text = response.content[0].text
+            text = response_text(response)
             # extract JSON from response (may have markdown fences / trailing data)
             classifications = extract_first_json(text)
             if isinstance(classifications, list):
@@ -397,11 +413,12 @@ async def categorize_issues_with_llm(
             response = await client.messages.create(
                 model=model,
                 max_tokens=2000,
+                thinking=THINKING_OFF,
                 messages=[{"role": "user", "content": prompt}],
             )
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
-            parsed = extract_first_json(response.content[0].text)
+            parsed = extract_first_json(response_text(response))
             if isinstance(parsed, list):
                 for obj in parsed:
                     idx = obj.get("id")
@@ -535,11 +552,12 @@ async def evaluate_quality_with_llm(
             response = await client.messages.create(
                 model=model,
                 max_tokens=1000,
+                thinking=THINKING_OFF,
                 messages=[{"role": "user", "content": prompt}],
             )
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
-            text = response.content[0].text
+            text = response_text(response)
             assessment = extract_first_json(text)
             if isinstance(assessment, dict):
                 results[sid] = assessment
