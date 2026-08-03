@@ -689,6 +689,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |
+| `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
 | `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
 | `test_phewas_categories.py` | PheWAS category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |

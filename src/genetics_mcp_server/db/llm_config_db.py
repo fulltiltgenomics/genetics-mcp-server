@@ -20,6 +20,24 @@ from .singleton import Singleton
 
 logger = logging.getLogger(__name__)
 
+# the selected set's body will be appended to the system prompt of every chat request once
+# prompt assembly consumes it, so both caps bound recurring token cost rather than storage.
+# Both are enforced at write time; on read they behave differently. The count cap is applied
+# by list_instruction_sets, which drops the rows past it, while an over-cap body is only
+# reported (InstructionSet.body_over_cap) and never clamped: rows predating a cap exceed it —
+# the legacy import applies none — and a read that truncated one would feed the truncation
+# straight back into the next write
+INSTRUCTION_SET_MAX_BODY_CHARS = 4000
+INSTRUCTION_SET_MAX_PER_USER = 20
+
+
+class InstructionSetBodyTooLong(ValueError):
+    """Raised when an instruction set body exceeds INSTRUCTION_SET_MAX_BODY_CHARS."""
+
+
+class InstructionSetLimitReached(ValueError):
+    """Raised when a user already holds INSTRUCTION_SET_MAX_PER_USER non-archived sets."""
+
 
 @dataclass
 class ToolDescriptionVersion:
@@ -57,7 +75,7 @@ class UserSetting:
 
 @dataclass
 class InstructionSet:
-    """A named set of user-authored instructions appended to the chat system prompt."""
+    """A named set of user-authored instructions, to be appended to the chat system prompt."""
 
     id: str
     user_id: str
@@ -66,6 +84,10 @@ class InstructionSet:
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None = None
+    # computed on read, never stored: body is always the authoritative stored text, so a
+    # consumer that must bound its length (prompt assembly) or explain why saving the set
+    # unchanged is rejected (the edit dialog) needs to be told the row predates the cap
+    body_over_cap: bool = False
 
 
 @dataclass
@@ -161,8 +183,9 @@ class LLMConfigDB(object, metaclass=Singleton):
             # everyone else's legacy text. Idempotency still holds because sets are archived
             # rather than deleted, so an imported set the user later archives blocks re-import.
             # changed_at is nullable in the legacy table, and binding NULL would override the
-            # column DEFAULT and yield a set whose timestamps crash every reader here, so it
-            # is coalesced both where rows are ranked and where they are stored. SQLite's
+            # column DEFAULT: readers degrade a missing stamp to the epoch, so the imported set
+            # would sort as the user's oldest and lose the date its text was actually written.
+            # It is coalesced both where rows are ranked and where they are stored. SQLite's
             # one-argument TRIM strips 0x20 only, hence the explicit whitespace character set
             cursor.execute(
                 """
@@ -654,6 +677,299 @@ class LLMConfigDB(object, metaclass=Singleton):
         self._conn.commit()
         return True
 
+    # user instruction sets
+
+    @classmethod
+    def _instruction_set_from_row(cls, row: sqlite3.Row) -> InstructionSet:
+        # the stored body is returned whole even when it exceeds the cap: a read that clamped
+        # it would be handed back by the next edit and silently destroy the rest of the text.
+        # Bounding the prompt is the job of whoever pays the token cost
+        body = row["body"]
+        return InstructionSet(
+            id=row["id"],
+            user_id=row["user_id"],
+            name=row["name"],
+            body=body,
+            created_at=cls._as_utc_or_epoch(row["created_at"]),
+            updated_at=cls._as_utc_or_epoch(row["updated_at"]),
+            archived_at=(
+                cls._as_utc_or_epoch(row["archived_at"]) if row["archived_at"] else None
+            ),
+            body_over_cap=len(body) > INSTRUCTION_SET_MAX_BODY_CHARS,
+        )
+
+    @staticmethod
+    def _discard_stale_transaction(conn: sqlite3.Connection) -> None:
+        """Roll back a transaction an earlier failed write left open on this connection.
+
+        Python's legacy isolation_level opens a transaction before any DML, and no accessor
+        outside this section rolls one back, so a failure anywhere in this class leaves the
+        thread's cached connection inside a transaction that holds locks against every other
+        writer of the file. Whatever is pending is by construction an abandoned write: a write
+        accessor commits before it returns, so anything still open belongs to a call that
+        raised. The only code that runs many DMLs under a single commit is _init_db and the
+        migration it calls, and no accessor can ever be inside it — it runs only from __init__,
+        calls no accessor, commits before returning, and Singleton publishes the instance only
+        once __init__ has succeeded. The connection belongs to this thread alone, so discarding
+        what is pending can lose nothing a caller still expects to be saved. Without this,
+        BEGIN IMMEDIATE below would raise and keep raising for the life of the thread, and a
+        plain UPDATE would silently commit the abandoned write along with its own.
+        """
+        if conn.in_transaction:
+            logger.warning("rolling back a transaction left open by an earlier failed write")
+            conn.rollback()
+
+    @staticmethod
+    def _check_body_cap(body: str) -> None:
+        if len(body) > INSTRUCTION_SET_MAX_BODY_CHARS:
+            raise InstructionSetBodyTooLong(
+                f"instruction set body is {len(body)} chars, "
+                f"the maximum is {INSTRUCTION_SET_MAX_BODY_CHARS}"
+            )
+
+    def list_instruction_sets(self, user_id: str) -> list[InstructionSet]:
+        """List a user's non-archived instruction sets, most recently edited first.
+
+        Returns at most INSTRUCTION_SET_MAX_PER_USER rows: the cap is re-applied here because
+        a user can hold more than it allows once it is lowered under them.
+        """
+        conn = self._conn
+        # a connection always sees its own uncommitted rows, so a write that raised earlier on
+        # this thread and left its DML pending would be read back here as if it had been saved,
+        # and the next write accessor would then roll it away again. Ending that transaction is
+        # the only way for a read to see committed state, and rolling back is the only end that
+        # keeps an abandoned write abandoned — committing it here would store what its caller
+        # was told had failed. It is exactly what the next write on this connection would do
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        # one row past the cap so an over-cap user can be reported without a second COUNT.
+        # updated_at has one-second resolution, so the uuid id breaks ties: arbitrary, but
+        # stable, where SQLite would otherwise be free to reorder between calls
+        cursor.execute(
+            """
+            SELECT id, user_id, name, body, created_at, updated_at, archived_at
+            FROM user_instruction_sets
+            WHERE user_id = ? AND archived_at IS NULL
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, INSTRUCTION_SET_MAX_PER_USER + 1),
+        )
+        rows = cursor.fetchall()
+        if len(rows) > INSTRUCTION_SET_MAX_PER_USER:
+            # only reachable by lowering the cap under an existing user. The hidden sets stay
+            # in the table and each one is still readable and archivable by id, but nothing
+            # hands those ids out once the listing drops them, so the user is editing a
+            # truncated view of what they own. They can still get back under the cap unaided —
+            # archiving enough of the sets that are listed brings the live count down to it and
+            # the hidden ones reappear here — but they do it by deleting sets they can see to
+            # recover sets they cannot, with no way to tell that is what is happening, hence
+            # the loud log
+            logger.warning(
+                "user %s holds more than %d instruction sets, listing the newest %d",
+                user_id,
+                INSTRUCTION_SET_MAX_PER_USER,
+                INSTRUCTION_SET_MAX_PER_USER,
+            )
+            rows = rows[:INSTRUCTION_SET_MAX_PER_USER]
+        return [self._instruction_set_from_row(row) for row in rows]
+
+    def get_instruction_set(self, user_id: str, set_id: str) -> InstructionSet | None:
+        """Get one of a user's instruction sets by id, archived or not.
+
+        Archived sets stay readable so a chat message that recorded the id remains resolvable.
+        """
+        conn = self._conn
+        # as in list_instruction_sets: without this, a write that raised earlier on this thread
+        # is still visible to this connection and would be handed to a chat turn as a stored set
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, name, body, created_at, updated_at, archived_at
+            FROM user_instruction_sets
+            WHERE id = ? AND user_id = ?
+            """,
+            (set_id, user_id),
+        )
+        row = cursor.fetchone()
+        return self._instruction_set_from_row(row) if row else None
+
+    def create_instruction_set(
+        self, user_id: str, name: str, body: str, comment: str | None = None
+    ) -> InstructionSet:
+        """Create a new instruction set for a user.
+
+        Raises InstructionSetBodyTooLong or InstructionSetLimitReached if a cap is exceeded.
+        """
+        self._check_body_cap(body)
+        set_id = str(uuid.uuid4())
+        conn = self._conn
+        cursor = conn.cursor()
+        try:
+            self._discard_stale_transaction(conn)
+            # BEGIN IMMEDIATE takes the database's write lock before the count is read. Left to
+            # itself python opens a deferred transaction at the INSERT only, so the count and
+            # the insert are two independently visible steps and concurrent requests — a double
+            # click, a retry — all see room under the cap and all succeed. The excess rows then
+            # stay live: list_instruction_sets clamps what it shows, but nothing archives them,
+            # so the user has to. It sits inside the try so a BEGIN that fails anyway still
+            # leaves the connection clean for the next call
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT COUNT(*) FROM user_instruction_sets "
+                "WHERE user_id = ? AND archived_at IS NULL",
+                (user_id,),
+            )
+            if cursor.fetchone()[0] >= INSTRUCTION_SET_MAX_PER_USER:
+                raise InstructionSetLimitReached(
+                    f"user already holds the maximum of {INSTRUCTION_SET_MAX_PER_USER} "
+                    "instruction sets"
+                )
+
+            # the timestamps are omitted rather than bound as NULL, which would override the
+            # column DEFAULTs: readers degrade a missing stamp to the epoch, so a brand new
+            # set would sort as the user's oldest and never carry its real creation time
+            cursor.execute(
+                """
+                INSERT INTO user_instruction_sets (id, user_id, name, body)
+                VALUES (?, ?, ?, ?)
+                """,
+                (set_id, user_id, name, body),
+            )
+            cursor.execute(
+                """
+                INSERT INTO user_instruction_set_history (set_id, user_id, name, body, comment)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (set_id, user_id, name, body, comment),
+            )
+            # inside the try: COMMIT itself can return SQLITE_BUSY against a concurrent reader,
+            # and a commit that raises leaves the transaction open, so the next accessor on this
+            # long-lived thread would commit the rows this caller was told had not been written
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        # read back so the returned timestamps are the ones SQLite stored, not a local clock
+        created = self.get_instruction_set(user_id, set_id)
+        if created is None:  # pragma: no cover - the row was just committed for this user
+            raise RuntimeError(f"instruction set {set_id} vanished right after it was created")
+        return created
+
+    def update_instruction_set(
+        self,
+        user_id: str,
+        set_id: str,
+        name: str | None = None,
+        body: str | None = None,
+        comment: str | None = None,
+    ) -> InstructionSet | None:
+        """Update a user's instruction set and append the new version to its history.
+
+        Returns None if the set does not exist for this user or has been archived, including
+        archived while this call was in flight — an archived set is deleted as far as the user
+        is concerned, so editing one must not report success. Un-archiving, if it is ever
+        offered, needs its own accessor that clears archived_at rather than this general editor.
+
+        Omitted fields keep their current value. Raises InstructionSetBodyTooLong if the new
+        body exceeds the cap, including when the caller is echoing back a stored over-cap body.
+        """
+        conn = self._conn
+        # before the BEGIN: an abandoned write still open on this connection would fail it,
+        # and would otherwise be part of the snapshot read here
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            # as in create, BEGIN IMMEDIATE takes the write lock before the read. The SELECT
+            # below supplies whichever of name and body the caller omitted and the UPDATE writes
+            # both back, so the pair is a read-modify-write: unprotected, a rename committed
+            # between them is read as the old name and silently written back over by a call that
+            # only meant to edit the body, with both callers told they succeeded
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT name, body FROM user_instruction_sets
+                WHERE id = ? AND user_id = ? AND archived_at IS NULL
+                """,
+                (set_id, user_id),
+            )
+            current = cursor.fetchone()
+            if current is None:
+                # the BEGIN above holds the write lock until the transaction is ended
+                conn.rollback()
+                return None
+
+            if body is not None:
+                self._check_body_cap(body)
+            new_name = current["name"] if name is None else name
+            new_body = current["body"] if body is None else body
+
+            # updated_at must be assigned here: DEFAULT CURRENT_TIMESTAMP fires on INSERT only,
+            # so leaving it alone would keep the listing ordered by creation time forever
+            cursor.execute(
+                """
+                UPDATE user_instruction_sets
+                SET name = ?, body = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ? AND archived_at IS NULL
+                """,
+                (new_name, new_body, set_id, user_id),
+            )
+            if cursor.rowcount == 0:
+                # archived between the SELECT and the UPDATE. The write lock now shuts other
+                # connections out of that window, so this needs an archive reaching this same
+                # connection from inside it — which discards the transaction taken above.
+                # Nothing was stored, so the history row must not be appended and the caller
+                # must get the same None an already-archived set returns; the read-back below
+                # would happily return the archived row
+                conn.rollback()
+                return None
+            cursor.execute(
+                """
+                INSERT INTO user_instruction_set_history (set_id, user_id, name, body, comment)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (set_id, user_id, new_name, new_body, comment),
+            )
+            # inside the try: a COMMIT that raises leaves the transaction open, and the next
+            # accessor on this thread would commit the body this caller was told was not saved
+            conn.commit()
+        except BaseException:
+            # without this the already-executed UPDATE stays pending and the next successful
+            # write on this connection commits it, leaving a body with no history row
+            conn.rollback()
+            raise
+        return self.get_instruction_set(user_id, set_id)
+
+    def archive_instruction_set(self, user_id: str, set_id: str) -> bool:
+        """Archive (soft delete) a user's instruction set.
+
+        Returns False if the user has no such set or it is archived already. There is
+        deliberately no hard delete: the row is the only record that a user has already been
+        offered the legacy import, and chat messages will reference sets by id from a separate
+        database file where no foreign key can catch a dangling reference.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE user_instruction_sets
+                SET archived_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ? AND archived_at IS NULL
+                """,
+                (set_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            # a failed UPDATE — or a COMMIT that raises, which SQLite allows — still leaves
+            # python's implicit transaction open, holding the write lock against every other
+            # writer of this file until the thread happens to commit something else
+            conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
     # user API tokens
 
     @staticmethod
@@ -670,6 +986,23 @@ class LLMConfigDB(object, metaclass=Singleton):
         """Parse a stored timestamp as UTC. SQLite's CURRENT_TIMESTAMP is naive UTC."""
         parsed = datetime.fromisoformat(value)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    @classmethod
+    def _as_utc_or_epoch(cls, value: str | None) -> datetime:
+        """Parse a stored timestamp that the schema permits to be NULL or malformed.
+
+        The instruction-set columns carry no NOT NULL, so a row written outside the accessors
+        can hold anything. A chat turn depends on this read path, so an unusable stamp degrades
+        to the epoch — which sorts oldest, the same place SQLite puts a NULL in the listing's
+        DESC order — instead of raising and failing the turn.
+        """
+        if isinstance(value, str):
+            try:
+                return cls._as_utc(value)
+            except ValueError:
+                pass
+        logger.warning("unusable stored timestamp %r, falling back to the epoch", value)
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     @staticmethod
     def _utc_stamp(value: datetime) -> str:
