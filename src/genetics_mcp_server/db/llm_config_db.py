@@ -11,6 +11,7 @@ import os
 import secrets
 import sqlite3
 import threading
+import uuid
 from collections import defaultdict as dd
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -105,31 +106,38 @@ class LLMConfigDB(object, metaclass=Singleton):
     def _conn(self) -> sqlite3.Connection:
         return self._connections[threading.get_ident()]
 
+    def _table_exists(self, cursor: sqlite3.Cursor, name: str) -> bool:
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        )
+        return cursor.fetchone() is not None
+
     def _migrate_to_history_tables(self, cursor: sqlite3.Cursor) -> None:
         """Migrate data from old tables to new history tables."""
-        # check if old user_instructions table exists and has data
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='user_instructions'"
-        )
-        if cursor.fetchone():
-            # check if history table is empty
-            cursor.execute("SELECT COUNT(*) FROM user_instructions_history")
-            if cursor.fetchone()[0] == 0:
-                # migrate data
-                cursor.execute(
-                    """
-                    INSERT INTO user_instructions_history (user_id, instructions, changed_at, comment)
-                    SELECT user_id, instructions, changed_at, comment FROM user_instructions
-                    """
+        # _init_db no longer creates user_instructions_history, so a database old enough to
+        # still hold user_instructions can reach here with no table to migrate into
+        if self._table_exists(cursor, "user_instructions"):
+            if not self._table_exists(cursor, "user_instructions_history"):
+                logger.warning(
+                    "user_instructions exists without user_instructions_history: its rows "
+                    "are left unmigrated. No deployed database should be in this state"
                 )
-            # drop old table
-            cursor.execute("DROP TABLE IF EXISTS user_instructions")
+            else:
+                # check if history table is empty
+                cursor.execute("SELECT COUNT(*) FROM user_instructions_history")
+                if cursor.fetchone()[0] == 0:
+                    # migrate data
+                    cursor.execute(
+                        """
+                        INSERT INTO user_instructions_history (user_id, instructions, changed_at, comment)
+                        SELECT user_id, instructions, changed_at, comment FROM user_instructions
+                        """
+                    )
+                # drop old table
+                cursor.execute("DROP TABLE IF EXISTS user_instructions")
 
-        # check if old user_tool_descriptions table exists and has data
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='user_tool_descriptions'"
-        )
-        if cursor.fetchone():
+        # check if old user_tool_descriptions table exists
+        if self._table_exists(cursor, "user_tool_descriptions"):
             # check if history table is empty
             cursor.execute("SELECT COUNT(*) FROM user_tool_descriptions_history")
             if cursor.fetchone()[0] == 0:
@@ -142,6 +150,67 @@ class LLMConfigDB(object, metaclass=Singleton):
                 )
             # drop old table
             cursor.execute("DROP TABLE IF EXISTS user_tool_descriptions")
+
+        # the per-user instructions feature was removed in 99fbdac (Mar 2026) and its text
+        # never reached prompt assembly, but users wrote it and may still want it, so hand
+        # each of them their last version as a named set they can edit or archive. The table
+        # is no longer created for new databases and is deliberately not dropped here, so
+        # deployed rows survive this release and stay available if the import needs redoing
+        if self._table_exists(cursor, "user_instructions_history"):
+            # the guard is per user, not table-wide: one user owning a set must not strand
+            # everyone else's legacy text. Idempotency still holds because sets are archived
+            # rather than deleted, so an imported set the user later archives blocks re-import.
+            # changed_at is nullable in the legacy table, and binding NULL would override the
+            # column DEFAULT and yield a set whose timestamps crash every reader here, so it
+            # is coalesced both where rows are ranked and where they are stored. SQLite's
+            # one-argument TRIM strips 0x20 only, hence the explicit whitespace character set
+            cursor.execute(
+                """
+                SELECT h.user_id, h.instructions,
+                       COALESCE(h.changed_at, CURRENT_TIMESTAMP) AS changed_at
+                FROM user_instructions_history h
+                WHERE h.id = (
+                    SELECT id FROM user_instructions_history
+                    WHERE user_id = h.user_id
+                    ORDER BY COALESCE(changed_at, CURRENT_TIMESTAMP) DESC, id DESC
+                    LIMIT 1
+                )
+                AND TRIM(h.instructions, char(32)||char(9)||char(10)||char(13)) != ''
+                AND NOT EXISTS (
+                    SELECT 1 FROM user_instruction_sets s WHERE s.user_id = h.user_id
+                )
+                """
+            )
+            for row in cursor.fetchall():
+                set_id = str(uuid.uuid4())
+                # the original changed_at is kept rather than stamping now, so the
+                # imported set does not claim to be the user's newest edit
+                cursor.execute(
+                    """
+                    INSERT INTO user_instruction_sets (id, user_id, name, body, created_at, updated_at)
+                    VALUES (?, ?, 'Imported', ?, ?, ?)
+                    """,
+                    (
+                        set_id,
+                        row["user_id"],
+                        row["instructions"],
+                        row["changed_at"],
+                        row["changed_at"],
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO user_instruction_set_history (set_id, user_id, name, body, changed_at, comment)
+                    VALUES (?, ?, 'Imported', ?, ?, ?)
+                    """,
+                    (
+                        set_id,
+                        row["user_id"],
+                        row["instructions"],
+                        row["changed_at"],
+                        "imported from the removed per-user instructions feature",
+                    ),
+                )
 
     def _init_db(self) -> None:
         """Create tables if they don't exist."""
@@ -170,18 +239,6 @@ class LLMConfigDB(object, metaclass=Singleton):
         # per-user tables with history (no unique constraints - all changes are stored)
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS user_instructions_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                instructions TEXT NOT NULL,
-                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                comment TEXT
-            )
-        """
-        )
-
-        cursor.execute(
-            """
             CREATE TABLE IF NOT EXISTS user_tool_descriptions_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
@@ -190,13 +247,6 @@ class LLMConfigDB(object, metaclass=Singleton):
                 changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 comment TEXT
             )
-        """
-        )
-
-        cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_user_instructions_history_user
-            ON user_instructions_history(user_id, changed_at DESC)
         """
         )
 
