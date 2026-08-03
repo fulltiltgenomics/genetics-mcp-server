@@ -120,6 +120,13 @@ class ToolExecutor:
         # lazily-fetched universe of expression resources (e.g. gtex, hpa), used to
         # tell "gene absent from this resource" apart from "resource unavailable"
         self._expression_resources: list[str] | None = None
+        # lazily-fetched cBioPortal metadata. The study and profile lists change
+        # only when cBioPortal reimports data, and the cancer-type denominators do
+        # not depend on the gene being queried, so all three are cached for the
+        # process lifetime rather than refetched per call.
+        self._cbio_studies: list[dict[str, Any]] | None = None
+        self._cbio_profiles: list[dict[str, Any]] | None = None
+        self._cbio_denominators: dict[str, dict[str, Any]] | None = None
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion
@@ -2984,6 +2991,661 @@ class ToolExecutor:
                 })
 
         return list(by_gene.values())[:size]
+
+    # -------------------------------------------------------------------------
+    # cBioPortal
+    # -------------------------------------------------------------------------
+
+    # Public cBioPortal REST API. Public studies need no authentication; the data
+    # is ODbL-licensed, so every result carries the attribution string below and
+    # study-level citations where we have them.
+    _CBIO_API = "https://www.cbioportal.org/api"
+    _CBIO_STUDY_URL = "https://www.cbioportal.org/study/summary"
+
+    _CBIO_ATTRIBUTION = (
+        "Data from cBioPortal (ODbL). Cite cBioPortal and the originating studies."
+    )
+
+    # cBioPortal is majority GRCh37 and does not lift over, so genomic coordinates
+    # from it must never be compared against this suite's GRCh38 positions. Gene
+    # symbols and protein changes are build-independent, which is why every query
+    # type here keys on those and reports coordinates only tagged with their build.
+    _CBIO_BUILD_NOTE = (
+        "cBioPortal reports each record on the build of its source study (mostly "
+        "GRCh37) and does not lift over. This suite is GRCh38, so do NOT compare "
+        "these genomic coordinates with GRCh38 positions. Gene symbol and protein "
+        "change are build-independent — match on those. To go from a GRCh38 "
+        "variant to a protein change first, use get_variant_protein_effect."
+    )
+
+    # mutations/fetch returns one record per mutated sample, so a hot gene is huge
+    # pan-cancer (TP53 is ~142k records / ~100 MB). Above this many records we drop
+    # to the curated cohort below, which keeps TP53 at ~23k records / ~17 MB.
+    _CBIO_MAX_MUTATION_RECORDS = 25000
+
+    # TCGA PanCancer Atlas plus the MSK pan-cancer cohorts: large, broadly
+    # non-overlapping, and deep enough to rank hotspots for genes too hot to fetch
+    # whole. Used only as the fallback scope, never silently for normal genes.
+    _CBIO_CURATED_STUDY_IDS = frozenset({"msk_impact_2017", "msk_chord_2024"})
+    _CBIO_CURATED_SUFFIX = "pan_can_atlas"
+
+    # discrete CNA levels as returned by genomic-data-counts
+    _CBIO_CNA_LABELS = {
+        "2": "amplification",
+        "1": "gain",
+        "0": "diploid",
+        "-1": "shallow_deletion",
+        "-2": "deep_deletion",
+    }
+
+    async def search_cbioportal(
+        self,
+        query: str,
+        query_type: str = "gene_summary",
+        cancer_types: list[str] | None = None,
+        max_results: int = 25,
+    ) -> dict[str, Any]:
+        """Search cBioPortal for somatic alteration frequencies in cancer cohorts."""
+        size = max(1, min(max_results, 100))
+        try:
+            if query_type == "gene_summary":
+                result = await self._cbio_gene_summary(query)
+            elif query_type == "gene_by_cancer_type":
+                result = await self._cbio_gene_by_cancer_type(
+                    query, cancer_types, size
+                )
+            elif query_type == "gene_mutations":
+                result = await self._cbio_gene_mutations(query, size)
+            elif query_type == "gene_fusions":
+                result = await self._cbio_gene_fusions(query, size)
+            elif query_type == "variant_hotspot":
+                result = await self._cbio_variant_hotspot(query)
+            elif query_type == "study_search":
+                result = await self._cbio_study_search(query, size)
+            else:
+                return {
+                    "success": False,
+                    "error": f"Unknown query_type: {query_type}",
+                }
+
+            if isinstance(result, dict) and result.get("_error"):
+                return {"success": False, "error": result["_error"]}
+
+            return {
+                "success": True,
+                "query": query,
+                "query_type": query_type,
+                "source": "cbioportal",
+                "attribution": self._CBIO_ATTRIBUTION,
+                **result,
+            }
+        except Exception as e:
+            logger.error(
+                f"Error in search_cbioportal({query!r}, type={query_type}): {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # --- transport -----------------------------------------------------------
+
+    async def _cbio_get(
+        self, path: str, params: dict[str, Any] | None = None, timeout: float = 30.0
+    ) -> Any:
+        """GET a cBioPortal endpoint. Returns parsed JSON, or a {'_error': ...}
+        sentinel on HTTP failure so callers can surface it without raising."""
+        resp = await self.external_client.get(
+            f"{self._CBIO_API}{path}", params=params, timeout=timeout
+        )
+        if resp.status_code != 200:
+            return {"_error": f"cBioPortal HTTP {resp.status_code}: {(resp.text or '')[:200]}"}
+        return resp.json()
+
+    async def _cbio_post(
+        self,
+        path: str,
+        body: Any,
+        params: dict[str, Any] | None = None,
+        timeout: float = 120.0,
+    ) -> Any:
+        """POST to a cBioPortal endpoint, with the same error sentinel as _cbio_get.
+
+        The timeout is generous because the pan-cancer fetches legitimately take
+        several seconds against 539 studies.
+        """
+        resp = await self.external_client.post(
+            f"{self._CBIO_API}{path}", json=body, params=params, timeout=timeout
+        )
+        if resp.status_code != 200:
+            return {"_error": f"cBioPortal HTTP {resp.status_code}: {(resp.text or '')[:200]}"}
+        return resp.json()
+
+    async def _cbio_count(self, path: str, body: Any) -> int | dict[str, Any]:
+        """Ask how many records a fetch would return, without downloading them.
+
+        projection=META returns an empty body and a total-count header, which is
+        what makes the size guard in _cbio_gene_mutations cheap (~0.4s).
+        """
+        resp = await self.external_client.post(
+            f"{self._CBIO_API}{path}",
+            json=body,
+            params={"projection": "META"},
+            timeout=60.0,
+        )
+        if resp.status_code != 200:
+            return {"_error": f"cBioPortal HTTP {resp.status_code}: {(resp.text or '')[:200]}"}
+        try:
+            return int(resp.headers.get("total-count", 0))
+        except ValueError:
+            return {"_error": "cBioPortal returned a non-numeric total-count header"}
+
+    # --- cached metadata -----------------------------------------------------
+
+    async def _cbio_get_studies(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self._cbio_studies is None:
+            data = await self._cbio_get("/studies", {"projection": "SUMMARY"})
+            if isinstance(data, dict):
+                return data
+            self._cbio_studies = data
+        return self._cbio_studies
+
+    async def _cbio_get_profiles(self) -> list[dict[str, Any]] | dict[str, Any]:
+        if self._cbio_profiles is None:
+            data = await self._cbio_get("/molecular-profiles", {"pageSize": 10000})
+            if isinstance(data, dict):
+                return data
+            self._cbio_profiles = data
+        return self._cbio_profiles
+
+    async def _cbio_profile_ids(
+        self, alteration_type: str, study_ids: set[str] | None = None
+    ) -> list[str] | dict[str, Any]:
+        profiles = await self._cbio_get_profiles()
+        if isinstance(profiles, dict):
+            return profiles
+        return [
+            p["molecularProfileId"]
+            for p in profiles
+            if p.get("molecularAlterationType") == alteration_type
+            and (study_ids is None or p.get("studyId") in study_ids)
+        ]
+
+    async def _cbio_resolve_gene(self, symbol: str) -> dict[str, Any]:
+        """Resolve a HUGO symbol to its Entrez gene id."""
+        data = await self._cbio_get(f"/genes/{quote(symbol.strip().upper(), safe='')}")
+        if isinstance(data, dict) and data.get("_error"):
+            if "HTTP 404" in data["_error"]:
+                return {"_error": f"Gene not found in cBioPortal: {symbol}"}
+            return data
+        return {
+            "hugo_symbol": data.get("hugoGeneSymbol"),
+            "entrez_gene_id": data.get("entrezGeneId"),
+            "gene_type": data.get("type"),
+        }
+
+    @staticmethod
+    def _cbio_normalize_label(label: str) -> str:
+        """Fold the free-text CANCER_TYPE values studies use into one key.
+
+        Studies spell the same disease differently ("Non Small Cell Lung Cancer"
+        vs "Non-Small Cell Lung Cancer"), and leaving them split understates the
+        sample counts of the biggest cancer types.
+        """
+        return re.sub(r"[^a-z0-9]+", " ", (label or "").lower()).strip()
+
+    @staticmethod
+    def _cbio_gene_filter(entrez_gene_id: int, symbol: str, profile_ids: list[str]) -> dict[str, Any]:
+        """StudyViewFilter gene filter selecting samples altered in one gene.
+
+        The include* flags mirror what the cBioPortal web UI sends with all
+        annotation filters switched off — omitting them silently drops mutations
+        whose driver status or germline/somatic status is unknown.
+        """
+        return {
+            "molecularProfileIds": profile_ids,
+            "geneQueries": [[{
+                "hugoGeneSymbol": symbol,
+                "entrezGeneId": entrez_gene_id,
+                "includeSomatic": True,
+                "includeGermline": True,
+                "includeUnknownStatus": True,
+                "includeDriver": True,
+                "includeVUS": True,
+                "includeUnknownOncogenicity": True,
+                "includeUnknownTier": True,
+                "tiersBooleanMap": {},
+            }]],
+        }
+
+    @staticmethod
+    def _cbio_counts_by_label(payload: Any) -> dict[str, dict[str, Any]]:
+        """Fold a clinical-data-counts response into {normalized: {label, count}}."""
+        entries = payload if isinstance(payload, list) else [payload]
+        merged: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            for c in (entry or {}).get("counts", []):
+                key = ToolExecutor._cbio_normalize_label(c.get("value", ""))
+                if not key:
+                    continue
+                row = merged.setdefault(key, {"label": c.get("value"), "count": 0})
+                row["count"] += c.get("count", 0)
+        return merged
+
+    async def _cbio_cancer_type_denominators(self) -> dict[str, dict[str, Any]]:
+        """Samples with mutation data, broken down by cancer type.
+
+        Gene-independent, so it is fetched once and reused. genomicProfiles
+        restricts to samples that actually have a mutation profile — without it
+        the counts include unsequenced samples and every frequency comes out low.
+        """
+        if self._cbio_denominators is None:
+            studies = await self._cbio_get_studies()
+            if isinstance(studies, dict):
+                return studies
+            body = {
+                "attributes": [{"attributeId": "CANCER_TYPE"}],
+                "studyViewFilter": {
+                    "studyIds": [s["studyId"] for s in studies],
+                    "genomicProfiles": [["mutations"]],
+                },
+            }
+            data = await self._cbio_post("/clinical-data-counts/fetch", body)
+            if isinstance(data, dict) and data.get("_error"):
+                return data
+            self._cbio_denominators = self._cbio_counts_by_label(data)
+        return self._cbio_denominators
+
+    # --- query handlers ------------------------------------------------------
+
+    async def _cbio_gene_summary(self, symbol: str) -> dict[str, Any]:
+        """Pan-cancer somatic mutation and copy-number frequency for one gene."""
+        gene = await self._cbio_resolve_gene(symbol)
+        if gene.get("_error"):
+            return gene
+
+        studies = await self._cbio_get_studies()
+        if isinstance(studies, dict):
+            return studies
+        study_ids = [s["studyId"] for s in studies]
+
+        gene_filter = [{"hugoGeneSymbol": gene["hugo_symbol"], "profileType": "mutations"}]
+        cna_filter = [{"hugoGeneSymbol": gene["hugo_symbol"], "profileType": "cna"}]
+        mut_body = {"genomicDataFilters": gene_filter, "studyViewFilter": {"studyIds": study_ids}}
+        cna_body = {"genomicDataFilters": cna_filter, "studyViewFilter": {"studyIds": study_ids}}
+
+        mut_data, cna_data = await asyncio.gather(
+            self._cbio_post("/mutation-data-counts/fetch", mut_body, {"projection": "SUMMARY"}),
+            self._cbio_post("/genomic-data-counts/fetch", cna_body),
+        )
+        if isinstance(mut_data, dict) and mut_data.get("_error"):
+            return mut_data
+
+        result: dict[str, Any] = {"gene": gene, "pan_cancer": {}}
+
+        counts = {c["value"]: c["count"] for c in (mut_data[0]["counts"] if mut_data else [])}
+        mutated = counts.get("MUTATED", 0)
+        profiled = mutated + counts.get("NOT_MUTATED", 0)
+        result["pan_cancer"]["mutation"] = {
+            "altered_samples": mutated,
+            "profiled_samples": profiled,
+            "frequency": round(mutated / profiled, 5) if profiled else None,
+            "not_profiled_samples": counts.get("NOT_PROFILED", 0),
+        }
+
+        # CNA counts are per discrete level; "NA" means the sample has no CNA call
+        # for this gene and must be excluded from the denominator.
+        if not (isinstance(cna_data, dict) and cna_data.get("_error")) and cna_data:
+            levels = {c["value"]: c["count"] for c in cna_data[0].get("counts", [])}
+            cna_profiled = sum(v for k, v in levels.items() if k != "NA")
+            result["pan_cancer"]["copy_number"] = {
+                "profiled_samples": cna_profiled,
+                "levels": {
+                    self._CBIO_CNA_LABELS.get(k, k): {
+                        "samples": v,
+                        "frequency": round(v / cna_profiled, 5) if cna_profiled else None,
+                    }
+                    for k, v in levels.items()
+                    if k != "NA" and k != "0"
+                },
+            }
+
+        result["cohort"] = self._cbio_cohort_summary(studies)
+        result["genome_build_note"] = self._CBIO_BUILD_NOTE
+        result["url"] = (
+            f"https://www.cbioportal.org/results/cancerTypesSummary"
+            f"?gene_list={quote(gene['hugo_symbol'] or symbol)}"
+        )
+        return result
+
+    async def _cbio_gene_by_cancer_type(
+        self, symbol: str, cancer_types: list[str] | None, size: int
+    ) -> dict[str, Any]:
+        """Somatic mutation frequency for one gene, broken down by cancer type.
+
+        Cancer type comes from each sample's CANCER_TYPE clinical attribute rather
+        than its study's headline cancer type — otherwise the large pan-cancer
+        cohorts (MSK-IMPACT is ~10k samples) all collapse into "Mixed".
+        """
+        gene = await self._cbio_resolve_gene(symbol)
+        if gene.get("_error"):
+            return gene
+
+        studies = await self._cbio_get_studies()
+        if isinstance(studies, dict):
+            return studies
+        profile_ids = await self._cbio_profile_ids("MUTATION_EXTENDED")
+        if isinstance(profile_ids, dict):
+            return profile_ids
+
+        num_body = {
+            "attributes": [{"attributeId": "CANCER_TYPE"}],
+            "studyViewFilter": {
+                "studyIds": [s["studyId"] for s in studies],
+                "geneFilters": [
+                    self._cbio_gene_filter(
+                        gene["entrez_gene_id"], gene["hugo_symbol"], profile_ids
+                    )
+                ],
+            },
+        }
+        num_data, denominators = await asyncio.gather(
+            self._cbio_post("/clinical-data-counts/fetch", num_body),
+            self._cbio_cancer_type_denominators(),
+        )
+        if isinstance(num_data, dict) and num_data.get("_error"):
+            return num_data
+        if isinstance(denominators, dict) and denominators.get("_error"):
+            return denominators
+
+        numerators = self._cbio_counts_by_label(num_data)
+        wanted = (
+            {self._cbio_normalize_label(c) for c in cancer_types}
+            if cancer_types
+            else None
+        )
+
+        rows = []
+        for key, num in numerators.items():
+            if wanted is not None and key not in wanted:
+                continue
+            den = denominators.get(key)
+            if not den or not den["count"]:
+                continue
+            rows.append({
+                "cancer_type": den["label"],
+                "altered_samples": num["count"],
+                "profiled_samples": den["count"],
+                "frequency": round(num["count"] / den["count"], 5),
+            })
+
+        # a 2-of-3 "frequency" from a tiny cohort outranks every real signal
+        min_cohort = 100
+        ranked = sorted(
+            (r for r in rows if r["profiled_samples"] >= min_cohort),
+            key=lambda r: -r["frequency"],
+        )
+        small = [r for r in rows if r["profiled_samples"] < min_cohort]
+
+        return {
+            "gene": gene,
+            "returned": len(ranked[:size]),
+            "results": ranked[:size],
+            "cancer_types_matched": len(rows),
+            "cancer_types_below_min_cohort": len(small),
+            "min_cohort_samples": min_cohort,
+            "denominator_basis": (
+                "samples with any mutation profile in that cancer type. This is not "
+                "gene-panel aware: a sample sequenced on a panel that omits this gene "
+                "still counts in the denominator, so frequencies are lower bounds. "
+                "Compare against not_profiled_samples from gene_summary to judge how "
+                "much panel coverage varies for this gene."
+            ),
+            "genome_build_note": self._CBIO_BUILD_NOTE,
+            "url": (
+                f"https://www.cbioportal.org/results/cancerTypesSummary"
+                f"?gene_list={quote(gene['hugo_symbol'] or symbol)}"
+            ),
+        }
+
+    async def _cbio_gene_mutations(self, symbol: str, size: int) -> dict[str, Any]:
+        """Recurrent protein changes (hotspots) for one gene across all cohorts."""
+        gene = await self._cbio_resolve_gene(symbol)
+        if gene.get("_error"):
+            return gene
+
+        profile_ids = await self._cbio_profile_ids("MUTATION_EXTENDED")
+        if isinstance(profile_ids, dict):
+            return profile_ids
+
+        body = {"molecularProfileIds": profile_ids, "entrezGeneIds": [gene["entrez_gene_id"]]}
+        total = await self._cbio_count("/mutations/fetch", body)
+        if isinstance(total, dict):
+            return total
+
+        scope = "all_studies"
+        if total > self._CBIO_MAX_MUTATION_RECORDS:
+            studies = await self._cbio_get_studies()
+            if isinstance(studies, dict):
+                return studies
+            curated = {
+                s["studyId"]
+                for s in studies
+                if s["studyId"] in self._CBIO_CURATED_STUDY_IDS
+                or self._CBIO_CURATED_SUFFIX in s["studyId"]
+            }
+            curated_ids = await self._cbio_profile_ids("MUTATION_EXTENDED", curated)
+            if isinstance(curated_ids, dict):
+                return curated_ids
+            body = {"molecularProfileIds": curated_ids, "entrezGeneIds": [gene["entrez_gene_id"]]}
+            scope = "curated_cohort"
+
+        data = await self._cbio_post("/mutations/fetch", body, {"projection": "SUMMARY"})
+        if isinstance(data, dict) and data.get("_error"):
+            return data
+
+        by_change: dict[str, dict[str, Any]] = {}
+        seen: dict[str, set[str]] = defaultdict(set)
+        builds: dict[str, int] = defaultdict(int)
+        for rec in data:
+            change = rec.get("proteinChange") or "(unspecified)"
+            entry = by_change.setdefault(change, {
+                "protein_change": change,
+                "protein_position": rec.get("proteinPosStart"),
+                "mutation_type": rec.get("mutationType"),
+                "sample_count": 0,
+                "coordinates_by_build": {},
+            })
+            key = rec.get("uniqueSampleKey") or f"{rec.get('studyId')}:{rec.get('sampleId')}"
+            if key in seen[change]:
+                continue
+            seen[change].add(key)
+            entry["sample_count"] += 1
+
+            build = rec.get("ncbiBuild") or "unknown"
+            builds[build] += 1
+            # keyed by build and never merged: the same protein change sits at
+            # different genomic positions in GRCh37 and GRCh38
+            entry["coordinates_by_build"].setdefault(build, {
+                "chromosome": rec.get("chr"),
+                "start_position": rec.get("startPosition"),
+                "reference_allele": rec.get("referenceAllele"),
+                "variant_allele": rec.get("variantAllele"),
+            })
+
+        ranked = sorted(by_change.values(), key=lambda e: -e["sample_count"])
+        return {
+            "gene": gene,
+            "returned": len(ranked[:size]),
+            "results": ranked[:size],
+            "distinct_protein_changes": len(by_change),
+            "total_mutation_records": total,
+            "records_analyzed": len(data),
+            "scope": scope,
+            "scope_note": (
+                "Counts come from the TCGA PanCancer Atlas and MSK pan-cancer "
+                "cohorts, not every study: the full set exceeded "
+                f"{self._CBIO_MAX_MUTATION_RECORDS} records. Rankings hold, absolute "
+                "counts are lower than pan-cancer totals."
+                if scope == "curated_cohort"
+                else "All cBioPortal studies with mutation data."
+            ),
+            "genome_builds": dict(builds),
+            "genome_build_note": self._CBIO_BUILD_NOTE,
+            "url": (
+                f"https://www.cbioportal.org/results/mutations"
+                f"?gene_list={quote(gene['hugo_symbol'] or symbol)}"
+            ),
+        }
+
+    async def _cbio_gene_fusions(self, symbol: str, size: int) -> dict[str, Any]:
+        """Structural-variant (fusion) partners observed for one gene."""
+        gene = await self._cbio_resolve_gene(symbol)
+        if gene.get("_error"):
+            return gene
+
+        profile_ids = await self._cbio_profile_ids("STRUCTURAL_VARIANT")
+        if isinstance(profile_ids, dict):
+            return profile_ids
+
+        data = await self._cbio_post(
+            "/structural-variant/fetch",
+            {"molecularProfileIds": profile_ids, "entrezGeneIds": [gene["entrez_gene_id"]]},
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            return data
+
+        partners: dict[str, dict[str, Any]] = {}
+        for rec in data:
+            site1 = rec.get("site1HugoSymbol") or ""
+            site2 = rec.get("site2HugoSymbol") or ""
+            partner = site2 if site1 == gene["hugo_symbol"] else site1
+            partner = partner or "(intergenic)"
+            entry = partners.setdefault(partner, {
+                "partner_gene": partner,
+                "sample_count": 0,
+                "studies": set(),
+                "variant_classes": set(),
+            })
+            entry["sample_count"] += 1
+            entry["studies"].add(rec.get("studyId"))
+            if rec.get("variantClass"):
+                entry["variant_classes"].add(rec["variantClass"])
+
+        ranked = sorted(partners.values(), key=lambda e: -e["sample_count"])[:size]
+        for e in ranked:
+            e["study_count"] = len(e["studies"])
+            e["studies"] = sorted(s for s in e["studies"] if s)[:10]
+            e["variant_classes"] = sorted(e["variant_classes"])
+
+        return {
+            "gene": gene,
+            "returned": len(ranked),
+            "results": ranked,
+            "total_structural_variant_records": len(data),
+            "distinct_partners": len(partners),
+            "genome_build_note": self._CBIO_BUILD_NOTE,
+            "url": (
+                f"https://www.cbioportal.org/results/structuralVariants"
+                f"?gene_list={quote(gene['hugo_symbol'] or symbol)}"
+            ),
+        }
+
+    async def _cbio_variant_hotspot(self, query: str) -> dict[str, Any]:
+        """How many samples carry a somatic mutation at one protein residue.
+
+        Accepts 'TP53 R175H', 'TP53 R175' or 'TP53 175' — only the residue number
+        is used for the count, so all three give the recurrence at that position.
+        """
+        parts = query.replace(":", " ").split()
+        if len(parts) < 2:
+            return {"_error": (
+                "variant_hotspot needs a gene and a residue, e.g. 'TP53 R175H' or "
+                "'TP53 175'."
+            )}
+        symbol, residue = parts[0], parts[1]
+        match = re.search(r"(\d+)", residue)
+        if not match:
+            return {"_error": f"Could not read a residue position from {residue!r}."}
+        position = int(match.group(1))
+
+        gene = await self._cbio_resolve_gene(symbol)
+        if gene.get("_error"):
+            return gene
+
+        data = await self._cbio_post(
+            "/mutation-counts-by-position/fetch",
+            [{
+                "entrezGeneId": gene["entrez_gene_id"],
+                "proteinPosStart": position,
+                "proteinPosEnd": position,
+            }],
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            return data
+
+        count = data[0].get("count", 0) if data else 0
+        return {
+            "gene": gene,
+            "protein_position": position,
+            "sample_count": count,
+            "note": (
+                "Samples with any somatic mutation at this residue, across all "
+                "cBioPortal studies — not restricted to one amino-acid substitution. "
+                "Use gene_mutations for the per-substitution breakdown."
+            ),
+            "genome_build_note": self._CBIO_BUILD_NOTE,
+            "url": (
+                f"https://www.cbioportal.org/results/mutations"
+                f"?gene_list={quote(gene['hugo_symbol'] or symbol)}"
+            ),
+        }
+
+    async def _cbio_study_search(self, query: str, size: int) -> dict[str, Any]:
+        """Find cBioPortal studies whose name, id or cancer type matches a term."""
+        studies = await self._cbio_get_studies()
+        if isinstance(studies, dict):
+            return studies
+
+        term = query.strip().lower()
+        matches = [
+            s for s in studies
+            if term in (s.get("name") or "").lower()
+            or term in (s.get("studyId") or "").lower()
+            or term in (s.get("cancerTypeId") or "").lower()
+            or term in (s.get("description") or "").lower()
+        ]
+        matches.sort(key=lambda s: -(s.get("allSampleCount") or 0))
+
+        return {
+            "returned": len(matches[:size]),
+            "matched": len(matches),
+            "results": [{
+                "study_id": s.get("studyId"),
+                "name": s.get("name"),
+                "cancer_type_id": s.get("cancerTypeId"),
+                "sample_count": s.get("allSampleCount"),
+                "reference_genome": s.get("referenceGenome"),
+                "citation": s.get("citation"),
+                "pmid": s.get("pmid"),
+                "url": f"{self._CBIO_STUDY_URL}?id={quote(s.get('studyId') or '')}",
+            } for s in matches[:size]],
+            "cohort": self._cbio_cohort_summary(studies),
+        }
+
+    @staticmethod
+    def _cbio_cohort_summary(studies: list[dict[str, Any]]) -> dict[str, Any]:
+        """Size and genome-build makeup of the cohort behind a result.
+
+        Derived from the live study list rather than hardcoded, since cBioPortal
+        adds studies and migrates them to hg38 over time.
+        """
+        builds: dict[str, int] = defaultdict(int)
+        for s in studies:
+            builds[s.get("referenceGenome") or "unknown"] += 1
+        return {
+            "studies": len(studies),
+            "samples": sum(s.get("allSampleCount") or 0 for s in studies),
+            "studies_by_reference_genome": dict(builds),
+        }
 
     # -------------------------------------------------------------------------
     # Helper Methods

@@ -130,7 +130,7 @@ A `gene_annotations` BigQuery table/view (built in `genetics-results-db`) is als
 The external search tools split into two conceptually distinct families:
 
 - **Literature backends** (`search_scientific_literature`): query a paper-indexing API — either `europepmc` (covers PubMed, Europe PMC, bioRxiv, medRxiv) or `perplexity` (broader scientific web). Exactly one backend is queried per call; "backend" is the API hit, not the content source indexed.
-- **Structured curated databases** (`search_mgi`): query a curated biological database that returns structured records (genes, phenotypes, alleles, orthologs) rather than papers. Complements — does not replace — the literature backends.
+- **Structured curated databases** (`search_mgi`, `search_cbioportal`): query a curated biological database that returns structured records (genes, phenotypes, alleles, orthologs; somatic alteration frequencies) rather than papers. Complements — does not replace — the literature backends.
 
 **Backend selection is the user's, never the model's.** The tool schema exposes no `backend` parameter, so the model cannot request one; `LLMService._execute_tool` additionally strips any `backend` key the model invents anyway. Selection resolves in this order, first match wins: the request-level `literature_backend` in the chat API body (the web UI always sends it, defaulting to `perplexity`); then `LITERATURE_SEARCH_BACKEND`; then the built-in default `perplexity`. Europe PMC is therefore used only when the user explicitly selects it. Every response still carries a `backend` field naming the API that ran, and that field is what the model must report. (Earlier the model could pass its own `backend`, which the request-level value then silently overrode; the model narrated the backend it had asked for and confabulated hybrid labels around the mismatch. Removing the parameter removes the mismatch at its source.)
 
@@ -141,10 +141,27 @@ The external search tools split into two conceptually distinct families:
 | `search_scientific_literature` | Search PubMed/bioRxiv via Europe PMC or Perplexity |
 | `web_search` | General web search via Tavily or DuckDuckGo |
 | `search_mgi` | Search Jackson Lab Mouse Genome Informatics for curated mouse gene→phenotype annotations, knockout/transgenic allele phenotypes, and human-mouse ortholog mappings. Chat-backend only — excluded from MCP server |
+| `search_cbioportal` | Query cBioPortal for somatic alteration frequency in cancer cohorts: pan-cancer mutation/CNA frequency, breakdown by cancer type, hotspot protein changes, fusion partners, study lookup. Chat-backend only — excluded from MCP server |
 
 #### MGI (native tool, chat-backend only)
 
 The `search_mgi` tool queries Jackson Lab's MouseMine (InterMine REST endpoint) for curated mouse data: gene → MP-ontology phenotype terms, knockout/transgenic allele phenotypes, and mouse-human ortholog mappings. Unlike Europe PMC and Perplexity which return papers, MGI returns structured curated records — so it complements rather than substitutes for literature search. Excluded from the MCP server (mirroring `get_myvariant_annotations`); only available via the chat API.
+
+#### cBioPortal (native tool, chat-backend only)
+
+`search_cbioportal` queries the public cBioPortal REST API (`https://www.cbioportal.org/api`, no authentication for public studies) for somatic alteration frequencies across ~540 cancer studies and ~400,000 tumour samples. Six `query_type`s: `gene_summary` (pan-cancer mutation and copy-number frequency), `gene_by_cancer_type`, `gene_mutations` (recurrent protein changes), `gene_fusions`, `variant_hotspot` (recurrence at one residue), `study_search`. Excluded from the MCP server alongside `search_mgi`; chat API only. Data is ODbL-licensed, so every response carries an `attribution` field and `study_search` returns per-study citations and PMIDs.
+
+**GRCh37/GRCh38 is the defining constraint.** 467 of 539 studies are hg19, and cBioPortal reports each record on its source study's build without lifting over — so its genomic coordinates cannot be compared against this suite's GRCh38 positions. Every query type therefore keys on gene symbol and protein change, which are build-independent. `gene_mutations` returns coordinates under a `coordinates_by_build` map that is never merged across builds, and every result carries a `genome_build_note` telling the agent to reach GRCh38 variants via `get_variant_protein_effect` (genomic → protein change) first. This is the same reasoning as the GRCh38 pin on `get_variant_protein_effect`: a coordinate carries no build, so silently mixing them answers for the wrong genome.
+
+**Denominators are the other correctness trap.** Counting altered samples is easy; dividing by the right cohort is not. Three distinct denominators exist and were checked against cBioPortal's own published figures:
+
+- `gene_summary` uses `/mutation-data-counts/fetch`, which is gene-panel aware — its `MUTATED + NOT_MUTATED` reproduces the authoritative `numberOfProfiledCases` exactly (EGFR: 17,483/366,522), and it also reports `not_profiled_samples`.
+- `gene_by_cancer_type` uses `/clinical-data-counts/fetch` with `genomicProfiles: [["mutations"]]`. That restriction is load-bearing: without it the denominator counts every sample in the study including unsequenced ones (400,081 rather than 367,336) and every frequency comes out low. It is profile-level rather than panel-level, so its frequencies are lower bounds — stated in the `denominator_basis` field on each response.
+- Cancer type comes from each sample's `CANCER_TYPE` clinical attribute, not its study's headline cancer type, because the large pan-cancer cohorts (MSK-IMPACT alone is ~10k samples) carry `cancerTypeId: mixed` and would otherwise vanish from every per-cancer-type row. Studies spell the same disease differently, so labels are folded on a punctuation- and case-insensitive key before counting.
+
+**Response-size guard.** `/mutations/fetch` returns one record per mutated sample, so pan-cancer TP53 is ~142k records / ~100 MB. `gene_mutations` therefore pre-flights with `projection=META` (a `total-count` header, no body, ~0.4 s) and falls back to the TCGA PanCancer Atlas + MSK pan-cancer cohorts above `_CBIO_MAX_MUTATION_RECORDS` (25,000), which keeps TP53 at ~23k records. The result reports `scope`, `scope_note`, `total_mutation_records` and `records_analyzed` so a narrowed count is never mistaken for a pan-cancer one.
+
+Study, molecular-profile and cancer-type-denominator lookups are cached on the executor for the process lifetime — they do not depend on the gene queried and change only when cBioPortal reimports data.
 
 ### External MCP server tools (proxied)
 
@@ -215,7 +232,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, search_mgi, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |

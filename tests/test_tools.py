@@ -1107,3 +1107,360 @@ class TestSearchMGI:
         result = await self.executor.search_mgi(query="x", query_type="nonsense")
         assert result["success"] is False
         assert "Unknown query_type" in result["error"]
+
+
+# cBioPortal responses are mocked by (method, path) because a single query type
+# fans out to several endpoints; the fixtures below mirror the real payload
+# shapes verified against https://www.cbioportal.org/api.
+@pytest.mark.asyncio
+class TestSearchCBioPortal:
+    """Mocked HTTP tests for ToolExecutor.search_cbioportal."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_executor(self):
+        from genetics_mcp_server.tools.executor import ToolExecutor
+
+        self.executor = ToolExecutor()
+        yield
+        await self.executor.close()
+
+    STUDIES = [
+        {"studyId": "luad_tcga_pan_can_atlas_2018", "name": "Lung Adenocarcinoma (TCGA)",
+         "cancerTypeId": "luad", "allSampleCount": 566, "referenceGenome": "hg19",
+         "citation": "TCGA, Cell 2018", "pmid": "29625048", "description": "lung"},
+        {"studyId": "msk_impact_2017", "name": "MSK-IMPACT Clinical Sequencing Cohort",
+         "cancerTypeId": "mixed", "allSampleCount": 10945, "referenceGenome": "hg38",
+         "citation": "Zehir et al. Nat Med 2017", "pmid": "28481359", "description": "pan-cancer"},
+    ]
+
+    PROFILES = [
+        {"molecularProfileId": "luad_tcga_pan_can_atlas_2018_mutations",
+         "studyId": "luad_tcga_pan_can_atlas_2018", "molecularAlterationType": "MUTATION_EXTENDED"},
+        {"molecularProfileId": "msk_impact_2017_mutations",
+         "studyId": "msk_impact_2017", "molecularAlterationType": "MUTATION_EXTENDED"},
+        {"molecularProfileId": "msk_impact_2017_structural_variants",
+         "studyId": "msk_impact_2017", "molecularAlterationType": "STRUCTURAL_VARIANT"},
+    ]
+
+    @staticmethod
+    def _resp(json_data, status_code: int = 200, headers: dict | None = None, text: str = ""):
+        from unittest.mock import MagicMock
+
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = text
+        resp.headers = headers or {}
+        resp.json = MagicMock(return_value=json_data)
+        return resp
+
+    def _patch(self, gets: dict, posts: dict):
+        """Route mocked GET/POST by URL suffix, failing loudly on an unmapped path."""
+        from unittest.mock import AsyncMock, patch
+
+        def pick(table, url):
+            for suffix, payload in table.items():
+                if url.endswith(suffix) or suffix in url:
+                    return payload
+            raise AssertionError(f"unmocked cBioPortal path: {url}")
+
+        async def do_get(url, **kwargs):
+            return pick(gets, url)
+
+        async def do_post(url, **kwargs):
+            return pick(posts, url)
+
+        return (
+            patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get),
+            patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post),
+        )
+
+    async def test_gene_summary(self):
+        gets = {
+            "/genes/EGFR": self._resp({"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}),
+            "/studies": self._resp(self.STUDIES),
+        }
+        posts = {
+            "/mutation-data-counts/fetch": self._resp([{"hugoGeneSymbol": "EGFR", "counts": [
+                {"value": "MUTATED", "count": 100},
+                {"value": "NOT_MUTATED", "count": 900},
+                {"value": "NOT_PROFILED", "count": 50},
+            ]}]),
+            "/genomic-data-counts/fetch": self._resp([{"hugoGeneSymbol": "EGFR", "counts": [
+                {"value": "NA", "count": 400},
+                {"value": "2", "count": 30},
+                {"value": "0", "count": 560},
+                {"value": "-2", "count": 10},
+            ]}]),
+        }
+        g, p = self._patch(gets, posts)
+        with g, p:
+            result = await self.executor.search_cbioportal(query="EGFR", query_type="gene_summary")
+
+        assert result["success"] is True
+        assert result["source"] == "cbioportal"
+        mut = result["pan_cancer"]["mutation"]
+        assert mut["altered_samples"] == 100
+        # denominator excludes the 50 samples never profiled for this gene
+        assert mut["profiled_samples"] == 1000
+        assert mut["frequency"] == 0.1
+        cna = result["pan_cancer"]["copy_number"]
+        # 'NA' means no CNA call for this gene and must not inflate the denominator
+        assert cna["profiled_samples"] == 600
+        assert cna["levels"]["amplification"]["samples"] == 30
+        assert cna["levels"]["deep_deletion"]["frequency"] == round(10 / 600, 5)
+        # diploid is not an alteration and is dropped from the reported levels
+        assert "diploid" not in cna["levels"]
+        assert result["cohort"]["studies_by_reference_genome"] == {"hg19": 1, "hg38": 1}
+
+    async def test_gene_by_cancer_type_merges_spellings_and_uses_profiled_denominator(self):
+        gets = {
+            "/genes/EGFR": self._resp({"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}),
+            "/studies": self._resp(self.STUDIES),
+            "/molecular-profiles": self._resp(self.PROFILES),
+        }
+        calls = []
+
+        from unittest.mock import AsyncMock, patch
+
+        async def do_post(url, **kwargs):
+            body = kwargs.get("json")
+            calls.append(body)
+            # the denominator call carries genomicProfiles, the numerator geneFilters
+            if "genomicProfiles" in body.get("studyViewFilter", {}):
+                return self._resp([{"attributeId": "CANCER_TYPE", "counts": [
+                    {"value": "Non-Small Cell Lung Cancer", "count": 600},
+                    {"value": "Non Small Cell Lung Cancer", "count": 400},
+                    {"value": "Tiny Cohort", "count": 10},
+                ]}])
+            return self._resp([{"attributeId": "CANCER_TYPE", "counts": [
+                {"value": "Non-Small Cell Lung Cancer", "count": 150},
+                {"value": "Non Small Cell Lung Cancer", "count": 50},
+                {"value": "Tiny Cohort", "count": 9},
+            ]}])
+
+        async def do_get(url, **kwargs):
+            for suffix, payload in gets.items():
+                if suffix in url:
+                    return payload
+            raise AssertionError(f"unmocked path: {url}")
+
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
+             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
+            result = await self.executor.search_cbioportal(
+                query="EGFR", query_type="gene_by_cancer_type"
+            )
+
+        assert result["success"] is True
+        # the two spellings fold into one row: 200/1000, not two rows of 150/600 and 50/400
+        assert len(result["results"]) == 1
+        row = result["results"][0]
+        assert row["altered_samples"] == 200
+        assert row["profiled_samples"] == 1000
+        assert row["frequency"] == 0.2
+        # a 9/10 cohort would otherwise top the ranking at 90%
+        assert result["cancer_types_below_min_cohort"] == 1
+        # denominator query must restrict to samples that have mutation data
+        den_call = next(c for c in calls if "genomicProfiles" in c["studyViewFilter"])
+        assert den_call["studyViewFilter"]["genomicProfiles"] == [["mutations"]]
+
+    async def test_gene_by_cancer_type_filters_to_requested_types(self):
+        gets = {
+            "/genes/EGFR": self._resp({"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}),
+            "/studies": self._resp(self.STUDIES),
+            "/molecular-profiles": self._resp(self.PROFILES),
+        }
+        from unittest.mock import AsyncMock, patch
+
+        async def do_post(url, **kwargs):
+            counts = ([{"value": "Glioma", "count": 500}, {"value": "Melanoma", "count": 500}]
+                      if "genomicProfiles" in kwargs["json"].get("studyViewFilter", {})
+                      else [{"value": "Glioma", "count": 50}, {"value": "Melanoma", "count": 100}])
+            return self._resp([{"attributeId": "CANCER_TYPE", "counts": counts}])
+
+        async def do_get(url, **kwargs):
+            for suffix, payload in gets.items():
+                if suffix in url:
+                    return payload
+            raise AssertionError(f"unmocked path: {url}")
+
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
+             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
+            result = await self.executor.search_cbioportal(
+                query="EGFR", query_type="gene_by_cancer_type", cancer_types=["glioma"]
+            )
+
+        assert [r["cancer_type"] for r in result["results"]] == ["Glioma"]
+
+    async def test_gene_mutations_keeps_builds_separate(self):
+        gets = {
+            "/genes/TP53": self._resp({"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}),
+            "/molecular-profiles": self._resp(self.PROFILES),
+        }
+        records = [
+            {"uniqueSampleKey": "s1", "proteinChange": "R175H", "proteinPosStart": 175,
+             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh37", "chr": "17",
+             "startPosition": 7578406, "referenceAllele": "C", "variantAllele": "T", "studyId": "a"},
+            {"uniqueSampleKey": "s2", "proteinChange": "R175H", "proteinPosStart": 175,
+             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh38", "chr": "17",
+             "startPosition": 7675088, "referenceAllele": "C", "variantAllele": "T", "studyId": "b"},
+            # same sample seen twice must not double-count
+            {"uniqueSampleKey": "s1", "proteinChange": "R175H", "proteinPosStart": 175,
+             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh37", "chr": "17",
+             "startPosition": 7578406, "referenceAllele": "C", "variantAllele": "T", "studyId": "a"},
+            {"uniqueSampleKey": "s3", "proteinChange": "R248Q", "proteinPosStart": 248,
+             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh37", "chr": "17",
+             "startPosition": 7577538, "referenceAllele": "C", "variantAllele": "T", "studyId": "a"},
+        ]
+        from unittest.mock import AsyncMock, patch
+
+        async def do_post(url, **kwargs):
+            if kwargs.get("params", {}).get("projection") == "META":
+                return self._resp(None, headers={"total-count": "3"})
+            return self._resp(records)
+
+        async def do_get(url, **kwargs):
+            for suffix, payload in gets.items():
+                if suffix in url:
+                    return payload
+            raise AssertionError(f"unmocked path: {url}")
+
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
+             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
+            result = await self.executor.search_cbioportal(query="TP53", query_type="gene_mutations")
+
+        assert result["success"] is True
+        assert result["scope"] == "all_studies"
+        top = result["results"][0]
+        assert top["protein_change"] == "R175H"
+        assert top["sample_count"] == 2
+        # the same amino-acid change sits at different positions per build: never merged
+        assert top["coordinates_by_build"]["GRCh37"]["start_position"] == 7578406
+        assert top["coordinates_by_build"]["GRCh38"]["start_position"] == 7675088
+        assert result["genome_builds"] == {"GRCh37": 2, "GRCh38": 1}
+        assert "GRCh38" in result["genome_build_note"]
+
+    async def test_gene_mutations_falls_back_to_curated_cohort_when_too_large(self):
+        gets = {
+            "/genes/TP53": self._resp({"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}),
+            "/molecular-profiles": self._resp(self.PROFILES),
+            "/studies": self._resp(self.STUDIES),
+        }
+        seen_bodies = []
+        from unittest.mock import AsyncMock, patch
+
+        async def do_post(url, **kwargs):
+            if kwargs.get("params", {}).get("projection") == "META":
+                return self._resp(None, headers={"total-count": "141838"})
+            seen_bodies.append(kwargs["json"])
+            return self._resp([])
+
+        async def do_get(url, **kwargs):
+            for suffix, payload in gets.items():
+                if suffix in url:
+                    return payload
+            raise AssertionError(f"unmocked path: {url}")
+
+        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
+             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
+            result = await self.executor.search_cbioportal(query="TP53", query_type="gene_mutations")
+
+        assert result["scope"] == "curated_cohort"
+        assert result["total_mutation_records"] == 141838
+        # the narrowed fetch must actually use the curated profiles, not the full set
+        assert set(seen_bodies[-1]["molecularProfileIds"]) == {
+            "luad_tcga_pan_can_atlas_2018_mutations", "msk_impact_2017_mutations"
+        }
+
+    async def test_gene_fusions_reports_partner_gene(self):
+        gets = {
+            "/genes/ALK": self._resp({"entrezGeneId": 238, "hugoGeneSymbol": "ALK", "type": "protein-coding"}),
+            "/molecular-profiles": self._resp(self.PROFILES),
+        }
+        posts = {
+            "/structural-variant/fetch": self._resp([
+                {"site1HugoSymbol": "EML4", "site2HugoSymbol": "ALK", "studyId": "a", "variantClass": "DELETION"},
+                {"site1HugoSymbol": "ALK", "site2HugoSymbol": "EML4", "studyId": "b", "variantClass": "DELETION"},
+                {"site1HugoSymbol": "", "site2HugoSymbol": "ALK", "studyId": "b", "variantClass": "NA"},
+            ]),
+        }
+        g, p = self._patch(gets, posts)
+        with g, p:
+            result = await self.executor.search_cbioportal(query="ALK", query_type="gene_fusions")
+
+        assert result["success"] is True
+        top = result["results"][0]
+        # partner is whichever side is not the queried gene, regardless of orientation
+        assert top["partner_gene"] == "EML4"
+        assert top["sample_count"] == 2
+        assert top["study_count"] == 2
+        assert result["results"][1]["partner_gene"] == "(intergenic)"
+
+    async def test_variant_hotspot_accepts_change_or_bare_position(self):
+        gets = {"/genes/TP53": self._resp({"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"})}
+        posts = {"/mutation-counts-by-position/fetch": self._resp(
+            [{"entrezGeneId": 7157, "proteinPosStart": 175, "proteinPosEnd": 175, "count": 6757}]
+        )}
+        for query in ("TP53 R175H", "TP53 175", "TP53:R175"):
+            g, p = self._patch(gets, posts)
+            with g, p:
+                result = await self.executor.search_cbioportal(query=query, query_type="variant_hotspot")
+            assert result["success"] is True, query
+            assert result["protein_position"] == 175, query
+            assert result["sample_count"] == 6757, query
+
+    async def test_variant_hotspot_rejects_missing_residue(self):
+        result = await self.executor.search_cbioportal(query="TP53", query_type="variant_hotspot")
+        assert result["success"] is False
+        assert "residue" in result["error"]
+
+    async def test_study_search_ranks_by_size(self):
+        gets = {"/studies": self._resp(self.STUDIES)}
+        g, p = self._patch(gets, {})
+        with g, p:
+            result = await self.executor.search_cbioportal(query="lung", query_type="study_search")
+
+        assert result["success"] is True
+        assert result["matched"] == 1
+        entry = result["results"][0]
+        assert entry["study_id"] == "luad_tcga_pan_can_atlas_2018"
+        assert entry["reference_genome"] == "hg19"
+        assert entry["pmid"] == "29625048"
+
+    async def test_unknown_gene_returns_error(self):
+        gets = {"/genes/NOPE": self._resp(None, status_code=404, text="Gene not found")}
+        g, p = self._patch(gets, {})
+        with g, p:
+            result = await self.executor.search_cbioportal(query="NOPE", query_type="gene_summary")
+
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    async def test_http_failure_returns_error_not_raises(self):
+        gets = {"/genes/TP53": self._resp(None, status_code=500, text="cBioPortal is down")}
+        g, p = self._patch(gets, {})
+        with g, p:
+            result = await self.executor.search_cbioportal(query="TP53", query_type="gene_summary")
+
+        assert result["success"] is False
+        assert "500" in result["error"]
+
+    async def test_network_exception_returns_error(self):
+        from unittest.mock import AsyncMock, patch
+
+        import httpx
+
+        with patch.object(
+            self.executor.external_client,
+            "get",
+            new_callable=AsyncMock,
+            side_effect=httpx.TimeoutException("timed out"),
+        ):
+            result = await self.executor.search_cbioportal(query="TP53", query_type="gene_summary")
+
+        assert result["success"] is False
+        assert "error" in result
+
+    async def test_unknown_query_type(self):
+        result = await self.executor.search_cbioportal(query="TP53", query_type="nonsense")
+        assert result["success"] is False
+        assert "Unknown query_type" in result["error"]
