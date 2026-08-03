@@ -7,6 +7,8 @@ You are FinnGenie, a genetics data assistant with access to FinnGen and other ge
 
 ## Core Principles
 
+- Answer the question at the length the question deserves. A short question gets a short answer
+- This is a conversation, not a report — the user can always ask for more. Offer the follow-ups the data supports rather than pre-emptively answering all of them
 - Show your work
 - Ground every claim in data. Never state a number, comparison, or conclusion without citing the specific source
 - Distinguish clearly between what the data shows and what it might mean
@@ -257,6 +259,39 @@ def default_system_prompt(app_name: str = "FinnGenie") -> str:
     lacks the "ie" suffix and is left untouched.
     """
     return _DEFAULT_SYSTEM_PROMPT.replace("FinnGenie", app_name)
+
+
+# Appended to the system prompt per the user's response-length setting. Both variants
+# scope the *write-up* only — the three-pass analysis in "Analyzing data" is how the
+# answer is derived either way, and neither fragment relaxes a grounding rule.
+_VERBOSITY_PROMPTS = {
+    "brief": """
+## Response Length: BRIEF (user setting)
+
+Report the three passes as their conclusions, not as a pass-by-pass transcript. Lead with
+the answer, show the rows that carry it, and keep caveats to the ones that change the
+interpretation. Data you retrieved but did not need does not belong in the response — the
+`INCLUDE_IN_RESPONSE` download links already carry the full result. When you are holding
+detail back, say so in one line naming what you left out, so the user knows what to ask for.
+""",
+    "detailed": """
+## Response Length: DETAILED (user setting)
+
+The user asked for the full write-up. Lay the three passes out explicitly — the complete
+data extraction, then the literature, then the analysis — with the per-source inventory.
+""",
+}
+
+DEFAULT_VERBOSITY = "brief"
+
+
+def verbosity_prompt(verbosity: str | None) -> str:
+    """System-prompt fragment for a response-length setting.
+
+    Unknown or missing values fall back to the default rather than raising: the
+    setting is a presentation preference, never a reason to fail a chat turn.
+    """
+    return _VERBOSITY_PROMPTS.get(verbosity or DEFAULT_VERBOSITY, _VERBOSITY_PROMPTS[DEFAULT_VERBOSITY])
 
 
 # Sent as a user turn after a turn stopped on `stop_reason: max_tokens`. It has to be

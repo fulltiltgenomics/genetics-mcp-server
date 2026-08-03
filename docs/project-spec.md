@@ -231,6 +231,19 @@ Each tool has a `category` field in its definition:
 
 Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"`. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
 
+## Response Length
+
+The chat API takes a `verbosity` parameter (`"brief"` — the default — or `"detailed"`), surfaced in the web UI as the **Answer** radio group beside the literature-backend and tool-profile selectors. `chat_api.stream_chat` appends the matching fragment from `_VERBOSITY_PROMPTS` (`config/defaults.py`, via `verbosity_prompt()`) to the end of the system prompt.
+
+| `verbosity` value | Effect on the write-up |
+|-------------------|------------------------|
+| `"brief"` (default, and the fallback for null/unrecognized values) | Report the three-pass analysis as its conclusions: the answer, the rows that carry it, and interpretation-changing caveats. Retrieved-but-unused data is left to the `INCLUDE_IN_RESPONSE` download links, with a one-line note of what was held back |
+| `"detailed"` | The full pass-by-pass write-up — complete data extraction, then literature, then analysis, with the per-source inventory |
+
+**The setting scopes presentation, never method or rigor.** The three-pass approach under "Analyzing data" and every grounding rule apply identically at both settings; only the volume of what gets printed changes. An unrecognized value falls back to `"brief"` rather than raising, since a presentation preference must not fail a chat turn.
+
+Both fragments sit inside the cached system block, so each setting keeps its own prompt-cache entry instead of invalidating the other's. The setting is per-request and is **not** persisted per message the way `literature_backend` and `tool_profile` are (`chat_messages` has no `verbosity` column) — a resumed conversation uses whatever the selector currently shows.
+
 ## Architecture
 
 ### Module structure

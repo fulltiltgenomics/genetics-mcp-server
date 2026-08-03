@@ -377,3 +377,49 @@ class TestChatEndpointProviders:
 
             # should accept tool_profile without validation error
             assert response.status_code != 422, f"tool_profile={profile} rejected"
+
+    def test_chat_with_verbosity(self, test_client):
+        """Test providing verbosity parameter."""
+        for verbosity in ["brief", "detailed", "nonsense"]:
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "verbosity": verbosity,
+                    "enable_tools": False,
+                },
+            )
+
+            # an unrecognized value falls back to the default rather than 422:
+            # a presentation preference must never fail a chat turn
+            assert response.status_code != 422, f"verbosity={verbosity} rejected"
+
+
+class TestVerbosityPrompt:
+    """The response-length fragment appended to the system prompt."""
+
+    def test_brief_is_the_default(self):
+        from genetics_mcp_server.config.defaults import verbosity_prompt
+
+        assert verbosity_prompt(None) == verbosity_prompt("brief")
+        assert verbosity_prompt("unrecognized") == verbosity_prompt("brief")
+
+    def test_settings_differ(self):
+        from genetics_mcp_server.config.defaults import verbosity_prompt
+
+        assert verbosity_prompt("detailed") != verbosity_prompt("brief")
+        assert "BRIEF" in verbosity_prompt("brief")
+        assert "DETAILED" in verbosity_prompt("detailed")
+
+    def test_three_pass_analysis_survives_both_settings(self):
+        """Verbosity scopes the write-up; it must not drop the analysis method."""
+        from genetics_mcp_server.config.defaults import (
+            default_system_prompt,
+            verbosity_prompt,
+        )
+
+        for setting in ("brief", "detailed"):
+            prompt = default_system_prompt("FinnGenie") + verbosity_prompt(setting)
+            assert "PASS 1 - DATA EXTRACTION" in prompt
+            assert "PASS 2 - LITERATURE SEARCH" in prompt
+            assert "PASS 3 - DATA ANALYSIS" in prompt

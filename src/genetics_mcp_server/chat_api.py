@@ -30,7 +30,7 @@ setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
 from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
 from genetics_mcp_server.config import get_settings
-from genetics_mcp_server.config.defaults import default_system_prompt
+from genetics_mcp_server.config.defaults import default_system_prompt, verbosity_prompt
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
 from genetics_mcp_server.rate_limit import check_rate_limit
@@ -218,6 +218,12 @@ class ChatRequest(BaseModel):
         "None = all tools, 'api' = general+API tools, 'bigquery' = general+BigQuery, "
         "'rag' = general+RAG external tools.",
     )
+    verbosity: str | None = Field(
+        None,
+        description="Response length: 'brief' (default) reports the analysis as its "
+        "conclusions, 'detailed' lays out the full three-pass write-up. Unknown "
+        "values fall back to 'brief'.",
+    )
     secret: bool = Field(
         False,
         description="Secret chat mode - messages are not logged or persisted.",
@@ -370,8 +376,12 @@ async def stream_chat(
     # convert messages to dicts
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
-    # use custom or default system prompt
+    # use custom or default system prompt. The response-length fragment is appended
+    # last so it reads as the final instruction; it lands inside the cached system
+    # block, so each setting keeps its own prompt-cache entry rather than
+    # invalidating the other's.
     system_prompt = request.system_prompt or default_system_prompt(settings.app_name)
+    system_prompt += verbosity_prompt(request.verbosity)
 
     async def event_generator():
         """Generate SSE events from LLM stream."""
