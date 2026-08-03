@@ -86,6 +86,7 @@ _mcp_disabled = _settings.disabled_tools | {
     "web_search",
     "get_myvariant_annotations",
     "search_mgi",
+    "search_cbioportal",
     "get_protein_annotations",
     "map_protein_variants",
     "get_variant_protein_effect",

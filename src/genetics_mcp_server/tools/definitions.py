@@ -744,6 +744,55 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "search_cbioportal",
+        "category": "general",
+        "description": """Query cBioPortal for how often a gene is somatically altered in cancer: pan-cancer mutation and copy-number frequency, the breakdown by cancer type, recurrent protein changes (hotspots), and fusion partners. Covers ~540 studies and ~400,000 tumour samples. Returns structured counts, not papers.
+
+This is somatic tumour data. It says nothing about germline association — do not read a high mutation frequency here as evidence for a GWAS or disease-association claim, and do not read the absence of a gene as evidence against one.
+
+GENOME BUILD — read before quoting any coordinate. cBioPortal reports each record on its source study's build, which is GRCh37 for most studies, and does not lift over. This suite is GRCh38. Never compare a coordinate from this tool against a GRCh38 position. Gene symbols and protein changes ARE build-independent, so match on those. Coordinates are returned grouped under the build they came from and are never merged across builds. To start from a GRCh38 variant, call get_variant_protein_effect first to get its protein change, then query here by protein change or residue.
+
+Examples:
+- How often is a gene mutated in cancer at all: search_cbioportal(query='PCSK9', query_type='gene_summary')
+- Which cancers it is mutated in: search_cbioportal(query='EGFR', query_type='gene_by_cancer_type')
+- Just lung and glioma: search_cbioportal(query='EGFR', query_type='gene_by_cancer_type', cancer_types=['Non-Small Cell Lung Cancer', 'Glioma'])
+- Hotspot residues: search_cbioportal(query='TP53', query_type='gene_mutations')
+- Recurrence at one residue: search_cbioportal(query='TP53 R175H', query_type='variant_hotspot')
+- Fusion partners: search_cbioportal(query='ALK', query_type='gene_fusions')
+
+Frequencies from gene_by_cancer_type are lower bounds: their denominator counts every sample with mutation data, including samples sequenced on gene panels that omit this gene. gene_summary reports the panel-aware profiled count and a not_profiled_samples figure — check it before treating a per-cancer-type frequency as exact.""",
+        "parameters": {
+            "query": {
+                "type": "string",
+                "description": "A gene symbol for the gene_* query types; 'GENE RESIDUE' (e.g. 'TP53 R175H' or 'TP53 175') for variant_hotspot; a free-text term for study_search.",
+                "required": True,
+            },
+            "query_type": {
+                "type": "string",
+                "description": "What to look up: 'gene_summary' (pan-cancer mutation + copy-number frequency), 'gene_by_cancer_type' (frequency per cancer type), 'gene_mutations' (recurrent protein changes / hotspots), 'gene_fusions' (structural-variant partners), 'variant_hotspot' (sample count at one residue), or 'study_search' (find studies).",
+                "enum": [
+                    "gene_summary",
+                    "gene_by_cancer_type",
+                    "gene_mutations",
+                    "gene_fusions",
+                    "variant_hotspot",
+                    "study_search",
+                ],
+                "default": "gene_summary",
+            },
+            "cancer_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional, gene_by_cancer_type only: restrict to these cancer types by name (matched case- and punctuation-insensitively, e.g. 'Non-Small Cell Lung Cancer'). Omit to rank all of them.",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum records to return (default 25, max 100).",
+                "default": 25,
+            },
+        },
+    },
+    {
         "name": "get_protein_annotations",
         "category": "general",
         "description": """Get curated protein annotations from UniProt: residue-level features (active sites, binding sites, domains, disulfide bonds, signal peptides, PTMs), function and subcellular location comments, cross-references, and optionally the amino-acid sequence.
@@ -1683,6 +1732,20 @@ def register_mcp_tools(
             """Search Jackson Lab MGI for curated mouse phenotypes, alleles, and orthologs."""
             return await executor.search_mgi(
                 query, query_type, species, max_results
+            )
+
+    if "search_cbioportal" not in _disabled:
+
+        @mcp.tool()
+        async def search_cbioportal(
+            query: str,
+            query_type: str = "gene_summary",
+            cancer_types: list[str] | None = None,
+            max_results: int = 25,
+        ) -> dict:
+            """Search cBioPortal for somatic alteration frequency in cancer cohorts. Coordinates are mostly GRCh37 — match on gene symbol and protein change, not position."""
+            return await executor.search_cbioportal(
+                query, query_type, cancer_types, max_results
             )
 
     if "get_protein_annotations" not in _disabled:
