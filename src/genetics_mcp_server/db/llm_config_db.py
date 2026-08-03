@@ -55,6 +55,19 @@ class UserSetting:
 
 
 @dataclass
+class InstructionSet:
+    """A named set of user-authored instructions appended to the chat system prompt."""
+
+    id: str
+    user_id: str
+    name: str
+    body: str
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+
+
+@dataclass
 class UserApiToken:
     """Per-user API token for MCP server access."""
 
@@ -191,6 +204,52 @@ class LLMConfigDB(object, metaclass=Singleton):
             """
             CREATE INDEX IF NOT EXISTS idx_user_tool_desc_history_user
             ON user_tool_descriptions_history(user_id, tool_name, changed_at DESC)
+        """
+        )
+
+        # named instruction sets, one row per set (the id is a uuid4 assigned on create).
+        # archived_at is a soft delete: chat messages will reference a set by id from a
+        # separate SQLite file (chat_history.db), where no foreign key can enforce the
+        # relationship, so a hard DELETE would silently orphan those references
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_instruction_sets (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived_at TIMESTAMP
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_instruction_sets_user
+            ON user_instruction_sets(user_id, archived_at, updated_at DESC)
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_instruction_set_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                set_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                comment TEXT
+            )
+        """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_instruction_set_history_set
+            ON user_instruction_set_history(set_id, changed_at DESC)
         """
         )
 
