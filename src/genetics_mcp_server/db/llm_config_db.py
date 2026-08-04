@@ -91,6 +91,19 @@ class InstructionSet:
 
 
 @dataclass
+class InstructionSetVersion:
+    """One stored version of an instruction set, from user_instruction_set_history."""
+
+    id: int
+    set_id: str
+    user_id: str
+    name: str
+    body: str
+    changed_at: datetime
+    comment: str | None
+
+
+@dataclass
 class UserApiToken:
     """Per-user API token for MCP server access."""
 
@@ -1106,6 +1119,43 @@ class LLMConfigDB(object, metaclass=Singleton):
             conn.rollback()
             raise
         return self.get_instruction_set(user_id, set_id)
+
+    def get_instruction_set_history(
+        self, user_id: str, set_id: str, limit: int = 20
+    ) -> list[InstructionSetVersion]:
+        """Recent versions of one of a user's instruction sets, newest first.
+
+        user_id is part of the predicate rather than checked afterwards, so another user's
+        history is not readable even by guessing a set id. changed_at has one-second
+        resolution, so the autoincrement id breaks ties — two versions saved in the same
+        second would otherwise come back in whatever order SQLite chose, and the newest-first
+        contract is what the dialog's rollback list depends on.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, set_id, user_id, name, body, changed_at, comment
+            FROM user_instruction_set_history
+            WHERE set_id = ? AND user_id = ?
+            ORDER BY changed_at DESC, id DESC
+            LIMIT ?
+            """,
+            (set_id, user_id, limit),
+        )
+        return [
+            InstructionSetVersion(
+                id=row["id"],
+                set_id=row["set_id"],
+                user_id=row["user_id"],
+                name=row["name"],
+                body=row["body"],
+                changed_at=self._as_utc_or_epoch(row["changed_at"]),
+                comment=row["comment"],
+            )
+            for row in cursor.fetchall()
+        ]
 
     def archive_instruction_set(self, user_id: str, set_id: str) -> bool:
         """Archive (soft delete) a user's instruction set.

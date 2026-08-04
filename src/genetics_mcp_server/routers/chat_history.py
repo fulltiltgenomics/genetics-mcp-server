@@ -70,6 +70,7 @@ class MessageResponse(BaseModel):
     literature_backend: Optional[str] = None  # europepmc or perplexity
     tool_profile: Optional[str] = None  # api, bigquery, rag, or None (all)
     tool_results_json: Optional[str] = None  # JSON string of tool_result blocks for this assistant turn
+    instruction_set_id: Optional[str] = None  # user instruction set in force for this turn
 
 
 class SessionDetailResponse(BaseModel):
@@ -100,6 +101,9 @@ class MessageSaveRequest(BaseModel):
     literature_backend: Optional[str] = Field(None, description="Literature search backend: europepmc or perplexity")
     tool_profile: Optional[str] = Field(None, description="Tool profile: api, bigquery, rag, or null (all)")
     tool_results_json: Optional[str] = Field(None, description="JSON string of tool_result blocks for this assistant turn")
+    # add_message re-saves the whole row on conflict, so a re-save that omits this clears the
+    # stored value — same semantics as tool_profile above. Every save of a message must carry it
+    instruction_set_id: Optional[str] = Field(None, description="Instruction set in force for this turn")
 
 
 class MessageRatingRequest(BaseModel):
@@ -284,6 +288,7 @@ async def get_session(
                 literature_backend=msg.literature_backend,
                 tool_profile=msg.tool_profile,
                 tool_results_json=msg.tool_results_json,
+                instruction_set_id=msg.instruction_set_id,
             )
             for msg in messages
         ],
@@ -425,6 +430,7 @@ async def save_message(
         request.literature_backend,
         request.tool_profile,
         request.tool_results_json,
+        request.instruction_set_id,
     )
 
     return MessageResponse(
@@ -437,6 +443,7 @@ async def save_message(
         literature_backend=msg.literature_backend,
         tool_profile=msg.tool_profile,
         tool_results_json=msg.tool_results_json,
+        instruction_set_id=msg.instruction_set_id,
     )
 
 

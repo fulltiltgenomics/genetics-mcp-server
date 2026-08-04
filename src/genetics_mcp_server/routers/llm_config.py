@@ -9,11 +9,17 @@ Provides endpoints for:
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from genetics_mcp_server.auth import auth_required
 from genetics_mcp_server.db import get_llm_config_db
+from genetics_mcp_server.db.llm_config_db import (
+    InstructionSet,
+    InstructionSetBodyTooLong,
+    InstructionSetLimitReached,
+    InstructionSetVersion,
+)
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
 
 logger = logging.getLogger(__name__)
@@ -81,6 +87,68 @@ class UserSettingUpdate(BaseModel):
 
     setting_value: str = Field(..., description="Setting value")
     comment: Optional[str] = Field(None, description="Optional comment describing the change")
+
+
+class InstructionSetResponse(BaseModel):
+    """A named set of user-authored instructions."""
+
+    id: str
+    name: str
+    body: str
+    created_at: str
+    updated_at: str
+    # true when the stored body predates the character cap, so the dialog can explain why
+    # saving the set back unchanged is rejected rather than looking broken
+    body_over_cap: bool = False
+
+
+class InstructionSetCreate(BaseModel):
+    """Request body for creating an instruction set."""
+
+    name: str = Field(..., description="Display name")
+    body: str = Field(..., description="Instruction text appended to the system prompt")
+    comment: Optional[str] = Field(None, description="Optional comment describing the change")
+
+
+class InstructionSetUpdate(BaseModel):
+    """Request body for updating an instruction set. Omitted fields keep their value."""
+
+    name: Optional[str] = Field(None, description="New display name")
+    body: Optional[str] = Field(None, description="New instruction text")
+    comment: Optional[str] = Field(None, description="Optional comment describing the change")
+
+
+class InstructionSetVersionResponse(BaseModel):
+    """One stored version of an instruction set."""
+
+    id: int
+    set_id: str
+    name: str
+    body: str
+    changed_at: str
+    comment: Optional[str] = None
+
+
+def _instruction_set_response(s: InstructionSet) -> InstructionSetResponse:
+    return InstructionSetResponse(
+        id=s.id,
+        name=s.name,
+        body=s.body,
+        created_at=s.created_at.isoformat(),
+        updated_at=s.updated_at.isoformat(),
+        body_over_cap=s.body_over_cap,
+    )
+
+
+def _instruction_set_version_response(v: InstructionSetVersion) -> InstructionSetVersionResponse:
+    return InstructionSetVersionResponse(
+        id=v.id,
+        set_id=v.set_id,
+        name=v.name,
+        body=v.body,
+        changed_at=v.changed_at.isoformat(),
+        comment=v.comment,
+    )
 
 
 @router.get(
@@ -296,6 +364,142 @@ async def delete_user_setting(
     return {"deleted": True}
 
 
+# user instruction sets
+#
+# which set is selected is not part of this resource: it is a user setting like any other,
+# read and written through /user/settings/selected_instruction_set. Every endpoint below is
+# scoped to the authenticated user by passing `user` into the accessor, so a set belonging to
+# someone else is indistinguishable from one that does not exist.
+
+@router.get(
+    "/llm-config/user/instruction-sets",
+    summary="List the user's instruction sets",
+    response_model=list[InstructionSetResponse],
+)
+async def list_instruction_sets(user: str = Depends(auth_required)):
+    """List the current user's non-archived instruction sets, most recently edited first."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    db = get_llm_config_db()
+    return [_instruction_set_response(s) for s in db.list_instruction_sets(user)]
+
+
+@router.post(
+    "/llm-config/user/instruction-sets",
+    summary="Create an instruction set",
+    response_model=InstructionSetResponse,
+)
+async def create_instruction_set(
+    create: InstructionSetCreate,
+    user: str = Depends(auth_required),
+):
+    """Create a new instruction set for the current user."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    name = create.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Instruction set name cannot be empty")
+    if not create.body.strip():
+        raise HTTPException(status_code=400, detail="Instruction set body cannot be empty")
+
+    db = get_llm_config_db()
+    try:
+        created = db.create_instruction_set(user, name, create.body, comment=create.comment)
+    except InstructionSetBodyTooLong as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    except InstructionSetLimitReached as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    logger.info(f"Instruction set {created.id} created by {user}")
+    return _instruction_set_response(created)
+
+
+@router.put(
+    "/llm-config/user/instruction-sets/{set_id}",
+    summary="Update an instruction set",
+    response_model=InstructionSetResponse,
+)
+async def update_instruction_set(
+    set_id: str,
+    update: InstructionSetUpdate,
+    user: str = Depends(auth_required),
+):
+    """Update one of the current user's instruction sets."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    name = None if update.name is None else update.name.strip()
+    if name is not None and not name:
+        raise HTTPException(status_code=400, detail="Instruction set name cannot be empty")
+    if update.body is not None and not update.body.strip():
+        raise HTTPException(status_code=400, detail="Instruction set body cannot be empty")
+
+    db = get_llm_config_db()
+    try:
+        updated = db.update_instruction_set(
+            user, set_id, name=name, body=update.body, comment=update.comment
+        )
+    except InstructionSetBodyTooLong as e:
+        raise HTTPException(status_code=413, detail=str(e))
+    # None covers an archived set as well as one belonging to someone else: an archived set is
+    # deleted as far as the user is concerned, so editing one must not report success
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Instruction set not found")
+
+    logger.info(f"Instruction set {set_id} updated by {user}")
+    return _instruction_set_response(updated)
+
+
+@router.delete(
+    "/llm-config/user/instruction-sets/{set_id}",
+    summary="Delete an instruction set",
+    status_code=204,
+)
+async def delete_instruction_set(
+    set_id: str,
+    user: str = Depends(auth_required),
+):
+    """Archive one of the current user's instruction sets.
+
+    Archived rather than removed, so a chat message that recorded the id stays resolvable.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    db = get_llm_config_db()
+    if not db.archive_instruction_set(user, set_id):
+        raise HTTPException(status_code=404, detail="Instruction set not found")
+
+    logger.info(f"Instruction set {set_id} archived by {user}")
+    return None
+
+
+@router.get(
+    "/llm-config/user/instruction-sets/{set_id}/history",
+    summary="Get instruction set change history",
+    response_model=list[InstructionSetVersionResponse],
+)
+async def get_instruction_set_history(
+    set_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    user: str = Depends(auth_required),
+):
+    """Recent versions of one of the current user's instruction sets, newest first."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    db = get_llm_config_db()
+    # archived sets stay readable here, so history survives a delete; only a set the user does
+    # not own 404s
+    if db.get_instruction_set(user, set_id) is None:
+        raise HTTPException(status_code=404, detail="Instruction set not found")
+
+    history = db.get_instruction_set_history(user, set_id, limit=limit)
+    return [_instruction_set_version_response(v) for v in history]
+
+
 # legacy global endpoints (kept for backward compatibility but deprecated)
 
 @router.get(
@@ -392,7 +596,7 @@ async def update_tool_description(
 )
 async def get_tool_description_history(
     tool_name: str,
-    limit: int = 20,
+    limit: int = Query(20, ge=1, le=100),
     user: str = Depends(auth_required),
 ):
     """

@@ -1011,3 +1011,135 @@ class TestDBBackedCache:
             rows, _ = _analysis_rows(sample_db)
             # rows rewritten at the bumped version
             assert all(r[1] == bumped for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Instruction set breakdown
+# ---------------------------------------------------------------------------
+
+def _messages_with_instruction_sets(messages):
+    """Attach instruction_set_id to the sample messages: s1 -> set-a, s3 -> set-b, s2 none."""
+    per_session = {"s1": "set-a", "s3": "set-b"}
+    return messages.with_columns(
+        pl.Series(
+            "instruction_set_id",
+            [per_session.get(sid) for sid in messages["session_id"].to_list()],
+            dtype=pl.Utf8,
+        )
+    )
+
+
+def _messages_switching_sets_midway(messages):
+    """s1's two user messages name different sets: m1 -> set-a, then m3 -> set-b."""
+    per_message = {"m1": "set-a", "m3": "set-b"}
+    return messages.with_columns(
+        pl.Series(
+            "instruction_set_id",
+            [per_message.get(mid) for mid in messages["id"].to_list()],
+            dtype=pl.Utf8,
+        )
+    )
+
+
+def _topics():
+    return {
+        "s1": {"topic": "gene_lookup", "complexity": 1, "brief_reason": ""},
+        "s2": {"topic": "variant_interpretation", "complexity": 1, "brief_reason": ""},
+        "s3": {"topic": "literature_search", "complexity": 1, "brief_reason": ""},
+    }
+
+
+class TestInstructionSetMetrics:
+    def test_missing_column_leaves_sets_empty(self, sample_db):
+        """chat_messages predating the migration has no instruction_set_id column."""
+        sessions, messages = load_data(sample_db)
+        assert "instruction_set_id" not in messages.columns
+        metrics = compute_all_metrics(
+            sessions, messages, build_session_tool_stats(messages), _topics()
+        )
+        assert all(m.instruction_set_id == "" for m in metrics)
+        assert all(m.instruction_set_name == "" for m in metrics)
+
+    def test_names_resolved_from_config_db(self, sample_db):
+        sessions, messages = load_data(sample_db)
+        messages = _messages_with_instruction_sets(messages)
+        metrics = compute_all_metrics(
+            sessions,
+            messages,
+            build_session_tool_stats(messages),
+            _topics(),
+            {"set-a": "Statistician", "set-b": "Terse"},
+        )
+        by_id = {m.session_id: m for m in metrics}
+        assert by_id["s1"].instruction_set_id == "set-a"
+        assert by_id["s1"].instruction_set_name == "Statistician"
+        assert by_id["s3"].instruction_set_name == "Terse"
+        assert by_id["s2"].instruction_set_id == ""
+        assert by_id["s2"].instruction_set_name == ""
+
+    def test_unresolvable_id_groups_under_the_id(self, sample_db):
+        sessions, messages = load_data(sample_db)
+        messages = _messages_with_instruction_sets(messages)
+        metrics = compute_all_metrics(
+            sessions, messages, build_session_tool_stats(messages), _topics()
+        )
+        by_id = {m.session_id: m for m in metrics}
+        assert by_id["s1"].instruction_set_name == "set-a"
+
+    def test_last_set_named_in_a_session_wins(self, sample_db):
+        """The selector can move mid-conversation; the session runs under the newest one."""
+        sessions, messages = load_data(sample_db)
+        messages = _messages_switching_sets_midway(messages)
+        metrics = compute_all_metrics(
+            sessions,
+            messages,
+            build_session_tool_stats(messages),
+            _topics(),
+            {"set-a": "Statistician", "set-b": "Terse"},
+        )
+        by_id = {m.session_id: m for m in metrics}
+        assert by_id["s1"].instruction_set_id == "set-b"
+        assert by_id["s1"].instruction_set_name == "Terse"
+
+    def test_report_groups_by_instruction_set(self, sample_db):
+        sessions, messages = load_data(sample_db)
+        messages = _messages_with_instruction_sets(messages)
+        tool_stats = build_session_tool_stats(messages)
+        metrics = compute_all_metrics(
+            sessions, messages, tool_stats, _topics(),
+            {"set-a": "Statistician", "set-b": "Terse"},
+        )
+        report = generate_report(metrics, sessions, messages, tool_stats)
+
+        assert "## Instruction Set Usage" in report
+        assert "| Instructions | Count | Avg Score |" in report
+        assert "| Statistician | 1 |" in report
+        assert "| Terse | 1 |" in report
+        # the session that used none still shows, so the baseline is comparable
+        assert "| (none) | 1 |" in report
+
+
+class TestLoadInstructionSetNames:
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert ac.load_instruction_set_names(str(tmp_path / "nope.db")) == {}
+
+    def test_missing_table_returns_empty(self, tmp_path):
+        path = str(tmp_path / "empty.db")
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE unrelated (id TEXT)")
+        conn.close()
+        assert ac.load_instruction_set_names(path) == {}
+
+    def test_reads_id_to_name(self, tmp_path):
+        path = str(tmp_path / "llm_config.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE user_instruction_sets (id TEXT PRIMARY KEY, user_id TEXT, "
+            "name TEXT, body TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO user_instruction_sets VALUES ('s1', 'u@x.com', 'Statistician', 'b')"
+        )
+        conn.commit()
+        conn.close()
+        assert ac.load_instruction_set_names(path) == {"s1": "Statistician"}

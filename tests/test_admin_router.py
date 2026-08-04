@@ -843,3 +843,102 @@ class TestAdminSessionsAnalysisJoin:
         assert by_id[s2]["issue_categories"] == ["refusal"]
         # ordered by created_at ascending
         assert "created_at" in rows[0]
+
+
+@pytest.fixture
+def instruction_set_admin_client(test_db):
+    """Admin client over a session whose messages recorded an instruction set."""
+    from genetics_mcp_server.config.settings import get_settings
+
+    if LLMConfigDB in Singleton._instances:
+        del Singleton._instances[LLMConfigDB]
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        config_path = f.name
+    config_db = LLMConfigDB(config_path)
+
+    named = config_db.create_instruction_set("alice@example.com", "Statistician", "be precise")
+    renamed = config_db.create_instruction_set("alice@example.com", "Terse", "be terse")
+
+    # s1 switches sets mid-conversation, s2 never used one, s3 references a set nobody owns
+    s1 = test_db.create_session("alice@example.com")
+    test_db.add_message(s1.id, "s1-m1", "user", "hi", instruction_set_id=named.id)
+    test_db.add_message(s1.id, "s1-m2", "user", "again", instruction_set_id=renamed.id)
+    s2 = test_db.create_session("alice@example.com")
+    test_db.add_message(s2.id, "s2-m1", "user", "hi")
+    s3 = test_db.create_session("bob@example.com")
+    test_db.add_message(s3.id, "s3-m1", "user", "hi", instruction_set_id="ghost-set")
+    # bob naming a set id that exists but belongs to alice: the memo must be keyed on
+    # (user_id, set_id), not set_id alone
+    s4 = test_db.create_session("bob@example.com")
+    test_db.add_message(s4.id, "s4-m1", "user", "hi", instruction_set_id=named.id)
+    sessions = {"alice_switch": s1.id, "alice_none": s2.id, "bob_ghost": s3.id,
+                "bob_borrowed": s4.id}
+
+    async def mock_admin():
+        return "admin@example.com"
+
+    app.dependency_overrides[admin_required] = mock_admin
+
+    with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
+        get_settings.cache_clear()
+        with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db), \
+                patch("genetics_mcp_server.routers.admin.get_llm_config_db",
+                      return_value=config_db):
+            with TestClient(app) as client:
+                yield client, config_db, sessions
+        get_settings.cache_clear()
+
+    app.dependency_overrides.clear()
+    if LLMConfigDB in Singleton._instances:
+        del Singleton._instances[LLMConfigDB]
+    close_and_unlink(config_db, config_path)
+
+
+class TestAdminSessionsInstructionSet:
+    """The operator needs to see which instructions were in force on a session."""
+
+    def _by_session(self, client_and_db):
+        client = client_and_db[0]
+        resp = client.get("/chat/v1/admin/sessions")
+        assert resp.status_code == 200
+        return {s["id"]: s for s in resp.json()["sessions"]}
+
+    def test_latest_set_name_is_reported(self, instruction_set_admin_client):
+        sessions = self._by_session(instruction_set_admin_client)
+        with_sets = [s for s in sessions.values() if s["instruction_set_name"]]
+        assert [s["instruction_set_name"] for s in with_sets] == ["Terse"]
+
+    def test_session_without_a_set_reports_none(self, instruction_set_admin_client):
+        sessions = self._by_session(instruction_set_admin_client)
+        assert any(
+            s["instruction_set_name"] is None and s["message_count"] == 1
+            for s in sessions.values()
+        )
+
+    def test_unresolvable_set_reports_none(self, instruction_set_admin_client):
+        """A message can reference an id from another user or another database file."""
+        sessions = self._by_session(instruction_set_admin_client)
+        ids = instruction_set_admin_client[2]
+        assert sessions[ids["bob_ghost"]]["instruction_set_name"] is None
+
+    def test_other_users_real_set_id_reports_none(self, instruction_set_admin_client):
+        """Resolution is scoped to the session's owner: alice's real id must not name
+        itself on bob's session."""
+        sessions = self._by_session(instruction_set_admin_client)
+        ids = instruction_set_admin_client[2]
+        assert sessions[ids["bob_borrowed"]]["instruction_set_name"] is None
+
+    def test_archived_set_still_names_itself(self, instruction_set_admin_client):
+        """Archiving is a soft delete precisely so history stays resolvable."""
+        config_db = instruction_set_admin_client[1]
+        sessions_before = self._by_session(instruction_set_admin_client)
+        target = next(
+            s for s in sessions_before.values() if s["instruction_set_name"] == "Terse"
+        )
+
+        terse = next(s for s in config_db.list_instruction_sets("alice@example.com")
+                     if s.name == "Terse")
+        assert config_db.archive_instruction_set("alice@example.com", terse.id)
+
+        after = self._by_session(instruction_set_admin_client)
+        assert after[target["id"]]["instruction_set_name"] == "Terse"

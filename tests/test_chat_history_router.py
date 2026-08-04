@@ -761,3 +761,66 @@ class TestGenerateTitle:
 
         assert resp.status_code == 200
         assert resp.json()["title"] == "What does APOE do?"
+
+
+class TestInstructionSetOnMessages:
+    """The instruction set in force is recorded per message and read back per message."""
+
+    def _session(self, client):
+        return client.post("/chat/v1/chat/sessions", json={}).json()["id"]
+
+    def test_save_message_round_trips_instruction_set_id(self, client_with_auth):
+        session_id = self._session(client_with_auth)
+
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={
+                "id": "m1",
+                "role": "user",
+                "content": "hello",
+                "instruction_set_id": "set-abc",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["instruction_set_id"] == "set-abc"
+
+        detail = client_with_auth.get(f"/chat/v1/chat/sessions/{session_id}")
+        assert detail.status_code == 200
+        assert detail.json()["messages"][0]["instruction_set_id"] == "set-abc"
+
+    def test_omitted_instruction_set_id_is_null(self, client_with_auth):
+        session_id = self._session(client_with_auth)
+
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={"id": "m1", "role": "user", "content": "hello"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["instruction_set_id"] is None
+
+    def test_resave_without_the_field_clears_it(self, client_with_auth):
+        """Documents the ON CONFLICT semantics: a re-save is a full replace of the row.
+
+        Same behaviour as tool_profile and literature_backend, so every save path has to
+        carry the field, not only the first save of a message.
+        """
+        session_id = self._session(client_with_auth)
+        client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={
+                "id": "m1",
+                "role": "assistant",
+                "content": "draft",
+                "instruction_set_id": "set-abc",
+            },
+        )
+
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={"id": "m1", "role": "assistant", "content": "final"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["instruction_set_id"] is None
+
+        detail = client_with_auth.get(f"/chat/v1/chat/sessions/{session_id}")
+        assert detail.json()["messages"][0]["instruction_set_id"] is None

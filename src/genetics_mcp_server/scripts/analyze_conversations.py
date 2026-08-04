@@ -79,6 +79,30 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     return sessions, messages
 
 
+def load_instruction_set_names(db_path: str) -> dict[str, str]:
+    """Map instruction set id -> name from the llm_config database.
+
+    The sets live in a different SQLite file from the conversations, and the analyzer is
+    pointed at the conversation one. Every failure to read the config file is degraded to an
+    empty map rather than raised: the report groups by id instead of name, which is worse to
+    read but still correct, and a nightly report is not worth failing over a sidecar file.
+    """
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT id, name FROM user_instruction_sets"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning(f"could not read instruction set names from {db_path}: {e}")
+        return {}
+    return {row[0]: row[1] for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Robust JSON extraction from LLM text
 # ---------------------------------------------------------------------------
@@ -605,6 +629,10 @@ class ConversationMetrics:
     tool_sequence: str = ""
     first_user_message: str = ""
     tool_profile: str = ""
+    # the user-authored instruction set in force, if any. Kept alongside the id because the
+    # name is what a reader recognises and the id is what survives a rename
+    instruction_set_id: str = ""
+    instruction_set_name: str = ""
     # LLM quality assessment fields
     llm_quality_score: int | None = None
     llm_answered: str = ""
@@ -717,6 +745,7 @@ def compute_all_metrics(
     messages: pl.DataFrame,
     tool_stats: pl.DataFrame,
     topics: dict[str, dict],
+    instruction_set_names: dict[str, str] | None = None,
 ) -> list[ConversationMetrics]:
     """Compute metrics for all sessions."""
     # pre-compute per-session message stats
@@ -747,6 +776,24 @@ def compute_all_metrics(
         .select("session_id", "tool_profile")
     )
 
+    # the last user message that named an instruction set decides the session's: the selector
+    # can move mid-conversation, so the newest one is what the session ended up running under.
+    # The column is guarded because chat_messages predating the migration does not have it
+    if "instruction_set_id" in messages.columns:
+        instruction_sets = (
+            messages.filter(pl.col("role") == "user")
+            .filter(pl.col("instruction_set_id").is_not_null())
+            .sort("created_at")
+            .group_by("session_id")
+            .last()
+            .select("session_id", "instruction_set_id")
+        )
+    else:
+        instruction_sets = pl.DataFrame({
+            "session_id": pl.Series([], dtype=pl.Utf8),
+            "instruction_set_id": pl.Series([], dtype=pl.Utf8),
+        })
+
     # check for error patterns in assistant messages
     error_sessions = set()
     for row in messages.filter(pl.col("role") == "assistant").iter_rows(named=True):
@@ -760,7 +807,9 @@ def compute_all_metrics(
     combined = combined.join(tool_stats, left_on="id", right_on="session_id", how="left")
     combined = combined.join(first_msgs, left_on="id", right_on="session_id", how="left")
     combined = combined.join(tool_profiles, left_on="id", right_on="session_id", how="left")
+    combined = combined.join(instruction_sets, left_on="id", right_on="session_id", how="left")
 
+    names = instruction_set_names or {}
     results = []
     for row in combined.iter_rows(named=True):
         sid = row["id"]
@@ -785,6 +834,14 @@ def compute_all_metrics(
             tool_sequence=row.get("tool_sequence") or "",
             first_user_message=row.get("first_user_message") or "",
             tool_profile=row.get("tool_profile") or "",
+            instruction_set_id=row.get("instruction_set_id") or "",
+            # an unresolvable id still groups, under the id itself: the sets live in a separate
+            # SQLite file that this analyzer may not have been pointed at
+            instruction_set_name=(
+                names.get(row["instruction_set_id"], row["instruction_set_id"])
+                if row.get("instruction_set_id")
+                else ""
+            ),
         )
         m.success_score = compute_success_score(m)
         m.success_label = label_success(m.success_score)
@@ -1154,6 +1211,21 @@ def generate_report(
             lines.append(f"| {profile_label} | {count} | {avg_s:.2f} |")
     lines.append("")
 
+    # --- instruction set analysis ---
+    # without this split a user who asked for terse prose reads as a quality regression: the
+    # judge sees a short answer and cannot know the user is the one who asked for it
+    lines.append("## Instruction Set Usage\n")
+    set_counts = Counter(m.instruction_set_name for m in metrics)
+    if set_counts:
+        lines.append("| Instructions | Count | Avg Score |")
+        lines.append("|--------------|------:|----------:|")
+        for set_name, count in set_counts.most_common():
+            set_label = (set_name or "(none)").replace("|", "/")
+            set_metrics = [m for m in metrics if m.instruction_set_name == set_name]
+            avg_s = sum(m.success_score for m in set_metrics) / len(set_metrics)
+            lines.append(f"| {set_label} | {count} | {avg_s:.2f} |")
+    lines.append("")
+
     # --- user engagement ---
     lines.append("## User Engagement\n")
     msg_counts = [m.user_messages for m in metrics]
@@ -1317,6 +1389,10 @@ async def main():
     )
     parser.add_argument("--db", required=True, help="Path to chat_history SQLite DB")
     parser.add_argument("--output-dir", default=None, help="Directory for output files")
+    parser.add_argument("--llm-config-db", default=None,
+                        help="Path to llm_config SQLite DB, used to name the instruction sets "
+                             "the report groups by (default: llm_config.db beside --db). "
+                             "If it is missing the report groups by set id instead.")
     parser.add_argument("--no-llm", action="store_true",
                         help="Use keyword categorization instead of LLM")
     parser.add_argument("--topic-model",
@@ -1504,7 +1580,12 @@ async def main():
 
     # --- compute metrics ---
     logger.info("Computing success metrics...")
-    all_metrics = compute_all_metrics(sessions, messages, tool_stats, topics)
+    instruction_set_names = load_instruction_set_names(
+        args.llm_config_db or str(Path(args.db).parent / "llm_config.db")
+    )
+    all_metrics = compute_all_metrics(
+        sessions, messages, tool_stats, topics, instruction_set_names
+    )
 
     # --- LLM quality evaluation ---
     if not args.no_llm:

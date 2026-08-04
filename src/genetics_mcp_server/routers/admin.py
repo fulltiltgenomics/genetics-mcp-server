@@ -38,6 +38,9 @@ class AdminSessionItem(BaseModel):
     issue_categories: list[str] = []
     llm_rating: Optional[int] = None
     success_label: Optional[str] = None
+    # name of the instruction set in force on the session's latest message that recorded one.
+    # None when no message carried a set, or when the id no longer resolves for that user
+    instruction_set_name: Optional[str] = None
 
 
 class AdminSessionListResponse(BaseModel):
@@ -161,11 +164,33 @@ async def list_all_sessions(
         unrated=unrated,
     )
 
+    # (user, set id) -> name, so a page of sessions from one user costs one lookup per set
+    # rather than one per session. Resolved lazily: a page where nobody used an instruction set
+    # never opens the config database at all
+    set_names: dict[tuple[str, str], Optional[str]] = {}
+
+    def resolve_instruction_set_name(user_id: str, session_messages) -> Optional[str]:
+        # the last message that recorded a set wins: the selector can move mid-conversation,
+        # so the newest one is what was actually in force when the session ended
+        set_id = next(
+            (m.instruction_set_id for m in reversed(session_messages) if m.instruction_set_id),
+            None,
+        )
+        if set_id is None:
+            return None
+        key = (user_id, set_id)
+        if key not in set_names:
+            # archived sets stay readable, so a set the user has since deleted still names itself
+            found = get_llm_config_db().get_instruction_set(user_id, set_id)
+            set_names[key] = found.name if found else None
+        return set_names[key]
+
     items = []
     for s in sessions:
         preview = db.get_first_user_message(s.id)
         messages = db.get_messages(s.id)
         items.append(AdminSessionItem(
+            instruction_set_name=resolve_instruction_set_name(s.user_id, messages),
             id=s.id,
             user_id=s.user_id,
             title=s.title,
