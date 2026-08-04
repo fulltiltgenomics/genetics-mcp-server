@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
-from conftest import close_and_unlink
+from conftest import close_and_unlink, settings_env
 from fastapi.testclient import TestClient
 
 from genetics_mcp_server.auth import admin_required, auth_required
@@ -280,39 +280,65 @@ class TestAdminAuthGuards:
 
     def test_non_admin_denied_when_auth_required(self, seeded_db):
         """Non-admin user gets 403 when REQUIRE_AUTH is true."""
-        from genetics_mcp_server.config.settings import get_settings
-
         async def mock_auth():
             return "regular@example.com"
 
         app.dependency_overrides[auth_required] = mock_auth
 
-        env = {"REQUIRE_AUTH": "true", "ADMIN_USERS": "admin@example.com", "ENABLE_ADMIN_PAGE": "true"}
         with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=seeded_db):
-            with patch.dict(os.environ, env):
-                get_settings.cache_clear()
-                with patch("genetics_mcp_server.auth.dependencies._require_auth", True):
-                    with TestClient(app) as client:
-                        response = client.get("/chat/v1/admin/sessions")
-                        assert response.status_code == 403
-                get_settings.cache_clear()
+            with settings_env(
+                REQUIRE_AUTH="true",
+                ADMIN_USERS="admin@example.com",
+                ENABLE_ADMIN_PAGE="true",
+            ):
+                with TestClient(app) as client:
+                    response = client.get("/chat/v1/admin/sessions")
+                    assert response.status_code == 403
 
         app.dependency_overrides.clear()
 
     def test_dev_mode_allows_any_user(self, seeded_db):
         """When REQUIRE_AUTH is false, any user can access admin."""
-        from genetics_mcp_server.config.settings import get_settings
-
         with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=seeded_db):
-            with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
-                get_settings.cache_clear()
-                with patch("genetics_mcp_server.auth.dependencies._require_auth", False):
-                    with TestClient(app) as client:
-                        response = client.get("/chat/v1/admin/sessions")
-                        assert response.status_code == 200
-                get_settings.cache_clear()
+            with settings_env(REQUIRE_AUTH="false", ENABLE_ADMIN_PAGE="true"):
+                with TestClient(app) as client:
+                    response = client.get("/chat/v1/admin/sessions")
+                    assert response.status_code == 200
 
         app.dependency_overrides.clear()
+
+    @pytest.mark.parametrize(
+        "require_auth,user,expect_admin",
+        [
+            ("true", "regular@example.com", False),
+            ("true", "admin@example.com", True),
+            ("false", "regular@example.com", True),
+        ],
+    )
+    def test_the_reported_is_admin_matches_the_gate_on_the_admin_endpoints(
+        self, seeded_db, require_auth, user, expect_admin
+    ):
+        """/chat/v1/auth's is_admin is what the frontend shows the admin UI on, and
+        admin_required is what actually guards the endpoints behind it. They used to read
+        REQUIRE_AUTH from two places — a module global snapshotted at import time and a per
+        request os.environ lookup — so moving one and not the other made them disagree: the
+        REQUIRE_AUTH=true row below reported is_admin False for a regular user while the gate,
+        still holding its import-time False, served that same user every admin endpoint
+        (genetics-results-suite-pol).
+        """
+        headers = {"X-Goog-Authenticated-User-Email": f"accounts.google.com:{user}"}
+        with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=seeded_db):
+            with settings_env(
+                REQUIRE_AUTH=require_auth,
+                ADMIN_USERS="admin@example.com",
+                ENABLE_ADMIN_PAGE="true",
+            ):
+                with TestClient(app) as client:
+                    reported = client.get("/chat/v1/auth", headers=headers).json()["is_admin"]
+                    gated = client.get("/chat/v1/admin/sessions", headers=headers)
+
+        assert reported is expect_admin
+        assert (gated.status_code == 200) is expect_admin
 
     def test_admin_disabled_returns_404(self, seeded_db):
         """When ENABLE_ADMIN_PAGE is false, admin endpoints return 404."""

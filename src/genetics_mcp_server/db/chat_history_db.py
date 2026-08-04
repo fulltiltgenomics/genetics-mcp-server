@@ -5,14 +5,17 @@ Stores chat sessions and messages with support for ratings and comments.
 """
 
 import json
+import logging
 import sqlite3
 import threading
 import uuid
 from collections import defaultdict as dd
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .singleton import Singleton
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -222,15 +225,21 @@ class ChatHistoryDB(object, metaclass=Singleton):
     ) -> ChatSession:
         """Create a new chat session."""
         session_id = str(uuid.uuid4())
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO chat_sessions (id, user_id, phenotype_code)
-            VALUES (?, ?, ?)
-            """,
-            (session_id, user_id, phenotype_code),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO chat_sessions (id, user_id, phenotype_code)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, user_id, phenotype_code),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
         return ChatSession(
             id=session_id,
@@ -246,7 +255,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def get_session(self, session_id: str, user_id: str) -> ChatSession | None:
         """Get a session by ID, verifying ownership."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
@@ -262,7 +273,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def list_sessions(self, user_id: str, limit: int = 50) -> list[ChatSession]:
         """List user's chat sessions, most recent first."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
@@ -303,45 +316,69 @@ class ChatHistoryDB(object, metaclass=Singleton):
         updates.append("updated_at = CURRENT_TIMESTAMP")
         params.extend([session_id, user_id])
 
-        cursor = self._conn.cursor()
-        cursor.execute(
-            f"""
-            UPDATE chat_sessions
-            SET {", ".join(updates)}
-            WHERE id = ? AND user_id = ?
-            """,
-            params,
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                UPDATE chat_sessions
+                SET {", ".join(updates)}
+                WHERE id = ? AND user_id = ?
+                """,
+                params,
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     def touch_session(self, session_id: str) -> None:
         """Update the session's updated_at timestamp."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (session_id,),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def delete_session(self, session_id: str, user_id: str) -> bool:
         """Delete a session and its messages. Returns True if deleted."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
-            (session_id, user_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     def set_shared(self, session_id: str, user_id: str, shared: bool) -> bool:
         """Set the shared flag on a session. Returns False if user doesn't own it."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "UPDATE chat_sessions SET shared = ? WHERE id = ? AND user_id = ?",
-            (shared, session_id, user_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE chat_sessions SET shared = ? WHERE id = ? AND user_id = ?",
+                (shared, session_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     def get_session_for_access(
@@ -351,7 +388,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         Returns (session, is_owner) or None if not accessible.
         """
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
@@ -382,26 +421,34 @@ class ChatHistoryDB(object, metaclass=Singleton):
         tool_results_json: str | None = None,
     ) -> ChatMessageRecord:
         """Add a message to a session. If message ID already exists, update it."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                content = excluded.content,
-                content_json = excluded.content_json,
-                literature_backend = excluded.literature_backend,
-                tool_profile = excluded.tool_profile,
-                tool_results_json = excluded.tool_results_json
-            """,
-            (message_id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json),
-        )
-        # also touch the session
-        cursor.execute(
-            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (session_id,),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        # both DMLs and the commit share one try: the message and the session's updated_at have
+        # to land together, so a failure in either has to leave neither behind
+        try:
+            cursor.execute(
+                """
+                INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    content = excluded.content,
+                    content_json = excluded.content_json,
+                    literature_backend = excluded.literature_backend,
+                    tool_profile = excluded.tool_profile,
+                    tool_results_json = excluded.tool_results_json
+                """,
+                (message_id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json),
+            )
+            # also touch the session
+            cursor.execute(
+                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
         return ChatMessageRecord(
             id=message_id,
@@ -418,7 +465,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def get_messages(self, session_id: str) -> list[ChatMessageRecord]:
         """Get all messages for a session, ordered by creation time."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, session_id, role, content, created_at, thumbs_up,
@@ -433,7 +482,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def get_first_user_message(self, session_id: str) -> str | None:
         """Get the first user message content for preview."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT content FROM chat_messages
@@ -448,12 +499,18 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def rate_message(self, message_id: str, thumbs_up: bool | None) -> bool:
         """Rate a message with thumbs up/down. Returns True if updated."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "UPDATE chat_messages SET thumbs_up = ? WHERE id = ?",
-            (thumbs_up, message_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE chat_messages SET thumbs_up = ? WHERE id = ?",
+                (thumbs_up, message_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     def add_attachment(
@@ -468,15 +525,21 @@ class ChatHistoryDB(object, metaclass=Singleton):
         text_path: str | None = None,
     ) -> ChatAttachment:
         """Add an attachment to a session."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO chat_attachments (id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (attachment_id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO chat_attachments (id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (attachment_id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return ChatAttachment(
             id=attachment_id,
             session_id=session_id,
@@ -491,7 +554,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def get_attachment(self, attachment_id: str, session_id: str) -> ChatAttachment | None:
         """Get an attachment by ID, verifying session ownership."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, session_id, file_name, file_type, mime_type, file_size, storage_path, created_at, text_path
@@ -507,7 +572,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def get_session_attachments(self, session_id: str) -> list[ChatAttachment]:
         """Get all attachments for a session."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, session_id, file_name, file_type, mime_type, file_size, storage_path, created_at, text_path
@@ -521,12 +588,18 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def delete_attachment(self, attachment_id: str, session_id: str) -> bool:
         """Delete an attachment. Returns True if deleted."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "DELETE FROM chat_attachments WHERE id = ? AND session_id = ?",
-            (attachment_id, session_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM chat_attachments WHERE id = ? AND session_id = ?",
+                (attachment_id, session_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     def list_all_sessions(
@@ -600,7 +673,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             f"""
             SELECT COUNT(*) as cnt
@@ -642,7 +717,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
         distinct category strings, empty when the session has no issues).
         Aggregation is left to the client (no GROUP BY here).
         """
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT s.id AS session_id, s.created_at AS created_at,
@@ -673,7 +750,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def get_session_any_user(self, session_id: str) -> ChatSession | None:
         """Get a session by ID without user ownership check (admin use)."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
@@ -701,37 +780,45 @@ class ChatHistoryDB(object, metaclass=Singleton):
         new_session_id = str(uuid.uuid4())
         now = datetime.now()
 
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO chat_sessions (id, user_id, title, phenotype_code)
-            VALUES (?, ?, ?, ?)
-            """,
-            (new_session_id, target_user_id, title, source.phenotype_code),
-        )
-
-        # copy messages preserving order
-        cursor.execute(
-            """
-            SELECT role, content, content_json, literature_backend, tool_profile, tool_results_json
-            FROM chat_messages
-            WHERE session_id = ?
-            ORDER BY created_at ASC
-            """,
-            (source_session_id,),
-        )
-        for row in cursor.fetchall():
-            new_msg_id = str(uuid.uuid4())
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        # the whole fork is one transaction: a failure partway through the message copy would
+        # otherwise leave a session holding a truncated conversation
+        try:
             cursor.execute(
                 """
-                INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (id, user_id, title, phenotype_code)
+                VALUES (?, ?, ?, ?)
                 """,
-                (new_msg_id, new_session_id, row["role"], row["content"],
-                 row["content_json"], row["literature_backend"], row["tool_profile"], row["tool_results_json"]),
+                (new_session_id, target_user_id, title, source.phenotype_code),
             )
 
-        self._conn.commit()
+            # copy messages preserving order
+            cursor.execute(
+                """
+                SELECT role, content, content_json, literature_backend, tool_profile, tool_results_json
+                FROM chat_messages
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+                """,
+                (source_session_id,),
+            )
+            for row in cursor.fetchall():
+                new_msg_id = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (new_msg_id, new_session_id, row["role"], row["content"],
+                     row["content_json"], row["literature_backend"], row["tool_profile"], row["tool_results_json"]),
+                )
+
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
         return ChatSession(
             id=new_session_id,
@@ -751,7 +838,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
         period: 'week' (7 days), 'month' (30 days), or 'year' (365 days)
         """
         days = {"week": 7, "month": 30, "year": 365}.get(period, 7)
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT date(created_at) as day,
@@ -775,20 +864,30 @@ class ChatHistoryDB(object, metaclass=Singleton):
         Returns dicts with user_id, comment, created_at, session_id for use
         in the unified admin feedback feed.
         """
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        # id DESC because created_at is CURRENT_TIMESTAMP and has one-second resolution: sessions
+        # commented inside one second tie on it and SQLite is then free to return them in either
+        # order. This listing is half of the paginated admin feedback feed, whose page boundary
+        # can only be stable if each source's own order is
         cursor.execute(
             """
             SELECT user_id, comment, created_at, id as session_id
             FROM chat_sessions
             WHERE comment IS NOT NULL AND comment != ''
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             """
         )
+        # aware UTC, matching what llm_config_db's list_all_user_comments returns for the other
+        # half of the feed: the merge sorts on isoformat() of these, and one side rendering a
+        # +00:00 suffix the other lacks would order a cross-source tie by the suffix rather than
+        # by the (source, id) tiebreak that is there to decide it
         return [
             {
                 "user_id": row["user_id"],
                 "comment": row["comment"],
-                "created_at": datetime.fromisoformat(row["created_at"]),
+                "created_at": self._as_utc_or_epoch(row["created_at"]),
                 "session_id": row["session_id"],
             }
             for row in cursor.fetchall()
@@ -817,9 +916,15 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         metrics_json = json.dumps(m, default=str)
 
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        # the analysis row and its issue rows are one transaction, as the docstring promises:
+        # committing the row without its issues, or deleting the issues without replacing them,
+        # would leave the two out of sync until the next nightly run
+        try:
+            cursor.execute(
+                """
             INSERT INTO conversation_analysis (
                 session_id, analyzed_at, analyzer_version, source_updated_at,
                 message_count, user_rating, llm_quality_score, success_label,
@@ -838,37 +943,42 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 topic = excluded.topic,
                 complexity = excluded.complexity,
                 metrics_json = excluded.metrics_json
-            """,
-            (
-                session_id,
-                analyzer_version,
-                source_updated_at,
-                message_count,
-                m.get("user_rating"),
-                m.get("llm_quality_score"),
-                m.get("success_label"),
-                m.get("llm_disposition"),
-                m.get("topic"),
-                m.get("complexity"),
-                metrics_json,
-            ),
-        )
-
-        # replace the session's issue rows wholesale to keep them in sync
-        cursor.execute(
-            "DELETE FROM conversation_issue WHERE session_id = ?", (session_id,)
-        )
-        if issue_categories:
-            cursor.executemany(
-                "INSERT INTO conversation_issue (session_id, category) VALUES (?, ?)",
-                [(session_id, category) for category in issue_categories],
+                """,
+                (
+                    session_id,
+                    analyzer_version,
+                    source_updated_at,
+                    message_count,
+                    m.get("user_rating"),
+                    m.get("llm_quality_score"),
+                    m.get("success_label"),
+                    m.get("llm_disposition"),
+                    m.get("topic"),
+                    m.get("complexity"),
+                    metrics_json,
+                ),
             )
 
-        self._conn.commit()
+            # replace the session's issue rows wholesale to keep them in sync
+            cursor.execute(
+                "DELETE FROM conversation_issue WHERE session_id = ?", (session_id,)
+            )
+            if issue_categories:
+                cursor.executemany(
+                    "INSERT INTO conversation_issue (session_id, category) VALUES (?, ?)",
+                    [(session_id, category) for category in issue_categories],
+                )
+
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def get_analysis_map(self) -> dict[str, dict]:
         """Return a session_id -> analysis-row dict map for fast lookup."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM conversation_analysis")
         return {row["session_id"]: dict(row) for row in cursor.fetchall()}
 
@@ -882,7 +992,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
         its analyzer_version differs from the current one. ``force`` selects
         every session regardless.
         """
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         if force:
             cursor.execute("SELECT id FROM chat_sessions")
             return [row["id"] for row in cursor.fetchall()]
@@ -899,6 +1011,51 @@ class ChatHistoryDB(object, metaclass=Singleton):
             (analyzer_version,),
         )
         return [row["id"] for row in cursor.fetchall()]
+
+    @staticmethod
+    def _discard_stale_transaction(conn: sqlite3.Connection) -> None:
+        """Roll back a transaction an earlier failed write left open on this connection.
+
+        Python's legacy isolation_level opens a transaction before any DML, and the connection
+        is cached for the life of the thread, so a write that raised without rolling back would
+        hold the write lock against every other writer of this file until that thread happened
+        to commit something else. WAL removes the reader/writer contention, not that.
+
+        Every write accessor here now rolls back on failure, so what can still be found open on
+        entry is a rollback that itself raised or a DML composed directly on db._conn (the tests
+        do the latter deliberately). Discarding it is safe because it is by construction an
+        abandoned write: every accessor commits before returning, so anything still pending
+        belongs to a call that raised, and the connection belongs to this thread alone.
+
+        The methods that run several DMLs under one commit — add_message, fork_session,
+        upsert_analysis, and _init_db — are unaffected: each discards once on entry, before its
+        own first statement, and none of them calls another accessor after that point
+        (fork_session's only nested read runs before its first INSERT). _init_db runs from
+        __init__ alone and Singleton publishes the instance only after it has committed.
+        """
+        if conn.in_transaction:
+            logger.warning("rolling back a transaction left open by an earlier failed write")
+            conn.rollback()
+
+    @staticmethod
+    def _as_utc_or_epoch(value: object) -> datetime:
+        """Parse a stored timestamp as UTC, degrading to the epoch when it cannot be parsed.
+
+        Mirrors the helper of the same name in llm_config_db, for the same reason: created_at
+        carries no NOT NULL and no format check, so a row written outside these accessors can
+        hold anything SQLite accepts, and the admin listing this feeds must not 500 on one bad
+        row. The epoch sorts oldest, which is where SQLite already puts a NULL in a DESC order.
+        fromisoformat raises TypeError on NULL and ValueError on a blank string, hence both the
+        isinstance guard and the except.
+        """
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        logger.warning("unusable stored timestamp %r, falling back to the epoch", value)
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def _row_to_attachment(self, row: sqlite3.Row) -> ChatAttachment:
         return ChatAttachment(

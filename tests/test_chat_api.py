@@ -3,6 +3,8 @@
 import json
 from unittest.mock import patch
 
+from conftest import settings_env
+
 from genetics_mcp_server.llm_service import StreamChunk
 
 
@@ -87,14 +89,14 @@ class TestAuthEndpoints:
 
     def test_me_unauthenticated(self, test_client):
         """Test /chat/v1/me returns 401 when no IAP header."""
-        with patch("genetics_mcp_server.auth.dependencies._require_auth", True):
+        with settings_env(REQUIRE_AUTH="true"):
             response = test_client.get("/chat/v1/me")
 
         assert response.status_code == 401
 
     def test_me_authenticated(self, test_client):
         """Test /chat/v1/me returns user from IAP header."""
-        with patch("genetics_mcp_server.auth.dependencies._require_auth", True):
+        with settings_env(REQUIRE_AUTH="true"):
             response = test_client.get(
                 "/chat/v1/me",
                 headers={"X-Goog-Authenticated-User-Email": "accounts.google.com:test@finngen.fi"},

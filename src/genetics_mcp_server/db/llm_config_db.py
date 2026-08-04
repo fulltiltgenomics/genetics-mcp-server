@@ -558,11 +558,9 @@ class LLMConfigDB(object, metaclass=Singleton):
         # with: versions saved in the same second tie on changed_at, so without it the row shown
         # first is not necessarily the one in force, and the LIMIT can drop the newest version
         # rather than the oldest.
-        # _as_utc, not a bare fromisoformat, so the head of this history is the same aware UTC
-        # value get_tool_description reports for the same row and the two string-match. It still
-        # raises on a stamp it cannot parse, unlike the reads above: this listing has no winner to
-        # pick, so there is nothing for a degraded row to get wrong, and the raise is tracked
-        # separately
+        # _as_utc_or_epoch, not a bare fromisoformat, so the head of this history is the same
+        # aware UTC value get_tool_description reports for the same row and the two string-match,
+        # and one unparseable stamp degrades to the epoch instead of failing the whole listing
         cursor.execute(
             """
             SELECT id, tool_name, description, changed_by, changed_at, comment
@@ -579,7 +577,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                 tool_name=row["tool_name"],
                 description=row["description"],
                 changed_by=row["changed_by"],
-                changed_at=self._as_utc(row["changed_at"]),
+                changed_at=self._as_utc_or_epoch(row["changed_at"]),
                 comment=row["comment"],
             )
             for row in cursor.fetchall()
@@ -605,12 +603,14 @@ class LLMConfigDB(object, metaclass=Singleton):
             """,
             (user_id,),
         )
+        # _as_utc_or_epoch for the reason given on the helper: created_at carries no NOT NULL,
+        # so one row written outside these accessors must not fail the whole listing
         return [
             UserComment(
                 id=row["id"],
                 user_id=row["user_id"],
                 comment=row["comment"],
-                created_at=datetime.fromisoformat(row["created_at"]),
+                created_at=self._as_utc_or_epoch(row["created_at"]),
             )
             for row in cursor.fetchall()
         ]
@@ -630,12 +630,14 @@ class LLMConfigDB(object, metaclass=Singleton):
             ORDER BY created_at DESC, id DESC
             """
         )
+        # as in get_user_comments, and it matters more here: this listing backs the admin
+        # feedback feed, which one unparseable stamp would otherwise 500 in full
         return [
             UserComment(
                 id=row["id"],
                 user_id=row["user_id"],
                 comment=row["comment"],
-                created_at=datetime.fromisoformat(row["created_at"]),
+                created_at=self._as_utc_or_epoch(row["created_at"]),
             )
             for row in cursor.fetchall()
         ]
@@ -654,11 +656,13 @@ class LLMConfigDB(object, metaclass=Singleton):
         except BaseException:
             conn.rollback()
             raise
+        # aware UTC, like the reads of this row: the column is DEFAULT CURRENT_TIMESTAMP, so a
+        # naive datetime.now() here reported the POST's stamp in local time and the GET's in UTC
         return UserComment(
             id=cursor.lastrowid,
             user_id=user_id,
             comment=comment,
-            created_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
         )
 
     def delete_user_comment(self, user_id: str, comment_id: int) -> bool:

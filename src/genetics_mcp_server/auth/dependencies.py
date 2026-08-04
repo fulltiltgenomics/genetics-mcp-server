@@ -10,9 +10,22 @@ from genetics_mcp_server.auth.core import get_authenticated_user
 
 logger = logging.getLogger(__name__)
 
-# when True, require X-Goog-Authenticated-User-Email header (set by IAP or oauth2-proxy)
-_require_auth = os.environ.get("REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
 _internal_api_secret = os.environ.get("INTERNAL_API_SECRET", "")
+
+
+def auth_is_required() -> bool:
+    """Whether to require the X-Goog-Authenticated-User-Email header (set by IAP or oauth2-proxy).
+
+    Read through settings rather than from a module global snapshotted at import time, so that
+    this gate and the is_admin reported by /chat/v1/auth cannot disagree: they now consult the
+    same cached Settings instance. get_settings is imported per call, as in admin_required, so a
+    reload of the config module does not leave this holding the pre-reload cache. The old
+    module global is deliberately gone rather than kept as an alias — a test still patching it
+    now fails loudly instead of silently moving nothing.
+    """
+    from genetics_mcp_server.config import get_settings
+
+    return get_settings().require_auth
 
 
 def is_public_endpoint(request: Request) -> bool:
@@ -25,7 +38,7 @@ def is_public_endpoint(request: Request) -> bool:
 
 async def auth_required(request: Request) -> str | None:
     """Dependency that requires authentication via IAP/oauth2-proxy header."""
-    if not _require_auth:
+    if not auth_is_required():
         # still check for IAP header in case it's present
         user = get_authenticated_user(request)
         return user or "anonymous"
@@ -66,7 +79,7 @@ async def admin_required(
     if not settings.enable_admin_page:
         raise HTTPException(status_code=404, detail="Not found")
 
-    if not _require_auth:
+    if not auth_is_required():
         return user or "anonymous"
 
     if not user:

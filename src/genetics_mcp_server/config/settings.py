@@ -166,6 +166,16 @@ class Settings:
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
     )
 
+    # auth gate. The single source of truth for REQUIRE_AUTH: auth.dependencies used to snapshot
+    # it into a module global at import time while chat_api re-read os.environ per request, so a
+    # test moving one left the other behind and /chat/v1/auth could report an admin that
+    # admin_required then refused (genetics-results-suite-pol).
+    require_auth: bool = field(
+        default_factory=lambda: os.environ.get(
+            "REQUIRE_AUTH", ""
+        ).lower() in ("1", "true", "yes")
+    )
+
     # admin page
     enable_admin_page: bool = field(
         default_factory=lambda: os.environ.get(

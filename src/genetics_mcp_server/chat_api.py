@@ -257,10 +257,11 @@ async def auth(request: Request):
     """Return current authentication status."""
     user = get_authenticated_user(request)
     settings = get_settings()
-    require_auth = os.environ.get("REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
+    # settings.require_auth, not a second read of os.environ: this is_admin has to agree with the
+    # gate admin_required applies to the endpoints the frontend shows once it is True
     is_admin = False
     if settings.enable_admin_page:
-        if not require_auth:
+        if not settings.require_auth:
             is_admin = True
         elif user and user.lower() in settings.admin_users_list:
             is_admin = True

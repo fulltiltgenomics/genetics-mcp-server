@@ -2,6 +2,8 @@
 
 import os
 import tempfile
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import pytest
 
@@ -33,6 +35,31 @@ def clear_settings_cache():
     clear_all()
     yield
     clear_all()
+
+
+@contextmanager
+def settings_env(**overrides):
+    """Override environment variables and rebuild the settings snapshot from them.
+
+    The only correct way to move REQUIRE_AUTH in a test since genetics-results-suite-pol: both
+    the auth gate and /chat/v1/auth's is_admin read it through Settings, so patching one module
+    global no longer moves the other — and no longer exists to be patched. The cache is cleared
+    on both edges so neither the test nor whatever runs after it sees a snapshot built from the
+    other's environment.
+    """
+    from genetics_mcp_server.config import get_settings as pkg_get_settings
+    from genetics_mcp_server.config.settings import get_settings as mod_get_settings
+
+    def clear_all():
+        for fn in (pkg_get_settings, mod_get_settings):
+            fn.cache_clear()
+
+    with patch.dict(os.environ, {k: str(v) for k, v in overrides.items()}):
+        clear_all()
+        try:
+            yield
+        finally:
+            clear_all()
 
 
 def close_and_unlink(db, db_path):

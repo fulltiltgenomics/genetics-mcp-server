@@ -640,13 +640,20 @@ stores `CURRENT_TIMESTAMP` as naive UTC and the API serializes them with `.isofo
 and `get_tool_description_history` return aware UTC too, so a `PUT` response and the following
 `GET` on one key no longer differ by the process's UTC offset (they still differ in precision —
 the save reports `now()` to the microsecond, the read the stored second) and the history head
-string-matches the description in force. The `user_comments` accessors are deliberately left out
-of this: their `created_at` is still naive, naive UTC out of the reads and naive *local* out of
-`add_user_comment`. That is a scope decision, not a technical obstacle: making them aware would
-leave the feedback feed's merge key total and in the same order, because both stamps render as a
-fixed 19-character `YYYY-MM-DDTHH:MM:SS` that decides every comparison except an exact tie, where
-the added `+00:00` would only flip which of the two sources wins — arbitrary either way. The
-change is owned by `genetics-results-suite-ni9`.
+string-matches the description in force. The `user_comments` accessors now follow
+(`genetics-results-suite-ni9`): `get_user_comments` and `list_all_user_comments` parse through
+`_as_utc_or_epoch` like the config reads, and `add_user_comment` hands back aware UTC instead of
+naive *local*, so a `POST` response and the `GET` of the same row no longer differ by the
+process's offset. `list_all_user_comments` is the one that had to stop raising — it backs
+`GET /chat/v1/admin/feedback`, so one unusable row 500'd the whole feed. Both halves of that feed
+moved together: `chat_history_db.list_sessions_with_comments` returns aware UTC as well, and for
+the merge that is the point rather than a tidy-up. The merge key is `(created_at, source, id)`
+with `created_at` an `.isoformat()` string, so an aware stamp renders 25 characters against a
+naive one's 19; had only one side moved, the shorter string would sort below the longer at every
+exact tie and settle it by the suffix instead of by the `(source, id)` tiebreak that is there to
+decide it. The key stays total either way, but only with both sides aware does it order ties the way
+`genetics-results-suite-qdf` set out. `list_sessions_with_comments` also gained the `id` tiebreak
+its `ORDER BY` was missing, so each source's own order is decided before the merge sees it.
 
 ### CORS
 
@@ -684,7 +691,7 @@ The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes 
 3. **Google Identity Token (JWT)** — if the token contains `.` it is validated via `google.oauth2.id_token.verify_oauth2_token` using a lazily-initialized singleton `google.auth.transport.requests.Request` (for JWKS caching). The payload must have `email_verified == True`; the email must satisfy the same allow-list (otherwise 401/403). Identity is set to the verified email. `verify_oauth2_token` **skips the `aud` claim when no audience is passed**, so `_audience_allowed` additionally requires `aud ∈ GOOGLE_TOKEN_AUDIENCE` — without it a token minted for an unrelated application would be accepted as long as its email is allow-listed. The check is inert (with a warning logged per token) while `GOOGLE_TOKEN_AUDIENCE` is unset; the deployment sets it to the gcloud CLI client id, which is what `gcloud auth print-identity-token` issues.
 4. **Per-user API token** — fall back to validating against the local LLM config DB (SHA-256 hashed) or via the chat-backend `/v1/tokens/validate` endpoint. Users create tokens via the chat API (`POST /chat/v1/tokens`).
 
-**Token expiry is idle-based, not absolute.** `user_api_tokens.expires_at` is a *rolling* deadline: `validate_api_token` rejects a token once the deadline has passed, and otherwise pushes it forward to `now + API_TOKEN_TTL_DAYS` (default 90; `0` disables expiry) in the same statement that updates `last_used_at`. A token in regular use therefore never expires, while an abandoned or quietly-leaked one stops working on its own. Rows predating the column have `expires_at IS NULL` and are judged on `COALESCE(last_used_at, created_at) + TTL`, so an actively-used legacy token is not killed the first time it is presented. Timestamps are written in SQLite's own `%Y-%m-%d %H:%M:%S` UTC form so the column stays lexicographically sortable alongside `CURRENT_TIMESTAMP` values; `_as_utc` accepts both that and ISO-8601 when reading. Pushing the deadline is bookkeeping, not part of the decision: it is the one write in `LLMConfigDB` whose failure is logged and swallowed rather than raised, so a locked or full database cannot reject a token the SELECT has already accepted. Every other write accessor rolls back and re-raises, and each of them (reads included) discards a transaction found open on the thread's cached connection, so no failure can hold the write lock against the other writers of `llm_config.db`.
+**Token expiry is idle-based, not absolute.** `user_api_tokens.expires_at` is a *rolling* deadline: `validate_api_token` rejects a token once the deadline has passed, and otherwise pushes it forward to `now + API_TOKEN_TTL_DAYS` (default 90; `0` disables expiry) in the same statement that updates `last_used_at`. A token in regular use therefore never expires, while an abandoned or quietly-leaked one stops working on its own. Rows predating the column have `expires_at IS NULL` and are judged on `COALESCE(last_used_at, created_at) + TTL`, so an actively-used legacy token is not killed the first time it is presented. Timestamps are written in SQLite's own `%Y-%m-%d %H:%M:%S` UTC form so the column stays lexicographically sortable alongside `CURRENT_TIMESTAMP` values; `_as_utc` accepts both that and ISO-8601 when reading. Pushing the deadline is bookkeeping, not part of the decision: it is the one write in `LLMConfigDB` whose failure is logged and swallowed rather than raised, so a locked or full database cannot reject a token the SELECT has already accepted. Every other write accessor rolls back and re-raises, and each of them (reads included) discards a transaction found open on the thread's cached connection, so no failure can hold the write lock against the other writers of `llm_config.db`. `chat_history_db.py` now carries the same guard (`genetics-results-suite-4um`): WAL made the trigger rarer there, not impossible, and a failed COMMIT is unaffected by journal mode. The methods that run several DMLs under one commit — `add_message` (message plus the session touch), `fork_session` (the session plus every copied message), `upsert_analysis` (the analysis row plus its issue rows) — put all of their statements inside the one `try`, so a failure partway leaves neither half rather than a session holding a truncated conversation. The discard on entry cannot cost them anything: each runs it once before its own first statement, and no accessor calls another after opening a transaction (`fork_session`'s only nested read runs before its first `INSERT`).
 
 Note that neither the shared `MCP_API_KEY` path nor this per-user path logs anything on success, so **mcp-server logs cannot attribute usage to a user for either** — only the Google-JWT and Keycloak branches emit an `authenticated … user: <email>` line. `user_api_tokens.last_used_at` is the only per-user record of API-token usage — and only when it can be written: the update is swallowed on failure (see above), so under a locked or full database the request is still authenticated and the sole trace is the `could not record use of API token id=…` WARNING, which names the token id but not the user.
 
@@ -700,6 +707,17 @@ In deployment, `ALLOWED_EMAILS` and `ALLOWED_EMAIL_DOMAINS` are sourced from the
 When `ENABLE_ADMIN_PAGE=true`, admin endpoints are available at `/chat/v1/admin/`. Access control depends on `REQUIRE_AUTH`:
 - `REQUIRE_AUTH=false` (dev mode): any user can access admin endpoints
 - `REQUIRE_AUTH=true`: only users listed in `ADMIN_USERS` can access admin endpoints
+
+`REQUIRE_AUTH` is read in exactly one place, `settings.require_auth`. `auth.dependencies` used to
+snapshot it into a module global at import time while `chat_api.py`'s `/chat/v1/auth` re-read
+`os.environ` per request; production never disagreed (nothing in `src/` writes `os.environ` at
+runtime), but the two could not be moved together in a test, so the `is_admin` the frontend shows
+its admin UI on could contradict the `admin_required` gate on the endpoints behind it
+(`genetics-results-suite-pol`). The global is gone rather than aliased, so a test still patching
+`auth.dependencies._require_auth` now fails loudly; use `conftest.settings_env(REQUIRE_AUTH=…)`,
+which patches the environment and rebuilds the cached `Settings`. Routing the gate through
+`Settings` also means it sees `.env` (loaded by `config/settings.py`) rather than only the real
+environment — in k8s the variable is set in the container env, so the value is unchanged there.
 
 Admin endpoints:
 - `GET /chat/v1/admin/sessions` — list all sessions with filters and pagination. Each session item carries conversation-analysis fields (LEFT JOINed from `conversation_analysis`): `disposition`, `issue_count`, `issue_categories` (list of strings), `llm_rating` (the `llm_quality_score`, 1-5 or null), `success_label`. Filters: `user`, `date_from`, `date_to`, `session_id`, plus analysis filters `disposition` (exact), `success_label` (exact), `min_issues` (keep sessions with `issue_count >= N`), and `rating`. The `rating` param is a **string**: `"1"`..`"5"` filter the exact LLM rating, and the sentinel `"NA"` filters to unrated sessions (no `llm_quality_score`, i.e. unanalyzed sessions or rows with a NULL score). NA is implemented via the `unrated: bool` param on `ChatHistoryDB.list_all_sessions` (`a.llm_quality_score IS NULL`). The paginated `total` reflects all active filters.
@@ -776,7 +794,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
-| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both), and the zone the write path returns (the saves and the version history hand back aware UTC, as the reads do) |
+| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both, and the comment and tool-history reads degrade the same way), chat-history write transaction safety (every write accessor over a failed DML and a failed commit, the retained lock, and the multi-DML writes rolled back whole), and the zone the write path returns (the saves, the version history and `add_user_comment` hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |

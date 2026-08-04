@@ -1437,3 +1437,307 @@ class TestValidateApiTokenTransactionSafety:
             assert "could not record use of API token" not in caplog.text
         finally:
             unblock_writes(llm_config_db, "user_api_tokens")
+
+
+class TestMalformedCommentAndHistoryStamps:
+    """The sibling reads of TestMalformedTimestampReads. created_at on user_comments and
+    changed_at on tool_description_history carry no NOT NULL and no format check either, and
+    these three accessors still called datetime.fromisoformat directly, so a NULL raised a
+    TypeError and a blank string a ValueError. list_all_user_comments is the one that matters
+    most: it backs GET /chat/v1/admin/feedback, so a single unusable row took the whole admin
+    feedback feed down with a 500 (genetics-results-suite-ni9).
+    """
+
+    @staticmethod
+    def restamp(db, table, column, value):
+        db._conn.execute(f"UPDATE {table} SET {column} = ?", (value,))
+        db._conn.commit()
+
+    @pytest.mark.parametrize("stamp", [None, "", "   ", "not a timestamp"])
+    def test_user_comment_reads_degrade_instead_of_raising(self, llm_config_db, stamp):
+        llm_config_db.add_user_comment(USER, "first")
+        llm_config_db.add_user_comment(USER, "second")
+        self.restamp(llm_config_db, "user_comments", "created_at", stamp)
+
+        mine = llm_config_db.get_user_comments(USER)
+        assert [c.comment for c in mine] == ["second", "first"]
+        assert {c.created_at for c in mine} == {EPOCH}
+
+        every = llm_config_db.list_all_user_comments()
+        assert [c.comment for c in every] == ["second", "first"]
+        assert {c.created_at for c in every} == {EPOCH}
+
+    @pytest.mark.parametrize("stamp", [None, "", "   ", "not a timestamp"])
+    def test_tool_description_history_degrades_instead_of_raising(self, llm_config_db, stamp):
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        llm_config_db.save_tool_description("search_genes", "Version 2", USER)
+        self.restamp(llm_config_db, "tool_description_history", "changed_at", stamp)
+
+        history = llm_config_db.get_tool_description_history("search_genes")
+        assert [v.description for v in history] == ["Version 2", "Version 1"]
+        assert {v.changed_at for v in history} == {EPOCH}
+
+    def test_one_unusable_row_does_not_take_the_rest_of_the_feed_with_it(self, llm_config_db):
+        """The 500 was the whole listing, not the one row: every other comment was readable."""
+        good = llm_config_db.add_user_comment(USER, "readable")
+        bad = llm_config_db.add_user_comment("other@example.com", "unstamped")
+        llm_config_db._conn.execute(
+            "UPDATE user_comments SET created_at = NULL WHERE id = ?", (bad.id,)
+        )
+        llm_config_db._conn.commit()
+
+        by_id = {c.id: c for c in llm_config_db.list_all_user_comments()}
+        assert set(by_id) == {good.id, bad.id}
+        assert by_id[bad.id].created_at == EPOCH
+        assert by_id[good.id].created_at.utcoffset() == timedelta(0)
+
+    def test_the_comment_reads_and_the_write_agree_on_the_zone(self, llm_config_db):
+        """add_user_comment's stamp is invented for the POST response — the row itself takes
+        DEFAULT CURRENT_TIMESTAMP — so a naive local now() there reported the new comment at an
+        instant the GET of the same row renders the process's UTC offset away."""
+        written = llm_config_db.add_user_comment(USER, "note")
+        read = llm_config_db.get_user_comments(USER)[0]
+
+        assert written.created_at.utcoffset() == timedelta(0)
+        assert read.created_at.utcoffset() == timedelta(0)
+        assert abs((written.created_at - read.created_at).total_seconds()) < 5
+
+
+# each case blocks one table so the accessor's own DML aborts, standing in for a disk error or a
+# lock timeout. `setup` returns whatever the call needs to act on
+CHAT_WRITE_ACCESSORS = [
+    (
+        "create_session",
+        "chat_sessions",
+        "INSERT",
+        lambda db: None,
+        lambda db, ctx: db.create_session(USER),
+    ),
+    (
+        "update_session",
+        "chat_sessions",
+        "UPDATE",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.update_session(ctx, USER, title="renamed"),
+    ),
+    (
+        "touch_session",
+        "chat_sessions",
+        "UPDATE",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.touch_session(ctx),
+    ),
+    (
+        "set_shared",
+        "chat_sessions",
+        "UPDATE",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.set_shared(ctx, USER, True),
+    ),
+    (
+        "delete_session",
+        "chat_sessions",
+        "DELETE",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.delete_session(ctx, USER),
+    ),
+    (
+        "add_message",
+        "chat_messages",
+        "INSERT",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.add_message(ctx, "msg-1", "user", "hello"),
+    ),
+    (
+        "rate_message",
+        "chat_messages",
+        "UPDATE",
+        lambda db: db.add_message(db.create_session(USER).id, "msg-1", "user", "hi").id,
+        lambda db, ctx: db.rate_message(ctx, True),
+    ),
+    (
+        "add_attachment",
+        "chat_attachments",
+        "INSERT",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.add_attachment(
+            "att-1", ctx, "f.tsv", "tsv", "text/tab-separated-values", 10, "/tmp/f.tsv"
+        ),
+    ),
+    (
+        "delete_attachment",
+        "chat_attachments",
+        "DELETE",
+        lambda db: db.add_attachment(
+            "att-1",
+            db.create_session(USER).id,
+            "f.tsv",
+            "tsv",
+            "text/tab-separated-values",
+            10,
+            "/tmp/f.tsv",
+        ).session_id,
+        lambda db, ctx: db.delete_attachment("att-1", ctx),
+    ),
+    (
+        "fork_session",
+        "chat_sessions",
+        "INSERT",
+        lambda db: _shared_session_with_a_message(db),
+        lambda db, ctx: db.fork_session(ctx, "other@example.com"),
+    ),
+    (
+        "upsert_analysis",
+        "conversation_analysis",
+        "INSERT",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.upsert_analysis(
+            {
+                "session_id": ctx,
+                "user_rating": 4,
+                "llm_quality_score": 4,
+                "success_label": "successful",
+                "llm_disposition": "",
+                "topic": "general_genetics",
+                "complexity": 2,
+                "llm_issue_categories": ["wrong_answer"],
+            },
+            1,
+            None,
+            2,
+        ),
+    ),
+]
+
+CHAT_WRITE_ACCESSOR_IDS = [case[0] for case in CHAT_WRITE_ACCESSORS]
+
+
+def _shared_session_with_a_message(db):
+    session = db.create_session(USER)
+    db.set_shared(session.id, USER, True)
+    db.add_message(session.id, "msg-1", "user", "hello")
+    return session.id
+
+
+class TestChatHistoryWriteTransactionSafety:
+    """The same bug class as TestLLMConfigWriteTransactionSafety, in the other database
+    (genetics-results-suite-4um). WAL removes the reader/writer contention but not this: python
+    opens a transaction before any DML, the connection is cached for the life of the thread, and
+    a write that raised without rolling back leaves it open — holding the write lock against
+    every other writer of the file, and letting the next commit on that thread store the write
+    its caller was told had failed.
+    """
+
+    @pytest.mark.parametrize(
+        "label,table,event,setup,call", CHAT_WRITE_ACCESSORS, ids=CHAT_WRITE_ACCESSOR_IDS
+    )
+    def test_a_failed_dml_leaves_no_open_transaction(
+        self, chat_history_db, label, table, event, setup, call
+    ):
+        ctx = setup(chat_history_db)
+        block_writes(chat_history_db, table, event=event)
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                call(chat_history_db, ctx)
+
+            assert chat_history_db._conn.in_transaction is False
+        finally:
+            unblock_writes(chat_history_db, table)
+
+    @pytest.mark.parametrize(
+        "label,table,event,setup,call", CHAT_WRITE_ACCESSORS, ids=CHAT_WRITE_ACCESSOR_IDS
+    )
+    def test_a_failed_commit_leaves_no_open_transaction(
+        self, chat_history_db, label, table, event, setup, call
+    ):
+        ctx = setup(chat_history_db)
+        with failing_commits(chat_history_db) as failing:
+            with pytest.raises(sqlite3.OperationalError):
+                call(chat_history_db, ctx)
+
+            assert failing.in_transaction is False
+
+    def test_a_failed_write_releases_the_lock_for_other_connections(self, chat_history_db):
+        """The damage is the retained lock: every other writer of this file — the live chat
+        threads and the nightly analysis job — blocks on it until this thread happens to commit
+        something else, which for a server thread may be never."""
+        block_writes(chat_history_db, "chat_sessions")
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                chat_history_db.create_session(USER)
+        finally:
+            unblock_writes(chat_history_db, "chat_sessions")
+
+        # timeout=0 so a held write lock reports itself at once instead of waiting it out
+        other = sqlite3.connect(chat_history_db.db_path, timeout=0)
+        try:
+            other.execute(
+                "INSERT INTO chat_sessions (id, user_id) VALUES (?, ?)",
+                ("from-another-connection", USER),
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    def test_a_write_that_could_not_commit_is_not_committed_by_the_next_accessor(
+        self, chat_history_db
+    ):
+        """A failed statement leaves nothing pending, but a failed COMMIT leaves the write
+        itself pending: the next accessor on this connection would store what its caller was
+        told had not been saved."""
+        session = chat_history_db.create_session(USER)
+        with failing_commits(chat_history_db):
+            with pytest.raises(sqlite3.OperationalError):
+                chat_history_db.update_session(session.id, USER, title="never saved")
+
+            chat_history_db.touch_session(session.id)
+
+        assert chat_history_db.get_session(session.id, USER).title is None
+
+    def test_reads_do_not_return_rows_an_earlier_failed_write_left_pending(self, chat_history_db):
+        """A connection sees its own uncommitted rows, so anything a write left behind stays
+        visible to every later read on that thread until something ends the transaction. The raw
+        INSERT stands in for the DML of a write that raised after executing it."""
+        conn = chat_history_db._conn
+        conn.execute(
+            "INSERT INTO chat_sessions (id, user_id, comment) VALUES (?, ?, ?)",
+            ("never-committed", USER, "pending comment"),
+        )
+        assert conn.in_transaction
+
+        assert chat_history_db.list_sessions(USER) == []
+        assert conn.in_transaction is False
+        assert chat_history_db.list_sessions_with_comments() == []
+
+    def test_a_partial_multi_dml_write_is_rolled_back_whole(self, chat_history_db):
+        """add_message writes the message and touches the session under one commit. Blocking the
+        touch leaves the message inserted but uncommitted, so without the rollback it survives as
+        soon as anything else on this connection commits — a message stored by a call that
+        raised."""
+        session = chat_history_db.create_session(USER)
+        block_writes(chat_history_db, "chat_sessions", event="UPDATE")
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                chat_history_db.add_message(session.id, "msg-1", "user", "hello")
+        finally:
+            unblock_writes(chat_history_db, "chat_sessions")
+
+        assert chat_history_db._conn.in_transaction is False
+        chat_history_db.touch_session(session.id)
+        assert chat_history_db.get_messages(session.id) == []
+
+    def test_a_fork_that_fails_partway_leaves_no_half_copied_session(self, chat_history_db):
+        """fork_session inserts the session and then copies every message. A failure in the copy
+        used to leave the new session pending, so the target user could end up owning a session
+        holding none of the conversation it claims to be a fork of."""
+        source = _shared_session_with_a_message(chat_history_db)
+        block_writes(chat_history_db, "chat_messages")
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                chat_history_db.fork_session(source, "other@example.com")
+        finally:
+            unblock_writes(chat_history_db, "chat_messages")
+
+        assert chat_history_db._conn.in_transaction is False
+        chat_history_db.touch_session(source)
+        assert chat_history_db.list_sessions("other@example.com") == []
