@@ -30,7 +30,13 @@ setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
 from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
 from genetics_mcp_server.config import get_settings
-from genetics_mcp_server.config.defaults import default_system_prompt, verbosity_prompt
+from genetics_mcp_server.config.defaults import (
+    default_system_prompt,
+    instruction_envelope,
+    verbosity_prompt,
+)
+from genetics_mcp_server.db import get_llm_config_db
+from genetics_mcp_server.db.llm_config_db import INSTRUCTION_SET_MAX_BODY_CHARS
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
 from genetics_mcp_server.rate_limit import check_rate_limit
@@ -224,6 +230,12 @@ class ChatRequest(BaseModel):
         "conclusions, 'detailed' lays out the full three-pass write-up. Unknown "
         "values fall back to 'brief'.",
     )
+    instruction_set_id: str | None = Field(
+        None,
+        description="Id of one of the caller's stored instruction sets. Only the id "
+        "travels: the body is loaded server-side, scoped to the authenticated user. An "
+        "id that does not resolve for this user is ignored, not rejected.",
+    )
     secret: bool = Field(
         False,
         description="Secret chat mode - messages are not logged or persisted.",
@@ -332,6 +344,53 @@ async def get_schema(
     return result["schema"]
 
 
+def _resolve_user_instructions(
+    user: str | None, set_id: str | None, secret: bool = False
+) -> str | None:
+    """Envelope fragment for the caller's selected instruction set, or None.
+
+    Every failure path degrades to 'no instructions' rather than raising: an id that
+    belongs to another user or does not exist, a set the user archived, an unavailable
+    database, an over-long body, a stored body that is not text. Instructions are a
+    presentation preference, and a presentation preference must never fail a chat turn.
+
+    In secret mode only the id is logged: the set name is free text the user wrote, and
+    the turn it is attached to was explicitly asked not to be logged.
+    """
+    if not user or not set_id:
+        return None
+    # the whole resolution runs under the handler, not just the fetch: a body that is not
+    # a str fails inside the slice or the envelope, and that must degrade too
+    try:
+        instruction_set = get_llm_config_db().get_instruction_set(user, set_id)
+        if instruction_set is None or instruction_set.archived_at is not None:
+            logger.info(f"Instruction set {set_id} does not resolve for this user, ignoring")
+            return None
+
+        # the accessor returns the authoritative stored body, which may predate the cap or
+        # survive a lowering of it, so the prompt is bounded here. len() is code points
+        body = instruction_set.body[:INSTRUCTION_SET_MAX_BODY_CHARS]
+        # truncate before wrapping so the envelope's fence is computed over the text that
+        # actually ships — a cut landing inside a backtick run would otherwise escape it
+        fragment = instruction_envelope(body) or None
+        if fragment is None:
+            return None
+
+        # id (and name, outside secret mode) only: the body is user-authored text and
+        # never reaches the log. logged here so nothing claims to apply a set that the
+        # whitespace-only check above just dropped
+        applied = f"Applying instruction set {instruction_set.id}"
+        if not secret:
+            applied += f" ({instruction_set.name!r})"
+        logger.info(
+            applied + (" [truncated to the length cap]" if instruction_set.body_over_cap else "")
+        )
+        return fragment
+    except Exception as e:
+        logger.warning(f"Could not load instruction set {set_id}, continuing without it: {e}")
+        return None
+
+
 @app.post("/chat/v1/chat")
 async def stream_chat(
     request: ChatRequest,
@@ -377,12 +436,17 @@ async def stream_chat(
     # convert messages to dicts
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
-    # use custom or default system prompt. The response-length fragment is appended
-    # last so it reads as the final instruction; it lands inside the cached system
-    # block, so each setting keeps its own prompt-cache entry rather than
-    # invalidating the other's.
+    # use custom or default system prompt. The response-length fragment is concatenated
+    # onto it because both are identical for every user, so each setting keeps its own
+    # prompt-cache entry rather than invalidating the other's. The user's instructions
+    # are NOT concatenated: they travel separately and land in their own cache block
+    # after this one, which both keeps the shared block cacheable across users and puts
+    # the envelope's guardrail postamble last, where recency favours it.
     system_prompt = request.system_prompt or default_system_prompt(settings.app_name)
     system_prompt += verbosity_prompt(request.verbosity)
+    user_instructions = _resolve_user_instructions(
+        user, request.instruction_set_id, secret=request.secret
+    )
 
     async def event_generator():
         """Generate SSE events from LLM stream."""
@@ -398,6 +462,7 @@ async def stream_chat(
                 secret=request.secret,
                 user=user,
                 session_id=request.session_id,
+                user_instructions=user_instructions,
             ):
                 if chunk.type == "text":
                     yield {

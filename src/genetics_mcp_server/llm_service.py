@@ -435,6 +435,7 @@ class LLMService:
         secret: bool = False,
         user: str | None = None,
         session_id: str | None = None,
+        user_instructions: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -453,6 +454,9 @@ class LLMService:
             secret: If True, suppress detailed logging to avoid persisting chat content.
             user: Authenticated user email for logging.
             session_id: Client conversation id, logged (id only) to count distinct conversations.
+            user_instructions: Pre-wrapped envelope holding this user's stored instruction
+                set. Kept separate from system_prompt rather than concatenated so it can
+                occupy its own cache block (Anthropic only).
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -467,6 +471,7 @@ class LLMService:
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
                 literature_backend, tool_profile, secret, user, session_id,
+                user_instructions,
             ):
                 yield chunk
         else:
@@ -528,6 +533,7 @@ class LLMService:
         secret: bool = False,
         user: str | None = None,
         session_id: str | None = None,
+        user_instructions: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -547,9 +553,11 @@ class LLMService:
         )
 
         # cache the replayed conversation history: mark the last content block of
-        # the last message with a cache_control breakpoint. This is the 3rd of
-        # Anthropic's 4 allowed breakpoints (system prompt and tool definitions use
-        # the other two). It offsets the larger replayed payload now that tool
+        # the last message with a cache_control breakpoint. Anthropic allows 4, and
+        # all 4 are now spoken for: tool definitions, the shared system block, this
+        # user's instruction block, and this one. There is no spare left, so anything
+        # that wants a new breakpoint has to take one of these away. It offsets the
+        # larger replayed payload now that tool
         # results are persisted and replayed. Caveats: ephemeral cache TTL is ~5 min,
         # and the cache lookback window means very long tool-heavy single turns may
         # not hit. Caching is most valuable for resumes and rapid follow-ups.
@@ -574,11 +582,24 @@ class LLMService:
         if model_supports_adaptive_thinking(model):
             request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
 
+        # the system prompt goes out as two separately cached blocks. Block 0 is identical
+        # for every user (default prompt + response-length fragment), so one cache entry
+        # per verbosity value serves the whole user base; block 1 carries only this user's
+        # instruction envelope. Concatenating them would refragment the ~7.4K-token shared
+        # block per user per event (~$0.043) rather than writing the small per-user block
+        # (~$0.0025), and leaving the user block uncached costs ~$0.05 across a
+        # 25-iteration turn.
+        system_blocks: list[dict[str, Any]] = []
         if system_prompt:
-            # use structured format with cache_control for prompt caching
-            request_params["system"] = [
+            system_blocks.append(
                 {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
-            ]
+            )
+        if user_instructions:
+            system_blocks.append(
+                {"type": "text", "text": user_instructions, "cache_control": {"type": "ephemeral"}}
+            )
+        if system_blocks:
+            request_params["system"] = system_blocks
 
         # add tool definitions if enabled
         tool_definitions = None

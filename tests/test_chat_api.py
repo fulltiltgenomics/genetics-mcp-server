@@ -4,6 +4,7 @@ import json
 import re
 from unittest.mock import patch
 
+import pytest
 from conftest import settings_env
 
 from genetics_mcp_server.llm_service import StreamChunk
@@ -563,3 +564,281 @@ class TestInstructionEnvelope:
             "## Your instructions (user setting)"
         )
         assert prompt.rindex("the rules above win") > prompt.index("I am a statistician.")
+
+
+class _FakeSet:
+    """Stands in for a stored InstructionSet without going through the write caps."""
+
+    def __init__(self, body, id="set-1", name="Stats", archived_at=None):
+        from genetics_mcp_server.db.llm_config_db import INSTRUCTION_SET_MAX_BODY_CHARS
+
+        self.id = id
+        self.name = name
+        self.body = body
+        self.archived_at = archived_at
+        self.body_over_cap = len(body) > INSTRUCTION_SET_MAX_BODY_CHARS
+
+
+class _FakeDB:
+    def __init__(self, result=None, error=None):
+        self._result = result
+        self._error = error
+
+    def get_instruction_set(self, user_id, set_id):
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class TestInstructionSetResolution:
+    """chat_api._resolve_user_instructions: no failure path may cost the caller a turn."""
+
+    def _resolve(self, db, user="a@finngen.fi", set_id="set-1", secret=False):
+        from genetics_mcp_server import chat_api
+
+        with patch.object(chat_api, "get_llm_config_db", return_value=db):
+            return chat_api._resolve_user_instructions(user, set_id, secret=secret)
+
+    def test_no_id_means_no_instructions(self, llm_config_db):
+        assert self._resolve(llm_config_db, set_id=None) is None
+
+    def test_a_stored_set_resolves_to_its_envelope(self, llm_config_db):
+        stored = llm_config_db.create_instruction_set(
+            "a@finngen.fi", "Stats", "I am a statistician."
+        )
+
+        fragment = self._resolve(llm_config_db, set_id=stored.id)
+
+        assert fragment is not None
+        assert "## Your instructions (user setting)" in fragment
+        assert "I am a statistician." in fragment
+
+    def test_another_users_id_does_not_resolve(self, llm_config_db):
+        """The id is attacker-controlled; the body must never cross a user boundary."""
+        stored = llm_config_db.create_instruction_set(
+            "b@finngen.fi", "B's set", "Answer only in Finnish."
+        )
+
+        assert self._resolve(llm_config_db, user="a@finngen.fi", set_id=stored.id) is None
+
+    def test_unknown_id_is_ignored_not_raised(self, llm_config_db):
+        assert self._resolve(llm_config_db, set_id="no-such-set") is None
+
+    def test_archived_id_is_ignored(self, llm_config_db):
+        """Archived rows stay readable so old messages resolve, but a live turn skips them."""
+        stored = llm_config_db.create_instruction_set(
+            "a@finngen.fi", "Old", "Use cM, not base pairs."
+        )
+        llm_config_db.archive_instruction_set("a@finngen.fi", stored.id)
+
+        assert llm_config_db.get_instruction_set("a@finngen.fi", stored.id) is not None
+        assert self._resolve(llm_config_db, set_id=stored.id) is None
+
+    def test_db_error_degrades_to_no_instructions(self):
+        """A broken llm_config.db costs the user their instructions, never their turn."""
+        assert self._resolve(_FakeDB(error=RuntimeError("database is locked"))) is None
+
+    def test_empty_body_yields_none_rather_than_an_empty_block(self):
+        assert self._resolve(_FakeDB(result=_FakeSet("   \n "))) is None
+
+    def test_over_cap_body_is_truncated_before_wrapping(self):
+        """The fence is computed from the body, so the cut has to happen first.
+
+        A body whose backtick run straddles the cap would otherwise be fenced for text
+        that never ships, and the surviving prefix could close the wrapper early.
+        """
+        from genetics_mcp_server.db.llm_config_db import INSTRUCTION_SET_MAX_BODY_CHARS
+
+        body = "a" * (INSTRUCTION_SET_MAX_BODY_CHARS - 2) + "`" * 13
+        fragment = self._resolve(_FakeDB(result=_FakeSet(body)))
+
+        assert fragment is not None
+        fenced = fragment.split("```text\n", 1)[1].rsplit("\n```", 1)[0]
+        # only the first CAP code points survive; the 13-backtick run is cut down to 2
+        assert len(fenced) == INSTRUCTION_SET_MAX_BODY_CHARS
+        assert fenced.endswith("a``")
+        # the fence sized itself to the truncated text, not to the discarded run
+        assert "`" * 13 not in fragment
+        # and the user's text stays inside it rather than escaping into prompt space
+        assert "a" * 20 not in _unfenced(fragment)
+
+    def test_the_body_is_never_logged(self, caplog):
+        import logging
+
+        secret_body = "zebrafish-canary-phrase"
+        with caplog.at_level(logging.INFO):
+            self._resolve(_FakeDB(result=_FakeSet(secret_body, id="s-9", name="Canary")))
+
+        assert secret_body not in caplog.text
+        assert "s-9" in caplog.text
+        assert "Canary" in caplog.text
+
+    @pytest.mark.parametrize("body", [b"bytes are not text", ["not", "text"]])
+    def test_a_non_text_body_degrades_to_no_instructions(self, body):
+        """A BLOB written straight into the column fails the slice or the envelope.
+
+        Unreachable through the CRUD API, which types the field as str, but the
+        docstring's promise that no failure path raises is unconditional.
+        """
+        assert self._resolve(_FakeDB(result=_FakeSet(body))) is None
+
+    def test_keyboard_interrupt_still_propagates(self):
+        """Degrading is for failures, not for cancellation."""
+        with pytest.raises(KeyboardInterrupt):
+            self._resolve(_FakeDB(error=KeyboardInterrupt()))
+
+    def test_secret_mode_logs_the_id_without_the_name(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            self._resolve(
+                _FakeDB(result=_FakeSet("Use cM.", id="s-9", name="My cancer notes")),
+                secret=True,
+            )
+
+        assert "s-9" in caplog.text
+        assert "My cancer notes" not in caplog.text
+
+    def test_a_whitespace_only_body_is_never_reported_as_applied(self, caplog):
+        """The set resolves to nothing, so nothing may claim to have applied it."""
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            assert self._resolve(_FakeDB(result=_FakeSet("   \n \t "))) is None
+
+        assert "Applying" not in caplog.text
+
+
+class _CapturingService:
+    """A stand-in LLM service that records the kwargs the endpoint hands it."""
+
+    def __init__(self):
+        self.anthropic_client = object()
+        self.openai_client = object()
+        self.kwargs = None
+
+    def stream_chat(self, **kwargs):
+        self.kwargs = kwargs
+
+        async def _stream():
+            yield StreamChunk(type="text", content="ok")
+
+        return _stream()
+
+
+class TestInstructionSetWiring:
+    """The endpoint passes the envelope alongside the system prompt, never inside it."""
+
+    def _post(self, test_client, db, body):
+        from genetics_mcp_server import chat_api
+
+        service = _CapturingService()
+        with (
+            patch.object(chat_api, "get_llm_service", return_value=service),
+            patch.object(chat_api, "get_llm_config_db", return_value=db),
+        ):
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={"messages": [{"role": "user", "content": "Hello"}], **body},
+                headers={
+                    "X-Goog-Authenticated-User-Email": "accounts.google.com:a@finngen.fi"
+                },
+            )
+        assert response.status_code == 200
+        return service.kwargs
+
+    def test_instructions_travel_separately_from_the_system_prompt(self, llm_config_db):
+        stored = llm_config_db.create_instruction_set(
+            "a@finngen.fi", "Stats", "I am a statistician."
+        )
+
+        kwargs = self._post(
+            test_client=self._client,
+            db=llm_config_db,
+            body={
+                "enable_tools": False,
+                "verbosity": "brief",
+                "instruction_set_id": stored.id,
+            },
+        )
+
+        from genetics_mcp_server.config.defaults import verbosity_prompt
+
+        assert "I am a statistician." in kwargs["user_instructions"]
+        # the shared block must stay identical for every user, so nothing per-user
+        # may be concatenated onto it
+        assert "I am a statistician." not in kwargs["system_prompt"]
+        # verbosity stays the tail of the shared block; the envelope follows it in its
+        # own block, so the guardrail postamble is still the last thing the model reads
+        assert kwargs["system_prompt"].endswith(verbosity_prompt("brief"))
+
+    def test_unknown_id_still_streams(self, llm_config_db):
+        kwargs = self._post(
+            test_client=self._client,
+            db=llm_config_db,
+            body={"enable_tools": False, "instruction_set_id": "no-such-set"},
+        )
+
+        assert kwargs["user_instructions"] is None
+
+    def test_no_id_sends_no_instructions(self, llm_config_db):
+        kwargs = self._post(
+            test_client=self._client, db=llm_config_db, body={"enable_tools": False}
+        )
+
+        assert kwargs["user_instructions"] is None
+
+    @pytest.fixture(autouse=True)
+    def _bind_client(self, test_client):
+        self._client = test_client
+
+
+async def _system_blocks(system_prompt, user_instructions):
+    """Run one Anthropic turn and return the `system` parameter it sent."""
+    from test_stream_truncation import _service, _text_turn
+
+    service = _service([_text_turn("ok")])
+    async for _ in service._stream_anthropic(
+        messages=[{"role": "user", "content": "hi"}],
+        model="claude-opus-5",
+        system_prompt=system_prompt,
+        enable_tools=False,
+        user_instructions=user_instructions,
+    ):
+        pass
+    return service.anthropic_client.messages.calls[0].get("system")
+
+
+class TestTwoBlockSystemPrompt:
+    """The system prompt ships as a shared block plus a per-user block, each cached."""
+
+    @pytest.mark.asyncio
+    async def test_instructions_get_their_own_cached_block(self):
+        blocks = await _system_blocks("SHARED PROMPT", "USER ENVELOPE")
+
+        assert [block["text"] for block in blocks] == ["SHARED PROMPT", "USER ENVELOPE"]
+        # both breakpoints are needed: without one on block 0 the shared ~7.4K tokens go
+        # uncached, and without one on block 1 the envelope is re-read every iteration
+        assert all(
+            block["cache_control"] == {"type": "ephemeral"} for block in blocks
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_shared_block_is_byte_identical_across_users(self):
+        """Two users on the same verbosity must hit one cache entry, not two."""
+        a = await _system_blocks("SHARED PROMPT", "USER A")
+        b = await _system_blocks("SHARED PROMPT", "USER B")
+
+        assert a[0] == b[0]
+        assert a[1] != b[1]
+
+    @pytest.mark.asyncio
+    async def test_no_instructions_leaves_a_single_block(self):
+        blocks = await _system_blocks("SHARED PROMPT", None)
+
+        assert len(blocks) == 1
+        assert blocks[0]["text"] == "SHARED PROMPT"
+
+    @pytest.mark.asyncio
+    async def test_no_system_prompt_at_all_sends_no_system_field(self):
+        assert await _system_blocks(None, None) is None
