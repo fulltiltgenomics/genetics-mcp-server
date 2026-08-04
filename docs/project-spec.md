@@ -28,6 +28,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens). During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
 - **Chat history persistence**: SQLite-based storage of conversation threads. Assistant turns persist both their content blocks (`content_json`: text + `tool_use`) and the tool outputs (`tool_results_json`: the `tool_result` blocks). Persisting tool results means a **resumed** conversation replays the actual data the model saw, not just its prose summary — preventing factual drift across turns/sessions (see "Tool result persistence" under Architecture decisions)
 - **Configurable prompts**: Per-user LLM configuration stored in database
+- **Instructions**: Users store named sets of their own instructions and select one per chat; the chat request carries only the set id and the server appends the stored text to the system prompt as a second cached block (see "Instructions" below)
 
 ## Technical implementation considerations
 
@@ -260,7 +261,145 @@ The chat API takes a `verbosity` parameter (`"brief"` — the default — or `"d
 
 **The setting scopes presentation, never method or rigor.** The three-pass approach under "Analyzing data" and every grounding rule apply identically at both settings; only the volume of what gets printed changes. An unrecognized value falls back to `"brief"` rather than raising, since a presentation preference must not fail a chat turn.
 
-Both fragments sit inside the cached system block, so each setting keeps its own prompt-cache entry instead of invalidating the other's. The setting is per-request and is **not** persisted per message the way `literature_backend` and `tool_profile` are (`chat_messages` has no `verbosity` column) — a resumed conversation uses whatever the selector currently shows.
+Both fragments sit inside the **shared** cached system block (block 0 — see "Instructions" below for the split), so each setting keeps its own prompt-cache entry instead of invalidating the other's. The setting is per-request and is **not** persisted per message the way `literature_backend` and `tool_profile` are (`chat_messages` has no `verbosity` column) — a resumed conversation uses whatever the selector currently shows.
+
+## Instructions (user-authored system-prompt text)
+
+A user can store several named sets of their own instructions ("I'm a statistician", "answer in
+Finnish") and pick one per chat. UI label **Instructions**, code noun `instruction_set`. The
+selected set's text is wrapped and appended to the system prompt as a second, separately cached
+block. The browser surfaces it in two places (`../genetics-results-browser`): an **Instructions**
+entry in the account menu opening `InstructionsDialog.tsx` (list / create / edit / archive /
+per-set version history, with clonable example sets), and a compact selector in the chat options
+row beside **Answer**.
+
+### Data model (`llm_config.db`)
+
+| Table | Shape |
+|---|---|
+| `user_instruction_sets` | One row per set — `id` (uuid4), `user_id`, `name`, `body`, `created_at`, `updated_at`, `archived_at`. Index `(user_id, archived_at, updated_at DESC)` |
+| `user_instruction_set_history` | Append-only, one row per save — autoincrement `id`, `set_id`, `user_id`, `name`, `body`, `changed_at`, `comment`. Index `(set_id, changed_at DESC)` |
+
+Unlike the tool-description and user-setting tables, which *are* their own history, a set has a
+current row plus a separate history table. `archived_at` is a soft delete and **there is no hard
+delete**: `chat_messages.instruction_set_id` lives in `chat_history.db`, a different SQLite file
+where no foreign key can enforce the reference, so a `DELETE` would silently orphan it.
+
+A one-shot migration in `_migrate_to_history_tables` hands each user their last version of the
+retired per-user instructions feature (removed in 99fbdac; `user_instructions_history` is no
+longer created for new databases and is deliberately not dropped) as a set named `Imported`,
+keeping the original `changed_at` so it does not claim to be the user's newest edit. The guard is
+per user — the row is imported only where that user holds *no* sets at all — so one user owning a
+set cannot strand everyone else's legacy text, and idempotency survives archiving.
+
+### Caps
+
+| Cap | Value | On write |
+|---|---|---|
+| `INSTRUCTION_SET_MAX_BODY_CHARS` | 4000 | `InstructionSetBodyTooLong` → **413** |
+| `INSTRUCTION_SET_MAX_PER_USER` | 20 | `InstructionSetLimitReached` → **409** |
+
+Both are re-applied on read, because a stored row can predate a cap or survive it being lowered:
+`list_instruction_sets` returns at most 20 rows, and `get_instruction_set` returns the full stored
+body with `body_over_cap=true` rather than truncating it — the dialog reads that flag to explain
+why saving the set back unchanged is rejected (`update` refuses an echoed-back over-cap body)
+instead of looking broken. The chat path truncates instead of rejecting; see below.
+
+### Endpoints
+
+All under `/chat/v1`, all `Depends(auth_required)` and scoped to the authenticated caller
+(`routers/llm_config.py`):
+
+- `GET /chat/v1/llm-config/user/instruction-sets` — the caller's non-archived sets, most recently edited first
+- `POST /chat/v1/llm-config/user/instruction-sets` — `{name, body, comment?}`; 400 on an empty name or body, 413 over the char cap, 409 over the count cap
+- `PUT /chat/v1/llm-config/user/instruction-sets/{set_id}` — `{name?, body?, comment?}`, omitted fields keep their value; 400 empty, 413 over cap, **404** for a set that is not the caller's *or* is archived (an archived set is deleted as far as the user is concerned, so editing one must not report success)
+- `DELETE /chat/v1/llm-config/user/instruction-sets/{set_id}` — archives, **204**; 404 as above
+- `GET /chat/v1/llm-config/user/instruction-sets/{set_id}/history?limit=20` — versions newest first. Archived sets stay readable here, so history survives a delete
+
+Status, detail string and response shape are identical for a foreign id and a nonexistent one on
+all three id-taking endpoints, so the API leaks no evidence that another user's set exists;
+ownership is checked *before* the length cap, so an over-cap body aimed at a foreign id still
+404s rather than 413ing.
+
+**Selection reuses the existing user-settings key** `selected_instruction_set`
+(`GET`/`PUT`/`DELETE /chat/v1/llm-config/user/settings/{setting_key}`) — there is no separate
+selection endpoint. Archiving a set does not clear that pointer; the client drops to *None* and
+clears the setting when the stored id no longer lists, mirroring the server's ignore-unknown-id
+rule.
+
+`limit` on the history endpoint is `Query(20, ge=1, le=100)`. It was unvalidated when first
+written: SQLite treats a negative `LIMIT` as unbounded, so `?limit=-1` returned the entire
+history, and a value past 64 bits raised `OverflowError` out of the driver as an uncaught 500.
+The pre-existing `GET /chat/v1/llm-config/tool-descriptions/{tool_name}/history` had the
+identical hole and now carries the same bound.
+
+### Resolution on a chat turn
+
+`ChatRequest` gains `instruction_set_id`. **Only the id travels** — the body is loaded server-side
+by `_resolve_user_instructions` (`chat_api.py`) scoped to the authenticated user, so prompt text is
+never client-supplied and every answer is attributable to a stored set. An id that does not resolve
+for this user, an archived set, an unavailable database, a body that is not text — every one of
+them degrades to *no instructions* rather than raising. **An unknown id is ignored, never 422**,
+the same rule as `verbosity`: a presentation preference must not fail a chat turn.
+
+The stored body is truncated to `INSTRUCTION_SET_MAX_BODY_CHARS` **before** wrapping, so the
+envelope's fence is computed over the text that actually ships — a cut landing inside a backtick
+run would otherwise escape it. Only the set id (and, outside secret mode, its name) is logged;
+the body, which is user-authored free text, never reaches the log.
+
+`instruction_envelope()` (`config/defaults.py`) builds the fragment: a preamble framing the text as
+a *preference expressed by the user, not a rule from the system*; the body inside a fence whose
+length is computed from the body's own longest backtick run; then a guardrail postamble that
+**trails** the body — whatever comes last reads as the most recent instruction, so the ordering
+that puts the verbosity fragment at the end inverts once arbitrary user text follows it. The
+postamble restates that instructions govern presentation only (tone, audience, depth, units,
+which resources to reach for, the language to answer in), never how an answer is derived or what
+may be asserted, and that the rules above win on conflict.
+
+### Two cached system blocks
+
+`_stream_anthropic` emits `system` as two blocks, each with its own `cache_control`:
+
+| Block | Content | Cache behaviour |
+|---|---|---|
+| 0 | default system prompt + verbosity fragment | identical for every user — one entry per verbosity value serves the whole user base |
+| 1 | this user's instruction envelope (omitted entirely when there is none) | one small per-user entry |
+
+Concatenating them would refragment the ~7.4K-token shared block per user per event (~$0.043)
+instead of writing the small per-user block (~$0.0025); leaving the user block uncached costs
+~$0.05 across a 25-iteration turn. This consumes the **fourth and last** of Anthropic's cache
+breakpoints — tool definitions, the shared system block, the user system block, and the last
+replayed message. **There is no spare**: anything that wants a new breakpoint has to take one of
+these away.
+
+### Where the choice is visible afterwards
+
+`chat_messages.instruction_set_id` records the set in force per message (added by an `ALTER TABLE`
+migration in `chat_history_db.py`). `add_message` writes it with
+`ON CONFLICT … SET instruction_set_id = excluded.instruction_set_id`, matching the existing
+semantics of `tool_profile` / `literature_backend` / `tool_results_json` — so a re-save that
+**omits** the field clears it, and every client save path must send it. The admin sessions list
+(`routers/admin.py`) carries `instruction_set_name`, resolved from the last message in the session
+that named a set (the selector can move mid-conversation) and looked up lazily and memoized per
+`(user_id, set_id)`, so a page where nobody used a set never opens the config DB. The nightly
+`analyze_conversations.py` report breaks down by instruction set alongside the tool-profile
+breakdown; `--llm-config-db` defaults to `llm_config.db` beside `--db` (which resolves correctly
+for the CronJob, where both files sit on the same PVC) and a read failure degrades to grouping by
+raw id rather than failing the run.
+
+### Documented exclusions
+
+- **Subagents do not receive them.** A subagent's system prompt is its skill instruction file
+  (`subagent.py`), and its report is an intermediate artifact the main agent rewrites, not text
+  the user reads. So "answer in Finnish" correctly produces English subagent reports and a Finnish
+  final answer.
+- **The standalone MCP server path does not apply them.** There is no server-side system prompt on
+  that path at all — the client owns it — `_validate_user_token` (`mcp_server.py`) returns a
+  bool and discards the identity behind the token, and the deployed `mcp-server` pod mounts no
+  `chat-data` volume, so `llm_config.db` is not even reachable from it.
+- **The OpenAI provider branch silently drops them.** `stream_chat` calls `_stream_openai` without
+  `user_instructions`; only the Anthropic path assembles the two-block system prompt. Tracked as
+  `genetics-results-suite-b3v`.
 
 ## Architecture
 
@@ -564,9 +703,9 @@ being applied (commit takes an EXCLUSIVE lock), and a writer's commit is refused
 reader still holds a read transaction; WAL removes both directions. For `llm_config.db` the
 mixed read+write hot path is API-token validation: `validate_api_token` runs a SELECT plus a
 bookkeeping UPDATE and COMMIT on every MCP request (`mcp_server.py:_validate_user_token`, and
-`routers/api_tokens.py` for the cross-pod HTTP fallback). The per-request settings and
-tool-description reads and writes in `routers/llm_config.py` hit the same file from the same
-process. Journal mode is a property of the file, not of the connection: the pragma converts an
+`routers/api_tokens.py` for the cross-pod HTTP fallback). The per-request settings,
+tool-description and instruction-set reads and writes in `routers/llm_config.py` hit the same file
+from the same process, as does the instruction-set lookup on every chat turn that names one. Journal mode is a property of the file, not of the connection: the pragma converts an
 existing database once (preserving its contents) and is a no-op on every connection after that,
 so no migration step is involved and an image without the pragma still reads the converted file.
 That one-time conversion, unlike the no-op, does need the write lock and raises
