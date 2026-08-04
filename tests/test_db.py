@@ -272,6 +272,72 @@ class TestChatHistoryDB:
         messages = chat_history_db.get_messages(session.id)
         assert messages[0].tool_results_json is None
 
+    def test_add_message_with_instruction_set_id(self, chat_history_db):
+        """The instruction set in force for a turn round-trips through save and read."""
+        session = chat_history_db.create_session(USER)
+        msg = chat_history_db.add_message(
+            session.id, "msg1", "user", "Hello", instruction_set_id="set-abc"
+        )
+
+        assert msg.instruction_set_id == "set-abc"
+
+        messages = chat_history_db.get_messages(session.id)
+        assert messages[0].instruction_set_id == "set-abc"
+
+    def test_add_message_upsert_updates_instruction_set_id(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(
+            session.id, "msg1", "assistant", "Hello", instruction_set_id="set-abc"
+        )
+        chat_history_db.add_message(
+            session.id, "msg1", "assistant", "Hello", instruction_set_id="set-def"
+        )
+
+        messages = chat_history_db.get_messages(session.id)
+        assert len(messages) == 1
+        assert messages[0].instruction_set_id == "set-def"
+
+    def test_instruction_set_id_defaults_none_for_old_messages(self, chat_history_db):
+        """Rows written before the column existed read NULL and behave as today."""
+        session = chat_history_db.create_session(USER)
+        conn = chat_history_db._conn
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            ("legacy", session.id, "user", "Hello"),
+        )
+        conn.commit()
+
+        messages = chat_history_db.get_messages(session.id)
+        assert len(messages) == 1
+        assert messages[0].instruction_set_id is None
+        assert messages[0].content == "Hello"
+
+    def test_instruction_set_id_survives_fork(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(
+            session.id, "msg1", "user", "Hello", instruction_set_id="set-abc"
+        )
+        chat_history_db.set_shared(session.id, USER, True)
+
+        forked = chat_history_db.fork_session(session.id, "other@example.com")
+        assert chat_history_db.get_messages(forked.id)[0].instruction_set_id == "set-abc"
+
+    def test_instruction_set_migration_is_idempotent(self, chat_history_db):
+        """Re-running the migration over a populated database is a no-op."""
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(
+            session.id, "msg1", "user", "Hello", instruction_set_id="set-abc"
+        )
+
+        chat_history_db._init_db()
+
+        columns = [
+            row[1]
+            for row in chat_history_db._conn.execute("PRAGMA table_info(chat_messages)")
+        ]
+        assert columns.count("instruction_set_id") == 1
+        assert chat_history_db.get_messages(session.id)[0].instruction_set_id == "set-abc"
+
     def test_get_messages(self, chat_history_db):
         """Test retrieving messages for a session."""
         session = chat_history_db.create_session("user@example.com")
