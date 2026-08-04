@@ -3,6 +3,7 @@
 import os
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -438,40 +439,41 @@ class TestAdminDBMethods:
             assert "session_id" in r
 
 
+@pytest.fixture
+def feedback_client(test_db):
+    """Client with both chat_history_db and llm_config_db mocked for feedback tests."""
+    from genetics_mcp_server.config.settings import get_settings
+
+    if LLMConfigDB in Singleton._instances:
+        del Singleton._instances[LLMConfigDB]
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        config_db_path = f.name
+
+    config_db = LLMConfigDB(config_db_path)
+
+    async def mock_admin():
+        return "admin@example.com"
+
+    app.dependency_overrides[admin_required] = mock_admin
+
+    with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
+        get_settings.cache_clear()
+        with (
+            patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db),
+            patch("genetics_mcp_server.routers.admin.get_llm_config_db", return_value=config_db),
+        ):
+            with TestClient(app) as client:
+                yield client, test_db, config_db
+        get_settings.cache_clear()
+
+    app.dependency_overrides.clear()
+    if LLMConfigDB in Singleton._instances:
+        del Singleton._instances[LLMConfigDB]
+    close_and_unlink(config_db, config_db_path)
+
+
 class TestAdminFeedbackEndpoint:
-
-    @pytest.fixture
-    def feedback_client(self, test_db):
-        """Client with both chat_history_db and llm_config_db mocked for feedback tests."""
-        from genetics_mcp_server.config.settings import get_settings
-
-        if LLMConfigDB in Singleton._instances:
-            del Singleton._instances[LLMConfigDB]
-
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            config_db_path = f.name
-
-        config_db = LLMConfigDB(config_db_path)
-
-        async def mock_admin():
-            return "admin@example.com"
-
-        app.dependency_overrides[admin_required] = mock_admin
-
-        with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
-            get_settings.cache_clear()
-            with (
-                patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db),
-                patch("genetics_mcp_server.routers.admin.get_llm_config_db", return_value=config_db),
-            ):
-                with TestClient(app) as client:
-                    yield client, test_db, config_db
-            get_settings.cache_clear()
-
-        app.dependency_overrides.clear()
-        if LLMConfigDB in Singleton._instances:
-            del Singleton._instances[LLMConfigDB]
-        close_and_unlink(config_db, config_db_path)
 
     def test_list_feedback_empty(self, feedback_client):
         client, _, _ = feedback_client
@@ -560,6 +562,114 @@ class TestAdminFeedbackEndpoint:
         # no overlap between pages
         all_comments = [i["comment"] for i in data_p1["items"] + data_p2["items"] + data_p3["items"]]
         assert len(all_comments) == len(set(all_comments))
+
+
+class TestAdminFeedbackPaginationStability:
+    """created_at comes from CURRENT_TIMESTAMP in both feedback tables, so it has one-second
+    resolution and any two submissions inside that second tie on it. Neither query orders the
+    tied rows, so the order they arrive in is the engine's to choose and may differ between two
+    requests; the feed sorts on created_at alone and hands out a slice of the result, so a page
+    boundary landing inside a tie shows an admin one item twice and never shows another
+    (genetics-results-suite-qdf).
+    """
+
+    STAMP = "2026-01-01 00:00:00"
+
+    @staticmethod
+    @contextmanager
+    def sources_reversed(config_db, chat_db):
+        """Return each source's rows in the reverse of the order the DB gave them.
+
+        That is one of the orders the engine is free to return for rows tied on created_at —
+        the same freedom PRAGMA reverse_unordered_selects stands in for in tests/test_db.py,
+        applied here instead because the request runs on a different thread from the test and
+        so on a different connection from the one a pragma would be set on.
+        """
+        originals = [
+            (config_db, "list_all_user_comments", config_db.list_all_user_comments),
+            (chat_db, "list_sessions_with_comments", chat_db.list_sessions_with_comments),
+        ]
+        for db, name, original in originals:
+            setattr(db, name, lambda original=original: list(reversed(original())))
+        try:
+            yield
+        finally:
+            for db, name, _ in originals:
+                delattr(db, name)
+
+    @pytest.fixture
+    def tied_feedback(self, feedback_client):
+        """Three comments from each source, every one of them stamped the same second."""
+        client, chat_db, config_db = feedback_client
+        for i in range(3):
+            config_db.add_user_comment(f"user{i}@example.com", f"dialog comment {i}")
+        for i in range(3):
+            s = chat_db.create_session(f"sess_user{i}@example.com")
+            chat_db.update_session(s.id, f"sess_user{i}@example.com", comment=f"session comment {i}")
+        # by SQL rather than by racing the clock: landing six writes in one second is the one
+        # thing a timing test cannot arrange
+        config_db._conn.execute("UPDATE user_comments SET created_at = ?", (self.STAMP,))
+        config_db._conn.commit()
+        chat_db._conn.execute("UPDATE chat_sessions SET created_at = ?", (self.STAMP,))
+        chat_db._conn.commit()
+        return client, chat_db, config_db
+
+    def test_paging_through_a_tie_returns_every_item_exactly_once(self, tied_feedback):
+        """The pages are walked with the row order flipped under the middle request, which is
+        what an admin clicking through the feed can hit: nothing pins the order between two
+        requests."""
+        client, chat_db, config_db = tied_feedback
+
+        seen = []
+        for offset in (0, 2, 4):
+            flip = offset == 2
+            with self.sources_reversed(config_db, chat_db) if flip else nullcontext():
+                page = client.get(f"/chat/v1/admin/feedback?limit=2&offset={offset}").json()
+            assert page["total"] == 6
+            seen.extend(item["comment"] for item in page["items"])
+
+        assert len(seen) == 6
+        assert set(seen) == {f"dialog comment {i}" for i in range(3)} | {
+            f"session comment {i}" for i in range(3)
+        }
+
+    def test_the_same_page_is_the_same_whichever_order_the_rows_arrive_in(self, tied_feedback):
+        """The page is a pure function of the stored rows, not of how they reached the merge."""
+        client, chat_db, config_db = tied_feedback
+
+        for offset in (0, 2, 4):
+            url = f"/chat/v1/admin/feedback?limit=2&offset={offset}"
+            forward = client.get(url).json()["items"]
+            with self.sources_reversed(config_db, chat_db):
+                backward = client.get(url).json()["items"]
+            assert forward == backward
+
+    def test_dialog_comments_tied_in_one_second_stay_newest_first(self, feedback_client):
+        """Making the merge total is not enough — it has to be total in the *same* order the feed
+        claims to be in, and the one the source query already put the rows in.
+
+        The tiebreak carries user_comments.id, an autoincrement, and eleven rows are enough for
+        the two orders to disagree: compared as text, '9' sorts above '10', so a stringified id
+        renders 9, 8, 11, 10 where the ids say 11, 10, 9, 8. That reverses pairs of adjacent rows
+        inside every tie and contradicts list_all_user_comments' own ORDER BY created_at DESC,
+        id DESC, which exists for exactly this feed. Session comments are tied into the same
+        second alongside them so the merge still has to compare across the two id spaces.
+        """
+        client, chat_db, config_db = feedback_client
+        for i in range(11):
+            config_db.add_user_comment("user@example.com", f"dialog comment {i}")
+        s = chat_db.create_session("sess@example.com")
+        chat_db.update_session(s.id, "sess@example.com", comment="session comment")
+        config_db._conn.execute("UPDATE user_comments SET created_at = ?", (self.STAMP,))
+        config_db._conn.commit()
+        chat_db._conn.execute("UPDATE chat_sessions SET created_at = ?", (self.STAMP,))
+        chat_db._conn.commit()
+
+        page = client.get("/chat/v1/admin/feedback?limit=50").json()
+        assert page["total"] == 12
+        dialog = [i["comment"] for i in page["items"] if i["source"] == "feedback_dialog"]
+        assert dialog == [c.comment for c in config_db.list_all_user_comments()]
+        assert dialog == [f"dialog comment {i}" for i in reversed(range(11))]
 
 
 class TestAdminSessionsAnalysisJoin:

@@ -9,6 +9,8 @@ import pytest
 from conftest import block_writes, unblock_writes
 
 USER = "user@example.com"
+# what a read degrades an unusable stored timestamp to, rather than raising
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 @contextmanager
@@ -726,6 +728,22 @@ class TestSameSecondTiebreak:
             assert llm_config_db.get_user_setting(USER, "backend").setting_value == ""
             assert "backend" not in llm_config_db.get_user_settings(USER)
 
+    def test_user_comments_written_in_one_second_are_ordered_by_id(self, llm_config_db):
+        """user_comments.created_at is the same CURRENT_TIMESTAMP with the same one-second
+        resolution, and two comments landing inside it are ordered by nothing at all: SQLite may
+        return them either way round, and differently between two calls. The admin feedback feed
+        pages a merge of these rows, so an undecided order there moves an item across a page
+        boundary between requests (genetics-results-suite-qdf)."""
+        saved = [llm_config_db.add_user_comment(USER, f"comment {i}") for i in range(5)]
+        llm_config_db._conn.execute("UPDATE user_comments SET created_at = ?", (self.STAMP,))
+        llm_config_db._conn.commit()
+        newest_first = [c.id for c in reversed(saved)]
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                assert [c.id for c in llm_config_db.get_user_comments(USER)] == newest_first
+                assert [c.id for c in llm_config_db.list_all_user_comments()] == newest_first
+
     def test_get_tool_description_returns_the_later_of_two_saves_in_one_second(
         self, llm_config_db
     ):
@@ -771,16 +789,17 @@ class TestSameSecondTiebreak:
                 for tool in tools:
                     assert descriptions[tool].id == llm_config_db.get_tool_description(tool).id
 
-    def test_a_key_with_only_blank_timestamps_drops_out_and_leaves_the_rest_readable(
-        self, llm_config_db
-    ):
-        """MAX ignores NULLs, so a key with nothing but blank timestamps has no newest row to
-        match and is left out — the behaviour the plural accessors had before the tiebreak, and
-        the only one that keeps the other keys readable, since fromisoformat cannot parse None.
-        The singular accessors have no such filter and raise on the same row."""
-        llm_config_db.save_user_setting(USER, "backend", "perplexity")
+    def test_a_key_with_only_blank_timestamps_is_read_by_both_accessors(self, llm_config_db):
+        """MAX ignores NULLs, so a key whose rows are all unstamped has no newest row for an
+        equality join to match: the plural accessors used to drop it while the singular ones
+        returned it and raised TypeError parsing the stamp. Both now hand back the same row —
+        the highest id, since nothing else separates the tied rows — with the unusable stamp
+        degraded to the epoch, and the keys around it are unaffected either way."""
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        newest_setting = llm_config_db.save_user_setting(USER, "backend", "perplexity")
         llm_config_db.save_user_setting(USER, "verbosity", "brief")
         llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        newest_description = llm_config_db.save_tool_description("search_genes", "Version 2", USER)
         llm_config_db.save_tool_description("search_variants", "Only version", USER)
         self.tie_timestamps(llm_config_db, "user_settings_history")
         self.tie_timestamps(llm_config_db, "tool_description_history")
@@ -790,16 +809,28 @@ class TestSameSecondTiebreak:
         for reversed_rows in (False, True):
             with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
                 settings = llm_config_db.get_user_settings(USER)
-                assert "backend" not in settings
+                assert settings["backend"].id == newest_setting.id
+                assert settings["backend"].setting_value == "perplexity"
+                assert settings["backend"].changed_at == EPOCH
                 assert settings["verbosity"].setting_value == "brief"
-                descriptions = llm_config_db.get_tool_descriptions()
-                assert "search_genes" not in descriptions
-                assert descriptions["search_variants"].description == "Only version"
+                one = llm_config_db.get_user_setting(USER, "backend")
+                assert (one.id, one.setting_value, one.changed_at) == (
+                    newest_setting.id,
+                    "perplexity",
+                    EPOCH,
+                )
 
-        with pytest.raises(TypeError):
-            llm_config_db.get_user_setting(USER, "backend")
-        with pytest.raises(TypeError):
-            llm_config_db.get_tool_description("search_genes")
+                descriptions = llm_config_db.get_tool_descriptions()
+                assert descriptions["search_genes"].id == newest_description.id
+                assert descriptions["search_genes"].description == "Version 2"
+                assert descriptions["search_genes"].changed_at == EPOCH
+                assert descriptions["search_variants"].description == "Only version"
+                got = llm_config_db.get_tool_description("search_genes")
+                assert (got.id, got.description, got.changed_at) == (
+                    newest_description.id,
+                    "Version 2",
+                    EPOCH,
+                )
 
     def test_a_blank_timestamp_does_not_outrank_a_real_one_in_the_same_second(self, llm_config_db):
         """The unstamped row here is the highest id of the three, so a tiebreak that fell back to
@@ -816,6 +847,31 @@ class TestSameSecondTiebreak:
             with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
                 assert llm_config_db.get_user_settings(USER)["backend"].id == stamped_winner.id
                 assert llm_config_db.get_user_setting(USER, "backend").id == stamped_winner.id
+
+    def test_a_blank_tool_timestamp_does_not_outrank_a_real_one_in_the_same_second(
+        self, llm_config_db
+    ):
+        """The tool-description twin of the test above, and it is not redundant with it: the two
+        accessor pairs run different SQL, so the setting test constrains nothing about this join.
+        The unstamped row is the highest id of the three, so a plural query that stopped
+        restricting the group to the newest changed_at — by dropping the join condition — would
+        hand it the tool, and one that took MIN(id) instead of MAX inside the group would hand the
+        tool to the *older* of the two stamped versions. Both are versions of the same failure the
+        listing exists to prevent: the admin page showing a description that is not the one
+        get_tool_description reports as current."""
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        stamped_winner = llm_config_db.save_tool_description("search_genes", "Version 2", USER)
+        unstamped = llm_config_db.save_tool_description("search_genes", "never stamped", USER)
+        self.tie_timestamps(llm_config_db, "tool_description_history")
+        self.unstamp(llm_config_db, "tool_description_history", "id = ?", (unstamped.id,))
+        assert unstamped.id > stamped_winner.id
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                current = llm_config_db.get_tool_descriptions()["search_genes"]
+                assert (current.id, current.description) == (stamped_winner.id, "Version 2")
+                one = llm_config_db.get_tool_description("search_genes")
+                assert (one.id, one.description) == (stamped_winner.id, "Version 2")
 
     def test_tool_description_history_leads_with_the_version_in_force(self, llm_config_db):
         """The listing is the version history an admin reads — the endpoint serves it "for
@@ -834,6 +890,150 @@ class TestSameSecondTiebreak:
             )
             paged = llm_config_db.get_tool_description_history("search_genes", limit=2)
             assert [v.description for v in paged] == ["Version 4", "Version 3"]
+
+
+class TestMalformedTimestampReads:
+    """changed_at carries no NOT NULL and no format check, and the column is untyped, so a row
+    that reached the table by any route other than the accessors — a migration, a manual fix —
+    can hold a NULL, a string nothing can parse, or a value that is not text at all.
+    These are admin and config reads, so one such row must not 500 the whole
+    listing: the stamp degrades to the epoch rather than raising. The two shapes the column
+    actually reaches fail differently, NULL as a TypeError out of fromisoformat and a blank string
+    as a ValueError, and neither used to be handled by the singular accessors
+    (genetics-results-suite-2cl).
+    """
+
+    @staticmethod
+    def restamp(db, table, value, where="1", params=()):
+        db._conn.execute(f"UPDATE {table} SET changed_at = ? WHERE {where}", (value, *params))
+        db._conn.commit()
+
+    @pytest.mark.parametrize("stamp", ["", "   ", "not a timestamp"])
+    def test_an_unparseable_setting_stamp_degrades_instead_of_raising(self, llm_config_db, stamp):
+        """A blank string is the shape a bad migration leaves behind, and it is *not* the NULL
+        case: it survives MAX and the join, so before this it took down the plural read too."""
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        newest = llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        self.restamp(llm_config_db, "user_settings_history", stamp)
+
+        one = llm_config_db.get_user_setting(USER, "backend")
+        assert (one.id, one.setting_value, one.changed_at) == (newest.id, "perplexity", EPOCH)
+        many = llm_config_db.get_user_settings(USER)["backend"]
+        assert (many.id, many.changed_at) == (newest.id, EPOCH)
+
+    @pytest.mark.parametrize("stamp", ["", "   ", "not a timestamp"])
+    def test_an_unparseable_tool_stamp_degrades_instead_of_raising(self, llm_config_db, stamp):
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        newest = llm_config_db.save_tool_description("search_genes", "Version 2", USER)
+        self.restamp(llm_config_db, "tool_description_history", stamp)
+
+        one = llm_config_db.get_tool_description("search_genes")
+        assert (one.id, one.description, one.changed_at) == (newest.id, "Version 2", EPOCH)
+        many = llm_config_db.get_tool_descriptions()["search_genes"]
+        assert (many.id, many.changed_at) == (newest.id, EPOCH)
+
+    @pytest.mark.parametrize("sentinel", ["", 0])
+    @pytest.mark.parametrize(
+        "table,plural,singular",
+        [
+            (
+                "user_settings_history",
+                lambda db: db.get_user_settings(USER)["backend"],
+                lambda db: db.get_user_setting(USER, "backend"),
+            ),
+            (
+                "tool_description_history",
+                lambda db: db.get_tool_descriptions()["search_genes"],
+                lambda db: db.get_tool_description("search_genes"),
+            ),
+        ],
+    )
+    def test_a_group_holding_both_a_null_and_a_sentinel_stamp_agrees_across_accessors(
+        self, llm_config_db, table, plural, singular, sentinel
+    ):
+        """The one group shape that distinguishes the null-safe `IS` join from a coalescing one,
+        and the reason the join is written with IS rather than COALESCE on both sides.
+
+        Neither sentinel is NULL: MAX ignores the NULL and returns the sentinel, so the group's
+        newest stamp is the sentinel row's, and the singular accessor's DESC order puts both a
+        blank string and a 0 above NULL for the same reason. Both accessors therefore have to
+        return the *sentinel* row here even though the NULL row is newer by id. Coalescing the
+        two sides to that same value collapses the two rows onto one key, MAX(id) inside the
+        group then picks the NULL row, and the plural read starts reporting a different current
+        row than the singular one — the exact disagreement this join is here to rule out, and the
+        only one an equality-vs-IS test cannot see. Both sentinels are run because neither stands
+        in for the other: SQLite sorts every integer below every string, so under a COALESCE to 0
+        a blank row keeps a key of its own and only a 0-stamped row collapses onto the NULLs.
+        """
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        llm_config_db.save_tool_description("search_genes", "Version 2", USER)
+        ids = [r[0] for r in llm_config_db._conn.execute(f"SELECT id FROM {table} ORDER BY id")]
+        sentinel_row, null_row = ids[-2], ids[-1]
+        self.restamp(llm_config_db, table, sentinel, "id = ?", (sentinel_row,))
+        self.restamp(llm_config_db, table, None, "id = ?", (null_row,))
+
+        for reversed_rows in (False, True):
+            with (
+                TestSameSecondTiebreak.unordered_rows_reversed(llm_config_db)
+                if reversed_rows
+                else nullcontext()
+            ):
+                assert plural(llm_config_db).id == sentinel_row
+                assert singular(llm_config_db).id == sentinel_row
+                assert plural(llm_config_db).changed_at == EPOCH
+
+    def test_a_usable_stamp_is_still_parsed_as_utc(self, llm_config_db):
+        """The degrade must not swallow the real stamps: SQLite stores naive UTC, so the read
+        attaches the zone rather than leaving the value to be read as local time."""
+        llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        stamped = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        self.restamp(llm_config_db, "user_settings_history", "2026-01-02 03:04:05")
+        self.restamp(llm_config_db, "tool_description_history", "2026-01-02 03:04:05")
+
+        assert llm_config_db.get_user_setting(USER, "backend").changed_at == stamped
+        assert llm_config_db.get_user_settings(USER)["backend"].changed_at == stamped
+        assert llm_config_db.get_tool_description("search_genes").changed_at == stamped
+        assert llm_config_db.get_tool_descriptions()["search_genes"].changed_at == stamped
+
+    @pytest.mark.parametrize("value", [None, "", "   ", "not a timestamp", 0, 1735689600])
+    def test_the_helper_degrades_every_unusable_shape(self, llm_config_db, value):
+        """Both raising paths in one place: the isinstance guard covers None and anything
+        non-textual SQLite let into the column, the except covers strings that will not parse."""
+        assert llm_config_db._as_utc_or_epoch(value) == EPOCH
+
+
+class TestSavedAndReadStampsCarryTheSameZone:
+    """The reads return aware UTC, so the writes have to as well. Neither save writes changed_at
+    — the row takes DEFAULT CURRENT_TIMESTAMP, which SQLite writes as naive UTC — so the stamp a
+    save hands back is one the process makes up for the response, and a naive local now() there
+    puts a value on the PUT response that is the process's UTC offset away from the zone every
+    subsequent GET on the same key reports. Same for the version history: it is rendered next to
+    the description in force, so its head has to carry the stamp get_tool_description does, not
+    the same instant under a different zone (genetics-results-suite-2cl).
+    """
+
+    @pytest.mark.parametrize(
+        "save",
+        [
+            lambda db: db.save_tool_description("search_genes", "Version 1", USER),
+            lambda db: db.save_user_setting(USER, "backend", "perplexity"),
+        ],
+        ids=["tool_description", "user_setting"],
+    )
+    def test_a_save_returns_an_aware_utc_stamp(self, llm_config_db, save):
+        assert save(llm_config_db).changed_at.utcoffset() == timedelta(0)
+
+    def test_the_history_head_carries_the_stamp_of_the_version_in_force(self, llm_config_db):
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+
+        current = llm_config_db.get_tool_description("search_genes")
+        head = llm_config_db.get_tool_description_history("search_genes")[0]
+        assert current.changed_at.utcoffset() == timedelta(0)
+        assert head.changed_at.utcoffset() == timedelta(0)
+        assert head.changed_at == current.changed_at
 
 
 class TestLLMConfigJournalMode:

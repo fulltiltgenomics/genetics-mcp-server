@@ -263,31 +263,42 @@ async def list_feedback(
     admin_user: str = Depends(admin_required),
 ):
     """List all user feedback from both feedback dialogs and session comments."""
-    # collect feedback from both sources
-    items: list[FeedbackItem] = []
+    # collect feedback from both sources, each carrying the key it is sorted by. created_at alone
+    # does not order this feed: it comes from CURRENT_TIMESTAMP in both tables and has one-second
+    # resolution, so any two submissions in the same second tie, and a sort on it leaves their
+    # relative order to whatever order the rows arrived in. The page is a slice of that order, so
+    # a boundary falling inside a tie can hand an admin the same item on two pages and never show
+    # another. The tiebreak is (source, id): the two sources have separate id spaces — an
+    # autoincrement int and a session uuid — and source is compared first, so an id is only ever
+    # compared with one from its own space. Within a source the id only has to be unique, which
+    # makes the whole key total and the page boundary the same on every request
+    entries: list[tuple[tuple[str, str, int | str], FeedbackItem]] = []
 
     for uc in get_llm_config_db().list_all_user_comments():
-        items.append(FeedbackItem(
+        created_at = uc.created_at.isoformat()
+        entries.append(((created_at, "feedback_dialog", uc.id), FeedbackItem(
             user=uc.user_id,
             comment=uc.comment,
             preview=uc.comment[:100],
-            created_at=uc.created_at.isoformat(),
+            created_at=created_at,
             source="feedback_dialog",
-        ))
+        )))
 
     for sc in get_chat_history_db().list_sessions_with_comments():
         comment = sc["comment"]
-        items.append(FeedbackItem(
+        created_at = sc["created_at"].isoformat()
+        entries.append(((created_at, "session_comment", sc["session_id"]), FeedbackItem(
             user=sc["user_id"],
             comment=comment,
             preview=comment[:100],
-            created_at=sc["created_at"].isoformat(),
+            created_at=created_at,
             source="session_comment",
             session_id=sc["session_id"],
-        ))
+        )))
 
-    # sort by created_at descending
-    items.sort(key=lambda x: x.created_at, reverse=True)
+    # newest first, ties broken by (source, id)
+    entries.sort(key=lambda e: e[0], reverse=True)
+    items = [item for _, item in entries]
 
     total = len(items)
     latest_at = items[0].created_at if items else None

@@ -433,9 +433,24 @@ class LLMConfigDB(object, metaclass=Singleton):
         # per-row correlated subquery: this table is append-only and never pruned, and the
         # correlated form costs a full table scan that reads and discards every row's description
         # blob — measured an order of magnitude slower by 60k rows, and widening.
-        # A tool whose rows all carry a NULL changed_at drops out here, as it did before this
-        # tiebreak: MAX ignores NULLs so nothing joins, and a NULL winner would raise in
-        # fromisoformat below and fail the whole listing
+        # the join is on IS rather than =, so a tool whose rows all carry a NULL changed_at is
+        # listed instead of vanishing: MAX ignores NULLs, so its group's max_changed_at is NULL
+        # and = never matches it, while IS is null-safe and leaves the tool its MAX(id) row —
+        # the same row get_tool_description returns for it, now that the parse degrades below.
+        # It is only the *equality* that is relaxed, and only IS relaxes just that. Dropping the
+        # condition lets the highest id in the group win outright, stamped or not, so an unstamped
+        # row takes a tool that also holds stamped ones. COALESCE on both sides is null-safe too,
+        # but it collapses the NULL rows onto whichever row holds the sentinel, and what that
+        # costs depends on which sentinel. Coalescing to '' or 0 cannot cost a tool its usable
+        # stamp: any row holding one outranks both sentinels in MAX ('' sorts below every other
+        # string, and every integer below every string), so the coalesced key is never the
+        # group max where a usable stamp exists. What it costs is agreement in the groups where
+        # no row holds one — the plural read then hands the group its highest id, sentinel-stamped
+        # or unstamped, while get_tool_description, whose DESC order puts '' and 0 above NULL,
+        # keeps returning the sentinel row. Coalescing to CURRENT_TIMESTAMP is the one that costs
+        # both: it equals every row written in the current second, so the NULL rows collapse onto
+        # a *usably* stamped one, MAX(id) hands the tool to whichever is newest, and an unstamped
+        # row wins a tool that holds a usable stamp
         cursor.execute(
             """
             SELECT id, tool_name, description, changed_by, changed_at, comment
@@ -447,7 +462,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                     SELECT tool_name, MAX(changed_at) AS max_changed_at
                     FROM tool_description_history
                     GROUP BY tool_name
-                ) t2 ON t1.tool_name = t2.tool_name AND t1.changed_at = t2.max_changed_at
+                ) t2 ON t1.tool_name = t2.tool_name AND t1.changed_at IS t2.max_changed_at
                 GROUP BY t1.tool_name
             )
         """
@@ -459,7 +474,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                 tool_name=row["tool_name"],
                 description=row["description"],
                 changed_by=row["changed_by"],
-                changed_at=datetime.fromisoformat(row["changed_at"]),
+                changed_at=self._as_utc_or_epoch(row["changed_at"]),
                 comment=row["comment"],
             )
         return result
@@ -482,12 +497,15 @@ class LLMConfigDB(object, metaclass=Singleton):
         row = cursor.fetchone()
         if row is None:
             return None
+        # the stamp is parsed leniently for the reason given on _as_utc_or_epoch: the column
+        # carries no NOT NULL, so the winning row can hold a NULL or an unparseable string, and
+        # raising here would fail the whole read where get_tool_descriptions returns a value
         return ToolDescriptionVersion(
             id=row["id"],
             tool_name=row["tool_name"],
             description=row["description"],
             changed_by=row["changed_by"],
-            changed_at=datetime.fromisoformat(row["changed_at"]),
+            changed_at=self._as_utc_or_epoch(row["changed_at"]),
             comment=row["comment"],
         )
 
@@ -517,12 +535,15 @@ class LLMConfigDB(object, metaclass=Singleton):
             conn.rollback()
             raise
 
+        # aware UTC, as the reads return: the row itself holds CURRENT_TIMESTAMP, which is UTC, so
+        # a naive local now() would make this response disagree with the value just stored and
+        # with the GET on the same key by the size of the process's UTC offset
         return ToolDescriptionVersion(
             id=cursor.lastrowid,
             tool_name=tool_name,
             description=description,
             changed_by=user,
-            changed_at=datetime.now(),
+            changed_at=datetime.now(timezone.utc),
             comment=comment,
         )
 
@@ -536,7 +557,12 @@ class LLMConfigDB(object, metaclass=Singleton):
         # id DESC for the same reason as in get_tool_description, which this listing has to agree
         # with: versions saved in the same second tie on changed_at, so without it the row shown
         # first is not necessarily the one in force, and the LIMIT can drop the newest version
-        # rather than the oldest
+        # rather than the oldest.
+        # _as_utc, not a bare fromisoformat, so the head of this history is the same aware UTC
+        # value get_tool_description reports for the same row and the two string-match. It still
+        # raises on a stamp it cannot parse, unlike the reads above: this listing has no winner to
+        # pick, so there is nothing for a degraded row to get wrong, and the raise is tracked
+        # separately
         cursor.execute(
             """
             SELECT id, tool_name, description, changed_by, changed_at, comment
@@ -553,7 +579,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                 tool_name=row["tool_name"],
                 description=row["description"],
                 changed_by=row["changed_by"],
-                changed_at=datetime.fromisoformat(row["changed_at"]),
+                changed_at=self._as_utc(row["changed_at"]),
                 comment=row["comment"],
             )
             for row in cursor.fetchall()
@@ -566,12 +592,16 @@ class LLMConfigDB(object, metaclass=Singleton):
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # id DESC because created_at is CURRENT_TIMESTAMP and has one-second resolution: two
+        # comments submitted inside one second tie on it, and SQLite is then free to return them
+        # in either order, differently between two calls. id is an AUTOINCREMENT sequence, so it
+        # orders the tied rows by the order they were written
         cursor.execute(
             """
             SELECT id, user_id, comment, created_at
             FROM user_comments
             WHERE user_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             """,
             (user_id,),
         )
@@ -590,11 +620,14 @@ class LLMConfigDB(object, metaclass=Singleton):
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # id DESC as in get_user_comments. It matters more here: this listing feeds the paginated
+        # admin feedback feed, so an order that is only decided for the untied rows moves items
+        # across a page boundary between two requests
         cursor.execute(
             """
             SELECT id, user_id, comment, created_at
             FROM user_comments
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             """
         )
         return [
@@ -670,12 +703,14 @@ class LLMConfigDB(object, metaclass=Singleton):
         row = cursor.fetchone()
         if row is None:
             return None
+        # as in get_tool_description: the winning row's stamp may be NULL or unparseable, and it
+        # degrades to the epoch rather than raising so that one bad row does not 500 the read
         return UserSetting(
             id=row["id"],
             user_id=row["user_id"],
             setting_key=row["setting_key"],
             setting_value=row["setting_value"],
-            changed_at=datetime.fromisoformat(row["changed_at"]),
+            changed_at=self._as_utc_or_epoch(row["changed_at"]),
             comment=row["comment"],
         )
 
@@ -699,10 +734,18 @@ class LLMConfigDB(object, metaclass=Singleton):
         # particular plan is being relied on here. Correlating the tiebreak instead re-runs an
         # ORDER BY ... LIMIT 1 lookup once per row the user ever wrote, on a table that is never
         # pruned: measured at 10k rows for one user, ~20 ms against 3-6 ms for this shape
-        # depending on statistics, and the endpoint runs it once per request. A key whose rows all
-        # carry a NULL changed_at drops out here, as it did before this tiebreak: MAX ignores NULLs
-        # so nothing joins, and a NULL winner would raise in fromisoformat below and fail the
-        # whole settings read
+        # depending on statistics, and the endpoint runs it once per request. The join is on IS
+        # rather than =, so a key whose rows all carry a NULL changed_at is returned instead of
+        # vanishing: MAX ignores NULLs, so that group's max_changed_at is NULL and = never matches
+        # it, while IS is null-safe and leaves the key its MAX(id) row — the row get_user_setting
+        # returns for it, now that the parse below degrades. Only the equality is relaxed, and only
+        # IS relaxes just that: dropping the condition lets the highest id in the group win
+        # whatever it is stamped with, so an unstamped row takes a key that also holds stamped
+        # ones, and coalescing both sides collapses the NULL rows onto whichever row holds the
+        # sentinel — which costs this key its usable stamp only for a sentinel a usably stamped
+        # row can itself hold, i.e. CURRENT_TIMESTAMP, and for '' or 0 costs instead the agreement
+        # between this read and get_user_setting on keys where no row is usably stamped. See
+        # get_tool_descriptions, which spells the two cases out
         cursor.execute(
             """
             SELECT id, user_id, setting_key, setting_value, changed_at, comment
@@ -715,7 +758,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                     FROM user_settings_history
                     WHERE user_id = ?
                     GROUP BY setting_key
-                ) h2 ON h1.setting_key = h2.setting_key AND h1.changed_at = h2.max_changed_at
+                ) h2 ON h1.setting_key = h2.setting_key AND h1.changed_at IS h2.max_changed_at
                 WHERE h1.user_id = ?
                 GROUP BY h1.setting_key
             )
@@ -731,7 +774,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                     user_id=row["user_id"],
                     setting_key=row["setting_key"],
                     setting_value=row["setting_value"],
-                    changed_at=datetime.fromisoformat(row["changed_at"]),
+                    changed_at=self._as_utc_or_epoch(row["changed_at"]),
                     comment=row["comment"],
                 )
         return result
@@ -760,12 +803,13 @@ class LLMConfigDB(object, metaclass=Singleton):
             conn.rollback()
             raise
 
+        # aware UTC as in save_tool_description, and for the same reason
         return UserSetting(
             id=cursor.lastrowid,
             user_id=user_id,
             setting_key=setting_key,
             setting_value=setting_value,
-            changed_at=datetime.now(),
+            changed_at=datetime.now(timezone.utc),
             comment=comment,
         )
 
@@ -1106,13 +1150,17 @@ class LLMConfigDB(object, metaclass=Singleton):
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     @classmethod
-    def _as_utc_or_epoch(cls, value: str | None) -> datetime:
+    def _as_utc_or_epoch(cls, value: object) -> datetime:
         """Parse a stored timestamp that the schema permits to be NULL or malformed.
 
-        The instruction-set columns carry no NOT NULL, so a row written outside the accessors
-        can hold anything. A chat turn depends on this read path, so an unusable stamp degrades
-        to the epoch — which sorts oldest, the same place SQLite puts a NULL in the listing's
-        DESC order — instead of raising and failing the turn.
+        No timestamp column in this file carries NOT NULL or a format check, and the column is
+        untyped, so a row written outside the accessors — a migration, a manual fix — can hold
+        anything SQLite accepts. These are admin and config reads: one unusable row must not 500
+        a whole listing, so the stamp degrades to the epoch — which sorts oldest, the same place
+        SQLite puts a NULL in a listing's DESC order — instead of raising. Both shapes the column
+        actually reaches are covered, and they raise differently: fromisoformat(None) is a
+        TypeError, caught here by the isinstance guard along with every other non-textual value,
+        and fromisoformat("") a ValueError.
         """
         if isinstance(value, str):
             try:

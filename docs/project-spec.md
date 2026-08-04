@@ -612,6 +612,42 @@ second one: the `analyze-conversations` CronJob
 PVC read-write and opens that database nightly at 02:30, so suspend it as well before reverting
 that file. A collision only makes the pragma fail loudly; it does not corrupt anything.
 
+**Which version of a config row is "current", and how its timestamp is read.** The
+tool-description and user-setting tables in `llm_config.db` are append-only histories, and
+`changed_at` is `CURRENT_TIMESTAMP` with one-second resolution, so two saves to the same key
+inside one second tie on it. The winner is the `(changed_at, id)` maximum in every accessor —
+`id` is an AUTOINCREMENT sequence, so it orders tied rows by the order they were written — which
+is why the singular reads order by `changed_at DESC, id DESC` and the plural ones take `MAX(id)`
+within the `MAX(changed_at)` group. No timestamp column in the file carries `NOT NULL` or a
+format check, so a row written by a migration or a manual fix can hold a NULL or an unparseable
+string. Such a stamp degrades to the epoch (`_as_utc_or_epoch`) rather than raising: these are
+admin and config reads behind `routers/llm_config.py`, and one unusable row must not 500 a whole
+listing. (A chat turn does not reach them — it takes its verbosity off the request body.) The
+plural queries join on `IS` rather than `=`, so a key whose rows are *all* unstamped still
+resolves to its `MAX(id)` row — the row the singular accessor returns for it — instead of
+dropping out of the listing. Only the equality is relaxed: an unstamped row never outranks a
+stamped one for the same key, since `MAX` ignores NULLs. `IS` and not a `COALESCE` on both sides:
+coalescing is null-safe too, but it collapses the NULL rows onto whichever row holds the sentinel,
+and the cost splits by sentinel. Coalescing to `''` or `0` cannot cost a key its usable stamp —
+a real stamp outranks both in `MAX`, since `''` sorts below every other string and every integer
+below every string — but in a key where *no* row is usably stamped the plural read then takes the
+group's highest id, unstamped or not, while the singular one keeps returning the sentinel row, so
+the two disagree whenever the unstamped row is the newer.
+Coalescing to `CURRENT_TIMESTAMP` is the one that costs both: it equals every row written in the
+current second, so the NULL rows collapse onto a usably stamped row and `MAX(id)` can hand the key
+to an unstamped one. Timestamps come back from these reads as timezone-aware UTC, because SQLite
+stores `CURRENT_TIMESTAMP` as naive UTC and the API serializes them with `.isoformat()`; the saves
+and `get_tool_description_history` return aware UTC too, so a `PUT` response and the following
+`GET` on one key no longer differ by the process's UTC offset (they still differ in precision —
+the save reports `now()` to the microsecond, the read the stored second) and the history head
+string-matches the description in force. The `user_comments` accessors are deliberately left out
+of this: their `created_at` is still naive, naive UTC out of the reads and naive *local* out of
+`add_user_comment`. That is a scope decision, not a technical obstacle: making them aware would
+leave the feedback feed's merge key total and in the same order, because both stamps render as a
+fixed 19-character `YYYY-MM-DDTHH:MM:SS` that decides every comparison except an exact tie, where
+the added `+00:00` would only flip which of the two sources wins — arbitrary either way. The
+change is owned by `genetics-results-suite-ni9`.
+
 ### CORS
 
 | Variable | Description | Default |
@@ -670,7 +706,7 @@ Admin endpoints:
 - `GET /chat/v1/admin/sessions/{id}` — session detail with all messages
 - `GET /chat/v1/admin/analytics/usage?period=week|month|year` — daily usage stats (unique users, conversations)
 - `GET /chat/v1/admin/analytics/quality` — raw per-conversation analysis rows for the Quality plots tab (`rows` of `session_id`, `created_at`, `llm_quality_score`, `llm_disposition`, `success_label`, `issue_categories`). Returned unaggregated (ordered by `created_at`); the frontend does the rolling-window aggregation client-side. Sourced from `ChatHistoryDB.list_all_analysis_rows`.
-- `GET /chat/v1/admin/feedback` — unified, paginated feed of all user feedback sorted by `created_at` DESC. Merges two sources: standalone feedback from the `user_comments` table (submitted via the Feedback dialog) and per-session comments from `chat_sessions.comment`. Response includes `items` (each with `user`, `comment`, `preview`, `created_at`, `source`, and optional `session_id`), `total` count, `latest_at` timestamp, and pagination parameters (`offset`, `limit`)
+- `GET /chat/v1/admin/feedback` — unified, paginated feed of all user feedback sorted by `created_at` DESC. Merges two sources: standalone feedback from the `user_comments` table (submitted via the Feedback dialog) and per-session comments from `chat_sessions.comment`. Response includes `items` (each with `user`, `comment`, `preview`, `created_at`, `source`, and optional `session_id`), `total` count, `latest_at` timestamp, and pagination parameters (`offset`, `limit`). The merge is ordered by `(created_at, source, id)`, not `created_at` alone: `created_at` is `CURRENT_TIMESTAMP` in both tables and has one-second resolution, so submissions inside one second tie and neither query orders them, and a page is a slice of that order — a boundary inside a tie would show an admin one item twice and hide another. The two sources have separate id spaces (an autoincrement int, a session uuid), which never meet because `source` is compared first
 
 The `/chat/v1/auth` endpoint includes an `is_admin` boolean in its response, used by the frontend to show/hide the admin menu.
 
@@ -740,7 +776,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
-| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description and user-setting accessors (`changed_at` has one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once) |
+| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both), and the zone the write path returns (the saves and the version history hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |
