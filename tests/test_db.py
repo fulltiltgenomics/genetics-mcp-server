@@ -588,6 +588,74 @@ class TestLLMConfigDB:
         assert "backend" not in settings
 
 
+class TestLLMConfigJournalMode:
+    """This file is read and written on the same request paths: validate_api_token does a SELECT
+    plus a bookkeeping UPDATE and COMMIT on every MCP request, and the settings and
+    tool-description routers read and write it per request, all from one process. Under
+    the default rollback journal those two block each other whenever a write reaches the file:
+    the writer needs every reader gone before it can commit, and a reader that arrives while it
+    is committing is turned away with "database is locked". WAL gives readers a consistent
+    snapshot that no writer has to wait for."""
+
+    def test_the_connection_is_in_wal_mode(self, llm_config_db):
+        cursor = llm_config_db._conn.cursor()
+        cursor.execute("PRAGMA journal_mode")
+        assert cursor.fetchone()[0].lower() == "wal"
+
+    def test_a_writer_can_commit_while_a_reader_holds_a_read_transaction(self, llm_config_db):
+        """Under a rollback journal the commit needs an exclusive lock, so an open read holds
+        the writer off until its own 5s busy_timeout runs out and the write fails outright."""
+        reader = sqlite3.connect(llm_config_db.db_path, timeout=0)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM user_settings_history").fetchone()
+
+            llm_config_db.save_user_setting(USER, "backend", "perplexity")
+
+            assert llm_config_db.get_user_setting(USER, "backend").setting_value == "perplexity"
+        finally:
+            reader.rollback()
+            reader.close()
+
+    def test_reads_are_never_locked_out_by_a_writer(self, llm_config_db):
+        """The reverse direction, and the one a chat turn feels: a reader arriving while a
+        write is being applied is refused, and under load that is most of the time. timeout=0
+        stands in for a reader that has exhausted its retries rather than one that never waits.
+        """
+        writes = 50
+        done = threading.Event()
+        failures = []
+
+        def write_repeatedly():
+            try:
+                for i in range(writes):
+                    llm_config_db.save_user_setting(USER, f"key_{i}", "value")
+            except Exception as exc:  # surfaced below rather than lost in the thread
+                failures.append(repr(exc))
+            finally:
+                done.set()
+
+        writer = threading.Thread(target=write_repeatedly)
+        reader = sqlite3.connect(llm_config_db.db_path, timeout=0)
+        reads = 0
+        locked = 0
+        try:
+            writer.start()
+            while not done.is_set():
+                try:
+                    reader.execute("SELECT COUNT(*) FROM user_settings_history").fetchone()
+                    reads += 1
+                except sqlite3.OperationalError:
+                    locked += 1
+        finally:
+            writer.join(timeout=30)
+            reader.close()
+
+        assert not failures, failures
+        assert reads > 0
+        assert locked == 0
+
+
 class TestUserApiTokenExpiry:
     """Tests for the idle (rolling) expiry on per-user API tokens.
 

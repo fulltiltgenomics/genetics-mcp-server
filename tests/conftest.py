@@ -11,6 +11,27 @@ os.environ.setdefault("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 os.environ["REQUIRE_AUTH"] = "false"
 
 
+def close_and_unlink(db, db_path):
+    """Both databases run in WAL mode, which leaves `-wal`/`-shm` sidecars next to the file.
+    SQLite only removes them on the last clean close, and the cached connections outlive the
+    fixture, so unlinking the database alone strands two files per test in the temp dir.
+    Connections opened on worker threads cannot be closed from here, hence the suppression;
+    `db` may be None when construction itself failed.
+    """
+    if db is not None:
+        for conn in db._connections.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        db._connections.clear()
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(db_path + suffix)
+        except FileNotFoundError:
+            pass
+
+
 @pytest.fixture
 def chat_history_db():
     """Create a temporary ChatHistoryDB instance for testing."""
@@ -31,7 +52,7 @@ def chat_history_db():
     # cleanup
     if ChatHistoryDB in Singleton._instances:
         del Singleton._instances[ChatHistoryDB]
-    os.unlink(db_path)
+    close_and_unlink(db, db_path)
 
 
 @pytest.fixture
@@ -54,7 +75,7 @@ def llm_config_db():
     # cleanup
     if LLMConfigDB in Singleton._instances:
         del Singleton._instances[LLMConfigDB]
-    os.unlink(db_path)
+    close_and_unlink(db, db_path)
 
 
 def block_writes(db, table, event="INSERT"):

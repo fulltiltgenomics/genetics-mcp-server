@@ -1,10 +1,10 @@
 """Integration tests for LLM config router endpoints."""
 
-import os
 import tempfile
 from unittest.mock import patch
 
 import pytest
+from conftest import close_and_unlink
 from fastapi.testclient import TestClient
 
 from genetics_mcp_server.auth import auth_required
@@ -28,7 +28,7 @@ def test_db():
 
     if LLMConfigDB in Singleton._instances:
         del Singleton._instances[LLMConfigDB]
-    os.unlink(db_path)
+    close_and_unlink(db, db_path)
 
 
 @pytest.fixture

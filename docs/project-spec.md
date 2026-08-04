@@ -558,6 +558,60 @@ All configuration is via environment variables (`.env` file supported):
 | `DOWNLOAD_STORAGE_PATH` | Path for tool result download files | `/mnt/disks/data/downloads` |
 | `DOWNLOAD_TTL_SECONDS` | TTL for download files in seconds | `2592000` (30 days) |
 
+**Both SQLite databases run in WAL mode**, set by `_create_connection` in `chat_history_db.py`
+and `llm_config_db.py`. Under the default rollback journal a reader is refused while a write is
+being applied (commit takes an EXCLUSIVE lock), and a writer's commit is refused while any
+reader still holds a read transaction; WAL removes both directions. For `llm_config.db` the
+mixed read+write hot path is API-token validation: `validate_api_token` runs a SELECT plus a
+bookkeeping UPDATE and COMMIT on every MCP request (`mcp_server.py:_validate_user_token`, and
+`routers/api_tokens.py` for the cross-pod HTTP fallback). The per-request settings and
+tool-description reads and writes in `routers/llm_config.py` hit the same file from the same
+process. Journal mode is a property of the file, not of the connection: the pragma converts an
+existing database once (preserving its contents) and is a no-op on every connection after that,
+so no migration step is involved and an image without the pragma still reads the converted file.
+That one-time conversion, unlike the no-op, does need the write lock and raises
+`database is locked` if another connection is mid-transaction — but it runs inside
+`LLMConfigDB.__init__`, before the `Singleton` metaclass publishes the instance or
+`get_llm_config_db` assigns it, and a failure there is self-healing: `_llm_config_db` is left
+`None`, so the next request constructs it again.
+WAL leaves `-wal` and `-shm` files beside the database on the `chat-data` PVC; the backup is a
+block-level GCE disk snapshot of that PVC, so they are captured with it and recovered on next
+open. `synchronous` and `busy_timeout` are left at their defaults (`FULL`, 5s) in both, so
+durability is unchanged — but availability on a read-only or full volume is not. The pragma is
+unconditional and `_create_connection` is the connection-cache factory, so if it raises, no
+connection exists at all and reads fail with it: a read-only database file or directory now
+fails at `attempt to write a readonly database` during construction instead of degrading to
+working reads, and a WAL database cannot be opened on a full filesystem because opening one
+creates a 32 KB `-shm`. Nothing is lost — everything reads again once the volume is writable —
+and that read-only condition has occurred on this PVC before (see the `CAP_DAC_OVERRIDE` note
+in `genetics-results-suite/k8s/deployments/chat-backend.yaml`), but `chat_history_db.py` has
+had the same property on the same PVC all along, so the service is already broken in those
+scenarios. The pod itself stays `Running` and `Ready` throughout — both probes hit `/healthz`
+(`chat_api.py`), which returns `{"status": "ok"}` without touching a database — so what fails is
+every request that reaches SQLite, not the pod.
+
+Reverting is a code change, not a data migration: drop the pragma and run
+`PRAGMA journal_mode = DELETE` once, which checkpoints the WAL back into the database and
+removes the sidecars. It needs *nothing* holding the file open, which a rolling restart does not
+give you — `get_llm_config_db`/`get_chat_history_db` open the file on the first request that
+touches it and cache the connection for the process lifetime, so any chat-backend pod that has
+served traffic still holds it, and against a running pod the pragma raises `database is locked`
+and leaves the sidecars in place. `replicas: 1` with a `Recreate` strategy only guarantees that
+no two pods hold the file at once. Scale the deployment down first:
+
+```bash
+kubectl -n genetics scale deploy/chat-backend --replicas=0
+# then run the pragma against /data/llm_config.db from a one-shot Job or debug pod
+# that mounts the chat-data PVC, and scale back up:
+kubectl -n genetics scale deploy/chat-backend --replicas=1
+```
+
+For `llm_config.db` a scaled-down chat-backend is the only holder. `chat_history.db` has a
+second one: the `analyze-conversations` CronJob
+(`genetics-results-suite/k8s/deployments/analyze-conversations-cronjob.yaml`) mounts the same
+PVC read-write and opens that database nightly at 02:30, so suspend it as well before reverting
+that file. A collision only makes the pragma fail loudly; it does not corrupt anything.
+
 ### CORS
 
 | Variable | Description | Default |
@@ -686,7 +740,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
-| `test_db.py` | Database operations, LLM-config write transaction safety |
+| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |

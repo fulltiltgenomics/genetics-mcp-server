@@ -6,6 +6,7 @@ import time
 from unittest.mock import patch
 
 import pytest
+from conftest import close_and_unlink
 from fastapi.testclient import TestClient
 
 from genetics_mcp_server.auth import admin_required, auth_required
@@ -29,7 +30,7 @@ def test_db():
 
     if ChatHistoryDB in Singleton._instances:
         del Singleton._instances[ChatHistoryDB]
-    os.unlink(db_path)
+    close_and_unlink(db, db_path)
 
 
 @pytest.fixture
@@ -377,6 +378,7 @@ class TestAdminDBMethods:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name
 
+        config_db = None
         try:
             config_db = LLMConfigDB(db_path)
             # insert with explicit timestamps for deterministic ordering
@@ -406,7 +408,7 @@ class TestAdminDBMethods:
         finally:
             if LLMConfigDB in Singleton._instances:
                 del Singleton._instances[LLMConfigDB]
-            os.unlink(db_path)
+            close_and_unlink(config_db, db_path)
 
     def test_list_sessions_with_comments(self, test_db):
         """list_sessions_with_comments returns only sessions with non-empty comments."""
@@ -469,7 +471,7 @@ class TestAdminFeedbackEndpoint:
         app.dependency_overrides.clear()
         if LLMConfigDB in Singleton._instances:
             del Singleton._instances[LLMConfigDB]
-        os.unlink(config_db_path)
+        close_and_unlink(config_db, config_db_path)
 
     def test_list_feedback_empty(self, feedback_client):
         client, _, _ = feedback_client

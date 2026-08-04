@@ -122,6 +122,10 @@ class LLMConfigDB(object, metaclass=Singleton):
     def _create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # under journal_mode=delete a reader is refused while a write is being applied (commit
+        # takes an EXCLUSIVE lock), and a writer's commit is refused while any reader still
+        # holds a read transaction. WAL removes both, as it already does for chat history
+        conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
     @property
