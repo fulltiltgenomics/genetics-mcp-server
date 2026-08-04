@@ -27,6 +27,9 @@ dev = [
     "pytest==9.0.3",
     "pytest-asyncio==1.3.0",
     "pytest-cov==7.1.0",
+    # pinned exactly: the seed -> order mapping is not stable across versions, so an
+    # unpinned dep would make a seed quoted in a bug report unreproducible
+    "pytest-randomly==4.1.0",
     "ruff==0.15.12",
     "xlsxwriter==3.2.9",
 ]

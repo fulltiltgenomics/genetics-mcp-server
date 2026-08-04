@@ -11,6 +11,30 @@ os.environ.setdefault("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 os.environ["REQUIRE_AUTH"] = "false"
 
 
+@pytest.fixture(autouse=True)
+def clear_settings_cache():
+    """Defence in depth, not the fix for the order-dependent auth failures — those came from
+    an importlib.reload() in test_temperature.py, which was removed. A stale lru_cache was
+    investigated and refuted as the cause.
+
+    Both handles are cleared because they can drift apart: production reads get_settings via
+    the package (`genetics_mcp_server.config`), while a reload of the submodule rebinds the
+    submodule's handle and leaves the package re-exporting the pre-reload function. Clearing
+    only one would miss whichever half a future reload leaves behind. Today they are the same
+    object, so the second clear is a no-op.
+    """
+    from genetics_mcp_server.config import get_settings as pkg_get_settings
+    from genetics_mcp_server.config.settings import get_settings as mod_get_settings
+
+    def clear_all():
+        for fn in (pkg_get_settings, mod_get_settings):
+            fn.cache_clear()
+
+    clear_all()
+    yield
+    clear_all()
+
+
 def close_and_unlink(db, db_path):
     """Both databases run in WAL mode, which leaves `-wal`/`-shm` sidecars next to the file.
     SQLite only removes them on the last clean close, and the cached connections outlive the

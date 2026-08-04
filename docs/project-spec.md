@@ -804,6 +804,13 @@ pytest
 pytest --cov=src/genetics_mcp_server  # with coverage
 ```
 
+`pytest-randomly` (pinned to 4.1.0 in the `dev` extra) shuffles test order on every run, so
+order-dependent state leaking between tests fails visibly instead of hiding behind the
+collection order. The seed is printed in the pytest header; reproduce a failure with
+`pytest --randomly-seed=<seed>`, or take the collection order out of the picture with
+`pytest -p no:randomly`. The pin is deliberate — the seed-to-order mapping is not stable
+across plugin versions, so a seed quoted in a bug report only means something at one version.
+
 ## Conversation Analysis
 
 `scripts/analyze_conversations.py` is an offline tool that reads the chat-history
