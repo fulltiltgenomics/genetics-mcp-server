@@ -411,7 +411,13 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def get_tool_descriptions(self) -> dict[str, ToolDescriptionVersion]:
         """Get the latest description for each tool."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        # every read in this class does this for the reason given in _discard_stale_transaction:
+        # a connection sees its own uncommitted rows, so a DML left pending on it would be read
+        # back here as if it had been stored. Defence in depth rather than a live hazard — every
+        # write accessor rolls back on failure, so none of them leaves one behind
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT t1.id, t1.tool_name, t1.description, t1.changed_by, t1.changed_at, t1.comment
@@ -437,7 +443,9 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def get_tool_description(self, tool_name: str) -> ToolDescriptionVersion | None:
         """Get the latest description for a specific tool."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, tool_name, description, changed_by, changed_at, comment
@@ -464,15 +472,27 @@ class LLMConfigDB(object, metaclass=Singleton):
         self, tool_name: str, description: str, user: str, comment: str | None = None
     ) -> ToolDescriptionVersion:
         """Save a new version of a tool description."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO tool_description_history (tool_name, description, changed_by, comment)
-            VALUES (?, ?, ?, ?)
-            """,
-            (tool_name, description, user, comment),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO tool_description_history (tool_name, description, changed_by, comment)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tool_name, description, user, comment),
+            )
+            # every write accessor in this class commits inside its try: python's legacy
+            # isolation_level opens a transaction before the DML, and both a failed statement and
+            # a COMMIT that raises leave it open, holding the write lock against every other
+            # writer of this file for the life of this thread's cached connection. _init_db is
+            # the one write not guarded this way — it runs from __init__, so a failure there
+            # aborts construction and no accessor ever inherits the connection
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
         return ToolDescriptionVersion(
             id=cursor.lastrowid,
@@ -487,7 +507,9 @@ class LLMConfigDB(object, metaclass=Singleton):
         self, tool_name: str, limit: int = 20
     ) -> list[ToolDescriptionVersion]:
         """Get recent versions of a specific tool description."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, tool_name, description, changed_by, changed_at, comment
@@ -514,7 +536,9 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def get_user_comments(self, user_id: str) -> list[UserComment]:
         """Get all comments for a user."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, comment, created_at
@@ -536,7 +560,9 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def list_all_user_comments(self) -> list[UserComment]:
         """List all user comments across all users, ordered by created_at DESC."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, comment, created_at
@@ -556,12 +582,18 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def add_user_comment(self, user_id: str, comment: str) -> UserComment:
         """Add a new comment for a user."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "INSERT INTO user_comments (user_id, comment) VALUES (?, ?)",
-            (user_id, comment),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO user_comments (user_id, comment) VALUES (?, ?)",
+                (user_id, comment),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return UserComment(
             id=cursor.lastrowid,
             user_id=user_id,
@@ -571,19 +603,27 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def delete_user_comment(self, user_id: str, comment_id: int) -> bool:
         """Delete a user's comment."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "DELETE FROM user_comments WHERE id = ? AND user_id = ?",
-            (comment_id, user_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM user_comments WHERE id = ? AND user_id = ?",
+                (comment_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     # user settings
 
     def get_user_setting(self, user_id: str, setting_key: str) -> UserSetting | None:
         """Get a user's latest value for a specific setting."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, setting_key, setting_value, changed_at, comment
@@ -608,7 +648,9 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def get_user_settings(self, user_id: str) -> dict[str, UserSetting]:
         """Get all latest settings for a user."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT h1.id, h1.user_id, h1.setting_key, h1.setting_value, h1.changed_at, h1.comment
@@ -645,15 +687,21 @@ class LLMConfigDB(object, metaclass=Singleton):
         comment: str | None = None,
     ) -> UserSetting:
         """Save a new version of a user setting."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO user_settings_history (user_id, setting_key, setting_value, comment)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, setting_key, setting_value, comment),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO user_settings_history (user_id, setting_key, setting_value, comment)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, setting_key, setting_value, comment),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
         return UserSetting(
             id=cursor.lastrowid,
@@ -666,15 +714,21 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def delete_user_setting(self, user_id: str, setting_key: str) -> bool:
         """Delete a user setting (soft delete by inserting empty value)."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO user_settings_history (user_id, setting_key, setting_value, comment)
-            VALUES (?, ?, '', 'Reset to default')
-            """,
-            (user_id, setting_key),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO user_settings_history (user_id, setting_key, setting_value, comment)
+                VALUES (?, ?, '', 'Reset to default')
+                """,
+                (user_id, setting_key),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return True
 
     # user instruction sets
@@ -702,18 +756,25 @@ class LLMConfigDB(object, metaclass=Singleton):
     def _discard_stale_transaction(conn: sqlite3.Connection) -> None:
         """Roll back a transaction an earlier failed write left open on this connection.
 
-        Python's legacy isolation_level opens a transaction before any DML, and no accessor
-        outside this section rolls one back, so a failure anywhere in this class leaves the
-        thread's cached connection inside a transaction that holds locks against every other
-        writer of the file. Whatever is pending is by construction an abandoned write: a write
-        accessor commits before it returns, so anything still open belongs to a call that
-        raised. The only code that runs many DMLs under a single commit is _init_db and the
-        migration it calls, and no accessor can ever be inside it — it runs only from __init__,
-        calls no accessor, commits before returning, and Singleton publishes the instance only
-        once __init__ has succeeded. The connection belongs to this thread alone, so discarding
-        what is pending can lose nothing a caller still expects to be saved. Without this,
-        BEGIN IMMEDIATE below would raise and keep raising for the life of the thread, and a
-        plain UPDATE would silently commit the abandoned write along with its own.
+        Defence in depth rather than a fix for a live leak: python's legacy isolation_level
+        opens a transaction before any DML, but every write accessor in this class rolls one
+        back on failure, so no ordinary failure path leaves one behind. What can still be found
+        open on entry is a rollback() that itself raised, or a DML composed directly on
+        db._conn rather than through an accessor (the tests do the latter deliberately). This
+        makes either survivable instead of permanent: the connection is cached for the life of
+        the thread, so an open transaction would otherwise hold locks against every other
+        writer of the file until that thread happened to commit something else, the BEGIN
+        IMMEDIATE in create_instruction_set and update_instruction_set would raise every time
+        it was reached, and a plain UPDATE would silently commit the abandoned write with its
+        own.
+
+        Discarding is safe because whatever is pending is by construction an abandoned write:
+        a write accessor commits before it returns, so anything still open belongs to a call
+        that raised. The only code that runs many DMLs under a single commit is _init_db and
+        the migration it calls, and no accessor can ever be inside it — it runs only from
+        __init__, calls no accessor, commits before returning, and Singleton publishes the
+        instance only once __init__ has succeeded. The connection belongs to this thread
+        alone, so discarding what is pending can lose nothing a caller still expects saved.
         """
         if conn.in_transaction:
             logger.warning("rolling back a transaction left open by an earlier failed write")
@@ -734,12 +795,12 @@ class LLMConfigDB(object, metaclass=Singleton):
         a user can hold more than it allows once it is lowered under them.
         """
         conn = self._conn
-        # a connection always sees its own uncommitted rows, so a write that raised earlier on
-        # this thread and left its DML pending would be read back here as if it had been saved,
-        # and the next write accessor would then roll it away again. Ending that transaction is
-        # the only way for a read to see committed state, and rolling back is the only end that
-        # keeps an abandoned write abandoned — committing it here would store what its caller
-        # was told had failed. It is exactly what the next write on this connection would do
+        # a connection always sees its own uncommitted rows, so a DML left pending on it would
+        # be read back here as if it had been saved. Defence in depth — every write accessor
+        # rolls back on failure, so none of them leaves one behind — but where something else
+        # does, ending that transaction is the only way for a read to see committed state,
+        # and rolling back is the only end that keeps an abandoned write abandoned: committing
+        # it here would store what its caller was told had failed
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
         # one row past the cap so an over-cap user can be reported without a second COUNT.
@@ -780,8 +841,8 @@ class LLMConfigDB(object, metaclass=Singleton):
         Archived sets stay readable so a chat message that recorded the id remains resolvable.
         """
         conn = self._conn
-        # as in list_instruction_sets: without this, a write that raised earlier on this thread
-        # is still visible to this connection and would be handed to a chat turn as a stored set
+        # as in list_instruction_sets: a DML left pending on this connection is still visible to
+        # it, and would otherwise be handed to a chat turn as a stored set
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
         cursor.execute(
@@ -1022,20 +1083,28 @@ class LLMConfigDB(object, metaclass=Singleton):
             else None
         )
 
-        cursor = self._conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO user_api_tokens (user_id, token_hash, token_prefix, name, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (user_id, token_hash, token_prefix, name, expires_at),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO user_api_tokens (user_id, token_hash, token_prefix, name, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, token_hash, token_prefix, name, expires_at),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.lastrowid, plaintext
 
     def list_api_tokens(self, user_id: str) -> list[UserApiToken]:
         """List all tokens for a user (active and inactive)."""
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT id, user_id, token_prefix, name, created_at, last_used_at,
@@ -1066,12 +1135,18 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def revoke_api_token(self, user_id: str, token_id: int) -> bool:
         """Revoke a token (sets is_active = 0)."""
-        cursor = self._conn.cursor()
-        cursor.execute(
-            "UPDATE user_api_tokens SET is_active = 0 WHERE id = ? AND user_id = ?",
-            (token_id, user_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE user_api_tokens SET is_active = 0 WHERE id = ? AND user_id = ?",
+                (token_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return cursor.rowcount > 0
 
     def validate_api_token(self, token: str) -> str | None:
@@ -1081,9 +1156,14 @@ class LLMConfigDB(object, metaclass=Singleton):
         API_TOKEN_TTL_DAYS after its last use, and every successful validation pushes the
         deadline forward. A token in regular use therefore never expires, while an abandoned
         or leaked-and-unnoticed one stops working without the user having to rotate it.
+
+        A token whose deadline cannot be written stays valid for this call: see the comment on
+        the update below.
         """
         token_hash = self._hash_token(token)
-        cursor = self._conn.cursor()
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
         cursor.execute(
             "SELECT id, user_id, created_at, last_used_at, expires_at FROM user_api_tokens "
             "WHERE token_hash = ? AND is_active = 1",
@@ -1111,11 +1191,32 @@ class LLMConfigDB(object, metaclass=Singleton):
         new_expires_at = (
             self._utc_stamp(now + timedelta(days=ttl_days)) if ttl_days > 0 else None
         )
-        cursor.execute(
-            "UPDATE user_api_tokens SET last_used_at = ?, expires_at = ? WHERE id = ?",
-            (self._utc_stamp(now), new_expires_at, row["id"]),
-        )
-        self._conn.commit()
+        try:
+            cursor.execute(
+                "UPDATE user_api_tokens SET last_used_at = ?, expires_at = ? WHERE id = ?",
+                (self._utc_stamp(now), new_expires_at, row["id"]),
+            )
+            conn.commit()
+        except Exception as exc:
+            # the only write in this class that does not propagate its failure. The SELECT above
+            # has already proved the token valid and unexpired; this update is bookkeeping, so
+            # letting a locked or full database reject the token would take every MCP request
+            # down with the write path. Dropping the update errs towards expiry rather than away
+            # from it — a deadline that stops being pushed forward eventually ends the token —
+            # and the rollback still releases the write lock the failed statement was holding
+            conn.rollback()
+            # no exc_info: this fires once per authenticated request, so a sustained lock or a
+            # full disk would put a stack trace in the log sink for every one of them. sqlite3
+            # raises from C, so that trace would be one of the two lines above and nothing more,
+            # saying nothing the exception text and the token id do not already say
+            logger.warning(
+                "could not record use of API token id=%s; its idle deadline was not extended: %s",
+                row["id"],
+                exc,
+            )
+        except BaseException:
+            conn.rollback()
+            raise
         return row["user_id"]
 
 

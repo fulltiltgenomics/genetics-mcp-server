@@ -1,6 +1,48 @@
 """Unit tests for database layer."""
 
+import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+
+import pytest
+from conftest import block_writes, unblock_writes
+
+USER = "user@example.com"
+
+
+@contextmanager
+def failing_commits(db, failures=1):
+    """Swap this thread's cached connection for one whose first `failures` commits raise.
+
+    SQLite can return SQLITE_BUSY from COMMIT itself, and unlike a failed statement that leaves
+    nothing pending, a failed commit leaves the write itself pending. `failures=1` lets the
+    connection recover afterwards, so a later accessor can show what it does with what was left.
+    """
+
+    class FailingCommit(sqlite3.Connection):
+        remaining = failures
+
+        def commit(self):
+            if self.remaining > 0:
+                self.remaining -= 1
+                raise sqlite3.OperationalError("database is locked")
+            super().commit()
+
+    ident = threading.get_ident()
+    healthy = db._connections[ident]
+    failing = sqlite3.connect(db.db_path, factory=FailingCommit)
+    failing.row_factory = sqlite3.Row
+    db._connections[ident] = failing
+    try:
+        yield failing
+    finally:
+        failing.close()
+        db._connections[ident] = healthy
+
+
+def token_row(db, token_id):
+    return next(t for t in db.list_api_tokens(USER) if t.id == token_id)
 
 
 class TestChatHistoryDB:
@@ -636,3 +678,246 @@ class TestUserApiTokenExpiry:
         llm_config_db.revoke_api_token("user@example.com", token_id)
 
         assert llm_config_db.validate_api_token(plaintext) is None
+
+
+# (label, table written, trigger event, setup -> ctx, call). Every one of these is a single DML
+# followed by a commit, so the setup exists only to give the DML a row to act on
+WRITE_ACCESSORS = [
+    (
+        "save_tool_description",
+        "tool_description_history",
+        "INSERT",
+        lambda db: None,
+        lambda db, ctx: db.save_tool_description("search_genes", "desc", USER),
+    ),
+    (
+        "add_user_comment",
+        "user_comments",
+        "INSERT",
+        lambda db: None,
+        lambda db, ctx: db.add_user_comment(USER, "note"),
+    ),
+    (
+        "delete_user_comment",
+        "user_comments",
+        "DELETE",
+        lambda db: db.add_user_comment(USER, "note").id,
+        lambda db, ctx: db.delete_user_comment(USER, ctx),
+    ),
+    (
+        "save_user_setting",
+        "user_settings_history",
+        "INSERT",
+        lambda db: None,
+        lambda db, ctx: db.save_user_setting(USER, "backend", "perplexity"),
+    ),
+    (
+        "delete_user_setting",
+        "user_settings_history",
+        "INSERT",
+        lambda db: db.save_user_setting(USER, "backend", "perplexity"),
+        lambda db, ctx: db.delete_user_setting(USER, "backend"),
+    ),
+    (
+        "create_api_token",
+        "user_api_tokens",
+        "INSERT",
+        lambda db: None,
+        lambda db, ctx: db.create_api_token(USER),
+    ),
+    (
+        "revoke_api_token",
+        "user_api_tokens",
+        "UPDATE",
+        lambda db: db.create_api_token(USER)[0],
+        lambda db, ctx: db.revoke_api_token(USER, ctx),
+    ),
+]
+
+WRITE_ACCESSOR_IDS = [case[0] for case in WRITE_ACCESSORS]
+
+
+class TestLLMConfigWriteTransactionSafety:
+    """Connections are cached per thread and server threads are long-lived, so a transaction one
+    call leaves open is inherited by every later call on that thread: it holds the write lock
+    against every other writer of this file, and turns a write the caller was told had failed
+    into a durable one as soon as anything else on that connection commits."""
+
+    @pytest.mark.parametrize(
+        "label,table,event,setup,call", WRITE_ACCESSORS, ids=WRITE_ACCESSOR_IDS
+    )
+    def test_a_failed_dml_leaves_no_open_transaction(
+        self, llm_config_db, label, table, event, setup, call
+    ):
+        ctx = setup(llm_config_db)
+        block_writes(llm_config_db, table, event=event)
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                call(llm_config_db, ctx)
+
+            assert llm_config_db._conn.in_transaction is False
+        finally:
+            unblock_writes(llm_config_db, table)
+
+    @pytest.mark.parametrize(
+        "label,table,event,setup,call", WRITE_ACCESSORS, ids=WRITE_ACCESSOR_IDS
+    )
+    def test_a_failed_commit_leaves_no_open_transaction(
+        self, llm_config_db, label, table, event, setup, call
+    ):
+        ctx = setup(llm_config_db)
+        with failing_commits(llm_config_db) as failing:
+            with pytest.raises(sqlite3.OperationalError):
+                call(llm_config_db, ctx)
+
+            assert failing.in_transaction is False
+
+    def test_a_failed_write_releases_the_lock_for_other_connections(self, llm_config_db):
+        """The damage is the retained lock: every other writer of this file — the instruction
+        sets, the settings store, the token paths — blocks on it until this thread happens to
+        commit something else, which for a server thread may be never."""
+        block_writes(llm_config_db, "user_settings_history")
+        try:
+            with pytest.raises(sqlite3.IntegrityError):
+                llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        finally:
+            unblock_writes(llm_config_db, "user_settings_history")
+
+        # timeout=0 so a held write lock reports itself at once instead of waiting it out
+        other = sqlite3.connect(llm_config_db.db_path, timeout=0)
+        try:
+            other.execute(
+                "INSERT INTO user_comments (user_id, comment) VALUES (?, ?)",
+                (USER, "from another connection"),
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    def test_a_write_that_could_not_commit_is_not_committed_by_the_next_accessor(
+        self, llm_config_db
+    ):
+        """A failed statement leaves nothing pending, but a failed COMMIT leaves the write
+        itself pending: the next accessor on this connection would store what its caller was
+        told had not been saved."""
+        with failing_commits(llm_config_db):
+            with pytest.raises(sqlite3.OperationalError):
+                llm_config_db.save_user_setting(USER, "backend", "perplexity")
+
+            llm_config_db.add_user_comment(USER, "note")
+
+        assert llm_config_db.get_user_setting(USER, "backend") is None
+        assert [c.comment for c in llm_config_db.get_user_comments(USER)] == ["note"]
+
+    def test_reads_do_not_return_rows_an_earlier_failed_write_left_pending(self, llm_config_db):
+        """A connection sees its own uncommitted rows, so anything a write left behind stays
+        visible to every later read on that thread until something ends the transaction. The raw
+        INSERT stands in for the DML of a write that raised after executing it."""
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        conn = llm_config_db._conn
+        conn.execute(
+            "INSERT INTO user_settings_history (user_id, setting_key, setting_value, changed_at) "
+            "VALUES (?, 'backend', 'never committed', '2099-01-01 00:00:00')",
+            (USER,),
+        )
+        assert conn.in_transaction
+
+        assert llm_config_db.get_user_setting(USER, "backend").setting_value == "europepmc"
+        assert llm_config_db.get_user_settings(USER)["backend"].setting_value == "europepmc"
+
+        # discarded rather than carried, so no later write can turn it into a stored value
+        assert conn.in_transaction is False
+        llm_config_db.add_user_comment(USER, "note")
+        assert llm_config_db.get_user_setting(USER, "backend").setting_value == "europepmc"
+
+
+class TestValidateApiTokenTransactionSafety:
+    """validate_api_token is the authentication hot path and the one write here that must not
+    turn a failed write into a failure: the token's validity is settled by its SELECT, and the
+    UPDATE only pushes the rolling idle deadline forward."""
+
+    @staticmethod
+    def _set_deadline(db, token_id, days_from_now):
+        stamp = db._utc_stamp(datetime.now(timezone.utc) + timedelta(days=days_from_now))
+        db._conn.execute(
+            "UPDATE user_api_tokens SET expires_at = ?, last_used_at = NULL WHERE id = ?",
+            (stamp, token_id),
+        )
+        db._conn.commit()
+        return stamp
+
+    def test_a_failed_deadline_update_still_authenticates(
+        self, llm_config_db, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        _, plaintext = llm_config_db.create_api_token(USER)
+        block_writes(llm_config_db, "user_api_tokens", event="UPDATE")
+        try:
+            with caplog.at_level("WARNING"):
+                assert llm_config_db.validate_api_token(plaintext) == USER
+
+            assert "could not record use of API token" in caplog.text
+            assert llm_config_db._conn.in_transaction is False
+        finally:
+            unblock_writes(llm_config_db, "user_api_tokens")
+
+    def test_a_failed_commit_still_authenticates_and_leaves_no_open_transaction(
+        self, llm_config_db, monkeypatch
+    ):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        _, plaintext = llm_config_db.create_api_token(USER)
+
+        with failing_commits(llm_config_db) as failing:
+            assert llm_config_db.validate_api_token(plaintext) == USER
+
+            assert failing.in_transaction is False
+
+    def test_a_deadline_that_could_not_commit_is_not_committed_by_the_next_accessor(
+        self, llm_config_db, monkeypatch
+    ):
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token(USER)
+        deadline = self._set_deadline(llm_config_db, token_id, 30)
+
+        with failing_commits(llm_config_db):
+            assert llm_config_db.validate_api_token(plaintext) == USER
+
+            llm_config_db.add_user_comment(USER, "note")
+
+        stored = token_row(llm_config_db, token_id)
+        assert llm_config_db._utc_stamp(stored.expires_at) == deadline
+        assert stored.last_used_at is None
+
+    def test_an_expired_token_is_still_rejected_after_a_failed_write(
+        self, llm_config_db, monkeypatch, caplog
+    ):
+        """A guard on the swallow rather than on the old bug: the expiry check runs before the
+        update, so widening what is tolerated must never reach it."""
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token(USER)
+        self._set_deadline(llm_config_db, token_id, -1)
+        block_writes(llm_config_db, "user_api_tokens", event="UPDATE")
+        try:
+            with caplog.at_level("WARNING"):
+                assert llm_config_db.validate_api_token(plaintext) is None
+
+            assert "could not record use of API token" not in caplog.text
+        finally:
+            unblock_writes(llm_config_db, "user_api_tokens")
+
+    def test_a_revoked_token_is_still_rejected_after_a_failed_write(
+        self, llm_config_db, monkeypatch, caplog
+    ):
+        """The other half of that guard: revocation is enforced by the SELECT's is_active = 1,
+        so a revoked token must never reach the update whose failure is tolerated."""
+        monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
+        token_id, plaintext = llm_config_db.create_api_token(USER)
+        assert llm_config_db.revoke_api_token(USER, token_id) is True
+        block_writes(llm_config_db, "user_api_tokens", event="UPDATE")
+        try:
+            with caplog.at_level("WARNING"):
+                assert llm_config_db.validate_api_token(plaintext) is None
+
+            assert "could not record use of API token" not in caplog.text
+        finally:
+            unblock_writes(llm_config_db, "user_api_tokens")

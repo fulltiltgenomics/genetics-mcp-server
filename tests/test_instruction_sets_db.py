@@ -13,6 +13,7 @@ import threading
 import uuid
 
 import pytest
+from conftest import block_writes, unblock_writes
 
 from genetics_mcp_server.db import llm_config_db as db_module
 from genetics_mcp_server.db.llm_config_db import (
@@ -53,22 +54,6 @@ def live_count(db, user_id):
         (user_id,),
     )
     return cursor.fetchone()[0]
-
-
-def block_writes(db, table, event="INSERT"):
-    """Make writes to a table abort, standing in for a disk error or a lock timeout.
-
-    RAISE(ABORT) undoes the offending statement and leaves the transaction open, which is
-    exactly what SQLite does to a failed write in real life.
-    """
-    db._conn.execute(
-        f"CREATE TRIGGER block_{table} BEFORE {event} ON {table} "
-        "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
-    )
-
-
-def unblock_writes(db, table):
-    db._conn.execute(f"DROP TRIGGER IF EXISTS block_{table}")
 
 
 def history_of(db, set_id):

@@ -57,6 +57,23 @@ def llm_config_db():
     os.unlink(db_path)
 
 
+def block_writes(db, table, event="INSERT"):
+    """Make writes to a table abort, standing in for a disk error or a lock timeout.
+
+    RAISE(ABORT) undoes the offending statement and leaves the transaction open, which is
+    exactly what SQLite does to a failed write in real life. CREATE TRIGGER is not DML, so
+    python does not open a transaction for it and it is committed as it runs.
+    """
+    db._conn.execute(
+        f"CREATE TRIGGER block_{table} BEFORE {event} ON {table} "
+        "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+    )
+
+
+def unblock_writes(db, table):
+    db._conn.execute(f"DROP TRIGGER IF EXISTS block_{table}")
+
+
 @pytest.fixture
 def test_client():
     """Create a FastAPI TestClient for testing API endpoints."""
