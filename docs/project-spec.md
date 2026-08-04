@@ -72,7 +72,8 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_gene_disease_associations` | Get Mendelian disease relationships from ClinGen/GENCC |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
 | `get_exome_results_by_phenotype` | Get exome variant results for a specific phenotype across all genes (genebass and IBD) |
-| `get_gene_based_results` | Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA |
+| `get_gene_based_results` | Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA (genebass rows filtered to p < 1e-4) |
+| `get_gene_based_results_by_phenotype` | Get the complete unfiltered gene burden results for one phenotype — every gene and annotation class, no p-value cutoff |
 | `get_nearest_genes` | Get genes nearest to a variant position |
 | `get_genes_in_region` | Get all genes in a genomic region |
 

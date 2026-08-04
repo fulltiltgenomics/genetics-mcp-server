@@ -502,11 +502,28 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_gene_based_results",
         "category": "api",
-        "description": "Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA datasets. Returns gene-based association statistics aggregated at the gene level. Different from get_exome_results_by_gene which returns individual variant-level exome results.",
+        "description": "Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA datasets. Returns gene-based association statistics aggregated at the gene level. Different from get_exome_results_by_gene which returns individual variant-level exome results. genebass rows here are limited to p<1e-4; for a gene's result in a specific trait regardless of significance use get_gene_based_results_by_phenotype, or the gene_burden_results table in the database (unfiltered) for batch queries across many genes or traits.",
         "parameters": {
             "gene": {
                 "type": "string",
                 "description": "Gene symbol or comma-separated list of gene symbols (e.g., 'APOE', 'BRCA1,TP53')",
+                "required": True,
+            },
+        },
+    },
+    {
+        "name": "get_gene_based_results_by_phenotype",
+        "category": "api",
+        "description": "Get the complete, unfiltered gene burden test results for one phenotype: every gene and annotation class tested in that trait, with no p-value cutoff. Use this to check whether a gene was tested in a trait and what the result was even when it is not significant, or to rank all genes within one trait. For a gene across many traits use get_gene_based_results instead.",
+        "parameters": {
+            "resource": {
+                "type": "string",
+                "description": "Gene-based data resource ('genebass', 'schema', 'bipex', 'ibd')",
+                "required": True,
+            },
+            "phenotype": {
+                "type": "string",
+                "description": "Phenotype or study code (e.g. 'categorical_41210_both_sexes_S068_', 'schizophrenia', 'bipolar_disorder', 'inflammatory_bowel_disease'). These are trait_original values from the burden results, which for IBD spell the disease out rather than using the IBD/UC/CD codes the exome variant results use",
                 "required": True,
             },
         },
@@ -1614,6 +1631,11 @@ def register_mcp_tools(
     async def get_gene_based_results(gene: str) -> dict:
         """Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA."""
         return await executor.get_gene_based_results(gene)
+
+    @mcp.tool()
+    async def get_gene_based_results_by_phenotype(resource: str, phenotype: str) -> dict:
+        """Get the complete unfiltered gene burden results for one phenotype."""
+        return await executor.get_gene_based_results_by_phenotype(resource, phenotype)
 
     if "get_phenotype_report" not in _disabled:
 
