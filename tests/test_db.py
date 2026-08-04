@@ -2,7 +2,7 @@
 
 import sqlite3
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -586,6 +586,254 @@ class TestLLMConfigDB:
         settings = llm_config_db.get_user_settings("user@example.com")
         # deleted settings should not appear
         assert "backend" not in settings
+
+
+class TestSameSecondTiebreak:
+    """changed_at is CURRENT_TIMESTAMP, whose resolution is one second, so any pair of saves to
+    the same key inside that second ties on it. Resolving "latest" by timestamp alone therefore
+    leaves the winner to the query plan, and a setting the user changed twice in quick succession
+    reverts to the first value with no error anywhere. A save is a single INSERT behind one PUT of
+    /llm-config/user/settings/{key}, so nothing spaces two writes further apart than a round trip.
+
+    The rows are forced into one second with SQL rather than by racing the clock — sleeping to
+    land two writes in the same second is the one thing a timing test cannot arrange.
+    """
+
+    STAMP = "2026-01-01 00:00:00"
+
+    @staticmethod
+    def tie_timestamps(db, table, stamp=STAMP):
+        """Collapse every row of a history table into the same second."""
+        db._conn.execute(f"UPDATE {table} SET changed_at = ?", (stamp,))
+        db._conn.commit()
+
+    @staticmethod
+    def unstamp(db, table, where, params):
+        """Blank the timestamps of the matching rows. changed_at carries no NOT NULL, so a row
+        that reached the table by any route other than the INSERTs in this class — a migration,
+        a manual fix — can have one."""
+        db._conn.execute(f"UPDATE {table} SET changed_at = NULL WHERE {where}", params)
+        db._conn.commit()
+
+    @staticmethod
+    @contextmanager
+    def unordered_rows_reversed(db):
+        """SQLite's own testing pragma: emit the rows of any select whose result order is
+        unconstrained in the reverse of the order this build would otherwise pick. That is one
+        alternative order, not every order the engine is free to choose, but it is exactly the
+        degree of freedom the pre-tiebreak queries left open — they returned every row tied for
+        the newest second and let the loop keep whichever arrived last — and flipping it flips
+        their answer. The fix removes the freedom instead of pinning it down: one row per key
+        comes back, so there is no order left for the pragma to change.
+        """
+        db._conn.execute("PRAGMA reverse_unordered_selects = ON")
+        try:
+            yield
+        finally:
+            db._conn.execute("PRAGMA reverse_unordered_selects = OFF")
+
+    def test_get_user_setting_returns_the_later_of_two_saves_in_one_second(self, llm_config_db):
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        later = llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+
+        for _ in range(5):
+            got = llm_config_db.get_user_setting(USER, "backend")
+            assert (got.setting_value, got.id) == ("perplexity", later.id)
+
+    def test_get_user_setting_returns_the_last_of_a_run_of_saves_in_one_second(
+        self, llm_config_db
+    ):
+        """One PUT stores one version, so a client that saves on every change of a control writes
+        the whole run of them into a second or two."""
+        saved = [llm_config_db.save_user_setting(USER, "backend", f"v{i}") for i in range(6)]
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+
+        for _ in range(5):
+            got = llm_config_db.get_user_setting(USER, "backend")
+            assert (got.setting_value, got.id) == ("v5", saved[-1].id)
+
+    def test_get_user_settings_returns_the_later_of_two_saves_in_one_second(self, llm_config_db):
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        later = llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        llm_config_db.save_user_setting(USER, "verbosity", "brief")
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+
+        # both plans, because which one runs is not this code's to decide
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                for _ in range(5):
+                    settings = llm_config_db.get_user_settings(USER)
+                    assert settings["backend"].setting_value == "perplexity"
+                    assert settings["backend"].id == later.id
+                    assert settings["verbosity"].setting_value == "brief"
+
+    def test_both_settings_accessors_pick_the_same_winner_within_one_second(self, llm_config_db):
+        """The two are read on different request paths for the same value, so they disagreeing
+        is a setting that reads back differently depending on which endpoint was called."""
+        for value in ("a", "b", "c"):
+            llm_config_db.save_user_setting(USER, "backend", value)
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                one = llm_config_db.get_user_setting(USER, "backend")
+                many = llm_config_db.get_user_settings(USER)["backend"]
+                assert one.id == many.id
+                assert one.setting_value == many.setting_value == "c"
+
+    def test_every_key_gets_its_own_winner_when_several_have_several_tied_versions(
+        self, llm_config_db
+    ):
+        """One key with a tie is the easy case. Several keys each carrying several tied rows is
+        where a rewrite that resolves the tie per row rather than per key goes wrong quietly: it
+        returns two rows for one key and the loop keeps the wrong one, or none for another and
+        the key vanishes. A second user writing the same keys in the same second is here because
+        the winner is per (user, key), not per key."""
+        expected = {}
+        for round_ in range(4):
+            for key in ("backend", "verbosity", "model", "profile"):
+                expected[key] = llm_config_db.save_user_setting(USER, key, f"{key}-{round_}")
+        for key in ("backend", "verbosity"):
+            llm_config_db.save_user_setting("other@example.com", key, "other user's value")
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                settings = llm_config_db.get_user_settings(USER)
+                assert set(settings) == set(expected)
+                for key, last_save in expected.items():
+                    assert settings[key].id == last_save.id
+                    assert settings[key].setting_value == f"{key}-3"
+                    assert settings[key].user_id == USER
+                    assert llm_config_db.get_user_setting(USER, key).id == last_save.id
+                other = llm_config_db.get_user_settings("other@example.com")
+                assert {k: v.setting_value for k, v in other.items()} == {
+                    "backend": "other user's value",
+                    "verbosity": "other user's value",
+                }
+
+    def test_a_reset_in_the_same_second_as_a_save_wins(self, llm_config_db):
+        """delete_user_setting is a soft delete that appends an empty value, so a reset landing in
+        the same second as the save it followed still beats it, exactly as any later write does:
+        get_user_setting reads the empty value back and get_user_settings drops the key, rather
+        than resurrecting the value the user just cleared."""
+        llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        llm_config_db.delete_user_setting(USER, "backend")
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+
+        for _ in range(5):
+            assert llm_config_db.get_user_setting(USER, "backend").setting_value == ""
+            assert "backend" not in llm_config_db.get_user_settings(USER)
+
+    def test_get_tool_description_returns_the_later_of_two_saves_in_one_second(
+        self, llm_config_db
+    ):
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        llm_config_db.save_tool_description("search_genes", "Version 2", USER)
+        self.tie_timestamps(llm_config_db, "tool_description_history")
+
+        for _ in range(5):
+            assert llm_config_db.get_tool_description("search_genes").description == "Version 2"
+
+    def test_get_tool_descriptions_returns_the_later_of_two_saves_in_one_second(
+        self, llm_config_db
+    ):
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        llm_config_db.save_tool_description("search_genes", "Version 2", USER)
+        llm_config_db.save_tool_description("search_variants", "Only version", USER)
+        self.tie_timestamps(llm_config_db, "tool_description_history")
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                for _ in range(5):
+                    descriptions = llm_config_db.get_tool_descriptions()
+                    assert descriptions["search_genes"].description == "Version 2"
+                    assert descriptions["search_variants"].description == "Only version"
+
+    def test_every_tool_gets_its_own_winner_when_several_have_several_tied_versions(
+        self, llm_config_db
+    ):
+        """As for settings: one row per tool, the last one written, with several tools tied at
+        once."""
+        tools = ("search_genes", "search_variants", "get_phewas", "run_query")
+        for round_ in range(4):
+            for tool in tools:
+                llm_config_db.save_tool_description(tool, f"{tool}-{round_}", USER)
+        self.tie_timestamps(llm_config_db, "tool_description_history")
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                descriptions = llm_config_db.get_tool_descriptions()
+                assert {n: d.description for n, d in descriptions.items()} == {
+                    tool: f"{tool}-3" for tool in tools
+                }
+                for tool in tools:
+                    assert descriptions[tool].id == llm_config_db.get_tool_description(tool).id
+
+    def test_a_key_with_only_blank_timestamps_drops_out_and_leaves_the_rest_readable(
+        self, llm_config_db
+    ):
+        """MAX ignores NULLs, so a key with nothing but blank timestamps has no newest row to
+        match and is left out — the behaviour the plural accessors had before the tiebreak, and
+        the only one that keeps the other keys readable, since fromisoformat cannot parse None.
+        The singular accessors have no such filter and raise on the same row."""
+        llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        llm_config_db.save_user_setting(USER, "verbosity", "brief")
+        llm_config_db.save_tool_description("search_genes", "Version 1", USER)
+        llm_config_db.save_tool_description("search_variants", "Only version", USER)
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+        self.tie_timestamps(llm_config_db, "tool_description_history")
+        self.unstamp(llm_config_db, "user_settings_history", "setting_key = ?", ("backend",))
+        self.unstamp(llm_config_db, "tool_description_history", "tool_name = ?", ("search_genes",))
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                settings = llm_config_db.get_user_settings(USER)
+                assert "backend" not in settings
+                assert settings["verbosity"].setting_value == "brief"
+                descriptions = llm_config_db.get_tool_descriptions()
+                assert "search_genes" not in descriptions
+                assert descriptions["search_variants"].description == "Only version"
+
+        with pytest.raises(TypeError):
+            llm_config_db.get_user_setting(USER, "backend")
+        with pytest.raises(TypeError):
+            llm_config_db.get_tool_description("search_genes")
+
+    def test_a_blank_timestamp_does_not_outrank_a_real_one_in_the_same_second(self, llm_config_db):
+        """The unstamped row here is the highest id of the three, so a tiebreak that fell back to
+        id alone would hand it the key — and then fail to parse its timestamp. Both accessors have
+        to pick the newest *stamped* row instead, and the same one."""
+        llm_config_db.save_user_setting(USER, "backend", "europepmc")
+        stamped_winner = llm_config_db.save_user_setting(USER, "backend", "perplexity")
+        unstamped = llm_config_db.save_user_setting(USER, "backend", "never stamped")
+        self.tie_timestamps(llm_config_db, "user_settings_history")
+        self.unstamp(llm_config_db, "user_settings_history", "id = ?", (unstamped.id,))
+        assert unstamped.id > stamped_winner.id
+
+        for reversed_rows in (False, True):
+            with self.unordered_rows_reversed(llm_config_db) if reversed_rows else nullcontext():
+                assert llm_config_db.get_user_settings(USER)["backend"].id == stamped_winner.id
+                assert llm_config_db.get_user_setting(USER, "backend").id == stamped_winner.id
+
+    def test_tool_description_history_leads_with_the_version_in_force(self, llm_config_db):
+        """The listing is the version history an admin reads — the endpoint serves it "for
+        audit/rollback reference" — so its head disagreeing with get_tool_description means the
+        row presented as current is not the one that accessor returns. The LIMIT is the sharper
+        edge: a tie can push the newest versions off a page instead of the oldest."""
+        for i in range(5):
+            llm_config_db.save_tool_description("search_genes", f"Version {i}", USER)
+        self.tie_timestamps(llm_config_db, "tool_description_history")
+
+        for _ in range(5):
+            history = llm_config_db.get_tool_description_history("search_genes")
+            assert [v.description for v in history] == [f"Version {i}" for i in reversed(range(5))]
+            assert history[0].description == (
+                llm_config_db.get_tool_description("search_genes").description
+            )
+            paged = llm_config_db.get_tool_description_history("search_genes", limit=2)
+            assert [v.description for v in paged] == ["Version 4", "Version 3"]
 
 
 class TestLLMConfigJournalMode:

@@ -740,7 +740,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
-| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys) |
+| `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description and user-setting accessors (`changed_at` has one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |

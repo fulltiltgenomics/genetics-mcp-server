@@ -422,15 +422,34 @@ class LLMConfigDB(object, metaclass=Singleton):
         # write accessor rolls back on failure, so none of them leaves one behind
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # changed_at is CURRENT_TIMESTAMP, which has one-second resolution, so two saves to the
+        # same tool inside one second are indistinguishable by it alone. Matching on MAX(changed_at)
+        # alone returns *both* tied rows and the loop below keeps whichever the query plan happened
+        # to emit last, which is not the newer one under any rule the engine promises to hold, so
+        # the admin listing can show a superseded version as current. MAX(id) over the tied group
+        # reduces that to one row per tool, ordered by (changed_at, id): id is an AUTOINCREMENT
+        # sequence, so it strictly increases with insertion order even when the clock does not move.
+        # Written as a grouped IN over the materialised MAX(changed_at) group rather than as a
+        # per-row correlated subquery: this table is append-only and never pruned, and the
+        # correlated form costs a full table scan that reads and discards every row's description
+        # blob — measured an order of magnitude slower by 60k rows, and widening.
+        # A tool whose rows all carry a NULL changed_at drops out here, as it did before this
+        # tiebreak: MAX ignores NULLs so nothing joins, and a NULL winner would raise in
+        # fromisoformat below and fail the whole listing
         cursor.execute(
             """
-            SELECT t1.id, t1.tool_name, t1.description, t1.changed_by, t1.changed_at, t1.comment
-            FROM tool_description_history t1
-            INNER JOIN (
-                SELECT tool_name, MAX(changed_at) as max_changed_at
-                FROM tool_description_history
-                GROUP BY tool_name
-            ) t2 ON t1.tool_name = t2.tool_name AND t1.changed_at = t2.max_changed_at
+            SELECT id, tool_name, description, changed_by, changed_at, comment
+            FROM tool_description_history
+            WHERE id IN (
+                SELECT MAX(t1.id)
+                FROM tool_description_history t1
+                INNER JOIN (
+                    SELECT tool_name, MAX(changed_at) AS max_changed_at
+                    FROM tool_description_history
+                    GROUP BY tool_name
+                ) t2 ON t1.tool_name = t2.tool_name AND t1.changed_at = t2.max_changed_at
+                GROUP BY t1.tool_name
+            )
         """
         )
         result = {}
@@ -455,7 +474,7 @@ class LLMConfigDB(object, metaclass=Singleton):
             SELECT id, tool_name, description, changed_by, changed_at, comment
             FROM tool_description_history
             WHERE tool_name = ?
-            ORDER BY changed_at DESC
+            ORDER BY changed_at DESC, id DESC
             LIMIT 1
             """,
             (tool_name,),
@@ -514,12 +533,16 @@ class LLMConfigDB(object, metaclass=Singleton):
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # id DESC for the same reason as in get_tool_description, which this listing has to agree
+        # with: versions saved in the same second tie on changed_at, so without it the row shown
+        # first is not necessarily the one in force, and the LIMIT can drop the newest version
+        # rather than the oldest
         cursor.execute(
             """
             SELECT id, tool_name, description, changed_by, changed_at, comment
             FROM tool_description_history
             WHERE tool_name = ?
-            ORDER BY changed_at DESC
+            ORDER BY changed_at DESC, id DESC
             LIMIT ?
             """,
             (tool_name, limit),
@@ -628,12 +651,18 @@ class LLMConfigDB(object, metaclass=Singleton):
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # id DESC is what actually decides this: changed_at comes from CURRENT_TIMESTAMP and has
+        # one-second resolution, so two saves to the same key inside one second tie on it and
+        # LIMIT 1 keeps whichever the scan reached first — in practice the *older* row, so a
+        # setting the user changed twice in quick succession silently reverts to the first value.
+        # id is an AUTOINCREMENT sequence, so it orders the tied rows by the order they were
+        # written even when the clock has not moved
         cursor.execute(
             """
             SELECT id, user_id, setting_key, setting_value, changed_at, comment
             FROM user_settings_history
             WHERE user_id = ? AND setting_key = ?
-            ORDER BY changed_at DESC
+            ORDER BY changed_at DESC, id DESC
             LIMIT 1
             """,
             (user_id, setting_key),
@@ -655,17 +684,41 @@ class LLMConfigDB(object, metaclass=Singleton):
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # as in get_user_setting, and it must agree with it: matching on MAX(changed_at) alone
+        # returns every row that ties for the newest second, and the loop below then keeps
+        # whichever of them the query plan emitted last. That is not a rule the engine promises
+        # to hold — the same rows come back in the opposite order under a different plan — so the
+        # value read here could disagree both with get_user_setting and with itself between calls.
+        # MAX(id) over the tied group leaves exactly one row per key, the (changed_at, id) winner,
+        # so the later write wins and row order decides nothing. The tiebreak stays inside the
+        # MAX(changed_at) group rather than becoming a per-row correlated subquery so that both
+        # sides of the join are built by seeking idx_user_settings_history_user on this user_id,
+        # and nobody else's rows are touched. How far into that index each side seeks, and which
+        # side drives the join, is the planner's choice and moves with the table statistics —
+        # nothing in this project runs ANALYZE, so deployed databases have none at all — so no
+        # particular plan is being relied on here. Correlating the tiebreak instead re-runs an
+        # ORDER BY ... LIMIT 1 lookup once per row the user ever wrote, on a table that is never
+        # pruned: measured at 10k rows for one user, ~20 ms against 3-6 ms for this shape
+        # depending on statistics, and the endpoint runs it once per request. A key whose rows all
+        # carry a NULL changed_at drops out here, as it did before this tiebreak: MAX ignores NULLs
+        # so nothing joins, and a NULL winner would raise in fromisoformat below and fail the
+        # whole settings read
         cursor.execute(
             """
-            SELECT h1.id, h1.user_id, h1.setting_key, h1.setting_value, h1.changed_at, h1.comment
-            FROM user_settings_history h1
-            INNER JOIN (
-                SELECT setting_key, MAX(changed_at) as max_changed_at
-                FROM user_settings_history
-                WHERE user_id = ?
-                GROUP BY setting_key
-            ) h2 ON h1.setting_key = h2.setting_key AND h1.changed_at = h2.max_changed_at
-            WHERE h1.user_id = ?
+            SELECT id, user_id, setting_key, setting_value, changed_at, comment
+            FROM user_settings_history
+            WHERE id IN (
+                SELECT MAX(h1.id)
+                FROM user_settings_history h1
+                INNER JOIN (
+                    SELECT setting_key, MAX(changed_at) AS max_changed_at
+                    FROM user_settings_history
+                    WHERE user_id = ?
+                    GROUP BY setting_key
+                ) h2 ON h1.setting_key = h2.setting_key AND h1.changed_at = h2.max_changed_at
+                WHERE h1.user_id = ?
+                GROUP BY h1.setting_key
+            )
             """,
             (user_id, user_id),
         )
