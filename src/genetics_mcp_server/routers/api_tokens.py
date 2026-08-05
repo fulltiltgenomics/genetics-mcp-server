@@ -2,7 +2,6 @@
 
 import hmac
 import logging
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -14,8 +13,6 @@ from genetics_mcp_server.db import get_llm_config_db
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-_internal_api_secret = os.environ.get("INTERNAL_API_SECRET", "")
 
 
 class TokenCreateRequest(BaseModel):
@@ -109,10 +106,13 @@ async def validate_token(body: TokenValidateRequest, request: Request):
     # here as an alternative — a client-suppliable header is not an authenticator, and no
     # caller ever sent it, so the shared secret is now the only way in.
     is_internal = False
-    if _internal_api_secret:
+    from genetics_mcp_server.config import get_settings
+
+    internal_api_secret = get_settings().internal_api_secret
+    if internal_api_secret:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
-            is_internal = hmac.compare_digest(auth_header[7:], _internal_api_secret)
+            is_internal = hmac.compare_digest(auth_header[7:], internal_api_secret)
     if not is_internal:
         raise HTTPException(status_code=403, detail="Internal endpoint")
 

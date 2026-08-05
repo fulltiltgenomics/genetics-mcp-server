@@ -95,6 +95,9 @@ class ToolExecutor:
         public_api_url: str | None = None,
         bigquery_api_url: str | None = None,
     ):
+        from genetics_mcp_server.config.settings import get_settings
+
+        settings = get_settings()
         self.base_url = api_base_url or os.environ.get(
             "GENETICS_API_URL", "http://0.0.0.0:2000/api"
         )
@@ -105,7 +108,7 @@ class ToolExecutor:
         # BigQuery API URL for direct SQL queries
         self.bigquery_url = bigquery_api_url or os.environ.get("BIGQUERY_API_URL")
         # authenticate to results-api with shared secret if configured
-        api_secret = os.environ.get("INTERNAL_API_SECRET", "")
+        api_secret = settings.internal_api_secret
         headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
         self.client = _ResilientAsyncClient(timeout=300.0, headers=headers)
         # separate client for third-party calls: carries no default auth so the
@@ -114,9 +117,7 @@ class ToolExecutor:
         self.external_client = _ResilientAsyncClient(timeout=30.0)
         # shares external_client so UniProt/EBI outages arrive as the synthetic 503
         # rather than raising, and so no internal auth header is ever sent to them
-        from genetics_mcp_server.config.settings import get_settings
-
-        self.uniprot = UniProtClient(self.external_client, get_settings())
+        self.uniprot = UniProtClient(self.external_client, settings)
         # lazily-fetched universe of expression resources (e.g. gtex, hpa), used to
         # tell "gene absent from this resource" apart from "resource unavailable"
         self._expression_resources: list[str] | None = None

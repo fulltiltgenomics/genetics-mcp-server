@@ -34,6 +34,13 @@ class Settings:
         default_factory=lambda: os.environ.get("OPENAI_API_KEY")
     )
 
+    # shared secret for service-to-service calls (bearer form of auth_required, and the
+    # /tokens/validate caller). read here rather than at each use site so the four consumers
+    # cannot disagree, and so no value can be snapshotted before config/settings.py's load_dotenv()
+    internal_api_secret: str = field(
+        default_factory=lambda: os.environ.get("INTERNAL_API_SECRET", "")
+    )
+
     # web search
     tavily_api_key: str | None = field(
         default_factory=lambda: os.environ.get("TAVILY_API_KEY")

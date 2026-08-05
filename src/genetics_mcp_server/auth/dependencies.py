@@ -2,16 +2,12 @@
 
 import hmac
 import logging
-import os
 
 from fastapi import Depends, HTTPException, Request
 
 from genetics_mcp_server.auth.core import get_authenticated_user
 
 logger = logging.getLogger(__name__)
-
-_internal_api_secret = os.environ.get("INTERNAL_API_SECRET", "")
-
 
 def auth_is_required() -> bool:
     """Whether to require the X-Goog-Authenticated-User-Email header (set by IAP or oauth2-proxy).
@@ -50,10 +46,12 @@ async def auth_required(request: Request) -> str | None:
     # accept a bare `X-Internal-MCP-Call: true` request header, which any client could send —
     # full authentication for anyone the auth-gateway forgot to strip it for. Nothing in the
     # stack ever sent that header; the real internal callers all use the bearer secret.
-    if _internal_api_secret:
+    from genetics_mcp_server.config import get_settings
+    internal_api_secret = get_settings().internal_api_secret
+    if internal_api_secret:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer ") and hmac.compare_digest(
-            auth_header[7:], _internal_api_secret
+            auth_header[7:], internal_api_secret
         ):
             return "mcp-tool"
 

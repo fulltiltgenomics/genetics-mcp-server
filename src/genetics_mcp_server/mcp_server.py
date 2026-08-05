@@ -242,7 +242,7 @@ def _validate_user_token(token: str) -> bool:
         return False
     try:
         import httpx
-        internal_secret = os.environ.get("INTERNAL_API_SECRET", "")
+        internal_secret = get_settings().internal_api_secret
         headers = {"Authorization": f"Bearer {internal_secret}"} if internal_secret else {}
         resp = httpx.post(
             f"{chat_url}/v1/tokens/validate",
