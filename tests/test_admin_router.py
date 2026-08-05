@@ -697,6 +697,50 @@ class TestAdminFeedbackPaginationStability:
         assert dialog == [c.comment for c in config_db.list_all_user_comments()]
         assert dialog == [f"dialog comment {i}" for i in reversed(range(11))]
 
+    def test_both_sources_stamp_created_at_in_the_same_shape(self, tied_feedback):
+        """The ni9 invariant, which nothing else guards (genetics-results-suite-uvh 5).
+
+        The merge sorts on the isoformat STRING, so the two sources' stamps have to be
+        lexicographically comparable. If one carried a +00:00 offset and the other did not, the
+        two would still sort consistently — every offset-bearing string sorts above every bare one
+        — so the pagination tests above would stay green while the feed silently grouped by source
+        instead of by time. The visible half of the same invariant is on the client: JS parses a
+        bare 'T12:00:00' as LOCAL time and the offset form as UTC, so a half-move shifts one
+        source's rendered times by the viewer's offset (genetics-results-suite-eis).
+        """
+        client, _, _ = tied_feedback
+
+        items = client.get("/chat/v1/admin/feedback?limit=50").json()["items"]
+        by_source = {}
+        for item in items:
+            by_source.setdefault(item["source"], []).append(item["created_at"])
+        assert set(by_source) == {"feedback_dialog", "session_comment"}
+
+        def shape(stamp: str) -> bool:
+            return stamp.endswith("+00:00")
+
+        shapes = {source: {shape(v) for v in vals} for source, vals in by_source.items()}
+        assert shapes["feedback_dialog"] == shapes["session_comment"], (
+            f"the two sources disagree on the timestamp shape: {shapes}"
+        )
+
+    def test_a_tie_orders_across_sources_rather_than_grouping_by_source(self, feedback_client):
+        """The other half of the same invariant: with equal stamps the tiebreak must interleave
+        the two sources, not stack one above the other."""
+        client, chat_db, config_db = feedback_client
+        config_db.add_user_comment("a@example.com", "dialog comment")
+        s = chat_db.create_session("b@example.com")
+        chat_db.update_session(s.id, "b@example.com", comment="session comment")
+        config_db._conn.execute("UPDATE user_comments SET created_at = ?", (self.STAMP,))
+        config_db._conn.commit()
+        chat_db._conn.execute("UPDATE chat_sessions SET created_at = ?", (self.STAMP,))
+        chat_db._conn.commit()
+
+        items = client.get("/chat/v1/admin/feedback?limit=50").json()["items"]
+        assert len(items) == 2
+        # both stamps are the same instant, so they must compare equal as strings
+        assert items[0]["created_at"] == items[1]["created_at"]
+
 
 class TestAdminSessionsAnalysisJoin:
     """DB-level tests for the conversation_analysis join in list_all_sessions
