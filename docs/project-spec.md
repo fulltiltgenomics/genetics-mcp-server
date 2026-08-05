@@ -895,8 +895,19 @@ its admin UI on could contradict the `admin_required` gate on the endpoints behi
 (`genetics-results-suite-pol`). The global is gone rather than aliased, so a test still patching
 `auth.dependencies._require_auth` now fails loudly; use `conftest.settings_env(REQUIRE_AUTH=…)`,
 which patches the environment and rebuilds the cached `Settings`. Routing the gate through
-`Settings` also means it sees `.env` (loaded by `config/settings.py`) rather than only the real
-environment — in k8s the variable is set in the container env, so the value is unchanged there.
+`Settings` does **not** change which sources are visible: `chat_api.py` calls `load_dotenv()`
+before it imports the auth dependencies and is their only importer, so the old global already saw
+`.env`. What it changes is that a `Settings` instance cannot exist before `config/settings.py`'s own
+module-level `load_dotenv()`, so the ordering hazard is structurally impossible rather than merely
+untriggered. In k8s the variable is set in the container env either way.
+
+`INTERNAL_API_SECRET` now goes through the same field, `settings.internal_api_secret`
+(`genetics-results-suite-avt`). It had four independent readers — `auth/dependencies.py` and
+`routers/api_tokens.py` snapshotted it at import, `tools/executor.py` and `mcp_server.py` read it
+live — so the four could disagree. It was fail-closed throughout (an empty secret skips the bearer
+branch entirely and falls through to requiring the IAP header, rather than comparing against `""`),
+and `tests/test_internal_api_secret.py` now pins both that and the agreement of all four consumers
+by setting the environment *after* import, which is exactly what a snapshot cannot see.
 
 Admin endpoints:
 - `GET /chat/v1/admin/sessions` — list all sessions with filters and pagination. Each session item carries conversation-analysis fields (LEFT JOINed from `conversation_analysis`): `disposition`, `issue_count`, `issue_categories` (list of strings), `llm_rating` (the `llm_quality_score`, 1-5 or null), `success_label`. Filters: `user`, `date_from`, `date_to`, `session_id`, plus analysis filters `disposition` (exact), `success_label` (exact), `min_issues` (keep sessions with `issue_count >= N`), and `rating`. The `rating` param is a **string**: `"1"`..`"5"` filter the exact LLM rating, and the sentinel `"NA"` filters to unrated sessions (no `llm_quality_score`, i.e. unanalyzed sessions or rows with a NULL score). NA is implemented via the `unrated: bool` param on `ChatHistoryDB.list_all_sessions` (`a.llm_quality_score IS NULL`). The paginated `total` reflects all active filters.
