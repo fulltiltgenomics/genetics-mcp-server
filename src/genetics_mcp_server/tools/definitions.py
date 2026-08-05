@@ -127,6 +127,37 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_credible_sets_by_region",
+        "category": "api",
+        "description": "Get credible sets overlapping a genomic region across all resources. Use this when the locus is defined by coordinates rather than a gene or a variant — e.g. a GWAS peak boundary, a fine-mapping window from a paper, or 'what else is fine-mapped in this interval'. For a gene use get_credible_sets_by_gene (it applies the window for you) and for a single variant use get_credible_sets_by_variant.",
+        "parameters": {
+            "region": {
+                "type": "string",
+                "description": "Region as chr:start-end (e.g. '1:1000000-1500000'; X is accepted). Max 10Mb.",
+                "required": True,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Comma-separated resources, e.g. 'finngen' or 'finngen,eqtl_catalogue'. Omit to search all.",
+            },
+            "coding_only": {
+                "type": "boolean",
+                "description": "If true, return only coding variants (by their most_severe consequence).",
+                "default": False,
+            },
+            "summarize": {
+                "type": "boolean",
+                "description": (
+                    "If true, return a credible set-level summary instead of variant-level rows. "
+                    "The summary carries a `counts` block with per-data-type totals — read those "
+                    "for any 'how many' question. If false, variant rows are capped at 500 and "
+                    "`truncated` says whether more exist; the full set is at `_download_url`."
+                ),
+                "default": True,
+            },
+        },
+    },
+    {
         "name": "get_credible_sets_by_phenotype",
         "category": "api",
         "description": "**PRIMARY TOOL for phenotype-to-gene queries.** Get ALL genes/variants associated with a phenotype from GWAS fine-mapping. Returns genome-wide significant loci with causal variant candidates ranked by PIP.",
@@ -145,6 +176,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "boolean",
                 "description": "If true, return credible set-level summary. Default is true.",
                 "default": True,
+            },
+        },
+    },
+    {
+        "name": "get_credible_set_leads_by_phenotype",
+        "category": "api",
+        "description": "Get ONE row per credible set for a phenotype: the lead variant of each set (the flagged lead, else highest PIP with ties broken by p-value). Use this to enumerate a trait's independent signals — 'how many loci does this trait have', 'list the lead variants' — without pulling every member variant. get_credible_sets_by_phenotype returns all member variants of all sets, which is far larger; use that only when you need the members.",
+        "parameters": {
+            "phenotype": {
+                "type": "string",
+                "description": "Phenotype code (e.g., 'I9_CHD', 'T2D', 'K11_CROHN')",
+                "required": True,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Data resource (default 'finngen')",
+                "default": "finngen",
             },
         },
     },
@@ -303,6 +351,62 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "resources": {
                 "type": "string",
                 "description": "Comma-separated resources: 'marderstein', 'li_brain_atac', 'catlas', 'epimap', 'calderon_immune', 'rosmap_brain'. Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_open_chromatin_by_peak",
+        "category": "api",
+        "description": "Get one open-chromatin atlas peak by its peak id (chr-start-end), returning every cell_type/tissue/condition row recorded for it. Use this to follow up a peak id returned by get_open_chromatin_by_variant/_by_region or by a caQTL credible set, when you want that peak's full annotation rather than everything overlapping a position.",
+        "parameters": {
+            "peak_id": {
+                "type": "string",
+                "description": "Peak ID as chr-start-end (e.g. 'chr5-35482826-35484273')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources: 'marderstein', 'li_brain_atac', 'catlas', 'epimap', 'calderon_immune', 'rosmap_brain'. Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_peak_to_genes",
+        "category": "api",
+        "description": "Get the GENES an Open4Gene chromatin peak is linked to, with the cell type each link was significant in. This is the peak-to-gene LINK table (which gene a regulatory region acts on) — distinct from get_open_chromatin_by_peak, which returns measured accessibility of the peak itself. Use this to interpret a caQTL signal: caQTL credible sets are keyed by peak, and this is what turns a peak id into candidate target genes.",
+        "parameters": {
+            "peak_id": {
+                "type": "string",
+                "description": "Peak ID as chr-start-end (e.g. 'chr5-35482826-35484273')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources. Omit to use all.",
+            },
+            "gencode_version": {
+                "type": "string",
+                "description": "GENCODE version for the returned gene coordinates. Omit for the latest available.",
+            },
+        },
+    },
+    {
+        "name": "get_gene_to_peaks",
+        "category": "api",
+        "description": "Get the Open4Gene chromatin PEAKS linked to a gene, per cell type — the inverse of get_peak_to_genes. Answers 'which regulatory regions act on this gene, and in which cell types'. Distinct from get_open_chromatin_by_gene, which returns measured accessibility near the gene by coordinate overlap with no link evidence. Rows are capped at 500 inline; `truncated` says whether more exist.",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol or ENSG ID (e.g. 'PCSK9', 'ENSG00000169174')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated resources. Omit to use all.",
+            },
+            "gencode_version": {
+                "type": "string",
+                "description": "GENCODE version for the gene's coordinates. Omit for the latest available.",
             },
         },
     },
@@ -475,11 +579,70 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_colocalization_by_credible_set",
+        "category": "api",
+        "description": "Get the credible sets that colocalize with ONE specific credible set, identified by resource + phenotype + cs_id. Use this after get_credible_sets_by_gene/_by_variant/_by_region has given you a cs_id and you want that signal's colocalizations specifically — get_colocalization takes a variant and returns everything colocalizing at the position, which mixes in other signals at the same locus.",
+        "parameters": {
+            "resource": {
+                "type": "string",
+                "description": "Data resource of the credible set (e.g. 'finngen')",
+                "required": True,
+            },
+            "phenotype": {
+                "type": "string",
+                "description": "Phenotype or study code of the credible set (e.g. 'K11_IBD_STRICT')",
+                "required": True,
+            },
+            "credible_set_id": {
+                "type": "string",
+                "description": "Credible set ID (e.g. 'chr1:65744548-68744548_3')",
+                "required": True,
+            },
+            "dual_format": {
+                "type": "boolean",
+                "description": "If true, return columns for both traits of each colocalizing pair instead of the compact single-trait view.",
+                "default": False,
+            },
+        },
+    },
+    {
         "name": "get_exome_results_by_gene",
         "category": "api",
         "description": "Get rare variant burden test results for a gene. Returns individual variant-level association statistics from exome sequencing across available resources (genebass/UKBB filtered to p<1e-4, IBD exome containing only exome-wide significant variants). Use this for single-gene queries. For batch queries across many genes, use the database instead (call get_database_schema to find the exome results table). For full individual-trait results, use get_exome_results_by_phenotype.",
         "parameters": {
             "gene": {"type": "string", "description": "Gene symbol or comma-separated list of gene symbols", "required": True},
+        },
+    },
+    {
+        "name": "get_exome_results_by_variant",
+        "category": "api",
+        "description": "Get rare-variant exome association results for one specific variant across exome resources (genebass/UKBB filtered to p<1e-4, IBD exome exome-wide significant). Use this to check whether a named coding variant has a rare-variant association, as the counterpart to get_credible_sets_by_variant for GWAS. For a gene use get_exome_results_by_gene.",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Variant ID as chr:pos:ref:alt (e.g. '19:44908684:T:C')",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated exome resources (e.g. 'genebass', 'ibd_exome_2026'). Omit to search all.",
+            },
+        },
+    },
+    {
+        "name": "get_exome_results_by_region",
+        "category": "api",
+        "description": "Get rare-variant exome association results overlapping a genomic region across exome resources. Use this when the locus is coordinates rather than a gene — e.g. checking whether a GWAS interval also carries rare-variant signal. For a single gene use get_exome_results_by_gene. Rows are capped at 500 inline; `truncated` says whether more exist and the full result is at `_download_url`.",
+        "parameters": {
+            "region": {
+                "type": "string",
+                "description": "Region as chr:start-end (e.g. '1:1000000-1500000'). Max 10Mb.",
+                "required": True,
+            },
+            "resources": {
+                "type": "string",
+                "description": "Comma-separated exome resources (e.g. 'genebass', 'ibd_exome_2026'). Omit to search all.",
+            },
         },
     },
     {
@@ -583,6 +746,24 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "description": "Include aggregate sample-size stats. Default true.",
             },
         },
+    },
+    {
+        "name": "get_resource_metadata",
+        "category": "general",
+        "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them.",
+        "parameters": {
+            "resource": {
+                "type": "string",
+                "description": "Resource name (e.g. 'finngen', 'eqtl_catalogue')",
+                "required": True,
+            },
+        },
+    },
+    {
+        "name": "get_dataset_display_names",
+        "category": "general",
+        "description": "Get the display-name overrides for raw `dataset` column values. Use this when a `dataset` value in a result (e.g. 'FinnGen_R13') needs to be rendered as its human-readable name in an answer, table or figure.",
+        "parameters": {},
     },
     {
         "name": "get_credible_sets_stats",
@@ -1083,6 +1264,40 @@ Do NOT use this as a discovery tool — use credible set tools or PheWAS for tha
         },
     },
     {
+        "name": "get_summary_stats_by_region",
+        "category": "api",
+        "description": """Get summary statistics for EVERY variant in a genomic region for one or more phenotypes — the full association profile of a locus, not just fine-mapped or significant variants.
+
+Use this when:
+- You need all associations across an interval for a trait (e.g. to describe a locus, or to see the shape of a signal around a lead variant)
+- You want to check a region for sub-threshold signal that credible sets would not include
+
+Phenotypes are REQUIRED: summary stats are stored per phenotype, so there is no region query across all traits. For specific known variants use get_summary_stats instead — it is much cheaper. Region size is capped (5Mb here); rows are capped at 500 inline with `truncated` set, and the full result is at `_download_url`.""",
+        "parameters": {
+            "region": {
+                "type": "string",
+                "description": "Region as chr:start-end (e.g. '1:1000000-1100000'; X is accepted)",
+                "required": True,
+            },
+            "phenotypes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of phenotype codes (e.g. ['T2D', 'I9_CHD'])",
+                "required": True,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Data resource — use list_datasets to find available ones. Common: 'finngen', 'finngen_mvp_ukbb', 'finngen_ukbb'",
+                "default": "finngen",
+            },
+            "data_type": {
+                "type": "string",
+                "description": "Analysis data type: 'gwas', 'pqtl' or 'eqtl'",
+                "default": "gwas",
+            },
+        },
+    },
+    {
         "name": "analyze_variant_list",
         "category": "api",
         "description": """Analyze a list of variants for shared phenotype associations, QTL patterns, and tissue enrichment.
@@ -1468,6 +1683,18 @@ def register_mcp_tools(
         )
 
     @mcp.tool()
+    async def get_credible_sets_by_region(
+        region: str,
+        resource: str | None = None,
+        coding_only: bool = False,
+        summarize: bool = True,
+    ) -> dict:
+        """Get credible sets overlapping a genomic region (chr:start-end)."""
+        return await executor.get_credible_sets_by_region(
+            region, resource, coding_only, summarize
+        )
+
+    @mcp.tool()
     async def get_credible_sets_by_phenotype(
         phenotype: str,
         resource: str = "finngen",
@@ -1477,6 +1704,13 @@ def register_mcp_tools(
         return await executor.get_credible_sets_by_phenotype(
             phenotype, resource, summarize
         )
+
+    @mcp.tool()
+    async def get_credible_set_leads_by_phenotype(
+        phenotype: str, resource: str = "finngen"
+    ) -> dict:
+        """Get one lead variant per credible set for a phenotype."""
+        return await executor.get_credible_set_leads_by_phenotype(phenotype, resource)
 
     @mcp.tool()
     async def get_credible_set_by_id(
@@ -1545,6 +1779,14 @@ def register_mcp_tools(
         return await executor.get_open_chromatin_by_region(chrom, start, end, resources)
 
     @mcp.tool()
+    async def get_open_chromatin_by_peak(
+        peak_id: str,
+        resources: str | None = None,
+    ) -> dict:
+        """Get one open-chromatin atlas peak by its peak id."""
+        return await executor.get_open_chromatin_by_peak(peak_id, resources)
+
+    @mcp.tool()
     async def get_open_chromatin_by_gene(
         gene: str,
         resources: str | None = None,
@@ -1552,6 +1794,24 @@ def register_mcp_tools(
     ) -> dict:
         """Get open-chromatin atlas peaks near a gene."""
         return await executor.get_open_chromatin_by_gene(gene, resources, window)
+
+    @mcp.tool()
+    async def get_peak_to_genes(
+        peak_id: str,
+        resources: str | None = None,
+        gencode_version: str | None = None,
+    ) -> dict:
+        """Get the genes an Open4Gene chromatin peak is linked to, per cell type."""
+        return await executor.get_peak_to_genes(peak_id, resources, gencode_version)
+
+    @mcp.tool()
+    async def get_gene_to_peaks(
+        gene: str,
+        resources: str | None = None,
+        gencode_version: str | None = None,
+    ) -> dict:
+        """Get the Open4Gene chromatin peaks linked to a gene, per cell type."""
+        return await executor.get_gene_to_peaks(gene, resources, gencode_version)
 
     @mcp.tool()
     async def get_variant_effect_by_variant(
@@ -1618,9 +1878,35 @@ def register_mcp_tools(
         return await executor.get_colocalization(variant)
 
     @mcp.tool()
+    async def get_colocalization_by_credible_set(
+        resource: str,
+        phenotype: str,
+        credible_set_id: str,
+        dual_format: bool = False,
+    ) -> dict:
+        """Get the credible sets that colocalize with one specific credible set."""
+        return await executor.get_colocalization_by_credible_set(
+            resource, phenotype, credible_set_id, dual_format
+        )
+
+    @mcp.tool()
     async def get_exome_results_by_gene(gene: str) -> dict:
         """Get rare variant burden test results for a gene."""
         return await executor.get_exome_results_by_gene(gene)
+
+    @mcp.tool()
+    async def get_exome_results_by_variant(
+        variant: str, resources: str | None = None
+    ) -> dict:
+        """Get rare-variant exome association results for one variant."""
+        return await executor.get_exome_results_by_variant(variant, resources)
+
+    @mcp.tool()
+    async def get_exome_results_by_region(
+        region: str, resources: str | None = None
+    ) -> dict:
+        """Get rare-variant exome association results overlapping a genomic region."""
+        return await executor.get_exome_results_by_region(region, resources)
 
     @mcp.tool()
     async def get_exome_results_by_phenotype(resource: str, phenotype: str) -> dict:
@@ -1655,6 +1941,16 @@ def register_mcp_tools(
     ) -> dict:
         """List all datasets with descriptions, products, and sample sizes."""
         return await executor.list_datasets(resource, include_stats)
+
+    @mcp.tool()
+    async def get_resource_metadata(resource: str) -> dict:
+        """Get the harmonized per-trait metadata of one resource."""
+        return await executor.get_resource_metadata(resource)
+
+    @mcp.tool()
+    async def get_dataset_display_names() -> dict:
+        """Get display-name overrides keyed by the raw dataset column value."""
+        return await executor.get_dataset_display_names()
 
     if "get_credible_sets_stats" not in _disabled:
 
@@ -1871,6 +2167,18 @@ def register_mcp_tools(
     ) -> dict:
         """Get summary statistics for specific variant-phenotype pairs."""
         return await executor.get_summary_stats(variants, phenotypes, resource, data_type)
+
+    @mcp.tool()
+    async def get_summary_stats_by_region(
+        region: str,
+        phenotypes: list[str],
+        resource: str = "finngen",
+        data_type: str = "gwas",
+    ) -> dict:
+        """Get summary statistics for every variant in a region for one or more phenotypes."""
+        return await executor.get_summary_stats_by_region(
+            region, phenotypes, resource, data_type
+        )
 
     @mcp.tool()
     async def get_variant_annotations(

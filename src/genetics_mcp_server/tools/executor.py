@@ -271,6 +271,24 @@ class ToolExecutor:
             query.update(params)
         return f"{url}?{urlencode(query)}"
 
+    # a region query is unbounded by nature: a wide window can return tens of thousands
+    # of rows, which is a table rather than an answer. Cap what goes into the context and
+    # leave the full result behind the download URL.
+    _REGION_ROW_LIMIT = 500
+
+    @classmethod
+    def _cap_rows(cls, rows: list, limit: int | None = None) -> tuple[list, bool]:
+        """Cap inline rows, returning (rows, truncated)."""
+        limit = cls._REGION_ROW_LIMIT if limit is None else limit
+        return rows[:limit], len(rows) > limit
+
+    @staticmethod
+    def _resources_param(resources: str | None) -> list[str] | None:
+        """Split a comma-separated resource string into the repeated query params the API expects."""
+        if not resources:
+            return None
+        return [r.strip() for r in resources.split(",") if r.strip()]
+
     async def close(self):
         """Close the HTTP clients."""
         await self.client.aclose()
@@ -557,6 +575,60 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
+    async def get_credible_sets_by_region(
+        self,
+        region: str,
+        resource: str | None = None,
+        coding_only: bool = False,
+        summarize: bool = True,
+    ) -> dict[str, Any]:
+        """Get credible sets overlapping a genomic region across resources."""
+        try:
+            params: dict[str, Any] = {}
+            rlist = self._resources_param(resource)
+            if rlist:
+                params["resources"] = rlist
+            if coding_only:
+                params["coding_only"] = "true"
+
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_region/{region}", dict(params)
+            )
+            url = f"{self.base_url}/v1/credible_sets_by_region/{region}"
+
+            if summarize:
+                params["format"] = "tsv"
+                resp = await self.client.get(url, params=params, timeout=300.0)
+                if resp.status_code == 200:
+                    summary = self._summarize_credible_sets_simple(resp.text)
+                    return {
+                        "success": True,
+                        "region": region,
+                        "_download_url": download_url,
+                        **summary,
+                    }
+                return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+            params["format"] = "json"
+            resp = await self.client.get(url, params=params, timeout=300.0)
+            if resp.status_code == 200:
+                results = self._prioritize_variants(resp.json())
+                rows, truncated = self._cap_rows(results)
+                return {
+                    "success": True,
+                    "region": region,
+                    "total_count": len(results),
+                    "truncated": truncated,
+                    "results": rows,
+                    "_download_url": download_url,
+                }
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in get_credible_sets_by_region({region}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
     async def get_credible_sets_by_phenotype(
         self,
         phenotype: str,
@@ -600,6 +672,42 @@ class ToolExecutor:
         except Exception as e:
             logger.error(
                 f"Error in get_credible_sets_by_phenotype({phenotype}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def get_credible_set_leads_by_phenotype(
+        self, phenotype: str, resource: str = "finngen"
+    ) -> dict[str, Any]:
+        """Get one lead variant per credible set for a phenotype."""
+        try:
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_phenotype_leads/{resource}/{phenotype}"
+            )
+            resp = await self.client.get(
+                f"{self.base_url}/v1/credible_sets_by_phenotype_leads/{resource}/{phenotype}",
+                params={"format": "json"},
+                timeout=300.0,
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                return {
+                    "success": True,
+                    "phenotype": phenotype,
+                    "resource": resource,
+                    "count": len(results),
+                    "results": results,
+                    "_download_url": download_url,
+                }
+            if resp.status_code == 404:
+                return {
+                    "success": False,
+                    "error": f"Not found: phenotype '{phenotype}' in resource '{resource}'",
+                }
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in get_credible_set_leads_by_phenotype({resource}, {phenotype}): "
+                f"{e}\n{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
@@ -838,6 +946,76 @@ class ToolExecutor:
                 "success": True, "region": f"{chrom}:{start}-{end}", "results": results,
                 "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_open_chromatin.tsv"},
             }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_open_chromatin_by_peak(
+        self, peak_id: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get an open-chromatin atlas peak by its peak id via the results-api."""
+        params: dict[str, Any] = {"format": "json"}
+        rlist = self._resources_param(resources)
+        if rlist:
+            params["resources"] = rlist
+        resp = await self.client.get(
+            f"{self.base_url}/v1/open_chromatin/peak/{peak_id}", params=params
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "peak_id": peak_id, "count": len(results), "results": results,
+                "_download_data": {"results": results, "filename": f"{peak_id}_open_chromatin.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_peak_to_genes(
+        self, peak_id: str, resources: str | None = None, gencode_version: str | None = None
+    ) -> dict[str, Any]:
+        """Get the genes an Open4Gene chromatin peak is linked to."""
+        params: dict[str, Any] = {"format": "json"}
+        rlist = self._resources_param(resources)
+        if rlist:
+            params["resources"] = rlist
+        if gencode_version:
+            params["gencode_version"] = gencode_version
+        resp = await self.client.get(
+            f"{self.base_url}/v1/peak_to_genes/{peak_id}", params=params, timeout=300.0
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "peak_id": peak_id, "count": len(results), "results": results,
+                "_download_data": {"results": results, "filename": f"{peak_id}_peak_to_genes.tsv"},
+            }
+        if resp.status_code == 404:
+            return {"success": False, "error": f"Not found: peak '{peak_id}'"}
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_gene_to_peaks(
+        self, gene: str, resources: str | None = None, gencode_version: str | None = None
+    ) -> dict[str, Any]:
+        """Get the Open4Gene chromatin peaks linked to a gene, per cell type."""
+        params: dict[str, Any] = {"format": "json"}
+        rlist = self._resources_param(resources)
+        if rlist:
+            params["resources"] = rlist
+        if gencode_version:
+            params["gencode_version"] = gencode_version
+        resp = await self.client.get(
+            f"{self.base_url}/v1/gene_to_peaks/{gene}", params=params, timeout=300.0
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            rows, truncated = self._cap_rows(results)
+            return {
+                "success": True,
+                "gene": gene,
+                "total_count": len(results),
+                "truncated": truncated,
+                "results": rows,
+                "_download_data": {"results": results, "filename": f"{gene}_gene_to_peaks.tsv"},
+            }
+        if resp.status_code == 404:
+            return {"success": False, "error": f"Not found: gene '{gene}'"}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_open_chromatin_by_gene(
@@ -1105,6 +1283,53 @@ class ToolExecutor:
             return {
                 "success": True, "gene": gene, "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_exome_results.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_exome_results_by_variant(
+        self, variant: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get exome sequencing results for a single variant across resources."""
+        params: dict[str, Any] = {"format": "json"}
+        rlist = self._resources_param(resources)
+        if rlist:
+            params["resources"] = rlist
+        resp = await self.client.get(
+            f"{self.base_url}/v1/exome_results_by_variant/{variant}", params=params
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, "variant": variant, "count": len(results), "results": results,
+                "_download_data": {"results": results, "filename": f"{variant}_exome_results.tsv"},
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_exome_results_by_region(
+        self, region: str, resources: str | None = None
+    ) -> dict[str, Any]:
+        """Get exome sequencing results overlapping a genomic region across resources."""
+        params: dict[str, Any] = {"format": "json"}
+        rlist = self._resources_param(resources)
+        if rlist:
+            params["resources"] = rlist
+        download_url = self._build_download_url(
+            f"/v1/exome_results_by_region/{region}",
+            {"resources": rlist} if rlist else None,
+        )
+        resp = await self.client.get(
+            f"{self.base_url}/v1/exome_results_by_region/{region}", params=params, timeout=300.0
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            rows, truncated = self._cap_rows(results)
+            return {
+                "success": True,
+                "region": region,
+                "total_count": len(results),
+                "truncated": truncated,
+                "results": rows,
+                "_download_url": download_url,
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
@@ -1407,6 +1632,41 @@ class ToolExecutor:
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
+    async def get_colocalization_by_credible_set(
+        self,
+        resource: str,
+        phenotype: str,
+        credible_set_id: str,
+        dual_format: bool = False,
+    ) -> dict[str, Any]:
+        """Get credible sets that colocalize with one specific credible set."""
+        encoded_cs_id = quote(credible_set_id, safe="")
+        path = f"/v1/colocalization_by_credible_set_id/{resource}/{phenotype}/{encoded_cs_id}"
+        params: dict[str, Any] = {"format": "json"}
+        if dual_format:
+            params["dual_format"] = "true"
+        resp = await self.client.get(f"{self.base_url}{path}", params=params, timeout=300.0)
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True,
+                "resource": resource,
+                "phenotype": phenotype,
+                "credible_set_id": credible_set_id,
+                "count": len(results),
+                "results": results,
+                "_download_url": self._build_download_url(
+                    path, {"dual_format": "true"} if dual_format else None
+                ),
+            }
+        if resp.status_code == 404:
+            return {
+                "success": False,
+                "error": f"Not found: credible set '{credible_set_id}' "
+                f"for phenotype '{phenotype}' in resource '{resource}'",
+            }
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
     async def get_phenotype_report(self, resource: str, phenotype_code: str) -> dict[str, Any]:
         """Get phenotype markdown report."""
         resp = await self.client.get(
@@ -1447,6 +1707,35 @@ class ToolExecutor:
         resp = await self.client.get(f"{self.base_url}/v1/datasets", params=params)
         if resp.status_code == 200:
             return {"success": True, "datasets": resp.json()}
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_dataset_display_names(self) -> dict[str, Any]:
+        """Get the display-name overrides keyed by the raw `dataset` column value."""
+        resp = await self.client.get(f"{self.base_url}/v1/dataset_display_names")
+        if resp.status_code == 200:
+            return {"success": True, "display_names": resp.json()}
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_resource_metadata(self, resource: str) -> dict[str, Any]:
+        """Get harmonized per-trait metadata (sample sizes, trait names) for a resource."""
+        resp = await self.client.get(
+            f"{self.base_url}/v1/resource_metadata/{resource}",
+            params={"format": "json"},
+            timeout=300.0,
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            rows, truncated = self._cap_rows(results) if isinstance(results, list) else (results, False)
+            return {
+                "success": True,
+                "resource": resource,
+                "count": len(results) if isinstance(results, list) else None,
+                "truncated": truncated,
+                "metadata": rows,
+                "_download_url": self._build_download_url(f"/v1/resource_metadata/{resource}"),
+            }
+        if resp.status_code == 404:
+            return {"success": False, "error": f"Not found: resource '{resource}'"}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     # -------------------------------------------------------------------------
@@ -1577,6 +1866,49 @@ class ToolExecutor:
             }
         except Exception as e:
             logger.error(f"Error in get_summary_stats: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def get_summary_stats_by_region(
+        self,
+        region: str,
+        phenotypes: list[str],
+        resource: str = "finngen",
+        data_type: str = "gwas",
+    ) -> dict[str, Any]:
+        """Get every summary stat record in a genomic region for one or more phenotypes."""
+        if not phenotypes:
+            return {"success": False, "error": "No phenotypes provided"}
+        try:
+            path = f"/v1/summary_stats_by_region/{resource}/{data_type}/{region}"
+            pheno_param = ",".join(p.strip() for p in phenotypes if p.strip())
+            resp = await self.client.get(
+                f"{self.base_url}{path}",
+                params={"phenotypes": pheno_param, "format": "json"},
+                timeout=300.0,
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                rows, truncated = self._cap_rows(results)
+                return {
+                    "success": True,
+                    "region": region,
+                    "resource": resource,
+                    "data_type": data_type,
+                    "phenotypes": phenotypes,
+                    "total_count": len(results),
+                    "truncated": truncated,
+                    "results": rows,
+                    "_download_url": self._build_download_url(
+                        path, {"phenotypes": pheno_param}
+                    ),
+                }
+            if resp.status_code in (404, 422):
+                return {"success": False, "error": f"{resp.status_code}: {resp.text}"}
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in get_summary_stats_by_region({region}): {e}\n{traceback.format_exc()}"
+            )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
     # -------------------------------------------------------------------------

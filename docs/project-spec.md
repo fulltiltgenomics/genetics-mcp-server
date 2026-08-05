@@ -60,7 +60,9 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 |------|-------------|
 | `get_credible_sets_by_gene` | Get credible sets for variants near a gene (gene body ± `window`, default **500 kb**). The wide default is deliberate: the strongest signal attributed to a gene can sit several hundred kb away (e.g. a long-range regulatory variant), so a narrow window can silently drop the top hit |
 | `get_credible_sets_by_variant` | Find associations containing a specific variant |
+| `get_credible_sets_by_region` | Get credible sets overlapping a `chr:start-end` region across resources, for loci defined by coordinates rather than a gene or variant. Same `summarize` semantics as the by-variant tool; variant-level rows are capped at 500 inline with `truncated` set |
 | `get_credible_sets_by_phenotype` | Get all GWAS associations for a phenotype |
+| `get_credible_set_leads_by_phenotype` | One row per credible set: its lead variant (flagged lead, else highest PIP, ties by p-value). The cheap way to enumerate a trait's independent signals without pulling every member variant |
 | `get_credible_set_by_id` | Get all variants in a specific credible set |
 | `get_credible_sets_by_qtl_gene` | Get QTL associations where a gene is the molecular trait. `summarize` defaults to **true** (credible set-level), like the sibling credible-set tools — see Architecture decision 7. Also the correct tool for **gene-based caQTL** questions: a caQTL trait is a chromatin peak, and the underlying `all_cs_qtl_file` resolves the Open4Gene peak-to-gene link (cell-type-matched), so `trait` holds the linked gene symbol while `trait_original`/`cs_id` keep the peak id. Peak-vs-gene coordinate matching is NOT a substitute — linked peaks sit up to ~1 Mb away and most peaks near a gene are not linked to it |
 | `get_credible_sets_stats` | Get summary statistics of credible sets for a dataset |
@@ -72,6 +74,8 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_gene_expression` | Get tissue-specific gene expression levels |
 | `get_gene_disease_associations` | Get Mendelian disease relationships from ClinGen/GENCC |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
+| `get_exome_results_by_variant` | Exome results for one specific variant across exome resources — the rare-variant counterpart to `get_credible_sets_by_variant` |
+| `get_exome_results_by_region` | Exome results overlapping a `chr:start-end` region; rows capped at 500 inline with `truncated` set |
 | `get_exome_results_by_phenotype` | Get exome variant results for a specific phenotype across all genes (genebass and IBD) |
 | `get_gene_based_results` | Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA (genebass rows filtered to p < 1e-4) |
 | `get_gene_based_results_by_phenotype` | Get the complete unfiltered gene burden results for one phenotype — every gene and annotation class, no p-value cutoff |
@@ -86,6 +90,8 @@ Four evidence types that must not be conflated, because a user question about "r
 |------|-------------|
 | `get_asm_qtl_by_variant` | Allele-specific methylation QTL (ASM-QTL) for a variant: associations with CpG/MDS methylation rates, effect sizes, methylation rate on reference vs alternative haplotype, primary/secondary variant rank. `resources`: `decode_cpg`, `decode_mds` |
 | `get_asm_qtl_by_gene` | ASM-QTL for variants near a gene (gene body ± `window`) |
+| `get_peak_to_genes`, `get_gene_to_peaks` | Open4Gene peak-to-gene **links** with the cell type each link was significant in — which gene a regulatory region acts on, and its inverse. This is what turns a caQTL peak id into candidate target genes; distinct from the open-chromatin atlas tools below, which measure accessibility and carry no link evidence |
+| `get_open_chromatin_by_peak` | One atlas peak by its `chr-start-end` id, with every cell_type/tissue/condition row recorded for it |
 | `get_open_chromatin_by_variant`, `get_open_chromatin_by_region`, `get_open_chromatin_by_gene` | Measured open-chromatin **atlas** peaks (scATAC/snATAC/bulk-ATAC/chromHMM) overlapping a variant position, a region, or a gene's window, labelled by `cell_type`, `tissue`, `life_stage` and `condition` so cell-type specificity can be reported. `resources`: `marderstein`, `li_brain_atac`, `catlas`, `epimap`, `calderon_immune`, `rosmap_brain` |
 | `get_variant_effect_by_variant`, `get_variant_effect_by_gene` | In-silico **predicted** variant effect on chromatin accessibility: ChromBPNet (`model=chrombpnet`) per cell type/tissue with `score`/`mlog10p`/`quantile_rank`/`is_significant`, FLARE (`model=flare`) as a pan-context score with null cell type. `resources`: `marderstein` |
 | `get_mpra_by_variant`, `get_mpra_by_region`, `get_mpra_by_gene` | **Measured** cis-regulatory allelic activity from a massively parallel reporter assay (Siraj et al. 2026). One long row per `cell_line` — `meta` (cross-cell-line meta-analysis) or K562/HEPG2/SKNSH/HCT116/A549 — carrying `emVar` (allele modulates reporter expression), `active`, `log2Skew` (signed allelic effect), `log2FC`, and their `*_mlog10p`. Coverage is partial (fine-mapped GTEx/UKBB/BBJ plus control common variants), so absence ≠ no effect. `resources`: `siraj_mpra` |
@@ -96,9 +102,13 @@ Four evidence types that must not be conflated, because a user question about "r
 | Tool | Description |
 |------|-------------|
 | `get_colocalization` | Find traits sharing causal signals at a variant |
+| `get_colocalization_by_credible_set` | Colocalizations of ONE credible set (resource + phenotype + `cs_id`), so the result is that signal's partners rather than everything at the position. `dual_format` returns both traits' columns |
+| `get_resource_metadata` | Harmonized per-trait metadata for a resource (trait names, sample sizes, sub-studies of a collection) — the per-trait rows behind `list_datasets`' aggregates |
+| `get_dataset_display_names` | Display-name overrides keyed by the raw `dataset` column value, for rendering results |
 | `get_phenotype_report` | Get detailed markdown report for a phenotype. Disabled by default — enable with `ENABLE_PHENOTYPE_REPORT` |
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
+| `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
