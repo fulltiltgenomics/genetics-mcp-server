@@ -13,7 +13,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -197,7 +197,15 @@ app.include_router(admin_router, prefix="/chat/v1", tags=["admin"])
 class ChatMessage(BaseModel):
     """A single message in the chat history."""
 
-    role: str = Field(..., description="Message role: 'user', 'assistant', or 'system'")
+    # constrained at the model boundary, not per provider: a client-sent 'system'
+    # message used to reach the OpenAI path verbatim and land in a genuine system
+    # slot after the server-assembled prompt, where recency favours it. Rejecting
+    # here means a future third provider cannot reintroduce the hole. The Anthropic
+    # path keeps its own system-role filter as defence in depth (llm_service.py),
+    # since stream_chat also takes message dicts from callers other than this model.
+    role: Literal["user", "assistant"] = Field(
+        ..., description="Message role: 'user' or 'assistant'"
+    )
     content: str | list[dict[str, Any]] = Field(..., description="Message content")
 
 
@@ -211,9 +219,6 @@ class ChatRequest(BaseModel):
     model: str | None = Field(None, description="Specific model to use")
     enable_tools: bool = Field(
         True, description="Enable MCP tools (only for Anthropic)"
-    )
-    system_prompt: str | None = Field(
-        None, description="Custom system prompt (overrides default)"
     )
     literature_backend: str | None = Field(
         None, description="Backend for literature search: 'europepmc' or 'perplexity'"
@@ -436,13 +441,15 @@ async def stream_chat(
     # convert messages to dicts
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
 
-    # use custom or default system prompt. The response-length fragment is concatenated
-    # onto it because both are identical for every user, so each setting keeps its own
-    # prompt-cache entry rather than invalidating the other's. The user's instructions
-    # are NOT concatenated: they travel separately and land in their own cache block
-    # after this one, which both keeps the shared block cacheable across users and puts
-    # the envelope's guardrail postamble last, where recency favours it.
-    system_prompt = request.system_prompt or default_system_prompt(settings.app_name)
+    # the system prompt is assembled server-side and is never client-supplied: it carries
+    # the grounding, citation, truncation and out-of-scope rules, so a request may not
+    # replace it. The response-length fragment is concatenated onto it because both are
+    # identical for every user, so each setting keeps its own prompt-cache entry rather
+    # than invalidating the other's. The user's instructions are NOT concatenated: they
+    # travel separately and land in their own cache block after this one, which both
+    # keeps the shared block cacheable across users and puts the envelope's guardrail
+    # postamble last, where recency favours it.
+    system_prompt = default_system_prompt(settings.app_name)
     system_prompt += verbosity_prompt(request.verbosity)
     user_instructions = _resolve_user_instructions(
         user, request.instruction_set_id, secret=request.secret

@@ -342,6 +342,28 @@ for this user, an archived set, an unavailable database, a body that is not text
 them degrades to *no instructions* rather than raising. **An unknown id is ignored, never 422**,
 the same rule as `verbosity`: a presentation preference must not fail a chat turn.
 
+`ChatRequest` **has no `system_prompt` field**. It used to, with no gate and no length bound, so
+any authenticated caller — any user who reaches the chat API through IAP/oauth2-proxy, or an
+internal caller holding the shared `INTERNAL_API_SECRET` bearer, which `auth_required` resolves to
+the identity `mcp-tool`; per-user API tokens do **not** open this path, they are validated only by
+the internal-only `POST /tokens/validate` that the `/mcp` path consumes — could
+replace the entire prompt for their turn and discard every grounding, citation, truncation and
+out-of-scope rule, bypassing all of the care above with a field two lines away from it. The field
+was removed rather than gated; nothing in the suite ever sent it. Pydantic ignores unknown keys, so
+a caller still sending one is silently ignored rather than 422'd. The prompt handed to
+`llm_service.stream_chat(system_prompt=...)` is always `default_system_prompt(app_name)` plus the
+verbosity fragment — that parameter is the internal channel `chat_api` assembles, not an override.
+
+The same capability had a second form: a client-sent **system-role message**. `ChatMessage.role`
+was an unvalidated `str`, and `_stream_openai` forwarded the caller's messages verbatim after
+prepending the server prompt, so injected text landed in a genuine system slot *after* the server's
+— weaker than replacing it (the grounding rules still shipped) but the same channel. `role` is now
+`Literal["user", "assistant"]`, so such a message is **422'd at the model boundary** rather than
+filtered: no caller in the suite sends one, and `POST /chat/v1/chat/sessions/{id}/messages` already
+rejects any other role, so failing closed is consistent and honest about what was sent. Both
+provider paths additionally drop system-role messages themselves — `stream_chat` is also callable
+with raw dicts, and neither path should depend on the other's validation.
+
 The stored body is truncated to `INSTRUCTION_SET_MAX_BODY_CHARS` **before** wrapping, so the
 envelope's fence is computed over the text that actually ships — a cut landing inside a backtick
 run would otherwise escape it. Only the set id (and, outside secret mode, its name) is logged;

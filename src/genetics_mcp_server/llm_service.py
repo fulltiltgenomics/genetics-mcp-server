@@ -444,7 +444,8 @@ class LLMService:
             messages: Chat history in OpenAI format [{"role": "user", "content": "..."}]
             provider: "openai" or "anthropic" (defaults to config setting)
             model: Specific model to use (defaults to provider's default model)
-            system_prompt: System prompt to prepend
+            system_prompt: Server-assembled system prompt to prepend. Callers build it
+                from default_system_prompt + verbosity_prompt; it is never client-supplied.
             enable_tools: Whether to enable MCP tools (Anthropic only)
             custom_tool_descriptions: Custom descriptions for tools
             literature_backend: Backend for literature search ('europepmc' or 'perplexity')
@@ -490,7 +491,11 @@ class LLMService:
         settings = get_settings()
         model = model or "gpt-4o"
 
-        # add system prompt if provided
+        # the server-assembled prompt is the only system message that may ship: any
+        # system-role message in `messages` is dropped, mirroring the Anthropic path.
+        # `ChatMessage.role` already rejects 'system' at the API boundary, so this is
+        # defence in depth for callers that reach stream_chat with raw dicts.
+        messages = [msg for msg in messages if msg.get("role") != "system"]
         if system_prompt:
             messages = [{"role": "system", "content": system_prompt}] + messages
 
@@ -545,7 +550,10 @@ class LLMService:
         # convert messages to Anthropic format: first strip the display-only
         # '*[Using tool: ...]*' markers from replayed assistant text (so the model
         # never learns to imitate them as prose), then strip orphaned tool_use
-        # blocks that were persisted without matching tool_result messages
+        # blocks that were persisted without matching tool_result messages.
+        # The system-role filter is kept even though `ChatMessage.role` now rejects
+        # 'system' at the API boundary: this method is also callable with raw dicts,
+        # and both provider paths should be safe on their own.
         anthropic_messages = _sanitize_tool_blocks(
             _strip_tool_use_markers(
                 [msg for msg in messages if msg["role"] != "system"]
