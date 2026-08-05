@@ -511,3 +511,47 @@ class TestInstructionSetCrossUserScoping:
 
         current["user"] = "bob@example.com"
         assert _create(client).status_code == 200
+
+
+class TestUserSettingsEndpoints:
+    """The chat option preferences ride on the generic settings endpoints, so the browser's
+    one-request read of all three depends on the shape of the bulk GET."""
+
+    def test_bulk_get_is_keyed_by_setting_name(self, client_with_auth):
+        client_with_auth.put(
+            "/chat/v1/llm-config/user/settings/chat_verbosity",
+            json={"setting_value": "detailed"},
+        )
+        client_with_auth.put(
+            "/chat/v1/llm-config/user/settings/chat_tool_profile",
+            json={"setting_value": "all"},
+        )
+
+        resp = client_with_auth.get("/chat/v1/llm-config/user/settings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["chat_verbosity"]["setting_value"] == "detailed"
+        assert data["chat_tool_profile"]["setting_value"] == "all"
+
+    def test_unset_key_is_absent_from_the_bulk_get(self, client_with_auth):
+        resp = client_with_auth.get("/chat/v1/llm-config/user/settings")
+        assert resp.status_code == 200
+        assert "chat_verbosity" not in resp.json()
+
+    def test_a_later_write_wins(self, client_with_auth):
+        for value in ("detailed", "brief"):
+            client_with_auth.put(
+                "/chat/v1/llm-config/user/settings/chat_verbosity",
+                json={"setting_value": value},
+            )
+
+        resp = client_with_auth.get("/chat/v1/llm-config/user/settings/chat_verbosity")
+        assert resp.json()["setting_value"] == "brief"
+
+    def test_empty_value_is_rejected(self, client_with_auth):
+        """Why the "all" tool profile round-trips through a sentinel rather than through ""."""
+        resp = client_with_auth.put(
+            "/chat/v1/llm-config/user/settings/chat_tool_profile",
+            json={"setting_value": ""},
+        )
+        assert resp.status_code == 400

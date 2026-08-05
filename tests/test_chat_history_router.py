@@ -824,3 +824,67 @@ class TestInstructionSetOnMessages:
 
         detail = client_with_auth.get(f"/chat/v1/chat/sessions/{session_id}")
         assert detail.json()["messages"][0]["instruction_set_id"] is None
+
+
+class TestVerbosityOnMessages:
+    """The answer detail in force is recorded per message, so reopening a conversation can
+    restore the options it was last held under."""
+
+    def _session(self, client):
+        return client.post("/chat/v1/chat/sessions", json={}).json()["id"]
+
+    def test_save_message_round_trips_verbosity(self, client_with_auth):
+        session_id = self._session(client_with_auth)
+
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={
+                "id": "m1",
+                "role": "user",
+                "content": "hello",
+                "verbosity": "detailed",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["verbosity"] == "detailed"
+
+        detail = client_with_auth.get(f"/chat/v1/chat/sessions/{session_id}")
+        assert detail.status_code == 200
+        assert detail.json()["messages"][0]["verbosity"] == "detailed"
+
+    def test_omitted_verbosity_is_null(self, client_with_auth):
+        """Messages predating the column read back as NULL, which the client resolves to the
+        user's own default rather than to the built-in one."""
+        session_id = self._session(client_with_auth)
+
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={"id": "m1", "role": "user", "content": "hello"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["verbosity"] is None
+
+    def test_fork_preserves_verbosity(self, client_with_auth, test_db):
+        """A fork is a copy of the conversation, so it has to reopen under the same options."""
+        session_id = self._session(client_with_auth)
+        client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/messages",
+            json={
+                "id": "m1",
+                "role": "user",
+                "content": "hello",
+                "verbosity": "detailed",
+                "literature_backend": "europepmc",
+            },
+        )
+        client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session_id}/share", json={"shared": True}
+        )
+
+        forked = client_with_auth.post(f"/chat/v1/chat/sessions/{session_id}/fork")
+        assert forked.status_code == 200
+
+        detail = client_with_auth.get(f"/chat/v1/chat/sessions/{forked.json()['id']}")
+        message = detail.json()["messages"][0]
+        assert message["verbosity"] == "detailed"
+        assert message["literature_backend"] == "europepmc"

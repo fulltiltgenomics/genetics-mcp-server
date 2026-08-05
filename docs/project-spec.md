@@ -261,7 +261,7 @@ The chat API takes a `verbosity` parameter (`"brief"` — the default — or `"d
 
 **The setting scopes presentation, never method or rigor.** The three-pass approach under "Analyzing data" and every grounding rule apply identically at both settings; only the volume of what gets printed changes. An unrecognized value falls back to `"brief"` rather than raising, since a presentation preference must not fail a chat turn.
 
-Both fragments sit inside the **shared** cached system block (block 0 — see "Instructions" below for the split), so each setting keeps its own prompt-cache entry instead of invalidating the other's. The setting is per-request and is **not** persisted per message the way `literature_backend` and `tool_profile` are (`chat_messages` has no `verbosity` column) — a resumed conversation uses whatever the selector currently shows.
+Both fragments sit inside the **shared** cached system block (block 0 — see "Instructions" below for the split), so each setting keeps its own prompt-cache entry instead of invalidating the other's. The setting is per-request, and `chat_messages.verbosity` records the value in force per message the same way `literature_backend`, `tool_profile` and `instruction_set_id` do — so reopening a conversation restores the answer detail it was last held under. The column carries the same `ON CONFLICT` full-row-replace semantics as its siblings: a save that omits it clears it.
 
 ## Instructions (user-authored system-prompt text)
 
@@ -325,7 +325,12 @@ ownership is checked *before* the length cap, so an over-cap body aimed at a for
 (`GET`/`PUT`/`DELETE /chat/v1/llm-config/user/settings/{setting_key}`) — there is no separate
 selection endpoint. Archiving a set does not clear that pointer; the client drops to *None* and
 clears the setting when the stored id no longer lists, mirroring the server's ignore-unknown-id
-rule.
+rule. The other three chat options persist the same way, under `chat_verbosity`,
+`chat_literature_backend` and `chat_tool_profile`; the "all" tool profile round-trips through the
+literal `all` because the settings `PUT` rejects an empty `setting_value` with a 400. All four keys
+hold the user's *default* — the value an explicit control interaction last wrote — while the
+`chat_messages` columns hold what each conversation was actually held under, so reopening an old
+conversation restores its options without changing what the next new chat starts from.
 
 `limit` on the history endpoint is `Query(20, ge=1, le=100)`. It was unvalidated when first
 written: SQLite treats a negative `LIMIT` as unbounded, so `?limit=-1` returned the entire

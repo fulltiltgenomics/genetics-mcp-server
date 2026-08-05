@@ -71,6 +71,7 @@ class MessageResponse(BaseModel):
     tool_profile: Optional[str] = None  # api, bigquery, rag, or None (all)
     tool_results_json: Optional[str] = None  # JSON string of tool_result blocks for this assistant turn
     instruction_set_id: Optional[str] = None  # user instruction set in force for this turn
+    verbosity: Optional[str] = None  # answer detail in force for this turn: brief or detailed
 
 
 class SessionDetailResponse(BaseModel):
@@ -104,6 +105,7 @@ class MessageSaveRequest(BaseModel):
     # add_message re-saves the whole row on conflict, so a re-save that omits this clears the
     # stored value — same semantics as tool_profile above. Every save of a message must carry it
     instruction_set_id: Optional[str] = Field(None, description="Instruction set in force for this turn")
+    verbosity: Optional[str] = Field(None, description="Answer detail in force for this turn: brief or detailed")
 
 
 class MessageRatingRequest(BaseModel):
@@ -289,6 +291,7 @@ async def get_session(
                 tool_profile=msg.tool_profile,
                 tool_results_json=msg.tool_results_json,
                 instruction_set_id=msg.instruction_set_id,
+                verbosity=msg.verbosity,
             )
             for msg in messages
         ],
@@ -431,6 +434,7 @@ async def save_message(
         request.tool_profile,
         request.tool_results_json,
         request.instruction_set_id,
+        request.verbosity,
     )
 
     return MessageResponse(
@@ -444,6 +448,7 @@ async def save_message(
         tool_profile=msg.tool_profile,
         tool_results_json=msg.tool_results_json,
         instruction_set_id=msg.instruction_set_id,
+        verbosity=msg.verbosity,
     )
 
 

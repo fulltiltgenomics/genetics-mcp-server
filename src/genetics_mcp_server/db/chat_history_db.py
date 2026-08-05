@@ -53,6 +53,7 @@ class ChatMessageRecord:
     tool_profile: str | None = None  # tool profile: api, bigquery, rag, or None (all)
     tool_results_json: str | None = None  # JSON string of tool_result blocks for this assistant turn
     instruction_set_id: str | None = None  # user instruction set in force for this turn, NULL if none
+    verbosity: str | None = None  # answer detail in force for this turn: brief or detailed
 
 
 @dataclass
@@ -166,6 +167,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
             cursor.execute("ALTER TABLE chat_messages ADD COLUMN tool_results_json TEXT")
         if "instruction_set_id" not in columns:
             cursor.execute("ALTER TABLE chat_messages ADD COLUMN instruction_set_id TEXT")
+        if "verbosity" not in columns:
+            cursor.execute("ALTER TABLE chat_messages ADD COLUMN verbosity TEXT")
 
         # migrations: add columns to chat_sessions if they don't exist
         cursor.execute("PRAGMA table_info(chat_sessions)")
@@ -423,6 +426,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         tool_profile: str | None = None,
         tool_results_json: str | None = None,
         instruction_set_id: str | None = None,
+        verbosity: str | None = None,
     ) -> ChatMessageRecord:
         """Add a message to a session. If message ID already exists, update it."""
         conn = self._conn
@@ -433,17 +437,18 @@ class ChatHistoryDB(object, metaclass=Singleton):
         try:
             cursor.execute(
                 """
-                INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id, verbosity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     content = excluded.content,
                     content_json = excluded.content_json,
                     literature_backend = excluded.literature_backend,
                     tool_profile = excluded.tool_profile,
                     tool_results_json = excluded.tool_results_json,
-                    instruction_set_id = excluded.instruction_set_id
+                    instruction_set_id = excluded.instruction_set_id,
+                    verbosity = excluded.verbosity
                 """,
-                (message_id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id),
+                (message_id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id, verbosity),
             )
             # also touch the session
             cursor.execute(
@@ -467,6 +472,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             tool_profile=tool_profile,
             tool_results_json=tool_results_json,
             instruction_set_id=instruction_set_id,
+            verbosity=verbosity,
         )
 
     def get_messages(self, session_id: str) -> list[ChatMessageRecord]:
@@ -478,7 +484,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             """
             SELECT id, session_id, role, content, created_at, thumbs_up,
                    content_json, literature_backend, tool_profile, tool_results_json,
-                   instruction_set_id
+                   instruction_set_id, verbosity
             FROM chat_messages
             WHERE session_id = ?
             ORDER BY created_at ASC
@@ -805,7 +811,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             cursor.execute(
                 """
                 SELECT role, content, content_json, literature_backend, tool_profile, tool_results_json,
-                       instruction_set_id
+                       instruction_set_id, verbosity
                 FROM chat_messages
                 WHERE session_id = ?
                 ORDER BY created_at ASC
@@ -816,12 +822,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 new_msg_id = str(uuid.uuid4())
                 cursor.execute(
                     """
-                    INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id, verbosity)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (new_msg_id, new_session_id, row["role"], row["content"],
                      row["content_json"], row["literature_backend"], row["tool_profile"], row["tool_results_json"],
-                     row["instruction_set_id"]),
+                     row["instruction_set_id"], row["verbosity"]),
                 )
 
             conn.commit()
@@ -1115,6 +1121,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             tool_profile=row["tool_profile"] if "tool_profile" in keys else None,
             tool_results_json=row["tool_results_json"] if "tool_results_json" in keys else None,
             instruction_set_id=row["instruction_set_id"] if "instruction_set_id" in keys else None,
+            verbosity=row["verbosity"] if "verbosity" in keys else None,
         )
 
 
