@@ -313,6 +313,11 @@ class TestAdminAuthGuards:
             ("true", "regular@example.com", False),
             ("true", "admin@example.com", True),
             ("false", "regular@example.com", True),
+            # unauthenticated: the gate answers 401 rather than 403, and dev mode lets even a
+            # nameless caller through — both were verified by hand and unpinned
+            # (genetics-results-suite-uvh 6)
+            ("true", None, False),
+            ("false", None, True),
         ],
     )
     def test_the_reported_is_admin_matches_the_gate_on_the_admin_endpoints(
@@ -326,7 +331,9 @@ class TestAdminAuthGuards:
         still holding its import-time False, served that same user every admin endpoint
         (genetics-results-suite-pol).
         """
-        headers = {"X-Goog-Authenticated-User-Email": f"accounts.google.com:{user}"}
+        headers = (
+            {"X-Goog-Authenticated-User-Email": f"accounts.google.com:{user}"} if user else {}
+        )
         with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=seeded_db):
             with settings_env(
                 REQUIRE_AUTH=require_auth,

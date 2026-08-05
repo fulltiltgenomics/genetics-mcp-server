@@ -46,6 +46,11 @@ def settings_env(**overrides):
     global no longer moves the other — and no longer exists to be patched. The cache is cleared
     on both edges so neither the test nor whatever runs after it sees a snapshot built from the
     other's environment.
+
+    Both handles are cleared for the same reason as `clear_settings_cache`: a reload of the
+    submodule leaves the package re-exporting the pre-reload function, so clearing one would miss
+    whichever half the reload left behind. Absent such a reload the two are the same object and
+    the second clear is a no-op.
     """
     from genetics_mcp_server.config import get_settings as pkg_get_settings
     from genetics_mcp_server.config.settings import get_settings as mod_get_settings

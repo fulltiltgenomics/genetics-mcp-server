@@ -62,7 +62,9 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
             schema_overrides={"rating": pl.Int64},
         )
 
-        cursor = conn.execute("SELECT * FROM chat_messages")
+        # rowid comes along so the "last message wins" below can tiebreak on insertion order,
+        # matching ChatHistoryDB.get_messages. created_at alone has one-second resolution
+        cursor = conn.execute("SELECT *, rowid AS _rowid FROM chat_messages")
         cols = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
         messages = pl.DataFrame(
@@ -77,6 +79,15 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
         conn.close()
 
     return sessions, messages
+
+
+def resolve_llm_config_db(db: str, explicit: str | None) -> str:
+    """Where to look for llm_config.db: alongside --db unless told otherwise.
+
+    The deployed CronJob passes only --db and relies on this default, so the derivation is load
+    bearing (genetics-results-suite-uvh 8). It lived inline in main() where no test reached it.
+    """
+    return explicit or str(Path(db).parent / "llm_config.db")
 
 
 def load_instruction_set_names(db_path: str) -> dict[str, str]:
@@ -776,14 +787,18 @@ def compute_all_metrics(
         .select("session_id", "tool_profile")
     )
 
-    # the last user message that named an instruction set decides the session's: the selector
-    # can move mid-conversation, so the newest one is what the session ended up running under.
+    # the last message that named an instruction set decides the session's: the selector can move
+    # mid-conversation, so the newest one is what the session ended up running under.
+    # Must agree with routers/admin.py's resolve_instruction_set_name, which answers the same
+    # question for the admin list — so: every role, not just user (an assistant row carries the
+    # same value as the turn that produced it), and tiebroken on rowid, because created_at has
+    # one-second resolution and two sets recorded in the same second would otherwise be free to
+    # disagree between the admin list and this report (genetics-results-suite-uvh 9).
     # The column is guarded because chat_messages predating the migration does not have it
     if "instruction_set_id" in messages.columns:
         instruction_sets = (
-            messages.filter(pl.col("role") == "user")
-            .filter(pl.col("instruction_set_id").is_not_null())
-            .sort("created_at")
+            messages.filter(pl.col("instruction_set_id").is_not_null())
+            .sort(["created_at", "_rowid"])
             .group_by("session_id")
             .last()
             .select("session_id", "instruction_set_id")
@@ -1581,7 +1596,7 @@ async def main():
     # --- compute metrics ---
     logger.info("Computing success metrics...")
     instruction_set_names = load_instruction_set_names(
-        args.llm_config_db or str(Path(args.db).parent / "llm_config.db")
+        resolve_llm_config_db(args.db, args.llm_config_db)
     )
     all_metrics = compute_all_metrics(
         sessions, messages, tool_stats, topics, instruction_set_names

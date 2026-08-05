@@ -1807,3 +1807,39 @@ class TestChatHistoryWriteTransactionSafety:
         assert chat_history_db._conn.in_transaction is False
         chat_history_db.touch_session(source)
         assert chat_history_db.list_sessions("other@example.com") == []
+
+
+class TestMessageOrderIsTotal:
+    """created_at comes from CURRENT_TIMESTAMP and has one-second resolution, so two messages in
+    the same second tie on it. get_messages tiebreaks on rowid (insertion order) so that "which
+    message was last" has one answer (genetics-results-suite-uvh 9).
+    """
+
+    def test_messages_tied_in_one_second_keep_insertion_order(self, chat_history_db):
+        session = chat_history_db.create_session("user@example.com")
+        for i in range(10):
+            chat_history_db.add_message(session.id, f"m{i}", "user", f"message {i}")
+        chat_history_db._conn.execute("UPDATE chat_messages SET created_at = '2026-01-01 00:00:00'")
+        chat_history_db._conn.commit()
+
+        ids = [m.id for m in chat_history_db.get_messages(session.id)]
+        assert ids == [f"m{i}" for i in range(10)]
+
+    def test_the_query_carries_a_total_order(self):
+        """A shape guard, deliberately.
+
+        The ambiguity cannot be forced from here: PRAGMA reverse_unordered_selects only reorders
+        scans with no ORDER BY, and idx_chat_messages_session already returns ties in insertion
+        order, so dropping the tiebreak leaves the behavioural test above still passing. What is
+        actually at risk is a different query plan — after ANALYZE, or on another engine — so the
+        guard is on the ORDER BY itself.
+        """
+        import inspect
+
+        from genetics_mcp_server.db import chat_history_db
+
+        source = inspect.getsource(chat_history_db.ChatHistoryDB.get_messages)
+        assert "ORDER BY created_at ASC, rowid ASC" in source, (
+            "get_messages must impose a total order: routers/admin.py and "
+            "scripts/analyze_conversations.py both resolve 'the last set wins' from it"
+        )

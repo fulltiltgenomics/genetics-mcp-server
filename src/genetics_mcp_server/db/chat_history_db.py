@@ -487,7 +487,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
                    instruction_set_id, verbosity
             FROM chat_messages
             WHERE session_id = ?
-            ORDER BY created_at ASC
+            -- rowid breaks the tie: created_at comes from CURRENT_TIMESTAMP and has one-second
+            -- resolution, so two messages in the same second are otherwise unordered and the
+            -- engine may return them either way round. rowid is insertion order, which is the
+            -- order the conversation happened in. Consumers that ask "which was last" depend on
+            -- this (genetics-results-suite-uvh 9)
+            ORDER BY created_at ASC, rowid ASC
             """,
             (session_id,),
         )

@@ -1143,3 +1143,24 @@ class TestLoadInstructionSetNames:
         conn.commit()
         conn.close()
         assert ac.load_instruction_set_names(path) == {"s1": "Statistician"}
+
+
+class TestResolveLlmConfigDb:
+    """The deployed CronJob passes only --db and relies on this default, so the derivation is
+    load bearing. It used to live inline in main() where no test could reach it
+    (genetics-results-suite-uvh 8)."""
+
+    def test_defaults_to_the_sibling_of_the_chat_db(self):
+        from genetics_mcp_server.scripts.analyze_conversations import resolve_llm_config_db
+
+        assert resolve_llm_config_db("/data/chat_history.db", None) == "/data/llm_config.db"
+
+    def test_an_explicit_path_wins(self):
+        from genetics_mcp_server.scripts.analyze_conversations import resolve_llm_config_db
+
+        assert resolve_llm_config_db("/data/chat_history.db", "/other/x.db") == "/other/x.db"
+
+    def test_a_bare_filename_resolves_beside_it_rather_than_at_the_root(self):
+        from genetics_mcp_server.scripts.analyze_conversations import resolve_llm_config_db
+
+        assert resolve_llm_config_db("chat_history.db", None) == "llm_config.db"

@@ -570,15 +570,15 @@ class LLMService:
             )
         )
 
-        # cache the replayed conversation history: mark the last content block of
-        # the last message with a cache_control breakpoint. Anthropic allows 4, and
-        # all 4 are now spoken for: tool definitions, the shared system block, this
-        # user's instruction block, and this one. There is no spare left, so anything
-        # that wants a new breakpoint has to take one of these away. It offsets the
-        # larger replayed payload now that tool
-        # results are persisted and replayed. Caveats: ephemeral cache TTL is ~5 min,
-        # and the cache lookback window means very long tool-heavy single turns may
-        # not hit. Caching is most valuable for resumes and rapid follow-ups.
+        # cache the replayed conversation history: mark the last content block of the last
+        # message with a cache_control breakpoint. This one earns its place by offsetting the
+        # larger replayed payload now that tool results are persisted and replayed.
+        # Anthropic allows 4 breakpoints and all 4 are spoken for — tool definitions, the shared
+        # system block, this user's instruction block, and this one — so anything that wants a
+        # new one has to take it from these.
+        # Caveats: ephemeral cache TTL is ~5 min, and the cache lookback window means very long
+        # tool-heavy single turns may not hit. Caching is most valuable for resumes and rapid
+        # follow-ups.
         _mark_history_cache_breakpoint(anthropic_messages)
 
         # prepare request parameters

@@ -14,10 +14,14 @@ def auth_is_required() -> bool:
 
     Read through settings rather than from a module global snapshotted at import time, so that
     this gate and the is_admin reported by /chat/v1/auth cannot disagree: they now consult the
-    same cached Settings instance. get_settings is imported per call, as in admin_required, so a
-    reload of the config module does not leave this holding the pre-reload cache. The old
-    module global is deliberately gone rather than kept as an alias — a test still patching it
-    now fails loudly instead of silently moving nothing.
+    same cached Settings instance. The old module global is deliberately gone rather than kept
+    as an alias — a test still patching it now fails loudly instead of silently moving nothing.
+
+    Importing get_settings per call does NOT make this reload-proof: the import resolves through
+    the package, and reloading `config.settings` rebinds only the submodule's handle while the
+    package keeps re-exporting the pre-reload function, so this would still read the pre-reload
+    cache. Move the setting with `conftest.settings_env`, which clears both handles, rather than
+    by reloading. See the note on `clear_settings_cache` in tests/conftest.py.
     """
     from genetics_mcp_server.config import get_settings
 
