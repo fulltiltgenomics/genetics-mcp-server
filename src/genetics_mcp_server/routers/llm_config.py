@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from genetics_mcp_server.auth import auth_required
+from genetics_mcp_server.auth import admin_required, auth_required
 from genetics_mcp_server.db import get_llm_config_db
 from genetics_mcp_server.db.llm_config_db import (
     InstructionSet,
@@ -500,14 +500,24 @@ async def get_instruction_set_history(
     return [_instruction_set_version_response(v) for v in history]
 
 
-# legacy global endpoints (kept for backward compatibility but deprecated)
+# legacy global endpoints (kept for backward compatibility but deprecated).
+#
+# admin-only, all four. tool descriptions are GLOBAL and tell the model when to call a tool, so a
+# write here reaches every user's turns — a far wider blast radius than an instruction set, which is
+# per-user and presentation-scoped. The write was auth_required, which let any authenticated user
+# overwrite one. Nothing loads these rows into the chat path today (llm_service receives
+# custom_tool_descriptions=None), so this was a dormant channel rather than a live one, but the
+# gate belongs here rather than on whoever eventually wires them in.
+#
+# the reads move too: they return changed_by, which is an admin's email address, and a resource
+# that is admin-to-write but world-to-read invites the write gate being read as accidental.
 
 @router.get(
     "/llm-config/tool-descriptions",
     summary="Get all tool descriptions",
     response_model=dict[str, ToolDescriptionResponse],
 )
-async def get_tool_descriptions(user: str = Depends(auth_required)):
+async def get_tool_descriptions(user: str = Depends(admin_required)):
     """
     Get the latest description for each tool.
     Returns a dictionary keyed by tool name.
@@ -534,7 +544,7 @@ async def get_tool_descriptions(user: str = Depends(auth_required)):
 )
 async def get_tool_description(
     tool_name: str,
-    user: str = Depends(auth_required),
+    user: str = Depends(admin_required),
 ):
     """
     Get the latest description for a specific tool.
@@ -562,7 +572,7 @@ async def get_tool_description(
 async def update_tool_description(
     tool_name: str,
     update: ToolDescriptionUpdate,
-    user: str = Depends(auth_required),
+    user: str = Depends(admin_required),
 ):
     """
     Save a new version of a tool description.
@@ -597,7 +607,7 @@ async def update_tool_description(
 async def get_tool_description_history(
     tool_name: str,
     limit: int = Query(20, ge=1, le=100),
-    user: str = Depends(auth_required),
+    user: str = Depends(admin_required),
 ):
     """
     Get recent versions of a tool description for audit/rollback reference.

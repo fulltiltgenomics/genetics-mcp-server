@@ -338,6 +338,19 @@ history, and a value past 64 bits raised `OverflowError` out of the driver as an
 The pre-existing `GET /chat/v1/llm-config/tool-descriptions/{tool_name}/history` had the
 identical hole and now carries the same bound.
 
+**The four legacy `/llm-config/tool-descriptions*` endpoints are admin-only** (they were
+`auth_required`, including the `PUT`). A tool description is *global* and is what tells the model
+when to call a tool, so one user's edit would reach every user's turns — a wider blast radius than
+an instruction set, which is per-user and presentation-scoped. Nothing loads these rows into the
+chat path today (`llm_service` always receives `custom_tool_descriptions=None`), so the channel
+was dormant rather than live, but the gate belongs on the resource rather than on whoever
+eventually wires it in. The reads moved with the write: they return `changed_by`, an admin's email
+address, and a resource that is admin-to-write but world-to-read invites the write gate being read
+as accidental. Note the consequence of `admin_required`: with `ENABLE_ADMIN_PAGE=false` these
+routes 404 for everyone. Production sets it `true`
+(`k8s/deployments/chat-backend.yaml`), and no client calls them — the browser's `llmConfigApi.ts`
+only touches the comments endpoints.
+
 ### Resolution on a chat turn
 
 `ChatRequest` gains `instruction_set_id`. **Only the id travels** — the body is loaded server-side

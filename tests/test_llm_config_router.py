@@ -4,7 +4,7 @@ import tempfile
 from unittest.mock import patch
 
 import pytest
-from conftest import close_and_unlink
+from conftest import close_and_unlink, settings_env
 from fastapi.testclient import TestClient
 
 from genetics_mcp_server.auth import auth_required
@@ -156,20 +156,42 @@ class TestUserCommentEndpoints:
         assert response.status_code == 404
 
 
-class TestGlobalToolDescriptionEndpoints:
-    """Tests for global tool description endpoints (legacy)."""
+@pytest.fixture
+def admin_client(test_db):
+    """A client for the admin-only endpoints.
 
-    def test_get_tool_descriptions_empty(self, client_with_auth):
+    admin_required 404s outright when ENABLE_ADMIN_PAGE is false, which is the default the rest
+    of the suite runs under, so enabling it is what makes these routes exist at all. REQUIRE_AUTH
+    stays false, so the mocked user is treated as an admin — the deny cases live in
+    TestToolDescriptionAuthGuards, which moves both settings.
+    """
+    async def mock_auth():
+        return "test@example.com"
+
+    app.dependency_overrides[auth_required] = mock_auth
+
+    with patch("genetics_mcp_server.routers.llm_config.get_llm_config_db", return_value=test_db):
+        with settings_env(ENABLE_ADMIN_PAGE="true"):
+            with TestClient(app) as client:
+                yield client
+
+    app.dependency_overrides.clear()
+
+
+class TestGlobalToolDescriptionEndpoints:
+    """Tests for global tool description endpoints (legacy, admin-only)."""
+
+    def test_get_tool_descriptions_empty(self, admin_client):
         """Test getting tool descriptions when none are saved."""
-        response = client_with_auth.get("/chat/v1/llm-config/tool-descriptions")
+        response = admin_client.get("/chat/v1/llm-config/tool-descriptions")
 
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, dict)
 
-    def test_update_tool_description(self, client_with_auth):
+    def test_update_tool_description(self, admin_client):
         """Test updating a tool description globally."""
-        response = client_with_auth.put(
+        response = admin_client.put(
             "/chat/v1/llm-config/tool-descriptions/search_genes",
             json={
                 "description": "Global custom description",
@@ -183,15 +205,15 @@ class TestGlobalToolDescriptionEndpoints:
         assert data["description"] == "Global custom description"
         assert data["changed_by"] == "test@example.com"
 
-    def test_get_tool_description(self, client_with_auth):
+    def test_get_tool_description(self, admin_client):
         """Test getting a specific tool description."""
         # save first
-        client_with_auth.put(
+        admin_client.put(
             "/chat/v1/llm-config/tool-descriptions/search_genes",
             json={"description": "Custom description"},
         )
 
-        response = client_with_auth.get(
+        response = admin_client.get(
             "/chat/v1/llm-config/tool-descriptions/search_genes"
         )
 
@@ -199,32 +221,32 @@ class TestGlobalToolDescriptionEndpoints:
         data = response.json()
         assert data["description"] == "Custom description"
 
-    def test_get_tool_description_not_found(self, client_with_auth):
+    def test_get_tool_description_not_found(self, admin_client):
         """Test getting a tool description that hasn't been customized."""
-        response = client_with_auth.get(
+        response = admin_client.get(
             "/chat/v1/llm-config/tool-descriptions/nonexistent_tool"
         )
 
         assert response.status_code == 200
         assert response.json() is None
 
-    def test_get_tool_description_history(self, client_with_auth):
+    def test_get_tool_description_history(self, admin_client):
         """Test getting tool description change history."""
         import time
 
         # make multiple changes
-        client_with_auth.put(
+        admin_client.put(
             "/chat/v1/llm-config/tool-descriptions/search_genes",
             json={"description": "Version 1"},
         )
         # wait for different timestamp
         time.sleep(1.1)
-        client_with_auth.put(
+        admin_client.put(
             "/chat/v1/llm-config/tool-descriptions/search_genes",
             json={"description": "Version 2"},
         )
 
-        response = client_with_auth.get(
+        response = admin_client.get(
             "/chat/v1/llm-config/tool-descriptions/search_genes/history"
         )
 
@@ -234,24 +256,24 @@ class TestGlobalToolDescriptionEndpoints:
         assert data[0]["description"] == "Version 2"
         assert data[1]["description"] == "Version 1"
 
-    def test_tool_description_history_limit_is_validated(self, client_with_auth):
+    def test_tool_description_history_limit_is_validated(self, admin_client):
         """Same unbounded/overflow hole as the instruction-set history endpoint."""
         url = "/chat/v1/llm-config/tool-descriptions/search_genes/history"
-        client_with_auth.put(
+        admin_client.put(
             "/chat/v1/llm-config/tool-descriptions/search_genes",
             json={"description": "Version 1"},
         )
 
-        assert client_with_auth.get(f"{url}?limit=-1").status_code == 422
-        assert client_with_auth.get(f"{url}?limit=0").status_code == 422
-        assert client_with_auth.get(f"{url}?limit=999999999999999999999").status_code == 422
-        assert client_with_auth.get(f"{url}?limit=101").status_code == 422
-        assert len(client_with_auth.get(f"{url}?limit=1").json()) == 1
-        assert client_with_auth.get(f"{url}?limit=100").status_code == 200
+        assert admin_client.get(f"{url}?limit=-1").status_code == 422
+        assert admin_client.get(f"{url}?limit=0").status_code == 422
+        assert admin_client.get(f"{url}?limit=999999999999999999999").status_code == 422
+        assert admin_client.get(f"{url}?limit=101").status_code == 422
+        assert len(admin_client.get(f"{url}?limit=1").json()) == 1
+        assert admin_client.get(f"{url}?limit=100").status_code == 200
 
-    def test_update_tool_description_empty_rejected(self, client_with_auth):
+    def test_update_tool_description_empty_rejected(self, admin_client):
         """Test that empty description is rejected."""
-        response = client_with_auth.put(
+        response = admin_client.put(
             "/chat/v1/llm-config/tool-descriptions/search_genes",
             json={"description": "  "},
         )
@@ -555,3 +577,87 @@ class TestUserSettingsEndpoints:
             json={"setting_value": ""},
         )
         assert resp.status_code == 400
+
+
+class TestToolDescriptionAuthGuards:
+    """Tool descriptions are GLOBAL: one write reaches every user's turns, because a tool
+    description is what tells the model when to call a tool. The write was auth_required, so any
+    authenticated user could overwrite one — dormant only because nothing loads these rows into
+    the chat path today (genetics-results-suite-bq3).
+
+    The rest of the suite runs with REQUIRE_AUTH=false, where admin_required waves everyone
+    through, so these cases have to move the setting themselves or they prove nothing.
+    """
+
+    def _as(self, email: str):
+        async def mock_auth():
+            return email
+
+        return mock_auth
+
+    @pytest.mark.parametrize(
+        "method,path,payload",
+        [
+            ("get", "/chat/v1/llm-config/tool-descriptions", None),
+            ("get", "/chat/v1/llm-config/tool-descriptions/search_genes", None),
+            ("put", "/chat/v1/llm-config/tool-descriptions/search_genes", {"description": "x"}),
+            ("get", "/chat/v1/llm-config/tool-descriptions/search_genes/history", None),
+        ],
+    )
+    def test_non_admin_denied_when_auth_required(self, test_db, method, path, payload):
+        app.dependency_overrides[auth_required] = self._as("regular@example.com")
+
+        with patch(
+            "genetics_mcp_server.routers.llm_config.get_llm_config_db", return_value=test_db
+        ):
+            with settings_env(
+                REQUIRE_AUTH="true",
+                ADMIN_USERS="admin@example.com",
+                ENABLE_ADMIN_PAGE="true",
+            ):
+                with TestClient(app) as client:
+                    kwargs = {"json": payload} if payload is not None else {}
+                    response = getattr(client, method)(path, **kwargs)
+                    assert response.status_code == 403
+
+        app.dependency_overrides.clear()
+
+    def test_admin_allowed_when_auth_required(self, test_db):
+        app.dependency_overrides[auth_required] = self._as("admin@example.com")
+
+        with patch(
+            "genetics_mcp_server.routers.llm_config.get_llm_config_db", return_value=test_db
+        ):
+            with settings_env(
+                REQUIRE_AUTH="true",
+                ADMIN_USERS="admin@example.com",
+                ENABLE_ADMIN_PAGE="true",
+            ):
+                with TestClient(app) as client:
+                    response = client.put(
+                        "/chat/v1/llm-config/tool-descriptions/search_genes",
+                        json={"description": "admin edit"},
+                    )
+                    assert response.status_code == 200
+                    assert response.json()["changed_by"] == "admin@example.com"
+
+        app.dependency_overrides.clear()
+
+    def test_the_per_user_instruction_endpoints_stay_open_to_any_user(self, test_db):
+        """The point of the change is scope, not lockdown: a user's own instruction sets are
+        per-user and must not need admin."""
+        app.dependency_overrides[auth_required] = self._as("regular@example.com")
+
+        with patch(
+            "genetics_mcp_server.routers.llm_config.get_llm_config_db", return_value=test_db
+        ):
+            with settings_env(
+                REQUIRE_AUTH="true",
+                ADMIN_USERS="admin@example.com",
+                ENABLE_ADMIN_PAGE="true",
+            ):
+                with TestClient(app) as client:
+                    response = client.get("/chat/v1/llm-config/user/instruction-sets")
+                    assert response.status_code == 200
+
+        app.dependency_overrides.clear()
