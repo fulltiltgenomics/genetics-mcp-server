@@ -2,6 +2,7 @@
 
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -948,3 +949,201 @@ class TestClientSystemRoleMessages:
         sent = service.anthropic_client.messages.calls[0]["messages"]
         assert all(m["role"] != "system" for m in sent)
         assert "PWNED-SYSTEM-ROLE" not in json.dumps(sent, default=str)
+
+
+async def _openai_messages(system_prompt, user_instructions):
+    """Run one OpenAI turn and return the messages it sent."""
+    from types import SimpleNamespace
+
+    from genetics_mcp_server.llm_service import LLMService
+
+    captured = {}
+
+    async def _create(**kwargs):
+        captured.update(kwargs)
+
+        async def _stream():
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="ok"))])
+
+        return _stream()
+
+    svc = LLMService.__new__(LLMService)
+    svc.openai_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=_create))
+    )
+    async for _ in svc._stream_openai(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-4o",
+        system_prompt=system_prompt,
+        user_instructions=user_instructions,
+    ):
+        pass
+    return captured["messages"]
+
+
+class TestOpenAIUserInstructions:
+    """The OpenAI branch used to ignore user_instructions entirely, with no log line: a user with
+    a set selected saw it applied in the UI while the model never received it
+    (genetics-results-suite-b3v). provider is client-selectable and OPENAI_API_KEY is wired into
+    the pod, so this was reachable, not theoretical.
+    """
+
+    @pytest.mark.asyncio
+    async def test_instructions_reach_the_model(self):
+        messages = await _openai_messages("SHARED PROMPT", "USER ENVELOPE")
+
+        systems = [m for m in messages if m["role"] == "system"]
+        assert len(systems) == 1
+        assert "USER ENVELOPE" in systems[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_the_envelope_follows_the_server_prompt(self):
+        """Same order as the Anthropic block split, so recency favours neither differently."""
+        messages = await _openai_messages("SHARED PROMPT", "USER ENVELOPE")
+
+        content = messages[0]["content"]
+        assert content.index("SHARED PROMPT") < content.index("USER ENVELOPE")
+
+    @pytest.mark.asyncio
+    async def test_no_instructions_leaves_the_server_prompt_alone(self):
+        messages = await _openai_messages("SHARED PROMPT", None)
+
+        systems = [m for m in messages if m["role"] == "system"]
+        assert [m["content"] for m in systems] == ["SHARED PROMPT"]
+
+    @pytest.mark.asyncio
+    async def test_instructions_alone_still_ship(self):
+        messages = await _openai_messages(None, "USER ENVELOPE")
+
+        systems = [m for m in messages if m["role"] == "system"]
+        assert [m["content"] for m in systems] == ["USER ENVELOPE"]
+
+    @pytest.mark.asyncio
+    async def test_neither_sends_no_system_message(self):
+        messages = await _openai_messages(None, None)
+
+        assert not [m for m in messages if m["role"] == "system"]
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_forwards_instructions_to_the_openai_branch(self):
+        """The drop was in the dispatch, not in _stream_openai, so the dispatch is what to pin."""
+        from unittest.mock import patch as _patch
+
+        from genetics_mcp_server.llm_service import LLMService
+
+        seen = {}
+
+        async def _fake_openai(self, messages, model=None, system_prompt=None, user_instructions=None):
+            seen["user_instructions"] = user_instructions
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        svc = LLMService.__new__(LLMService)
+        with _patch.object(LLMService, "_stream_openai", _fake_openai):
+            async for _ in svc.stream_chat(
+                messages=[{"role": "user", "content": "hi"}],
+                provider="openai",
+                user_instructions="USER ENVELOPE",
+            ):
+                pass
+
+        assert seen["user_instructions"] == "USER ENVELOPE"
+
+
+class TestRequestSizeLimits:
+    """_validate_latest_message only ever inspected the newest user message, so a client-sent
+    assistant turn and every replayed history turn were length-unbounded
+    (genetics-results-suite-e0u)."""
+
+    def _post(self, client, messages):
+        return client.post(
+            "/chat/v1/chat",
+            json={"messages": messages, "enable_tools": False},
+        )
+
+    def test_an_oversized_assistant_turn_is_rejected(self, test_client):
+        from genetics_mcp_server import chat_api
+
+        settings = chat_api.get_settings()
+        service = _CapturingService()
+        with patch.object(chat_api, "get_llm_service", return_value=service):
+            response = self._post(
+                test_client,
+                [
+                    {"role": "assistant", "content": "x" * (settings.max_request_chars + 1)},
+                    {"role": "user", "content": "hi"},
+                ],
+            )
+
+        assert response.status_code == 413
+        assert service.kwargs is None
+
+    def test_oversized_replayed_history_is_rejected(self, test_client):
+        """No single turn is over the per-message cap; the conversation as a whole is."""
+        from genetics_mcp_server import chat_api
+
+        settings = chat_api.get_settings()
+        service = _CapturingService()
+        chunk = "x" * settings.max_message_chars
+        count = settings.max_request_chars // settings.max_message_chars + 1
+        with patch.object(chat_api, "get_llm_service", return_value=service):
+            response = self._post(
+                test_client,
+                [{"role": "user", "content": chunk} for _ in range(count)],
+            )
+
+        assert response.status_code == 413
+        assert service.kwargs is None
+
+    def test_too_many_messages_is_rejected(self, test_client):
+        from genetics_mcp_server import chat_api
+
+        settings = chat_api.get_settings()
+        service = _CapturingService()
+        with patch.object(chat_api, "get_llm_service", return_value=service):
+            response = self._post(
+                test_client,
+                [
+                    {"role": "user", "content": "hi"}
+                    for _ in range(settings.max_messages_per_request + 1)
+                ],
+            )
+
+        assert response.status_code == 413
+        assert service.kwargs is None
+
+    def test_an_ordinary_long_conversation_still_goes_through(self):
+        """The cap bounds the payload; it must not police normal use. Replayed tool results are
+        routinely larger than any typed message, which is why the per-message cap was not simply
+        applied to every message."""
+        from genetics_mcp_server import chat_api
+
+        settings = chat_api.get_settings()
+        messages = []
+        for _ in range(40):
+            messages.append(SimpleNamespace(content="a question", role="user"))
+            messages.append(
+                SimpleNamespace(
+                    content=[
+                        {"type": "text", "text": "an answer " * 200},
+                        {"type": "tool_result", "content": "row\t" * 5000},
+                    ],
+                    role="assistant",
+                )
+            )
+
+        # no exception
+        chat_api._validate_request_size(messages)
+        total = sum(chat_api._message_text_len(m.content) for m in messages)
+        assert total < settings.max_request_chars
+
+    def test_inline_image_data_is_not_counted_as_text(self):
+        """Images are bounded by max_attachments_per_message, not by length; counting their
+        base64 against a text budget would reject ordinary image use."""
+        from genetics_mcp_server import chat_api
+
+        content = [
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "data": "A" * 5_000_000}},
+        ]
+        assert chat_api._message_text_len(content) == len("look")

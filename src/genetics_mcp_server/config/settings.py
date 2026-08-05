@@ -172,6 +172,17 @@ class Settings:
     max_attachments_per_message: int = field(
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
     )
+    # caps on the request as a whole. The per-message caps above only ever saw the newest user
+    # message, so a client-sent assistant turn and every replayed history turn were unbounded
+    # (genetics-results-suite-e0u). Deliberately generous: replayed tool results are legitimately
+    # far larger than a typed message, so these bound the payload rather than police it. Text
+    # only — inline image data is counted by max_attachments_per_message, not by length
+    max_request_chars: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_REQUEST_CHARS", "2000000"))
+    )
+    max_messages_per_request: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_MESSAGES_PER_REQUEST", "500"))
+    )
 
     # auth gate. The single source of truth for REQUIRE_AUTH: auth.dependencies used to snapshot
     # it into a module global at import time while chat_api re-read os.environ per request, so a

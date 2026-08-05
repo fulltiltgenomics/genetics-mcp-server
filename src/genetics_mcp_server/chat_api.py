@@ -87,6 +87,57 @@ def _classify_error(e: Exception) -> str:
 _FILE_BLOCK_PREFIX = "[File: "
 
 
+def _message_text_len(content) -> int:
+    """Characters of text in one message, ignoring inline image/document data."""
+    if isinstance(content, str):
+        return len(content)
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            total += len(str(block.get("text", "")))
+        elif block.get("type") == "tool_result":
+            # replayed tool output, which is where the bulk of a long conversation lives
+            inner = block.get("content")
+            total += len(inner) if isinstance(inner, str) else _message_text_len(inner)
+    return total
+
+
+def _validate_request_size(messages: list["ChatMessage"]) -> None:
+    """Bound the request as a whole. Raises HTTP 413.
+
+    _validate_latest_message only ever inspects the newest user message, so a client-sent
+    assistant turn and every replayed history turn were length-unbounded
+    (genetics-results-suite-e0u). A forged assistant turn carries no system authority — the
+    concern here is request size, not authority — but nothing capped it.
+
+    Applying the per-message cap to every message would have been the tighter rule and the wrong
+    one: replayed tool results are routinely larger than any typed message, so it would reject
+    ordinary long conversations.
+    """
+    settings = get_settings()
+    if len(messages) > settings.max_messages_per_request:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Too many messages in one request ({len(messages)}, limit "
+                f"{settings.max_messages_per_request})."
+            ),
+        )
+    total = sum(_message_text_len(m.content) for m in messages)
+    if total > settings.max_request_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Conversation too large ({total} characters, limit "
+                f"{settings.max_request_chars}). Start a new chat to continue."
+            ),
+        )
+
+
 def _validate_latest_message(messages: list["ChatMessage"]) -> None:
     """Enforce per-message limits on the newest user message.
 
@@ -424,6 +475,7 @@ async def stream_chat(
         )
 
     # enforce per-message size limits before any model call
+    _validate_request_size(request.messages)
     _validate_latest_message(request.messages)
 
     # validate provider

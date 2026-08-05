@@ -456,8 +456,9 @@ class LLMService:
             user: Authenticated user email for logging.
             session_id: Client conversation id, logged (id only) to count distinct conversations.
             user_instructions: Pre-wrapped envelope holding this user's stored instruction
-                set. Kept separate from system_prompt rather than concatenated so it can
-                occupy its own cache block (Anthropic only).
+                set. Kept separate from system_prompt rather than concatenated so it can occupy
+                its own cache block on the Anthropic path; the OpenAI path has no equivalent
+                breakpoint and concatenates the two into one system message.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -466,7 +467,9 @@ class LLMService:
         provider = provider or settings.default_provider
 
         if provider == "openai":
-            async for chunk in self._stream_openai(messages, model, system_prompt):
+            async for chunk in self._stream_openai(
+                messages, model, system_prompt, user_instructions
+            ):
                 yield chunk
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
@@ -483,6 +486,7 @@ class LLMService:
         messages: list[dict],
         model: str | None = None,
         system_prompt: str | None = None,
+        user_instructions: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from OpenAI."""
         if not self.openai_client:
@@ -496,8 +500,14 @@ class LLMService:
         # `ChatMessage.role` already rejects 'system' at the API boundary, so this is
         # defence in depth for callers that reach stream_chat with raw dicts.
         messages = [msg for msg in messages if msg.get("role") != "system"]
-        if system_prompt:
-            messages = [{"role": "system", "content": system_prompt}] + messages
+        # concatenated rather than a second system message: the two-block split on the Anthropic
+        # path exists to give each half its own prompt-cache breakpoint, which has no equivalent
+        # here. Order matches that path — the envelope follows the server prompt. This used to be
+        # dropped outright, so a user with a set selected saw it applied in the UI while the model
+        # never received it (genetics-results-suite-b3v)
+        combined = "\n\n".join(part for part in (system_prompt, user_instructions) if part)
+        if combined:
+            messages = [{"role": "system", "content": combined}] + messages
 
         try:
             logger.info(f"Streaming OpenAI chat with model {model}")
@@ -556,7 +566,7 @@ class LLMService:
         # and both provider paths should be safe on their own.
         anthropic_messages = _sanitize_tool_blocks(
             _strip_tool_use_markers(
-                [msg for msg in messages if msg["role"] != "system"]
+                [msg for msg in messages if msg.get("role") != "system"]
             )
         )
 

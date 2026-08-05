@@ -22,7 +22,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Optional IAP/oauth2-proxy authentication**: Protect the chat API via `X-Goog-Authenticated-User-Email` header
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
-- **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) are inlined by the frontend as text blocks prefixed `[File: <name>]` — both are counted toward the attachment limit, not the character limit. The frontend (`LLMChat.tsx`) mirrors these limits for immediate feedback. Bulk data should be attached as a file rather than pasted
+- **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. `_validate_request_size` bounds the request as a whole — total text across **all** messages (`MAX_REQUEST_CHARS`, default 2M, images excluded) and message count (`MAX_MESSAGES_PER_REQUEST`, default 500) — because the per-message check only ever inspects the newest *user* message, leaving a client-sent assistant turn and every replayed history turn unbounded (`genetics-results-suite-e0u`). Applying the per-message cap to every message would have been the tighter rule and the wrong one: replayed tool results are routinely larger than any typed message, so it would reject ordinary long conversations. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) are inlined by the frontend as text blocks prefixed `[File: <name>]` — both are counted toward the attachment limit, not the character limit. The frontend (`LLMChat.tsx`) mirrors these limits for immediate feedback. Bulk data should be attached as a file rather than pasted
 - **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, since sessions are created lazily after the first exchange and no `session_id` exists at first send. The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens). During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
@@ -437,9 +437,13 @@ raw id rather than failing the run.
   that path at all — the client owns it — `_validate_user_token` (`mcp_server.py`) returns a
   bool and discards the identity behind the token, and the deployed `mcp-server` pod mounts no
   `chat-data` volume, so `llm_config.db` is not even reachable from it.
-- **The OpenAI provider branch silently drops them.** `stream_chat` calls `_stream_openai` without
-  `user_instructions`; only the Anthropic path assembles the two-block system prompt. Tracked as
-  `genetics-results-suite-b3v`.
+- **The OpenAI provider branch applies them too**, as one concatenated system message rather than
+  two blocks: the split exists to give each half its own prompt-cache breakpoint, which that path
+  has no equivalent for. Order matches Anthropic's — the envelope follows the server prompt. It
+  previously dropped `user_instructions` outright with no log line, so a user with a set selected
+  saw it applied in the UI while the model never received it; `provider` is client-selectable and
+  `OPENAI_API_KEY` is wired into the pod, so that was reachable rather than theoretical
+  (`genetics-results-suite-b3v`).
 
 ## Architecture
 
@@ -733,6 +737,8 @@ All configuration is via environment variables (`.env` file supported):
 | `ATTACHMENT_STORAGE_PATH` | Path for file attachment storage | `/path/to/attachments` |
 | `MAX_ATTACHMENT_SIZE` | Max attachment size in bytes | `52428800` (50MB) |
 | `MAX_MESSAGE_CHARS` | Max typed-text characters in a single user message (excludes attachments) | `50000` |
+| `MAX_REQUEST_CHARS` | Cap on total text across **all** messages in one chat request, images excluded. Deliberately generous — replayed tool results are legitimately far larger than a typed message — so it bounds the payload rather than policing use | `2000000` |
+| `MAX_MESSAGES_PER_REQUEST` | Cap on the number of messages in one chat request | `500` |
 | `MAX_ATTACHMENTS_PER_MESSAGE` | Max attachment blocks (image/document/inlined data file) per message | `10` |
 | `DOWNLOAD_STORAGE_PATH` | Path for tool result download files | `/mnt/disks/data/downloads` |
 | `DOWNLOAD_TTL_SECONDS` | TTL for download files in seconds | `2592000` (30 days) |
