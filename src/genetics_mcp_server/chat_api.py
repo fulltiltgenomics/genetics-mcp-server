@@ -301,6 +301,15 @@ class ChatRequest(BaseModel):
         description="Client conversation id. Logged (id only, never content) so distinct "
         "conversations can be counted, including secret ones.",
     )
+    message_id: str | None = Field(
+        None,
+        max_length=64,
+        description="Client-generated id the assistant message of this turn will be saved "
+        "under. Used only to key the turn's recorded metrics to chat_messages; the metrics "
+        "row is written with or without it, and never for a secret chat. Bounded at 64 "
+        "characters (uuid4 is 36): unlike session_id, which is only logged, this value is "
+        "persisted, and the service has no request-body-size middleware.",
+    )
 
 
 class ChatStatusResponse(BaseModel):
@@ -522,6 +531,7 @@ async def stream_chat(
                 user=user,
                 session_id=request.session_id,
                 user_instructions=user_instructions,
+                message_id=request.message_id,
             ):
                 if chunk.type == "text":
                     yield {

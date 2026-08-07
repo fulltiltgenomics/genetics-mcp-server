@@ -436,6 +436,7 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         user_instructions: str | None = None,
+        message_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -459,6 +460,9 @@ class LLMService:
                 set. Kept separate from system_prompt rather than concatenated so it can occupy
                 its own cache block on the Anthropic path; the OpenAI path has no equivalent
                 breakpoint and concatenates the two into one system message.
+            message_id: Client-generated id of the assistant message this turn will become,
+                used only to key the recorded turn metrics to chat_messages. Optional: the
+                metrics row is still written without it, it just cannot be joined.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -475,7 +479,7 @@ class LLMService:
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
                 literature_backend, tool_profile, secret, user, session_id,
-                user_instructions,
+                user_instructions, message_id,
             ):
                 yield chunk
         else:
@@ -549,10 +553,13 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         user_instructions: str | None = None,
+        message_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
             raise RuntimeError("Anthropic client not initialized. Check API key.")
+
+        turn_started = time.monotonic()
 
         settings = get_settings()
         model = model or settings.default_model
@@ -677,6 +684,9 @@ class LLMService:
             total_cost = 0.0
             total_input_tokens = 0
             total_output_tokens = 0
+            total_cache_read = 0
+            total_cache_create = 0
+            tool_call_count = 0
 
             # collect all content blocks for persistence
             all_content_blocks: list[dict[str, Any]] = []
@@ -754,6 +764,8 @@ class LLMService:
                 total_cost += iter_cost
                 total_input_tokens += input_tok
                 total_output_tokens += output_tok
+                total_cache_read += cache_read
+                total_cache_create += cache_create
                 logger.info(
                     f"{log_prefix}API call iteration={iteration} model={model} "
                     f"input_tokens={input_tok} output_tokens={output_tok} "
@@ -855,6 +867,8 @@ class LLMService:
 
                 if not tool_uses or not self.executor:
                     break
+
+                tool_call_count += len(tool_uses)
 
                 # emit tool-use indicators to stream
                 for tool_use in tool_uses:
@@ -1019,12 +1033,70 @@ class LLMService:
                 tool_results=all_tool_results or None,
             )
 
+            # after the terminator, never before it: `done` carries the message_content the
+            # client persists, and an await placed ahead of it would put a SQLite busy wait
+            # (up to the 5s default, whenever the nightly analysis job holds the write lock)
+            # and a fresh cancellation point between the answer and its delivery. The
+            # consumer in chat_api iterates this generator with a plain `async for` and no
+            # `break`, so it is driven one step past this yield and the write still runs.
+            #
+            # Otherwise deliberately here and nowhere else: one metrics row exists exactly
+            # when one "Chat complete" line exists, so the two can never disagree. A turn
+            # that ended abnormally (exception, timeout, client disconnect) reaches neither
+            # and is recorded by neither — its accumulators are partial and would bias the
+            # cost-per-turn figures the benchmark gates on. A turn stopped by max_iterations
+            # does reach both and is recorded: those are the expensive tail this exists to
+            # measure.
+            await self._record_turn_metrics(
+                secret=secret,
+                session_id=session_id,
+                message_id=message_id,
+                user_id=user,
+                iterations=iteration,
+                tool_call_count=tool_call_count,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_read_tokens=total_cache_read,
+                cache_create_tokens=total_cache_create,
+                cost_usd=total_cost,
+                wall_ms=int((time.monotonic() - turn_started) * 1000),
+                tool_profile=tool_profile,
+                model=model,
+            )
+
         except asyncio.TimeoutError:
             logger.error("Anthropic streaming timed out after 300s")
             raise
         except Exception as e:
             logger.error(f"Error streaming Anthropic chat: {e}")
             raise
+
+    async def _record_turn_metrics(self, *, secret: bool, **fields: Any) -> None:
+        """Persist one completed turn's cost and roundtrip profile, best effort.
+
+        Secret chat is skipped outright, before the database is even reached. The promise
+        attached to it is that the conversation leaves no trace, and the same rule that
+        keeps chat_messages empty has to keep this table empty: iteration counts and costs
+        are not content, but a row keyed to a session id still says a conversation happened
+        and how expensive it was.
+
+        Everything else is swallowed. This runs inside a live SSE generator, so an
+        exception here would truncate an answer the user already paid for — telemetry is
+        never worth that. The write goes to a worker thread because chat_history.db lives
+        on a ReadWriteOnce volume shared with the nightly analysis job: SQLite will block
+        for its busy timeout when that job holds the write lock, and blocking the event
+        loop would stall every other stream in this process, not just this one.
+        """
+        if secret:
+            return
+        try:
+            from genetics_mcp_server.db.chat_history_db import get_chat_history_db
+
+            await asyncio.to_thread(
+                lambda: get_chat_history_db().record_turn_metrics(**fields)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record turn metrics: {e}")
 
     async def _execute_tool(
         self,

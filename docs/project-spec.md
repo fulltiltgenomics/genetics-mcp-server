@@ -342,6 +342,73 @@ hold the user's *default* — the value an explicit control interaction last wro
 `chat_messages` columns hold what each conversation was actually held under, so reopening an old
 conversation restores its options without changing what the next new chat starts from.
 
+### Per-turn metrics (`chat_turn_metrics`)
+
+One row per **completed** assistant turn, written by `_stream_anthropic` in the same block that
+logs the `Chat complete:` line, so the log line and the row can never disagree. **The Anthropic
+path only** — `_stream_openai` records nothing, so any aggregate over this table under-counts a
+deployment that also serves OpenAI. It holds
+`iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
+`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model` and `created_at`. Before it,
+these numbers existed only in Cloud Logging and had to be recovered from the BigQuery log sink;
+`chat_messages.content_json` is not a substitute, because it flattens a whole turn's blocks into
+one assistant record, leaving parallel and sequential tool calls indistinguishable and roundtrips
+per turn underivable.
+
+- **Keying.** A surrogate `id`, plus `session_id` and `message_id` columns and a *partial* unique
+  index on `message_id WHERE message_id IS NOT NULL`. `message_id` is the client-generated
+  `chat_messages` primary key and is globally unique on its own, so it needs no `session_id` to
+  disambiguate. Both ids are nullable and neither carries a foreign key — `PRAGMA foreign_keys` is
+  ON here, so one would abort the insert: the row is written while the stream is still open,
+  before the client POSTs the assistant message, and on a conversation's first turn before the
+  session row exists at all (the browser creates the session only after the first exchange
+  completes). `delete_session` therefore deletes these rows explicitly; the `chat_sessions`
+  cascade does not reach them.
+- **`user_id` scopes the upsert.** `message_id` arrives from the client and is unique only by
+  convention, so without an owner on the row any authenticated user could send another user's
+  `message_id` and have their turn overwrite that user's row — cost zeroed, `session_id`
+  reassigned, no error and no log. The row therefore carries the authenticated user, and the
+  `DO UPDATE` ends in `WHERE chat_turn_metrics.user_id IS excluded.user_id`. A conflicting write
+  from a different user **inserts nothing, overwrites nothing, and logs a warning**;
+  `record_turn_metrics` returns `None` rather than a row id. `IS` and not `=` so a deployment
+  with auth disabled, writing NULL `user_id`, can still re-record its own rows. `user_id` is also
+  what makes per-user cost analysis possible at all.
+- **Turn-1 rows are orphaned.** The browser does not send `message_id` today and creates the
+  session only after the first exchange, so *every* conversation's opening turn is written with
+  both ids NULL. Consequences, until the browser change lands (tracked in the browser repo):
+  per-session analysis systematically omits every conversation's first turn — usually its most
+  cache-expensive — and `WHERE session_id = ?` alone cannot find those rows to delete them.
+  `delete_session` therefore also deletes `user_id = ? AND session_id IS NULL AND message_id IS
+  NULL`. Those rows are unattributable to any session by construction, so removing them costs no
+  analysis that was possible anyway, and leaving them would keep a permanent record that the user
+  held a conversation and what it cost. The trade is that deleting one conversation also drops the
+  opening turns of that user's *other* conversations; privacy wins it until the ids arrive.
+- **`message_id` is bounded at 64 characters** (`Field(None, max_length=64)`; uuid4 is 36). The
+  service has no request-body-size middleware, and unlike `session_id` — which is only logged —
+  this value is written to the shared RWO volume.
+- **Secret chat writes nothing**, checked before the database is reached. Counts and costs are not
+  content, but a row keyed to a session id still says a conversation happened and what it cost,
+  and secret chat is promised to leave no trace.
+- **Abnormal endings.** A turn stopped by `MCP_MAX_ITERATIONS` *is* recorded — that is the
+  expensive tail the numbers exist to measure. A turn ended by an exception, a timeout or a client
+  disconnect is not: it reaches neither the log line nor the write, and its partial accumulators
+  would bias per-turn cost.
+- **Failure is swallowed, and the write is off the answer's critical path.** It happens *after*
+  the `done` chunk is yielded, not before: `done` carries the `message_content` the client
+  persists, and an `await` ahead of it would put a SQLite busy wait (up to the 5s default,
+  whenever the nightly analysis job holds the write lock) and a fresh cancellation point between
+  the answer and its delivery. `chat_api`'s `event_generator` iterates the stream with a plain
+  `async for` and no `break`, so the generator is driven one step past that yield and the write
+  still runs. The write is also wrapped and only logged on failure: this runs inside a
+  live SSE generator, and telemetry must never truncate an answer. It also runs via
+  `asyncio.to_thread`, because `chat_history.db` sits on a ReadWriteOnce volume shared with the
+  nightly analyze-conversations CronJob — SQLite blocks for its busy timeout when that job holds
+  the write lock, and blocking the event loop would stall every other stream in the process.
+- **`message_id` plumbing.** `ChatRequest.message_id` (optional) carries the id the client will
+  save the assistant message under, through `stream_chat` into the row. The browser already holds
+  that id before it opens the stream but does not send it yet, so today the column is written NULL
+  and the row is joined to `chat_messages` by `session_id` + `created_at` ordering.
+
 `limit` on the history endpoint is `Query(20, ge=1, le=100)`. It was unvalidated when first
 written: SQLite treats a negative `LIMIT` as unbounded, so `?limit=-1` returned the entire
 history, and a value past 64 bits raised `OverflowError` out of the driver as an uncaught 500.
