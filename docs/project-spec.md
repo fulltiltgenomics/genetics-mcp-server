@@ -731,6 +731,7 @@ src/genetics_mcp_server/
 │   ├── analysis_timeseries.py  # shared rolling-window aggregation used by both renderers
 │   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
+│   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -1267,6 +1268,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
+| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling (runs a local stub SSE server) |
 
 Run tests:
 ```bash
@@ -1379,6 +1381,119 @@ quality-over-time plots).
   every conversation from scratch — a superset of `--no-cache` for the selected range;
   `--force` wins over `--refresh-quality` since it recomputes topics too). The issue text →
   taxonomy-category map remains a small flat sidecar at `<output-dir>/.cache/issue_categories.json`.
+
+## Replay Benchmark
+
+`scripts/replay_benchmark.py` replays the `user_turns` sequences from
+`eval_dataset.json` through `POST /chat/v1/chat` under two `tool_profile` arms and
+reports per-arm distributions. It is the measurement gate for the code-execution
+epic (`genetics-results-suite-4h6`): a candidate arm has to beat the recorded
+baseline before it is defaulted on.
+
+**Running it costs real money** — production averaged $2.01 per turn, and the
+harness issues two arms per case. `--base-url` therefore defaults to
+`http://localhost:8000`, never a deployment, and `--dry-run` resolves the whole plan
+(case order, arm order, turn count) without issuing a single request.
+
+- **Paired design.** Both arms of a case run back to back inside one worker, so a
+  model swap or an API slowdown mid-run hits both arms equally. `--concurrency`
+  parallelises over *cases*; the semaphore is held for the whole case, so the two
+  arms of one case never overlap. Case order is deterministic (sorted on
+  `session_id`) and the arm order alternates by case index — even cases run
+  (A, B), odd cases (B, A) — so the second-position warm-cache advantage does not
+  accrue to one arm. The order actually used is recorded per case in the report.
+- **The analysis is matched, because the design is paired.** The headline
+  distributions (`report["matched"]`) cover only the `(case_id, turn_index)` pairs
+  that came back `ok` on *both* arms. Summarising each arm's own `ok` turns
+  independently would reward an arm for failing: `replay_case_arm` aborts only the
+  failing arm, so an arm that dies on the hard, late, expensive turns keeps just its
+  cheap early ones while the healthy arm carries the full tail, and its
+  iterations/cost/latency medians drop *because it failed*. The per-arm marginals are
+  still reported (`report["per_arm"]`) but printed under an explicit "UNMATCHED
+  MARGINALS — not comparable across arms" heading, and the summary states how many
+  `ok` turns each arm contributed that the other arm did not.
+- **Replayed history carries the tool results.** The `done` chunk's `tool_results`
+  are appended after the assistant message as `{"role": "user", "content":
+  tool_results}` — exactly what the browser does (`LLMChat.tsx`) and what
+  `llm_service` itself does inside the agentic loop. Without them
+  `_sanitize_tool_blocks` strips every `tool_use` block of the replayed assistant
+  turn as orphaned, so from turn 2 on the model would see an assistant that answered
+  out of thin air. That matters more here than anywhere else: tool results are the
+  bulk of the context growth the benchmark exists to measure (median 39k → 117k
+  tokens across a conversation), and the loss is asymmetric — the arm calling more or
+  larger tools loses more context, compressing the measured gap between arms.
+- **Metrics come off the SSE stream, not the database.** Every request carries
+  `secret=true` (a benchmark must not write into a user's history), and secret chat
+  deliberately writes no `chat_turn_metrics` row, so the DB is not an option — see
+  the `chat_turn_metrics` section. `llm_service` yields a `usage` chunk per model
+  roundtrip; the harness reads `iteration`, per-iteration `input_tokens`,
+  `total_input_tokens`, `total_output_tokens` and `context_percent` from it, and
+  takes the tool-call count from the `done` chunk's `message_content` by counting
+  real `tool_use` blocks (never the `*[Using tool: …]*` display markers, which the
+  model has been observed to imitate as prose).
+- **The `usage` chunk's `input_tokens` is the whole context**, i.e.
+  `input_tokens + cache_read + cache_creation`, while `total_input_tokens`
+  accumulates only the billed uncached input. `cached_input_tokens` is therefore
+  derived as `sum(per-iteration input_tokens) - total_input_tokens`, and cache reads
+  cannot be separated from cache creations — they differ by more than 12x in price.
+  **Cost is consequently reported as an interval**, `cost_usd_min` (all cached
+  tokens priced as cache reads) to `cost_usd_max` (all priced as cache creations),
+  never as a single fabricated number. Pricing also needs a model name the pricing
+  table actually knows: without `--model`, *or* with a model `cost.has_pricing()`
+  cannot match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
+  ("not priced") with a warning, not `0` and not silently priced at the
+  `_match_pricing` Sonnet fallback.
+- **A turn that reaches `done` without a single `usage` chunk is `no_usage_chunks`,
+  not `ok`.** Iterations, tokens and cost are all unmeasurable for it, so counting
+  its (necessarily zero) `tool_use` blocks would push a fake `0` into the tool-call
+  distribution while contributing nothing to any other, diverging the two samples'
+  `n` and dragging the tool-call median down. This is not hypothetical: the OpenAI
+  path in `llm_service` yields one synthetic text block with no usage chunk and no
+  tool_use blocks, so a deployment whose `default_provider` is OpenAI would report
+  `tool_calls=0` for every turn. `--provider` pins the provider on the request and is
+  recorded in the report config. The history stays intact, so the rest of the case
+  still runs; it is the status, not an abort, that keeps the turn out of the
+  comparison.
+- **`--timeout` is a wall-clock deadline per turn**, enforced with
+  `asyncio.timeout` around the whole stream. httpx's timeout is per *read*, and
+  `sse_starlette` sends a keepalive comment every 15s that the parser drops silently
+   — each one resets a read timeout, so a wedged generator could stream keepalives
+  (and burn money) indefinitely without ever tripping it.
+- **Distributions, not medians.** Every metric is reported as n / mean / p25 / p50 /
+  p75 / p90 / p95 / max, because the production distribution is tail-weighted
+  (iterations median 2 but p95 8, max 25). A percentile is flagged
+  `unreliable at n=<n>` whenever `n * (1 - p) < 1`, i.e. when the sample has no
+  observation above it and the "percentile" is just the maximum: p25 and p50 need
+  n≥2, p75 n≥4, p90 n≥10, p95 n≥20. The threshold is computed as
+  `ceil(100 / (100 - p))`, not `ceil(1 / (1 - p/100))` — the latter makes p90's
+  threshold 11 because `1 - 0.9` is `0.09999999999999998` in binary floating point.
+  The human summary states N and warns outright below 10 cases.
+- **Failures are counted, never dropped.** A turn that errors, times out or hits an
+  unreachable target is recorded with its status and message; the remaining turns of
+  that case *and that arm only* are recorded as `not_attempted` (the history is
+  broken, so they cannot be replayed under comparable conditions). The other arm and
+  every other case continue. A whole case that raises out of the worker emits one
+  `error` record per `(arm, turn_index)` over its planned turns, in that case's
+  alternated arm order — not two `turn_index=0` records, which would under-report
+  `turns_attempted` and hide the loss from the per-status table.
+- **Script-failure and retry-loop counters are declared but not yet emitted.**
+  A code-execution arm scores ~1 tool call by construction, so tool-call count alone
+  is a dishonest win condition; the counters exist to price the failure modes that
+  offset it. Nothing on the chat stream emits script results today, so the harness
+  looks for a `script_result` chunk (`exit_code` / `timed_out` / `exception`) and,
+  when it sees none, reports `null` and prints `NOT MEASURED` with the reason —
+  deliberately *not* `0`, which would read as "measured, no failures". Once the
+  sandbox arm emits the chunk the fields populate, and a run with scripts that all
+  succeeded then reports a real `0`. The `NOT MEASURED` branch keys on `script_runs
+  is None`, never on `script_failure_rate is None`: the rate is also `None` for an arm
+  that *was* measured and ran zero scripts, and printing that as unmeasured would
+  defeat the whole point of distinguishing the two states.
+- **Output** is a JSON report (`--output`) carrying the config, the per-case arm
+  order, the matched-pair headline summaries, the unmatched per-arm marginals and
+  every individual turn record (including the per-iteration usage detail), plus a
+  human-readable summary on stdout.
+- Authentication, when the target requires it, comes from `$REPLAY_AUTH_TOKEN` and is
+  sent as a bearer token; it is never written into the report or logged.
 
 ## Development Workflow
 
