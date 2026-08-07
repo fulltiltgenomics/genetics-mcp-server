@@ -13,8 +13,10 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     ConversationMetrics,
     _attachment_note,
     _format_conversation_for_eval,
+    _session_user_turns,
     apply_quality_assessments,
     build_session_tool_stats,
+    build_tool_coverage,
     cached_topic_and_quality,
     categorize_by_keywords,
     categorize_issues_with_llm,
@@ -28,7 +30,10 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     label_success,
     load_data,
     mark_unscored_unknown,
+    message_sort_keys,
+    message_tool_calls,
     parse_tool_calls,
+    parse_tool_calls_from_content_json,
 )
 
 
@@ -140,6 +145,196 @@ class TestParseToolCalls:
     def test_tool_in_surrounding_text(self):
         content = "Let me search.\n\n*[Using tool: web_search; query: genetics]*\n\nFound results."
         assert parse_tool_calls(content) == ["web_search"]
+
+
+def _blocks(*blocks) -> str:
+    return json.dumps(list(blocks))
+
+
+class TestParseToolCallsFromContentJson:
+    def test_tool_use_blocks(self):
+        content_json = _blocks(
+            {"type": "text", "text": "let me look"},
+            {"type": "tool_use", "id": "t1", "name": "search_genes", "input": {"q": "TP53"}},
+            {"type": "tool_use", "id": "t2", "name": "get_gene_expression", "input": {}},
+        )
+        assert parse_tool_calls_from_content_json(content_json) == [
+            "search_genes", "get_gene_expression"
+        ]
+
+    def test_ignores_non_tool_use_blocks(self):
+        content_json = _blocks(
+            {"type": "thinking", "thinking": "hmm"},
+            {"type": "text", "text": "hello"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "..."},
+        )
+        assert parse_tool_calls_from_content_json(content_json) == []
+
+    def test_recorded_but_toolless_is_empty_not_none(self):
+        # [] means "recorded, no tools"; None means "nothing recorded" -> fallback
+        assert parse_tool_calls_from_content_json("[]") == []
+
+    def test_missing_returns_none(self):
+        assert parse_tool_calls_from_content_json(None) is None
+        assert parse_tool_calls_from_content_json("") is None
+
+    def test_malformed_json_returns_none(self):
+        assert parse_tool_calls_from_content_json("{not json") is None
+
+    def test_non_list_returns_none(self):
+        assert parse_tool_calls_from_content_json('{"type": "tool_use"}') is None
+
+    def test_junk_blocks_are_skipped_without_raising(self):
+        content_json = _blocks(
+            "a bare string",
+            None,
+            {"type": "tool_use"},               # no name
+            {"type": "tool_use", "name": ""},   # empty name
+            {"type": "tool_use", "name": 7},    # wrong type
+            {"type": "tool_use", "name": "ok_tool"},
+        )
+        assert parse_tool_calls_from_content_json(content_json) == ["ok_tool"]
+
+
+class TestMessageToolCalls:
+    def test_content_json_wins_over_markers(self):
+        row = {
+            "content": "*[Using tool: stale_marker; q: x]*",
+            "content_json": _blocks({"type": "tool_use", "name": "real_tool"}),
+        }
+        assert message_tool_calls(row) == (["real_tool"], True)
+
+    def test_recorded_toolless_row_does_not_fall_back(self):
+        row = {
+            "content": "*[Using tool: imitated_marker]*",
+            "content_json": _blocks({"type": "text", "text": "hi"}),
+        }
+        assert message_tool_calls(row) == ([], True)
+
+    def test_falls_back_to_markers_without_content_json(self):
+        row = {"content": "*[Using tool: legacy_tool; q: x]*", "content_json": None}
+        assert message_tool_calls(row) == (["legacy_tool"], False)
+
+    def test_fallback_is_not_authoritative_even_when_empty(self):
+        row = {"content": "plain prose", "content_json": None}
+        assert message_tool_calls(row) == ([], False)
+
+
+class TestToolCoverage:
+    @staticmethod
+    def _messages(rows):
+        return pl.DataFrame(rows, schema={
+            "session_id": pl.Utf8, "role": pl.Utf8,
+            "content": pl.Utf8, "content_json": pl.Utf8,
+        })
+
+    def test_counts_split_by_source(self):
+        messages = self._messages([
+            {"session_id": "a", "role": "user", "content": "q", "content_json": None},
+            {"session_id": "a", "role": "assistant", "content": "x",
+             "content_json": _blocks({"type": "tool_use", "name": "t1"},
+                                     {"type": "tool_use", "name": "t2"})},
+            {"session_id": "b", "role": "assistant",
+             "content": "*[Using tool: legacy]*", "content_json": None},
+        ])
+        frame, coverage = build_tool_coverage(messages)
+
+        assert coverage.assistant_messages == 2
+        assert coverage.messages_from_content_json == 1
+        assert coverage.messages_from_markers == 1
+        assert coverage.tool_calls_from_content_json == 2
+        assert coverage.tool_calls_from_markers == 1
+        assert coverage.total_tool_calls == 3
+        assert coverage.sessions == 2
+        assert coverage.fully_covered_sessions == 1
+        assert coverage.is_exact is False
+
+        flags = dict(zip(frame["session_id"], frame["tool_count_is_lower_bound"], strict=True))
+        assert flags == {"a": False, "b": True}
+
+    def test_partially_covered_session_is_a_lower_bound(self):
+        messages = self._messages([
+            {"session_id": "a", "role": "assistant", "content": "x",
+             "content_json": _blocks({"type": "tool_use", "name": "t1"})},
+            {"session_id": "a", "role": "assistant",
+             "content": "*[Using tool: legacy]*", "content_json": None},
+        ])
+        frame, coverage = build_tool_coverage(messages)
+        assert coverage.fully_covered_sessions == 0
+        assert frame["tool_count_is_lower_bound"].item() is True
+
+    def test_exact_when_everything_has_content_json(self):
+        messages = self._messages([
+            {"session_id": "a", "role": "assistant", "content": "x", "content_json": "[]"},
+        ])
+        _, coverage = build_tool_coverage(messages)
+        assert coverage.is_exact is True
+        assert "exact" in " ".join(coverage.summary_lines())
+
+    def test_empty_frame(self):
+        frame, coverage = build_tool_coverage(self._messages([]))
+        assert frame.height == 0
+        assert coverage.sessions == 0
+        assert coverage.summary_lines()  # must not divide by zero
+
+    def test_empty_frame_is_not_exact(self):
+        # nothing was counted, so there is nothing to have counted exactly; claiming
+        # "all tool counts are exact" over zero data is a vacuous truth in a report
+        _, coverage = build_tool_coverage(self._messages([]))
+        assert coverage.is_exact is False
+        assert any("no assistant messages" in line.lower() for line in coverage.summary_lines())
+        assert not any("**exact**" in line for line in coverage.summary_lines())
+
+    def test_session_stats_prefer_content_json(self, sample_db):
+        # s1's markers claim 3 calls; content_json on one message overrides that message
+        conn = sqlite3.connect(sample_db)
+        conn.execute(
+            "UPDATE chat_messages SET content_json = ? WHERE id = 'm2'",
+            (_blocks({"type": "tool_use", "name": "real_a"},
+                     {"type": "tool_use", "name": "real_b"},
+                     {"type": "tool_use", "name": "real_c"}),),
+        )
+        conn.commit()
+        conn.close()
+
+        _, messages = load_data(sample_db)
+        stats = build_session_tool_stats(messages)
+        s1 = stats.filter(pl.col("session_id") == "s1")
+        assert s1["total_tool_calls"].item() == 4  # 3 real from m2 + 1 marker from m4
+        assert "real_a" in s1["tool_sequence"].item()
+
+
+class TestToolCoverageInMetricsAndReport:
+    def test_lower_bound_flag_and_report_caveat(self, sample_db):
+        sessions, messages = load_data(sample_db)
+        tool_stats = build_session_tool_stats(messages)
+        metrics = compute_all_metrics(sessions, messages, tool_stats, {})
+
+        # the fixture has no content_json anywhere, so every session is marker-counted
+        assert all(m.tool_count_is_lower_bound for m in metrics)
+
+        report = generate_report(metrics, sessions, messages, tool_stats)
+        assert "Counting coverage" in report
+        assert "LOWER BOUND" in report
+        assert "lower bound" in report
+
+    def test_report_says_exact_when_fully_covered(self, sample_db):
+        conn = sqlite3.connect(sample_db)
+        conn.execute(
+            "UPDATE chat_messages SET content_json = ? WHERE role = 'assistant'",
+            (_blocks({"type": "tool_use", "name": "real_tool"}),),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions, messages = load_data(sample_db)
+        tool_stats = build_session_tool_stats(messages)
+        metrics = compute_all_metrics(sessions, messages, tool_stats, {})
+        assert not any(m.tool_count_is_lower_bound for m in metrics)
+
+        report = generate_report(metrics, sessions, messages, tool_stats)
+        assert "LOWER BOUND" not in report
+        assert "exact" in report
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +621,152 @@ class TestExportEvalDataset:
         assert "session_id" in data[0]
         assert "topic" in data[0]
         assert "turns" in data[0]
+        # pre-existing keys must survive for any consumer of the old shape
+        for key in ("first_user_message", "tools_used", "total_tool_calls", "turn_count"):
+            assert key in data[0]
+
+
+@pytest.fixture
+def replay_db(tmp_path):
+    """A DB with per-turn options, tied timestamps, and multi-turn sessions."""
+    db_path = str(tmp_path / "replay_chat.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            title TEXT,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            rating INTEGER,
+            comment TEXT,
+            phenotype_code TEXT
+        );
+        CREATE TABLE chat_messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP,
+            thumbs_up BOOLEAN,
+            content_json TEXT,
+            literature_backend TEXT,
+            tool_profile TEXT,
+            instruction_set_id TEXT,
+            verbosity TEXT
+        );
+
+        INSERT INTO chat_sessions VALUES
+            ('r1', 'user1@test.com', 'Multi turn', '2025-12-10', '2025-12-10', NULL, NULL, NULL);
+
+        -- every row shares one timestamp: created_at has one-second resolution, so only
+        -- the rowid tiebreak keeps this order deterministic.
+        -- the client sends all four option keys on every save, and a null tool_profile is
+        -- the real value for "all tools" — it is never persisted as the string 'all'
+        INSERT INTO chat_messages VALUES
+            ('q1', 'r1', 'user', 'first question', '2025-12-10 10:00:00', NULL, NULL,
+             'europepmc', NULL, 'iset-1', 'brief'),
+            ('a1', 'r1', 'assistant', 'first answer', '2025-12-10 10:00:00', NULL, NULL,
+             'europepmc', NULL, 'iset-1', 'brief'),
+            ('q2', 'r1', 'user', 'second question', '2025-12-10 10:00:00', NULL, NULL,
+             'europepmc', NULL, 'iset-1', 'detailed'),
+            ('a2', 'r1', 'assistant', 'second answer', '2025-12-10 10:00:00', NULL, NULL,
+             'europepmc', 'bigquery', 'iset-1', 'detailed'),
+            ('q3', 'r1', 'user', 'third question', '2025-12-10 10:00:00', NULL, NULL,
+             'europepmc', NULL, 'iset-2', 'detailed');
+    """)
+    conn.close()
+    return db_path
+
+
+class TestUserTurnExport:
+    def _case(self, db_path, tmp_path):
+        sessions, messages = load_data(db_path)
+        tool_stats = build_session_tool_stats(messages)
+        metrics = compute_all_metrics(sessions, messages, tool_stats, {})
+        output_dir = tmp_path / "replay_output"
+        export_eval_dataset(metrics, messages, output_dir)
+        with open(output_dir / "eval_dataset.json") as f:
+            return json.load(f)[0]
+
+    def test_all_user_turns_exported_in_order(self, replay_db, tmp_path):
+        case = self._case(replay_db, tmp_path)
+        assert case["user_turn_count"] == 3
+        assert [t["content"] for t in case["user_turns"]] == [
+            "first question", "second question", "third question"
+        ]
+        assert [t["index"] for t in case["user_turns"]] == [0, 1, 2]
+        assert [t["message_id"] for t in case["user_turns"]] == ["q1", "q2", "q3"]
+
+    def test_options_in_force_are_each_rows_own_values(self, replay_db, tmp_path):
+        case = self._case(replay_db, tmp_path)
+        opts = [t["options"] for t in case["user_turns"]]
+
+        assert opts[0] == {
+            "verbosity": "brief", "tool_profile": None,
+            "instruction_set_id": "iset-1", "literature_backend": "europepmc",
+        }
+        assert opts[1] == {
+            "verbosity": "detailed", "tool_profile": None,
+            "instruction_set_id": "iset-1", "literature_backend": "europepmc",
+        }
+        # a2 ran under tool_profile='bigquery'; q3 switched back to all tools, which the
+        # client persists as NULL. carrying the last non-null value forward would export
+        # q3 as still running 'bigquery' and a replay would reproduce the wrong conditions.
+        assert opts[2] == {
+            "verbosity": "detailed", "tool_profile": None,
+            "instruction_set_id": "iset-2", "literature_backend": "europepmc",
+        }
+
+    def test_options_carry_forward_only_on_fully_null_rows(self):
+        # a row written by the current client always carries at least verbosity and
+        # literature_backend, so an all-null row predates that wiring and inherits
+        messages = pl.DataFrame({
+            "id": ["q1", "a1", "q2"],
+            "role": ["user", "assistant", "user"],
+            "content": ["one", "answer", "two"],
+            "created_at": ["2025-12-10 10:00:00"] * 3,
+            "verbosity": ["brief", None, None],
+            "tool_profile": ["api", None, None],
+            "instruction_set_id": ["iset-1", None, None],
+            "literature_backend": ["perplexity", None, None],
+        })
+        turns = _session_user_turns(messages)
+
+        assert turns[1]["options"] == {
+            "verbosity": "brief", "tool_profile": "api",
+            "instruction_set_id": "iset-1", "literature_backend": "perplexity",
+        }
+
+    def test_user_turn_content_is_not_truncated(self, replay_db, tmp_path):
+        long_text = "x" * 5000
+        conn = sqlite3.connect(replay_db)
+        conn.execute("UPDATE chat_messages SET content = ? WHERE id = 'q1'", (long_text,))
+        conn.commit()
+        conn.close()
+
+        case = self._case(replay_db, tmp_path)
+        assert case["user_turns"][0]["content"] == long_text
+        # the display transcript stays capped
+        assert len(case["turns"][0]["content"]) == 2000
+
+    def test_sort_keys_use_rowid_when_available(self, replay_db):
+        _, messages = load_data(replay_db)
+        assert message_sort_keys(messages) == ["created_at", "_rowid"]
+        assert message_sort_keys(messages.drop("_rowid")) == ["created_at"]
+
+    def test_missing_option_columns_degrade_to_none(self, sample_db):
+        # sample_db predates the verbosity / instruction_set_id migrations
+        _, messages = load_data(sample_db)
+        session_msgs = messages.filter(pl.col("session_id") == "s2").sort(
+            message_sort_keys(messages)
+        )
+        turns = _session_user_turns(session_msgs)
+        assert len(turns) == 1
+        assert turns[0]["options"] == {
+            "verbosity": None, "tool_profile": "api",
+            "instruction_set_id": None, "literature_backend": None,
+        }
 
 
 # ---------------------------------------------------------------------------

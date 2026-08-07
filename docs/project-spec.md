@@ -1111,6 +1111,23 @@ report (`report.md`) plus an eval dataset. With `--output-dir` it also writes a
 local-dev `metrics.json` (consumed by `plot_conversation_scores.py` for
 quality-over-time plots).
 
+- **Eval export** (`export_eval_dataset()` → `eval_dataset.json`) picks representative
+  conversations per topic and, besides the display transcript (`turns`, capped at 2,000
+  chars per message), emits `user_turns`: every user turn of the session in order, with
+  untruncated content and the options in force at that turn (`verbosity`, `tool_profile`,
+  `instruction_set_id`, `literature_backend`). This is what makes a multi-turn replay
+  possible — `first_user_message` alone only reproduces the opening. **Each row's own
+  values are the options in force at that row, nulls included**: the browser sends all
+  four keys on every `saveMessage` and `add_message` stores exactly what the request
+  carried, so a null is a recorded choice rather than a gap — `tool_profile IS NULL`
+  specifically means "all tools" (`build_anthropic_tools` applies no category filter
+  when it is `None`). Carrying the last non-null value forward would export a user who
+  switched back to all-tools as still running the previous profile. The one exception
+  is a row on which **all four** columns are null, which cannot have been written by
+  the current client and so predates the wiring; there the previous turn's settings
+  carry forward. Message order uses `message_sort_keys()` — `(created_at, rowid)`,
+  because `created_at` has one-second resolution and a user turn routinely shares a
+  second with its reply. All previously exported keys are retained.
 - **Models** (env-overridable): both topic classification (`$ANALYZE_TOPIC_MODEL`)
   and the quality judge (`$ANALYZE_QUALITY_MODEL`) default to Opus 5.
   CLI flags `--topic-model` / `--quality-model` override the env defaults.
@@ -1134,6 +1151,29 @@ quality-over-time plots).
   conversations the agent could have done well at. Conversations the judge skipped
   (no quality score) and with no user rating are labelled `unknown` rather than given
   a heuristic label, so they stay out of the quality metric.
+- **Tool-call counting** comes from the `tool_use` blocks in `chat_messages.content_json`,
+  which is the real record of what the model called. The `*[Using tool: X]*` markers in
+  `content` are display prose — injected for the UI and stripped from replayed history by
+  `_strip_tool_use_markers` — so they are only a fallback, used for rows that carry no
+  block list at all (history predating the `content_json` migration).
+  `parse_tool_calls_from_content_json()` returns `None` for such rows and `[]` for a row
+  that was recorded and called nothing, which is what keeps the fallback in
+  `message_tool_calls()` targeted instead of silently preferring one source. Malformed
+  or non-list `content_json` degrades to `None` rather than raising: the column is
+  client-supplied and one bad row must not fail a run over thousands.
+- **Counting coverage is reported alongside every tool aggregate.** `build_tool_coverage()`
+  returns a per-session provenance frame plus a `ToolCountCoverage` summary (assistant
+  messages and tool calls per source, sessions fully covered by `content_json`). A session
+  with even one marker-counted assistant message gets
+  `ConversationMetrics.tool_count_is_lower_bound`, the report prints a **Counting coverage**
+  block under Tool Usage Patterns, and every tool aggregate carries an explicit
+  lower-bound caveat when any session is not fully covered; per-session counts render as
+  `>=N` wherever the session's flag is set. This exists so a tool-count aggregate is never
+  quoted — or benchmarked against — as if it were a total. Note that full coverage is not
+  the same as completeness: the browser also persists partial `content_json` when a stream
+  is interrupted (`LLMChat`'s `partialMsg` path), so a present block list may be truncated
+  at the point the stream died while still counting as fully covered. An empty frame is
+  reported as "no assistant messages" rather than exact.
 - **Issue categorization**: the judge's detailed per-conversation issues are mapped
   onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a separate
   cheap pass (batched, on the topic model) so the report surfaces recurring problems
