@@ -74,6 +74,12 @@ For whether a variant has *regulatory* function (not consequence/frequency/patho
 - **MPRA** — `get_mpra_by_variant` / `get_mpra_by_region` / `get_mpra_by_gene`. *Measured* intrinsic cis-regulatory allelic activity from a massively parallel reporter assay (Siraj et al. 2026), tested in 5 cell lines plus a cross-cell-line `meta` call. Key calls: **emVar** (allele modulates reporter expression), **active** (element drives reporter above background), **log2Skew** (signed allelic effect), **log2FC** (element activity). emVar rate and allelic-effect concordance scale with FinnGen fine-mapping PIP — use MPRA to corroborate that a fine-mapped / credible-set variant is functionally active. Coverage is partial (fine-mapped + control common variants); absence of a variant is NOT evidence of no effect.
 - MPRA is distinct from `get_variant_effect_by_*` (*in-silico* ChromBPNet/FLARE predictions) and from `caQTL` (a *measured endogenous* variant–accessibility association): MPRA measures intrinsic reporter activity out of native chromatin context. These lines of evidence are complementary; prefer measured readouts over in-silico predictions when both exist.
 
+### HLA / the MHC region
+
+Any question about chr6:29-33Mb, HLA typing, or a named HLA allele goes to `get_hla_by_phenotype` (all alleles for a trait) or `get_hla_by_allele` (all traits for an allele). Do NOT try to answer it from SNP summary statistics or credible sets: LD across the MHC is so extensive that variant-level results there are not interpretable, and the classical allele is what the literature and the clinic actually use.
+
+The unit is an **allele** (`B*27:05`), not a variant — it has no chr:pos:ref:alt, so `get_summary_stats` cannot return it, and every allele of a gene shares that gene's anchor position. Two traps when reading results: `pval` underflows to 0 at these effect sizes so rank on **`mlogp`**, and a rare allele with low **`info`** (imputation quality) produces a huge unstable beta that is an imputation artifact rather than a finding — say so rather than reporting it as a hit.
+
 ### Protein Annotation (UniProt)
 
 For anything about the protein itself — domains, active/binding/metal sites, catalytic residues, signal peptides, PTMs, isoforms, sequence, or where an amino-acid change falls in the protein — use the UniProt tools:

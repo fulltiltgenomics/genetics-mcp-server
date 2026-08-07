@@ -1264,6 +1264,79 @@ Do NOT use this as a discovery tool — use credible set tools or PheWAS for tha
         },
     },
     {
+        "name": "get_hla_by_phenotype",
+        "category": "api",
+        "description": """Get the classical HLA allele associations for one or more phenotypes — every imputed HLA allele (187 alleles across HLA-A, -B, -C, -DPB1, -DQA1, -DQB1, -DRB1, -DRB3, -DRB4, -DRB5) tested against the trait in FinnGen R14.
+
+Use this whenever a question touches the MHC/HLA region:
+- "Which HLA allele drives coeliac disease / T1D / ankylosing spondylitis?"
+- A credible set or a strong signal lands on chr6:29-33Mb — SNP summary stats there are hard to interpret because of the extreme LD, and the allele-level result is the interpretable answer
+- The user asks about HLA typing, haplotypes, or a named allele for a specific disease
+
+The unit is an ALLELE, not a variant: there is no chr:pos:ref:alt to look up, so get_summary_stats cannot answer this. Every allele of a gene shares that gene's anchor position.
+
+Read `mlogp`, NOT `pval` — pval underflows to 0 for the strongest HLA signals (coeliac DQB1*02:01 is mlogp 1596). Always check `info`: a rare allele imputed at info < 0.5 produces a huge unstable beta that is an imputation artifact, not an association.
+
+For the reverse question — which traits an allele is associated with — use get_hla_by_allele.""",
+        "parameters": {
+            "phenotypes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of FinnGen endpoint codes (e.g. ['K11_COELIAC', 'T1D'])",
+                "required": True,
+            },
+            "genes": {
+                "type": "string",
+                "description": "Optional comma-separated HLA gene filter, e.g. 'HLA-B,HLA-DQB1'. Omit for all 10 genes. HLA-DRB3/DRB4/DRB5 share one anchor position and always return together",
+            },
+            "resource": {
+                "type": "string",
+                "description": "Data resource carrying HLA results",
+                "default": "finngen",
+            },
+        },
+    },
+    {
+        "name": "get_hla_by_allele",
+        "category": "api",
+        "description": """Get every phenotype a classical HLA allele is associated with — the PheWAS view of one HLA allele across all 2,712 FinnGen R14 endpoints.
+
+Use this when the user names an allele:
+- "What is HLA-B*27:05 associated with?" / "What diseases does DQB1*02:01 predispose to?"
+- You found a lead allele with get_hla_by_phenotype and want to know what else it drives (pleiotropy across autoimmune traits is the norm in the MHC)
+
+Pass the allele gene-stripped and two-field, exactly as it appears in the data: 'B*27:05', 'DQB1*02:01', 'DRB1*15:01' — NOT 'HLA-B*27:05'.
+
+Results are filtered to `min_info` (default 0.5) because rare badly-imputed alleles produce enormous unstable betas that look like spectacular associations; pass min_info=0 to see them. Ranked by `mlogp`.""",
+        "parameters": {
+            "allele": {
+                "type": "string",
+                "description": "Gene-stripped two-field HLA allele name, e.g. 'B*27:05' or 'DQB1*02:01'",
+                "required": True,
+            },
+            "min_mlogp": {
+                "type": "number",
+                "description": "Minimum -log10 p-value (7.3 = genome-wide significance)",
+                "default": 7.3,
+            },
+            "min_info": {
+                "type": "number",
+                "description": "Minimum imputation INFO for the allele; 0 disables the filter",
+                "default": 0.5,
+            },
+            "resource": {
+                "type": "string",
+                "description": "Data resource carrying HLA results",
+                "default": "finngen",
+            },
+            "max_rows": {
+                "type": "integer",
+                "description": "Maximum phenotypes to return",
+                "default": 200,
+            },
+        },
+    },
+    {
         "name": "get_summary_stats_by_region",
         "category": "api",
         "description": """Get summary statistics for EVERY variant in a genomic region for one or more phenotypes — the full association profile of a locus, not just fine-mapped or significant variants.
@@ -2178,6 +2251,28 @@ def register_mcp_tools(
         """Get summary statistics for every variant in a region for one or more phenotypes."""
         return await executor.get_summary_stats_by_region(
             region, phenotypes, resource, data_type
+        )
+
+    @mcp.tool()
+    async def get_hla_by_phenotype(
+        phenotypes: list[str],
+        genes: str | None = None,
+        resource: str = "finngen",
+    ) -> dict:
+        """Get classical HLA allele associations for one or more phenotypes."""
+        return await executor.get_hla_by_phenotype(phenotypes, genes, resource)
+
+    @mcp.tool()
+    async def get_hla_by_allele(
+        allele: str,
+        min_mlogp: float = 7.3,
+        min_info: float = 0.5,
+        resource: str = "finngen",
+        max_rows: int = 200,
+    ) -> dict:
+        """Get every phenotype a classical HLA allele is associated with."""
+        return await executor.get_hla_by_allele(
+            allele, min_mlogp, min_info, resource, max_rows
         )
 
     @mcp.tool()

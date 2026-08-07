@@ -1345,6 +1345,118 @@ class ToolExecutor:
             return self._bq_gene_payload(gene, result, f"{gene}_mpra.tsv", with_metadata)
         return result
 
+    # -------------------------------------------------------------------------
+    # HLA Tools
+    # -------------------------------------------------------------------------
+
+    # An HLA allele name is gene-stripped and two-field: letters/digits for the locus,
+    # '*', then colon-separated numeric fields, optionally with a WHO expression suffix
+    # letter (N/L/S/C/A/Q). Anything else is rejected rather than interpolated into SQL.
+    _HLA_ALLELE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*\*\d{2,3}(:\d{2,3})+[NLSCAQ]?$")
+
+    async def get_hla_by_phenotype(
+        self,
+        phenotypes: list[str],
+        genes: str | None = None,
+        resource: str = "finngen",
+    ) -> dict[str, Any]:
+        """Get every classical HLA allele association for the given phenotype(s).
+
+        One read returns a trait's whole HLA profile (187 alleles across 10 genes), so
+        this is the tool for "what drives the MHC signal for X?". There is no by-variant
+        form: an HLA allele has no chr:pos:ref:alt identity. For the reverse question —
+        which traits an allele is associated with — use get_hla_by_allele.
+        """
+        if not phenotypes:
+            return {"success": False, "error": "No phenotypes provided"}
+        pheno_param = ",".join(p.strip() for p in phenotypes if p.strip())
+        if not pheno_param:
+            return {"success": False, "error": "No phenotypes provided"}
+
+        params: dict[str, Any] = {"phenotypes": pheno_param, "format": "json"}
+        if genes:
+            params["genes"] = ",".join(g.strip() for g in genes.split(",") if g.strip())
+
+        try:
+            path = f"/v1/hla/{resource}"
+            resp = await self.client.get(
+                f"{self.base_url}{path}", params=params, timeout=300.0
+            )
+            if resp.status_code == 200:
+                results = resp.json()
+                rows, truncated = self._cap_rows(results)
+                download_params = {k: v for k, v in params.items() if k != "format"}
+                return {
+                    "success": True,
+                    "resource": resource,
+                    "phenotypes": phenotypes,
+                    "total_count": len(results),
+                    "truncated": truncated,
+                    "results": rows,
+                    "_download_url": self._build_download_url(path, download_params),
+                }
+            if resp.status_code in (404, 422):
+                return {"success": False, "error": f"{resp.status_code}: {resp.text}"}
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            logger.error(
+                f"Error in get_hla_by_phenotype({phenotypes}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def get_hla_by_allele(
+        self,
+        allele: str,
+        min_mlogp: float = 7.3,
+        min_info: float = 0.5,
+        resource: str = "finngen",
+        max_rows: int = 200,
+    ) -> dict[str, Any]:
+        """Get every phenotype an HLA allele is associated with, via BigQuery.
+
+        The per-phenotype files results-api serves cannot answer this — it spans all
+        2,712 of them — so it goes through `hla_associations_v`. `min_info` defaults to
+        0.5 because rare, badly-imputed alleles produce huge unstable betas that read as
+        spectacular associations; pass 0 to see them anyway.
+        """
+        # the data stores alleles gene-stripped ('B*27:05'), but the conventional written
+        # form carries the gene ('HLA-B*27:05') and that is what a user will type, so it
+        # is normalized here rather than costing a turn on a rejection
+        name = re.sub(r"^HLA-", "", allele.strip(), flags=re.IGNORECASE)
+        if not self._HLA_ALLELE_RE.match(name):
+            return {
+                "success": False,
+                "error": f"'{allele}' is not an HLA allele name. Expected a gene-stripped "
+                f"two-field name such as 'B*27:05' or 'DQB1*02:01'.",
+            }
+
+        info_filter = f" AND info >= {float(min_info)}" if min_info else ""
+        sql = (
+            f"SELECT phenotype, gene, allele, mlogp, pval, beta, sebeta, "
+            f"af_alt, af_alt_cases, af_alt_controls, info "
+            f"FROM `genetics_results.hla_associations_v` "
+            f"WHERE allele = '{name}' AND resource = '{resource}' "
+            f"AND mlogp >= {float(min_mlogp)}{info_filter} "
+            f"ORDER BY mlogp DESC LIMIT {int(max_rows)}"
+        )
+        result = await self.query_database(sql, max_rows=max_rows)
+        if result.get("success"):
+            rows = result.get("rows", [])
+            return {
+                "success": True,
+                "allele": name,
+                "resource": resource,
+                "min_mlogp": min_mlogp,
+                "min_info": min_info,
+                "count": len(rows),
+                "results": rows,
+                "_download_data": {
+                    "results": rows,
+                    "filename": f"{name.replace('*', '_').replace(':', '_')}_hla.tsv",
+                },
+            }
+        return result
+
     async def get_mpra_pip_concordance_by_gene(
         self,
         gene: str,
