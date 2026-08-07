@@ -364,6 +364,9 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   rows to `pl.from_dicts` does not raise — it transposes them into `column_0`/`column_1` with
   every value stringified — so `_frame()` switches constructor on whether `columns` is present,
   and an empty result with `columns` keeps its schema so `.filter(pl.col(...))` still works.
+  When `columns` is present but the rows are already dicts (the five by-gene tools, which now
+  name their rows for the model), they are re-flattened against `columns`, so column order and
+  schema come from `columns` in every case rather than from dict iteration order.
 - **A branch that cannot honour an argument refuses it.** Dropping a filter silently is worse
   than rejecting it: `exome(gene=..., resources=[...])` that ignores `resources` returns *more*
   rows than asked for and the frame says nothing. `_reject()` raises `GeneticsUsageError` for
@@ -414,10 +417,29 @@ calls `_strip_trailing_limit()` and then fetches `max(max_rows, 100_000)`, so th
 trailing `LIMIT` never reaches BigQuery — the join and `ORDER BY` run in full regardless, and a
 low `limit` buys nothing but a positional prefix of an ordered result.
 
-They also take `with_metadata=False`. When set, the returned dict carries the underlying
-query's `columns` and `truncated`, which is how the SDK names the positional rows and detects
-truncation. It is opt-in so the payload these five tools return to the model stays
-byte-identical (bead `genetics-results-suite-bef` covers changing that, and needs sign-off).
+**Each consumer of these five results gets the shape it can actually use** (`_bq_gene_payload`).
+db-api returns rows positionally with the names in a separate `columns` key, and both consumers
+used to be handed the bare `rows`:
+
+- `results`, which goes to the **model**, is a list of **dicts** built by zipping `columns` with
+  each row. The model was previously shown `[["19", 44908822, 12.3], …]` — values with no names,
+  so ASM-QTL, open-chromatin, variant-effect and MPRA by-gene answers were guesswork. This set is
+  capped, so building dicts is cheap.
+- `_download_data` uses the `{"columns", "rows", "filename"}` form, which `_convert_to_tsv`
+  already has a branch for. Passing a list of lists under `results` instead hit that function's
+  `results[0].keys()` and raised `AttributeError` inside `_process_download_hints`' `except`, so
+  **the download link silently vanished**. The positional form is also the right one here: the
+  download carries up to 100k rows and would be flattened back anyway.
+
+Names always come from `columns` positionally, never from dict iteration order, and a row whose
+arity disagrees with `columns` — or that is not a positional sequence at all — makes the tool
+return `success: False` rather than label genomic values with the wrong column names.
+
+They also take `with_metadata=False`. When set, the returned dict carries the underlying query's
+`columns` and `truncated`. Both are still needed after the shape change: an **empty** result has
+no row to carry names, and `_frame()` builds `pl.DataFrame({c: [] for c in columns})` so a script
+filtering a no-hit gene gets an empty frame instead of `ColumnNotFound`; `truncated` is what
+`_check_truncation` raises on. It stays opt-in so the model's payload is not padded with either.
 
 ### URL path segments
 
@@ -1255,7 +1277,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint |
-| `test_bigquery_gene_tools.py` | BigQuery-backed gene tools, and the injection defence on the five methods that build SQL themselves (injected gene/resource/window rejected before the query is issued, legitimate symbols quoted, `limit` honoured by both the statement and the row cap) |
+| `test_bigquery_gene_tools.py` | BigQuery-backed gene tools: the two result shapes (`results` named as dicts for the model, `_download_data` positional and actually round-tripped through `_convert_to_tsv` to prove the TSV has a header row), empty results, loud failure on a `columns`/row-arity mismatch, and the injection defence on the five methods that build SQL themselves (injected gene/resource/window rejected before the query is issued, legitimate symbols quoted, `limit` honoured by both the statement and the row cap) |
 | `test_sql_safety.py` | Allow-list SQL literal validation: real gene/resource ids accepted, quote/backslash/semicolon/newline/NUL payloads rejected, numeric coercion and range checks |
 | `test_sdk.py` | Genetics SDK: argument-shape dispatch for every collapsed function (gene vs variant vs region vs phenotype), refusal of ambiguous or empty shapes and of arguments the selected branch cannot honour, region parsing, DataFrame return contract (positional db-api rows named from `columns`, empty results keeping their schema), `GeneticsError` on failure and on truncation, `limit` defaulting to the row ceiling, the row cap being lifted only on executors the client builds, `configure()` refusing to redirect the authenticated client, phenotype/dataset/gene-symbol lookups, the sync facade, and a subprocess check that importing the SDK pulls in no chat-backend module |
 | `test_gene_group_tools.py` | Gene group membership and symbol normalization |

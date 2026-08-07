@@ -349,17 +349,64 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         """Optionally attach the column names and truncation flag of the underlying query.
 
-        db-api returns rows POSITIONALLY (a list per row, names in a separate `columns`
-        key), so a consumer that never sees `columns` cannot name the values — the SDK
-        needs them to build a DataFrame, and needs `truncated` because silent truncation
-        is the one failure a script cannot detect. Off by default: the payload these five
-        tools return to the model stays byte-identical until genetics-results-suite-bef
-        is signed off.
+        `results` already carries the names on every row, but an EMPTY result has no row
+        to carry them: the SDK builds `pl.DataFrame({c: [] for c in columns})` so a script
+        filtering a no-hit gene gets an empty frame rather than ColumnNotFound. `truncated`
+        stays because silent truncation is the one failure a script cannot detect for
+        itself. Off by default so the model's payload is not padded with either.
         """
         if include:
             payload["columns"] = query_result.get("columns", [])
             payload["truncated"] = query_result.get("truncated", False)
         return payload
+
+    def _bq_gene_payload(
+        self,
+        gene: str,
+        query_result: dict[str, Any],
+        filename: str,
+        with_metadata: bool,
+    ) -> dict[str, Any]:
+        """Shape a BigQuery by-gene query result for its two consumers.
+
+        db-api returns rows POSITIONALLY (a list per row, names in a separate `columns`
+        key), and the two consumers want opposite things with that:
+
+        - `results` goes to the model, which cannot interpret `["19", 44908822, 12.3]`,
+          so rows become dicts. This set is capped, so zipping is cheap.
+        - `_download_data` keeps the positional `{columns, rows}` form that
+          `_convert_to_tsv` handles directly — the download can carry 100k rows, and
+          re-materialising each as a dict only to flatten it back is waste.
+
+        Names come from `columns` positionally, never from dict iteration order, and a
+        row whose arity disagrees with `columns` is an error rather than a shifted
+        labelling: mislabelled genomic values are worse than no values.
+        """
+        columns = query_result.get("columns") or []
+        rows = query_result.get("rows") or []
+        if rows and not columns:
+            return {"success": False, "error": "query result has rows but no column names"}
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                return {
+                    "success": False,
+                    "error": f"query result row is {type(row).__name__}, expected a positional list",
+                }
+            if len(row) != len(columns):
+                return {
+                    "success": False,
+                    "error": (
+                        f"query result row has {len(row)} values but "
+                        f"{len(columns)} column names"
+                    ),
+                }
+        payload = {
+            "success": True,
+            "gene": gene,
+            "results": [dict(zip(columns, row)) for row in rows],
+            "_download_data": {"columns": columns, "rows": rows, "filename": filename},
+        }
+        return self._query_metadata(payload, query_result, with_metadata)
 
     @staticmethod
     def _gene_window_cte(gene_literal: str) -> str:
@@ -991,12 +1038,7 @@ class ToolExecutor:
         )
         result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            rows = result.get("rows", [])
-            payload = {
-                "success": True, "gene": gene, "results": rows,
-                "_download_data": {"results": rows, "filename": f"{gene}_asm_qtl.tsv"},
-            }
-            return self._query_metadata(payload, result, with_metadata)
+            return self._bq_gene_payload(gene, result, f"{gene}_asm_qtl.tsv", with_metadata)
         return result
 
     async def get_open_chromatin_by_variant(
@@ -1146,12 +1188,7 @@ class ToolExecutor:
         )
         result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            rows = result.get("rows", [])
-            payload = {
-                "success": True, "gene": gene, "results": rows,
-                "_download_data": {"results": rows, "filename": f"{gene}_open_chromatin.tsv"},
-            }
-            return self._query_metadata(payload, result, with_metadata)
+            return self._bq_gene_payload(gene, result, f"{gene}_open_chromatin.tsv", with_metadata)
         return result
 
     async def get_variant_effect_by_variant(
@@ -1219,12 +1256,7 @@ class ToolExecutor:
         )
         result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            rows = result.get("rows", [])
-            payload = {
-                "success": True, "gene": gene, "results": rows,
-                "_download_data": {"results": rows, "filename": f"{gene}_variant_effect.tsv"},
-            }
-            return self._query_metadata(payload, result, with_metadata)
+            return self._bq_gene_payload(gene, result, f"{gene}_variant_effect.tsv", with_metadata)
         return result
 
     async def get_mpra_by_variant(
@@ -1310,12 +1342,7 @@ class ToolExecutor:
         )
         result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            rows = result.get("rows", [])
-            payload = {
-                "success": True, "gene": gene, "results": rows,
-                "_download_data": {"results": rows, "filename": f"{gene}_mpra.tsv"},
-            }
-            return self._query_metadata(payload, result, with_metadata)
+            return self._bq_gene_payload(gene, result, f"{gene}_mpra.tsv", with_metadata)
         return result
 
     async def get_mpra_pip_concordance_by_gene(
@@ -1380,12 +1407,9 @@ class ToolExecutor:
         )
         result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            rows = result.get("rows", [])
-            payload = {
-                "success": True, "gene": gene, "results": rows,
-                "_download_data": {"results": rows, "filename": f"{gene}_mpra_pip_concordance.tsv"},
-            }
-            return self._query_metadata(payload, result, with_metadata)
+            return self._bq_gene_payload(
+                gene, result, f"{gene}_mpra_pip_concordance.tsv", with_metadata
+            )
         return result
 
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:

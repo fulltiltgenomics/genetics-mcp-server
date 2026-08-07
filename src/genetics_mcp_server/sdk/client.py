@@ -46,6 +46,12 @@ def _frame(rows: Any, columns: list[str] | None = None) -> pl.DataFrame:
         # empty frame, not ColumnNotFoundError, when the gene simply has no hits
         if not rows:
             return pl.DataFrame({c: [] for c in columns})
+        if isinstance(rows, dict):
+            rows = [rows]
+        if isinstance(rows[0], dict):
+            # `columns` still decides order and schema; the dicts are re-flattened against
+            # it rather than trusted to iterate in the query's column order
+            rows = [[row.get(c) for c in columns] for row in rows]
         return pl.DataFrame(rows, schema=columns, orient="row", infer_schema_length=None)
     if not rows:
         return pl.DataFrame()

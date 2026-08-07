@@ -31,13 +31,90 @@ async def test_get_asm_qtl_by_gene_surfaces_rows():
 
         assert result["success"] is True
         assert result["gene"] == "APOE"
-        assert result["results"] == fake_rows
-        assert result["_download_data"]["results"] == fake_rows
-        # column names reach the SDK only when asked for, so the MCP payload is unchanged
+        # the model gets NAMED rows: bare positional lists are uninterpretable to it
+        assert result["results"] == [{"chr": "19", "pos": 44908822, "mlog10p": 12.3}]
+        # the download keeps the positional form _convert_to_tsv already handles
+        assert result["_download_data"]["columns"] == fake_columns
+        assert result["_download_data"]["rows"] == fake_rows
+        # `columns` at the top level is SDK-only, so the model's payload is not padded
         assert "columns" not in result
         with_meta = await executor.get_asm_qtl_by_gene("APOE", with_metadata=True)
         assert with_meta["columns"] == fake_columns
         assert with_meta["truncated"] is False
+    finally:
+        await executor.close()
+
+
+_BY_GENE_FILENAMES = {
+    "get_asm_qtl_by_gene": "APOE_asm_qtl.tsv",
+    "get_open_chromatin_by_gene": "APOE_open_chromatin.tsv",
+    "get_variant_effect_by_gene": "APOE_variant_effect.tsv",
+    "get_mpra_by_gene": "APOE_mpra.tsv",
+    "get_mpra_pip_concordance_by_gene": "APOE_mpra_pip_concordance.tsv",
+}
+
+
+@pytest.mark.parametrize("method", sorted(_BY_GENE_FILENAMES))
+async def test_by_gene_download_data_converts_to_tsv_with_a_header(method):
+    """The download used to carry a list of lists under `results`; _convert_to_tsv's
+    `results` branch does `results[0].keys()`, so it raised AttributeError inside
+    _process_download_hints' except and the user silently got no download link."""
+    from genetics_mcp_server.llm_service import _convert_to_tsv
+
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    try:
+        executor.query_database = AsyncMock(
+            return_value={
+                "success": True,
+                "columns": ["chr", "pos", "mlog10p"],
+                "rows": [["19", 44908822, 12.3], ["19", 44909000, 8.1]],
+            }
+        )
+        result = await getattr(executor, method)("APOE")
+
+        download = result["_download_data"]
+        assert download["filename"] == _BY_GENE_FILENAMES[method]
+        tsv = _convert_to_tsv(download).decode()
+        assert tsv.splitlines() == [
+            "chr\tpos\tmlog10p",
+            "19\t44908822\t12.3",
+            "19\t44909000\t8.1",
+        ]
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize("method", sorted(_BY_GENE_FILENAMES))
+async def test_by_gene_empty_result_is_sane(method):
+    async with _stubbed_executor() as executor:
+        result = await getattr(executor, method)("APOE")
+
+        assert result["success"] is True
+        assert result["results"] == []
+        assert result["_download_data"]["rows"] == []
+        assert result["_download_data"]["columns"] == []
+
+
+@pytest.mark.parametrize(
+    "bad_result",
+    [
+        {"success": True, "columns": ["chr", "pos"], "rows": [["19", 1, 2.0]]},
+        {"success": True, "columns": ["chr", "pos", "mlog10p"], "rows": [["19", 1]]},
+        {"success": True, "columns": [], "rows": [["19", 1]]},
+        {"success": True, "columns": ["chr", "pos"], "rows": [{"chr": "19", "pos": 1}]},
+    ],
+    ids=["row-too-long", "row-too-short", "no-column-names", "row-is-a-dict"],
+)
+async def test_by_gene_fails_loudly_on_column_row_mismatch(bad_result):
+    """Zipping unequal-length sequences truncates silently, which would label genomic
+    values with the wrong column names. Refusing is the only safe outcome."""
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    try:
+        executor.query_database = AsyncMock(return_value=bad_result)
+        result = await executor.get_mpra_by_gene("APOE")
+
+        assert result["success"] is False
+        assert "column" in result["error"] or "positional" in result["error"]
     finally:
         await executor.close()
 
