@@ -96,6 +96,8 @@ async def test_mpra_dispatches_on_argument_shape(kwargs, expected):
         ("exome", {"phenotype": "T1D"}, "get_exome_results_by_phenotype"),
         ("gene_burden", {"gene": "APOE"}, "get_gene_based_results"),
         ("gene_burden", {"phenotype": "T1D"}, "get_gene_based_results_by_phenotype"),
+        ("hla", {"phenotype": "K11_COELIAC"}, "get_hla_by_phenotype"),
+        ("hla", {"allele": "B*27:05"}, "get_hla_by_allele"),
         ("asm_qtl", {"gene": "APOE"}, "get_asm_qtl_by_gene"),
         ("asm_qtl", {"variant": "19:44908822:T:C"}, "get_asm_qtl_by_variant"),
         ("variant_effect", {"gene": "APOE"}, "get_variant_effect_by_gene"),
@@ -302,6 +304,12 @@ async def test_bigquery_limit_defaults_to_the_row_ceiling_not_500():
         ("credible_sets", {"phenotype": "T1D", "credible_set_id": "cs1", "gene": "IL7R"}),
         ("colocalization", {"phenotype": "T1D", "credible_set_id": "cs1", "variant": "1:1:A:G"}),
         ("exome", {"gene": "IL7R", "resources": ["genebass"]}),
+        # results-api serves whole per-phenotype files: there is nothing to threshold on
+        ("hla", {"phenotype": "K11_COELIAC", "min_mlogp": 7.3}),
+        ("hla", {"phenotype": "K11_COELIAC", "min_info": 0.5}),
+        ("hla", {"phenotype": "K11_COELIAC", "limit": 10}),
+        # the BigQuery view is queried for one allele, so a gene filter is meaningless
+        ("hla", {"allele": "B*27:05", "genes": "HLA-B"}),
         ("gene_annotations", {"region": "1:1-2", "n": 5}),
         ("gene_annotations", {"nearest_to": "1:1:A:G", "exclude_olfactory": True}),
     ],
@@ -310,6 +318,78 @@ async def test_arguments_the_branch_cannot_honour_are_refused(method, kwargs):
     client, _ = make_client()
     with pytest.raises(GeneticsUsageError):
         await getattr(client, method)(**kwargs)
+
+
+# ------------------------------------------------------------------------- HLA
+
+
+async def test_hla_by_phenotype_accepts_one_trait_or_many_and_joins_the_gene_filter():
+    client, executor = make_client()
+
+    await client.hla(phenotype="K11_COELIAC", genes=["HLA-B", "HLA-DQB1"])
+    assert executor.last[1] == (["K11_COELIAC"],)
+    assert executor.last[2]["genes"] == "HLA-B,HLA-DQB1"
+
+    await client.hla(phenotype=["K11_COELIAC", "T1D"], resource="finngen")
+    assert executor.last[1] == (["K11_COELIAC", "T1D"],)
+
+
+async def test_hla_by_allele_uses_the_bigquery_defaults_and_the_row_ceiling():
+    """The allele shape goes to hla_associations_v, so it needs `columns` back to label
+    the rows and `truncated` to refuse a prefix — both only arrive with_metadata."""
+    client, executor = make_client()
+    await client.hla(allele="HLA-B*27:05")
+    kwargs = executor.last[2]
+    assert kwargs["min_mlogp"] == 7.3
+    assert kwargs["min_info"] == 0.5
+    assert kwargs["max_rows"] == 100_000
+    assert kwargs["with_metadata"] is True
+
+
+async def test_hla_min_info_zero_is_forwarded_not_replaced_by_the_default():
+    """0 disables the imputation-quality filter; a falsy-not-None default would eat it."""
+    client, executor = make_client()
+    await client.hla(allele="B*27:05", min_info=0, min_mlogp=0)
+    assert executor.last[2]["min_info"] == 0
+    assert executor.last[2]["min_mlogp"] == 0
+
+
+async def test_hla_by_allele_rows_are_named_by_the_query_columns():
+    client, _ = make_client(
+        {
+            "success": True,
+            "results": [["K11_COELIAC", "HLA-DQB1", "DQB1*02:01", 1596.65]],
+            "columns": ["phenotype", "gene", "allele", "mlogp"],
+        }
+    )
+    frame = await client.hla(allele="DQB1*02:01")
+    assert frame.columns == ["phenotype", "gene", "allele", "mlogp"]
+    assert frame["mlogp"].to_list() == [1596.65]
+
+
+async def test_hla_by_allele_empty_result_keeps_its_schema():
+    """A script filtering a no-hit allele must get an empty frame, not ColumnNotFound."""
+    client, _ = make_client(
+        {"success": True, "results": [], "columns": ["phenotype", "mlogp"]}
+    )
+    frame = await client.hla(allele="B*27:05")
+    assert frame.columns == ["phenotype", "mlogp"]
+    assert frame.height == 0
+
+
+async def test_hla_truncated_result_raises_instead_of_returning_a_prefix():
+    client, _ = make_client(
+        {"success": True, "results": [["T1D"]], "columns": ["phenotype"], "truncated": True}
+    )
+    with pytest.raises(GeneticsError, match="truncated"):
+        await client.hla(allele="B*27:05")
+
+
+async def test_hla_requires_exactly_one_selector():
+    client, _ = make_client()
+    for kwargs in ({}, {"phenotype": "T1D", "allele": "B*27:05"}):
+        with pytest.raises(GeneticsUsageError):
+            await client.hla(**kwargs)
 
 
 async def test_phenotype_codes_resolve_to_names():

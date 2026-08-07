@@ -1378,7 +1378,7 @@ class ToolExecutor:
             params["genes"] = ",".join(g.strip() for g in genes.split(",") if g.strip())
 
         try:
-            path = f"/v1/hla/{resource}"
+            path = f"/v1/hla/{_seg(resource)}"
             resp = await self.client.get(
                 f"{self.base_url}{path}", params=params, timeout=300.0
             )
@@ -1411,6 +1411,7 @@ class ToolExecutor:
         min_info: float = 0.5,
         resource: str = "finngen",
         max_rows: int = 200,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Get every phenotype an HLA allele is associated with, via BigQuery.
 
@@ -1430,19 +1431,25 @@ class ToolExecutor:
                 f"two-field name such as 'B*27:05' or 'DQB1*02:01'.",
             }
 
+        try:
+            resource_lit = quote_literal(resource, name="resource")
+            limit_sql = sql_int(max_rows, name="max_rows", minimum=1, maximum=self._MAX_SQL_LIMIT)
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
+
         info_filter = f" AND info >= {float(min_info)}" if min_info else ""
         sql = (
             f"SELECT phenotype, gene, allele, mlogp, pval, beta, sebeta, "
             f"af_alt, af_alt_cases, af_alt_controls, info "
             f"FROM `genetics_results.hla_associations_v` "
-            f"WHERE allele = '{name}' AND resource = '{resource}' "
+            f"WHERE allele = '{name}' AND resource = {resource_lit} "
             f"AND mlogp >= {float(min_mlogp)}{info_filter} "
-            f"ORDER BY mlogp DESC LIMIT {int(max_rows)}"
+            f"ORDER BY mlogp DESC LIMIT {limit_sql}"
         )
         result = await self.query_database(sql, max_rows=max_rows)
         if result.get("success"):
             rows = result.get("rows", [])
-            return {
+            payload = {
                 "success": True,
                 "allele": name,
                 "resource": resource,
@@ -1455,6 +1462,7 @@ class ToolExecutor:
                     "filename": f"{name.replace('*', '_').replace(':', '_')}_hla.tsv",
                 },
             }
+            return self._query_metadata(payload, result, with_metadata)
         return result
 
     async def get_mpra_pip_concordance_by_gene(

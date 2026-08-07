@@ -31,6 +31,7 @@ _FUNCTIONS = (
     "colocalization",
     "exome",
     "gene_burden",
+    "hla",
     "asm_qtl",
     "open_chromatin",
     "peak_to_gene",

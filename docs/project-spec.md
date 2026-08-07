@@ -266,8 +266,10 @@ Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) ar
 
 An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
 genetics data programmatically rather than through a tool schema. It is the data half of the
-code-execution agent: a script in the sandbox imports it instead of the agent calling 42
-API-category tools.
+code-execution agent: a script in the sandbox imports it instead of the agent calling the
+API-category tools one at a time. It wraps 40 of the 44; `analyze_variant_list`,
+`get_phenotype_report`, `get_credible_sets_stats` and `get_myvariant_annotations` have no
+SDK wrapper and stay tool-only.
 
 ```python
 import genetics_mcp_server.sdk as genetics
@@ -293,6 +295,7 @@ winner.
 | `colocalization(variant=\|credible_set_id=+phenotype=)` | `get_colocalization`, `get_colocalization_by_credible_set` |
 | `exome(gene=\|variant=\|region=\|phenotype=)` | `get_exome_results_by_gene`/`_variant`/`_region`/`_phenotype` |
 | `gene_burden(gene=\|phenotype=)` | `get_gene_based_results`, `get_gene_based_results_by_phenotype` |
+| `hla(phenotype=\|allele=)` | `get_hla_by_phenotype`, `get_hla_by_allele` |
 | `asm_qtl(variant=\|gene=)` | `get_asm_qtl_by_variant`, `get_asm_qtl_by_gene` |
 | `open_chromatin(variant=\|region=\|peak=\|gene=)` | `get_open_chromatin_by_variant`/`_region`/`_peak`/`_gene` |
 | `peak_to_gene(peak=\|gene=)` | `get_peak_to_genes`, `get_gene_to_peaks` |
@@ -315,6 +318,18 @@ winner.
 `mpra_pip_concordance` stays a separate function rather than a keyword on `mpra()`: it is a
 join of `credible_sets_v` and `mpra_v` and returns credible-set columns alongside MPRA
 columns, so the row shape differs from every other `mpra()` result.
+
+`hla()` is the one collapse whose two branches read **different stores**, and they do not
+agree on column names. `hla(phenotype=)` reads the per-phenotype tabix files through
+results-api and spells the statistics `mlog10p`/`se`/`af`/`af_cases`/`af_controls`;
+`hla(allele=)` must go to BigQuery `hla_associations_v` — no single file spans phenotypes —
+which spells them `mlogp`/`sebeta`/`af_alt`/`af_alt_cases`/`af_alt_controls`. The trait
+column is `phenotype` in both, a third convention next to the `trait`/`phenocode` used
+elsewhere in the suite; `hla_associations_v` has no `trait` or `trait_original` at all. Both
+are documented on the function's docstring because a script consuming both shapes must
+rename rather than assume. Only the `allele=` branch preserves column names on an empty
+result, via the `with_metadata=True` / `columns` path the BigQuery functions use — the
+results-api returns a bare `[]` with no schema to recover.
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
 cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,

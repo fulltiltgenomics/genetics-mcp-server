@@ -84,6 +84,23 @@ class TestGetHlaByPhenotype:
         finally:
             await executor.close()
 
+    async def test_resource_is_percent_encoded_into_the_path(self):
+        """`resource` reaches the path of a request carrying the internal bearer token,
+        and httpx normalises `..`, so an unencoded segment resolves to another endpoint."""
+        executor = ToolExecutor(api_base_url="http://unused.test/api")
+        try:
+            executor.client.get = AsyncMock(return_value=_api_response(HLA_ROWS))
+
+            await executor.get_hla_by_phenotype(["K11_COELIAC"], resource="../../admin/users")
+
+            # the separators are encoded, so the `..` never become path segments httpx
+            # could normalise away — the whole thing stays one opaque resource name
+            url = executor.client.get.await_args.args[0]
+            assert url.endswith("/v1/hla/..%2F..%2Fadmin%2Fusers")
+            assert "/admin/users" not in url
+        finally:
+            await executor.close()
+
     async def test_api_error_is_reported(self):
         executor = ToolExecutor(api_base_url="http://unused.test/api")
         try:
@@ -112,6 +129,31 @@ class TestGetHlaByAllele:
             assert result["results"] == HLA_ROWS
             # '*' and ':' are not safe in a filename
             assert result["_download_data"]["filename"] == "B_27_05_hla.tsv"
+        finally:
+            await executor.close()
+
+    async def test_metadata_is_off_for_the_model_and_on_for_the_sdk(self):
+        """db-api returns rows positionally. The model reads `results` as-is, but a script
+        needs `columns` to label them (and to keep a schema on an empty result) and
+        `truncated` to refuse a silent prefix — so they are opt-in, leaving the MCP
+        payload unchanged."""
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            query_result = {
+                "success": True,
+                "rows": [["K11_COELIAC", "DQB1*02:01", 1596.65]],
+                "columns": ["phenotype", "allele", "mlogp"],
+                "truncated": True,
+            }
+            executor.query_database = AsyncMock(return_value=query_result)
+
+            plain = await executor.get_hla_by_allele("B*27:05")
+            assert "columns" not in plain
+            assert "truncated" not in plain
+
+            annotated = await executor.get_hla_by_allele("B*27:05", with_metadata=True)
+            assert annotated["columns"] == ["phenotype", "allele", "mlogp"]
+            assert annotated["truncated"] is True
         finally:
             await executor.close()
 
@@ -144,6 +186,56 @@ class TestGetHlaByAllele:
             assert result["success"] is False
             assert "not an HLA allele name" in result["error"]
             executor.query_database.assert_not_awaited()
+        finally:
+            await executor.close()
+
+    @pytest.mark.parametrize(
+        "bad", ["finngen' OR 1=1--", "finngen; DROP TABLE hla_associations", "fin ngen", 7]
+    )
+    async def test_unsafe_resource_never_reaches_sql(self, bad):
+        """`resource` is a caller-controlled literal, so it goes through the same
+        allow-list as every other resource filter rather than being interpolated raw."""
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            executor.query_database = AsyncMock()
+
+            result = await executor.get_hla_by_allele("B*27:05", resource=bad)
+
+            assert result["success"] is False
+            assert "resource" in result["error"]
+            executor.query_database.assert_not_awaited()
+        finally:
+            await executor.close()
+
+    async def test_legitimate_resource_is_quoted_into_the_filter(self):
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            executor.query_database = AsyncMock(
+                return_value={"success": True, "rows": [], "columns": []}
+            )
+
+            await executor.get_hla_by_allele("B*27:05", resource="finngen_mvp_ukbb")
+
+            assert "resource = 'finngen_mvp_ukbb'" in executor.query_database.await_args.args[0]
+        finally:
+            await executor.close()
+
+    async def test_max_rows_is_range_checked_before_it_reaches_limit(self):
+        """query_database strips the trailing LIMIT today, which makes an unchecked
+        `LIMIT {int(max_rows)}` only accidentally safe — it is bounded at the source."""
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            executor.query_database = AsyncMock(
+                return_value={"success": True, "rows": [], "columns": []}
+            )
+
+            await executor.get_hla_by_allele("B*27:05", max_rows=200)
+            assert executor.query_database.await_args.args[0].endswith("LIMIT 200")
+
+            for bad in (0, -1, ToolExecutor._MAX_SQL_LIMIT + 1, 1.5, "200"):
+                result = await executor.get_hla_by_allele("B*27:05", max_rows=bad)
+                assert result["success"] is False
+                assert "max_rows" in result["error"]
         finally:
             await executor.close()
 

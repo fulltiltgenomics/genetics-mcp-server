@@ -339,6 +339,66 @@ class GeneticsClient:
             )
         return self._rows(result)
 
+    # ------------------------------------------------------------------ HLA
+
+    async def hla(
+        self,
+        *,
+        phenotype: str | list[str] | None = None,
+        allele: str | None = None,
+        genes: str | list[str] | None = None,
+        resource: str = "finngen",
+        min_mlogp: float | None = None,
+        min_info: float | None = None,
+        limit: int | None = None,
+    ) -> pl.DataFrame:
+        """Classical HLA allele associations, from whichever end is fixed.
+
+        phenotype — every imputed allele (187 across 10 genes) tested against one or more
+                    traits; `genes` narrows to e.g. 'HLA-B,HLA-DQB1'
+        allele    — the PheWAS view: every trait one allele is associated with, filtered
+                    by `min_mlogp` (default 7.3) and `min_info` (default 0.5; pass 0 to
+                    see badly-imputed rare alleles, whose betas are artifacts)
+
+        Pass `allele` gene-stripped and two-field ('B*27:05', 'DQB1*02:01'); the written
+        'HLA-B*27:05' form is normalized for you. There is no by-variant shape — an HLA
+        allele has no chr:pos:ref:alt identity.
+
+        THE TWO SHAPES DO NOT RETURN THE SAME COLUMNS, because they read different stores.
+        The trait column is `phenotype` in both (not `trait` or `phenocode`, which the rest
+        of the suite uses), but the statistics are spelled differently:
+
+            phenotype=  (per-trait files)  mlog10p  se      af      af_cases      af_controls
+            allele=     (hla_associations_v)  mlogp  sebeta  af_alt  af_alt_cases  af_alt_controls
+
+        Rank on the -log10 p-value in both cases — `pval` underflows to a literal 0 for the
+        strongest signals (coeliac DQB1*02:01 is mlog10p 1596). A script that consumes both
+        shapes must rename rather than assume. Only the `allele=` shape carries its column
+        names through an empty result; results-api returns a bare `[]` with no schema.
+        """
+        key, value = _one_of(phenotype=phenotype, allele=allele)
+        if key == "phenotype":
+            _reject(
+                "hla(phenotype=...)", min_mlogp=min_mlogp, min_info=min_info, limit=limit
+            )
+            phenotypes = [value] if isinstance(value, str) else list(value)
+            return self._rows(
+                await self.executor.get_hla_by_phenotype(
+                    phenotypes, genes=_csv(genes), resource=resource
+                )
+            )
+        _reject("hla(allele=...)", genes=_csv(genes))
+        return self._rows(
+            await self.executor.get_hla_by_allele(
+                value,
+                min_mlogp=7.3 if min_mlogp is None else min_mlogp,
+                min_info=0.5 if min_info is None else min_info,
+                resource=resource,
+                max_rows=MAX_ROWS if limit is None else limit,
+                with_metadata=True,
+            )
+        )
+
     # ------------------------------------------------------------------ regulatory
 
     async def asm_qtl(
