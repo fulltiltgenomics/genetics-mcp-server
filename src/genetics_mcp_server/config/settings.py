@@ -217,6 +217,18 @@ class Settings:
         }
     )
 
+    # whether the deployment supplied an allow-list at all, as opposed to inheriting the
+    # finngen.fi default above. auth.core fails open on the proxied-identity path when this is
+    # False: chat-backend only started reading these in genetics-results-suite-th2, so a pod
+    # that has not yet picked up the bearer-auth-allowed ConfigMap must not refuse every user
+    # of a non-finngen deployment. Enforcement is defence in depth; the trusted-proxy marker
+    # is what actually closes the hole.
+    allow_list_configured: bool = field(
+        default_factory=lambda: bool(
+            os.environ.get("ALLOWED_EMAIL_DOMAINS") or os.environ.get("ALLOWED_EMAILS")
+        )
+    )
+
     # OAuth client id(s) a Google Identity Token must be addressed to (its `aud` claim).
     # google.oauth2.id_token.verify_oauth2_token skips audience verification entirely when
     # this is None, which means ANY Google-signed id_token belonging to an allow-listed email

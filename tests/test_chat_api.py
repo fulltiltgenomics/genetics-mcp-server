@@ -98,11 +98,19 @@ class TestAuthEndpoints:
         assert response.status_code == 401
 
     def test_me_authenticated(self, test_client):
-        """Test /chat/v1/me returns user from IAP header."""
-        with settings_env(REQUIRE_AUTH="true"):
+        """Test /chat/v1/me returns the user the trusted proxy asserted.
+
+        The internal-secret bearer is the marker auth-gateway now attaches alongside the header
+        (genetics-results-suite-th2); the header alone no longer authenticates. See
+        tests/test_auth_header_trust.py for the full precedence table.
+        """
+        with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET="test-internal-secret"):
             response = test_client.get(
                 "/chat/v1/me",
-                headers={"X-Goog-Authenticated-User-Email": "accounts.google.com:test@finngen.fi"},
+                headers={
+                    "X-Goog-Authenticated-User-Email": "accounts.google.com:test@finngen.fi",
+                    "Authorization": "Bearer test-internal-secret",
+                },
             )
 
         assert response.status_code == 200

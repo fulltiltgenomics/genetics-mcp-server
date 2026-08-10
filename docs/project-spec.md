@@ -1217,6 +1217,32 @@ branch entirely and falls through to requiring the IAP header, rather than compa
 and `tests/test_internal_api_secret.py` now pins both that and the agreement of all four consumers
 by setting the environment *after* import, which is exactly what a snapshot cannot see.
 
+**The identity header is not a credential on its own** (`genetics-results-suite-th2`). Anything
+that can reach chat-backend on the pod network can set `X-Goog-Authenticated-User-Email` to any
+string, so `auth/core.py:get_authenticated_user` honours it only when the request also carries the
+trusted-proxy marker, and then holds the address to `ALLOWED_EMAILS`/`ALLOWED_EMAIL_DOMAINS` (which
+fails open, with a warning, when a deployment configures neither). `auth/dependencies.py:auth_required`
+resolves: marker + allow-listed header → that user; marker + non-allow-listed header → 401, never a
+downgrade to `mcp-tool`; marker alone → `mcp-tool`; header alone → 401.
+
+`auth/core.py:is_internal_caller` is the **single** place `INTERNAL_API_SECRET` is compared, and it
+accepts the marker in either transport:
+
+- `X-Internal-Auth: <secret>` — auth-gateway's, on the two locations proxying browser traffic here
+  (`/chat/v1/` and `= /status`). A dedicated header rather than `Authorization` so that a
+  chat-backend still on the previous image ignores it: with the marker on `Authorization`, the old
+  code matches the bearer *before* it reads the identity header, and every browser user during the
+  gateway-leads-backend rollout window would have resolved to the one `mcp-tool` identity — owning
+  their sessions, messages, downloads and API tokens permanently.
+- `Authorization: Bearer <secret>` — results-api's and mcp-server's, unchanged. Service-to-service
+  callers with no `Authorization` of their own to displace.
+
+Both compare as **bytes**: `hmac.compare_digest` on `str` raises `TypeError` for a non-ASCII value,
+and a 500 from a forged header is a worse failure mode than a 401. `POST /chat/v1/tokens/validate`
+is the only route with no auth dependency; it calls the same helper (it used to repeat the
+comparison, on `str`, and drifted) and additionally rejects any request carrying an identity header,
+since its genuine callers never assert one.
+
 Admin endpoints:
 - `GET /chat/v1/admin/sessions` — list all sessions with filters and pagination. Each session item carries conversation-analysis fields (LEFT JOINed from `conversation_analysis`): `disposition`, `issue_count`, `issue_categories` (list of strings), `llm_rating` (the `llm_quality_score`, 1-5 or null), `success_label`. Filters: `user`, `date_from`, `date_to`, `session_id`, plus analysis filters `disposition` (exact), `success_label` (exact), `min_issues` (keep sessions with `issue_count >= N`), and `rating`. The `rating` param is a **string**: `"1"`..`"5"` filter the exact LLM rating, and the sentinel `"NA"` filters to unrated sessions (no `llm_quality_score`, i.e. unanalyzed sessions or rows with a NULL score). NA is implemented via the `unrated: bool` param on `ChatHistoryDB.list_all_sessions` (`a.llm_quality_score IS NULL`). The paginated `total` reflects all active filters.
 - `GET /chat/v1/admin/sessions/{id}` — session detail with all messages

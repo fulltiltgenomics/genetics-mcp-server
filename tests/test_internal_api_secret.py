@@ -63,6 +63,53 @@ class TestAllConsumersReadTheSameLiveValue:
                 )
                 assert response.status_code == 403
 
+    def test_tokens_validate_rejects_the_marker_alongside_an_asserted_identity(self):
+        """The genuine callers are service-to-service and never assert an identity, so the pair
+        can only mean a proxy built this request for a browser user. Minting a token answer from
+        one would be the route acting on an end-user request it has no dependency guarding."""
+        with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET=SECRET):
+            with TestClient(app) as client:
+                for marker in (
+                    {"Authorization": f"Bearer {SECRET}"},
+                    {"X-Internal-Auth": SECRET},
+                ):
+                    response = client.post(
+                        "/chat/v1/tokens/validate",
+                        json={"token": "irrelevant"},
+                        headers={
+                            **marker,
+                            "X-Goog-Authenticated-User-Email": "someone@finngen.fi",
+                        },
+                    )
+                    assert response.status_code == 403
+
+    async def test_tokens_validate_rejects_a_non_ascii_bearer_rather_than_raising(self):
+        """It used to compare_digest on str here, which raises TypeError — a 500 — for a
+        non-ASCII bearer. Sharing is_internal_caller is what keeps the two comparisons alike.
+
+        Driven below TestClient because httpx refuses to encode a non-ASCII header itself; the
+        forged request this guards against is written straight onto the socket."""
+        import fastapi
+        import pytest as _pytest
+
+        from genetics_mcp_server.routers.api_tokens import (
+            TokenValidateRequest,
+            validate_token,
+        )
+
+        request = fastapi.Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/chat/v1/tokens/validate",
+                "headers": [(b"authorization", "Bearer säkerhet".encode("utf-8"))],
+            }
+        )
+        with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET=SECRET):
+            with _pytest.raises(fastapi.HTTPException) as exc:
+                await validate_token(TokenValidateRequest(token="irrelevant"), request)
+            assert exc.value.status_code == 403
+
     def test_the_tool_executor_sends_the_same_secret(self):
         """executor.py was already a live read, but it has to agree with the other three."""
         from genetics_mcp_server.tools.executor import ToolExecutor
@@ -116,11 +163,15 @@ class TestEmptySecretStaysFailClosed:
                 assert response.status_code == 401
 
     def test_compare_digest_is_used_rather_than_equality(self):
-        """Guards the shape of the comparison, which is what makes it constant-time."""
+        """Guards the shape of the comparison, which is what makes it constant-time.
+
+        Lives in auth.core since genetics-results-suite-th2 — auth_required and the identity
+        header now share one is_internal_caller instead of comparing the secret in two places.
+        """
         import inspect
 
-        from genetics_mcp_server.auth import dependencies
+        from genetics_mcp_server.auth import core
 
-        source = inspect.getsource(dependencies)
+        source = inspect.getsource(core)
         assert "hmac.compare_digest" in source
         assert hmac.compare_digest(SECRET, SECRET)
