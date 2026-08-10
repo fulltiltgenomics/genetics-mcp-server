@@ -41,6 +41,14 @@ class Settings:
         default_factory=lambda: os.environ.get("INTERNAL_API_SECRET", "")
     )
 
+    # signing key for the per-execution sandbox tokens (docs/code-execution-security.md §4).
+    # Deliberately NOT internal_api_secret: separate key, separate blast radius, independent
+    # rotation. Only chat-backend (mint) and db-api/results-api (verify) hold it; the sandbox
+    # holds neither this nor internal_api_secret.
+    sandbox_token_signing_key: str = field(
+        default_factory=lambda: os.environ.get("SANDBOX_TOKEN_SIGNING_KEY", "")
+    )
+
     # web search
     tavily_api_key: str | None = field(
         default_factory=lambda: os.environ.get("TAVILY_API_KEY")
