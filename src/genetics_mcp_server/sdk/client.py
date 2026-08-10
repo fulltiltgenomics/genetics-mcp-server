@@ -755,7 +755,24 @@ class GeneticsClient:
         """Run read-only SQL against the genetics BigQuery views.
 
         The db-api rejects anything that is not a plain SELECT over the exposed views, so
-        this is the escape hatch for joins the typed functions above do not cover.
+        this is the escape hatch for joins the typed functions above do not cover. Qualify
+        every table as `genetics_results.<view>`; the schema docs' examples are written that
+        way.
+
+        Like the `limit=` functions, a truncated result RAISES rather than returning a
+        prefix — a short frame with no signal would make every downstream count and join
+        silently wrong. Two ceilings can trip it, and neither is raised by passing a bigger
+        `max_rows`:
+
+          rows  — db-api caps a sandbox execution at 25,000 returned rows regardless of
+                  `max_rows`, and reports the cut, which becomes a GeneticsError. (The
+                  error text names no number, so there is nothing in it to tell you which
+                  ceiling you hit — assume 25,000.)
+          bytes — 50 GB scanned per query and 200 GB across one execution; over either is a
+                  GeneticsError too, not a short result.
+
+        So aggregate, filter or add the partition predicate in SQL rather than fetching
+        every row and reducing in polars.
         """
         result = self._payload(await self.executor.query_database(query, max_rows=max_rows))
         self._check_truncation(result)
