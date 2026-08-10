@@ -360,6 +360,42 @@ class ToolExecutor:
             payload["truncated"] = query_result.get("truncated", False)
         return payload
 
+    @staticmethod
+    def _positional_rows(
+        query_result: dict[str, Any],
+    ) -> tuple[list[str], list[Any], dict[str, Any] | None]:
+        """Split a db-api query result into column names and positional rows.
+
+        Returns `(columns, rows, error)`; `error` is a ready-to-return failure payload
+        when the two disagree, and None otherwise. `zip` truncates silently, so a row
+        whose arity disagrees with `columns` must be an error rather than a shifted
+        labelling: mislabelled genomic values are worse than no values. A row arriving
+        as a dict is the same class of failure — zipping names against dict KEYS would
+        produce plausible-looking garbage.
+        """
+        columns = query_result.get("columns") or []
+        rows = query_result.get("rows") or []
+        if rows and not columns:
+            return columns, rows, {
+                "success": False,
+                "error": "query result has rows but no column names",
+            }
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                return columns, rows, {
+                    "success": False,
+                    "error": f"query result row is {type(row).__name__}, expected a positional list",
+                }
+            if len(row) != len(columns):
+                return columns, rows, {
+                    "success": False,
+                    "error": (
+                        f"query result row has {len(row)} values but "
+                        f"{len(columns)} column names"
+                    ),
+                }
+        return columns, rows, None
+
     def _bq_gene_payload(
         self,
         gene: str,
@@ -377,29 +413,10 @@ class ToolExecutor:
         - `_download_data` keeps the positional `{columns, rows}` form that
           `_convert_to_tsv` handles directly — the download can carry 100k rows, and
           re-materialising each as a dict only to flatten it back is waste.
-
-        Names come from `columns` positionally, never from dict iteration order, and a
-        row whose arity disagrees with `columns` is an error rather than a shifted
-        labelling: mislabelled genomic values are worse than no values.
         """
-        columns = query_result.get("columns") or []
-        rows = query_result.get("rows") or []
-        if rows and not columns:
-            return {"success": False, "error": "query result has rows but no column names"}
-        for row in rows:
-            if not isinstance(row, (list, tuple)):
-                return {
-                    "success": False,
-                    "error": f"query result row is {type(row).__name__}, expected a positional list",
-                }
-            if len(row) != len(columns):
-                return {
-                    "success": False,
-                    "error": (
-                        f"query result row has {len(row)} values but "
-                        f"{len(columns)} column names"
-                    ),
-                }
+        columns, rows, error = self._positional_rows(query_result)
+        if error:
+            return error
         payload = {
             "success": True,
             "gene": gene,
@@ -1448,7 +1465,9 @@ class ToolExecutor:
         )
         result = await self.query_database(sql, max_rows=max_rows)
         if result.get("success"):
-            rows = result.get("rows", [])
+            columns, rows, error = self._positional_rows(result)
+            if error:
+                return error
             payload = {
                 "success": True,
                 "allele": name,
@@ -1456,9 +1475,13 @@ class ToolExecutor:
                 "min_mlogp": min_mlogp,
                 "min_info": min_info,
                 "count": len(rows),
-                "results": rows,
+                # the model cannot tell mlogp from beta from af_alt in a bare positional
+                # list, so it gets named rows; the download keeps the positional form
+                # `_convert_to_tsv` handles, whose `results` branch needs dicts
+                "results": [dict(zip(columns, row)) for row in rows],
                 "_download_data": {
-                    "results": rows,
+                    "columns": columns,
+                    "rows": rows,
                     "filename": f"{name.replace('*', '_').replace(':', '_')}_hla.tsv",
                 },
             }

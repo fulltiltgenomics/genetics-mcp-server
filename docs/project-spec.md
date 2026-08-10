@@ -450,7 +450,15 @@ used to be handed the bare `rows`:
 
 Names always come from `columns` positionally, never from dict iteration order, and a row whose
 arity disagrees with `columns` — or that is not a positional sequence at all — makes the tool
-return `success: False` rather than label genomic values with the wrong column names.
+return `success: False` rather than label genomic values with the wrong column names. That
+validation lives in `_positional_rows`, shared rather than duplicated.
+
+`get_hla_by_allele` is the sixth BigQuery-backed tool and had both defects independently: it
+landed in parallel with the fix above, so it shipped bare positional lists to the model and a
+dead download link. It now shapes its payload the same way — named dicts in `results`, the
+`{columns, rows}` form in `_download_data`, and the same loud failure on a mismatch — through
+`_positional_rows`. It keeps its own payload builder rather than calling `_bq_gene_payload`
+because it is keyed on `allele`/`resource`/`min_mlogp`/`min_info`/`count`, not on `gene`.
 
 They also take `with_metadata=False`. When set, the returned dict carries the underlying query's
 `columns` and `truncated`. Both are still needed after the shape change: an **empty** result has

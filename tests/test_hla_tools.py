@@ -35,6 +35,17 @@ HLA_ROWS = [
     }
 ]
 
+# get_hla_by_allele goes through db-api's /query, which serializes rows POSITIONALLY
+# (`[_serialize_value(v) for v in row.values()]`) with the names in a separate key —
+# unlike the results-api rows above, which arrive as dicts.
+ALLELE_COLUMNS = [
+    "phenotype", "gene", "allele", "mlogp", "pval", "beta", "sebeta",
+    "af_alt", "af_alt_cases", "af_alt_controls", "info",
+]
+ALLELE_ROWS = [
+    ["K11_COELIAC", "HLA-DQB1", "DQB1*02:01", 1596.65, 0.0, 1.6397, 0.0421, 0.30, 0.51, 0.28, 0.96906]
+]
+
 
 class TestGetHlaByPhenotype:
     async def test_surfaces_rows_and_download_url(self):
@@ -115,28 +126,93 @@ class TestGetHlaByPhenotype:
 
 
 class TestGetHlaByAllele:
-    async def test_surfaces_rows(self):
+    async def test_surfaces_named_rows(self):
+        """db-api returns rows POSITIONALLY with the names in a separate `columns` key.
+        The model cannot tell mlogp from beta from af_alt in a bare list, so `results`
+        carries dicts built by zipping `columns`."""
         executor = ToolExecutor(bigquery_api_url="http://unused.test")
         try:
             executor.query_database = AsyncMock(
-                return_value={"success": True, "rows": HLA_ROWS, "columns": []}
+                return_value={
+                    "success": True,
+                    "rows": ALLELE_ROWS,
+                    "columns": ALLELE_COLUMNS,
+                }
             )
 
             result = await executor.get_hla_by_allele("B*27:05")
 
             assert result["success"] is True
             assert result["allele"] == "B*27:05"
-            assert result["results"] == HLA_ROWS
+            assert result["count"] == 1
+            assert result["results"] == [dict(zip(ALLELE_COLUMNS, ALLELE_ROWS[0]))]
+            assert result["results"][0]["mlogp"] == 1596.65
+            assert result["results"][0]["beta"] == 1.6397
+            # the download keeps the positional form _convert_to_tsv already handles
+            assert result["_download_data"]["columns"] == ALLELE_COLUMNS
+            assert result["_download_data"]["rows"] == ALLELE_ROWS
             # '*' and ':' are not safe in a filename
             assert result["_download_data"]["filename"] == "B_27_05_hla.tsv"
         finally:
             await executor.close()
 
+    async def test_download_data_converts_to_tsv_with_a_header(self):
+        """The download used to carry a list of lists under `results`; _convert_to_tsv's
+        `results` branch does `results[0].keys()`, so it raised AttributeError inside
+        _process_download_hints' except and the user silently got no download link."""
+        from genetics_mcp_server.llm_service import _convert_to_tsv
+
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            executor.query_database = AsyncMock(
+                return_value={
+                    "success": True,
+                    "columns": ["phenotype", "allele", "mlogp"],
+                    "rows": [["K11_COELIAC", "DQB1*02:01", 1596.65], ["M13_ANKYLOSPON", "B*27:05", 88.2]],
+                }
+            )
+
+            result = await executor.get_hla_by_allele("B*27:05")
+
+            tsv = _convert_to_tsv(result["_download_data"]).decode()
+            assert tsv.splitlines() == [
+                "phenotype\tallele\tmlogp",
+                "K11_COELIAC\tDQB1*02:01\t1596.65",
+                "M13_ANKYLOSPON\tB*27:05\t88.2",
+            ]
+        finally:
+            await executor.close()
+
+    @pytest.mark.parametrize(
+        "bad_result",
+        [
+            {"success": True, "columns": ["phenotype", "allele"], "rows": [["K11", "B*27:05", 1.0]]},
+            {"success": True, "columns": ["phenotype", "allele", "mlogp"], "rows": [["K11", "B*27:05"]]},
+            {"success": True, "columns": [], "rows": [["K11", "B*27:05"]]},
+            {"success": True, "columns": ["phenotype", "allele"], "rows": [{"phenotype": "K11", "allele": "B*27:05"}]},
+        ],
+        ids=["row-too-long", "row-too-short", "no-column-names", "row-is-a-dict"],
+    )
+    async def test_fails_loudly_on_column_row_mismatch(self, bad_result):
+        """Zipping unequal-length sequences truncates silently, which would label genomic
+        values with the wrong column names. A dict row is the same class of failure: the
+        names would zip against dict KEYS. Refusing is the only safe outcome."""
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            executor.query_database = AsyncMock(return_value=bad_result)
+
+            result = await executor.get_hla_by_allele("B*27:05")
+
+            assert result["success"] is False
+            assert "column" in result["error"] or "positional" in result["error"]
+        finally:
+            await executor.close()
+
     async def test_metadata_is_off_for_the_model_and_on_for_the_sdk(self):
-        """db-api returns rows positionally. The model reads `results` as-is, but a script
-        needs `columns` to label them (and to keep a schema on an empty result) and
-        `truncated` to refuse a silent prefix — so they are opt-in, leaving the MCP
-        payload unchanged."""
+        """`results` now carries the names on every row, but an EMPTY result has no row
+        to carry them, so the SDK still needs `columns` to keep a schema — and needs
+        `truncated` to refuse a silent prefix. Both stay opt-in so the model's payload is
+        not padded with them."""
         executor = ToolExecutor(bigquery_api_url="http://unused.test")
         try:
             query_result = {
@@ -150,6 +226,10 @@ class TestGetHlaByAllele:
             plain = await executor.get_hla_by_allele("B*27:05")
             assert "columns" not in plain
             assert "truncated" not in plain
+            # the names reach the model on the rows themselves instead
+            assert plain["results"] == [
+                {"phenotype": "K11_COELIAC", "allele": "DQB1*02:01", "mlogp": 1596.65}
+            ]
 
             annotated = await executor.get_hla_by_allele("B*27:05", with_metadata=True)
             assert annotated["columns"] == ["phenotype", "allele", "mlogp"]
