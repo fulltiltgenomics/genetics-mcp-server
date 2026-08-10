@@ -6,9 +6,12 @@ import io
 import logging
 import os
 import re
+import threading
 import traceback
 from collections import defaultdict
-from typing import Any
+from dataclasses import dataclass
+from functools import cached_property
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
 from xml.sax.saxutils import quoteattr
 
@@ -32,7 +35,81 @@ from genetics_mcp_server.tools.sql_safety import (
 )
 from genetics_mcp_server.tools.uniprot import UniProtClient
 
+if TYPE_CHECKING:
+    from genetics_mcp_server.config.settings import Settings
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PrunedInstallSettings:
+    """Stand-in for Settings where config/settings.py is not installed.
+
+    Exactly one install is like that: the sandbox image, which ships only the SDK's
+    import closure because config/settings.py names the whole internal configuration
+    surface (genetics-results-suite-l41). The values are Settings' own defaults rather
+    than environment reads — the sandbox holds no internal secret by design, and reading
+    the variables here would put their names back into the image this is removing them
+    from. tests/test_sdk_import_closure.py asserts these agree with Settings' defaults.
+    """
+
+    internal_api_secret: str = ""
+    myvariant_api_url: str = "https://myvariant.info/v1"
+    uniprot_api_url: str = "https://rest.uniprot.org"
+    ebi_proteins_api_url: str = "https://www.ebi.ac.uk/proteins/api"
+    uniprot_cache_ttl: int = 86400
+
+
+_PRUNED_INSTALL_SETTINGS = _PrunedInstallSettings()
+
+
+_warned_pruned_install = False
+
+
+def _resolve_settings() -> "Settings | _PrunedInstallSettings":
+    """Settings, resolved at first use rather than at ToolExecutor construction.
+
+    Deferred so that importing — or constructing — the executor never requires
+    config/settings.py, which the sandbox image deliberately does not ship.
+
+    Only config/settings.py itself going missing is the pruned install; a
+    ModuleNotFoundError from anywhere else in its import chain (today python-dotenv,
+    tomorrow any new optional dependency) is a broken install and must not degrade
+    silently into the credential-less fallback.
+    """
+    global _warned_pruned_install
+    try:
+        from genetics_mcp_server.config.settings import get_settings
+    except ModuleNotFoundError as exc:
+        if exc.name not in (
+            "genetics_mcp_server.config",
+            "genetics_mcp_server.config.settings",
+        ):
+            raise
+        if not _warned_pruned_install:
+            _warned_pruned_install = True
+            # once, not per call: in the sandbox this is the expected path
+            logger.warning(
+                "settings module is not installed; using the pruned-install defaults "
+                "(no internal credentials, upstream endpoints at their public defaults)"
+            )
+        return _PRUNED_INSTALL_SETTINGS
+    return get_settings()
+
+
+def _endpoint_env(name: str, default: str | None = None) -> str | None:
+    """An endpoint URL from the environment, read only after settings has had its chance.
+
+    config/settings.py calls load_dotenv() at module scope, so a standalone process with
+    a .env file sees these variables only once that module has been imported. These
+    reads used to sit in __init__ *after* the settings import that has since been
+    deferred; routing them through _resolve_settings() keeps them on the far side of
+    load_dotenv() without putting the import back into construction. In the pruned
+    install there is no settings module and the reads fall through to the environment
+    the sandbox itself set.
+    """
+    _resolve_settings()
+    return os.environ.get(name, default)
 
 # distinguishes "caller did not ask for a row cap" from "caller asked for no cap at all",
 # since None is a meaningful value for _row_limit
@@ -124,29 +201,14 @@ class ToolExecutor:
         bigquery_api_url: str | None = None,
         row_limit: Any = _KEEP_DEFAULT_ROW_LIMIT,
     ):
-        from genetics_mcp_server.config.settings import get_settings
-
-        settings = get_settings()
-        self.base_url = api_base_url or os.environ.get(
-            "GENETICS_API_URL", "http://0.0.0.0:2000/api"
-        )
-        # public URL for download links shown to users
-        self.public_url = public_api_url or os.environ.get(
-            "GENETICS_PUBLIC_API_URL", self.base_url
-        )
-        # BigQuery API URL for direct SQL queries
-        self.bigquery_url = bigquery_api_url or os.environ.get("BIGQUERY_API_URL")
-        # authenticate to results-api with shared secret if configured
-        api_secret = settings.internal_api_secret
-        headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
-        self.client = _ResilientAsyncClient(timeout=300.0, headers=headers)
+        self._client_lock = threading.Lock()
+        self._api_base_url_arg = api_base_url
+        self._public_api_url_arg = public_api_url
+        self._bigquery_api_url_arg = bigquery_api_url
         # separate client for third-party calls: carries no default auth so the
         # internal API secret is never leaked to external services (e.g. MouseMine,
         # myvariant.info). Per-call auth (Perplexity, Tavily) is passed explicitly.
         self.external_client = _ResilientAsyncClient(timeout=30.0)
-        # shares external_client so UniProt/EBI outages arrive as the synthetic 503
-        # rather than raising, and so no internal auth header is ever sent to them
-        self.uniprot = UniProtClient(self.external_client, settings)
         # lazily-fetched universe of expression resources (e.g. gtex, hpa), used to
         # tell "gene absent from this resource" apart from "resource unavailable"
         self._expression_resources: list[str] | None = None
@@ -161,6 +223,62 @@ class ToolExecutor:
         self._row_limit: int | None = (
             self._REGION_ROW_LIMIT if row_limit is _KEEP_DEFAULT_ROW_LIMIT else row_limit
         )
+
+    @cached_property
+    def base_url(self) -> str:
+        """The internal results-api endpoint, resolved on first use (see _endpoint_env)."""
+        return self._api_base_url_arg or _endpoint_env(
+            "GENETICS_API_URL", "http://0.0.0.0:2000/api"
+        )
+
+    @cached_property
+    def public_url(self) -> str:
+        """Public URL for download links shown to users."""
+        return self._public_api_url_arg or _endpoint_env(
+            "GENETICS_PUBLIC_API_URL", self.base_url
+        )
+
+    @cached_property
+    def bigquery_url(self) -> str | None:
+        """BigQuery API URL for direct SQL queries; None disables the SQL tools."""
+        return self._bigquery_api_url_arg or _endpoint_env("BIGQUERY_API_URL")
+
+    @property
+    def client(self) -> _ResilientAsyncClient:
+        """The internal API client, built on first use.
+
+        Lazy because its Authorization header is the only reason __init__ needed
+        settings; deferring it keeps construction free of config/settings.py. Assigning
+        `executor.client = ...` still works — the setter below writes the instance dict,
+        which is also where close() looks.
+
+        Locked rather than a cached_property because functools dropped that descriptor's
+        per-instance lock in 3.12: two threads racing the first access would each build a
+        client, and only the winner's connection pool is the one close() ever sees. The
+        service holds one shared executor across threads (mcp_server.py).
+        """
+        client = self.__dict__.get("client")
+        if client is None:
+            with self._client_lock:
+                client = self.__dict__.get("client")
+                if client is None:
+                    api_secret = _resolve_settings().internal_api_secret
+                    headers = (
+                        {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
+                    )
+                    client = _ResilientAsyncClient(timeout=300.0, headers=headers)
+                    self.__dict__["client"] = client
+        return client
+
+    @client.setter
+    def client(self, value: _ResilientAsyncClient) -> None:
+        self.__dict__["client"] = value
+
+    @cached_property
+    def uniprot(self) -> UniProtClient:
+        """Shares external_client so UniProt/EBI outages arrive as the synthetic 503
+        rather than raising, and so no internal auth header is ever sent to them."""
+        return UniProtClient(self.external_client, _resolve_settings())
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion
@@ -330,8 +448,14 @@ class ToolExecutor:
         return [r.strip() for r in resources.split(",") if r.strip()]
 
     async def close(self):
-        """Close the HTTP clients."""
-        await self.client.aclose()
+        """Close the HTTP clients.
+
+        `client` is read out of the instance dict rather than through the attribute so
+        closing an executor that never made an internal call does not build one first.
+        """
+        client = self.__dict__.get("client")
+        if client is not None:
+            await client.aclose()
         await self.external_client.aclose()
 
     # -------------------------------------------------------------------------
@@ -4761,10 +4885,7 @@ class ToolExecutor:
         fields: str | None = None,
     ) -> dict[str, Any]:
         """Get clinical/functional variant annotations from myvariant.info."""
-        from genetics_mcp_server.config.settings import get_settings
-
-        settings = get_settings()
-        base_url = settings.myvariant_api_url
+        base_url = _resolve_settings().myvariant_api_url
 
         req_fields = fields or self._MYVARIANT_DEFAULT_FIELDS
         params: dict[str, str] = {"fields": req_fields, "assembly": "hg38"}

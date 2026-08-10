@@ -397,6 +397,37 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 - **Importable standalone.** Nothing under `sdk/` imports the chat backend, the LLM service,
   the MCP server or the SQLite databases, so the package can be installed into a sandbox image
   on its own. `test_sdk.py` asserts this in a subprocess.
+- **The import closure is pinned, because the sandbox image ships exactly it.** That image
+  installs this distribution and then deletes every `genetics_mcp_server` file outside the
+  closure — a prompt-injected script *reads* source, it does not need it to import. The closure
+  is eleven modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
+  `tools/{__init__,definitions,executor,phewas_categories,sql_safety,uniprot}`.
+  `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
+  environment variable of the suite — so `uniprot.py` now imports `Settings` under
+  `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
+  first use rather than in `__init__`, falling back to `_PrunedInstallSettings` (a frozen copy
+  of the four public-URL/TTL defaults, and an empty `internal_api_secret`, since a sandbox
+  holds no secret) when `config.settings` is *itself* not installed — a `ModuleNotFoundError`
+  naming anything else in its import chain is re-raised, so a broken install cannot degrade
+  into the credential-less fallback, and taking the fallback logs one warning naming no
+  variable. `uniprot`, `base_url`, `public_url` and `bigquery_url` are `cached_property` for
+  the same reason; `client` is a lock-guarded lazy property rather than a `cached_property`
+  because 3.12 dropped that descriptor's lock and the service shares one executor across
+  threads, so a race would leak the loser's connection pool past `close()`. Assigning over
+  any of them in a test still works.
+- **The endpoint reads must stay behind the settings resolution.** `config/settings.py` calls
+  `load_dotenv()` at module scope, so the `GENETICS_API_URL` / `GENETICS_PUBLIC_API_URL` /
+  `BIGQUERY_API_URL` reads only see a `.env` file once that module has been imported. They go
+  through `_endpoint_env()`, which resolves settings first — reading `os.environ` directly at
+  construction would put a standalone run (`scripts/analyze_variants.py`, the SDK outside the
+  service) on the hard-coded default URL while still attaching a `.env`-supplied secret to it,
+  and would silently disable the BigQuery tools. `test_sdk_import_closure.py` pins this.
+- `test_sdk_import_closure.py` measures the closure in a fresh interpreter and asserts
+  equality, and asserts the SDK imports with `dotenv` unavailable. Every probe forces `src/`
+  onto the subprocess `PYTHONPATH` and asserts `genetics_mcp_server.__file__` resolves under
+  it, so an editable install pointing at another checkout cannot make it measure the wrong
+  tree. Widening the closure means widening `SDK_ALLOWLIST` in
+  `genetics-results-suite/sandbox/prune_venv.py` in the same change, or the image build fails.
 
 ### SQL safety at the SDK boundary
 
