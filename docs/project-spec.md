@@ -109,7 +109,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
 | `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
-| `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlogp`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
+| `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlog10p`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
@@ -319,17 +319,24 @@ winner.
 join of `credible_sets_v` and `mpra_v` and returns credible-set columns alongside MPRA
 columns, so the row shape differs from every other `mpra()` result.
 
-`hla()` is the one collapse whose two branches read **different stores**, and they do not
-agree on column names. `hla(phenotype=)` reads the per-phenotype tabix files through
-results-api and spells the statistics `mlog10p`/`se`/`af`/`af_cases`/`af_controls`;
-`hla(allele=)` must go to BigQuery `hla_associations_v` — no single file spans phenotypes —
-which spells them `mlogp`/`sebeta`/`af_alt`/`af_alt_cases`/`af_alt_controls`. The trait
-column is `phenotype` in both, a third convention next to the `trait`/`phenocode` used
-elsewhere in the suite; `hla_associations_v` has no `trait` or `trait_original` at all. Both
-are documented on the function's docstring because a script consuming both shapes must
-rename rather than assume. Only the `allele=` branch preserves column names on an empty
-result, via the `with_metadata=True` / `columns` path the BigQuery functions use — the
-results-api returns a bare `[]` with no schema to recover.
+`hla()` is the one collapse whose two branches read **different stores**. `hla(phenotype=)`
+reads the per-phenotype tabix files through results-api; `hla(allele=)` must go to BigQuery
+`hla_associations_v` — no single file spans phenotypes. They nevertheless spell the
+statistics the **same way**: `mlog10p`/`se`/`af`/`af_cases`/`af_controls`, so per-column
+access is uniform and no renaming is ever needed. The column *sets* still differ:
+`hla(allele=)` selects the 11 columns common to both, while `hla(phenotype=)` returns those
+plus `resource`, `version`, `chr` and `pos` — 15 in all — so a bare `pl.concat` of the two
+still fails on width and the shared 11 have to be selected explicitly first. The name
+agreement is not free — `hla_associations_v`
+renames FinnGen's native `mlogp`/`sebeta`/`af_alt`/`af_alt_cases`/`af_alt_controls` in the
+view definition (`genetics-results-db/schemas/hla_associations_v.sql`); the staged file and
+the `hla_associations` table underneath still carry the native spelling. The rename is 1:1
+on byte-identical values, and the view is what every consumer reads. The trait column is
+`phenotype` in both branches, a third convention next to the `trait`/`phenocode` used
+elsewhere in the suite; `hla_associations_v` has no `trait` or `trait_original` at all. Only
+the `allele=` branch preserves column names on an empty result, via the
+`with_metadata=True` / `columns` path the BigQuery functions use — the results-api returns
+a bare `[]` with no schema to recover.
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
 cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,

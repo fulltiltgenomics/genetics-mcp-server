@@ -1580,12 +1580,12 @@ class ToolExecutor:
 
         info_filter = f" AND info >= {float(min_info)}" if min_info else ""
         sql = (
-            f"SELECT phenotype, gene, allele, mlogp, pval, beta, sebeta, "
-            f"af_alt, af_alt_cases, af_alt_controls, info "
+            f"SELECT phenotype, gene, allele, mlog10p, pval, beta, se, "
+            f"af, af_cases, af_controls, info "
             f"FROM `genetics_results.hla_associations_v` "
             f"WHERE allele = '{name}' AND resource = {resource_lit} "
-            f"AND mlogp >= {float(min_mlogp)}{info_filter} "
-            f"ORDER BY mlogp DESC LIMIT {limit_sql}"
+            f"AND mlog10p >= {float(min_mlogp)}{info_filter} "
+            f"ORDER BY mlog10p DESC LIMIT {limit_sql}"
         )
         result = await self.query_database(sql, max_rows=max_rows)
         if result.get("success"):
@@ -1599,7 +1599,7 @@ class ToolExecutor:
                 "min_mlogp": min_mlogp,
                 "min_info": min_info,
                 "count": len(rows),
-                # the model cannot tell mlogp from beta from af_alt in a bare positional
+                # the model cannot tell mlog10p from beta from af in a bare positional
                 # list, so it gets named rows; the download keeps the positional form
                 # `_convert_to_tsv` handles, whose `results` branch needs dicts
                 "results": [dict(zip(columns, row)) for row in rows],

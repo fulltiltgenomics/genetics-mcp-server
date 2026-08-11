@@ -359,21 +359,21 @@ async def test_hla_by_allele_rows_are_named_by_the_query_columns():
         {
             "success": True,
             "results": [["K11_COELIAC", "HLA-DQB1", "DQB1*02:01", 1596.65]],
-            "columns": ["phenotype", "gene", "allele", "mlogp"],
+            "columns": ["phenotype", "gene", "allele", "mlog10p"],
         }
     )
     frame = await client.hla(allele="DQB1*02:01")
-    assert frame.columns == ["phenotype", "gene", "allele", "mlogp"]
-    assert frame["mlogp"].to_list() == [1596.65]
+    assert frame.columns == ["phenotype", "gene", "allele", "mlog10p"]
+    assert frame["mlog10p"].to_list() == [1596.65]
 
 
 async def test_hla_by_allele_empty_result_keeps_its_schema():
     """A script filtering a no-hit allele must get an empty frame, not ColumnNotFound."""
     client, _ = make_client(
-        {"success": True, "results": [], "columns": ["phenotype", "mlogp"]}
+        {"success": True, "results": [], "columns": ["phenotype", "mlog10p"]}
     )
     frame = await client.hla(allele="B*27:05")
-    assert frame.columns == ["phenotype", "mlogp"]
+    assert frame.columns == ["phenotype", "mlog10p"]
     assert frame.height == 0
 
 

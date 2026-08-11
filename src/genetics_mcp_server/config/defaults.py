@@ -78,7 +78,7 @@ For whether a variant has *regulatory* function (not consequence/frequency/patho
 
 Any question about chr6:29-33Mb, HLA typing, or a named HLA allele goes to `get_hla_by_phenotype` (all alleles for a trait) or `get_hla_by_allele` (all traits for an allele). Do NOT try to answer it from SNP summary statistics or credible sets: LD across the MHC is so extensive that variant-level results there are not interpretable, and the classical allele is what the literature and the clinic actually use.
 
-The unit is an **allele** (`B*27:05`), not a variant — it has no chr:pos:ref:alt, so `get_summary_stats` cannot return it, and every allele of a gene shares that gene's anchor position. Two traps when reading results: `pval` underflows to 0 at these effect sizes so rank on **`mlogp`**, and a rare allele with low **`info`** (imputation quality) produces a huge unstable beta that is an imputation artifact rather than a finding — say so rather than reporting it as a hit.
+The unit is an **allele** (`B*27:05`), not a variant — it has no chr:pos:ref:alt, so `get_summary_stats` cannot return it, and every allele of a gene shares that gene's anchor position. Two traps when reading results: `pval` underflows to 0 at these effect sizes so rank on **`mlog10p`** (both tools spell it that way), and a rare allele with low **`info`** (imputation quality) produces a huge unstable beta that is an imputation artifact rather than a finding — say so rather than reporting it as a hit.
 
 ### Protein Annotation (UniProt)
 

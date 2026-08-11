@@ -39,8 +39,8 @@ HLA_ROWS = [
 # (`[_serialize_value(v) for v in row.values()]`) with the names in a separate key —
 # unlike the results-api rows above, which arrive as dicts.
 ALLELE_COLUMNS = [
-    "phenotype", "gene", "allele", "mlogp", "pval", "beta", "sebeta",
-    "af_alt", "af_alt_cases", "af_alt_controls", "info",
+    "phenotype", "gene", "allele", "mlog10p", "pval", "beta", "se",
+    "af", "af_cases", "af_controls", "info",
 ]
 ALLELE_ROWS = [
     ["K11_COELIAC", "HLA-DQB1", "DQB1*02:01", 1596.65, 0.0, 1.6397, 0.0421, 0.30, 0.51, 0.28, 0.96906]
@@ -128,7 +128,7 @@ class TestGetHlaByPhenotype:
 class TestGetHlaByAllele:
     async def test_surfaces_named_rows(self):
         """db-api returns rows POSITIONALLY with the names in a separate `columns` key.
-        The model cannot tell mlogp from beta from af_alt in a bare list, so `results`
+        The model cannot tell mlog10p from beta from af in a bare list, so `results`
         carries dicts built by zipping `columns`."""
         executor = ToolExecutor(bigquery_api_url="http://unused.test")
         try:
@@ -146,7 +146,7 @@ class TestGetHlaByAllele:
             assert result["allele"] == "B*27:05"
             assert result["count"] == 1
             assert result["results"] == [dict(zip(ALLELE_COLUMNS, ALLELE_ROWS[0]))]
-            assert result["results"][0]["mlogp"] == 1596.65
+            assert result["results"][0]["mlog10p"] == 1596.65
             assert result["results"][0]["beta"] == 1.6397
             # the download keeps the positional form _convert_to_tsv already handles
             assert result["_download_data"]["columns"] == ALLELE_COLUMNS
@@ -167,7 +167,7 @@ class TestGetHlaByAllele:
             executor.query_database = AsyncMock(
                 return_value={
                     "success": True,
-                    "columns": ["phenotype", "allele", "mlogp"],
+                    "columns": ["phenotype", "allele", "mlog10p"],
                     "rows": [["K11_COELIAC", "DQB1*02:01", 1596.65], ["M13_ANKYLOSPON", "B*27:05", 88.2]],
                 }
             )
@@ -176,7 +176,7 @@ class TestGetHlaByAllele:
 
             tsv = _convert_to_tsv(result["_download_data"]).decode()
             assert tsv.splitlines() == [
-                "phenotype\tallele\tmlogp",
+                "phenotype\tallele\tmlog10p",
                 "K11_COELIAC\tDQB1*02:01\t1596.65",
                 "M13_ANKYLOSPON\tB*27:05\t88.2",
             ]
@@ -187,7 +187,7 @@ class TestGetHlaByAllele:
         "bad_result",
         [
             {"success": True, "columns": ["phenotype", "allele"], "rows": [["K11", "B*27:05", 1.0]]},
-            {"success": True, "columns": ["phenotype", "allele", "mlogp"], "rows": [["K11", "B*27:05"]]},
+            {"success": True, "columns": ["phenotype", "allele", "mlog10p"], "rows": [["K11", "B*27:05"]]},
             {"success": True, "columns": [], "rows": [["K11", "B*27:05"]]},
             {"success": True, "columns": ["phenotype", "allele"], "rows": [{"phenotype": "K11", "allele": "B*27:05"}]},
         ],
@@ -218,7 +218,7 @@ class TestGetHlaByAllele:
             query_result = {
                 "success": True,
                 "rows": [["K11_COELIAC", "DQB1*02:01", 1596.65]],
-                "columns": ["phenotype", "allele", "mlogp"],
+                "columns": ["phenotype", "allele", "mlog10p"],
                 "truncated": True,
             }
             executor.query_database = AsyncMock(return_value=query_result)
@@ -228,11 +228,11 @@ class TestGetHlaByAllele:
             assert "truncated" not in plain
             # the names reach the model on the rows themselves instead
             assert plain["results"] == [
-                {"phenotype": "K11_COELIAC", "allele": "DQB1*02:01", "mlogp": 1596.65}
+                {"phenotype": "K11_COELIAC", "allele": "DQB1*02:01", "mlog10p": 1596.65}
             ]
 
             annotated = await executor.get_hla_by_allele("B*27:05", with_metadata=True)
-            assert annotated["columns"] == ["phenotype", "allele", "mlogp"]
+            assert annotated["columns"] == ["phenotype", "allele", "mlog10p"]
             assert annotated["truncated"] is True
         finally:
             await executor.close()
@@ -331,6 +331,69 @@ class TestGetHlaByAllele:
 
             await executor.get_hla_by_allele("B*27:05", min_info=0)
             assert "info >=" not in executor.query_database.await_args.args[0]
+        finally:
+            await executor.close()
+
+
+# the house spelling both HLA backends must use. results-api's _HLA_HEADER_SCHEMA emits
+# these directly; hla_associations_v reaches them by renaming FinnGen's native
+# mlogp/sebeta/af_alt/af_alt_cases/af_alt_controls in the view definition
+# (genetics-results-db/schemas/hla_associations_v.sql). genetics-results-suite-5wm was a
+# divergence nothing tested. What lives in THIS repo can only pin the allele branch, whose
+# SQL is written here; the phenotype branch's names are chosen in genetics-results-api and
+# are pinned there by tests/test_hla_column_names.py.
+HLA_STAT_COLUMNS = ("mlog10p", "se", "af", "af_cases", "af_controls")
+HLA_LEGACY_STAT_COLUMNS = ("mlogp", "sebeta", "af_alt", "af_alt_cases", "af_alt_controls")
+
+
+class TestHlaColumnNamesAgreeAcrossBranches:
+    async def test_phenotype_branch_passes_through_the_house_names(self):
+        """The executor forwards results-api rows verbatim, so that repo's header schema is
+        this tool's output shape unaltered. This pins the pass-through only — the row here
+        is authored in this file, so it cannot detect a rename in results-api;
+        genetics-results-api/tests/test_hla_column_names.py is what pins those names."""
+        executor = ToolExecutor(api_base_url="http://unused.test/api")
+        try:
+            row = {
+                "phenotype": "K11_COELIAC",
+                "gene": "HLA-DQB1",
+                "allele": "DQB1*02:01",
+                "pval": 0.0,
+                "mlog10p": 1596.65,
+                "beta": 1.6397,
+                "se": 0.0421,
+                "af": 0.30,
+                "af_cases": 0.51,
+                "af_controls": 0.28,
+                "info": 0.96906,
+            }
+            executor.client.get = AsyncMock(return_value=_api_response([row]))
+
+            result = await executor.get_hla_by_phenotype(["K11_COELIAC"])
+
+            keys = set(result["results"][0])
+            assert set(HLA_STAT_COLUMNS) <= keys
+            assert keys.isdisjoint(HLA_LEGACY_STAT_COLUMNS)
+        finally:
+            await executor.close()
+
+    async def test_allele_branch_selects_the_same_names_from_the_view(self):
+        """The view renames on the way out, so the SQL must ask for the renamed columns —
+        asking for the table's native names is the 'code old, view new' failure."""
+        executor = ToolExecutor(bigquery_api_url="http://unused.test")
+        try:
+            executor.query_database = AsyncMock(
+                return_value={"success": True, "rows": [], "columns": []}
+            )
+
+            await executor.get_hla_by_allele("B*27:05")
+            sql = executor.query_database.await_args.args[0]
+
+            for column in HLA_STAT_COLUMNS:
+                assert f" {column}," in sql or f" {column} " in sql
+            assert "ORDER BY mlog10p DESC" in sql
+            for legacy in HLA_LEGACY_STAT_COLUMNS:
+                assert legacy not in sql
         finally:
             await executor.close()
 

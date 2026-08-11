@@ -364,16 +364,18 @@ class GeneticsClient:
         'HLA-B*27:05' form is normalized for you. There is no by-variant shape — an HLA
         allele has no chr:pos:ref:alt identity.
 
-        THE TWO SHAPES DO NOT RETURN THE SAME COLUMNS, because they read different stores.
-        The trait column is `phenotype` in both (not `trait` or `phenocode`, which the rest
-        of the suite uses), but the statistics are spelled differently:
+        Both shapes spell the statistics the same way — `mlog10p`, `se`, `af`, `af_cases`,
+        `af_controls` — even though they read different stores, so per-column access is
+        uniform across the two. The column SETS still differ: `allele=` returns the 11
+        columns common to both (`phenotype`, `gene`, `allele`, `mlog10p`, `pval`, `beta`,
+        `se`, `af`, `af_cases`, `af_controls`, `info`), while `phenotype=` returns those
+        plus `resource`, `version`, `chr` and `pos` — 15 in all. A bare concat of the two
+        therefore fails on width; select the 11 shared columns on both sides first. The
+        trait column is `phenotype` in both, not `trait` or `phenocode` as the rest of the
+        suite uses.
 
-            phenotype=  (per-trait files)  mlog10p  se      af      af_cases      af_controls
-            allele=     (hla_associations_v)  mlogp  sebeta  af_alt  af_alt_cases  af_alt_controls
-
-        Rank on the -log10 p-value in both cases — `pval` underflows to a literal 0 for the
-        strongest signals (coeliac DQB1*02:01 is mlog10p 1596). A script that consumes both
-        shapes must rename rather than assume. Only the `allele=` shape carries its column
+        Rank on `mlog10p` — `pval` underflows to a literal 0 for the strongest signals
+        (coeliac DQB1*02:01 is mlog10p 1596). Only the `allele=` shape carries its column
         names through an empty result; results-api returns a bare `[]` with no schema.
         """
         key, value = _one_of(phenotype=phenotype, allele=allele)
