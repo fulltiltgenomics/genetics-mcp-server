@@ -274,7 +274,11 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         )
 
     def _token_is_valid(token: str) -> bool:
-        if any(hmac.compare_digest(token, key) for key in api_keys):
+        # compare as bytes, like auth/core.py: compare_digest on a str containing non-ASCII
+        # raises TypeError, and this runs in raw ASGI middleware with nothing above it to
+        # translate that into a response — a bad credential would be a 500 rather than a 401
+        token_bytes = token.encode("utf-8")
+        if any(hmac.compare_digest(token_bytes, key.encode("utf-8")) for key in api_keys):
             return True
 
         # route by token format: JWTs have dots, user tokens don't
@@ -328,7 +332,13 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
 
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers", []))
-            auth_header = headers.get(b"authorization", b"").decode()
+            try:
+                auth_header = headers.get(b"authorization", b"").decode()
+            except UnicodeDecodeError:
+                # ASGI header values are arbitrary bytes and need not be valid utf-8; an
+                # undecodable credential is treated as absent so it fails closed with a 401
+                # instead of raising out of the middleware as a 500
+                auth_header = ""
 
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]

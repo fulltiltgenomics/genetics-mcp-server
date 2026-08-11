@@ -448,6 +448,33 @@ class TestBearerAuthMiddleware:
         assert any(m.get("status") == 401 for m in messages)
 
     @pytest.mark.asyncio
+    async def test_non_ascii_bearer_is_401_not_500(self, wrapped_app):
+        """hmac.compare_digest on a non-ASCII str raises TypeError — a 500 out of raw ASGI.
+
+        The header goes on the wire as raw bytes; httpx refuses to encode a non-ASCII header
+        value, so only a client that is not httpx produces this, and the scope carries the
+        undecoded bytes either way.
+        """
+        app, call_log = wrapped_app
+        scope = self._make_scope(headers=[(b"authorization", "Bearer sécret".encode())])
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_undecodable_bearer_is_401_not_500(self, wrapped_app):
+        """A header value that is not valid utf-8 must fail closed, not raise UnicodeDecodeError."""
+        app, call_log = wrapped_app
+        scope = self._make_scope(headers=[(b"authorization", b"Bearer \xff")])
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
     async def test_missing_both_header_and_query_param(self, wrapped_app):
         """No auth credentials at all should return 401."""
         app, call_log = wrapped_app
