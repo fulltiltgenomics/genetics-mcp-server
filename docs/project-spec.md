@@ -333,10 +333,11 @@ view definition (`genetics-results-db/schemas/hla_associations_v.sql`); the stag
 the `hla_associations` table underneath still carry the native spelling. The rename is 1:1
 on byte-identical values, and the view is what every consumer reads. The trait column is
 `phenotype` in both branches, a third convention next to the `trait`/`phenocode` used
-elsewhere in the suite; `hla_associations_v` has no `trait` or `trait_original` at all. Only
-the `allele=` branch preserves column names on an empty result, via the
-`with_metadata=True` / `columns` path the BigQuery functions use — the results-api returns
-a bare `[]` with no schema to recover.
+elsewhere in the suite; `hla_associations_v` has no `trait` or `trait_original` at all. Both branches
+preserve column names on an empty result: the `allele=` branch via the
+`with_metadata=True` / `columns` path the BigQuery functions use, the `phenotype=` branch
+via the `X-Columns` response header results-api added for
+`genetics-results-suite-6uk` (see "Empty results keep their schema").
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
 cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
@@ -504,6 +505,38 @@ They also take `with_metadata=False`. When set, the returned dict carries the un
 no row to carry names, and `_frame()` builds `pl.DataFrame({c: [] for c in columns})` so a script
 filtering a no-hit gene gets an empty frame instead of `ColumnNotFound`; `truncated` is what
 `_check_truncation` raises on. It stays opt-in so the model's payload is not padded with either.
+
+### Empty results keep their schema
+
+A sandboxed script filters whatever frame it gets, so an empty result that has lost its
+column names turns an ordinary no-hit query into `ColumnNotFoundError` and costs a retry
+iteration (`genetics-results-suite-6uk`). The two backends get there differently:
+
+- **db-api** carries `columns` from the BigQuery job schema, which exists for a zero-row
+  result. Covered by `with_metadata=True` above.
+- **results-api** returns a bare JSON array, so an empty one is `[]` with no schema at all.
+  It now advertises the served file's own header line in an **`X-Columns` response header**
+  (one change in that repo's `range_response`, covering all 11 JSON-range routers).
+  `ToolExecutor._columns_meta` lifts it into a `column_names` key on the result dict.
+
+`_columns_meta` returns a **dict to splice with `**`** and is gated on
+`ToolExecutor(expose_columns=True)`, which only `GeneticsClient` passes: a tool result dict
+*is* the MCP tool payload and the chat backend's model input, and this epic freezes both, so
+with the flag off — or on an endpoint that does not advertise (search, gene annotations,
+gene groups, rsID lookup, LD, gene-disease, gene-based/gene-burden results) — the dict is byte-identical
+to before. An **injected** executor keeps whatever it was built with, so an empty
+results-api result through the running service's shared executor falls back to a bare frame
+rather than silently changing that service's tool output.
+
+`column_names` is deliberately **not** merged into db-api's `columns`. db-api's is required
+to read positional rows; this one is advisory, because results-api's rows are already named
+dicts. `_frame()` consults `column_names` only when the result is empty — routing a
+non-empty results-api result through the positional constructor would give up
+`pl.from_dicts`' `strict=False` fallback for the mixed-type columns upstream does produce.
+
+Not covered: results-api endpoints outside the `range_response` family (search, gene
+annotations, gene groups, rsID, LD, gene–disease) compute their JSON instead of streaming a
+TSV, so they have no header to advertise and degrade to today's bare `pl.DataFrame()`.
 
 ### URL path segments
 

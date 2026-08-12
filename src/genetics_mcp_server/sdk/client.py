@@ -28,7 +28,9 @@ MAX_ROWS = ToolExecutor._MAX_SQL_LIMIT
 _REGION_RE = re.compile(r"^(?:chr)?([0-9]+|[XYxy]|MT|mt)[:_-](\d+)[-_](\d+)$")
 
 
-def _frame(rows: Any, columns: list[str] | None = None) -> pl.DataFrame:
+def _frame(
+    rows: Any, columns: list[str] | None = None, empty_columns: list[str] | None = None
+) -> pl.DataFrame:
     """Build a DataFrame from either row dicts or positional rows plus column names.
 
     Both shapes occur upstream: the results-api returns JSON objects, while db-api returns
@@ -40,7 +42,15 @@ def _frame(rows: Any, columns: list[str] | None = None) -> pl.DataFrame:
     infer_schema_length=None scans every row, so a column that is null in the first rows
     and populated later still gets a usable dtype; strict=False is the fallback for mixed
     types within a column, which the upstream JSON does produce.
+
+    `empty_columns` is the results-api counterpart and is deliberately NOT merged into
+    `columns`. Those rows are named dicts that already carry their own schema, so the list
+    is needed only when there are none; routing a non-empty results-api result through the
+    positional constructor above would give up `from_dicts`' strict=False fallback for the
+    mixed-type columns that upstream does produce.
     """
+    if not rows and not columns and empty_columns:
+        return pl.DataFrame({c: [] for c in empty_columns})
     if columns:
         # an empty result still has a schema: a script filtering on a column must get an
         # empty frame, not ColumnNotFoundError, when the gene simply has no hits
@@ -131,7 +141,11 @@ class GeneticsClient:
         # constructor rather than assigned afterwards: an executor handed in by a caller
         # may be the running service's shared one, and lifting its cap in place would
         # flood the model's context on every MCP call site that relies on it.
-        self.executor = executor or ToolExecutor(row_limit=None)
+        # expose_columns is asked for HERE and not defaulted on in ToolExecutor because
+        # the extra key would otherwise land in the MCP tool payload and the chat
+        # backend's model input. An INJECTED executor keeps whatever it was built with,
+        # so an empty results-api result through one falls back to a bare empty frame.
+        self.executor = executor or ToolExecutor(row_limit=None, expose_columns=True)
 
     async def close(self) -> None:
         await self.executor.close()
@@ -148,7 +162,11 @@ class GeneticsClient:
     def _rows(cls, result: dict[str, Any], key: str = "results") -> pl.DataFrame:
         payload = cls._payload(result)
         cls._check_truncation(payload)
-        return _frame(payload.get(key) or [], columns=payload.get("columns"))
+        return _frame(
+            payload.get(key) or [],
+            columns=payload.get("columns"),
+            empty_columns=payload.get("column_names"),
+        )
 
     @staticmethod
     def _check_truncation(payload: dict[str, Any]) -> None:
@@ -375,8 +393,9 @@ class GeneticsClient:
         suite uses.
 
         Rank on `mlog10p` — `pval` underflows to a literal 0 for the strongest signals
-        (coeliac DQB1*02:01 is mlog10p 1596). Only the `allele=` shape carries its column
-        names through an empty result; results-api returns a bare `[]` with no schema.
+        (coeliac DQB1*02:01 is mlog10p 1596). Both shapes carry their column names through
+        an empty result, so filtering a no-hit phenotype gives an empty frame rather than
+        ColumnNotFoundError.
         """
         key, value = _one_of(phenotype=phenotype, allele=allele)
         if key == "phenotype":

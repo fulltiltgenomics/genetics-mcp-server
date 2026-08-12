@@ -200,6 +200,7 @@ class ToolExecutor:
         public_api_url: str | None = None,
         bigquery_api_url: str | None = None,
         row_limit: Any = _KEEP_DEFAULT_ROW_LIMIT,
+        expose_columns: bool = False,
     ):
         self._client_lock = threading.Lock()
         self._api_base_url_arg = api_base_url
@@ -223,6 +224,30 @@ class ToolExecutor:
         self._row_limit: int | None = (
             self._REGION_ROW_LIMIT if row_limit is _KEEP_DEFAULT_ROW_LIMIT else row_limit
         )
+        # off by default: a tool result dict IS the MCP tool payload and the chat
+        # backend's model input, and this epic forbids changing either. Only the SDK
+        # (which builds its own executor) asks for it. See _columns_meta.
+        self._expose_columns = expose_columns
+
+    def _columns_meta(self, resp: httpx.Response) -> dict[str, list[str]]:
+        """The results-api column names for this response, when it advertised them.
+
+        results-api's JSON range responses are bare arrays, so an EMPTY one carries no
+        schema at all and a client cannot build a named frame from it — the SDK raised
+        ColumnNotFoundError on a no-hit query. It now advertises the file's own header in
+        an `X-Columns` response header (genetics-results-api app/core/responses.py), which
+        is populated even when zero rows matched.
+
+        Returned as a dict to splice with `**` so that, when this is off or the endpoint
+        does not advertise, the result dict is byte-identical to before. `column_names`
+        rather than `columns`: db-api's `columns` is REQUIRED to read its positional rows,
+        while these rows are already named dicts and this list matters only when there are
+        none. Conflating them would put dict rows down the positional constructor.
+        """
+        if not self._expose_columns:
+            return {}
+        raw = resp.headers.get("X-Columns")
+        return {"column_names": raw.split(",")} if raw else {}
 
     @cached_property
     def base_url(self) -> str:
@@ -752,7 +777,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "gene": gene, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "gene": gene, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -767,6 +792,7 @@ class ToolExecutor:
                     results = self._prioritize_variants(results)
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "gene": gene,
                         "total_count": len(results),
                         "results": results,
@@ -808,7 +834,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "variant": variant, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "variant": variant, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -824,6 +850,7 @@ class ToolExecutor:
                     results = self._prioritize_variants(results)
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "variant": variant,
                         "total_count": len(results),
                         "results": results,
@@ -867,6 +894,7 @@ class ToolExecutor:
                     summary = self._summarize_credible_sets_simple(resp.text)
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "region": region,
                         "_download_url": download_url,
                         **summary,
@@ -880,6 +908,7 @@ class ToolExecutor:
                 rows, truncated = self._cap_rows(results)
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "region": region,
                     "total_count": len(results),
                     "truncated": truncated,
@@ -912,7 +941,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_trait(resp.text)
-                    return {"success": True, "phenotype": phenotype, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "phenotype": phenotype, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -925,6 +954,7 @@ class ToolExecutor:
                 if resp.status_code == 200:
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "phenotype": phenotype,
                         "results": resp.json(),
                         "_download_url": download_url,
@@ -995,6 +1025,7 @@ class ToolExecutor:
                 variants = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
                     "credible_set_id": credible_set_id,
@@ -1043,7 +1074,7 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "gene": gene, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "gene": gene, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1055,7 +1086,7 @@ class ToolExecutor:
                     params=params,
                 )
                 if resp.status_code == 200:
-                    return {"success": True, "gene": gene, "results": resp.json(), "_download_url": download_url}
+                    return {"success": True, **self._columns_meta(resp), "gene": gene, "results": resp.json(), "_download_url": download_url}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1095,7 +1126,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             out: dict[str, Any] = {
-                "success": True, "gene": gene, "results": results,
+                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_expression.tsv"},
             }
             # Annotate which expression resources returned no rows for this gene, so a
@@ -1134,7 +1165,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_asm_qtl.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1196,7 +1227,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1214,7 +1245,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "region": f"{chrom}:{start}-{end}", "results": results,
+                "success": True, **self._columns_meta(resp), "region": f"{chrom}:{start}-{end}", "results": results,
                 "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1233,7 +1264,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "peak_id": peak_id, "count": len(results), "results": results,
+                "success": True, **self._columns_meta(resp), "peak_id": peak_id, "count": len(results), "results": results,
                 "_download_data": {"results": results, "filename": f"{peak_id}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1254,7 +1285,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "peak_id": peak_id, "count": len(results), "results": results,
+                "success": True, **self._columns_meta(resp), "peak_id": peak_id, "count": len(results), "results": results,
                 "_download_data": {"results": results, "filename": f"{peak_id}_peak_to_genes.tsv"},
             }
         if resp.status_code == 404:
@@ -1279,6 +1310,7 @@ class ToolExecutor:
             rows, truncated = self._cap_rows(results)
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "gene": gene,
                 "total_count": len(results),
                 "truncated": truncated,
@@ -1350,7 +1382,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_variant_effect.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1418,7 +1450,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_mpra.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1436,7 +1468,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "region": f"{chrom}:{start}-{end}", "results": results,
+                "success": True, **self._columns_meta(resp), "region": f"{chrom}:{start}-{end}", "results": results,
                 "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_mpra.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1529,6 +1561,7 @@ class ToolExecutor:
                 download_params = {k: v for k, v in params.items() if k != "format"}
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotypes": phenotypes,
                     "total_count": len(results),
@@ -1708,7 +1741,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "gene": gene, "results": results,
+                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_exome_results.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1727,7 +1760,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "count": len(results), "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "count": len(results), "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_exome_results.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1752,6 +1785,7 @@ class ToolExecutor:
             rows, truncated = self._cap_rows(results)
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "region": region,
                 "total_count": len(results),
                 "truncated": truncated,
@@ -1774,6 +1808,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
                     "count": len(results),
@@ -2054,7 +2089,7 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_colocalization.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -2077,6 +2112,7 @@ class ToolExecutor:
             results = resp.json()
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "resource": resource,
                 "phenotype": phenotype,
                 "credible_set_id": credible_set_id,
@@ -2218,6 +2254,7 @@ class ToolExecutor:
                 query_desc = query_value if variants is None else f"{len(variants)} variants"
                 result: dict[str, Any] = {
                     "success": True,
+                    **self._columns_meta(resp),
                     "source": source,
                     "query": query_desc,
                     "count": len(results),
@@ -2274,6 +2311,7 @@ class ToolExecutor:
                 results = resp.json()
                 result: dict[str, Any] = {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "data_type": data_type,
                     "count": len(results),
@@ -2318,6 +2356,7 @@ class ToolExecutor:
                 rows, truncated = self._cap_rows(results)
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "region": region,
                     "resource": resource,
                     "data_type": data_type,
