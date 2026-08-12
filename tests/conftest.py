@@ -1,8 +1,10 @@
 """Shared test fixtures for genetics-mcp-server tests."""
 
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +13,52 @@ import pytest
 os.environ.setdefault("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 # disable auth for tests by default (overrides .env which may have REQUIRE_AUTH=true)
 os.environ["REQUIRE_AUTH"] = "false"
+
+
+def pytest_configure(config):
+    """Abort the run if genetics_mcp_server resolves outside the tree being tested.
+
+    genetics-results-suite-6o3: in a fresh worktree `uv run pytest` fell through to the
+    pyenv shim, whose interpreter has the MAIN checkout installed editable. The worktree's
+    tests then ran against the main checkout's source and reported green — edits made in
+    the worktree were invisible, and the numbers were right only because both trees
+    happened to sit on the same clean commit.
+
+    The package is resolved from the environment (an editable install contributes a .pth
+    pointing at ONE tree's src/), not from this file's location, so nothing else in the
+    run notices the mismatch. Checked in pytest_configure so it aborts before a single
+    test is collected: a failure buried in a run is the outcome this guard exists to
+    prevent.
+    """
+    rootdir = Path(config.rootpath).resolve()
+    fix = (
+        f"Fix, from {rootdir}:\n"
+        f"    uv sync --extra dev\n"
+        f'    uv run python -c "import genetics_mcp_server, sys; '
+        f'print(genetics_mcp_server.__file__); print(sys.executable)"\n'
+        f"Both printed paths must be under {rootdir}."
+    )
+    try:
+        import genetics_mcp_server
+    except ImportError as exc:
+        raise pytest.UsageError(
+            f"genetics_mcp_server is not importable ({exc}), so these tests cannot be "
+            f"testing anything.\n"
+            f"    interpreter    : {sys.executable}\n"
+            f"    pytest rootdir : {rootdir}\n" + fix
+        ) from exc
+
+    package = Path(genetics_mcp_server.__file__).resolve().parent
+    if not package.is_relative_to(rootdir):
+        raise pytest.UsageError(
+            "genetics_mcp_server is imported from OUTSIDE the tree pytest is testing, so "
+            "this run would exercise another checkout's source and report green.\n"
+            f"    imported package : {package}\n"
+            f"    pytest rootdir   : {rootdir}\n"
+            f"    interpreter      : {sys.executable}\n"
+            "The interpreter is not this tree's .venv (typically the pyenv shim, picked "
+            "up when the worktree venv has no pytest).\n" + fix
+        )
 
 
 @pytest.fixture(autouse=True)

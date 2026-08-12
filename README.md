@@ -73,6 +73,12 @@ uv run pytest
 uv run ruff check src/
 ```
 
+In a **git worktree**, run `uv sync --extra dev` in the worktree before testing: otherwise
+`uv run pytest` resolves to a global interpreter that has the main checkout installed
+editable, and the run silently tests the main checkout's source. `tests/conftest.py` refuses
+to start such a run — it checks that `genetics_mcp_server` imports from under the pytest
+rootdir and aborts with the fix if it does not.
+
 ## License
 
 MIT

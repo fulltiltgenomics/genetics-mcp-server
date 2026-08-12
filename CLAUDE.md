@@ -91,6 +91,12 @@ requires updating that repo's `docs/project-spec.md`, not just the docs here.
    - Document new variables in `.env.example`
 4. Tests use pytest with pytest-asyncio
    - Run with `pytest` or `pytest --cov` for coverage
+   - **In a git worktree, run `uv sync --extra dev` first.** Without it `uv run pytest` falls
+     through to the pyenv shim, whose interpreter has the MAIN checkout installed editable,
+     and the worktree's tests then exercise the main checkout's source and report green
+     (genetics-results-suite-6o3). `tests/conftest.py` now aborts the run in
+     `pytest_configure` when `genetics_mcp_server` resolves outside the pytest rootdir, so
+     this fails at startup with the fix instructions instead of passing silently.
 
 
 ====
