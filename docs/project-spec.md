@@ -246,7 +246,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |
@@ -267,9 +267,12 @@ Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) ar
 An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
 genetics data programmatically rather than through a tool schema. It is the data half of the
 code-execution agent: a script in the sandbox imports it instead of the agent calling the
-API-category tools one at a time. It wraps 40 of the 44; `analyze_variant_list`,
-`get_phenotype_report`, `get_credible_sets_stats` and `get_myvariant_annotations` have no
-SDK wrapper and stay tool-only.
+API-category tools one at a time. It wraps 40 of the 44; the four `api`-category tools it does
+**not** wrap are `get_phenotype_report`, `get_credible_sets_stats`, `analyze_variant_list` and
+`get_myvariant_annotations`. The "Deliberately **not** in the SDK" section below gives the
+reasoning, but it is written across categories — its list also names `general`-category tools
+such as `create_phewas_plot`, which was never one of the 44 — so it is not a substitute for
+the four named here.
 
 ```python
 import genetics_mcp_server.sdk as genetics
@@ -394,10 +397,17 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   schema come from `columns` in every case rather than from dict iteration order.
 - **A branch that cannot honour an argument refuses it.** Dropping a filter silently is worse
   than rejecting it: `exome(gene=..., resources=[...])` that ignores `resources` returns *more*
-  rows than asked for and the frame says nothing. `_reject()` raises `GeneticsUsageError` for
-  `credible_sets(credible_set_id=...)` + a selector, `colocalization(credible_set_id=...)` +
-  `variant`, `exome`/`gene_burden` resource arguments outside their branch, and
-  `gene_annotations`' `n`/`max_distance` (nearest_to only) and `exclude_olfactory` (group only).
+  rows than asked for and the frame says nothing. `_reject()` raises `GeneticsUsageError` in
+  eight functions — re-derive from `grep -n '_reject(' src/genetics_mcp_server/sdk/client.py`
+  rather than trusting this list: `credible_sets` (any selector alongside `credible_set_id`;
+  `window` off the gene branch, `coding_only` off region, `leads_only` off phenotype,
+  `data_types` on region/phenotype), `colocalization` (`variant` alongside `credible_set_id`;
+  `resource`/`dual_format` on the `variant=` branch), `exome` (`resources` on gene/phenotype,
+  `resource` off phenotype), `gene_burden` (`resource` on the gene branch), `hla`
+  (`min_mlogp`/`min_info`/`limit` on the `phenotype=` branch, `genes` on `allele=`),
+  `gene_annotations` (`n`/`max_distance` off nearest_to, `exclude_olfactory` off group,
+  `gencode_version` on group), `ld` (`window` when `other` is given) and `search`
+  (`query`/`limit` alongside `rsids`).
 - **Sync by default.** Module-level functions are synchronous wrappers that run the coroutine
   on a dedicated background event loop (`sdk/_runner.py`), which keeps the HTTP connection pool
   warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the

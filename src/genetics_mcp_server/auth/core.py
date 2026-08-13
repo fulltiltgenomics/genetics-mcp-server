@@ -133,6 +133,6 @@ def get_authenticated_user(request: Request) -> str | None:
         logger.warning("proxied identity rejected: email not in the allow-list")
         return None
     # matching is case-insensitive and whitespace-tolerant, so the same person can arrive as
-    # several spellings; return the normalized form or chat sessions, downloads, API tokens and
-    # the ADMIN_USERS check split one person across several identity strings
+    # several spellings; return the normalized form or else chat sessions, downloads, API
+    # tokens and the ADMIN_USERS check split one person across several identity strings
     return email.strip().lower()

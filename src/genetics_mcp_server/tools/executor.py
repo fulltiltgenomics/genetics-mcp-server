@@ -1625,6 +1625,10 @@ class ToolExecutor:
             }
 
         try:
+            # normalized before quoting so the value echoed back in the payload is the one
+            # the allow-list saw — uniformity with the `gene` sites, not a security fix:
+            # this resource only lands in a JSON field, never a filename or a header
+            resource = normalize_literal(resource, name="resource")
             resource_lit = quote_literal(resource, name="resource")
             limit_sql = sql_int(max_rows, name="max_rows", minimum=1, maximum=self._MAX_SQL_LIMIT)
         except SqlValueError as e:
@@ -1703,6 +1707,7 @@ class ToolExecutor:
         try:
             gene = normalize_literal(gene, name="gene")
             gene_lit = quote_literal(gene, name="gene")
+            resource = normalize_literal(resource, name="resource")
             resource_lit = quote_literal(resource, name="resource")
             window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
             min_pip_sql = sql_float(min_pip, name="min_pip", minimum=0.0, maximum=1.0)
