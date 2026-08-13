@@ -1843,3 +1843,163 @@ class TestMessageOrderIsTotal:
             "get_messages must impose a total order: routers/admin.py and "
             "scripts/analyze_conversations.py both resolve 'the last set wins' from it"
         )
+
+
+class TestChatTurnMetrics:
+    """Tests for chat_turn_metrics, the per-turn cost and roundtrip telemetry."""
+
+    def _record(self, db, **overrides):
+        fields = dict(
+            session_id="sess1",
+            message_id="msg1",
+            user_id=USER,
+            iterations=3,
+            tool_call_count=7,
+            input_tokens=1000,
+            output_tokens=200,
+            cache_read_tokens=5000,
+            cache_create_tokens=800,
+            cost_usd=1.2345,
+            wall_ms=4200,
+            tool_profile="bigquery",
+            model="claude-opus-5",
+        )
+        fields.update(overrides)
+        return db.record_turn_metrics(**fields)
+
+    def test_record_and_read_back(self, chat_history_db):
+        row_id = self._record(chat_history_db)
+        rows = chat_history_db.get_turn_metrics("sess1")
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["id"] == row_id
+        assert row["message_id"] == "msg1"
+        assert row["iterations"] == 3
+        assert row["tool_call_count"] == 7
+        assert row["input_tokens"] == 1000
+        assert row["output_tokens"] == 200
+        assert row["cache_read_tokens"] == 5000
+        assert row["cache_create_tokens"] == 800
+        assert row["cost_usd"] == pytest.approx(1.2345)
+        assert row["wall_ms"] == 4200
+        assert row["tool_profile"] == "bigquery"
+        assert row["model"] == "claude-opus-5"
+        assert row["created_at"] is not None
+
+    def test_no_foreign_key_on_session_or_message(self, chat_history_db):
+        """The row is written while the stream is open, before the client has POSTed the
+        assistant message and — on a conversation's first turn — before the session row
+        exists at all. A foreign key would abort the insert, PRAGMA foreign_keys being ON."""
+        self._record(chat_history_db, session_id="never-created", message_id="never-saved")
+        assert len(chat_history_db.get_turn_metrics("never-created")) == 1
+
+    def test_both_ids_may_be_absent(self, chat_history_db):
+        """A turn with no client ids still contributes its cost and iteration numbers."""
+        self._record(chat_history_db, session_id=None, message_id=None)
+        count = chat_history_db._conn.execute(
+            "SELECT COUNT(*) FROM chat_turn_metrics"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_null_message_ids_do_not_collide(self, chat_history_db):
+        """The uniqueness guarantee is partial: NULL message ids are not deduplicated."""
+        self._record(chat_history_db, message_id=None)
+        self._record(chat_history_db, message_id=None)
+        assert len(chat_history_db.get_turn_metrics("sess1")) == 2
+
+    def test_same_message_id_overwrites(self, chat_history_db):
+        self._record(chat_history_db, iterations=3)
+        self._record(chat_history_db, iterations=9, cost_usd=2.0)
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        assert rows[0]["iterations"] == 9
+        assert rows[0]["cost_usd"] == pytest.approx(2.0)
+
+    def test_scoped_to_session(self, chat_history_db):
+        self._record(chat_history_db, message_id="a", session_id="sess1")
+        self._record(chat_history_db, message_id="b", session_id="sess1")
+        self._record(chat_history_db, message_id="c", session_id="other")
+
+        assert {r["message_id"] for r in chat_history_db.get_turn_metrics("sess1")} == {"a", "b"}
+        assert [r["message_id"] for r in chat_history_db.get_turn_metrics("other")] == ["c"]
+
+    def test_delete_session_removes_metrics(self, chat_history_db):
+        """No foreign key means the chat_sessions cascade does not reach this table."""
+        session = chat_history_db.create_session(USER)
+        self._record(chat_history_db, session_id=session.id)
+
+        chat_history_db.delete_session(session.id, USER)
+
+        assert chat_history_db.get_turn_metrics(session.id) == []
+
+    def test_another_users_message_id_cannot_overwrite_the_row(self, chat_history_db):
+        """message_id is client-supplied. Sending someone else's used to silently replace
+        their row: cost zeroed, session reassigned, no error and no log."""
+        self._record(chat_history_db, user_id=USER, cost_usd=9.99, session_id="sess1")
+
+        assert (
+            self._record(
+                chat_history_db,
+                user_id="attacker@example.com",
+                cost_usd=0.0,
+                session_id="attacker-sess",
+            )
+            is None
+        )
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        assert rows[0]["user_id"] == USER
+        assert rows[0]["cost_usd"] == pytest.approx(9.99)
+        # and nothing was inserted under the attacker's session either
+        assert chat_history_db.get_turn_metrics("attacker-sess") == []
+
+    def test_same_user_may_still_re_record(self, chat_history_db):
+        """The user_id guard must not break the legitimate overwrite path."""
+        self._record(chat_history_db, user_id=USER, cost_usd=1.0)
+        assert self._record(chat_history_db, user_id=USER, cost_usd=2.0) is not None
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        assert rows[0]["cost_usd"] == pytest.approx(2.0)
+
+    def test_null_user_id_re_records(self, chat_history_db):
+        """An unauthenticated deployment writes NULL user_id; `IS` makes it match itself."""
+        self._record(chat_history_db, user_id=None, cost_usd=1.0)
+        assert self._record(chat_history_db, user_id=None, cost_usd=2.0) is not None
+        assert chat_history_db.get_turn_metrics("sess1")[0]["cost_usd"] == pytest.approx(2.0)
+
+    def test_delete_session_reaches_this_users_unattributable_rows(self, chat_history_db):
+        """Every conversation's opening turn streams before the session row exists and
+        without a message id, so it can never be joined to anything. Leaving it behind
+        would keep a permanent record that this user held a conversation and its cost."""
+        session = chat_history_db.create_session(USER)
+        self._record(chat_history_db, session_id=session.id, message_id="m-attributed")
+        self._record(chat_history_db, session_id=None, message_id=None, user_id=USER)
+        self._record(
+            chat_history_db, session_id=None, message_id=None, user_id="other@example.com"
+        )
+
+        chat_history_db.delete_session(session.id, USER)
+
+        remaining = chat_history_db._conn.execute(
+            "SELECT user_id FROM chat_turn_metrics"
+        ).fetchall()
+        assert [r["user_id"] for r in remaining] == ["other@example.com"]
+
+    def test_delete_by_another_user_keeps_metrics(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        self._record(chat_history_db, session_id=session.id)
+
+        assert chat_history_db.delete_session(session.id, "someone@else.com") is False
+        assert len(chat_history_db.get_turn_metrics(session.id)) == 1
+
+    def test_failed_commit_leaves_nothing_pending(self, chat_history_db):
+        with failing_commits(chat_history_db):
+            with pytest.raises(sqlite3.OperationalError):
+                self._record(chat_history_db)
+
+        # the rollback released the write lock, so the next writer succeeds
+        self._record(chat_history_db, message_id="msg2")
+        assert [r["message_id"] for r in chat_history_db.get_turn_metrics("sess1")] == ["msg2"]

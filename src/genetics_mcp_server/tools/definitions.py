@@ -1275,7 +1275,7 @@ Use this whenever a question touches the MHC/HLA region:
 
 The unit is an ALLELE, not a variant: there is no chr:pos:ref:alt to look up, so get_summary_stats cannot answer this. Every allele of a gene shares that gene's anchor position.
 
-Read `mlogp`, NOT `pval` — pval underflows to 0 for the strongest HLA signals (coeliac DQB1*02:01 is mlogp 1596). Always check `info`: a rare allele imputed at info < 0.5 produces a huge unstable beta that is an imputation artifact, not an association.
+Read `mlog10p`, NOT `pval` — pval underflows to 0 for the strongest HLA signals (coeliac DQB1*02:01 is mlog10p 1596). Always check `info`: a rare allele imputed at info < 0.5 produces a huge unstable beta that is an imputation artifact, not an association.
 
 For the reverse question — which traits an allele is associated with — use get_hla_by_allele.""",
         "parameters": {
@@ -1307,7 +1307,7 @@ Use this when the user names an allele:
 
 Pass the allele gene-stripped and two-field, exactly as it appears in the data: 'B*27:05', 'DQB1*02:01', 'DRB1*15:01' — NOT 'HLA-B*27:05'.
 
-Results are filtered to `min_info` (default 0.5) because rare badly-imputed alleles produce enormous unstable betas that look like spectacular associations; pass min_info=0 to see them. Ranked by `mlogp`.""",
+Results are filtered to `min_info` (default 0.5) because rare badly-imputed alleles produce enormous unstable betas that look like spectacular associations; pass min_info=0 to see them. Ranked by `mlog10p`.""",
         "parameters": {
             "allele": {
                 "type": "string",

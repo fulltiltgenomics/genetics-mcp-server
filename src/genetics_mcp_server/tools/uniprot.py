@@ -8,12 +8,17 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
 
-from genetics_mcp_server.config.settings import Settings
+if TYPE_CHECKING:
+    # type-only: importing config.settings for real would put it in the SDK's import
+    # closure, and that module enumerates every internal env var name — which is what
+    # put it in the sandbox image (genetics-results-suite-l41). Only three attributes
+    # are read here, so the dependency is structural, not nominal.
+    from genetics_mcp_server.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +268,7 @@ _CACHE = _TTLCache()
 class UniProtClient:
     """Async client for UniProtKB and the EBI Proteins API."""
 
-    def __init__(self, client: httpx.AsyncClient, settings: Settings):
+    def __init__(self, client: httpx.AsyncClient, settings: "Settings"):
         # the httpx client is injected, not constructed here: the executor passes its
         # _ResilientAsyncClient (30s timeout, no auth headers), so connection failures
         # arrive as a synthetic 503 instead of raising, and tests can mock it

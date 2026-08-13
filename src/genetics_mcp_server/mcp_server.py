@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import TransportSecuritySettings
 
-from genetics_mcp_server.config.settings import get_settings
+from genetics_mcp_server.config.settings import get_settings, require_internal_api_secret
 from genetics_mcp_server.tools.definitions import register_mcp_tools
 from genetics_mcp_server.tools.executor import ToolExecutor
 
@@ -242,6 +242,13 @@ def _validate_user_token(token: str) -> bool:
         return False
     try:
         import httpx
+        # same silent-fallback shape as tools/executor.py (genetics-results-suite-618): with the
+        # secret unset this posts to chat-backend with no Authorization header at all. On the
+        # remote transports `main()` calls require_internal_api_secret() before serving, so the
+        # process cannot reach here in that state. It is NOT covered for a stdio server that has
+        # CHAT_BACKEND_URL set and no secret — stdio takes no MCP_API_KEY and runs no guard —
+        # which is a local-dev shape talking to a local chat-backend, hence left as a fallback
+        # rather than a startup failure.
         internal_secret = get_settings().internal_api_secret
         headers = {"Authorization": f"Bearer {internal_secret}"} if internal_secret else {}
         resp = httpx.post(
@@ -274,7 +281,20 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         )
 
     def _token_is_valid(token: str) -> bool:
-        if any(hmac.compare_digest(token, key) for key in api_keys):
+        # compare as bytes, like auth/core.py: compare_digest on a str containing non-ASCII
+        # raises TypeError, and this runs in raw ASGI middleware with nothing above it to
+        # translate that into a response — a bad credential would be a 500 rather than a 401.
+        #
+        # utf-8 on BOTH sides here, unlike auth/core.py's latin-1 presented side, and that is
+        # not an inconsistency to fix: no starlette is involved on this path. The caller above
+        # decodes the raw ASGI header bytes itself, with utf-8, so re-encoding with utf-8
+        # reproduces the wire bytes exactly and anything undecodable is already a 401 before it
+        # reaches this line. Switching only the encode would raise UnicodeEncodeError — a 500,
+        # the failure this comment exists to prevent — and switching the decode and the encode
+        # together would not change which tokens are accepted at all (the expected side is
+        # valid utf-8 by construction), only where an undecodable value is rejected.
+        token_bytes = token.encode("utf-8")
+        if any(hmac.compare_digest(token_bytes, key.encode("utf-8")) for key in api_keys):
             return True
 
         # route by token format: JWTs have dots, user tokens don't
@@ -328,7 +348,13 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
 
         if scope["type"] in ("http", "websocket"):
             headers = dict(scope.get("headers", []))
-            auth_header = headers.get(b"authorization", b"").decode()
+            try:
+                auth_header = headers.get(b"authorization", b"").decode()
+            except UnicodeDecodeError:
+                # ASGI header values are arbitrary bytes and need not be valid utf-8; an
+                # undecodable credential is treated as absent so it fails closed with a 401
+                # instead of raising out of the middleware as a 500
+                auth_header = ""
 
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
@@ -342,7 +368,14 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                 # browser history, and Referer on any outbound link. Off by default now; set
                 # MCP_ALLOW_QUERY_TOKEN=true only for a client that genuinely cannot send the
                 # Authorization header.
-                query_string = scope.get("query_string", b"").decode()
+                try:
+                    query_string = scope.get("query_string", b"").decode()
+                except UnicodeDecodeError:
+                    # same reasoning as the authorization header above: the ASGI query string
+                    # is arbitrary bytes and need not be valid utf-8, and raising here escapes
+                    # the middleware as a 500 rather than the 401 an undecodable credential
+                    # deserves. An empty string finds no token and falls through to that 401.
+                    query_string = ""
                 params = parse_qs(query_string)
                 token_values = params.get("token", [])
                 token = token_values[0] if token_values else None
@@ -458,6 +491,12 @@ def main():
         if not api_key_env:
             logger.error("MCP_API_KEY is required for remote transports — refusing to start without authentication")
             sys.exit(1)
+        # same reasoning one line up, for the credential this server SENDS rather than the one
+        # it accepts: a remote-transport server is a deployed service, and its tools are HTTP
+        # calls to results-api and db-api. Without the secret every one of them would go out
+        # with no Authorization header (genetics-results-suite-618), which results-api now
+        # answers 401 — a misconfiguration that would present as a far-end auth failure.
+        require_internal_api_secret("the MCP server")
         api_keys = [k.strip() for k in api_key_env.split(",") if k.strip()]
         app = _wrap_with_bearer_auth(app, api_keys)
         logger.info(f"Bearer token authentication enabled ({len(api_keys)} key(s))")

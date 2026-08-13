@@ -5,8 +5,19 @@ conversations: every tool_use must be paired with a matching tool_result, and
 orphans must be stripped. This is the load-bearing logic for both tool_result
 persistence (resumed conversations carry the data) and backward compatibility
 (old conversations without persisted results behave exactly as before).
+
+The second half covers the per-turn metrics row written where the "Chat complete"
+line is logged, driving the same `_stream_anthropic` harness test_stream_truncation
+uses.
 """
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from test_stream_truncation import _Block, _delta_event, _FakeMessage, _service
+
+from genetics_mcp_server.cost import estimate_cost
 from genetics_mcp_server.llm_service import (
     _count_result_items,
     _mark_history_cache_breakpoint,
@@ -210,3 +221,242 @@ class TestTruncationNotice:
         assert "ORDERED" in notice
         assert "absent" in notice
         assert "summarize=true" in notice
+
+
+MODEL = "claude-opus-5"
+
+
+def _usage(message, *, input_tokens, output_tokens, cache_read=0, cache_create=0):
+    message.usage = SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_input_tokens=cache_read,
+        cache_creation_input_tokens=cache_create,
+    )
+    return message
+
+
+def _answer_turn(text="done", **usage):
+    message = _FakeMessage([_Block("text", text=text)], "end_turn")
+    return ([_delta_event("text_delta", text)], _usage(message, **usage))
+
+
+def _tool_turn(*tool_ids, **usage):
+    blocks = [_Block("tool_use", id=tid, name="lookup", input={}) for tid in tool_ids]
+    return ([], _usage(_FakeMessage(blocks, "tool_use"), **usage))
+
+
+async def _run(svc, **kwargs):
+    params = dict(
+        messages=[{"role": "user", "content": "hi"}],
+        model=MODEL,
+        system_prompt=None,
+        enable_tools=False,
+        session_id="sess1",
+        message_id="msg1",
+    )
+    params.update(kwargs)
+    return [chunk async for chunk in svc._stream_anthropic(**params)]
+
+
+def _with_tools(svc):
+    """Make the loop execute tool_use blocks: it needs a truthy executor, and the
+    executor itself is irrelevant to what is being counted."""
+    svc.executor = object()
+
+    async def _execute(name, tool_input, literature_backend=None):
+        return {"success": True, "rows": []}
+
+    svc._execute_tool = _execute
+    return svc
+
+
+class TestTurnMetrics:
+    """The chat_turn_metrics row written where the 'Chat complete' line is emitted."""
+
+    def _patch_db(self, db):
+        return patch(
+            "genetics_mcp_server.db.chat_history_db.get_chat_history_db",
+            return_value=db,
+        )
+
+    @pytest.mark.asyncio
+    async def test_records_one_row_with_turn_totals(self, chat_history_db):
+        turns = [
+            _tool_turn("t1", input_tokens=100, output_tokens=50, cache_read=900, cache_create=40),
+            _answer_turn(input_tokens=200, output_tokens=80, cache_read=1100, cache_create=0),
+        ]
+        svc = _with_tools(_service(turns))
+
+        with self._patch_db(chat_history_db):
+            await _run(svc, tool_profile="bigquery")
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["message_id"] == "msg1"
+        assert row["iterations"] == 2
+        assert row["tool_call_count"] == 1
+        assert row["input_tokens"] == 300
+        assert row["output_tokens"] == 130
+        assert row["cache_read_tokens"] == 2000
+        assert row["cache_create_tokens"] == 40
+        assert row["tool_profile"] == "bigquery"
+        assert row["model"] == MODEL
+        assert row["wall_ms"] >= 0
+        expected_cost = estimate_cost(MODEL, 100, 50, 900, 40) + estimate_cost(MODEL, 200, 80, 1100, 0)
+        assert row["cost_usd"] == pytest.approx(expected_cost)
+
+    @pytest.mark.asyncio
+    async def test_tool_call_count_spans_parallel_and_sequential_calls(self, chat_history_db):
+        """The count content_json cannot reconstruct: two parallel calls in one roundtrip
+        plus one in the next are three calls over three iterations."""
+        turns = [
+            _tool_turn("a", "b", input_tokens=1, output_tokens=1),
+            _tool_turn("c", input_tokens=1, output_tokens=1),
+            _answer_turn(input_tokens=1, output_tokens=1),
+        ]
+        svc = _with_tools(_service(turns))
+
+        with self._patch_db(chat_history_db):
+            await _run(svc)
+
+        row = chat_history_db.get_turn_metrics("sess1")[0]
+        assert row["iterations"] == 3
+        assert row["tool_call_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_tool_uses_are_not_counted_without_an_executor(self, chat_history_db):
+        """The loop breaks before executing them, so nothing was actually called."""
+        turns = [_tool_turn("a", input_tokens=1, output_tokens=1)]
+        svc = _service(turns)
+
+        with self._patch_db(chat_history_db):
+            await _run(svc)
+
+        assert chat_history_db.get_turn_metrics("sess1")[0]["tool_call_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_secret_chat_records_nothing(self, chat_history_db):
+        """Secret chat is promised to leave no trace. Counts and costs are not content,
+        but a row still says a conversation happened and how expensive it was."""
+        turns = [_answer_turn(input_tokens=100, output_tokens=50)]
+        svc = _service(turns)
+
+        with self._patch_db(chat_history_db) as get_db:
+            chunks = await _run(svc, secret=True)
+
+        assert get_db.call_count == 0
+        count = chat_history_db._conn.execute(
+            "SELECT COUNT(*) FROM chat_turn_metrics"
+        ).fetchone()[0]
+        assert count == 0
+        # the answer itself is unaffected
+        assert [c.type for c in chunks].count("done") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_db_failure_does_not_truncate_the_answer(self, chat_history_db):
+        turns = [_answer_turn(input_tokens=100, output_tokens=50)]
+        svc = _service(turns)
+
+        boom = patch.object(
+            type(chat_history_db),
+            "record_turn_metrics",
+            side_effect=RuntimeError("database is locked"),
+        )
+        with self._patch_db(chat_history_db), boom:
+            chunks = await _run(svc)
+
+        assert [c.type for c in chunks].count("done") == 1
+        assert "".join(c.content for c in chunks if c.type == "text") == "done"
+
+    @pytest.mark.asyncio
+    async def test_records_a_turn_that_hit_the_iteration_cap(self, chat_history_db):
+        """The expensive tail the benchmark exists to measure must not be the one case
+        that goes unrecorded."""
+        turns = [_tool_turn(f"t{i}", input_tokens=1, output_tokens=1) for i in range(3)]
+        svc = _with_tools(_service(turns))
+
+        with self._patch_db(chat_history_db), patch(
+            "genetics_mcp_server.llm_service.get_settings"
+        ) as get_settings:
+            get_settings.return_value = SimpleNamespace(
+                default_provider="anthropic",
+                default_model=MODEL,
+                max_tokens=1000,
+                temperature=None,
+                mcp_enabled=False,
+                mcp_max_iterations=3,
+                mcp_max_result_size=100_000,
+                max_continuations=1,
+                disabled_tools=[],
+            )
+            chunks = await _run(svc)
+
+        row = chat_history_db.get_turn_metrics("sess1")[0]
+        assert row["iterations"] == 3
+        assert row["tool_call_count"] == 3
+        assert "Max tool iterations reached" in "".join(
+            c.content for c in chunks if c.type == "text"
+        )
+
+    @pytest.mark.asyncio
+    async def test_done_is_emitted_before_the_metrics_write(self, chat_history_db):
+        """The done chunk carries the message_content the client persists. An await ahead
+        of it can block on SQLite's busy timeout while the nightly job holds the write lock,
+        and is a cancellation point a client disconnect can land on."""
+        turns = [_answer_turn(input_tokens=100, output_tokens=50)]
+        svc = _service(turns)
+
+        events = []
+        real = type(chat_history_db).record_turn_metrics
+
+        def _spy(db_self, **kwargs):
+            events.append("write")
+            return real(db_self, **kwargs)
+
+        with self._patch_db(chat_history_db), patch.object(
+            type(chat_history_db), "record_turn_metrics", _spy
+        ):
+            async for chunk in svc._stream_anthropic(
+                messages=[{"role": "user", "content": "hi"}],
+                model=MODEL,
+                system_prompt=None,
+                enable_tools=False,
+                session_id="sess1",
+                message_id="msg1",
+                user="user@example.com",
+            ):
+                events.append(chunk.type)
+
+        assert "write" in events
+        assert events.index("done") < events.index("write")
+
+    @pytest.mark.asyncio
+    async def test_records_the_authenticated_user(self, chat_history_db):
+        """Without user_id the upsert cannot tell whose row a client message_id targets,
+        and per-user cost analysis is impossible."""
+        turns = [_answer_turn(input_tokens=100, output_tokens=50)]
+        svc = _service(turns)
+
+        with self._patch_db(chat_history_db):
+            await _run(svc, user="user@example.com")
+
+        assert chat_history_db.get_turn_metrics("sess1")[0]["user_id"] == "user@example.com"
+
+    @pytest.mark.asyncio
+    async def test_missing_client_ids_still_record(self, chat_history_db):
+        """The browser creates the session only after the first exchange, so a
+        conversation's opening turn streams with no session id at all."""
+        turns = [_answer_turn(input_tokens=100, output_tokens=50)]
+        svc = _service(turns)
+
+        with self._patch_db(chat_history_db):
+            await _run(svc, session_id=None, message_id=None)
+
+        row = chat_history_db._conn.execute(
+            "SELECT session_id, message_id, iterations FROM chat_turn_metrics"
+        ).fetchone()
+        assert row["session_id"] is None
+        assert row["message_id"] is None
+        assert row["iterations"] == 1

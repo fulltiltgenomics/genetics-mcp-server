@@ -441,7 +441,8 @@ class TestDownloadHintProcessing:
 
             result = await service._execute_subagent_tool("some_tool", {}, skill)
 
-        mock_hints.assert_called_once_with(raw_result)
+        # the tool name is passed so a download failure names its producer in the log
+        mock_hints.assert_called_once_with(raw_result, tool_name="some_tool")
         assert result["success"] is True
 
     @pytest.mark.asyncio

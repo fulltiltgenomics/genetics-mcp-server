@@ -20,7 +20,6 @@ Analyzes conversations for:
 
 import argparse
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -36,7 +35,6 @@ import polars as pl
 from dotenv import load_dotenv
 
 from genetics_mcp_server.config import model_rejects_disabled_thinking
-from genetics_mcp_server.scripts.conversation_prompts import ISSUE_CATEGORIES, NON_ISSUE_CATEGORIES
 
 load_dotenv()
 
@@ -138,39 +136,6 @@ def extract_first_json(text: str):
     return None
 
 
-def extract_json_list(text: str) -> list[dict]:
-    """Parse the JSON objects an LLM was asked to return as one array.
-
-    Accepts the array, or a bare sequence of objects (one per line). The batch
-    prompts ask for an array, but Opus 5 with thinking off often answers with
-    one object per line; extract_first_json then returned only the first
-    object, the ``isinstance(..., list)`` check at each call site failed, and
-    the whole batch was silently dropped behind a 200 OK — in production the
-    main source of the August 2026 issue-category "other" spike. Non-object
-    values (a stray ``[0]`` in prose) are skipped rather than returned.
-    """
-    decoder = json.JSONDecoder()
-    objects: list[dict] = []
-    i = 0
-    while i < len(text):
-        if text[i] not in "{[":
-            i += 1
-            continue
-        try:
-            value, end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            i += 1
-            continue
-        if isinstance(value, list):
-            dicts = [v for v in value if isinstance(v, dict)]
-            if dicts:
-                return objects + dicts
-        elif isinstance(value, dict):
-            objects.append(value)
-        i = end
-    return objects
-
-
 # thinking is off on every analysis call below (see thinking_off_kwargs), but a
 # response can still lead with a non-text block, so never index content[0]:
 # on thinking-capable models that block is a ThinkingBlock with no .text.
@@ -192,31 +157,6 @@ def thinking_off_kwargs(model: str) -> dict:
     return {"thinking": {"type": "disabled"}}
 
 
-# the SDK retries twice with sub-second backoff, which covers blips but not the
-# multi-minute 529 "overloaded" windows the 02:30 nightly run has hit; a call that
-# gives up there skips a whole batch of work for the night
-RETRY_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 529})
-RETRY_DELAYS = (15, 30, 60, 120, 240)
-
-
-async def create_with_backoff(client, *, delays=RETRY_DELAYS, **kwargs):
-    """client.messages.create with long backoff on transient status codes.
-
-    Errors are matched by status_code rather than SDK exception class so the
-    helper works against the mocked client the tests inject.
-    """
-    for attempt, delay in enumerate((*delays, None)):
-        try:
-            return await client.messages.create(**kwargs)
-        except Exception as e:
-            status = getattr(e, "status_code", None)
-            if status not in RETRY_STATUS_CODES or delay is None:
-                raise
-            logger.warning(f"Anthropic API returned {status}; retrying in {delay}s "
-                           f"(attempt {attempt + 1}/{len(delays)})")
-            await asyncio.sleep(delay)
-
-
 # ---------------------------------------------------------------------------
 # Tool usage parsing
 # ---------------------------------------------------------------------------
@@ -226,8 +166,179 @@ TOOL_MARKER_RE = re.compile(r"\*\[Using tool: ([^;.\]]+)[^]]*\]\*")
 
 
 def parse_tool_calls(content: str) -> list[str]:
-    """Extract tool names from assistant message content."""
+    """Extract tool names from the display markers in an assistant message's text.
+
+    Fallback source only — see message_tool_calls. These markers are prose injected
+    during streaming for the UI, and llm_service._strip_tool_use_markers removes them
+    from replayed history, so they are neither authoritative nor complete.
+    """
     return TOOL_MARKER_RE.findall(content)
+
+
+def parse_tool_calls_from_content_json(content_json: str | None) -> list[str] | None:
+    """Tool names from the tool_use blocks of a persisted assistant message.
+
+    Returns None when the row carries no usable block list at all — absent, empty,
+    unparseable, or not a JSON list — so the caller can tell "nothing was recorded
+    here" apart from "recorded, and this turn called no tools" (an empty list).
+    That distinction is what makes the marker fallback targeted rather than silent.
+
+    content_json is client-supplied, so every malformed shape degrades to None
+    instead of raising: one bad row must not fail a report over thousands of them.
+    """
+    if not content_json:
+        return None
+    try:
+        blocks = json.loads(content_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(blocks, list):
+        return None
+
+    names = []
+    for block in blocks:
+        # text / thinking / tool_result blocks live in here too and are not tool calls
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            name = block.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
+
+
+def message_tool_calls(row: dict) -> tuple[list[str], bool]:
+    """Tool names for one assistant message, and whether the count is authoritative.
+
+    Precedence is deliberate and explicit:
+      1. content_json tool_use blocks — the real record of what the model called.
+      2. the *[Using tool: X]* display markers in `content` — used ONLY for rows that
+         carry no block list at all (history predating the content_json migration).
+
+    The second element is False in the fallback case: markers are display prose and
+    under-count, so anything aggregated from them is a lower bound.
+    """
+    from_content_json = parse_tool_calls_from_content_json(row.get("content_json"))
+    if from_content_json is not None:
+        return from_content_json, True
+    return parse_tool_calls(row.get("content") or ""), False
+
+
+@dataclass
+class ToolCountCoverage:
+    """How much of the tool-call counting rests on authoritative content_json.
+
+    Every tool aggregate in the report has to be read against this: a session with
+    even one assistant message lacking content_json can only be counted from display
+    markers, and that count is a floor, not a total.
+
+    "Exact" is still an upper claim on quality, not a guarantee of completeness: the
+    client also persists partial content_json when a stream is interrupted (LLMChat's
+    partialMsg path), so a present block list may be truncated at the point the stream
+    died and such a row counts as fully covered anyway.
+    """
+    assistant_messages: int = 0
+    messages_from_content_json: int = 0
+    messages_from_markers: int = 0
+    sessions: int = 0
+    fully_covered_sessions: int = 0
+    tool_calls_from_content_json: int = 0
+    tool_calls_from_markers: int = 0
+
+    @property
+    def total_tool_calls(self) -> int:
+        return self.tool_calls_from_content_json + self.tool_calls_from_markers
+
+    @property
+    def is_exact(self) -> bool:
+        """True only when there are assistant messages and all came from content_json.
+
+        An empty frame is not "exact" — there is nothing to have counted exactly.
+        """
+        return self.assistant_messages > 0 and self.assistant_messages == self.messages_from_content_json
+
+    def summary_lines(self) -> list[str]:
+        """Markdown lines stating the counting basis and, if partial, the caveat."""
+        msg_pct = (
+            self.messages_from_content_json / self.assistant_messages * 100
+            if self.assistant_messages else 0.0
+        )
+        sess_pct = (
+            self.fully_covered_sessions / self.sessions * 100 if self.sessions else 0.0
+        )
+        lines = [
+            "### Counting coverage\n",
+            f"- Counted from `content_json` `tool_use` blocks: "
+            f"{self.messages_from_content_json}/{self.assistant_messages} assistant messages "
+            f"({msg_pct:.1f}%), {self.tool_calls_from_content_json} tool calls",
+            f"- Counted from `*[Using tool: …]*` display markers (fallback, under-counts): "
+            f"{self.messages_from_markers} assistant messages, "
+            f"{self.tool_calls_from_markers} tool calls",
+            f"- Sessions with `content_json` on **every** assistant message: "
+            f"{self.fully_covered_sessions}/{self.sessions} ({sess_pct:.1f}%)",
+        ]
+        if self.assistant_messages == 0:
+            lines.append("\nNo assistant messages: there is nothing to count, so no "
+                         "exactness claim is made.")
+        elif self.is_exact:
+            lines.append("\nAll tool counts below are **exact**.")
+        else:
+            lines.append(
+                f"\n**Every tool-call aggregate in this report is a LOWER BOUND** for the "
+                f"{self.sessions - self.fully_covered_sessions} sessions that are not fully "
+                "covered: their marker-derived messages record only the tool uses the UI "
+                "happened to annotate. Do not compare them against an exactly-counted "
+                "benchmark without accounting for this."
+            )
+        return lines
+
+
+def build_tool_coverage(messages: pl.DataFrame) -> tuple[pl.DataFrame, ToolCountCoverage]:
+    """Per-session tool-count provenance plus the aggregate coverage.
+
+    Kept separate from build_session_tool_stats because coverage has to include
+    sessions whose tool count is zero — a session with assistant messages that have
+    neither content_json nor markers is precisely the case a coverage number exists
+    to expose, and build_session_tool_stats drops it.
+    """
+    coverage = ToolCountCoverage()
+    per_session: dict[str, dict] = {}
+
+    assistant_msgs = messages.filter(pl.col("role") == "assistant")
+    for row in assistant_msgs.iter_rows(named=True):
+        tools, authoritative = message_tool_calls(row)
+        sid = row["session_id"]
+        entry = per_session.setdefault(
+            sid, {"session_id": sid, "assistant_messages": 0, "messages_from_content_json": 0}
+        )
+        entry["assistant_messages"] += 1
+        coverage.assistant_messages += 1
+        if authoritative:
+            entry["messages_from_content_json"] += 1
+            coverage.messages_from_content_json += 1
+            coverage.tool_calls_from_content_json += len(tools)
+        else:
+            coverage.messages_from_markers += 1
+            coverage.tool_calls_from_markers += len(tools)
+
+    coverage.sessions = len(per_session)
+    coverage.fully_covered_sessions = sum(
+        1 for e in per_session.values()
+        if e["assistant_messages"] == e["messages_from_content_json"]
+    )
+
+    rows = [
+        {**e, "tool_count_is_lower_bound": e["assistant_messages"] != e["messages_from_content_json"]}
+        for e in per_session.values()
+    ]
+    if not rows:
+        frame = pl.DataFrame({
+            "session_id": pl.Series([], dtype=pl.Utf8),
+            "assistant_messages": pl.Series([], dtype=pl.Int64),
+            "messages_from_content_json": pl.Series([], dtype=pl.Int64),
+            "tool_count_is_lower_bound": pl.Series([], dtype=pl.Boolean),
+        })
+    else:
+        frame = pl.DataFrame(rows)
+    return frame, coverage
 
 
 def build_session_tool_stats(messages: pl.DataFrame) -> pl.DataFrame:
@@ -236,7 +347,7 @@ def build_session_tool_stats(messages: pl.DataFrame) -> pl.DataFrame:
 
     rows = []
     for row in assistant_msgs.iter_rows(named=True):
-        tools = parse_tool_calls(row["content"])
+        tools, _authoritative = message_tool_calls(row)
         if tools:
             rows.append({
                 "session_id": row["session_id"],
@@ -437,8 +548,7 @@ async def categorize_with_llm(
         prompt = TOPIC_CLASSIFICATION_PROMPT.format(messages=messages_text)
 
         try:
-            response = await create_with_backoff(
-                client,
+            response = await client.messages.create(
                 model=model,
                 max_tokens=2000,
                 **thinking_off_kwargs(model),
@@ -447,12 +557,15 @@ async def categorize_with_llm(
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
             text = response_text(response)
-            for c in extract_json_list(text):
-                results[c["id"]] = {
-                    "topic": c["topic"],
-                    "complexity": c.get("complexity", 2),
-                    "brief_reason": c.get("brief_reason", ""),
-                }
+            # extract JSON from response (may have markdown fences / trailing data)
+            classifications = extract_first_json(text)
+            if isinstance(classifications, list):
+                for c in classifications:
+                    results[c["id"]] = {
+                        "topic": c["topic"],
+                        "complexity": c.get("complexity", 2),
+                        "brief_reason": c.get("brief_reason", ""),
+                    }
         except Exception as e:
             logger.error(f"LLM categorization failed for batch {i // batch_size + 1}: {e}")
             # fall back to keyword for this batch
@@ -479,7 +592,7 @@ async def categorize_issues_with_llm(
     issues: list[str],
     model: str = "claude-opus-5",
     cost_tracker: "CostTracker | None" = None,
-) -> tuple[dict[str, str], int]:
+) -> dict[str, str]:
     """Map detailed free-text quality issues onto a fixed taxonomy.
 
     The judge emits one detailed issue string per problem, so raw issues almost
@@ -490,22 +603,17 @@ async def categorize_issues_with_llm(
         issues: distinct issue strings to categorize.
 
     Returns:
-        (categories, failed_batches): categories maps each issue the model
-        actually assigned to a category name. Issues from a failed batch, or
-        that the model skipped, are absent rather than defaulted, so the caller
-        can treat them as "other" for this run without caching that verdict —
-        a cached fallback would never be retried (in production a single 529
-        at 02:30 turned 117 issues into permanent "other" over August 2026).
+        dict mapping each issue string to a category name (always "other" at
+        worst, so every input gets a category even if the LLM call fails).
     """
     import anthropic
 
-    from .conversation_prompts import ISSUE_CATEGORIZATION_PROMPT
+    from .conversation_prompts import ISSUE_CATEGORIES, ISSUE_CATEGORIZATION_PROMPT
 
     valid = {c for c, _ in ISSUE_CATEGORIES}
     categories_text = "\n".join(f"- {c}: {d}" for c, d in ISSUE_CATEGORIES)
     client = anthropic.AsyncAnthropic()
     results: dict[str, str] = {}
-    failed_batches = 0
     batch_size = 40
 
     for i in range(0, len(issues), batch_size):
@@ -516,8 +624,7 @@ async def categorize_issues_with_llm(
         )
 
         try:
-            response = await create_with_backoff(
-                client,
+            response = await client.messages.create(
                 model=model,
                 max_tokens=2000,
                 **thinking_off_kwargs(model),
@@ -525,52 +632,21 @@ async def categorize_issues_with_llm(
             )
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
-            for obj in extract_json_list(response_text(response)):
-                idx = obj.get("id")
-                cat = obj.get("category", "other")
-                if isinstance(idx, int) and 0 <= idx < len(batch):
-                    results[batch[idx]] = cat if cat in valid else "other"
+            parsed = extract_first_json(response_text(response))
+            if isinstance(parsed, list):
+                for obj in parsed:
+                    idx = obj.get("id")
+                    cat = obj.get("category", "other")
+                    if isinstance(idx, int) and 0 <= idx < len(batch):
+                        results[batch[idx]] = cat if cat in valid else "other"
         except Exception as e:
-            failed_batches += 1
             logger.error(f"Issue categorization failed for batch {i // batch_size + 1}: {e}")
 
-    return results, failed_batches
+        # anything the LLM didn't assign (or a failed batch) falls back to "other"
+        for issue in batch:
+            results.setdefault(issue, "other")
 
-
-def taxonomy_fingerprint() -> str:
-    return hashlib.sha256(
-        "\n".join(f"{c}: {d}" for c, d in ISSUE_CATEGORIES).encode()
-    ).hexdigest()[:16]
-
-
-def load_issue_category_cache(path: Path) -> dict[str, str]:
-    """Read the issue-text → category sidecar, or {} if it is unusable.
-
-    The cache is keyed only by issue text, so a taxonomy change (new category,
-    reworded description) silently leaves every old verdict stale. The file
-    carries a fingerprint of the taxonomy it was built with and is discarded
-    wholesale on mismatch, so deploying a taxonomy change re-categorizes
-    everything on the next run with no manual wipe. The pre-fingerprint flat
-    format has no fingerprint and is discarded the same way.
-    """
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError:
-        logger.warning(f"  Issue category cache at {path} is not valid JSON; discarding it")
-        return {}
-    if not isinstance(data, dict) or data.get("taxonomy") != taxonomy_fingerprint():
-        logger.info("  Issue category cache was built with a different taxonomy; discarding it")
-        return {}
-    return dict(data.get("categories") or {})
-
-
-def save_issue_category_cache(path: Path, categories: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(
-        {"taxonomy": taxonomy_fingerprint(), "categories": categories}, indent=2,
-    ))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +763,7 @@ async def evaluate_quality_with_llm(
         )
 
         try:
-            response = await create_with_backoff(
-                client,
+            response = await client.messages.create(
                 model=model,
                 max_tokens=1000,
                 **thinking_off_kwargs(model),
@@ -724,6 +799,9 @@ class ConversationMetrics:
     user_messages: int = 0
     assistant_messages: int = 0
     total_tool_calls: int = 0
+    # true when at least one assistant message in the session had no content_json, so its
+    # tool calls could only be counted from display markers: total_tool_calls is a floor
+    tool_count_is_lower_bound: bool = False
     max_tools_in_message: int = 0
     unique_tools: int = 0
     has_error_response: bool = False
@@ -749,10 +827,6 @@ class ConversationMetrics:
     llm_disposition: str = ""
     llm_issues: list[str] | None = None
     llm_issue_categories: list[str] | None = None
-    # minor blemishes and strengths the judge keeps out of llm_issues; stored so
-    # they are not lost, but never categorized or charted
-    llm_nits: list[str] | None = None
-    llm_strengths: list[str] | None = None
 
 
 def compute_success_score(m: ConversationMetrics) -> float:
@@ -909,6 +983,8 @@ def compute_all_metrics(
             "instruction_set_id": pl.Series([], dtype=pl.Utf8),
         })
 
+    tool_coverage, _ = build_tool_coverage(messages)
+
     # check for error patterns in assistant messages
     error_sessions = set()
     for row in messages.filter(pl.col("role") == "assistant").iter_rows(named=True):
@@ -923,6 +999,10 @@ def compute_all_metrics(
     combined = combined.join(first_msgs, left_on="id", right_on="session_id", how="left")
     combined = combined.join(tool_profiles, left_on="id", right_on="session_id", how="left")
     combined = combined.join(instruction_sets, left_on="id", right_on="session_id", how="left")
+    combined = combined.join(
+        tool_coverage.select("session_id", "tool_count_is_lower_bound"),
+        left_on="id", right_on="session_id", how="left",
+    )
 
     names = instruction_set_names or {}
     results = []
@@ -940,6 +1020,7 @@ def compute_all_metrics(
             user_messages=row.get("user_messages") or 0,
             assistant_messages=row.get("assistant_messages") or 0,
             total_tool_calls=row.get("total_tool_calls") or 0,
+            tool_count_is_lower_bound=bool(row.get("tool_count_is_lower_bound")),
             max_tools_in_message=row.get("max_tools_in_message") or 0,
             unique_tools=row.get("unique_tools") or 0,
             has_error_response=sid in error_sessions,
@@ -1012,8 +1093,6 @@ def cached_topic_and_quality(
                 "concluded": m.get("llm_concluded", ""),
                 "disposition": m.get("llm_disposition", ""),
                 "issues": m.get("llm_issues") or [],
-                "nits": m.get("llm_nits") or [],
-                "strengths": m.get("llm_strengths") or [],
             }
         if m.get("llm_issue_categories"):
             issue_cats[sid] = list(m["llm_issue_categories"])
@@ -1039,8 +1118,6 @@ def apply_quality_assessments(
             m.llm_concluded = qa.get("concluded", "")
             m.llm_disposition = qa.get("disposition", "")
             m.llm_issues = qa.get("issues")
-            m.llm_nits = qa.get("nits")
-            m.llm_strengths = qa.get("strengths")
             # recompute score now that LLM quality is available, then let the
             # disposition decide the bucket (out_of_scope/unfinished/weird/technical
             # don't fold into the successful/neutral/unsuccessful quality labels)
@@ -1071,13 +1148,72 @@ def mark_unscored_unknown(metrics: list[ConversationMetrics]) -> int:
 # Eval dataset export
 # ---------------------------------------------------------------------------
 
+# the per-turn options a replay has to restore to reproduce the original conditions.
+# All four are nullable per message and a null is a real value, not a gap: the browser
+# sends all four on every saveMessage, and `tool_profile IS NULL` specifically means
+# "all tools" (build_anthropic_tools applies no category filter when it is None) — see
+# _session_user_turns
+TURN_OPTION_COLUMNS = ("verbosity", "tool_profile", "instruction_set_id", "literature_backend")
+
+
+def message_sort_keys(messages: pl.DataFrame) -> list[str]:
+    """Total order over messages: created_at alone has one-second resolution.
+
+    Ties within a second are real (a user turn and its assistant reply routinely share
+    one), so rowid breaks them, matching ChatHistoryDB.get_messages and routers/admin.py.
+    The column is guarded because a caller may hand over a frame built without it.
+    """
+    return ["created_at", "_rowid"] if "_rowid" in messages.columns else ["created_at"]
+
+
+def _session_user_turns(session_msgs: pl.DataFrame) -> list[dict]:
+    """Every user turn of one session, in order, with the options in force at that turn.
+
+    session_msgs must already be sorted by message_sort_keys.
+
+    A row's own values ARE the options in force at that row, nulls included. The client
+    sends all four keys on every saveMessage and the write path stores exactly what the
+    request carried, so a null is the recorded choice — notably `tool_profile IS NULL`
+    means "all tools". Carrying the last non-null value forward would export a user who
+    switched back to all-tools as still running the previous profile.
+
+    The one exception is a row on which ALL four columns are null. A row written by the
+    current client always carries at least verbosity and literature_backend, so all-null
+    means the row predates the client wiring; there the previous turn's settings are the
+    best available guess and do carry forward.
+    """
+    in_force: dict[str, str | None] = dict.fromkeys(TURN_OPTION_COLUMNS)
+    turns: list[dict] = []
+
+    for row in session_msgs.iter_rows(named=True):
+        row_options = {col: row.get(col) for col in TURN_OPTION_COLUMNS}
+        if any(value is not None for value in row_options.values()):
+            in_force = row_options
+        if row["role"] != "user":
+            continue
+        turns.append({
+            "index": len(turns),
+            "message_id": row.get("id"),
+            "created_at": str(row.get("created_at") or ""),
+            # untruncated: a replay has to send exactly what the user sent
+            "content": row["content"],
+            "options": dict(in_force),
+        })
+
+    return turns
+
+
 def export_eval_dataset(
     metrics: list[ConversationMetrics],
     messages: pl.DataFrame,
     output_dir: Path,
     max_per_topic: int = 5,
 ):
-    """Export representative conversations as eval test cases."""
+    """Export representative conversations as eval test cases.
+
+    Each case carries the full ordered user-turn sequence (`user_turns`) so a replay
+    harness can drive the whole conversation, not just its opening message.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # group by topic, select diverse conversations
@@ -1100,7 +1236,7 @@ def export_eval_dataset(
         for conv in selected:
             session_msgs = messages.filter(
                 pl.col("session_id") == conv.session_id
-            ).sort("created_at")
+            ).sort(message_sort_keys(messages))
 
             turns = []
             for msg_row in session_msgs.iter_rows(named=True):
@@ -1109,12 +1245,12 @@ def export_eval_dataset(
                     "content": msg_row["content"][:2000],
                 })
 
-            tools_used = parse_tool_calls(
-                " ".join(
-                    msg_row["content"]
-                    for msg_row in session_msgs.filter(pl.col("role") == "assistant").iter_rows(named=True)
-                )
-            )
+            user_turns = _session_user_turns(session_msgs)
+
+            tools_used: list[str] = []
+            for msg_row in session_msgs.filter(pl.col("role") == "assistant").iter_rows(named=True):
+                tools, _authoritative = message_tool_calls(msg_row)
+                tools_used.extend(tools)
 
             eval_cases.append({
                 "session_id": conv.session_id,
@@ -1126,8 +1262,11 @@ def export_eval_dataset(
                 "first_user_message": conv.first_user_message[:500],
                 "tools_used": tools_used,
                 "total_tool_calls": conv.total_tool_calls,
+                "tool_count_is_lower_bound": conv.tool_count_is_lower_bound,
                 "turn_count": len(turns),
                 "turns": turns,
+                "user_turn_count": len(user_turns),
+                "user_turns": user_turns,
             })
 
     # write JSON eval file
@@ -1165,6 +1304,22 @@ def generate_report(
 ) -> str:
     """Generate a markdown analysis report."""
     lines = ["# Conversation Analysis Report\n"]
+    _, tool_coverage = build_tool_coverage(messages)
+    lower_bound_sessions = sum(1 for m in metrics if m.tool_count_is_lower_bound)
+
+    def tool_count_caveat() -> str:
+        """One-line provenance stamp to hang under any aggregate over tool counts."""
+        if not lower_bound_sessions:
+            return ("_Tool counts are exact (every assistant message has `content_json`)._")
+        return (
+            f"_Tool counts are a **lower bound**: {lower_bound_sessions}/{len(metrics)} sessions "
+            "have assistant messages with no `content_json` and fall back to display markers "
+            "(see Tool Usage Patterns → Counting coverage)._"
+        )
+
+    def tool_total(m: ConversationMetrics) -> str:
+        """A session's tool count, never quoted as a total when it is only a floor."""
+        return f">={m.total_tool_calls}" if m.tool_count_is_lower_bound else str(m.total_tool_calls)
 
     # --- overview ---
     lines.append("## Overview\n")
@@ -1233,9 +1388,13 @@ def generate_report(
         pct = count / len(metrics) * 100
         lines.append(f"| {topic} | {count} | {pct:.1f} | {avg_s:.2f} | {avg_t:.1f} |")
     lines.append("")
+    lines.append(tool_count_caveat())
+    lines.append("")
 
     # --- tool usage patterns ---
     lines.append("## Tool Usage Patterns\n")
+    lines.extend(tool_coverage.summary_lines())
+    lines.append("")
     all_tools: list[str] = []
     for m in metrics:
         if m.tool_sequence:
@@ -1255,6 +1414,8 @@ def generate_report(
                  f"Median: {sorted(tool_counts)[len(tool_counts)//2]}, "
                  f"Mean: {sum(tool_counts)/len(tool_counts):.1f}")
     lines.append("")
+    lines.append(tool_count_caveat())
+    lines.append("")
 
     # --- high tool-use sessions ---
     # flag excessive tool use within a single message, not session totals: a long
@@ -1268,8 +1429,10 @@ def generate_report(
         for m in heavy[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
             lines.append(f"| {m.session_id} | {m.max_tools_in_message} | "
-                         f"{m.total_tool_calls} | {m.topic} | {m.success_score:.2f} | "
+                         f"{tool_total(m)} | {m.topic} | {m.success_score:.2f} | "
                          f"{msg_preview} |")
+        lines.append("")
+        lines.append(tool_count_caveat())
     else:
         lines.append("None found.\n")
     lines.append("")
@@ -1286,7 +1449,9 @@ def generate_report(
         for m in sorted(unsuccessful, key=lambda m: m.success_score)[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
             lines.append(f"| {m.session_id} | {m.success_score:.2f} | "
-                         f"{m.topic} | {m.total_tool_calls} | {msg_preview} |")
+                         f"{m.topic} | {tool_total(m)} | {msg_preview} |")
+        lines.append("")
+        lines.append(tool_count_caveat())
     else:
         lines.append("No unsuccessful conversations found.\n")
     lines.append("")
@@ -1313,8 +1478,10 @@ def generate_report(
         lines.append("|---------|-------|------:|---------------|")
         for m in sorted(bucket, key=lambda m: m.session_id)[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id} | {m.topic} | {m.total_tool_calls} | "
+            lines.append(f"| {m.session_id} | {m.topic} | {tool_total(m)} | "
                          f"{msg_preview} |")
+        lines.append("")
+        lines.append(tool_count_caveat())
         lines.append("")
 
     # --- tool profile analysis ---
@@ -1414,14 +1581,11 @@ def generate_report(
                 all_issues.extend(m.llm_issues)
         if all_issues:
             if issue_categories:
-                categorized = [
-                    (i, issue_categories.get(i, "other")) for i in all_issues
-                    if issue_categories.get(i, "other") not in NON_ISSUE_CATEGORIES
-                ]
-                cat_counter = Counter(c for _, c in categorized)
+                cat_counter = Counter(issue_categories.get(i, "other") for i in all_issues)
                 # shortest raw issue per category as a representative example
                 examples: dict[str, str] = {}
-                for i, c in categorized:
+                for i in all_issues:
+                    c = issue_categories.get(i, "other")
                     if c not in examples or len(i) < len(examples[c]):
                         examples[c] = i
                 lines.append("### Most common issue categories\n")
@@ -1429,7 +1593,7 @@ def generate_report(
                 lines.append("|----------|------:|--:|---------|")
                 for cat, count in cat_counter.most_common():
                     ex = examples.get(cat, "")[:100].replace("|", "/").replace("\n", " ")
-                    pct = count / len(categorized) * 100
+                    pct = count / len(all_issues) * 100
                     lines.append(f"| {cat} | {count} | {pct:.0f} | {ex} |")
             else:
                 # no categorization available (e.g. --no-llm): raw frequency
@@ -1453,8 +1617,10 @@ def generate_report(
             issues_str = "; ".join(m.llm_issues) if m.llm_issues else ""
             issues_str = issues_str.replace("|", "/").replace("\n", " ")
             lines.append(f"| {m.session_id} | {m.llm_quality_score} | "
-                         f"{m.topic} | {m.total_tool_calls} | {m.llm_answered} | "
+                         f"{m.topic} | {tool_total(m)} | {m.llm_answered} | "
                          f"{issues_str} |")
+        lines.append("")
+        lines.append(tool_count_caveat())
         lines.append("")
 
     # --- improvement recommendations ---
@@ -1483,6 +1649,7 @@ def generate_report(
         ut_freq = Counter(unsuccessful_tools)
         lines.append(f"- Tools most common in unsuccessful conversations: "
                      f"{', '.join(t for t, _ in ut_freq.most_common(5))}")
+        lines.append(f"  {tool_count_caveat()}")
 
     if heavy:
         avg_heavy_tools = sum(m.max_tools_in_message for m in heavy) / len(heavy)
@@ -1583,8 +1750,15 @@ async def main():
     tool_stats = build_session_tool_stats(messages)
     sessions_with_tools = tool_stats.height
     total_tool_calls = tool_stats.select(pl.col("total_tool_calls").sum()).item() if sessions_with_tools > 0 else 0
+    _, tool_coverage = build_tool_coverage(messages)
     logger.info(f"  {sessions_with_tools} sessions used tools, "
                 f"{total_tool_calls} total tool calls")
+    logger.info(
+        f"  counting basis: {tool_coverage.messages_from_content_json}/"
+        f"{tool_coverage.assistant_messages} assistant messages from content_json, "
+        f"{tool_coverage.fully_covered_sessions}/{tool_coverage.sessions} sessions fully covered"
+        + ("" if tool_coverage.is_exact else " — aggregates over the rest are LOWER BOUNDS")
+    )
 
     # --- categorize ---
     logger.info("Categorizing conversations...")
@@ -1741,41 +1915,34 @@ async def main():
     # taxonomy with a cheap separate pass (cached by issue text, reuses the
     # quality cache above untouched)
     issue_categories: dict[str, str] = {}
-    categorization_failures = 0
     if not args.no_llm:
         distinct_issues = sorted({
             issue for m in all_metrics if m.llm_issues for issue in m.llm_issues
         })
         if distinct_issues:
-            cached_cats = {} if args.no_cache else load_issue_category_cache(issue_cat_cache)
-            if cached_cats:
+            cached_cats: dict[str, str] = {}
+            if issue_cat_cache.exists() and not args.no_cache:
+                cached_cats = json.loads(issue_cat_cache.read_text())
                 logger.info(f"  Loaded {len(cached_cats)} cached issue categories")
 
             uncategorized = [t for t in distinct_issues if t not in cached_cats]
             if uncategorized:
                 logger.info(f"Categorizing {len(uncategorized)} distinct issues "
                             f"(model={args.topic_model})...")
-                new_cats, categorization_failures = await categorize_issues_with_llm(
+                new_cats = await categorize_issues_with_llm(
                     uncategorized, model=args.topic_model, cost_tracker=cost_tracker,
                 )
                 cached_cats.update(new_cats)
-                save_issue_category_cache(issue_cat_cache, cached_cats)
-                left = len(uncategorized) - len(new_cats)
-                if left:
-                    # not cached, so the next run retries them; tonight they read as "other"
-                    logger.error(f"  {left} issues left uncategorized "
-                                 f"({categorization_failures} failed batch(es)); "
-                                 "counted as 'other' this run, retried next run")
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                issue_cat_cache.write_text(json.dumps(cached_cats, indent=2))
             issue_categories = cached_cats
 
-            # persist per-conversation categories for downstream use / plotting;
-            # praise the judge filed under issues is dropped here so it never
-            # reaches conversation_issue or the admin chart
+            # persist per-conversation categories for downstream use / plotting
             for m in all_metrics:
                 if m.llm_issues:
                     m.llm_issue_categories = sorted({
                         issue_categories.get(i, "other") for i in m.llm_issues
-                    } - NON_ISSUE_CATEGORIES)
+                    })
 
     success_dist = Counter(m.success_label for m in all_metrics)
     logger.info(f"  Success: {dict(success_dist)}")
@@ -1824,12 +1991,7 @@ async def main():
         logger.info(f"  Wrote metrics to {metrics_path}")
 
     logger.info("Done!")
-    # a failed categorization batch is the one part of the run that is not
-    # retried within the run; a non-zero exit lets the CronJob's OnFailure
-    # restart redo it (everything else replays from cache) and makes the
-    # failure visible as a failed job rather than a quietly skewed chart
-    return 1 if categorization_failures else 0
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    asyncio.run(main())

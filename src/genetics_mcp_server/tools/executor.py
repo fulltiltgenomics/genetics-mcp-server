@@ -6,9 +6,12 @@ import io
 import logging
 import os
 import re
+import threading
 import traceback
 from collections import defaultdict
-from typing import Any
+from dataclasses import dataclass
+from functools import cached_property
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
 from xml.sax.saxutils import quoteattr
 
@@ -22,9 +25,111 @@ from genetics_mcp_server.tools.phewas_categories import (
     categorize_phenotype,
     get_category_color,
 )
+from genetics_mcp_server.tools.sql_safety import (
+    SqlValueError,
+    normalize_literal,
+    quote_literal,
+    quote_literal_list,
+    sql_float,
+    sql_int,
+)
 from genetics_mcp_server.tools.uniprot import UniProtClient
 
+if TYPE_CHECKING:
+    from genetics_mcp_server.config.settings import Settings
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _PrunedInstallSettings:
+    """Stand-in for Settings where config/settings.py is not installed.
+
+    Exactly one install is like that: the sandbox image, which ships only the SDK's
+    import closure because config/settings.py names the whole internal configuration
+    surface (genetics-results-suite-l41). The values are Settings' own defaults rather
+    than environment reads — the sandbox holds no internal secret by design, and reading
+    the variables here would put their names back into the image this is removing them
+    from. tests/test_sdk_import_closure.py asserts these agree with Settings' defaults.
+    """
+
+    internal_api_secret: str = ""
+    myvariant_api_url: str = "https://myvariant.info/v1"
+    uniprot_api_url: str = "https://rest.uniprot.org"
+    ebi_proteins_api_url: str = "https://www.ebi.ac.uk/proteins/api"
+    uniprot_cache_ttl: int = 86400
+
+
+_PRUNED_INSTALL_SETTINGS = _PrunedInstallSettings()
+
+
+_warned_pruned_install = False
+
+
+def _resolve_settings() -> "Settings | _PrunedInstallSettings":
+    """Settings, resolved at first use rather than at ToolExecutor construction.
+
+    Deferred so that importing — or constructing — the executor never requires
+    config/settings.py, which the sandbox image deliberately does not ship.
+
+    Only config/settings.py itself going missing is the pruned install; a
+    ModuleNotFoundError from anywhere else in its import chain (today python-dotenv,
+    tomorrow any new optional dependency) is a broken install and must not degrade
+    silently into the credential-less fallback.
+    """
+    global _warned_pruned_install
+    try:
+        from genetics_mcp_server.config.settings import get_settings
+    except ModuleNotFoundError as exc:
+        if exc.name not in (
+            "genetics_mcp_server.config",
+            "genetics_mcp_server.config.settings",
+        ):
+            raise
+        if not _warned_pruned_install:
+            _warned_pruned_install = True
+            # once, not per call: in the sandbox this is the expected path
+            logger.warning(
+                "settings module is not installed; using the pruned-install defaults "
+                "(no internal credentials, upstream endpoints at their public defaults)"
+            )
+        return _PRUNED_INSTALL_SETTINGS
+    return get_settings()
+
+
+def _endpoint_env(name: str, default: str | None = None) -> str | None:
+    """An endpoint URL from the environment, read only after settings has had its chance.
+
+    config/settings.py calls load_dotenv() at module scope, so a standalone process with
+    a .env file sees these variables only once that module has been imported. These
+    reads used to sit in __init__ *after* the settings import that has since been
+    deferred; routing them through _resolve_settings() keeps them on the far side of
+    load_dotenv() without putting the import back into construction. In the pruned
+    install there is no settings module and the reads fall through to the environment
+    the sandbox itself set.
+    """
+    _resolve_settings()
+    return os.environ.get(name, default)
+
+# distinguishes "caller did not ask for a row cap" from "caller asked for no cap at all",
+# since None is a meaningful value for _row_limit
+_KEEP_DEFAULT_ROW_LIMIT = object()
+
+
+def _seg(value: Any) -> str:
+    """Percent-encode a caller-supplied value for use as a URL *path segment*.
+
+    Every by-gene/by-variant/by-region endpoint puts a caller string straight into the
+    path of a request that carries the internal bearer token. Unencoded, `../../admin/users`
+    resolves to a different endpoint entirely (httpx normalises `..`) and `x?a=b#c` appends
+    an attacker-controlled query string — so an unvalidated segment defeats the typed
+    surface. safe="" encodes `/`, `?`, `#` and everything else reserved; the bare-dot
+    segments are encoded explicitly because `.` is unreserved and would survive quote().
+    """
+    encoded = quote(str(value), safe="")
+    if encoded in (".", ".."):
+        return encoded.replace(".", "%2E")
+    return encoded
 
 # generic error message returned to clients
 INTERNAL_ERROR_MSG = "Internal server error. Check server logs for details."
@@ -38,14 +143,6 @@ UPSTREAM_UNREACHABLE_MSG = (
 # marker header on the synthetic response so callers can distinguish 'unreachable'
 # from a real upstream 503
 _UNREACHABLE_HEADER = "x-fg-upstream-unreachable"
-
-# MouseMine fails by accepting the connection and then never answering, so it needs its
-# own message: _ResilientAsyncClient only rewrites connect-level failures, and a read
-# timeout is not "the genetics data service is down" — every other tool still works
-MOUSEMINE_UNAVAILABLE_MSG = (
-    "MGI (MouseMine) did not respond in time. The service is intermittently "
-    "unresponsive — please try again later."
-)
 
 # variant classifications for counting coding and loss-of-function variants
 CODING_VARIANTS = {
@@ -102,30 +199,17 @@ class ToolExecutor:
         api_base_url: str | None = None,
         public_api_url: str | None = None,
         bigquery_api_url: str | None = None,
+        row_limit: Any = _KEEP_DEFAULT_ROW_LIMIT,
+        expose_columns: bool = False,
     ):
-        from genetics_mcp_server.config.settings import get_settings
-
-        settings = get_settings()
-        self.base_url = api_base_url or os.environ.get(
-            "GENETICS_API_URL", "http://0.0.0.0:2000/api"
-        )
-        # public URL for download links shown to users
-        self.public_url = public_api_url or os.environ.get(
-            "GENETICS_PUBLIC_API_URL", self.base_url
-        )
-        # BigQuery API URL for direct SQL queries
-        self.bigquery_url = bigquery_api_url or os.environ.get("BIGQUERY_API_URL")
-        # authenticate to results-api with shared secret if configured
-        api_secret = settings.internal_api_secret
-        headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
-        self.client = _ResilientAsyncClient(timeout=300.0, headers=headers)
+        self._client_lock = threading.Lock()
+        self._api_base_url_arg = api_base_url
+        self._public_api_url_arg = public_api_url
+        self._bigquery_api_url_arg = bigquery_api_url
         # separate client for third-party calls: carries no default auth so the
         # internal API secret is never leaked to external services (e.g. MouseMine,
         # myvariant.info). Per-call auth (Perplexity, Tavily) is passed explicitly.
         self.external_client = _ResilientAsyncClient(timeout=30.0)
-        # shares external_client so UniProt/EBI outages arrive as the synthetic 503
-        # rather than raising, and so no internal auth header is ever sent to them
-        self.uniprot = UniProtClient(self.external_client, settings)
         # lazily-fetched universe of expression resources (e.g. gtex, hpa), used to
         # tell "gene absent from this resource" apart from "resource unavailable"
         self._expression_resources: list[str] | None = None
@@ -136,6 +220,109 @@ class ToolExecutor:
         self._cbio_studies: list[dict[str, Any]] | None = None
         self._cbio_profiles: list[dict[str, Any]] | None = None
         self._cbio_denominators: dict[str, dict[str, Any]] | None = None
+        # inline row cap; None disables capping (see _cap_rows)
+        self._row_limit: int | None = (
+            self._REGION_ROW_LIMIT if row_limit is _KEEP_DEFAULT_ROW_LIMIT else row_limit
+        )
+        # off by default: a tool result dict IS the MCP tool payload and the chat
+        # backend's model input, and this epic forbids changing either. Only the SDK
+        # (which builds its own executor) asks for it. See _columns_meta.
+        self._expose_columns = expose_columns
+
+    def _columns_meta(self, resp: httpx.Response) -> dict[str, list[str]]:
+        """The results-api column names for this response, when it advertised them.
+
+        results-api's JSON range responses are bare arrays, so an EMPTY one carries no
+        schema at all and a client cannot build a named frame from it — the SDK raised
+        ColumnNotFoundError on a no-hit query. It now advertises the file's own header in
+        an `X-Columns` response header (genetics-results-api app/core/responses.py), which
+        is populated even when zero rows matched.
+
+        Returned as a dict to splice with `**` so that, when this is off or the endpoint
+        does not advertise, the result dict is byte-identical to before. `column_names`
+        rather than `columns`: db-api's `columns` is REQUIRED to read its positional rows,
+        while these rows are already named dicts and this list matters only when there are
+        none. Conflating them would put dict rows down the positional constructor.
+        """
+        if not self._expose_columns:
+            return {}
+        raw = resp.headers.get("X-Columns")
+        return {"column_names": raw.split(",")} if raw else {}
+
+    @cached_property
+    def base_url(self) -> str:
+        """The internal results-api endpoint, resolved on first use (see _endpoint_env)."""
+        return self._api_base_url_arg or _endpoint_env(
+            "GENETICS_API_URL", "http://0.0.0.0:2000/api"
+        )
+
+    @cached_property
+    def public_url(self) -> str:
+        """Public URL for download links shown to users."""
+        return self._public_api_url_arg or _endpoint_env(
+            "GENETICS_PUBLIC_API_URL", self.base_url
+        )
+
+    @cached_property
+    def bigquery_url(self) -> str | None:
+        """BigQuery API URL for direct SQL queries; None disables the SQL tools."""
+        return self._bigquery_api_url_arg or _endpoint_env("BIGQUERY_API_URL")
+
+    @property
+    def client(self) -> _ResilientAsyncClient:
+        """The internal API client, built on first use.
+
+        Lazy because its Authorization header is the only reason __init__ needed
+        settings; deferring it keeps construction free of config/settings.py. Assigning
+        `executor.client = ...` still works — the setter below writes the instance dict,
+        which is also where close() looks.
+
+        Locked rather than a cached_property because functools dropped that descriptor's
+        per-instance lock in 3.12: two threads racing the first access would each build a
+        client, and only the winner's connection pool is the one close() ever sees. The
+        service holds one shared executor across threads (mcp_server.py).
+        """
+        client = self.__dict__.get("client")
+        if client is None:
+            with self._client_lock:
+                client = self.__dict__.get("client")
+                if client is None:
+                    settings = _resolve_settings()
+                    api_secret = settings.internal_api_secret
+                    headers = (
+                        {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
+                    )
+                    if not api_secret and settings is not _PRUNED_INSTALL_SETTINGS:
+                        # NOT raising, and not silent either (genetics-results-suite-618).
+                        # Raising here would break a local run against an unauthenticated
+                        # results-api, which README documents as supported; the deployed
+                        # entrypoints call config.require_internal_api_secret() at startup so a
+                        # pod in this state never reaches this line. What is left is a
+                        # developer's own machine, where a bare 401 from results-api is the only
+                        # other symptom and does not name the cause.
+                        # The pruned install is excluded because credential-less is its DESIGN,
+                        # not a misconfiguration: the sandbox holds no internal secret and gets
+                        # a per-execution token instead (genetics-results-suite-4h6.9 / .14).
+                        logger.warning(
+                            "INTERNAL_API_SECRET is unset; calls to %s and %s will be sent with "
+                            "no Authorization header and will be refused by any deployment that "
+                            "requires authentication",
+                            self.base_url,
+                            self.bigquery_url or "the BigQuery API",
+                        )
+                    client = _ResilientAsyncClient(timeout=300.0, headers=headers)
+                    self.__dict__["client"] = client
+        return client
+
+    @client.setter
+    def client(self, value: _ResilientAsyncClient) -> None:
+        self.__dict__["client"] = value
+
+    @cached_property
+    def uniprot(self) -> UniProtClient:
+        """Shares external_client so UniProt/EBI outages arrive as the synthetic 503
+        rather than raising, and so no internal auth header is ever sent to them."""
+        return UniProtClient(self.external_client, _resolve_settings())
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion
@@ -284,10 +471,17 @@ class ToolExecutor:
     # leave the full result behind the download URL.
     _REGION_ROW_LIMIT = 500
 
-    @classmethod
-    def _cap_rows(cls, rows: list, limit: int | None = None) -> tuple[list, bool]:
-        """Cap inline rows, returning (rows, truncated)."""
-        limit = cls._REGION_ROW_LIMIT if limit is None else limit
+    def _cap_rows(self, rows: list, limit: int | None = None) -> tuple[list, bool]:
+        """Cap inline rows, returning (rows, truncated).
+
+        The cap protects the model's context, not the data — a caller that consumes rows
+        programmatically (the SDK) sets `_row_limit = None` to receive the whole result set,
+        while the tool surface keeps the default.
+        """
+        if limit is None:
+            limit = self._row_limit
+        if limit is None:
+            return list(rows), False
         return rows[:limit], len(rows) > limit
 
     @staticmethod
@@ -298,13 +492,119 @@ class ToolExecutor:
         return [r.strip() for r in resources.split(",") if r.strip()]
 
     async def close(self):
-        """Close the HTTP clients."""
-        await self.client.aclose()
+        """Close the HTTP clients.
+
+        `client` is read out of the instance dict rather than through the attribute so
+        closing an executor that never made an internal call does not build one first.
+        """
+        client = self.__dict__.get("client")
+        if client is not None:
+            await client.aclose()
         await self.external_client.aclose()
 
     # -------------------------------------------------------------------------
     # BigQuery Tools
     # -------------------------------------------------------------------------
+
+    # bounds for values rendered into server-built SQL. The window bound also stops a caller
+    # turning a gene-window scan into a whole-genome scan.
+    _MAX_SQL_WINDOW = 10_000_000
+    _MAX_SQL_LIMIT = 100_000
+
+    @staticmethod
+    def _query_metadata(
+        payload: dict[str, Any], query_result: dict[str, Any], include: bool
+    ) -> dict[str, Any]:
+        """Optionally attach the column names and truncation flag of the underlying query.
+
+        `results` already carries the names on every row, but an EMPTY result has no row
+        to carry them: the SDK builds `pl.DataFrame({c: [] for c in columns})` so a script
+        filtering a no-hit gene gets an empty frame rather than ColumnNotFound. `truncated`
+        stays because silent truncation is the one failure a script cannot detect for
+        itself. Off by default so the model's payload is not padded with either.
+        """
+        if include:
+            payload["columns"] = query_result.get("columns", [])
+            payload["truncated"] = query_result.get("truncated", False)
+        return payload
+
+    @staticmethod
+    def _positional_rows(
+        query_result: dict[str, Any],
+    ) -> tuple[list[str], list[Any], dict[str, Any] | None]:
+        """Split a db-api query result into column names and positional rows.
+
+        Returns `(columns, rows, error)`; `error` is a ready-to-return failure payload
+        when the two disagree, and None otherwise. `zip` truncates silently, so a row
+        whose arity disagrees with `columns` must be an error rather than a shifted
+        labelling: mislabelled genomic values are worse than no values. A row arriving
+        as a dict is the same class of failure — zipping names against dict KEYS would
+        produce plausible-looking garbage.
+        """
+        columns = query_result.get("columns") or []
+        rows = query_result.get("rows") or []
+        if rows and not columns:
+            return columns, rows, {
+                "success": False,
+                "error": "query result has rows but no column names",
+            }
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                return columns, rows, {
+                    "success": False,
+                    "error": f"query result row is {type(row).__name__}, expected a positional list",
+                }
+            if len(row) != len(columns):
+                return columns, rows, {
+                    "success": False,
+                    "error": (
+                        f"query result row has {len(row)} values but "
+                        f"{len(columns)} column names"
+                    ),
+                }
+        return columns, rows, None
+
+    def _bq_gene_payload(
+        self,
+        gene: str,
+        query_result: dict[str, Any],
+        filename: str,
+        with_metadata: bool,
+    ) -> dict[str, Any]:
+        """Shape a BigQuery by-gene query result for its two consumers.
+
+        db-api returns rows POSITIONALLY (a list per row, names in a separate `columns`
+        key), and the two consumers want opposite things with that:
+
+        - `results` goes to the model, which cannot interpret `["19", 44908822, 12.3]`,
+          so rows become dicts. This set is capped, so zipping is cheap.
+        - `_download_data` keeps the positional `{columns, rows}` form that
+          `_convert_to_tsv` handles directly — the download can carry 100k rows, and
+          re-materialising each as a dict only to flatten it back is waste.
+        """
+        columns, rows, error = self._positional_rows(query_result)
+        if error:
+            return error
+        payload = {
+            "success": True,
+            "gene": gene,
+            "results": [dict(zip(columns, row)) for row in rows],
+            "_download_data": {"columns": columns, "rows": rows, "filename": filename},
+        }
+        return self._query_metadata(payload, query_result, with_metadata)
+
+    @staticmethod
+    def _gene_window_cte(gene_literal: str) -> str:
+        """CTE resolving a gene symbol to its chromosome and span.
+
+        `gene_literal` must already have come through sql_safety.quote_literal.
+        """
+        return (
+            f"WITH g AS ("
+            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
+            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = {gene_literal} GROUP BY chr"
+            f") "
+        )
 
     @staticmethod
     def _strip_trailing_limit(sql: str) -> tuple[str, bool]:
@@ -487,16 +787,16 @@ class ToolExecutor:
                 dl_params["resources"] = resource
             if data_types:
                 dl_params["data_types"] = data_types
-            download_url = self._build_download_url(f"/v1/credible_sets_by_gene/{gene}", dl_params)
+            download_url = self._build_download_url(f"/v1/credible_sets_by_gene/{_seg(gene)}", dl_params)
 
             if summarize:
                 params["format"] = "tsv"
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_gene/{gene}", params=params
+                    f"{self.base_url}/v1/credible_sets_by_gene/{_seg(gene)}", params=params
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "gene": gene, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "gene": gene, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -504,13 +804,14 @@ class ToolExecutor:
             else:
                 params["format"] = "json"
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_gene/{gene}", params=params
+                    f"{self.base_url}/v1/credible_sets_by_gene/{_seg(gene)}", params=params
                 )
                 if resp.status_code == 200:
                     results = resp.json()
                     results = self._prioritize_variants(results)
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "gene": gene,
                         "total_count": len(results),
                         "results": results,
@@ -542,17 +843,17 @@ class ToolExecutor:
                 params["data_types"] = data_types
 
             dl_params = {k: v for k, v in params.items()}
-            download_url = self._build_download_url(f"/v1/credible_sets_by_variant/{variant}", dl_params)
+            download_url = self._build_download_url(f"/v1/credible_sets_by_variant/{_seg(variant)}", dl_params)
 
             if summarize:
                 params["format"] = "tsv"
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_variant/{variant}",
+                    f"{self.base_url}/v1/credible_sets_by_variant/{_seg(variant)}",
                     params=params,
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "variant": variant, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "variant": variant, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -560,7 +861,7 @@ class ToolExecutor:
             else:
                 params["format"] = "json"
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_variant/{variant}",
+                    f"{self.base_url}/v1/credible_sets_by_variant/{_seg(variant)}",
                     params=params,
                 )
                 if resp.status_code == 200:
@@ -568,6 +869,7 @@ class ToolExecutor:
                     results = self._prioritize_variants(results)
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "variant": variant,
                         "total_count": len(results),
                         "results": results,
@@ -602,7 +904,7 @@ class ToolExecutor:
             download_url = self._build_download_url(
                 f"/v1/credible_sets_by_region/{region}", dict(params)
             )
-            url = f"{self.base_url}/v1/credible_sets_by_region/{region}"
+            url = f"{self.base_url}/v1/credible_sets_by_region/{_seg(region)}"
 
             if summarize:
                 params["format"] = "tsv"
@@ -611,6 +913,7 @@ class ToolExecutor:
                     summary = self._summarize_credible_sets_simple(resp.text)
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "region": region,
                         "_download_url": download_url,
                         **summary,
@@ -624,6 +927,7 @@ class ToolExecutor:
                 rows, truncated = self._cap_rows(results)
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "region": region,
                     "total_count": len(results),
                     "truncated": truncated,
@@ -651,24 +955,25 @@ class ToolExecutor:
 
             if summarize:
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_phenotype/{resource}/{phenotype}",
+                    f"{self.base_url}/v1/credible_sets_by_phenotype/{_seg(resource)}/{_seg(phenotype)}",
                     params={"format": "tsv"},
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_trait(resp.text)
-                    return {"success": True, "phenotype": phenotype, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "phenotype": phenotype, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
                 }
             else:
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_phenotype/{resource}/{phenotype}",
+                    f"{self.base_url}/v1/credible_sets_by_phenotype/{_seg(resource)}/{_seg(phenotype)}",
                     params={"format": "json"},
                 )
                 if resp.status_code == 200:
                     return {
                         "success": True,
+                        **self._columns_meta(resp),
                         "phenotype": phenotype,
                         "results": resp.json(),
                         "_download_url": download_url,
@@ -692,7 +997,7 @@ class ToolExecutor:
                 f"/v1/credible_sets_by_phenotype_leads/{resource}/{phenotype}"
             )
             resp = await self.client.get(
-                f"{self.base_url}/v1/credible_sets_by_phenotype_leads/{resource}/{phenotype}",
+                f"{self.base_url}/v1/credible_sets_by_phenotype_leads/{_seg(resource)}/{_seg(phenotype)}",
                 params={"format": "json"},
                 timeout=300.0,
             )
@@ -732,13 +1037,14 @@ class ToolExecutor:
                 f"/v1/credible_sets_by_id/{resource}/{phenotype}/{encoded_cs_id}"
             )
             resp = await self.client.get(
-                f"{self.base_url}/v1/credible_sets_by_id/{resource}/{phenotype}/{encoded_cs_id}",
+                f"{self.base_url}/v1/credible_sets_by_id/{_seg(resource)}/{_seg(phenotype)}/{encoded_cs_id}",
                 params={"format": "json"},
             )
             if resp.status_code == 200:
                 variants = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
                     "credible_set_id": credible_set_id,
@@ -777,17 +1083,17 @@ class ToolExecutor:
                 params["resources"] = resource
 
             dl_params = {k: v for k, v in params.items()}
-            download_url = self._build_download_url(f"/v1/credible_sets_by_qtl_gene/{gene}", dl_params)
+            download_url = self._build_download_url(f"/v1/credible_sets_by_qtl_gene/{_seg(gene)}", dl_params)
 
             if summarize:
                 params["format"] = "tsv"
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_qtl_gene/{gene}",
+                    f"{self.base_url}/v1/credible_sets_by_qtl_gene/{_seg(gene)}",
                     params=params,
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, "gene": gene, "_download_url": download_url, **summary}
+                    return {"success": True, **self._columns_meta(resp), "gene": gene, "_download_url": download_url, **summary}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -795,11 +1101,11 @@ class ToolExecutor:
             else:
                 params["format"] = "json"
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/credible_sets_by_qtl_gene/{gene}",
+                    f"{self.base_url}/v1/credible_sets_by_qtl_gene/{_seg(gene)}",
                     params=params,
                 )
                 if resp.status_code == 200:
-                    return {"success": True, "gene": gene, "results": resp.json(), "_download_url": download_url}
+                    return {"success": True, **self._columns_meta(resp), "gene": gene, "results": resp.json(), "_download_url": download_url}
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -834,12 +1140,12 @@ class ToolExecutor:
     async def get_gene_expression(self, gene: str) -> dict[str, Any]:
         """Get tissue expression for a gene."""
         resp = await self.client.get(
-            f"{self.base_url}/v1/expression_by_gene/{gene}", params={"format": "json"}
+            f"{self.base_url}/v1/expression_by_gene/{_seg(gene)}", params={"format": "json"}
         )
         if resp.status_code == 200:
             results = resp.json()
             out: dict[str, Any] = {
-                "success": True, "gene": gene, "results": results,
+                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_expression.tsv"},
             }
             # Annotate which expression resources returned no rows for this gene, so a
@@ -878,13 +1184,18 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_asm_qtl.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_asm_qtl_by_gene(
-        self, gene: str, resources: str | None = None, window: int = 500000
+        self,
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+        limit: int = 500,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Get ASM-QTL data for variants near a gene via BigQuery.
 
@@ -893,30 +1204,32 @@ class ToolExecutor:
         for regulatory variants and misses signals that sit near — but not inside —
         the gene. Gene coordinates come from `gene_annotations_v`.
         """
-        dataset_filter = ""
-        if resources:
-            ds_map = {"decode_cpg": "deCODE_asmQTL_CpG", "decode_mds": "deCODE_asmQTL_MDS"}
-            datasets = [ds_map.get(r.strip(), r.strip()) for r in resources.split(",")]
-            quoted = ", ".join(f"'{d}'" for d in datasets)
-            dataset_filter = f" AND a.dataset IN ({quoted})"
+        try:
+            gene = normalize_literal(gene, name="gene")
+            gene_lit = quote_literal(gene, name="gene")
+            window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
+            limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+            limit = int(limit_sql)
+            dataset_filter = ""
+            if resources:
+                ds_map = {"decode_cpg": "deCODE_asmQTL_CpG", "decode_mds": "deCODE_asmQTL_MDS"}
+                datasets = [ds_map.get(r.strip(), r.strip()) for r in resources.split(",")]
+                quoted = quote_literal_list(datasets, name="resources")
+                dataset_filter = f" AND a.dataset IN ({quoted})"
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
 
         sql = (
-            f"WITH g AS ("
-            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
-            f") "
+            f"{self._gene_window_cte(gene_lit)}"
             f"SELECT a.* FROM `genetics_results.asm_qtl_v` a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
-            f"AND a.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{dataset_filter} "
-            f"ORDER BY a.mlog10p DESC LIMIT 500"
+            f"ORDER BY a.mlog10p DESC LIMIT {limit_sql}"
         )
-        result = await self.query_database(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            return {
-                "success": True, "gene": gene, "results": result.get("rows", []),
-                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_asm_qtl.tsv"},
-            }
+            return self._bq_gene_payload(gene, result, f"{gene}_asm_qtl.tsv", with_metadata)
         return result
 
     async def get_open_chromatin_by_variant(
@@ -928,12 +1241,12 @@ class ToolExecutor:
             # list value -> repeated query params, which the API's list[str] Query expects
             params["resources"] = [r.strip() for r in resources.split(",")]
         resp = await self.client.get(
-            f"{self.base_url}/v1/open_chromatin/variant/{variant}", params=params
+            f"{self.base_url}/v1/open_chromatin/variant/{_seg(variant)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -946,12 +1259,12 @@ class ToolExecutor:
         if resources:
             params["resources"] = [r.strip() for r in resources.split(",")]
         resp = await self.client.get(
-            f"{self.base_url}/v1/open_chromatin/region/{chrom}/{start}/{end}", params=params
+            f"{self.base_url}/v1/open_chromatin/region/{_seg(chrom)}/{_seg(start)}/{_seg(end)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "region": f"{chrom}:{start}-{end}", "results": results,
+                "success": True, **self._columns_meta(resp), "region": f"{chrom}:{start}-{end}", "results": results,
                 "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -965,12 +1278,12 @@ class ToolExecutor:
         if rlist:
             params["resources"] = rlist
         resp = await self.client.get(
-            f"{self.base_url}/v1/open_chromatin/peak/{peak_id}", params=params
+            f"{self.base_url}/v1/open_chromatin/peak/{_seg(peak_id)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "peak_id": peak_id, "count": len(results), "results": results,
+                "success": True, **self._columns_meta(resp), "peak_id": peak_id, "count": len(results), "results": results,
                 "_download_data": {"results": results, "filename": f"{peak_id}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -986,12 +1299,12 @@ class ToolExecutor:
         if gencode_version:
             params["gencode_version"] = gencode_version
         resp = await self.client.get(
-            f"{self.base_url}/v1/peak_to_genes/{peak_id}", params=params, timeout=300.0
+            f"{self.base_url}/v1/peak_to_genes/{_seg(peak_id)}", params=params, timeout=300.0
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "peak_id": peak_id, "count": len(results), "results": results,
+                "success": True, **self._columns_meta(resp), "peak_id": peak_id, "count": len(results), "results": results,
                 "_download_data": {"results": results, "filename": f"{peak_id}_peak_to_genes.tsv"},
             }
         if resp.status_code == 404:
@@ -1009,13 +1322,14 @@ class ToolExecutor:
         if gencode_version:
             params["gencode_version"] = gencode_version
         resp = await self.client.get(
-            f"{self.base_url}/v1/gene_to_peaks/{gene}", params=params, timeout=300.0
+            f"{self.base_url}/v1/gene_to_peaks/{_seg(gene)}", params=params, timeout=300.0
         )
         if resp.status_code == 200:
             results = resp.json()
             rows, truncated = self._cap_rows(results)
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "gene": gene,
                 "total_count": len(results),
                 "truncated": truncated,
@@ -1027,7 +1341,12 @@ class ToolExecutor:
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_open_chromatin_by_gene(
-        self, gene: str, resources: str | None = None, window: int = 500000
+        self,
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+        limit: int = 500,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Get open-chromatin atlas peaks near a gene via BigQuery.
 
@@ -1037,29 +1356,31 @@ class ToolExecutor:
         Gene coordinates come from `gene_annotations_v`; resources are filtered on the view's
         derived `resource` column.
         """
-        resource_filter = ""
-        if resources:
-            rlist = [r.strip() for r in resources.split(",")]
-            quoted = ", ".join(f"'{r}'" for r in rlist)
-            resource_filter = f" AND a.resource IN ({quoted})"
+        try:
+            gene = normalize_literal(gene, name="gene")
+            gene_lit = quote_literal(gene, name="gene")
+            window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
+            limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+            limit = int(limit_sql)
+            resource_filter = ""
+            if resources:
+                rlist = [r.strip() for r in resources.split(",")]
+                quoted = quote_literal_list(rlist, name="resources")
+                resource_filter = f" AND a.resource IN ({quoted})"
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
 
         sql = (
-            f"WITH g AS ("
-            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
-            f") "
+            f"{self._gene_window_cte(gene_lit)}"
             f"SELECT a.* FROM `genetics_results.open_chromatin_v` a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
-            f"AND a.peak_start <= g.gend + {window} AND a.peak_end >= g.gstart - {window} "
+            f"AND a.peak_start <= g.gend + {window_sql} AND a.peak_end >= g.gstart - {window_sql} "
             f"WHERE TRUE{resource_filter} "
-            f"ORDER BY a.tissue, a.cell_type, a.peak_start LIMIT 500"
+            f"ORDER BY a.tissue, a.cell_type, a.peak_start LIMIT {limit_sql}"
         )
-        result = await self.query_database(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            return {
-                "success": True, "gene": gene, "results": result.get("rows", []),
-                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_open_chromatin.tsv"},
-            }
+            return self._bq_gene_payload(gene, result, f"{gene}_open_chromatin.tsv", with_metadata)
         return result
 
     async def get_variant_effect_by_variant(
@@ -1075,18 +1396,23 @@ class ToolExecutor:
             # list value -> repeated query params, which the API's list[str] Query expects
             params["resources"] = [r.strip() for r in resources.split(",")]
         resp = await self.client.get(
-            f"{self.base_url}/v1/variant_effect/variant/{variant}", params=params
+            f"{self.base_url}/v1/variant_effect/variant/{_seg(variant)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_variant_effect.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_variant_effect_by_gene(
-        self, gene: str, resources: str | None = None, window: int = 500000
+        self,
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+        limit: int = 500,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Get in-silico predicted variant effects on chromatin accessibility near a gene via BigQuery.
 
@@ -1098,29 +1424,31 @@ class ToolExecutor:
         scores so the agent can summarize how strongly and in which cell types accessibility is
         predicted to be affected (FLARE is pan-context, so cell_type may be null).
         """
-        resource_filter = ""
-        if resources:
-            rlist = [r.strip() for r in resources.split(",")]
-            quoted = ", ".join(f"'{r}'" for r in rlist)
-            resource_filter = f" AND a.resource IN ({quoted})"
+        try:
+            gene = normalize_literal(gene, name="gene")
+            gene_lit = quote_literal(gene, name="gene")
+            window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
+            limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+            limit = int(limit_sql)
+            resource_filter = ""
+            if resources:
+                rlist = [r.strip() for r in resources.split(",")]
+                quoted = quote_literal_list(rlist, name="resources")
+                resource_filter = f" AND a.resource IN ({quoted})"
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
 
         sql = (
-            f"WITH g AS ("
-            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
-            f") "
+            f"{self._gene_window_cte(gene_lit)}"
             f"SELECT a.* FROM `genetics_results.variant_effect_v` a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
-            f"AND a.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{resource_filter} "
-            f"ORDER BY a.mlog10p DESC LIMIT 500"
+            f"ORDER BY a.mlog10p DESC LIMIT {limit_sql}"
         )
-        result = await self.query_database(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            return {
-                "success": True, "gene": gene, "results": result.get("rows", []),
-                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_variant_effect.tsv"},
-            }
+            return self._bq_gene_payload(gene, result, f"{gene}_variant_effect.tsv", with_metadata)
         return result
 
     async def get_mpra_by_variant(
@@ -1136,12 +1464,12 @@ class ToolExecutor:
             # list value -> repeated query params, which the API's list[str] Query expects
             params["resources"] = [r.strip() for r in resources.split(",")]
         resp = await self.client.get(
-            f"{self.base_url}/v1/mpra/variant/{variant}", params=params
+            f"{self.base_url}/v1/mpra/variant/{_seg(variant)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_mpra.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1154,18 +1482,23 @@ class ToolExecutor:
         if resources:
             params["resources"] = [r.strip() for r in resources.split(",")]
         resp = await self.client.get(
-            f"{self.base_url}/v1/mpra/region/{chrom}/{start}/{end}", params=params
+            f"{self.base_url}/v1/mpra/region/{_seg(chrom)}/{_seg(start)}/{_seg(end)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "region": f"{chrom}:{start}-{end}", "results": results,
+                "success": True, **self._columns_meta(resp), "region": f"{chrom}:{start}-{end}", "results": results,
                 "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_mpra.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_mpra_by_gene(
-        self, gene: str, resources: str | None = None, window: int = 500000
+        self,
+        gene: str,
+        resources: str | None = None,
+        window: int = 500000,
+        limit: int = 500,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Get measured MPRA cis-regulatory allelic activity near a gene via BigQuery.
 
@@ -1177,29 +1510,31 @@ class ToolExecutor:
         emVar/active/log2Skew/log2FC so the agent can summarize which variants are functionally
         active and how strongly; ordered by allelic-skew significance.
         """
-        resource_filter = ""
-        if resources:
-            rlist = [r.strip() for r in resources.split(",")]
-            quoted = ", ".join(f"'{r}'" for r in rlist)
-            resource_filter = f" AND a.resource IN ({quoted})"
+        try:
+            gene = normalize_literal(gene, name="gene")
+            gene_lit = quote_literal(gene, name="gene")
+            window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
+            limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+            limit = int(limit_sql)
+            resource_filter = ""
+            if resources:
+                rlist = [r.strip() for r in resources.split(",")]
+                quoted = quote_literal_list(rlist, name="resources")
+                resource_filter = f" AND a.resource IN ({quoted})"
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
 
         sql = (
-            f"WITH g AS ("
-            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
-            f") "
+            f"{self._gene_window_cte(gene_lit)}"
             f"SELECT a.* FROM `genetics_results.mpra_v` a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
-            f"AND a.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{resource_filter} "
-            f"ORDER BY a.log2Skew_mlog10p DESC LIMIT 500"
+            f"ORDER BY a.log2Skew_mlog10p DESC LIMIT {limit_sql}"
         )
-        result = await self.query_database(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            return {
-                "success": True, "gene": gene, "results": result.get("rows", []),
-                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_mpra.tsv"},
-            }
+            return self._bq_gene_payload(gene, result, f"{gene}_mpra.tsv", with_metadata)
         return result
 
     # -------------------------------------------------------------------------
@@ -1235,7 +1570,7 @@ class ToolExecutor:
             params["genes"] = ",".join(g.strip() for g in genes.split(",") if g.strip())
 
         try:
-            path = f"/v1/hla/{resource}"
+            path = f"/v1/hla/{_seg(resource)}"
             resp = await self.client.get(
                 f"{self.base_url}{path}", params=params, timeout=300.0
             )
@@ -1245,6 +1580,7 @@ class ToolExecutor:
                 download_params = {k: v for k, v in params.items() if k != "format"}
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotypes": phenotypes,
                     "total_count": len(results),
@@ -1268,6 +1604,7 @@ class ToolExecutor:
         min_info: float = 0.5,
         resource: str = "finngen",
         max_rows: int = 200,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Get every phenotype an HLA allele is associated with, via BigQuery.
 
@@ -1287,31 +1624,48 @@ class ToolExecutor:
                 f"two-field name such as 'B*27:05' or 'DQB1*02:01'.",
             }
 
+        try:
+            # normalized before quoting so the value echoed back in the payload is the one
+            # the allow-list saw — uniformity with the `gene` sites, not a security fix:
+            # this resource only lands in a JSON field, never a filename or a header
+            resource = normalize_literal(resource, name="resource")
+            resource_lit = quote_literal(resource, name="resource")
+            limit_sql = sql_int(max_rows, name="max_rows", minimum=1, maximum=self._MAX_SQL_LIMIT)
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
+
         info_filter = f" AND info >= {float(min_info)}" if min_info else ""
         sql = (
-            f"SELECT phenotype, gene, allele, mlogp, pval, beta, sebeta, "
-            f"af_alt, af_alt_cases, af_alt_controls, info "
+            f"SELECT phenotype, gene, allele, mlog10p, pval, beta, se, "
+            f"af, af_cases, af_controls, info "
             f"FROM `genetics_results.hla_associations_v` "
-            f"WHERE allele = '{name}' AND resource = '{resource}' "
-            f"AND mlogp >= {float(min_mlogp)}{info_filter} "
-            f"ORDER BY mlogp DESC LIMIT {int(max_rows)}"
+            f"WHERE allele = '{name}' AND resource = {resource_lit} "
+            f"AND mlog10p >= {float(min_mlogp)}{info_filter} "
+            f"ORDER BY mlog10p DESC LIMIT {limit_sql}"
         )
         result = await self.query_database(sql, max_rows=max_rows)
         if result.get("success"):
-            rows = result.get("rows", [])
-            return {
+            columns, rows, error = self._positional_rows(result)
+            if error:
+                return error
+            payload = {
                 "success": True,
                 "allele": name,
                 "resource": resource,
                 "min_mlogp": min_mlogp,
                 "min_info": min_info,
                 "count": len(rows),
-                "results": rows,
+                # the model cannot tell mlog10p from beta from af in a bare positional
+                # list, so it gets named rows; the download keeps the positional form
+                # `_convert_to_tsv` handles, whose `results` branch needs dicts
+                "results": [dict(zip(columns, row)) for row in rows],
                 "_download_data": {
-                    "results": rows,
+                    "columns": columns,
+                    "rows": rows,
                     "filename": f"{name.replace('*', '_').replace(':', '_')}_hla.tsv",
                 },
             }
+            return self._query_metadata(payload, result, with_metadata)
         return result
 
     async def get_mpra_pip_concordance_by_gene(
@@ -1320,6 +1674,8 @@ class ToolExecutor:
         window: int = 500000,
         resource: str = "finngen",
         min_pip: float = 0.1,
+        limit: int = 500,
+        with_metadata: bool = False,
     ) -> dict[str, Any]:
         """Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls.
 
@@ -1348,34 +1704,42 @@ class ToolExecutor:
             WHERE c.resource = 'finngen' AND c.pip >= 0.1
             ORDER BY m.emVar DESC, c.pip DESC
         """
+        try:
+            gene = normalize_literal(gene, name="gene")
+            gene_lit = quote_literal(gene, name="gene")
+            resource = normalize_literal(resource, name="resource")
+            resource_lit = quote_literal(resource, name="resource")
+            window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
+            min_pip_sql = sql_float(min_pip, name="min_pip", minimum=0.0, maximum=1.0)
+            limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+            limit = int(limit_sql)
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
+
         sql = (
-            f"WITH g AS ("
-            f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = '{gene}' GROUP BY chr"
-            f") "
+            f"{self._gene_window_cte(gene_lit)}"
             f"SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type, "
             f"c.mlog10p AS gwas_mlog10p, c.beta, "
             f"m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort "
             f"FROM `genetics_results.credible_sets_v` c "
             f"JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING) "
-            f"AND c.pos BETWEEN g.gstart - {window} AND g.gend + {window} "
+            f"AND c.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"JOIN `genetics_results.mpra_v` m "
             f"ON m.variant = c.variant AND m.cell_line = 'meta' "
-            f"WHERE c.resource = '{resource}' AND c.pip >= {min_pip} "
-            f"ORDER BY m.emVar DESC, c.pip DESC LIMIT 500"
+            f"WHERE c.resource = {resource_lit} AND c.pip >= {min_pip_sql} "
+            f"ORDER BY m.emVar DESC, c.pip DESC LIMIT {limit_sql}"
         )
-        result = await self.query_database(sql, max_rows=500)
+        result = await self.query_database(sql, max_rows=limit)
         if result.get("success"):
-            return {
-                "success": True, "gene": gene, "results": result.get("rows", []),
-                "_download_data": {"results": result.get("rows", []), "filename": f"{gene}_mpra_pip_concordance.tsv"},
-            }
+            return self._bq_gene_payload(
+                gene, result, f"{gene}_mpra_pip_concordance.tsv", with_metadata
+            )
         return result
 
     async def get_gene_disease_associations(self, gene: str) -> dict[str, Any]:
         """Get gene-disease associations."""
         resp = await self.client.get(
-            f"{self.base_url}/v1/gene_disease/{gene}", params={"format": "json"}
+            f"{self.base_url}/v1/gene_disease/{_seg(gene)}", params={"format": "json"}
         )
         if resp.status_code == 200:
             results = resp.json()
@@ -1395,13 +1759,13 @@ class ToolExecutor:
     async def get_exome_results_by_gene(self, gene: str) -> dict[str, Any]:
         """Get exome sequencing results for a gene."""
         resp = await self.client.get(
-            f"{self.base_url}/v1/exome_results_by_gene/{gene}",
+            f"{self.base_url}/v1/exome_results_by_gene/{_seg(gene)}",
             params={"format": "json"},
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "gene": gene, "results": results,
+                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_exome_results.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1415,12 +1779,12 @@ class ToolExecutor:
         if rlist:
             params["resources"] = rlist
         resp = await self.client.get(
-            f"{self.base_url}/v1/exome_results_by_variant/{variant}", params=params
+            f"{self.base_url}/v1/exome_results_by_variant/{_seg(variant)}", params=params
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "count": len(results), "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "count": len(results), "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_exome_results.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1438,13 +1802,14 @@ class ToolExecutor:
             {"resources": rlist} if rlist else None,
         )
         resp = await self.client.get(
-            f"{self.base_url}/v1/exome_results_by_region/{region}", params=params, timeout=300.0
+            f"{self.base_url}/v1/exome_results_by_region/{_seg(region)}", params=params, timeout=300.0
         )
         if resp.status_code == 200:
             results = resp.json()
             rows, truncated = self._cap_rows(results)
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "region": region,
                 "total_count": len(results),
                 "truncated": truncated,
@@ -1459,7 +1824,7 @@ class ToolExecutor:
         """Get individual variant exome results for a specific phenotype."""
         try:
             resp = await self.client.get(
-                f"{self.base_url}/v1/exome_results_by_phenotype/{resource}/{phenotype}",
+                f"{self.base_url}/v1/exome_results_by_phenotype/{_seg(resource)}/{_seg(phenotype)}",
                 params={"format": "json"},
                 timeout=300.0,
             )
@@ -1467,6 +1832,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
                     "count": len(results),
@@ -1493,7 +1859,7 @@ class ToolExecutor:
         """Get unfiltered gene burden results for one phenotype."""
         try:
             resp = await self.client.get(
-                f"{self.base_url}/v1/gene_based_results_by_phenotype/{resource}/{phenotype}",
+                f"{self.base_url}/v1/gene_based_results_by_phenotype/{_seg(resource)}/{_seg(phenotype)}",
                 params={"format": "json"},
                 timeout=300.0,
             )
@@ -1526,7 +1892,7 @@ class ToolExecutor:
         import csv
         import io
 
-        resp = await self.client.get(f"{self.base_url}/v1/gene_based/{gene}")
+        resp = await self.client.get(f"{self.base_url}/v1/gene_based/{_seg(gene)}")
         if resp.status_code == 200:
             reader = csv.DictReader(io.StringIO(resp.text), delimiter="\t")
             results = list(reader)
@@ -1741,13 +2107,13 @@ class ToolExecutor:
     async def get_colocalization(self, variant: str) -> dict[str, Any]:
         """Get colocalization results for a variant."""
         resp = await self.client.get(
-            f"{self.base_url}/v1/colocalization_by_variant/{variant}",
+            f"{self.base_url}/v1/colocalization_by_variant/{_seg(variant)}",
             params={"format": "json"},
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, "variant": variant, "results": results,
+                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_colocalization.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1761,7 +2127,7 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         """Get credible sets that colocalize with one specific credible set."""
         encoded_cs_id = quote(credible_set_id, safe="")
-        path = f"/v1/colocalization_by_credible_set_id/{resource}/{phenotype}/{encoded_cs_id}"
+        path = f"/v1/colocalization_by_credible_set_id/{_seg(resource)}/{_seg(phenotype)}/{encoded_cs_id}"
         params: dict[str, Any] = {"format": "json"}
         if dual_format:
             params["dual_format"] = "true"
@@ -1770,6 +2136,7 @@ class ToolExecutor:
             results = resp.json()
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "resource": resource,
                 "phenotype": phenotype,
                 "credible_set_id": credible_set_id,
@@ -1790,7 +2157,7 @@ class ToolExecutor:
     async def get_phenotype_report(self, resource: str, phenotype_code: str) -> dict[str, Any]:
         """Get phenotype markdown report."""
         resp = await self.client.get(
-            f"{self.base_url}/v1/phenotype/{resource}/{phenotype_code}/markdown",
+            f"{self.base_url}/v1/phenotype/{_seg(resource)}/{_seg(phenotype_code)}/markdown",
         )
         if resp.status_code == 200:
             return {
@@ -1839,7 +2206,7 @@ class ToolExecutor:
     async def get_resource_metadata(self, resource: str) -> dict[str, Any]:
         """Get harmonized per-trait metadata (sample sizes, trait names) for a resource."""
         resp = await self.client.get(
-            f"{self.base_url}/v1/resource_metadata/{resource}",
+            f"{self.base_url}/v1/resource_metadata/{_seg(resource)}",
             params={"format": "json"},
             timeout=300.0,
         )
@@ -1852,7 +2219,7 @@ class ToolExecutor:
                 "count": len(results) if isinstance(results, list) else None,
                 "truncated": truncated,
                 "metadata": rows,
-                "_download_url": self._build_download_url(f"/v1/resource_metadata/{resource}"),
+                "_download_url": self._build_download_url(f"/v1/resource_metadata/{_seg(resource)}"),
             }
         if resp.status_code == 404:
             return {"success": False, "error": f"Not found: resource '{resource}'"}
@@ -1892,7 +2259,7 @@ class ToolExecutor:
             if variants is not None:
                 # POST endpoint for batch variant lookup
                 resp = await self.client.post(
-                    f"{self.base_url}/v1/variant_annotation/{source}",
+                    f"{self.base_url}/v1/variant_annotation/{_seg(source)}",
                     params={"format": "json"},
                     json={"variants": variants},
                     timeout=300.0,
@@ -1901,7 +2268,7 @@ class ToolExecutor:
                 # GET endpoint for single variant, region, or gene
                 params: dict[str, Any] = {"format": "json", query_key: query_value}
                 resp = await self.client.get(
-                    f"{self.base_url}/v1/variant_annotation/{source}",
+                    f"{self.base_url}/v1/variant_annotation/{_seg(source)}",
                     params=params,
                     timeout=300.0,
                 )
@@ -1911,6 +2278,7 @@ class ToolExecutor:
                 query_desc = query_value if variants is None else f"{len(variants)} variants"
                 result: dict[str, Any] = {
                     "success": True,
+                    **self._columns_meta(resp),
                     "source": source,
                     "query": query_desc,
                     "count": len(results),
@@ -1958,7 +2326,7 @@ class ToolExecutor:
 
         try:
             resp = await self.client.post(
-                f"{self.base_url}/v1/summary_stats/{resource}/{data_type}",
+                f"{self.base_url}/v1/summary_stats/{_seg(resource)}/{_seg(data_type)}",
                 params={"format": "json"},
                 json={"variants": normalized, "phenotypes": phenotypes},
                 timeout=300.0,
@@ -1967,6 +2335,7 @@ class ToolExecutor:
                 results = resp.json()
                 result: dict[str, Any] = {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "data_type": data_type,
                     "count": len(results),
@@ -1999,7 +2368,7 @@ class ToolExecutor:
         if not phenotypes:
             return {"success": False, "error": "No phenotypes provided"}
         try:
-            path = f"/v1/summary_stats_by_region/{resource}/{data_type}/{region}"
+            path = f"/v1/summary_stats_by_region/{_seg(resource)}/{_seg(data_type)}/{_seg(region)}"
             pheno_param = ",".join(p.strip() for p in phenotypes if p.strip())
             resp = await self.client.get(
                 f"{self.base_url}{path}",
@@ -2011,6 +2380,7 @@ class ToolExecutor:
                 rows, truncated = self._cap_rows(results)
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "region": region,
                     "resource": resource,
                     "data_type": data_type,
@@ -2221,7 +2591,7 @@ class ToolExecutor:
         """Get credible sets statistics for a dataset."""
         try:
             resp = await self.client.get(
-                f"{self.base_url}/v1/credible_sets/{resource_or_dataset}/stats",
+                f"{self.base_url}/v1/credible_sets/{_seg(resource_or_dataset)}/stats",
                 params={"format": "json"},
             )
             if resp.status_code != 200:
@@ -2670,7 +3040,7 @@ class ToolExecutor:
                 params["gencode_version"] = gencode_version
 
             resp = await self.client.get(
-                f"{self.base_url}/v1/nearest_genes/{variant}",
+                f"{self.base_url}/v1/nearest_genes/{_seg(variant)}",
                 params=params,
             )
             if resp.status_code == 200:
@@ -2705,7 +3075,7 @@ class ToolExecutor:
                 params["gencode_version"] = gencode_version
 
             resp = await self.client.get(
-                f"{self.base_url}/v1/genes_in_region/{chr}/{start}/{end}",
+                f"{self.base_url}/v1/genes_in_region/{_seg(chr)}/{_seg(start)}/{_seg(end)}",
                 params=params,
             )
             if resp.status_code == 200:
@@ -3129,10 +3499,6 @@ class ToolExecutor:
     # Templates would be friendlier but pin us to JAX-named templates that
     # change over releases. Inline PathQuery XML keeps this self-contained.
     _MOUSEMINE_URL = "https://www.mousemine.org/mousemine/service/query/results"
-    # MouseMine is a public best-effort instance and is regularly slow; cap the wait so a
-    # hung upstream can't hold an MCP tool call open. Each _mgi_* helper issues one query,
-    # so this is also the worst case for the whole search_mgi call.
-    _MOUSEMINE_TIMEOUT = 20.0
     _MGI_MARKER_URL = "https://www.informatics.jax.org/marker"
     _MGI_ALLELE_URL = "https://www.informatics.jax.org/allele"
 
@@ -3195,19 +3561,9 @@ class ToolExecutor:
             "format": "json",
             "size": str(size),
         }
-        try:
-            resp = await self.external_client.get(
-                self._MOUSEMINE_URL, params=params, timeout=self._MOUSEMINE_TIMEOUT
-            )
-        except httpx.TimeoutException:
-            # the connection succeeds and the read then hangs, so _ResilientAsyncClient's
-            # ConnectError path never fires. Without this the timeout reaches search_mgi's
-            # generic handler and a routine upstream outage is reported to the user as an
-            # internal error and to the log as a traceback.
-            logger.warning(
-                "MouseMine did not respond within %ss", self._MOUSEMINE_TIMEOUT
-            )
-            return {"_error": MOUSEMINE_UNAVAILABLE_MSG}
+        resp = await self.external_client.get(
+            self._MOUSEMINE_URL, params=params, timeout=20.0
+        )
         if resp.status_code != 200:
             # truncate body to keep error messages bounded
             body = (resp.text or "")[:200]
@@ -4592,10 +4948,7 @@ class ToolExecutor:
         fields: str | None = None,
     ) -> dict[str, Any]:
         """Get clinical/functional variant annotations from myvariant.info."""
-        from genetics_mcp_server.config.settings import get_settings
-
-        settings = get_settings()
-        base_url = settings.myvariant_api_url
+        base_url = _resolve_settings().myvariant_api_url
 
         req_fields = fields or self._MYVARIANT_DEFAULT_FIELDS
         params: dict[str, str] = {"fields": req_fields, "assembly": "hg38"}

@@ -224,6 +224,67 @@ class ChatHistoryDB(object, metaclass=Singleton):
             ON conversation_issue(category)
         """)
 
+        # per-turn cost/roundtrip telemetry, one row per completed assistant turn.
+        #
+        # No foreign keys, deliberately, and PRAGMA foreign_keys is ON here so one would
+        # abort the insert rather than be ignored: the row is written when the stream
+        # finishes, but the assistant's chat_messages row is POSTed by the client only
+        # afterwards, and on the first turn of a new conversation the session row does
+        # not exist yet either (the client creates it after the first exchange). Both ids
+        # are therefore nullable — a turn whose ids are not yet known still contributes
+        # its iteration and cost numbers, which is what this table is for.
+        #
+        # message_id, when present, is the client-generated chat_messages primary key and
+        # is globally unique on its own, so it needs no session_id to disambiguate; the
+        # partial unique index gives the "one row per assistant turn" guarantee without
+        # forcing a key onto rows that have no message id yet.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_turn_metrics (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                message_id TEXT,
+                user_id TEXT,
+                iterations INTEGER NOT NULL,
+                tool_call_count INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_read_tokens INTEGER NOT NULL,
+                cache_create_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL,
+                wall_ms INTEGER NOT NULL,
+                tool_profile TEXT,
+                model TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_turn_metrics_message
+            ON chat_turn_metrics(message_id) WHERE message_id IS NOT NULL
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_turn_metrics_session
+            ON chat_turn_metrics(session_id, created_at ASC)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_turn_metrics_created_at
+            ON chat_turn_metrics(created_at)
+        """)
+
+        cursor.execute("PRAGMA table_info(chat_turn_metrics)")
+        metrics_columns = {row[1] for row in cursor.fetchall()}
+        if "user_id" not in metrics_columns:
+            cursor.execute("ALTER TABLE chat_turn_metrics ADD COLUMN user_id TEXT")
+
+        # delete_session has to reach this user's rows that carry no session id, and
+        # per-user cost aggregation scans on user_id alone
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_turn_metrics_user
+            ON chat_turn_metrics(user_id)
+        """)
+
         self._conn.commit()
 
     def create_session(
@@ -365,11 +426,33 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
                 (session_id, user_id),
             )
+            deleted = cursor.rowcount > 0
+            # chat_turn_metrics carries no foreign key (see _init_db), so the cascade that
+            # clears chat_messages and conversation_analysis does not reach it.
+            #
+            # The second clause covers this user's rows that carry neither id. Every
+            # conversation's first turn streams before the browser has created the session
+            # row, and the browser does not send message_id yet, so those rows can never be
+            # attributed to any session — keeping them would leave a permanent record that
+            # this user held a conversation and what it cost, which is exactly what
+            # "delete my conversation" is meant to remove. They are already invisible to
+            # per-session analysis, so deleting them costs no capability that existed;
+            # it does drop the opening turns of this user's other conversations, and
+            # privacy wins that trade until the browser sends the ids.
+            if deleted:
+                cursor.execute(
+                    """
+                    DELETE FROM chat_turn_metrics
+                    WHERE session_id = ?
+                       OR (user_id = ? AND session_id IS NULL AND message_id IS NULL)
+                    """,
+                    (session_id, user_id),
+                )
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
-        return cursor.rowcount > 0
+        return deleted
 
     def set_shared(self, session_id: str, user_id: str, shared: bool) -> bool:
         """Set the shared flag on a session. Returns False if user doesn't own it."""
@@ -912,6 +995,104 @@ class ChatHistoryDB(object, metaclass=Singleton):
             }
             for row in cursor.fetchall()
         ]
+
+    def record_turn_metrics(
+        self,
+        *,
+        session_id: str | None,
+        message_id: str | None,
+        user_id: str | None,
+        iterations: int,
+        tool_call_count: int,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_create_tokens: int,
+        cost_usd: float,
+        wall_ms: int,
+        tool_profile: str | None = None,
+        model: str | None = None,
+    ) -> str | None:
+        """Record the cost and roundtrip profile of one completed assistant turn.
+
+        A single INSERT under its own commit: this runs while an SSE stream is open and
+        the database file sits on a volume shared with the nightly analysis job, so the
+        write must not extend over anything else. Re-recording the same message_id
+        overwrites rather than raising, mirroring add_message's upsert.
+
+        message_id is client-supplied and globally unique only by convention, so the
+        upsert is scoped to user_id: without that, anyone could send another user's
+        message_id and have their own turn's numbers overwrite that user's row, zeroing
+        its cost and reassigning its session. The DO UPDATE's WHERE makes the conflicting
+        write a no-op instead — nothing is inserted and nothing is overwritten. `IS` and
+        not `=` so that the NULL user_id of an unauthenticated deployment still matches
+        itself rather than failing every re-record.
+
+        Returns the row id, or None when the write was rejected as another user's row.
+        """
+        row_id = str(uuid.uuid4())
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO chat_turn_metrics (
+                    id, session_id, message_id, user_id, iterations, tool_call_count,
+                    input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                    cost_usd, wall_ms, tool_profile, model
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id) WHERE message_id IS NOT NULL DO UPDATE SET
+                    session_id = excluded.session_id,
+                    iterations = excluded.iterations,
+                    tool_call_count = excluded.tool_call_count,
+                    input_tokens = excluded.input_tokens,
+                    output_tokens = excluded.output_tokens,
+                    cache_read_tokens = excluded.cache_read_tokens,
+                    cache_create_tokens = excluded.cache_create_tokens,
+                    cost_usd = excluded.cost_usd,
+                    wall_ms = excluded.wall_ms,
+                    tool_profile = excluded.tool_profile,
+                    model = excluded.model
+                WHERE chat_turn_metrics.user_id IS excluded.user_id
+                """,
+                (
+                    row_id, session_id, message_id, user_id, iterations, tool_call_count,
+                    input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                    cost_usd, wall_ms, tool_profile, model,
+                ),
+            )
+            written = cursor.rowcount > 0
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        if not written:
+            logger.warning(
+                f"Turn metrics rejected: message_id={message_id} is already recorded "
+                f"for a different user than {user_id}"
+            )
+            return None
+        return row_id
+
+    def get_turn_metrics(self, session_id: str) -> list[dict]:
+        """Return the recorded turn metrics for a session, oldest first."""
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, session_id, message_id, user_id, iterations, tool_call_count,
+                   input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                   cost_usd, wall_ms, tool_profile, model, created_at
+            FROM chat_turn_metrics
+            WHERE session_id = ?
+            ORDER BY created_at ASC
+            """,
+            (session_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     def upsert_analysis(
         self,

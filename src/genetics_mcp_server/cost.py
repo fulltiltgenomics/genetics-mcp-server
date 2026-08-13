@@ -26,6 +26,17 @@ def get_context_window(model: str) -> int:
     return 200_000
 
 
+def has_pricing(model: str) -> bool:
+    """True when `model` matches a known pricing entry exactly.
+
+    `_match_pricing` falls back to Sonnet for anything unrecognised, which is fine for a
+    rough in-flight estimate but not for a report that gates a spend decision: `gpt-4o`
+    or a transposed `claude-4-opus` would be priced confidently and wrongly. Callers that
+    must not fabricate a number check this first.
+    """
+    return any(prefix in model for prefix in _PRICING)
+
+
 def _match_pricing(model: str) -> tuple[float, float, float, float]:
     """Find pricing by matching model name prefix."""
     for prefix, pricing in _PRICING.items():

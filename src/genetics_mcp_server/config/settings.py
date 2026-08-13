@@ -41,6 +41,14 @@ class Settings:
         default_factory=lambda: os.environ.get("INTERNAL_API_SECRET", "")
     )
 
+    # signing key for the per-execution sandbox tokens (docs/code-execution-security.md §4).
+    # Deliberately NOT internal_api_secret: separate key, separate blast radius, independent
+    # rotation. Only chat-backend (mint) and db-api/results-api (verify) hold it; the sandbox
+    # holds neither this nor internal_api_secret.
+    sandbox_token_signing_key: str = field(
+        default_factory=lambda: os.environ.get("SANDBOX_TOKEN_SIGNING_KEY", "")
+    )
+
     # web search
     tavily_api_key: str | None = field(
         default_factory=lambda: os.environ.get("TAVILY_API_KEY")
@@ -217,6 +225,18 @@ class Settings:
         }
     )
 
+    # whether the deployment supplied an allow-list at all, as opposed to inheriting the
+    # finngen.fi default above. auth.core fails open on the proxied-identity path when this is
+    # False: chat-backend only started reading these in genetics-results-suite-th2, so a pod
+    # that has not yet picked up the bearer-auth-allowed ConfigMap must not refuse every user
+    # of a non-finngen deployment. Enforcement is defence in depth; the trusted-proxy marker
+    # is what actually closes the hole.
+    allow_list_configured: bool = field(
+        default_factory=lambda: bool(
+            os.environ.get("ALLOWED_EMAIL_DOMAINS") or os.environ.get("ALLOWED_EMAILS")
+        )
+    )
+
     # OAuth client id(s) a Google Identity Token must be addressed to (its `aud` claim).
     # google.oauth2.id_token.verify_oauth2_token skips audience verification entirely when
     # this is None, which means ANY Google-signed id_token belonging to an allow-listed email
@@ -375,3 +395,56 @@ def model_rejects_disabled_thinking(model: str) -> bool:
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def require_internal_api_secret(component: str) -> str:
+    """The internal credential, or a startup failure that names the variable.
+
+    genetics-results-suite-618: every call this process makes to results-api and db-api goes
+    through one client whose header is built as "bearer if the secret is set, nothing if it is
+    not". With the variable unset that fallback is silent, it happens at request time rather
+    than at startup, and it is invisible at the far end — on a route that resolves no principal
+    an anonymous caller's usage log row is identical to an internal one's (measured: 246/246
+    NULL user_email on GET /api/v1/rsid/variants over 90 days). results-api now refuses a
+    credential-less request on every data-path route (`ANONYMOUS_SURFACE_MINIMAL`,
+    genetics-results-suite-rhh), so the same misconfiguration would present as an unexplained
+    401 on every tool call with nothing local saying why.
+
+    Deployed entrypoints call this so the pod fails immediately and says which variable is
+    missing. Deliberately NOT enforced at import, in `Settings`, or in `ToolExecutor`: a local
+    run against an unauthenticated results-api needs no secret (README documents it as
+    optional), and the sandbox image holds no internal credential BY DESIGN — see
+    `_PrunedInstallSettings` in tools/executor.py. The contract being enforced is
+    genetics-results-suite-4h6.9's "a deployed service never falls back to no credential", not
+    "this variable is always set".
+    """
+    secret = get_settings().internal_api_secret
+    if not secret.strip():
+        raise RuntimeError(
+            f"INTERNAL_API_SECRET is unset or empty, so {component} would send every call to "
+            "results-api and db-api with no Authorization header at all — anonymously, and "
+            "invisibly in their logs. Set INTERNAL_API_SECRET (in the cluster: the "
+            "internal-api-secret key of the genetics-secrets Secret). Only the mcp-server "
+            "Deployment marks that secretKeyRef optional: true, so a missing key there leaves "
+            "the variable unset and the pod starts — which is how you get here. chat-backend's "
+            "does NOT, so a missing key stops that pod at CreateContainerConfigError instead."
+        )
+    # genetics-results-suite-ctq: the secret must be ASCII, and this is where that becomes real
+    # rather than documented. Measured off a real socket, HTTP clients disagree on how to put a
+    # non-ASCII header value on the wire — node fetch/undici and python-requests send latin-1,
+    # aiohttp sends utf-8, httpx 0.28 (this process's own client) refuses to send one at all —
+    # so no server-side codec recovers the same secret from every caller and `is_internal_caller`
+    # would be well defined for none of them. Checked here rather than in `Settings` on purpose:
+    # the same reasoning as above applies, an unset secret is legitimate for a local run and for
+    # the sandbox image, so only the deployed entrypoints enforce anything. The failure mode is
+    # the good one — the pod fails readiness and the rollout stalls with the old pods still
+    # serving, instead of every internal call 401ing at request time with no local signal.
+    if not secret.isascii():
+        raise RuntimeError(
+            "INTERNAL_API_SECRET contains non-ASCII characters. HTTP clients disagree on how "
+            "to encode a non-ASCII header value (node/undici and python-requests send latin-1, "
+            "aiohttp sends utf-8, httpx refuses to send one at all), so no server-side decoding "
+            "recovers the same secret from every caller. Set INTERNAL_API_SECRET to an ASCII "
+            "value — scripts/create-secrets.sh generates one with `openssl rand -base64 32`."
+        )
+    return secret

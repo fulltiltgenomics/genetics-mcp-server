@@ -1,13 +1,12 @@
 """API token router for managing per-user MCP server access tokens."""
 
-import hmac
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from genetics_mcp_server.auth import auth_required
+from genetics_mcp_server.auth import IDENTITY_HEADER, auth_required, is_internal_caller
 from genetics_mcp_server.db import get_llm_config_db
 
 logger = logging.getLogger(__name__)
@@ -102,18 +101,15 @@ class TokenValidateRequest(BaseModel):
 @router.post("/tokens/validate")
 async def validate_token(body: TokenValidateRequest, request: Request):
     """Validate a token and return the user_id. Internal use only."""
-    # only allow internal callers. The `X-Internal-MCP-Call: true` header used to be accepted
-    # here as an alternative — a client-suppliable header is not an authenticator, and no
-    # caller ever sent it, so the shared secret is now the only way in.
-    is_internal = False
-    from genetics_mcp_server.config import get_settings
-
-    internal_api_secret = get_settings().internal_api_secret
-    if internal_api_secret:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            is_internal = hmac.compare_digest(auth_header[7:], internal_api_secret)
-    if not is_internal:
+    # only allow internal callers, via the shared is_internal_caller — comparing the secret
+    # here as well let this route drift (its own compare_digest was on str, which raises
+    # TypeError on a non-ASCII bearer). The `X-Internal-MCP-Call: true` header used to be
+    # accepted as an alternative; a client-suppliable header is not an authenticator.
+    #
+    # An identity header disqualifies the request outright: the genuine callers (results-api,
+    # mcp-server) are service-to-service and never assert one, so its presence means the marker
+    # arrived on a request that a proxy built for a browser user.
+    if not is_internal_caller(request) or request.headers.get(IDENTITY_HEADER):
         raise HTTPException(status_code=403, detail="Internal endpoint")
 
     db = get_llm_config_db()

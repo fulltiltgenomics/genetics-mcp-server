@@ -1,11 +1,14 @@
 """FastAPI dependencies for authentication."""
 
-import hmac
 import logging
 
 from fastapi import Depends, HTTPException, Request
 
-from genetics_mcp_server.auth.core import get_authenticated_user
+from genetics_mcp_server.auth.core import (
+    IDENTITY_HEADER,
+    get_authenticated_user,
+    is_internal_caller,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,29 +40,47 @@ def is_public_endpoint(request: Request) -> bool:
 
 
 async def auth_required(request: Request) -> str | None:
-    """Dependency that requires authentication via IAP/oauth2-proxy header."""
+    """Resolve the caller's identity from the internal-secret marker and the identity header.
+
+    Precedence, in the order decided here:
+
+    1. **marker + allow-listed identity header** -> that email. The shared secret only says "an
+       in-cluster proxy sent this"; when that proxy also asserts *whose* request it is relaying,
+       the asserted person is the caller. Checking the bearer first — which is what this did
+       before — collapses every browser request to the generic ``mcp-tool`` and loses the real
+       user for chat history, downloads, API tokens and the ADMIN_USERS check.
+    2. **marker + identity header that is not allow-listed** -> 401. Deliberately *not*
+       downgraded to ``mcp-tool``: a downgrade would let anything holding the shared secret
+       launder a refused identity into a working, service-attributed request, and the refusal
+       would never surface.
+    3. **marker alone** (or with a literally empty header) -> ``mcp-tool``. results-api's
+       /tokens/validate call and mcp-server's tool calls land here; unchanged.
+    4. **identity header alone, no marker** -> 401. This is the hole being closed: the header is
+       settable by anything with network reach to port 8000, and admin membership, token minting
+       and every per-user route were decided from it.
+
+    The secret used to be an ALTERNATIVE identity rather than a marker. It also used to accept a
+    bare `X-Internal-MCP-Call: true` request header, which any client could send — full
+    authentication for anyone the auth-gateway forgot to strip it for.
+    """
     if not auth_is_required():
-        # still check for IAP header in case it's present
+        # dev mode: no proxy, no secret. get_authenticated_user honours the header as-is here
         user = get_authenticated_user(request)
         return user or "anonymous"
 
     if is_public_endpoint(request):
         return None
 
-    # internal service-to-service calls authenticate with the shared secret. This used to
-    # accept a bare `X-Internal-MCP-Call: true` request header, which any client could send —
-    # full authentication for anyone the auth-gateway forgot to strip it for. Nothing in the
-    # stack ever sent that header; the real internal callers all use the bearer secret.
-    from genetics_mcp_server.config import get_settings
-    internal_api_secret = get_settings().internal_api_secret
-    if internal_api_secret:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer ") and hmac.compare_digest(
-            auth_header[7:], internal_api_secret
-        ):
-            return "mcp-tool"
+    if is_internal_caller(request):
+        if request.headers.get(IDENTITY_HEADER):
+            # cases 1 and 2 — an asserted identity, once present, decides the outcome either way
+            user = get_authenticated_user(request)
+            if user is None:
+                raise HTTPException(status_code=401, detail="Not authenticated")
+            return user
+        return "mcp-tool"  # case 3
 
-    user = get_authenticated_user(request)
+    user = get_authenticated_user(request)  # case 4, always None without the marker
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user

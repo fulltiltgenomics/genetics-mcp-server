@@ -472,7 +472,7 @@ class SubagentService:
             # lazy import to avoid circular dependency with llm_service
             from genetics_mcp_server.llm_service import _process_download_hints
 
-            return _process_download_hints(result)
+            return _process_download_hints(result, tool_name=tool_name)
 
         except Exception as e:
             logger.error(f"Subagent tool '{tool_name}' error: {e}")

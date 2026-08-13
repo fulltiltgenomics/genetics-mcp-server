@@ -27,7 +27,7 @@ Series shape (mirrored by the frontend):
 import math
 from datetime import date, datetime, timedelta
 
-from .conversation_prompts import ISSUE_CATEGORIES, NON_ISSUE_CATEGORIES
+from .conversation_prompts import ISSUE_CATEGORIES
 
 SCORES = [1, 2, 3, 4, 5]
 
@@ -40,7 +40,7 @@ DISPOSITION_LABELS = [
 ]
 
 # the fixed issue taxonomy, imported so it stays in sync with the analyzer.
-ISSUE_CATEGORY_NAMES = [c for c, _ in ISSUE_CATEGORIES if c not in NON_ISSUE_CATEGORIES]
+ISSUE_CATEGORY_NAMES = [c for c, _ in ISSUE_CATEGORIES]
 
 # dispositions that are not agent-quality failures; excluded from the score trend
 # so out-of-scope / unfinished / weird / technical conversations don't skew it.

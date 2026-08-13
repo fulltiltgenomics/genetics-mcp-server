@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
@@ -256,30 +257,102 @@ class StreamChunk:
     image_alt: str | None = None
 
 
+class DownloadShapeError(TypeError):
+    """A `_download_data` payload does not match either shape `_convert_to_tsv` accepts.
+
+    Not necessarily a local programming error: most of the ~25 producers put the sibling
+    results-api's parsed response body straight into `_download_data` without shape-checking
+    it (e.g. `executor._get_ld_matrix`, `_get_summary_stats`), so a shape defect can equally
+    be upstream drift. That is why `_process_download_hints` surfaces it — an ERROR log plus
+    a user-visible note — instead of letting it kill the chat turn. Silently swallowing it
+    hid the same positional-rows bug twice (genetics-results-suite-bef, -buc).
+    """
+
+
+def _describe_shape(value: Any, depth: int = 0) -> str:
+    """Compact type description of a download payload, for the error and the log line."""
+    if isinstance(value, dict):
+        if depth == 0:
+            inner = ", ".join(f"{k}: {_describe_shape(v, depth + 1)}" for k, v in value.items())
+            return f"{{{inner}}}"
+        return f"dict[{len(value)} keys]"
+    if isinstance(value, (list, tuple)):
+        name = type(value).__name__
+        if not value:
+            return f"{name}[empty]"
+        return f"{name}[{len(value)} x {_describe_shape(value[0], depth + 1)}]"
+    return type(value).__name__
+
+
 def _convert_to_tsv(download_info: dict) -> bytes:
     """Convert download data to TSV bytes.
 
     Supports two formats:
     - {"results": [list of dicts]} — keys from first dict become headers
     - {"columns": [...], "rows": [[...], ...]} — BigQuery-style columnar data
+
+    The two shapes are deliberately NOT unified: `results` feeds the model and is capped,
+    while `columns`/`rows` carries up to 100k rows positionally and must not be
+    re-materialised as dicts just to be flattened again (see genetics-results-suite-bef).
+    The cost of shape-per-consumer is that a producer can pass the wrong one, so every
+    branch validates and raises DownloadShapeError naming expected vs observed rather than
+    dying with a bare AttributeError deep inside the writer loop.
     """
+    if not isinstance(download_info, dict):
+        raise DownloadShapeError(
+            f"_download_data must be a dict with 'results' or 'columns'+'rows'; got {_describe_shape(download_info)}"
+        )
+
+    # validated here rather than at the store: the sidecar is json.dump'd after the .tsv is
+    # already on disk, so a non-str filename would raise mid-write and orphan the data file
+    if "filename" in download_info and not isinstance(download_info["filename"], str):
+        raise DownloadShapeError(
+            "_download_data 'filename' must be a str; got "
+            f"{_describe_shape(download_info['filename'])} in {_describe_shape(download_info)}"
+        )
+
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter="\t", lineterminator="\n")
 
     if "columns" in download_info and "rows" in download_info:
-        writer.writerow(download_info["columns"])
-        for row in download_info["rows"]:
+        columns, rows = download_info["columns"], download_info["rows"]
+        if not isinstance(columns, (list, tuple)) or not isinstance(rows, (list, tuple)):
+            raise DownloadShapeError(
+                "_download_data columnar form expects {'columns': list, 'rows': list of lists}; "
+                f"got {_describe_shape(download_info)}"
+            )
+        writer.writerow(columns)
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                raise DownloadShapeError(
+                    "_download_data 'rows' must hold positional lists (one per row); "
+                    f"got {_describe_shape(download_info)}"
+                )
             writer.writerow(row)
     elif "results" in download_info:
         results = download_info["results"]
+        if not isinstance(results, (list, tuple)):
+            raise DownloadShapeError(
+                "_download_data row form expects {'results': list of dicts}; "
+                f"got {_describe_shape(download_info)}"
+            )
         if not results:
             return b""
+        if not all(isinstance(row, Mapping) for row in results):
+            raise DownloadShapeError(
+                "_download_data 'results' must hold dicts (column name -> value); positional "
+                "rows belong in the {'columns': [...], 'rows': [[...]]} form instead. Got "
+                f"{_describe_shape(download_info)}"
+            )
         headers = list(results[0].keys())
         writer.writerow(headers)
         for row in results:
             writer.writerow([row.get(h, "") for h in headers])
     else:
-        return b""
+        raise DownloadShapeError(
+            "_download_data must carry either 'results' or both 'columns' and 'rows'; "
+            f"got {_describe_shape(download_info)}"
+        )
 
     return buf.getvalue().encode("utf-8")
 
@@ -335,11 +408,34 @@ def _truncation_notice(result: Any) -> str:
     )
 
 
-def _process_download_hints(result: dict, owner: str | None = None) -> dict:
+DOWNLOAD_FAILED_NOTE = (
+    "⚠️ The download file for these results could not be written, so there is no download "
+    "link for this answer. The results shown are unaffected. Tell the user the download is "
+    "unavailable and that the failure has been logged."
+)
+
+DOWNLOAD_SHAPE_NOTE = (
+    "⚠️ The download file for these results could not be prepared because the result had an "
+    "unexpected structure, so there is no download link for this answer. The results shown "
+    "are unaffected. Tell the user the download is unavailable and that the problem has been "
+    "logged for investigation. Do not suggest re-running the query — it would fail the same way."
+)
+
+
+def _process_download_hints(result: dict, owner: str | None = None, tool_name: str | None = None) -> dict:
     """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links.
 
     Uses relative URLs so links work regardless of deployment domain. `owner` binds the
     stored file to the user who ran the query so nobody else can fetch it by id.
+
+    Nothing here is allowed to fail silently and nothing here is allowed to kill the turn.
+    Storage failures and shape defects each get their own ERROR log token and their own
+    user-visible INCLUDE_IN_RESPONSE note: catching everything and returning silently made
+    two identical positional-rows bugs invisible in production (genetics-results-suite-bef,
+    -buc), because a missing link is indistinguishable from a result that never warranted
+    one. Shape defects are not fatal because most producers pass the sibling API's parsed
+    body through unvalidated, so a bad shape is often upstream drift rather than a local bug
+    — and losing the whole answer over a missing download link is the worse failure.
     """
     if not isinstance(result, dict) or not result.get("success"):
         return result
@@ -364,8 +460,25 @@ def _process_download_hints(result: dict, owner: str | None = None) -> dict:
                 url = f"/chat/v1/downloads/{download_id}"
                 link = f"\U0001f4e5 [Download full results as TSV]({url})"
                 return _add_include_in_response(result, link)
-        except Exception as e:
-            logger.warning(f"Failed to create download: {e}")
+        # a shape defect is deterministic and often upstream drift, so it is logged under
+        # its own token (the suite's alerter pushes new ERROR lines to Slack) and reported
+        # to the model without any "try again" advice
+        except DownloadShapeError:
+            logger.error(
+                f"DOWNLOAD_SHAPE_DEFECT tool={tool_name or 'unknown'} "
+                f"shape={_describe_shape(download_info)}",
+                exc_info=True,
+            )
+            return _add_include_in_response(result, DOWNLOAD_SHAPE_NOTE)
+        # OSError covers everything the store can fail with (ENOSPC, permissions, a
+        # storage path that is not a directory); UnicodeEncodeError is reachable from real
+        # upstream data, since JSON can decode lone surrogates that utf-8 cannot encode.
+        except (OSError, UnicodeEncodeError) as e:
+            logger.error(
+                f"DOWNLOAD_FAILED tool={tool_name or 'unknown'} "
+                f"shape={_describe_shape(download_info)} error={type(e).__name__}: {e}"
+            )
+            return _add_include_in_response(result, DOWNLOAD_FAILED_NOTE)
 
     return result
 
@@ -436,6 +549,7 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         user_instructions: str | None = None,
+        message_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -459,6 +573,9 @@ class LLMService:
                 set. Kept separate from system_prompt rather than concatenated so it can occupy
                 its own cache block on the Anthropic path; the OpenAI path has no equivalent
                 breakpoint and concatenates the two into one system message.
+            message_id: Client-generated id of the assistant message this turn will become,
+                used only to key the recorded turn metrics to chat_messages. Optional: the
+                metrics row is still written without it, it just cannot be joined.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -475,7 +592,7 @@ class LLMService:
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
                 literature_backend, tool_profile, secret, user, session_id,
-                user_instructions,
+                user_instructions, message_id,
             ):
                 yield chunk
         else:
@@ -549,10 +666,13 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         user_instructions: str | None = None,
+        message_id: str | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
             raise RuntimeError("Anthropic client not initialized. Check API key.")
+
+        turn_started = time.monotonic()
 
         settings = get_settings()
         model = model or settings.default_model
@@ -677,6 +797,9 @@ class LLMService:
             total_cost = 0.0
             total_input_tokens = 0
             total_output_tokens = 0
+            total_cache_read = 0
+            total_cache_create = 0
+            tool_call_count = 0
 
             # collect all content blocks for persistence
             all_content_blocks: list[dict[str, Any]] = []
@@ -754,6 +877,8 @@ class LLMService:
                 total_cost += iter_cost
                 total_input_tokens += input_tok
                 total_output_tokens += output_tok
+                total_cache_read += cache_read
+                total_cache_create += cache_create
                 logger.info(
                     f"{log_prefix}API call iteration={iteration} model={model} "
                     f"input_tokens={input_tok} output_tokens={output_tok} "
@@ -855,6 +980,8 @@ class LLMService:
 
                 if not tool_uses or not self.executor:
                     break
+
+                tool_call_count += len(tool_uses)
 
                 # emit tool-use indicators to stream
                 for tool_use in tool_uses:
@@ -967,7 +1094,7 @@ class LLMService:
                         result["note"] = "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
 
                     # convert download hints into INCLUDE_IN_RESPONSE links
-                    result = _process_download_hints(result, owner=user)
+                    result = _process_download_hints(result, owner=user, tool_name=tool_use.name)
 
                     result_json = json.dumps(result)
 
@@ -1019,12 +1146,70 @@ class LLMService:
                 tool_results=all_tool_results or None,
             )
 
+            # after the terminator, never before it: `done` carries the message_content the
+            # client persists, and an await placed ahead of it would put a SQLite busy wait
+            # (up to the 5s default, whenever the nightly analysis job holds the write lock)
+            # and a fresh cancellation point between the answer and its delivery. The
+            # consumer in chat_api iterates this generator with a plain `async for` and no
+            # `break`, so it is driven one step past this yield and the write still runs.
+            #
+            # Otherwise deliberately here and nowhere else: one metrics row exists exactly
+            # when one "Chat complete" line exists, so the two can never disagree. A turn
+            # that ended abnormally (exception, timeout, client disconnect) reaches neither
+            # and is recorded by neither — its accumulators are partial and would bias the
+            # cost-per-turn figures the benchmark gates on. A turn stopped by max_iterations
+            # does reach both and is recorded: those are the expensive tail this exists to
+            # measure.
+            await self._record_turn_metrics(
+                secret=secret,
+                session_id=session_id,
+                message_id=message_id,
+                user_id=user,
+                iterations=iteration,
+                tool_call_count=tool_call_count,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_read_tokens=total_cache_read,
+                cache_create_tokens=total_cache_create,
+                cost_usd=total_cost,
+                wall_ms=int((time.monotonic() - turn_started) * 1000),
+                tool_profile=tool_profile,
+                model=model,
+            )
+
         except asyncio.TimeoutError:
             logger.error("Anthropic streaming timed out after 300s")
             raise
         except Exception as e:
             logger.error(f"Error streaming Anthropic chat: {e}")
             raise
+
+    async def _record_turn_metrics(self, *, secret: bool, **fields: Any) -> None:
+        """Persist one completed turn's cost and roundtrip profile, best effort.
+
+        Secret chat is skipped outright, before the database is even reached. The promise
+        attached to it is that the conversation leaves no trace, and the same rule that
+        keeps chat_messages empty has to keep this table empty: iteration counts and costs
+        are not content, but a row keyed to a session id still says a conversation happened
+        and how expensive it was.
+
+        Everything else is swallowed. This runs inside a live SSE generator, so an
+        exception here would truncate an answer the user already paid for — telemetry is
+        never worth that. The write goes to a worker thread because chat_history.db lives
+        on a ReadWriteOnce volume shared with the nightly analysis job: SQLite will block
+        for its busy timeout when that job holds the write lock, and blocking the event
+        loop would stall every other stream in this process, not just this one.
+        """
+        if secret:
+            return
+        try:
+            from genetics_mcp_server.db.chat_history_db import get_chat_history_db
+
+            await asyncio.to_thread(
+                lambda: get_chat_history_db().record_turn_metrics(**fields)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record turn metrics: {e}")
 
     async def _execute_tool(
         self,

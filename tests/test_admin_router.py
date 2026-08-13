@@ -16,6 +16,8 @@ from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
 from genetics_mcp_server.db.llm_config_db import LLMConfigDB
 from genetics_mcp_server.db.singleton import Singleton
 
+INTERNAL_SECRET = "test-internal-secret"
+
 
 @pytest.fixture
 def test_db():
@@ -290,6 +292,9 @@ class TestAdminAuthGuards:
                 REQUIRE_AUTH="true",
                 ADMIN_USERS="admin@example.com",
                 ENABLE_ADMIN_PAGE="true",
+                # a REQUIRE_AUTH deployment with no internal secret refuses to start since
+                # genetics-results-suite-618, and TestClient's context manager runs the lifespan
+                INTERNAL_API_SECRET="startup-guard",
             ):
                 with TestClient(app) as client:
                     response = client.get("/chat/v1/admin/sessions")
@@ -331,14 +336,23 @@ class TestAdminAuthGuards:
         still holding its import-time False, served that same user every admin endpoint
         (genetics-results-suite-pol).
         """
+        # the identity header needs the trusted-proxy marker alongside it since
+        # genetics-results-suite-th2; without it admin membership was decided from a string any
+        # pod could send. The None rows stay credential-less on purpose — that is the 401 row.
         headers = (
-            {"X-Goog-Authenticated-User-Email": f"accounts.google.com:{user}"} if user else {}
+            {
+                "X-Goog-Authenticated-User-Email": f"accounts.google.com:{user}",
+                "Authorization": f"Bearer {INTERNAL_SECRET}",
+            }
+            if user
+            else {}
         )
         with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=seeded_db):
             with settings_env(
                 REQUIRE_AUTH=require_auth,
                 ADMIN_USERS="admin@example.com",
                 ENABLE_ADMIN_PAGE="true",
+                INTERNAL_API_SECRET=INTERNAL_SECRET,
             ):
                 with TestClient(app) as client:
                     reported = client.get("/chat/v1/auth", headers=headers).json()["is_admin"]
