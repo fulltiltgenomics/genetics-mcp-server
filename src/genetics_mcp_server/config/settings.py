@@ -429,4 +429,22 @@ def require_internal_api_secret(component: str) -> str:
             "the variable unset and the pod starts — which is how you get here. chat-backend's "
             "does NOT, so a missing key stops that pod at CreateContainerConfigError instead."
         )
+    # genetics-results-suite-ctq: the secret must be ASCII, and this is where that becomes real
+    # rather than documented. Measured off a real socket, HTTP clients disagree on how to put a
+    # non-ASCII header value on the wire — node fetch/undici and python-requests send latin-1,
+    # aiohttp sends utf-8, httpx 0.28 (this process's own client) refuses to send one at all —
+    # so no server-side codec recovers the same secret from every caller and `is_internal_caller`
+    # would be well defined for none of them. Checked here rather than in `Settings` on purpose:
+    # the same reasoning as above applies, an unset secret is legitimate for a local run and for
+    # the sandbox image, so only the deployed entrypoints enforce anything. The failure mode is
+    # the good one — the pod fails readiness and the rollout stalls with the old pods still
+    # serving, instead of every internal call 401ing at request time with no local signal.
+    if not secret.isascii():
+        raise RuntimeError(
+            "INTERNAL_API_SECRET contains non-ASCII characters. HTTP clients disagree on how "
+            "to encode a non-ASCII header value (node/undici and python-requests send latin-1, "
+            "aiohttp sends utf-8, httpx refuses to send one at all), so no server-side decoding "
+            "recovers the same secret from every caller. Set INTERNAL_API_SECRET to an ASCII "
+            "value — scripts/create-secrets.sh generates one with `openssl rand -base64 32`."
+        )
     return secret

@@ -207,6 +207,21 @@ class TestTheStartupGuard:
         with settings_env(INTERNAL_API_SECRET=SECRET):
             assert require_internal_api_secret("a service") == SECRET
 
+    def test_the_helper_refuses_a_non_ascii_secret(self):
+        """genetics-results-suite-ctq: HTTP clients disagree on how to put a non-ASCII header
+        value on the wire (node/undici and requests send latin-1, aiohttp utf-8, httpx refuses
+        outright), so no codec makes `is_internal_caller` well defined for every caller. The
+        ASCII invariant is enforced here rather than merely documented — but only where the
+        secret is already required, so an absent one still takes the message above and a local
+        run that sets none is untouched."""
+        from genetics_mcp_server.config import require_internal_api_secret
+
+        with settings_env(INTERNAL_API_SECRET="sécret"):
+            with pytest.raises(RuntimeError, match="non-ASCII"):
+                require_internal_api_secret("a service")
+        with settings_env(INTERNAL_API_SECRET=SECRET):
+            assert require_internal_api_secret("a service") == SECRET
+
     def test_chat_backend_refuses_to_start_without_it(self):
         """The whole point: a crash-looping pod with a message, not a working pod making
         anonymous requests."""

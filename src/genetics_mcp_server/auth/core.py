@@ -39,17 +39,34 @@ def is_internal_caller(request: Request) -> bool:
     if not secret:
         return False
     # compare as bytes: compare_digest on str raises TypeError for non-ASCII, and a 500 from a
-    # forged header would be a worse failure mode than a 401
+    # forged header would be a worse failure mode than a 401.
+    #
+    # The two codecs differ on purpose — do not "fix" the latin-1 ones to utf-8. Starlette
+    # decodes raw header bytes as latin-1, so re-encoding a header value with latin-1 undoes
+    # that decode exactly; utf-8 would re-encode the mojibake instead (b"s\xc3\xa9cret" comes
+    # back out as b"s\xc3\x83\xc2\xa9cret").
+    #
+    # It does NOT recover "the bytes the client sent" in general: measured off a real socket
+    # the clients disagree with each other — node fetch/undici and python-requests put latin-1
+    # on the wire, aiohttp puts utf-8, and httpx 0.28 (this process's own client) refuses to
+    # send a non-ASCII header value at all. No codec is right for all of them, so under a
+    # hypothetical non-ASCII secret this pairing would favour the aiohttp-shaped caller and 401
+    # the others. What makes the comparison well defined is the ASCII invariant enforced by
+    # config.require_internal_api_secret at startup; every codec coincides on ASCII.
+    #
+    # No try/except on the re-encodes, unlike results-api's is_internal_caller: this takes a
+    # starlette Request, so the only strs it can see came from starlette's own latin-1 decode
+    # and re-encode by construction. Add the guard if a str-taking entry point is introduced.
     expected = secret.encode("utf-8")
 
     marker = request.headers.get(INTERNAL_MARKER_HEADER)
-    if marker and hmac.compare_digest(marker.encode("utf-8"), expected):
+    if marker and hmac.compare_digest(marker.encode("latin-1"), expected):
         return True
 
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
         return False
-    return hmac.compare_digest(auth_header[7:].encode("utf-8"), expected)
+    return hmac.compare_digest(auth_header[7:].encode("latin-1"), expected)
 
 
 def _email_allowed(email: str) -> bool:

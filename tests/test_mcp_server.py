@@ -475,6 +475,34 @@ class TestBearerAuthMiddleware:
         assert any(m.get("status") == 401 for m in messages)
 
     @pytest.mark.asyncio
+    async def test_undecodable_query_string_is_401_not_500(self, monkeypatch):
+        """A query string that is not valid utf-8 must fail closed like the header does.
+
+        The ASGI query string is raw bytes; decoding it unguarded raises UnicodeDecodeError out
+        of the middleware, where nothing turns it into a response. Built as a scope because
+        httpx will not put these bytes in a URL, and the branch only exists when opted in.
+        """
+        from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
+
+        monkeypatch.setenv("MCP_ALLOW_QUERY_TOKEN", "true")
+        monkeypatch.setattr(
+            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
+        )
+
+        call_log: list[dict] = []
+
+        async def inner_app(scope, receive, send):
+            call_log.append(scope)
+
+        app = _wrap_with_bearer_auth(inner_app, [self.VALID_KEY])
+        scope = self._make_scope(query_string=b"token=\xff")
+
+        messages = await self._collect_response(app, scope)
+
+        assert len(call_log) == 0, "Inner app should NOT have been called"
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
     async def test_missing_both_header_and_query_param(self, wrapped_app):
         """No auth credentials at all should return 401."""
         app, call_log = wrapped_app

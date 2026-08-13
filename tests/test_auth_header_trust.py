@@ -108,6 +108,54 @@ class TestHeaderAloneIsNotACredential:
         assert core.is_internal_caller(req) is False
         assert core.is_internal_caller(_request({"X-Internal-Auth": "säkerhet"})) is False
 
+    def test_non_ascii_secret_compares_the_bytes_actually_sent(self):
+        """Starlette decodes raw header bytes as latin-1, so re-encoding the presented
+        credential with utf-8 compared mojibake against the secret. latin-1 undoes that decode
+        exactly — for a caller that put utf-8 on the wire, which is what `_request` builds; see
+        `test_which_wire_bytes_authenticate_a_non_ascii_secret` for the callers that do not."""
+        secret = "sécret"
+        with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET=secret):
+            assert core.is_internal_caller(_request({"Authorization": f"Bearer {secret}"})) is True
+            assert core.is_internal_caller(_request({core.INTERNAL_MARKER_HEADER: secret})) is True
+            assert core.is_internal_caller(_request({"Authorization": "Bearer sekret"})) is False
+
+    def test_which_wire_bytes_authenticate_a_non_ascii_secret(self):
+        """Pin the accept/reject map over RAW wire bytes — what genetics-results-suite-ctq
+        changed, and what no other test covers.
+
+        Hand-built ASGI scope because TestClient cannot express it: `starlette/testclient.py`
+        does `value.encode()` (utf-8) on httpx's already-decoded header str, so latin-1 wire
+        bytes are rewritten to utf-8 before the app sees them and both cases below would look
+        identical. `require_internal_api_secret` refuses a non-ASCII secret at startup, so this
+        map is unreachable in a deployment; the comparison is still reachable, so it is pinned
+        at that level.
+        """
+
+        def _raw(raw: bytes) -> Request:
+            return Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/chat/v1/me",
+                    "headers": [(b"authorization", raw)],
+                }
+            )
+
+        with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET="sécret"):
+            # utf-8 on the wire (aiohttp-shaped): authenticates now, 401 before ctq
+            assert core.is_internal_caller(_raw(b"Bearer s\xc3\xa9cret")) is True
+            # latin-1 on the wire (node/undici- and requests-shaped): 401 now, was accepted
+            assert core.is_internal_caller(_raw(b"Bearer s\xe9cret")) is False
+
+    def test_ascii_secret_is_unaffected(self, prod_auth):
+        """The codecs agree on ASCII, so the deployed shape behaves exactly as before."""
+        assert core.is_internal_caller(
+            _request({"Authorization": f"Bearer {INTERNAL_SECRET}"})
+        ) is True
+        assert core.is_internal_caller(
+            _request({core.INTERNAL_MARKER_HEADER: INTERNAL_SECRET})
+        ) is True
+
 
 # ---------------------------------------------------------------------------
 # the precedence table

@@ -283,7 +283,16 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
     def _token_is_valid(token: str) -> bool:
         # compare as bytes, like auth/core.py: compare_digest on a str containing non-ASCII
         # raises TypeError, and this runs in raw ASGI middleware with nothing above it to
-        # translate that into a response — a bad credential would be a 500 rather than a 401
+        # translate that into a response — a bad credential would be a 500 rather than a 401.
+        #
+        # utf-8 on BOTH sides here, unlike auth/core.py's latin-1 presented side, and that is
+        # not an inconsistency to fix: no starlette is involved on this path. The caller above
+        # decodes the raw ASGI header bytes itself, with utf-8, so re-encoding with utf-8
+        # reproduces the wire bytes exactly and anything undecodable is already a 401 before it
+        # reaches this line. Switching only the encode would raise UnicodeEncodeError — a 500,
+        # the failure this comment exists to prevent — and switching the decode and the encode
+        # together would not change which tokens are accepted at all (the expected side is
+        # valid utf-8 by construction), only where an undecodable value is rejected.
         token_bytes = token.encode("utf-8")
         if any(hmac.compare_digest(token_bytes, key.encode("utf-8")) for key in api_keys):
             return True
@@ -359,7 +368,14 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                 # browser history, and Referer on any outbound link. Off by default now; set
                 # MCP_ALLOW_QUERY_TOKEN=true only for a client that genuinely cannot send the
                 # Authorization header.
-                query_string = scope.get("query_string", b"").decode()
+                try:
+                    query_string = scope.get("query_string", b"").decode()
+                except UnicodeDecodeError:
+                    # same reasoning as the authorization header above: the ASGI query string
+                    # is arbitrary bytes and need not be valid utf-8, and raising here escapes
+                    # the middleware as a 500 rather than the 401 an undecodable credential
+                    # deserves. An empty string finds no token and falls through to that 401.
+                    query_string = ""
                 params = parse_qs(query_string)
                 token_values = params.get("token", [])
                 token = token_values[0] if token_values else None
