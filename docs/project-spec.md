@@ -274,6 +274,37 @@ reasoning, but it is written across categories — its list also names `general`
 such as `create_phewas_plot`, which was never one of the 44 — so it is not a substitute for
 the four named here.
 
+The four are excluded deliberately, but not for one shared reason, and the axis that separates
+them is **not** whether the endpoint computes something server-side. It is whether the rows the
+answer is built from sit somewhere a sandboxed script can read.
+
+`analyze_variant_list` is a rollup over endpoints the SDK already wraps, so a script composes it
+from primitives. `get_credible_sets_stats` aggregates nothing server-side at all — results-api
+streams a pre-generated TSV out of GCS, the same storage pattern as the phenotype report — yet
+its underlying rows are `credible_sets_v`, which `sql()` reaches, so a script can compute the
+same class of counts itself. Read "itself" strictly: the view carries the PIP, effect-size and
+consequence columns the counts are built from, but the upstream's risk/protective convention
+(taking the sign of the lead variant's beta is an inference, not a documented rule) and which
+consequence terms it treats as coding versus loss-of-function are published nowhere the script
+can see. Expect a script to produce defensible statistics, not necessarily *these* numbers.
+
+`get_myvariant_annotations` is the one genuine unavailability: it targets a third-party host,
+and no third-party target is permitted by the sandbox egress policy, so a wrapper for it would
+be a function that cannot connect. `get_phenotype_report` is **not** in that class, and an
+earlier version of this passage was wrong to put it there. Its gene scores and tier assignments
+exist in no allow-listed view, so a script cannot recompute them — but results-api is a
+permitted egress target, results-api is what serves the markdown, and the sandbox's credential
+is not scoped per route, so the document is reachable from a script by a hand-rolled HTTP call.
+What the SDK's omission costs is the affordance, not the data: neither the SDK nor the sandbox
+stubs name that route, so a model would have to invent the request rather than call something
+put in front of it. That is a discoverability and convenience asymmetry, not an availability
+one, and inventing the call is not the intended way to use the sandbox.
+`genetics-results-suite-4h6.23` should still exclude or explicitly book questions that lean on
+either tool — but for those two different reasons, and without scoring the code-execution arm
+down as though both were unreachable. The egress allow-list and the credential's scope are
+specified and maintained in `genetics-results-suite` `docs/code-execution-security.md`; treat
+that document as the authority for both rather than the summary here, which will age.
+
 ```python
 import genetics_mcp_server.sdk as genetics
 import polars as pl
@@ -344,9 +375,12 @@ via the `X-Columns` response header results-api added for
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
 cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
-`analyze_variant_list`, `get_phenotype_report`, `get_credible_sets_stats`). The first group is
+`analyze_variant_list`, `get_credible_sets_stats`) and `get_phenotype_report`. The first group is
 not genetics-results data; the second is model-facing summarisation that a script writes for
-itself.
+itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
+scores and tier flags are in no view a script can query, so a script cannot write the report for
+itself — it can only fetch the document results-api serves. See the SDK coverage passage above
+for why that is a discoverability gap rather than an unreachable one.
 
 `credible_sets`, `summary_stats` and `gene_burden` all return trait **codes** (`I9_CHD`), and
 `search(kind="phenotypes")` is the fuzzy ranked index rather than a lookup, so
