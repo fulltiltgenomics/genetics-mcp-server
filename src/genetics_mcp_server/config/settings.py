@@ -395,3 +395,38 @@ def model_rejects_disabled_thinking(model: str) -> bool:
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def require_internal_api_secret(component: str) -> str:
+    """The internal credential, or a startup failure that names the variable.
+
+    genetics-results-suite-618: every call this process makes to results-api and db-api goes
+    through one client whose header is built as "bearer if the secret is set, nothing if it is
+    not". With the variable unset that fallback is silent, it happens at request time rather
+    than at startup, and it is invisible at the far end — on a route that resolves no principal
+    an anonymous caller's usage log row is identical to an internal one's (measured: 246/246
+    NULL user_email on GET /api/v1/rsid/variants over 90 days). results-api now refuses a
+    credential-less request on every data-path route (`ANONYMOUS_SURFACE_MINIMAL`,
+    genetics-results-suite-rhh), so the same misconfiguration would present as an unexplained
+    401 on every tool call with nothing local saying why.
+
+    Deployed entrypoints call this so the pod fails immediately and says which variable is
+    missing. Deliberately NOT enforced at import, in `Settings`, or in `ToolExecutor`: a local
+    run against an unauthenticated results-api needs no secret (README documents it as
+    optional), and the sandbox image holds no internal credential BY DESIGN — see
+    `_PrunedInstallSettings` in tools/executor.py. The contract being enforced is
+    genetics-results-suite-4h6.9's "a deployed service never falls back to no credential", not
+    "this variable is always set".
+    """
+    secret = get_settings().internal_api_secret
+    if not secret.strip():
+        raise RuntimeError(
+            f"INTERNAL_API_SECRET is unset or empty, so {component} would send every call to "
+            "results-api and db-api with no Authorization header at all — anonymously, and "
+            "invisibly in their logs. Set INTERNAL_API_SECRET (in the cluster: the "
+            "internal-api-secret key of the genetics-secrets Secret). Only the mcp-server "
+            "Deployment marks that secretKeyRef optional: true, so a missing key there leaves "
+            "the variable unset and the pod starts — which is how you get here. chat-backend's "
+            "does NOT, so a missing key stops that pod at CreateContainerConfigError instead."
+        )
+    return secret

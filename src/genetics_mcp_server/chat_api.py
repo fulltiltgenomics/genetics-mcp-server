@@ -29,7 +29,7 @@ from genetics_mcp_server.logging_config import setup_logging
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
 from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
-from genetics_mcp_server.config import get_settings
+from genetics_mcp_server.config import get_settings, require_internal_api_secret
 from genetics_mcp_server.config.defaults import (
     default_system_prompt,
     instruction_envelope,
@@ -194,6 +194,13 @@ def _validate_latest_message(messages: list["ChatMessage"]) -> None:
 async def lifespan(app: FastAPI):
     """Manage application lifecycle."""
     logger.info("Starting chat API server")
+    # chat-backend runs the tool executor IN-PROCESS, so every results-api and db-api call it
+    # makes carries INTERNAL_API_SECRET — or, until genetics-results-suite-618, no credential at
+    # all and no signal that it was missing. Gated on require_auth because that is what
+    # distinguishes a deployment from a local run against an open results-api: REQUIRE_AUTH is
+    # "true" in k8s/deployments/chat-backend.yaml and false everywhere else.
+    if get_settings().require_auth:
+        require_internal_api_secret("chat-backend")
     configure_rate_limit(
         max_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", "20")),
         max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "100")),

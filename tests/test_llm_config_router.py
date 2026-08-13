@@ -614,6 +614,9 @@ class TestToolDescriptionAuthGuards:
                 REQUIRE_AUTH="true",
                 ADMIN_USERS="admin@example.com",
                 ENABLE_ADMIN_PAGE="true",
+                # a REQUIRE_AUTH deployment with no internal secret refuses to start since
+                # genetics-results-suite-618, and TestClient's context manager runs the lifespan
+                INTERNAL_API_SECRET="startup-guard",
             ):
                 with TestClient(app) as client:
                     kwargs = {"json": payload} if payload is not None else {}
@@ -632,6 +635,9 @@ class TestToolDescriptionAuthGuards:
                 REQUIRE_AUTH="true",
                 ADMIN_USERS="admin@example.com",
                 ENABLE_ADMIN_PAGE="true",
+                # a REQUIRE_AUTH deployment with no internal secret refuses to start since
+                # genetics-results-suite-618, and TestClient's context manager runs the lifespan
+                INTERNAL_API_SECRET="startup-guard",
             ):
                 with TestClient(app) as client:
                     response = client.put(
@@ -655,6 +661,9 @@ class TestToolDescriptionAuthGuards:
                 REQUIRE_AUTH="true",
                 ADMIN_USERS="admin@example.com",
                 ENABLE_ADMIN_PAGE="true",
+                # a REQUIRE_AUTH deployment with no internal secret refuses to start since
+                # genetics-results-suite-618, and TestClient's context manager runs the lifespan
+                INTERNAL_API_SECRET="startup-guard",
             ):
                 with TestClient(app) as client:
                     response = client.get("/chat/v1/llm-config/user/instruction-sets")

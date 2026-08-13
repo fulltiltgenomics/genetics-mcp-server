@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import TransportSecuritySettings
 
-from genetics_mcp_server.config.settings import get_settings
+from genetics_mcp_server.config.settings import get_settings, require_internal_api_secret
 from genetics_mcp_server.tools.definitions import register_mcp_tools
 from genetics_mcp_server.tools.executor import ToolExecutor
 
@@ -242,6 +242,13 @@ def _validate_user_token(token: str) -> bool:
         return False
     try:
         import httpx
+        # same silent-fallback shape as tools/executor.py (genetics-results-suite-618): with the
+        # secret unset this posts to chat-backend with no Authorization header at all. On the
+        # remote transports `main()` calls require_internal_api_secret() before serving, so the
+        # process cannot reach here in that state. It is NOT covered for a stdio server that has
+        # CHAT_BACKEND_URL set and no secret — stdio takes no MCP_API_KEY and runs no guard —
+        # which is a local-dev shape talking to a local chat-backend, hence left as a fallback
+        # rather than a startup failure.
         internal_secret = get_settings().internal_api_secret
         headers = {"Authorization": f"Bearer {internal_secret}"} if internal_secret else {}
         resp = httpx.post(
@@ -468,6 +475,12 @@ def main():
         if not api_key_env:
             logger.error("MCP_API_KEY is required for remote transports — refusing to start without authentication")
             sys.exit(1)
+        # same reasoning one line up, for the credential this server SENDS rather than the one
+        # it accepts: a remote-transport server is a deployed service, and its tools are HTTP
+        # calls to results-api and db-api. Without the secret every one of them would go out
+        # with no Authorization header (genetics-results-suite-618), which results-api now
+        # answers 401 — a misconfiguration that would present as a far-end auth failure.
+        require_internal_api_secret("the MCP server")
         api_keys = [k.strip() for k in api_key_env.split(",") if k.strip()]
         app = _wrap_with_bearer_auth(app, api_keys)
         logger.info(f"Bearer token authentication enabled ({len(api_keys)} key(s))")

@@ -287,10 +287,29 @@ class ToolExecutor:
             with self._client_lock:
                 client = self.__dict__.get("client")
                 if client is None:
-                    api_secret = _resolve_settings().internal_api_secret
+                    settings = _resolve_settings()
+                    api_secret = settings.internal_api_secret
                     headers = (
                         {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
                     )
+                    if not api_secret and settings is not _PRUNED_INSTALL_SETTINGS:
+                        # NOT raising, and not silent either (genetics-results-suite-618).
+                        # Raising here would break a local run against an unauthenticated
+                        # results-api, which README documents as supported; the deployed
+                        # entrypoints call config.require_internal_api_secret() at startup so a
+                        # pod in this state never reaches this line. What is left is a
+                        # developer's own machine, where a bare 401 from results-api is the only
+                        # other symptom and does not name the cause.
+                        # The pruned install is excluded because credential-less is its DESIGN,
+                        # not a misconfiguration: the sandbox holds no internal secret and gets
+                        # a per-execution token instead (genetics-results-suite-4h6.9 / .14).
+                        logger.warning(
+                            "INTERNAL_API_SECRET is unset; calls to %s and %s will be sent with "
+                            "no Authorization header and will be refused by any deployment that "
+                            "requires authentication",
+                            self.base_url,
+                            self.bigquery_url or "the BigQuery API",
+                        )
                     client = _ResilientAsyncClient(timeout=300.0, headers=headers)
                     self.__dict__["client"] = client
         return client

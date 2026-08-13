@@ -24,7 +24,7 @@ All environment variables are optional but needed for each type of functionality
 |----------|-------------|---------|
 | `GENETICS_API_URL` | Base URL for [genetics-results-api](https://github.com/fulltiltgenomics/genetics-results-api) server | `http://0.0.0.0:2000/api` |
 | `BIGQUERY_API_URL` | Base URL for [genetics-results-db](https://github.com/fulltiltgenomics/genetics-results-db) server | - |
-| `INTERNAL_API_SECRET` | Shared secret sent as a bearer token on every call to `GENETICS_API_URL` and `BIGQUERY_API_URL`, for deployments where those services require internal auth | - |
+| `INTERNAL_API_SECRET` | Shared secret sent as a bearer token on every call to `GENETICS_API_URL` and `BIGQUERY_API_URL`. Optional only for a local run against services that require no internal auth — the remote-transport MCP server and the chat API with `REQUIRE_AUTH=true` refuse to start without it, rather than making anonymous calls | - |
 | `ANTHROPIC_API_KEY` | Anthropic API key (for chat) | - |
 | `OPENAI_API_KEY` | OpenAI API key (for chat) | - |
 | `PERPLEXITY_API_KEY` | Perplexity API key (for literature search, the default backend) | - |
