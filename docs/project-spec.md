@@ -379,8 +379,31 @@ cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
 not genetics-results data; the second is model-facing summarisation that a script writes for
 itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
 scores and tier flags are in no view a script can query, so a script cannot write the report for
-itself — it can only fetch the document results-api serves. See the SDK coverage passage above
-for why that is a discoverability gap rather than an unreachable one.
+itself — it can only fetch the document results-api serves.
+
+**"Not in the SDK" does not mean "not reachable", and this list is not an enforcement boundary.**
+`GeneticsClient` keeps the full `ToolExecutor` on `._executor` — and reaching it needs no client
+at all: `tools/executor.py` is on `sandbox/prune_venv.py`'s `SDK_ALLOWLIST` (it ships because
+`sdk/client.py` imports `ToolExecutor` directly), so a sandboxed script can simply
+`from genetics_mcp_server.tools.executor import ToolExecutor` and construct its own. httpx ships
+too, as the SDK's own transport. The leading underscore is **curation, not enforcement**: it marks
+the executor as outside the curated surface so that a reader or a model does not treat it as a
+recommended entry point, and it should never be cited as a control. The containment boundary, **as
+specified**, is the sandbox's deny-by-default **network egress allow-list** (db-api and results-api
+only) in `genetics-results-suite` `docs/code-execution-security.md` — specified rather than live:
+the sandbox is not deployed, and that policy stays decoration until `genetics-results-suite-4h6.7`
+ships a Deployment carrying the labels it selects.
+
+Reachability therefore divides this list along a different axis than the one that put tools on
+it. The third-party tools **are** genuinely unreachable from a sandboxed script — but for the
+network reason, not the SDK one: no permitted egress target serves myvariant.info, Europe PMC,
+MGI, cBioPortal, UniProt or a web-search API (Perplexity/Tavily), so reaching
+`get_myvariant_annotations` through `._executor` still fails to connect. The presentation tools and `get_phenotype_report` are **reachable**: results-api is a
+permitted target and the sandbox credential is not scoped per route, so `._executor` or a
+hand-rolled httpx call gets them. For those, what the omission costs is the affordance and not
+the data — the discoverability and convenience asymmetry the SDK coverage passage above
+describes, not an availability one. Same list, two different reasons, and the reason is the
+point (`genetics-results-suite-4h6.33`).
 
 `credible_sets`, `summary_stats` and `gene_burden` all return trait **codes** (`I9_CHD`), and
 `search(kind="phenotypes")` is the fuzzy ranked index rather than a lookup, so

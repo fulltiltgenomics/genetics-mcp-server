@@ -145,10 +145,30 @@ class GeneticsClient:
         # the extra key would otherwise land in the MCP tool payload and the chat
         # backend's model input. An INJECTED executor keeps whatever it was built with,
         # so an empty results-api result through one falls back to a bare empty frame.
-        self.executor = executor or ToolExecutor(row_limit=None, expose_columns=True)
+        #
+        # THE UNDERSCORE IS CURATION, NOT ENFORCEMENT. It marks the executor as "not part
+        # of the curated SDK surface" so that neither a reader nor a model treats it as a
+        # recommended entry point — it does NOT make it unreachable, and nothing here
+        # should ever be cited as though it did. `_executor` is one attribute access away
+        # from every unwrapped tool method on the same authenticated client, and a script
+        # needs no client at all to get one: `tools/executor.py` is on the SDK_ALLOWLIST in
+        # genetics-results-suite `sandbox/prune_venv.py` (it must ship because this module
+        # imports ToolExecutor directly), so sandboxed code can just
+        # `from genetics_mcp_server.tools.executor import ToolExecutor` and build its own.
+        # `tools/uniprot.py` is on that same allow-list — a third-party HTTP client ships
+        # into the image — so "the third-party tools are unreachable" rests ENTIRELY on
+        # egress, with no second layer pruning them out.
+        # The real containment boundary, AS SPECIFIED rather than as deployed (the sandbox
+        # is not running and the policy is decoration until genetics-results-suite-4h6.7
+        # ships a Deployment with the labels it selects), is the sandbox's NETWORK EGRESS
+        # ALLOW-LIST — deny-by-default, permitting only db-api:8080 and results-api:4000 —
+        # specified in genetics-results-suite `docs/code-execution-security.md`. The
+        # constructor PARAMETER stays public (`executor=`) because in-process callers
+        # legitimately inject a configured one.
+        self._executor = executor or ToolExecutor(row_limit=None, expose_columns=True)
 
     async def close(self) -> None:
-        await self.executor.close()
+        await self._executor.close()
 
     # ------------------------------------------------------------------ plumbing
 
@@ -232,7 +252,7 @@ class GeneticsClient:
                 leads_only=leads_only,
             )
             return self._rows(
-                await self.executor.get_credible_set_by_id(
+                await self._executor.get_credible_set_by_id(
                     resource or "finngen", phenotype, credible_set_id
                 ),
                 key="variants",
@@ -251,7 +271,7 @@ class GeneticsClient:
             _reject(f"credible_sets({key}=...)", data_types=data_types)
 
         if key == "gene":
-            result = await self.executor.get_credible_sets_by_gene(
+            result = await self._executor.get_credible_sets_by_gene(
                 value,
                 window=500_000 if window is None else window,
                 resource=resource,
@@ -259,23 +279,23 @@ class GeneticsClient:
                 summarize=False,
             )
         elif key == "qtl_gene":
-            result = await self.executor.get_credible_sets_by_qtl_gene(
+            result = await self._executor.get_credible_sets_by_qtl_gene(
                 value, data_types=data_types, resource=resource, summarize=False
             )
         elif key == "variant":
-            result = await self.executor.get_credible_sets_by_variant(
+            result = await self._executor.get_credible_sets_by_variant(
                 value, resource=resource, data_types=data_types, summarize=False
             )
         elif key == "region":
-            result = await self.executor.get_credible_sets_by_region(
+            result = await self._executor.get_credible_sets_by_region(
                 value, resource=resource, coding_only=coding_only, summarize=False
             )
         elif leads_only:
-            result = await self.executor.get_credible_set_leads_by_phenotype(
+            result = await self._executor.get_credible_set_leads_by_phenotype(
                 value, resource=resource or "finngen"
             )
         else:
-            result = await self.executor.get_credible_sets_by_phenotype(
+            result = await self._executor.get_credible_sets_by_phenotype(
                 value, resource=resource or "finngen", summarize=False
             )
         return self._rows(result)
@@ -297,13 +317,13 @@ class GeneticsClient:
                 raise GeneticsUsageError("credible_set_id requires phenotype")
             _reject("colocalization(credible_set_id=...)", variant=variant)
             return self._rows(
-                await self.executor.get_colocalization_by_credible_set(
+                await self._executor.get_colocalization_by_credible_set(
                     resource or "finngen", phenotype, credible_set_id, dual_format=dual_format
                 )
             )
         _one_of(variant=variant)
         _reject("colocalization(variant=...)", resource=resource, dual_format=dual_format)
-        return self._rows(await self.executor.get_colocalization(variant))
+        return self._rows(await self._executor.get_colocalization(variant))
 
     # ------------------------------------------------------------------ exome / burden
 
@@ -324,17 +344,17 @@ class GeneticsClient:
         if key != "phenotype":
             _reject(f"exome({key}=...)", resource=resource)
         if key == "gene":
-            result = await self.executor.get_exome_results_by_gene(value)
+            result = await self._executor.get_exome_results_by_gene(value)
         elif key == "variant":
-            result = await self.executor.get_exome_results_by_variant(
+            result = await self._executor.get_exome_results_by_variant(
                 value, resources=_csv(resources)
             )
         elif key == "region":
-            result = await self.executor.get_exome_results_by_region(
+            result = await self._executor.get_exome_results_by_region(
                 value, resources=_csv(resources)
             )
         else:
-            result = await self.executor.get_exome_results_by_phenotype(
+            result = await self._executor.get_exome_results_by_phenotype(
                 resource or "finngen", value
             )
         return self._rows(result)
@@ -350,9 +370,9 @@ class GeneticsClient:
         key, value = _one_of(gene=gene, phenotype=phenotype)
         if key == "gene":
             _reject("gene_burden(gene=...)", resource=resource)
-            result = await self.executor.get_gene_based_results(value)
+            result = await self._executor.get_gene_based_results(value)
         else:
-            result = await self.executor.get_gene_based_results_by_phenotype(
+            result = await self._executor.get_gene_based_results_by_phenotype(
                 resource or "finngen", value
             )
         return self._rows(result)
@@ -404,13 +424,13 @@ class GeneticsClient:
             )
             phenotypes = [value] if isinstance(value, str) else list(value)
             return self._rows(
-                await self.executor.get_hla_by_phenotype(
+                await self._executor.get_hla_by_phenotype(
                     phenotypes, genes=_csv(genes), resource=resource
                 )
             )
         _reject("hla(allele=...)", genes=_csv(genes))
         return self._rows(
-            await self.executor.get_hla_by_allele(
+            await self._executor.get_hla_by_allele(
                 value,
                 min_mlogp=7.3 if min_mlogp is None else min_mlogp,
                 min_info=0.5 if min_info is None else min_info,
@@ -439,9 +459,9 @@ class GeneticsClient:
         """
         key, value = _one_of(variant=variant, gene=gene)
         if key == "variant":
-            result = await self.executor.get_asm_qtl_by_variant(value, resources=_csv(resources))
+            result = await self._executor.get_asm_qtl_by_variant(value, resources=_csv(resources))
         else:
-            result = await self.executor.get_asm_qtl_by_gene(
+            result = await self._executor.get_asm_qtl_by_gene(
                 value,
                 resources=_csv(resources),
                 window=window,
@@ -469,20 +489,20 @@ class GeneticsClient:
         """
         key, value = _one_of(variant=variant, region=region, peak=peak, gene=gene)
         if key == "variant":
-            result = await self.executor.get_open_chromatin_by_variant(
+            result = await self._executor.get_open_chromatin_by_variant(
                 value, resources=_csv(resources)
             )
         elif key == "region":
             chrom, start, end = parse_region(value)
-            result = await self.executor.get_open_chromatin_by_region(
+            result = await self._executor.get_open_chromatin_by_region(
                 chrom, start, end, resources=_csv(resources)
             )
         elif key == "peak":
-            result = await self.executor.get_open_chromatin_by_peak(
+            result = await self._executor.get_open_chromatin_by_peak(
                 value, resources=_csv(resources)
             )
         else:
-            result = await self.executor.get_open_chromatin_by_gene(
+            result = await self._executor.get_open_chromatin_by_gene(
                 value,
                 resources=_csv(resources),
                 window=window,
@@ -502,7 +522,7 @@ class GeneticsClient:
         """Open4Gene peak-to-gene links, from either end."""
         key, value = _one_of(peak=peak, gene=gene)
         method = (
-            self.executor.get_peak_to_genes if key == "peak" else self.executor.get_gene_to_peaks
+            self._executor.get_peak_to_genes if key == "peak" else self._executor.get_gene_to_peaks
         )
         return self._rows(
             await method(value, resources=_csv(resources), gencode_version=gencode_version)
@@ -525,11 +545,11 @@ class GeneticsClient:
         """
         key, value = _one_of(variant=variant, gene=gene)
         if key == "variant":
-            result = await self.executor.get_variant_effect_by_variant(
+            result = await self._executor.get_variant_effect_by_variant(
                 value, resources=_csv(resources)
             )
         else:
-            result = await self.executor.get_variant_effect_by_gene(
+            result = await self._executor.get_variant_effect_by_gene(
                 value,
                 resources=_csv(resources),
                 window=window,
@@ -556,14 +576,14 @@ class GeneticsClient:
         """
         key, value = _one_of(variant=variant, region=region, gene=gene)
         if key == "variant":
-            result = await self.executor.get_mpra_by_variant(value, resources=_csv(resources))
+            result = await self._executor.get_mpra_by_variant(value, resources=_csv(resources))
         elif key == "region":
             chrom, start, end = parse_region(value)
-            result = await self.executor.get_mpra_by_region(
+            result = await self._executor.get_mpra_by_region(
                 chrom, start, end, resources=_csv(resources)
             )
         else:
-            result = await self.executor.get_mpra_by_gene(
+            result = await self._executor.get_mpra_by_gene(
                 value,
                 resources=_csv(resources),
                 window=window,
@@ -591,7 +611,7 @@ class GeneticsClient:
         cheaper, and a truncated result raises rather than returning a prefix.
         """
         return self._rows(
-            await self.executor.get_mpra_pip_concordance_by_gene(
+            await self._executor.get_mpra_pip_concordance_by_gene(
                 gene,
                 window=window,
                 resource=resource,
@@ -615,7 +635,7 @@ class GeneticsClient:
         """Variant annotations (consequence, AF, gene) for one variant, a region, a gene or a batch."""
         _one_of(variant=variant, region=region, gene=gene, variants=variants)
         return self._rows(
-            await self.executor.get_variant_annotations(
+            await self._executor.get_variant_annotations(
                 variant=variant, region=region, gene=gene, variants=variants, source=source
             )
         )
@@ -647,14 +667,14 @@ class GeneticsClient:
         if key == "region":
             chrom, start, end = parse_region(value)
             return self._rows(
-                await self.executor.get_genes_in_region(
+                await self._executor.get_genes_in_region(
                     chrom, start, end, gene_type=gene_type, gencode_version=gencode_version
                 ),
                 key="genes",
             )
         if key == "nearest_to":
             return self._rows(
-                await self.executor.get_nearest_genes(
+                await self._executor.get_nearest_genes(
                     value,
                     gene_type=gene_type,
                     n=3 if n is None else n,
@@ -665,7 +685,7 @@ class GeneticsClient:
             )
         by_id = isinstance(value, int) or (isinstance(value, str) and value.isdigit())
         return self._rows(
-            await self.executor.get_gene_group_members(
+            await self._executor.get_gene_group_members(
                 group_id=int(value) if by_id else None,
                 group_name=None if by_id else value,
                 exclude_olfactory=True if exclude_olfactory is None else exclude_olfactory,
@@ -675,11 +695,11 @@ class GeneticsClient:
 
     async def expression(self, gene: str) -> pl.DataFrame:
         """Tissue expression for a gene, across expression resources."""
-        return self._rows(await self.executor.get_gene_expression(gene))
+        return self._rows(await self._executor.get_gene_expression(gene))
 
     async def gene_disease(self, gene: str) -> pl.DataFrame:
         """Mendelian gene-disease associations."""
-        return self._rows(await self.executor.get_gene_disease_associations(gene))
+        return self._rows(await self._executor.get_gene_disease_associations(gene))
 
     # ------------------------------------------------------------------ sumstats / LD
 
@@ -696,11 +716,11 @@ class GeneticsClient:
         pheno_list = [phenotypes] if isinstance(phenotypes, str) else list(phenotypes)
         key, value = _one_of(variants=variants, region=region)
         if key == "variants":
-            result = await self.executor.get_summary_stats(
+            result = await self._executor.get_summary_stats(
                 value, pheno_list, resource=resource, data_type=data_type
             )
         else:
-            result = await self.executor.get_summary_stats_by_region(
+            result = await self._executor.get_summary_stats_by_region(
                 value, pheno_list, resource=resource, data_type=data_type
             )
         return self._rows(result)
@@ -723,7 +743,7 @@ class GeneticsClient:
         if other is not None:
             _reject("ld(variant, other)", window=window)
             result = self._payload(
-                await self.executor.get_ld_between_variants(
+                await self._executor.get_ld_between_variants(
                     variant, other, r2_threshold=0.1 if r2_threshold is None else r2_threshold,
                     panel=panel,
                 )
@@ -737,7 +757,7 @@ class GeneticsClient:
                 "panel": panel,
             }])
         return self._rows(
-            await self.executor.get_variants_in_ld(
+            await self._executor.get_variants_in_ld(
                 variant,
                 window=1_500_000 if window is None else window,
                 r2_threshold=0.6 if r2_threshold is None else r2_threshold,
@@ -760,14 +780,14 @@ class GeneticsClient:
         if rsids is not None:
             _reject("search(rsids=...)", query=query, limit=limit)
             return self._rows(
-                await self.executor.lookup_variants_by_rsid(_csv(rsids)), key="variants"
+                await self._executor.lookup_variants_by_rsid(_csv(rsids)), key="variants"
             )
         if query is None:
             raise GeneticsUsageError("provide either query= or rsids=")
         if kind == "genes":
-            result = await self.executor.search_genes(query, limit=limit or 10)
+            result = await self._executor.search_genes(query, limit=limit or 10)
         elif kind == "phenotypes":
-            result = await self.executor.search_phenotypes(query, limit=limit or 100)
+            result = await self._executor.search_phenotypes(query, limit=limit or 100)
         else:
             raise GeneticsUsageError(f"kind must be 'phenotypes' or 'genes', got {kind!r}")
         return self._rows(result, key="results")
@@ -795,7 +815,7 @@ class GeneticsClient:
         So aggregate, filter or add the partition predicate in SQL rather than fetching
         every row and reducing in polars.
         """
-        result = self._payload(await self.executor.query_database(query, max_rows=max_rows))
+        result = self._payload(await self._executor.query_database(query, max_rows=max_rows))
         self._check_truncation(result)
         return _frame(result.get("rows") or [], columns=result.get("columns") or None)
 
@@ -810,7 +830,7 @@ class GeneticsClient:
         upstream's 'Unknown: <code>' placeholder.
         """
         code_list = [codes] if isinstance(codes, str) else list(codes)
-        names = self._payload(await self.executor.lookup_phenotype_names(code_list))["names"]
+        names = self._payload(await self._executor.lookup_phenotype_names(code_list))["names"]
         return _frame(
             [[code, names.get(code)] for code in code_list],
             columns=["phenotype", "name"],
@@ -818,7 +838,7 @@ class GeneticsClient:
 
     async def get_dataset_display_names(self) -> pl.DataFrame:
         """Display-name overrides keyed by the raw `dataset` column value."""
-        mapping = self._payload(await self.executor.get_dataset_display_names())["display_names"]
+        mapping = self._payload(await self._executor.get_dataset_display_names())["display_names"]
         return _frame(
             [[key, value] for key, value in mapping.items()],
             columns=["dataset", "display_name"],
@@ -834,7 +854,7 @@ class GeneticsClient:
         """
         given = [symbols] if isinstance(symbols, str) else list(symbols)
         cleaned = [str(s).strip() for s in given if s and str(s).strip()]
-        payload = self._payload(await self.executor.normalize_gene_symbols(cleaned))
+        payload = self._payload(await self._executor.normalize_gene_symbols(cleaned))
         by_input = {m.get("input"): m for m in payload.get("mappings") or []}
         return _frame(
             [
@@ -851,16 +871,16 @@ class GeneticsClient:
 
     async def schema(self, table: str | None = None) -> dict[str, Any]:
         """Column-level schema of the BigQuery views. A dict, not a frame: it is nested."""
-        return self._payload(await self.executor.get_database_schema(table))["schema"]
+        return self._payload(await self._executor.get_database_schema(table))["schema"]
 
     async def resources(self) -> dict[str, Any]:
         """Catalog of available data resources, grouped by data product."""
-        return self._payload(await self.executor.get_available_resources())["resources"]
+        return self._payload(await self._executor.get_available_resources())["resources"]
 
     async def datasets(
         self, resource: str | None = None, include_stats: bool = True
     ) -> dict[str, Any]:
         """Dataset catalog with descriptions and aggregate stats."""
         return self._payload(
-            await self.executor.list_datasets(resource=resource, include_stats=include_stats)
+            await self._executor.list_datasets(resource=resource, include_stats=include_stats)
         )["datasets"]

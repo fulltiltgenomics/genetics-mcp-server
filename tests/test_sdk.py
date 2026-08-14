@@ -246,7 +246,7 @@ async def test_client_lifts_the_context_row_cap_only_on_executors_it_builds():
     """
     own = GeneticsClient()
     try:
-        assert own.executor._row_limit is None
+        assert own._executor._row_limit is None
     finally:
         await own.close()
 
