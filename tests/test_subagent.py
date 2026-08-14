@@ -412,6 +412,38 @@ class TestOrchestrationCategoryExclusion:
                 f"launch_subagents should be excluded for skill '{skill_name}'"
             )
 
+    def test_code_execution_tools_excluded_from_every_skill(self):
+        """The orchestration *category* excludes nothing — the name list does.
+
+        TOOL_PROFILES puts "orchestration" in both the api and bigquery profiles, so
+        read_artifact and list_capabilities reach three of the five skills unless
+        subagent.py names them. A subagent must not be able to retrieve another
+        execution's artifacts (genetics-results-suite-4h6).
+        """
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        service = SubagentService(mock_client, mock_executor)
+
+        for skill_name in SKILL_REGISTRY:
+            skill = get_skill(skill_name)
+            with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+                settings = MagicMock()
+                settings.disabled_tools = set()
+                settings.enable_subagents = True
+                settings.enable_script_execution = False
+                settings.subagent_allowed_paths_list = []
+                mock_settings.return_value = settings
+
+                tools = service._get_tool_definitions(skill)
+
+            tool_names = {t["name"] for t in tools}
+            assert "read_artifact" not in tool_names, (
+                f"read_artifact should be excluded for skill '{skill_name}'"
+            )
+            assert "list_capabilities" not in tool_names, (
+                f"list_capabilities should be excluded for skill '{skill_name}'"
+            )
+
 
 class TestDownloadHintProcessing:
     """Tests that _execute_subagent_tool applies _process_download_hints on local tool results."""

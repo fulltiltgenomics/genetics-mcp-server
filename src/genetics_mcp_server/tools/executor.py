@@ -2,15 +2,19 @@
 
 import asyncio
 import base64
+import inspect
 import io
 import logging
+import mimetypes
 import os
 import re
+import stat
 import threading
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
 from xml.sax.saxutils import quoteattr
@@ -133,6 +137,15 @@ def _seg(value: Any) -> str:
 
 # generic error message returned to clients
 INTERNAL_ERROR_MSG = "Internal server error. Check server logs for details."
+
+# SANDBOX_ARTIFACTS_DIR must resolve under this prefix or read_artifact refuses. Without it
+# the only thing between this code and behaviour docs/code-execution-security.md forbids is
+# an env var staying unset: read_artifact is registered in the chat backend, so setting
+# SANDBOX_ARTIFACTS_DIR=/data there would make chat_history.db and llm_config.db readable
+# and base64'd back to the model. chat-backend has no /scratch volume and never will, so
+# hardcoding the prefix makes that misconfiguration unreachable rather than merely unmade.
+# Tests patch this to a temp path; nothing else may.
+_ARTIFACTS_DIR_PREFIX = "/scratch/"
 
 # returned when an upstream service (genetics API / BigQuery db) can't be connected to,
 # as opposed to a genuine internal error — lets callers and the UI show something actionable
@@ -5164,3 +5177,429 @@ class ToolExecutor:
         return self._uniprot_download_hint(
             result, "uniprot_search.tsv", min_rows=self._UNIPROT_DOWNLOAD_THRESHOLD
         )
+
+    # -------------------------------------------------------------------------
+    # Code execution support (genetics-results-suite-4h6)
+    # -------------------------------------------------------------------------
+
+    async def list_capabilities(self, module: str | None = None) -> dict[str, Any]:
+        """Describe the `genetics` SDK surface one module at a time.
+
+        The point of the tool is that the catalogue costs nothing until it is asked for:
+        the model carries one short tool description instead of a signature per data
+        product, so adding a dataset — which adds an SDK argument or function — costs no
+        per-turn context. Signatures are read out of the live SDK objects rather than a
+        checked-in copy, so they cannot drift from what a script can actually call.
+
+        What it renders is per-function signatures and docstrings, and module-level
+        docstrings deliberately not: sdk.__doc__ describes the deployment around the SDK,
+        naming INTERNAL_API_SECRET, GENETICS_API_URL and BIGQUERY_API_URL and the services
+        behind them, none of which is needed to write a call.
+
+        This tool is NOT in mcp_server.py's _mcp_disabled, so an MCP client sees whatever
+        it returns, and that IS new disclosure — the SDK is not the MCP tool surface, so
+        none of it is a restatement of the tool list. It is judged acceptable on its
+        content: signatures and function docstrings describe the SDK's shape, not data,
+        session state or any execution.
+
+        Be honest about what stripping module docs does NOT remove. Function docstrings
+        are written to describe the SDK, so they disclose SDK internals by CATEGORY, and
+        the categories are what to reason about — an enumeration of the individual strings
+        has been re-derived twice and been wrong both times, so treat the examples as
+        illustrative, not exhaustive:
+
+        - the settings mechanism, including that endpoint URLs come from the environment
+          and cannot be set from a script (`_URL_SETTINGS`, `configure`);
+        - internal service and component names (`db-api`, the FinnGen LD server, the
+          sandbox itself);
+        - the execution model behind an argument — e.g. that `limit=` still runs the full
+          join and ORDER BY server-side;
+        - limit and quota values: the per-execution row cap, the per-query and
+          per-execution byte quotas, and the SDK's own row ceilings.
+
+        Rewriting the docstrings is a separate decision (it would also drift the generated
+        sandbox stubs). `genetics_results.<view>` names are NOT in this list: they already
+        appear in MCP tool descriptions, so they are not new disclosure.
+        """
+        try:
+            return _sdk_capabilities(module)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(
+                f"Error in list_capabilities({module!r}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # a read over 4 MiB is not something a chat turn can use; a truncated PNG is garbage
+    # rather than a short answer, so oversized binaries are refused instead of cut
+    _MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+    _MAX_ARTIFACT_TEXT_CHARS = 100_000
+
+    @staticmethod
+    def _artifacts_dir() -> str:
+        """The single directory `read_artifact` may read, or "" when there is none.
+
+        This is the allow-list, and it is deliberately its own variable: the obvious
+        alternative, SUBAGENT_ALLOWED_PATHS, is `/data` in the deployment — the PVC
+        holding chat_history.db and llm_config.db — so wiring artifact reads to it would
+        hand the model every conversation in the deployment. It is never read here.
+
+        Only the process that owns the scratch directory sets SANDBOX_ARTIFACTS_DIR. In
+        chat-backend it is unset, so this method refuses; retrieval there goes over HTTP
+        to the sandbox pod, which is where the filesystem read and the validation below
+        happen (genetics-results-suite docs/code-execution-security.md, section 6). The
+        HTTP client and the session-scoped name resolution belong to 4h6.11, not here.
+
+        Two structural checks, both of which fail closed to "" (= not enabled):
+
+        - the configured directory may not itself be a symlink. `_validate_path` resolves
+          both sides, so a symlinked allow-list root makes *every* file under its target
+          validate. This is reachable, not merely operator error: /scratch/<id> is chown'd
+          to the child uid (code-execution-security.md section 2), so the child can rmdir
+          its `artifacts` and relink it at another execution's retained artifacts — the
+          cross-session channel section 6.4 exists to prevent.
+        - the resolved directory must sit under _ARTIFACTS_DIR_PREFIX.
+
+        Both are advisory: they answer about a PATH, and the answer is stale the moment it
+        returns, because the child owns /scratch/<id> and can swap `artifacts` for a
+        symlink between this check and the open. `_open_artifacts_dir` is the enforcing
+        layer — it checks an open descriptor instead.
+        """
+        configured = os.environ.get("SANDBOX_ARTIFACTS_DIR", "").strip()
+        if not configured:
+            return ""
+        try:
+            if stat.S_ISLNK(os.lstat(configured).st_mode):
+                logger.error("SANDBOX_ARTIFACTS_DIR is a symlink; refusing artifact reads")
+                return ""
+            resolved = os.path.realpath(configured)
+        except OSError:
+            return ""
+        prefix = _ARTIFACTS_DIR_PREFIX.rstrip("/") + "/"
+        if not resolved.startswith(prefix):
+            logger.error("SANDBOX_ARTIFACTS_DIR is outside %s; refusing artifact reads", prefix)
+            return ""
+        return resolved
+
+    @staticmethod
+    def _open_artifacts_dir() -> int | None:
+        """Open the artifacts directory and verify the DESCRIPTOR, not the path.
+
+        `_artifacts_dir` hands back a path string, and every subsequent use of that string
+        re-walks the directory chain — so the `artifacts` component, which the child uid
+        owns, can be rmdir'd and relinked at another execution's artifacts (or anywhere)
+        after the check passed and before the file is opened. `_validate_path` cannot see
+        it either: it resolves both sides through the same swapped link, so both land on
+        the attacker's target and it agrees.
+
+        So the directory is opened once, with O_NOFOLLOW (the configured name itself may
+        not be a symlink) and O_DIRECTORY, and the prefix check is then made against
+        /proc/self/fd/<dirfd> — the kernel's own name for the inode this fd holds, not a
+        name re-resolved through whatever the directory chain says now. The caller opens
+        the artifact relative to this fd, so a later swap changes a name the read no longer
+        uses. Fails closed to None; the caller must close the fd.
+        """
+        configured = os.environ.get("SANDBOX_ARTIFACTS_DIR", "").strip()
+        if not configured:
+            return None
+        try:
+            dirfd = os.open(configured, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            actual = os.readlink(f"/proc/self/fd/{dirfd}")
+        except OSError:
+            # no /proc, or the fd names nothing checkable: there is no way to verify the
+            # descriptor, so there is no read
+            os.close(dirfd)
+            return None
+        prefix = _ARTIFACTS_DIR_PREFIX.rstrip("/") + "/"
+        # " (deleted)" is how the kernel renders an unlinked directory's fd; the path it
+        # prints then describes where the inode used to be, so it proves nothing
+        if not actual.startswith(prefix) or actual.endswith(" (deleted)"):
+            logger.error("artifacts directory fd is outside %s; refusing artifact reads", prefix)
+            os.close(dirfd)
+            return None
+        return dirfd
+
+    async def read_artifact(self, name: str) -> dict[str, Any]:
+        """Read one named file out of the directory named by SANDBOX_ARTIFACTS_DIR.
+
+        Cross-execution scoping is NOT implemented here: there is no session or execution
+        parameter, so which execution's artifacts are reachable rests entirely on that env
+        var pointing at the right directory. Resolving a name against a session belongs to
+        4h6.11, and until it exists this tool reads whatever directory it is pointed at
+        (subject to `_artifacts_dir`'s structural checks).
+
+        `name` is a bare file name, never a path and never an execution id: the model
+        learns names from the run's artifact manifest, and nothing else is addressable.
+        Validation is layered on purpose, and the layers are not equal. The name check
+        (separators, traversal) and `_validate_path`'s resolved-path check are advisory:
+        both answer about a path, and a script owns the directory, so it can swap either
+        the final component or the `artifacts` directory itself between the check and the
+        read. The enforcing layer is a pair of descriptors — the directory is opened once
+        and verified as an fd (`_open_artifacts_dir`), the artifact is opened *relative to
+        that fd* with O_NOFOLLOW, and every decision after that (regular file, link count,
+        bytes) is taken from that one fd's fstat. After `_open_artifacts_dir` returns,
+        nothing here addresses anything by path again.
+
+        O_NONBLOCK is on the file open because O_RDONLY on a FIFO with no writer blocks in
+        the kernel, before S_ISREG is ever reached — a script that does
+        `os.mkfifo(artifacts/results.tsv)` would otherwise hang the calling coroutine (and
+        so the chat backend) forever. It is inert for regular files, which are all that
+        survives the S_ISREG check.
+
+        Known and accepted: a refusal caused by `_validate_path` returns measurably faster
+        than one caused by the open, so a caller can tell that a name IT planted resolves
+        out of tree. A dangling symlink takes the same fast path, so this is not an
+        existence oracle for anything the caller did not create.
+        """
+        from genetics_mcp_server.skills.sandbox_tools import _validate_path
+
+        artifacts_dir = self._artifacts_dir()
+        if not artifacts_dir:
+            return {
+                "success": False,
+                "error": "Code execution is not enabled here, so there are no artifacts to read.",
+            }
+
+        if not isinstance(name, str) or not name.strip():
+            return {"success": False, "error": "An artifact name is required."}
+        name = name.strip()
+        if (
+            name in (".", "..")
+            or "/" in name
+            or "\\" in name
+            or "\x00" in name
+            or os.path.isabs(name)
+            or Path(name).name != name
+        ):
+            return {
+                "success": False,
+                "error": (
+                    f"Invalid artifact name '{name}': pass the bare file name from the "
+                    f"run's artifact manifest, not a path."
+                ),
+            }
+
+        not_found = {"success": False, "error": f"Artifact not found: {name}"}
+        path = os.path.join(artifacts_dir, name)
+        try:
+            # belt and braces: catches a resolved path outside the allow-list before any
+            # open, but its answer is advisory — the fd below is the enforcing layer.
+            # OSError from resolve() is folded in here so it cannot escape carrying the
+            # absolute path in its message
+            _validate_path(path, [artifacts_dir])
+        except (ValueError, OSError):
+            # the same answer as a missing file: which names exist outside the allow-list
+            # is not something a caller gets to learn by probing
+            return not_found
+
+        dirfd = self._open_artifacts_dir()
+        if dirfd is None:
+            # the directory passed _artifacts_dir a moment ago and does not verify now:
+            # that is either a swap in progress or a teardown, and neither gets an answer
+            return not_found
+
+        try:
+            try:
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd
+                )
+            except OSError:
+                # includes ELOOP: O_NOFOLLOW refuses a symlink at the final component,
+                # which is the swap a script can perform after _validate_path resolved the
+                # name. Resolution starts at dirfd, so the directory cannot be swapped out
+                # from under it either
+                return not_found
+
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    # FIFOs and devices land here rather than in a blocked open, thanks to
+                    # O_NONBLOCK above
+                    return not_found
+                if st.st_nlink != 1:
+                    # a hardlink has nothing to resolve, so both path layers see an in-tree
+                    # path over an out-of-tree inode. Refusing st_nlink != 1 states the
+                    # property here instead of inheriting it from fs.protected_hardlinks
+                    return not_found
+                if st.st_size > self._MAX_ARTIFACT_BYTES:
+                    return {
+                        "success": False,
+                        # no byte count: an exact size would answer questions about files
+                        # the caller cannot read
+                        "error": (
+                            f"Artifact '{name}' is over the {self._MAX_ARTIFACT_BYTES} byte "
+                            f"read limit. Write a smaller summary from the script instead."
+                        ),
+                    }
+                chunks: list[bytes] = []
+                remaining = self._MAX_ARTIFACT_BYTES
+                while remaining > 0:
+                    chunk = os.read(fd, min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+            except OSError as e:
+                logger.error(f"Error reading artifact {name!r}: {e}")
+                return not_found
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dirfd)
+
+        # the size at open can disagree with what was read if the file grew mid-read, so
+        # report the payload rather than the stat
+        size = len(raw)
+
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return {
+                "success": True,
+                "name": name,
+                "size": size,
+                "content_type": content_type,
+                "encoding": "base64",
+                "content": base64.b64encode(raw).decode("ascii"),
+            }
+
+        truncated = len(text) > self._MAX_ARTIFACT_TEXT_CHARS
+        return {
+            "success": True,
+            "name": name,
+            "size": size,
+            "content_type": content_type,
+            "encoding": "utf-8",
+            "content": text[: self._MAX_ARTIFACT_TEXT_CHARS],
+            "truncated": truncated,
+        }
+
+
+# --------------------------------------------------------------------------- SDK catalogue
+
+# the modules a script sees, in the order the index reports them. They are the three the
+# sandbox stubs are generated from (sandbox/stubs/*.pyi), so the tool and the shipped
+# reference describe the same surface.
+_SDK_MODULES = ("genetics", "client", "errors")
+
+# one-line labels written here rather than taken from each module's __doc__. The catalogue
+# renders per-function signatures and docstrings only: module docstrings describe the
+# deployment around the SDK — the env vars endpoints and credentials come from, the
+# services behind it, the per-execution row and byte quotas — none of which a script needs
+# to write a call, and list_capabilities is reachable from MCP.
+_SDK_MODULE_SUMMARIES = {
+    "genetics": "the sync functions a script calls; every one returns a polars DataFrame",
+    "client": "the awaitable GeneticsClient form of the same functions",
+    "errors": "what a script catches",
+}
+
+# `genetics` re-exports these beyond the data functions; the data functions themselves come
+# from sdk._FUNCTIONS, which is the SDK's own export list rather than a second copy of it
+_SDK_EXTRA_FUNCTIONS = ("configure", "get_client", "close", "parse_region")
+
+# fully-qualified reprs that inspect produces for evaluated annotations, written the way a
+# script writes them
+_ANNOTATION_ALIASES = {
+    "polars.dataframe.frame.DataFrame": "pl.DataFrame",
+    "genetics_mcp_server.sdk.client.GeneticsClient": "GeneticsClient",
+}
+
+
+def _render_annotations(text: str) -> str:
+    for long_name, short_name in _ANNOTATION_ALIASES.items():
+        text = text.replace(long_name, short_name)
+    return text
+
+
+def _render_def(name: str, func: Any, *, is_async: bool) -> str:
+    signature = inspect.signature(func)
+    params = list(signature.parameters.values())
+    # every renderable object here is either a bound-form class method or a sync wrapper
+    # whose __wrapped__ is one, so `self` is always present and never part of the surface
+    if params and params[0].name == "self":
+        signature = signature.replace(parameters=params[1:])
+    keyword = "async def" if is_async else "def"
+    lines = [_render_annotations(f"{keyword} {name}{signature}:")]
+    doc = inspect.getdoc(func)
+    if doc:
+        body = "\n".join(f"    {line}".rstrip() for line in doc.splitlines())
+        lines.append(f'    """{body.lstrip()}\n    """')
+    else:
+        lines.append("    ...")
+    return "\n".join(lines)
+
+
+def _render_class(name: str, cls: type) -> str:
+    bases = ", ".join(base.__name__ for base in cls.__bases__)
+    doc = inspect.getdoc(cls)
+    if doc:
+        body = "\n".join(f"    {line}".rstrip() for line in doc.splitlines())
+        return f'class {name}({bases}):\n    """{body.lstrip()}\n    """'
+    return f"class {name}({bases}):\n    ..."
+
+
+def _sdk_members(module: str) -> list[tuple[str, Any]]:
+    """(name, object) pairs for one SDK module, in the order they should be rendered."""
+    from genetics_mcp_server import sdk
+    from genetics_mcp_server.sdk import client as sdk_client
+    from genetics_mcp_server.sdk import errors as sdk_errors
+
+    if module == "genetics":
+        names = list(sdk._FUNCTIONS) + list(_SDK_EXTRA_FUNCTIONS)
+        return [(n, getattr(sdk, n)) for n in names if hasattr(sdk, n)]
+    if module == "client":
+        names = list(sdk._FUNCTIONS) + ["close"]
+        return [
+            (n, getattr(sdk_client.GeneticsClient, n))
+            for n in names
+            if hasattr(sdk_client.GeneticsClient, n)
+        ]
+    return [
+        (n, obj)
+        for n, obj in vars(sdk_errors).items()
+        if inspect.isclass(obj) and obj.__module__ == sdk_errors.__name__
+    ]
+
+
+def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
+    from genetics_mcp_server.sdk import client as sdk_client
+
+    if module is not None and module not in _SDK_MODULES:
+        raise ValueError(
+            f"unknown SDK module '{module}'; expected one of: {', '.join(_SDK_MODULES)}"
+        )
+
+    if module is None:
+        return {
+            "success": True,
+            "usage": "import genetics_mcp_server.sdk as genetics",
+            "modules": [
+                {
+                    "module": name,
+                    "summary": _SDK_MODULE_SUMMARIES[name],
+                    "names": [n for n, _ in _sdk_members(name)],
+                }
+                for name in _SDK_MODULES
+            ],
+            "next": "call list_capabilities(module=...) for signatures and docstrings",
+        }
+
+    blocks = []
+    if module == "genetics" and hasattr(sdk_client, "MAX_ROWS"):
+        blocks.append(f"MAX_ROWS: int = {sdk_client.MAX_ROWS}")
+    for name, obj in _sdk_members(module):
+        if inspect.isclass(obj):
+            blocks.append(_render_class(name, obj))
+        else:
+            blocks.append(_render_def(name, obj, is_async=module == "client"))
+    return {
+        "success": True,
+        "module": module,
+        "signatures": "\n\n".join(blocks),
+    }

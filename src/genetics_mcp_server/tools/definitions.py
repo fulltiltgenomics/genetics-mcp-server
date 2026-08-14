@@ -1529,6 +1529,49 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             },
         },
     },
+    # Code execution (genetics-results-suite-4h6). Category "orchestration" rather than
+    # "general": these hand work to another runtime instead of fetching data themselves,
+    # which is what launch_subagents is. The category alone excludes nothing from subagents
+    # — TOOL_PROFILES includes "orchestration" in both the api and bigquery profiles —
+    # so subagent.py names all three orchestration tools in its `disabled` set, which is
+    # what keeps a subagent from retrieving another execution's artifacts or being told how
+    # to start one. read_artifact is additionally in mcp_server.py's _mcp_disabled.
+    {
+        "name": "list_capabilities",
+        "category": "orchestration",
+        "description": (
+            "List the `genetics` SDK surface available to analysis scripts, one module at a "
+            "time. Returns signatures with their docstrings. Call this before writing a "
+            "script instead of guessing function names. Modules: 'genetics' (the sync functions a "
+            "script calls), 'client' (the awaitable GeneticsClient form), 'errors' (what a "
+            "script catches). Omit `module` for a cheap index of module names and the "
+            "functions each exports."
+        ),
+        "parameters": {
+            "module": {
+                "type": "string",
+                "description": "SDK module to describe. Omit for the index.",
+                "enum": ["genetics", "client", "errors"],
+            },
+        },
+    },
+    {
+        "name": "read_artifact",
+        "category": "orchestration",
+        "description": (
+            "Read a named file an analysis script wrote to its artifacts directory (a plot, "
+            "a TSV). Takes the artifact NAME exactly as reported in the run's artifact "
+            "manifest — never a path and never an execution id. Returns text inline, and "
+            "binary content base64-encoded with its content type."
+        ),
+        "parameters": {
+            "name": {
+                "type": "string",
+                "description": "Artifact file name from the run's manifest, e.g. 'manhattan.png'.",
+                "required": True,
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -2300,6 +2343,20 @@ def register_mcp_tools(
             return await executor.get_myvariant_annotations(
                 variant=variant, variants=variants, fields=fields
             )
+
+    if "list_capabilities" not in _disabled:
+
+        @mcp.tool()
+        async def list_capabilities(module: str | None = None) -> dict:
+            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors') as signatures with docstrings. Omit module for the index."""
+            return await executor.list_capabilities(module=module)
+
+    if "read_artifact" not in _disabled:
+
+        @mcp.tool()
+        async def read_artifact(name: str) -> dict:
+            """Read a named file an analysis script wrote to its artifacts directory."""
+            return await executor.read_artifact(name=name)
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()

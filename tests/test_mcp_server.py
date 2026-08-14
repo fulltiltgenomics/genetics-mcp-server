@@ -211,11 +211,25 @@ class TestMCPDisabledTools:
         search_uniprot) are chat-backend only by explicit requirement: they
         must stay defined for the chat backend but never reach standalone
         MCP clients.
+
+        read_artifact is there for a stronger reason: code execution must not
+        be reachable via MCP (genetics-results-suite-4h6), and membership of
+        this literal is the sole registration-layer control.
         """
         from genetics_mcp_server import mcp_server
 
         assert "search_mgi" in mcp_server._mcp_disabled
         assert "get_myvariant_annotations" in mcp_server._mcp_disabled
+        assert "read_artifact" in mcp_server._mcp_disabled
+        # list_capabilities renders per-function SDK signatures and docstrings — the SDK's
+        # shape, not data, session state or any execution — so it is deliberately NOT
+        # excluded; an exclusion set padded with harmless names stops reading as a
+        # security control. That surface is genuinely new to an MCP client rather than a
+        # restatement of the tool list, which is why module docstrings — the credential
+        # and endpoint env var names — are stripped from its output. Function docstrings
+        # still name db-api, the execution quotas and the sandbox; that is accepted, not
+        # denied (see TestListCapabilities in tests/test_code_execution_tools.py)
+        assert "list_capabilities" not in mcp_server._mcp_disabled
 
         names = {t["name"] for t in TOOL_DEFINITIONS}
         for tool_name in ("get_protein_annotations", "map_protein_variants", "search_uniprot"):
@@ -238,6 +252,27 @@ class TestMCPDisabledTools:
 
         registered = self._registered_names(mcp)
         assert not (uniprot_tools & registered)
+
+    def test_code_execution_tools_absent_from_the_registered_tool_list(self):
+        """Assert on the tool list, not on the constant.
+
+        Asserting on _mcp_disabled tests that someone typed the name; asserting on what
+        the registration path produced tests the property the user actually requires —
+        that code execution is not reachable via MCP (genetics-results-suite-4h6).
+        """
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server import mcp_server
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools=mcp_server._mcp_disabled)
+
+        registered = self._registered_names(mcp)
+        assert "read_artifact" not in registered
+        # the catalogue is signatures only and stays available
+        assert "list_capabilities" in registered
 
 
 @pytest.mark.integration

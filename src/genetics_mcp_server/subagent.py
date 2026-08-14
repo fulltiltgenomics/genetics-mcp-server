@@ -397,9 +397,13 @@ class SubagentService:
         else:
             tool_profile = "rag"  # general-only
 
-        # exclude orchestration tools to prevent recursive subagent launches
+        # exclude orchestration tools to prevent recursive subagent launches, and to keep a
+        # subagent away from another execution's artifacts. The exclusion is by NAME, not
+        # by category: TOOL_PROFILES puts "orchestration" in both the api and bigquery
+        # profiles, so the category is present in three of the five skills and every
+        # orchestration tool must be listed here individually to actually be dropped
         disabled = set(settings.disabled_tools) if settings.disabled_tools else set()
-        disabled.add("launch_subagents")
+        disabled |= {"launch_subagents", "read_artifact", "list_capabilities"}
 
         tools = get_anthropic_tools(
             tool_profile=tool_profile,
@@ -412,7 +416,10 @@ class SubagentService:
             existing_names = {t["name"] for t in tools}
             # add any extra tools that aren't already included
             if not extra_names.issubset(existing_names):
-                all_tools = get_anthropic_tools(disabled_tools=settings.disabled_tools)
+                # `disabled`, not settings.disabled_tools: this fallback is a second path
+                # into the tool list and would otherwise re-add the orchestration tools
+                # excluded above for any skill that named one in extra_tools
+                all_tools = get_anthropic_tools(disabled_tools=disabled)
                 for tool in all_tools:
                     if tool["name"] in extra_names and tool["name"] not in existing_names:
                         tools.append(tool)

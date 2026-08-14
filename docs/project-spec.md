@@ -227,6 +227,116 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 
 **Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
 
+### Code execution tools
+
+Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
+not deployed, so `run_analysis` does not exist yet and `read_artifact` has nothing to read
+in any running service.
+
+| Tool | Description |
+|------|-------------|
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `read_artifact` | Read one named file an analysis script wrote to its artifacts directory. Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Chat-backend only — excluded from MCP server |
+
+**Both are category `orchestration`**, not `general`: they hand work to another runtime
+rather than fetching data, which is what `launch_subagents` is. The category by itself
+excludes nothing — `TOOL_PROFILES` includes `orchestration` in both the `api` and
+`bigquery` profiles, so it reaches three of the five subagent skills — so `subagent.py`
+names all three orchestration tools explicitly:
+`disabled |= {"launch_subagents", "read_artifact", "list_capabilities"}`. That name list,
+not the category, is what keeps a subagent from retrieving another execution's artifacts
+or being told how to start one; `tests/test_subagent.py` pins it.
+
+**Exposure decision**: `read_artifact` is in the `_mcp_disabled` literal in
+`mcp_server.py`. This is a security control, not a product decision — the user requires
+that code execution is not reachable via MCP — and it is the *only* registration-layer
+control, since `register_mcp_tools` is called with no profile and `tool_profile=None`
+means no filtering at all. `run_analysis` joins the set with `4h6.16`.
+`list_capabilities` is deliberately **not** excluded: what it renders is per-function SDK
+signatures and docstrings, which describe the SDK's shape rather than data, session state
+or any execution, and an exclusion set padded with harmless names stops reading as a
+security control. That surface is genuinely new disclosure to an MCP client — the SDK is
+not the MCP tool surface — and is judged acceptable on its content, not on being visible
+elsewhere. **Module-level** docstrings are stripped from the output for exactly that
+reason: `sdk.__doc__` names the endpoint and credential env vars (`GENETICS_API_URL`,
+`BIGQUERY_API_URL`, `INTERNAL_API_SECRET`) and the services behind them, none of which is
+needed to write a call. The index's one-line module summaries are written in `executor.py`
+(`_SDK_MODULE_SUMMARIES`) rather than sliced out of `__doc__`. What that does **not**
+remove, and the justification must not pretend otherwise: function docstrings describe
+the SDK, so they disclose SDK internals by **category**. The categories are the claim;
+the examples are illustrative, not an enumeration (enumerating them precisely has been
+attempted twice and been incomplete both times):
+
+- the **settings mechanism** — that endpoint URLs come from the environment and cannot be
+  set from a script (`_URL_SETTINGS`, `configure`);
+- **internal service and component names** — `db-api`, the FinnGen LD server, the sandbox;
+- the **execution model** behind an argument — e.g. that `limit=` still runs the full join
+  and `ORDER BY` server-side;
+- **limit and quota values** — the per-execution row cap, the per-query and per-execution
+  byte quotas, and the SDK's own row ceilings.
+
+Rewriting them is a separate decision (it would also drift the generated
+`sandbox/stubs/*.pyi`). `genetics_results.<view>` names are deliberately absent from that
+list: they already appear in MCP tool descriptions, so they are not new disclosure.
+
+**Where the artifact read happens**: `read_artifact` reads the single directory named by
+`SANDBOX_ARTIFACTS_DIR`, and returns "code execution is not enabled" when it is unset —
+which is everywhere today. Chat-backend never sets it; retrieval there proxies over HTTP
+to the sandbox pod, where the filesystem read happens (`4h6.11` owns that client and the
+session-scoped name resolution). The allow-list is its own variable on purpose: the
+obvious alternative, `SUBAGENT_ALLOWED_PATHS`, is `/data` in the deployment — the PVC
+holding `chat_history.db` and `llm_config.db` — so wiring artifact reads to it would hand
+the model every conversation in the deployment.
+
+Two structural checks fail closed to "not enabled" before any name is looked at, both in
+`_artifacts_dir()`. Both are **advisory**: they answer about a path string, and the answer
+is stale the moment it returns (see the descriptor check below).
+
+- **the configured directory may not itself be a symlink** (`lstat` + `S_ISLNK`).
+  `_validate_path` resolves both sides, so a symlinked allow-list root makes every file
+  under its target validate. The child uid owns `/scratch/<id>`, so it can `rmdir` its
+  `artifacts` and relink it at another execution's retained artifacts — the cross-session
+  channel the suite's `docs/code-execution-security.md` section 6.4 exists to prevent.
+- **the resolved directory must sit under the hardcoded `_ARTIFACTS_DIR_PREFIX`
+  (`/scratch/`)**. `read_artifact` is registered in the chat backend, so without this the
+  only thing preventing `SANDBOX_ARTIFACTS_DIR=/data` from base64'ing `chat_history.db`
+  back to the model is that nobody sets it. chat-backend has no `/scratch` volume, so the
+  misconfiguration is unreachable rather than merely unmade.
+
+Then, per read: the name check rejects separators, `..`, NUL and absolute paths before
+touching the filesystem, and `skills/sandbox_tools.py:_validate_path` re-checks the
+*resolved* path. **Neither is the enforcing layer** — a script owns its artifacts directory
+and can swap what a name resolves through after the check, at the final component *or at
+the `artifacts` directory itself*, and `_validate_path` cannot see the latter because it
+resolves both sides through the same swapped link and they agree. So after those checks
+nothing is addressed by path again:
+
+- `_open_artifacts_dir()` opens the directory once with `O_RDONLY | O_DIRECTORY |
+  O_NOFOLLOW` and checks **that descriptor** — `readlink("/proc/self/fd/<dirfd>")` must sit
+  under `_ARTIFACTS_DIR_PREFIX` and must not be `" (deleted)"` — rather than re-resolving
+  the path;
+- the artifact is opened **relative to that fd** (`dir_fd=`) with `O_RDONLY | O_NOFOLLOW |
+  O_NONBLOCK`, so a later directory swap changes a name the read no longer uses;
+- regular-file, link-count and content all come from that one fd's `fstat`. `O_NOFOLLOW`
+  refuses a symlink at the final component; `st_nlink != 1` refuses a hardlink, which has
+  nothing to resolve and so passes both path layers while pointing at an out-of-tree inode;
+  `O_NONBLOCK` is what makes the FIFO case reachable at all — `O_RDONLY` on a writerless
+  FIFO blocks in the kernel before `S_ISREG` is tested, so a script could hang the chat
+  backend with one `mkfifo` in its own artifacts directory.
+
+The reported `size` is the payload length, not `st_size`, so a file that grows mid-read
+cannot report a size that disagrees with the bytes returned. Every failure — outside the
+allow-list, symlink, hardlink, FIFO, directory swap, `OSError` — is reported as "not
+found", so probing discloses nothing, and the oversize refusal omits the byte count so it
+is not a size oracle. A `_validate_path` refusal does return measurably faster than one
+from the open, which tells a caller whether a name **it planted** is an out-of-tree
+symlink; a dangling symlink takes the same fast path, so it is not an existence oracle.
+
+**Not implemented**: cross-execution scoping. `read_artifact` takes no session or execution
+argument, so which execution's artifacts are reachable rests entirely on
+`SANDBOX_ARTIFACTS_DIR` pointing at the right directory. Resolving a name against a session
+belongs to `4h6.11`.
+
 #### Open Targets Platform MCP
 
 | Tool | Description |
@@ -249,7 +359,7 @@ Each tool has a `category` field in its definition:
 | `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
-| `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |
+| `orchestration` | Main-agent-only tools: launch_subagents, list_capabilities, read_artifact. `subagent.py` drops all three **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches and to keep a subagent away from another execution's artifacts. |
 
 ### Profile behavior
 
