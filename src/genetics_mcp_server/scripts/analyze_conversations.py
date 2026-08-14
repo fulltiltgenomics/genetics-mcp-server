@@ -14,6 +14,7 @@ Analyzes conversations for:
 - Topic categorization (LLM-based or keyword fallback)
 - LLM-based quality evaluation of full conversations
 - Tool usage patterns and efficiency
+- SDK function calls made from inside sandboxed scripts, when --sdk-log is given
 - Success/failure metrics
 - Eval dataset extraction
 """
@@ -380,6 +381,172 @@ def build_session_tool_stats(messages: pl.DataFrame) -> pl.DataFrame:
     )
 
     return session_tools
+
+
+# ---------------------------------------------------------------------------
+# SDK function-call parsing (genetics-results-suite-4h6.12)
+# ---------------------------------------------------------------------------
+
+# The counterpart of the tool-call parsing above, for data access that happens INSIDE a
+# sandboxed script. Such a script is a single `run_analysis` tool call no matter how many
+# queries it issues, so every per-tool statistic in this report under-describes it by
+# construction. The SDK emits one audit line per function call
+# (`genetics_mcp_server/sdk/client.py`); this reads them back.
+#
+# The source is a LOG, not the chat DB — the calls happen in another process and are never
+# persisted as message content, so unlike tool calls they cannot be recovered from
+# chat_history.db at all. Point --sdk-log at the collected lines (a Cloud Logging export or
+# a captured container log); with no --sdk-log every SDK aggregate below is zero and is
+# labelled "not supplied" rather than "none happened".
+# A cancelled call ends in a bare ` cancelled` rather than ` error: CancelledError`: it was
+# taken away mid-flight, which is not the same event as a read that failed. It is surfaced
+# here as `sdk_error="cancelled"` — distinguishable from any exception type name, and it keeps
+# the parsed shape identical for every kind of line.
+SDK_CALL_RE = re.compile(
+    r"\[user=(?P<user>[^\]]*)\] \[session=(?P<session>[^\]]*)\] \[execution=(?P<execution>[^\]]*)\] "
+    r"Executing SDK function: (?P<function>\S+) with input: (?P<arguments>.*?) "
+    r"rows: (?P<rows>\d+)(?: error: (?P<error>\S+))?(?P<cancelled> cancelled)?$"
+)
+
+# A call refused by the SDK's own argument validation never reached the executor and read
+# nothing, so the SDK gives it a different marker and no `rows:` field. It is counted, because
+# a burst of refusals is worth seeing, but never as a data access.
+SDK_REJECT_RE = re.compile(
+    r"\[user=[^\]]*\] \[session=[^\]]*\] \[execution=[^\]]*\] "
+    r"Rejected SDK function: (?P<function>\S+) with input: .*? error: (?P<error>\S+)$"
+)
+
+SDK_TRUNCATED_RE = re.compile(r"SDK audit truncated after (?P<limit>\d+) records")
+
+# emitted once per process by the SDK when it has no dedicated audit fd; see
+# `SHARED_STREAM_WARNING` in sdk/client.py
+SDK_SHARED_STREAM_MARKER = "NOT a tamper-evident audit trail"
+
+
+def parse_sdk_calls(lines) -> list[dict]:
+    """Extract SDK function calls from audit log lines.
+
+    Lines that do not match are skipped silently: the input is a raw log stream that also
+    carries every other line the service logged, and one unrecognised line must not fail a
+    report. A JSON-wrapped export works too — the payload is matched anywhere in the line.
+    """
+    calls = []
+    for line in lines:
+        match = SDK_CALL_RE.search(line)
+        if not match:
+            continue
+        calls.append({
+            "session_id": match.group("session"),
+            "user": match.group("user"),
+            "execution_id": match.group("execution"),
+            "sdk_function": match.group("function"),
+            "sdk_rows": int(match.group("rows")),
+            "sdk_error": match.group("error") or ("cancelled" if match.group("cancelled") else ""),
+        })
+    return calls
+
+
+def scan_sdk_notices(lines) -> dict:
+    """Facts about the LOG rather than about any one call.
+
+    `shared_stream` is the one that changes how the whole report should be read: when the SDK
+    had no dedicated audit fd it says so in the stream, because the records then share a
+    stream the audited script writes to itself and any of them may be forged.
+    """
+    notices = {"rejected": 0, "truncated": 0, "truncated_at": 0, "shared_stream": False}
+    for line in lines:
+        if SDK_SHARED_STREAM_MARKER in line:
+            notices["shared_stream"] = True
+        truncated = SDK_TRUNCATED_RE.search(line)
+        if truncated:
+            notices["truncated"] += 1
+            notices["truncated_at"] = int(truncated.group("limit"))
+        if SDK_REJECT_RE.search(line):
+            notices["rejected"] += 1
+    return notices
+
+
+def load_sdk_log(paths: list[str] | None) -> tuple[list[dict], dict]:
+    """Read each log once, returning the calls and the log-level notices together."""
+    calls: list[dict] = []
+    notices = {"rejected": 0, "truncated": 0, "truncated_at": 0, "shared_stream": False}
+    for path in paths or []:
+        # streamed, not read into memory: an SDK audit log is one line per data access from
+        # every script in the range and is expected to be large
+        with open(path, errors="replace") as f:
+            for line in f:
+                calls.extend(parse_sdk_calls([line]))
+                found = scan_sdk_notices([line])
+                notices["rejected"] += found["rejected"]
+                notices["truncated"] += found["truncated"]
+                notices["truncated_at"] = max(notices["truncated_at"], found["truncated_at"])
+                notices["shared_stream"] = notices["shared_stream"] or found["shared_stream"]
+    return calls, notices
+
+
+def load_sdk_calls(paths: list[str] | None) -> list[dict]:
+    return load_sdk_log(paths)[0]
+
+
+_EMPTY_SDK_STATS = pl.DataFrame({
+    "session_id": pl.Series([], dtype=pl.Utf8),
+    "total_sdk_calls": pl.Series([], dtype=pl.Int64),
+    "sdk_rows": pl.Series([], dtype=pl.Int64),
+    "sdk_executions": pl.Series([], dtype=pl.Int64),
+    "unique_sdk_functions": pl.Series([], dtype=pl.Int64),
+    "sdk_sequence": pl.Series([], dtype=pl.Utf8),
+    "sdk_function_counts": pl.Series([], dtype=pl.Utf8),
+})
+
+# `sdk_sequence` lands in a metrics row and in every CSV cell, and a script can make thousands
+# of SDK calls from one `run_analysis`, so the join is bounded: 10k calls would otherwise be a
+# ~150 KB cell. The per-function TOTALS the report needs stay exact — they come from
+# `sdk_function_counts`, which is bounded by the number of SDK functions (25) instead.
+_SDK_SEQUENCE_MAX = 50
+
+
+def build_session_sdk_stats(calls: list[dict]) -> pl.DataFrame:
+    """Per-session SDK usage, shaped like build_session_tool_stats so it joins the same way.
+
+    A session with `unknown` for its session id is kept rather than dropped: until
+    `4h6.14` delivers the sandbox token's `sid` to the SDK, that is what every line carries,
+    and silently discarding them would report "no script access happened".
+    """
+    if not calls:
+        return _EMPTY_SDK_STATS
+    frame = pl.DataFrame(calls)
+    function_counts = (
+        frame.group_by(["session_id", "sdk_function"])
+        .len()
+        .group_by("session_id")
+        .agg(
+            (pl.col("sdk_function") + ":" + pl.col("len").cast(pl.Utf8))
+            .str.join("|")
+            .alias("sdk_function_counts")
+        )
+    )
+    return (
+        frame.group_by("session_id")
+        .agg(
+            pl.len().alias("total_sdk_calls"),
+            pl.col("sdk_rows").sum().alias("sdk_rows"),
+            pl.col("execution_id").n_unique().alias("sdk_executions"),
+            pl.col("sdk_function").n_unique().alias("unique_sdk_functions"),
+            pl.col("sdk_function").head(_SDK_SEQUENCE_MAX).str.join(" -> ").alias("sdk_sequence"),
+            # cast first: pl.len() is UInt32 and the subtraction underflows below the bound
+            (pl.len().cast(pl.Int64) - _SDK_SEQUENCE_MAX).alias("_elided"),
+        )
+        .with_columns(
+            pl.when(pl.col("_elided") > 0)
+            .then(pl.col("sdk_sequence") + pl.format(" -> ... (+{} more)", pl.col("_elided")))
+            .otherwise(pl.col("sdk_sequence"))
+            .alias("sdk_sequence")
+        )
+        .drop("_elided")
+        .join(function_counts, on="session_id", how="left")
+        .cast({"total_sdk_calls": pl.Int64, "sdk_rows": pl.Int64,
+               "sdk_executions": pl.Int64, "unique_sdk_functions": pl.Int64})
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +971,17 @@ class ConversationMetrics:
     tool_count_is_lower_bound: bool = False
     max_tools_in_message: int = 0
     unique_tools: int = 0
+    # data access from inside sandboxed scripts (genetics-results-suite-4h6.12). These come
+    # from the SDK audit log, not from the chat DB, so they are zero unless --sdk-log was
+    # given — never read a zero here as "the session ran no scripts"
+    total_sdk_calls: int = 0
+    sdk_rows: int = 0
+    unique_sdk_functions: int = 0
+    # bounded to the first _SDK_SEQUENCE_MAX calls, with the elided count appended: a script
+    # can make thousands of SDK calls and the untrimmed join is a ~150 KB cell. Per-function
+    # totals come from `sdk_function_counts` ("fn:n|fn:n"), which stays exact.
+    sdk_sequence: str = ""
+    sdk_function_counts: str = ""
     has_error_response: bool = False
     reached_conclusion: bool = True
     success_score: float = 0.0
@@ -931,6 +1109,7 @@ def compute_all_metrics(
     tool_stats: pl.DataFrame,
     topics: dict[str, dict],
     instruction_set_names: dict[str, str] | None = None,
+    sdk_stats: pl.DataFrame | None = None,
 ) -> list[ConversationMetrics]:
     """Compute metrics for all sessions."""
     # pre-compute per-session message stats
@@ -1003,6 +1182,10 @@ def compute_all_metrics(
         tool_coverage.select("session_id", "tool_count_is_lower_bound"),
         left_on="id", right_on="session_id", how="left",
     )
+    combined = combined.join(
+        sdk_stats if sdk_stats is not None else _EMPTY_SDK_STATS,
+        left_on="id", right_on="session_id", how="left",
+    )
 
     names = instruction_set_names or {}
     results = []
@@ -1023,6 +1206,11 @@ def compute_all_metrics(
             tool_count_is_lower_bound=bool(row.get("tool_count_is_lower_bound")),
             max_tools_in_message=row.get("max_tools_in_message") or 0,
             unique_tools=row.get("unique_tools") or 0,
+            total_sdk_calls=row.get("total_sdk_calls") or 0,
+            sdk_rows=row.get("sdk_rows") or 0,
+            unique_sdk_functions=row.get("unique_sdk_functions") or 0,
+            sdk_sequence=row.get("sdk_sequence") or "",
+            sdk_function_counts=row.get("sdk_function_counts") or "",
             has_error_response=sid in error_sessions,
             topic=topic_info.get("topic", "general_genetics"),
             complexity=topic_info.get("complexity", 2),
@@ -1301,6 +1489,8 @@ def generate_report(
     tool_stats: pl.DataFrame,
     cost_tracker: "CostTracker | None" = None,
     issue_categories: dict[str, str] | None = None,
+    sdk_stats: pl.DataFrame | None = None,
+    sdk_notices: dict | None = None,
 ) -> str:
     """Generate a markdown analysis report."""
     lines = ["# Conversation Analysis Report\n"]
@@ -1415,6 +1605,71 @@ def generate_report(
                  f"Mean: {sum(tool_counts)/len(tool_counts):.1f}")
     lines.append("")
     lines.append(tool_count_caveat())
+    lines.append("")
+
+    # --- SDK function calls from sandboxed scripts (genetics-results-suite-4h6.12) ---
+    # Reported next to the tool counts and never folded into them: a tool call is one model
+    # decision, an SDK call is one line of a script the model wrote, and adding them would
+    # make "calls per session" mean two different things at once.
+    lines.append("### SDK function calls (sandboxed scripts)\n")
+    if sdk_stats is None:
+        lines.append(
+            "_No SDK audit log supplied (`--sdk-log`). Data access from inside `run_analysis` "
+            "scripts is invisible to every tool count above: the whole script is ONE tool "
+            "call. Absence here is absence of the log, not absence of script access._"
+        )
+    else:
+        sdk_metrics = [m for m in metrics if m.total_sdk_calls]
+        # totals come from the log, not from `metrics`: a call whose session id matches no
+        # session in this DB joins to nothing and would otherwise disappear from the report
+        logged_calls = int(sdk_stats.select(pl.col("total_sdk_calls").sum()).item() or 0)
+        logged_rows = int(sdk_stats.select(pl.col("sdk_rows").sum()).item() or 0)
+        attributed = sum(m.total_sdk_calls for m in metrics)
+        lines.append(f"- Sessions with SDK calls: {len(sdk_metrics)}/{len(metrics)}")
+        lines.append(f"- Total SDK function calls: {logged_calls}")
+        lines.append(f"- Total rows returned to scripts: {logged_rows}")
+        notices = sdk_notices or {}
+        if notices.get("shared_stream"):
+            lines.append("")
+            lines.append(
+                "> **These lines are not a tamper-evident audit trail.** The log declares "
+                "(see `SHARED_STREAM_WARNING` in `sdk/client.py`) that the SDK had no "
+                "dedicated audit fd, so its records shared a stream the audited script writes "
+                "to itself: any line here — including its user and session — may have been "
+                "written by the script rather than by the SDK, and the counts below are an "
+                "upper bound on what actually happened. Delivering a dedicated fd is "
+                "genetics-results-suite-4h6.14."
+            )
+        if notices.get("truncated"):
+            lines.append("")
+            lines.append(
+                f"_{notices['truncated']} process(es) hit the SDK audit ceiling of "
+                f"{notices['truncated_at']} records; their REFUSED calls past that point are "
+                "missing from the refusal count below. The ceiling applies only to calls that "
+                "never reached the executor, so no data access is missing because of it._"
+            )
+        if notices.get("rejected"):
+            lines.append(f"- Calls refused before any data access: {notices['rejected']}")
+        if sdk_metrics:
+            lines.append("")
+            # from the exact per-function counts, not from the (bounded) sequence
+            sdk_freq = Counter()
+            for m in sdk_metrics:
+                for entry in filter(None, m.sdk_function_counts.split("|")):
+                    name, _, count = entry.rpartition(":")
+                    sdk_freq[name] += int(count)
+            lines.append("| SDK function | Calls |")
+            lines.append("|--------------|------:|")
+            for name, count in sdk_freq.most_common(15):
+                lines.append(f"| {name} | {count} |")
+        if logged_calls > attributed:
+            lines.append("")
+            lines.append(
+                f"_{logged_calls - attributed} of {logged_calls} SDK calls match no session in "
+                "this DB — `session=unknown`, or a session outside the analyzed range. The "
+                "sandbox does not yet receive the token whose `sid` claim identifies the "
+                "session (genetics-results-suite-4h6.14), so today every line is `unknown`._"
+            )
     lines.append("")
 
     # --- high tool-use sessions ---
@@ -1682,6 +1937,12 @@ async def main():
                         help="Path to llm_config SQLite DB, used to name the instruction sets "
                              "the report groups by (default: llm_config.db beside --db). "
                              "If it is missing the report groups by set id instead.")
+    parser.add_argument("--sdk-log", action="append", default=None, metavar="PATH",
+                        help="Log file carrying the sandbox SDK's audit lines "
+                             "('Executing SDK function: ...'). Repeatable. Data accessed "
+                             "from inside run_analysis scripts is one tool call in the chat "
+                             "DB no matter how many queries it issued, so without this the "
+                             "report cannot see it at all.")
     parser.add_argument("--no-llm", action="store_true",
                         help="Use keyword categorization instead of LLM")
     parser.add_argument("--topic-model",
@@ -1744,6 +2005,20 @@ async def main():
                     f"[{args.start_from or '-inf'}, {args.until or '+inf'})")
 
     logger.info(f"  {sessions.height} sessions, {messages.height} messages")
+
+    # --- parse SDK usage from the audit log ---
+    sdk_stats = None
+    sdk_notices = None
+    if args.sdk_log:
+        logger.info("Parsing SDK function calls...")
+        sdk_calls, sdk_notices = load_sdk_log(args.sdk_log)
+        sdk_stats = build_session_sdk_stats(sdk_calls)
+        logger.info(f"  {len(sdk_calls)} SDK calls across {sdk_stats.height} sessions")
+        if sdk_notices["shared_stream"]:
+            logger.warning(
+                "  this log came from a SHARED stream (no GENETICS_SDK_AUDIT_FD): its lines "
+                "are forgeable by the audited script and are not a tamper-evident trail"
+            )
 
     # --- parse tool usage ---
     logger.info("Parsing tool usage...")
@@ -1880,7 +2155,7 @@ async def main():
         resolve_llm_config_db(args.db, args.llm_config_db)
     )
     all_metrics = compute_all_metrics(
-        sessions, messages, tool_stats, topics, instruction_set_names
+        sessions, messages, tool_stats, topics, instruction_set_names, sdk_stats=sdk_stats
     )
 
     # --- LLM quality evaluation ---
@@ -1966,7 +2241,8 @@ async def main():
     # --- generate report ---
     logger.info("Generating report...")
     report = generate_report(all_metrics, sessions, messages, tool_stats, cost_tracker,
-                             issue_categories=issue_categories)
+                             issue_categories=issue_categories, sdk_stats=sdk_stats,
+                             sdk_notices=sdk_notices)
     print(report)
 
     # also write the report (stdout content) to a markdown file

@@ -11,7 +11,13 @@ adds is: exactly-one-of dispatch, `{"success": False}` turned into a raised
 `GeneticsError`, and a polars DataFrame instead of a nested dict.
 """
 
+import asyncio
+import functools
+import inspect
+import logging
+import os
 import re
+import sys
 from typing import Any
 
 import polars as pl
@@ -884,3 +890,469 @@ class GeneticsClient:
         return self._payload(
             await self._executor.list_datasets(resource=resource, include_stats=include_stats)
         )["datasets"]
+
+
+# --------------------------------------------------------------------------- audit trail
+
+# genetics-results-suite-4h6.12. Today every data access is an MCP tool call and chat-backend
+# logs one `Executing tool: <name> with input: <dict>` line per call under a
+# `[user=…] [session=…] ` prefix (llm_service.py). Once access moves inside a sandboxed
+# script that trail disappears: one `run_analysis` tool call stands for an unbounded number
+# of queries. These lines put it back, one per SDK function call, in the same shape so the
+# same log queries answer the same questions — `Executing tool:` still matches exactly what
+# it matched before, and `Executing SDK function:` is its counterpart for script access.
+#
+# WHAT THE TRAIL COVERS, AND WHAT IT DOES NOT. These lines cover calls made through the
+# curated SDK surface — `GeneticsClient` coroutine methods and the `genetics.<fn>` sync
+# wrappers that delegate to them. They do NOT cover `client._executor.<method>()`, which is
+# one attribute access away and returns the same data with no line at all (see the
+# constructor's note: `tools/executor.py` ships in the sandbox image, so a script can build
+# its own executor without a client). Closing that means instrumenting `ToolExecutor`
+# itself, which is a much larger change: every MCP tool call goes through the same methods,
+# so it would need chat-backend's existing `Executing tool:` line suppressed or deduplicated
+# against it. Until then this is "audited if you use the recommended surface", not
+# "unbypassable", and nothing should cite it as the latter.
+#
+# WHERE THE LINE GOES, AND WHETHER IT CAN BE TRUSTED. In-process (chat-backend, tests) it is
+# an ordinary record on `genetics_mcp_server.sdk.audit` and lands wherever `Executing tool:`
+# lands. In the sandbox the SDK runs in a forked child that configures no logging at all, so
+# a handler is installed on first use. Only ONE of those shapes is tamper-evident:
+#
+#   dedicated fd (GENETICS_SDK_AUDIT_FD) — the supervisor holds the write end and the child
+#       writes nothing else to it; propagation is switched off so inherited handlers cannot
+#       put the records back on a shared stream.
+#   anything else — the records share a stream (stderr, or the host's logging config) that
+#       the audited script writes to itself with `print(..., file=sys.stderr)`. Per-value
+#       escaping is irrelevant when the writer owns the stream: a forged line parses cleanly
+#       through this repo's own parser and can name any user and session it likes. When no
+#       fd is configured the channel says so, once, in the stream itself — see
+#       `_warn_shared_stream` — and `scripts/analyze_conversations.py` repeats the warning in
+#       any report built from such a log.
+#
+# THE SUPERVISOR HALF DOES NOT EXIST YET (genetics-results-suite-4h6.7 / .14): nothing sets
+# GENETICS_SDK_AUDIT_FD, and nothing forwards the child's audit stream to the pod's stdout
+# where the cluster's logging agent would collect it. So today every emitted record is on the
+# untrusted side of that line, and this module is honest about it rather than claiming a
+# tamper-evident trail it cannot provide.
+#
+# AND NOTHING IN THIS FILE CAN CHANGE THAT. The audited script shares this address space, so
+# every in-process control here is reachable from the code it is supposed to constrain. This
+# is not a list of gaps to be patched one by one; it is the consequence of where the code
+# runs, and each of these was demonstrated against an earlier revision of this module:
+#
+#   FORGERY   — `logging.getLogger("genetics_mcp_server.sdk.audit").info(...)` emits a record
+#               indistinguishable from ours, and `os.write(int(os.environ["…AUDIT_FD"]), …)`
+#               puts arbitrary bytes on the dedicated fd itself. The fd number has to be in
+#               the child's environment for the SDK to find it, so the script can find it too.
+#   SUPPRESSION — `logger.disabled = True`, `setLevel`, `addFilter`, `removeHandler` all
+#               silence real records, from the script, with one line.
+#   BUDGET RESET — any per-execution counter keyed on an environment variable is reset by
+#               rewriting that variable, which is why the budget below is keyed on nothing
+#               the script can write.
+#
+# SO: THESE RECORDS ARE A BEST-EFFORT OBSERVABILITY SIGNAL, NOT A SECURITY CONTROL. They tell
+# an operator what a well-behaved script did. They do not bound what a hostile one can claim,
+# hide or emit, and nothing — this repo's docs, a review, an incident write-up — may cite them
+# as evidence of what happened under an assumption of compromise. The controls that DO hold
+# against a hostile script are the ones outside the process: the sandbox's network policy,
+# db-api's own `endpoint_access` lines, and the byte/row quotas.
+#
+# WHAT WOULD ACTUALLY WORK, AND IS THE SPECIFICATION FOR genetics-results-suite-4h6.14:
+#
+#   1. THE SUPERVISOR READS THE FD AND ENFORCES ON THE READ END. The child holds only the
+#      write end; the rate cap, the byte cap and the per-line length cap are applied by the
+#      supervisor as it reads, where no code in the child can raise, reset or bypass them.
+#      Overrun is the supervisor's decision to record and act on (drop with a counted notice,
+#      or fail the execution) — not the child's.
+#   2. THE SUPERVISOR STAMPS IDENTITY. `[user=…] [session=…] [execution=…]` must be written by
+#      the process that holds the sandbox token, from its `sub`/`sid`/`jti` claims, on lines
+#      it accepts from the child. The child must not be asked to state who it is — see
+#      `_audit_identity` below, which reads exactly what the script can rewrite.
+#   3. THE CHILD'S FRAMING IS UNTRUSTED INPUT. The supervisor parses each line, rejects any it
+#      cannot parse, and re-emits it in its own framing. The sanitisation below reduces the
+#      damage a malformed line does; it is not a substitute for the supervisor re-framing it.
+#
+# Until all three exist, the honest statement is the one at the top of this paragraph.
+_audit_logger = logging.getLogger("genetics_mcp_server.sdk.audit")
+
+# A logger with no level of its own inherits root's. A host that leaves root at WARNING would
+# therefore discard this entire control with no error and no missing-handler warning, so the
+# level is pinned here at import instead of only on the fallback path. (Handler levels in the
+# host's own config still apply; nothing here can override those.)
+_audit_logger.setLevel(logging.INFO)
+
+# Statements ABOUT the channel — it is shared, it was truncated — go on a child logger. They
+# propagate into the same sink, so an operator and the analyzer both see them, but they are
+# not data accesses: they must not parse as an SDK call or be counted as one.
+_audit_meta_logger = logging.getLogger("genetics_mcp_server.sdk.audit.meta")
+_audit_meta_logger.setLevel(logging.INFO)
+
+_AUDIT_FD_ENV = "GENETICS_SDK_AUDIT_FD"
+
+SHARED_STREAM_WARNING = (
+    "SDK audit records here are NOT a tamper-evident audit trail: no "
+    f"{_AUDIT_FD_ENV} was configured, so they share a stream the audited script can write to "
+    "itself. Any line below may be forged, including its user and session. Delivering a "
+    "dedicated audit fd to the sandbox child is genetics-results-suite-4h6.14."
+)
+
+# WHAT IS BOUNDED, AND WHAT MUST NEVER BE. Only records for calls that NEVER REACHED THE
+# EXECUTOR — refusals — are bounded. Records for calls that did reach it are never dropped.
+#
+# The two are not the same primitive. A refusal costs the script nothing: no socket, no
+# upstream, no bytes, just local argument validation raising, which is why 1000 of them were
+# driven through in ~50ms. That is the flooding primitive, and it is worth bounding. A call
+# that reached the executor is already rate-limited by an HTTP round-trip to db-api and is
+# charged against the byte and row quotas the rest of the sandbox's resource controls rely
+# on, so it cannot be driven at flood rates in the first place — and a bound on it is not a
+# bound at all but a SUPPRESSION PRIMITIVE: an earlier revision counted both against one
+# ceiling, so 1001 cheap refusals bought silence for every genuine `sql()` read that followed.
+# Silently dropping the records that matter, on demand, is strictly worse than the noisy flood
+# the ceiling replaced. Hence: bound the cheap side, never the side that read data.
+#
+# KEYED ON A MODULE-LEVEL PROCESS COUNTER, deliberately, and on nothing else. Any key the
+# script can write is a reset button: keying this on SANDBOX_EXECUTION_ID meant a loop that
+# rewrote that variable restored the full flood (19,622 lines/s — higher than before the
+# ceiling existed). A process-global counter is not resettable from outside this module, and a
+# script that can reach into this module's globals can also just call the logger directly, so
+# nothing is lost by not defending that case here. This does mean a supervisor that reuses one
+# process across executions shares one refusal budget across them; that is the right trade,
+# and the supervisor-side enforcement described above is what removes the need for it.
+#
+# WHY 1000: refusals are a bug signal, not a workload. The heaviest observed real session is
+# 58 tool calls; a script emitting a four-figure count of refusals is looping on a mistake,
+# and the first thousand say so as well as a million would.
+_AUDIT_MAX_REFUSALS = 1000
+
+# Statements ABOUT the channel are themselves emitted from script-driven paths, so the meta
+# channel needs its own process-global bound: the truncation notice used to fire once per
+# execution id, and rotating that id produced 3,873 notices in one second. Small, because the
+# only things that belong here are the shared-stream warning and the refusal cut, once each.
+_AUDIT_MAX_META_RECORDS = 8
+
+_audit_handler_pid: int | None = None
+_audit_dedicated_fd = False
+_audit_refusals = 0
+_audit_meta_records = 0
+_audit_emit_failures = 0
+
+
+def _install_audit_handler(stream: Any) -> None:
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    # marked so a re-check after fork replaces OUR handler and leaves the host's alone
+    handler._sdk_audit_owned = True  # type: ignore[attr-defined]
+    _audit_logger.addHandler(handler)
+
+
+def _ensure_audit_handler() -> None:
+    """Point the audit logger at a dedicated fd if there is one, else at a shared stream.
+
+    KEYED ON THE PID, not on a one-shot flag. The sandbox child is forked from a supervisor
+    that may already have made SDK calls, and both this module's state and the parent's
+    handlers survive `fork()` — a one-shot flag therefore left the child writing into the
+    parent's inherited sink and never reading GENETICS_SDK_AUDIT_FD at all, which made the
+    one separation mechanism unreachable in exactly the shape it was written for.
+
+    A host process (chat-backend, the MCP server, pytest) owns its own logging config, and
+    adding a second handler there would duplicate every line into a different sink — so the
+    shared-stream branch installs one only when nothing else has configured logging. The
+    dedicated-fd branch always installs, and stops propagation: inherited handlers would
+    otherwise copy every record back onto the shared stream the fd exists to escape.
+    """
+    global _audit_handler_pid, _audit_dedicated_fd
+    pid = os.getpid()
+    if _audit_handler_pid == pid:
+        return
+    _audit_handler_pid = pid
+    _audit_dedicated_fd = False
+    for handler in [h for h in _audit_logger.handlers if getattr(h, "_sdk_audit_owned", False)]:
+        _audit_logger.removeHandler(handler)
+
+    fd = os.environ.get(_AUDIT_FD_ENV, "").strip()
+    if fd.isdigit():
+        try:
+            # closefd=False: the fd belongs to the supervisor that passed it in
+            stream = os.fdopen(int(fd), "w", buffering=1, closefd=False)
+        except OSError:
+            stream = None
+        if stream is not None:
+            _install_audit_handler(stream)
+            _audit_logger.propagate = False
+            _audit_dedicated_fd = True
+            return
+
+    _audit_logger.propagate = True
+    if not logging.getLogger().handlers and not _audit_logger.handlers:
+        _install_audit_handler(sys.stderr)
+    _warn_shared_stream()
+
+
+def _warn_shared_stream() -> None:
+    """Say in the stream itself that the stream is not trustworthy.
+
+    Emitted once per process, before any record it qualifies, so a collected log carries its
+    own provenance: a reader (or the analyzer) does not have to know how the process was
+    launched to know whether the lines below can be forged.
+    """
+    _emit_meta(SHARED_STREAM_WARNING)
+
+
+def _emit_meta(message: str) -> None:
+    """Emit a statement about the channel, bounded per process, carrying no script-chosen text.
+
+    Both properties are load-bearing. The bound: these are emitted from paths a script drives,
+    so an unbounded meta channel is the same flooding primitive one level up. No script-chosen
+    text: the truncation notice used to interpolate `[execution=…]`, which is whatever the
+    script last wrote to SANDBOX_EXECUTION_ID — chosen bytes on the one channel that exists to
+    describe the log rather than to carry the script's input. Callers must pass literals.
+    """
+    global _audit_meta_records
+    if _audit_meta_records >= _AUDIT_MAX_META_RECORDS:
+        return
+    _audit_meta_records += 1
+    _emit(_audit_meta_logger, logging.WARNING, message)
+
+
+def _emit(logger: logging.Logger, level: int, message: str) -> None:
+    """Emit without ever letting logging break the call it describes.
+
+    The wrapper's contract is transparency: a handler that raises (a full disk, a closed fd
+    passed by a supervisor that went away) must not turn a SUCCESSFUL data access into a
+    failed one. Swallowing silently would be its own defect, so the first failure is reported
+    on the process's original stderr — `sys.__stderr__`, not `sys.stderr`, which a sandboxed
+    script may have rebound — and the count stays readable for tests and for callers.
+    """
+    global _audit_emit_failures
+    try:
+        logger.log(level, message)
+    except Exception as exc:
+        _audit_emit_failures += 1
+        if _audit_emit_failures == 1:
+            try:
+                print(
+                    f"genetics sdk audit: emitting a record failed ({type(exc).__name__}); "
+                    "SDK calls are no longer being recorded",
+                    file=sys.__stderr__,
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+
+def _audit_refusal_budget() -> bool:
+    """False once this PROCESS has spent its refusal budget; announces the cut exactly once.
+
+    Applies only to calls that never reached the executor — see `_AUDIT_MAX_REFUSALS` for why
+    reads are deliberately not bounded here, and why the key is a process global rather than
+    anything the audited script can write.
+    """
+    global _audit_refusals
+    if _audit_refusals < _AUDIT_MAX_REFUSALS:
+        _audit_refusals += 1
+        return True
+    if _audit_refusals == _AUDIT_MAX_REFUSALS:
+        _audit_refusals += 1
+        _emit_meta(
+            f"SDK audit truncated after {_AUDIT_MAX_REFUSALS} records; further REFUSED SDK "
+            "calls in this process are NOT recorded. Calls that reached the executor are "
+            "still recorded in full."
+        )
+    return False
+
+
+# Identity is read from the environment and the environment is script-writable, so these three
+# fields get the SAME treatment as an argument value — they were interpolated raw and unbounded
+# until `4h6.12`'s last revision, which is a defect on any architecture and not merely a
+# sandbox one. Two consequences were measured: `SANDBOX_USER` of 100 KB put 100,431 bytes on
+# the stream for ONE legitimate call, and `SANDBOX_USER = "alice\n[user=admin@finngen.fi"`
+# rendered a line this repo's OWN parser (`scripts/analyze_conversations.py`) read back as
+# `user='admin@finngen.fi'` — a forged attribution needing no logger access at all.
+#
+# A value that fails is REPLACED, never truncated. Truncating "admin@finngen.fi.attacker.test"
+# to a plausible prefix manufactures a different, credible-looking identity; `<invalid>` is
+# unmistakably not a user id, keeps the field's position so the line still parses, and contains
+# no `]` so it cannot escape the bracket the parser keys on.
+_AUDIT_SAFE_IDENTITY_RE = re.compile(r"\A[A-Za-z0-9_.:/@|+-]{1,64}\Z")
+_AUDIT_BAD_IDENTITY = "<invalid>"
+
+
+def _audit_identifier(value: str) -> str:
+    return value if _AUDIT_SAFE_IDENTITY_RE.match(value) else _AUDIT_BAD_IDENTITY
+
+
+def _audit_identity() -> tuple[str, str, str]:
+    """(user, session, execution) for the audit prefix, sanitised.
+
+    Read from the environment per call rather than cached: the supervisor sets them on the
+    forked child, and the SDK may well be imported before that happens. Which also means the
+    audited script can rewrite them at will — this function reads exactly what the script
+    controls, which is why the supervisor, not the child, has to stamp identity (`4h6.14`; see
+    the module header). Sanitising here bounds the damage; it does not make the values true.
+
+    ALL THREE ARE `unknown` TODAY. The values are the sandbox token's `sub`, `sid` and `jti`
+    claims (genetics-results-suite docs/code-execution-security.md §4), and the SDK does not
+    yet receive that token — `4h6.14` owns delivering it. `jti` is also the
+    `/scratch/<execution-id>` directory name, which is what makes this line joinable with
+    db-api's `endpoint_access` lines and with chat-backend's own.
+    """
+    env = os.environ
+    return (
+        _audit_identifier(env.get("SANDBOX_USER") or "unknown"),
+        _audit_identifier(env.get("SANDBOX_SESSION_ID") or "unknown"),
+        _audit_identifier(env.get("SANDBOX_EXECUTION_ID") or "unknown"),
+    )
+
+
+# An identifier-shaped string is logged verbatim; anything else is reduced to its type and
+# length. This is a DISCLOSURE decision, not formatting. The tool layer logs raw inputs
+# because they are model-authored and bounded by a schema; SDK arguments are SCRIPT-authored
+# and unbounded, so raw logging would (a) let an injected script write chosen text —
+# including forged `\n`-separated log lines — into the operator's log pipeline, and (b) copy
+# whole `sql()` query bodies, which carry free text and are the argument most likely to
+# embed data, into a sink read by people who did not ask for it. The charset admits gene
+# symbols, variant ids, rsids, phenotype codes, regions, dataset and view names — the values
+# that answer "what did that script actually read?" — and excludes whitespace, quotes and
+# every control character, so the rendered line can be neither forged nor expanded.
+#
+# `\Z`, NOT `$`. `$` matches before a terminal newline, so `'IL7R\n'` passed as
+# identifier-shaped and the verbatim bound was 65 characters rather than 64. Only the `repr()`
+# below defanged it, which makes the whole property rest on a formatting choice a future
+# readability tweak would drop; `\Z` puts it back in the charset where the comment says it is.
+# What it does NOT cover: `sql()` bodies and every list argument fall to `<str:N>`/`<list:N>`,
+# so for the two most powerful shapes the line records that a read happened and not what was
+# read — see docs/project-spec.md, which states the limitation next to the claim.
+_AUDIT_SAFE_VALUE_RE = re.compile(r"\A[A-Za-z0-9_.:/@|+-]{1,64}\Z")
+
+
+def _summarize_value(value: Any) -> str:
+    if value is None or isinstance(value, (bool, int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return repr(value) if _AUDIT_SAFE_VALUE_RE.match(value) else f"<str:{len(value)}>"
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
+        return f"<{type(value).__name__}:{len(value)}>"
+    return f"<{type(value).__name__}>"
+
+
+def _summarize_arguments(signature: inspect.Signature, args: tuple, kwargs: dict) -> str:
+    """Render the supplied arguments dict-style, mirroring the tool line's `{...}` input.
+
+    Only what the caller actually passed appears, as on the tool side: defaults are the
+    SDK's, not the script's, and a line full of them hides the two arguments that mattered.
+    """
+    try:
+        # `signature` is the UNBOUND method's, so `self` has to occupy the first slot or a
+        # positional argument binds to it and is then dropped by the filter below
+        bound = signature.bind_partial(None, *args, **kwargs)
+    except TypeError:
+        # the call is about to raise anyway; the attempt is still worth a line
+        return "<unavailable>"
+    items = [
+        f"{name!r}: {_summarize_value(value)}"
+        for name, value in bound.arguments.items()
+        if name != "self"
+    ]
+    return "{" + ", ".join(items) + "}"
+
+
+def _result_rows(result: Any) -> int:
+    """Rows the call returned.
+
+    `schema`/`resources`/`datasets` return nested dicts, where this is the number of
+    top-level entries — the only honest count for a non-tabular answer, and still the signal
+    that separates "read everything" from "read nothing".
+    """
+    if isinstance(result, pl.DataFrame):
+        return result.height
+    if isinstance(result, (list, tuple, set, frozenset, dict)):
+        return len(result)
+    return 1
+
+
+def _audit(
+    function: str,
+    summary: str,
+    *,
+    rows: int | None,
+    error: str | None = None,
+    cancelled: bool = False,
+) -> None:
+    """One record per call. `rows=None` means the call never reached the executor.
+
+    A call refused by local argument validation read NOTHING, so it gets a different marker
+    and no `rows:` field at all. Recording it in the same shape as a real data access both
+    inflated the flood (the refusal path is the cheap one — no network, no upstream) and
+    polluted the answer to "what did that script read?" with calls that read nothing.
+
+    It is also the ONLY branch the budget applies to: a refusal is free to the caller and can
+    therefore be driven at flood rates, while a call that reached the executor paid an HTTP
+    round-trip and is charged against the sandbox's byte and row quotas. Dropping the latter
+    is not a flood control, it is a way for a script to buy silence — see `_AUDIT_MAX_REFUSALS`.
+    """
+    _ensure_audit_handler()
+    user, session, execution = _audit_identity()
+    prefix = f"[user={user}] [session={session}] [execution={execution}] "
+    if rows is None:
+        if not _audit_refusal_budget():
+            return
+        _emit(
+            _audit_logger,
+            logging.INFO,
+            f"{prefix}Rejected SDK function: {function} with input: {summary} error: {error}",
+        )
+        return
+    line = f"{prefix}Executing SDK function: {function} with input: {summary} rows: {rows}"
+    if error:
+        line = f"{line} error: {error}"
+    if cancelled:
+        line = f"{line} cancelled"
+    _emit(_audit_logger, logging.INFO, line)
+
+
+def _audited(method):
+    """Wrap one `GeneticsClient` coroutine method so every call emits exactly one line.
+
+    functools.wraps plus an untouched `__signature__` is load-bearing, not hygiene:
+    `list_capabilities` renders the SDK catalogue out of these live objects with `inspect`,
+    and `sdk._make_sync` builds the sync surface by slicing the same signature.
+    """
+    signature = inspect.signature(method)
+
+    @functools.wraps(method)
+    async def wrapper(self, *args: Any, **kwargs: Any):
+        summary = _summarize_arguments(signature, args, kwargs)
+        try:
+            result = await method(self, *args, **kwargs)
+        except GeneticsUsageError as e:
+            # every GeneticsUsageError in this module is raised by _one_of / _reject /
+            # parse_region BEFORE any executor call, so this branch is exactly "the call
+            # never reached the executor" and is recorded as a refusal, not as a read
+            _audit(method.__name__, summary, rows=None, error=type(e).__name__)
+            raise
+        except asyncio.CancelledError:
+            # a cancelled call is not a failed read — the task was taken away from it, and
+            # `error: CancelledError` would file every shutdown and timeout as a failure
+            _audit(method.__name__, summary, rows=0, cancelled=True)
+            raise
+        except BaseException as e:
+            # the exception TYPE only: upstream error strings are not ours to copy into a
+            # sink read by people who did not ask for them
+            _audit(method.__name__, summary, rows=0, error=type(e).__name__)
+            raise
+        _audit(method.__name__, summary, rows=_result_rows(result))
+        return result
+
+    return wrapper
+
+
+def _instrument(cls: type) -> None:
+    """Instrument at the client, not at `sdk._make_sync`: the sync functions delegate here,
+    so one wrapper covers both surfaces and neither double-counts."""
+    for name, method in list(vars(cls).items()):
+        if name.startswith("_") or name == "close" or not inspect.iscoroutinefunction(method):
+            continue
+        setattr(cls, name, _audited(method))
+
+
+_instrument(GeneticsClient)

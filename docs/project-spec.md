@@ -579,6 +579,156 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   on a dedicated background event loop (`sdk/_runner.py`), which keeps the HTTP connection pool
   warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the
   same functions as awaitables.
+- **Every call through the SDK surface is audited — `_executor` is not**
+  (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine
+  method is wrapped at import time (`_instrument` in `sdk/client.py`) so one line per call goes
+  to the `genetics_mcp_server.sdk.audit` logger:
+  `[user=…] [session=…] [execution=…] Executing SDK function: <name> with input: {…} rows: <n>`,
+  plus ` error: <ExceptionType>` when the call raised. It mirrors chat-backend's
+  `[user=…] [session=…] Executing tool: <name> with input: {…}` (`llm_service.py`) rather than
+  reusing its marker, so a query for `Executing tool:` still matches exactly what it did before
+  and script access is a separate, countable thing. The wrapper is instrumented at the client,
+  not at `sdk._make_sync`, so the sync and awaitable surfaces produce one line between them and
+  not two. `functools.wraps` plus an untouched `__signature__` is load-bearing: `list_capabilities`
+  renders the catalogue out of these live objects.
+  - **Argument values are summarised, not logged.** An identifier-shaped string
+    (`[A-Za-z0-9_.:/@|+-]{1,64}` — gene symbols, variant ids, rsids, phenotype codes, regions,
+    view names) is kept verbatim; every other string becomes `<str:len>`, every container
+    `<type:len>`, and `bool`/`int`/`float`/`None` stay as they are. SDK arguments are
+    *script*-authored and unbounded, unlike the schema-bounded tool inputs, so raw logging would
+    let an injected script write chosen text — including forged newline-separated log lines —
+    into the operator's log pipeline, and would copy whole `sql()` bodies into it. Exceptions
+    contribute their **type** only, because `GeneticsUsageError` messages quote arguments back.
+    The charset is anchored with `\Z`, not `$`, which matched before a terminal newline and let
+    `'IL7R\n'` through as identifier-shaped.
+  - **What the summary cannot tell you.** For the two most powerful shapes the line records
+    *that* a read happened, not *what* was read: `sql()` renders as `{'query': <str:N>}` and
+    every batch argument (`variants=[…]`, `phenotypes=[…]`, `codes=[…]`) as `<list:N>`. So for
+    arbitrary SQL and for batch calls the trail does **not** answer
+    genetics-results-suite `docs/code-execution-security.md` §6.2's "what did that script
+    read?" — it answers only "how much". Logging the raw query would reintroduce exactly the
+    injection the summary exists to prevent, so it is not the fix; what would close it is a
+    bounded, allow-list-derived summary — the `genetics_results.<view>` names a query
+    references, emitted only when the extracted name is on a shipped view allow-list, so no
+    attacker-chosen text can reach the line. This repo has no such allow-list today
+    (`tools/sql_safety.py` allow-lists *values*, not views; the view list is db-api's), so the
+    gap is stated rather than papered over.
+  - **A call refused before it reached the executor is not recorded as a read.** Local
+    argument validation (`_one_of`, `_reject`, `parse_region` — every `GeneticsUsageError` in
+    the module) raises before any upstream call, so it emits
+    `Rejected SDK function: <name> with input: {…} error: <ExceptionType>` with **no `rows:`
+    field** and does not parse as a data access. The refusal path is the cheap one, so
+    recording it in the read shape both inflated the volume below and polluted the answer to
+    "what did that script read?" with calls that read nothing.
+  - **Only refusals are bounded — 1000 per process (`_AUDIT_MAX_REFUSALS`) — and a call that
+    reached the executor is never dropped.** The two are different primitives. A refusal costs
+    the script nothing (no socket, no upstream: 1000 were driven through in ~50ms), so it is
+    the flooding primitive and is capped, after which one `SDK audit truncated after 1000
+    records` notice is emitted and further refusals go unrecorded. A call that reached the
+    executor paid an HTTP round-trip to db-api and is charged against the byte and row quotas
+    the rest of the sandbox's resource controls rely on, so it cannot be driven at flood
+    rates — and capping it is not a flood control but a **suppression primitive**: an earlier
+    revision counted both against one ceiling, so 1001 cheap refusals bought silence for every
+    genuine `sql()` read that followed. The budget is keyed on a **module-level process
+    counter and on nothing the script can write**; keying it on `SANDBOX_EXECUTION_ID` gave a
+    script a reset button (a loop rewriting that variable restored the flood at 19,622
+    lines/s, higher than before the ceiling existed). Measured after the change, with the
+    execution id rotated on every call: 1001 lines / ~206 KB total, then a flat zero. The cost
+    is that a supervisor reusing one process across executions shares one refusal budget;
+    fixing that belongs on the supervisor's side of the fd (`4h6.14`), not here.
+  - **The meta channel is bounded too, and carries no script-chosen text**
+    (`_AUDIT_MAX_META_RECORDS`, `_emit_meta`). The truncation notice used to interpolate
+    `[execution=…]` — i.e. whatever the script last wrote to `SANDBOX_EXECUTION_ID` — and
+    fired once per execution id, so rotating the id produced 3,873 notices in one second.
+    Statements about the channel are now capped per process and are literals.
+  - **A cancelled call is not filed as a failed read.** `asyncio.CancelledError` ends the line
+    with a bare ` cancelled` instead of ` error: CancelledError`, so a shutdown or a timeout
+    does not read back as a failure.
+  - **Logging can never break the call.** Every emit goes through `_emit`, which swallows
+    handler exceptions (a full disk, a supervisor's closed fd) so a successful data access is
+    never turned into a failure; the first failure is reported on `sys.__stderr__` — not
+    `sys.stderr`, which a sandboxed script may have rebound — and counted in
+    `_audit_emit_failures`. The audit logger's level is pinned to `INFO` at import, because a
+    logger with no level of its own inherits root's and a host at `WARNING` would have
+    discarded this entire control with no error.
+  - **`_executor` calls are NOT audited.** `genetics.get_client()._executor.<method>()`
+    returns the same data and emits nothing, and `tools/executor.py` ships in the sandbox
+    image, so a script can build its own executor in one import (`genetics-results-suite-4h6.33`).
+    The underscore is curation, not enforcement. Closing this means instrumenting
+    `ToolExecutor` itself, which is a much larger change: every MCP tool call goes through
+    those same methods, so it would need chat-backend's existing `Executing tool:` line
+    suppressed or deduplicated against the new one. Until then this control reads "audited if
+    you use the recommended surface", never "unbypassable".
+  - **Identity is `unknown` today**, and the line says so rather than omitting the fields. The
+    values are the sandbox token's `sub`/`sid`/`jti` claims, read from `SANDBOX_USER`,
+    `SANDBOX_SESSION_ID` and `SANDBOX_EXECUTION_ID`; delivering the token to the child is
+    `genetics-results-suite-4h6.14`.
+  - **The identity fields are sanitised like any other script-authored value**
+    (`_audit_identifier`). They come from the environment, which the audited script writes, so
+    they get the same `[A-Za-z0-9_.:/@|+-]{1,64}\Z` charset and length cap as an argument, and
+    anything failing it is replaced with the literal `<invalid>` — replaced, never truncated,
+    because truncating `admin@finngen.fi.attacker.test` to a prefix manufactures a different,
+    entirely plausible identity. This is a defect on any architecture, not a sandbox-only one:
+    interpolated raw, `SANDBOX_USER = "alice\n[user=admin@finngen.fi"` produced a line that
+    **this repo's own parser** (`analyze_conversations.py`) read back as
+    `user='admin@finngen.fi'`, and a 100 KB `SANDBOX_USER` put 100,431 bytes on the stream for
+    one legitimate call (197 bytes after the fix). Sanitising bounds the damage; it does not
+    make the values true — only the supervisor stamping them does.
+  - **Without a dedicated fd these records are NOT a tamper-evident audit trail, and they say
+    so.** In-process the record lands wherever `Executing tool:` lands; in the sandbox the SDK
+    runs in a forked child that configures no logging, so a handler is installed on first use.
+    Only the `GENETICS_SDK_AUDIT_FD` path is trustworthy: the supervisor holds the write end,
+    and the SDK switches off propagation so inherited handlers cannot copy the records back
+    onto a shared stream. Every other shape shares a stream with the audited script — the same
+    stderr it writes to with `print(..., file=sys.stderr)` — and per-value escaping is
+    irrelevant when the writer owns the stream: a forged line parses cleanly through
+    `analyze_conversations.py` and can name any user and session. So when no fd is configured
+    the SDK emits `SHARED_STREAM_WARNING` once per process on
+    `genetics_mcp_server.sdk.audit.meta` (a child logger: it reaches the same sink but must not
+    parse or count as a data access), and the analyzer repeats that warning in any report built
+    from such a log. Handler installation is keyed on the **pid**, not a one-shot flag, because
+    both the module's state and the parent's handlers survive `fork()` — the earlier one-shot
+    guard made the fd path unreachable in exactly the shape it exists for. **Nothing sets that
+    fd today, and nothing forwards the child's stream to the pod's stdout for the cluster's
+    logging agent: the supervisor does not exist yet (`4h6.7` / `4h6.14`), so every record
+    emitted today is on the untrusted side of this line.**
+  - **These records are a best-effort observability signal, not a security control, and no
+    in-process change can make them one.** The audited script shares the address space with
+    the code that emits them, so every control in `sdk/client.py` is reachable from the code it
+    constrains — each of these was demonstrated: forgery by calling
+    `logging.getLogger("genetics_mcp_server.sdk.audit").info(...)` directly, or `os.write` to
+    the fd number the SDK necessarily leaves in the environment for the child to find;
+    suppression of real records via `logger.disabled`, `setLevel`, `addFilter` or
+    `removeHandler`; and reset of any budget keyed on a script-writable variable. The bounds
+    and sanitisation above make the channel honest and stop it being actively harmful; they do
+    not bound what a hostile script can claim, hide or emit. So the trail describes what a
+    well-behaved script did, and nothing — a review, an incident write-up, this document —
+    may cite it as evidence under an assumption of compromise. The controls that hold against a
+    hostile script are outside the process: the sandbox network policy, db-api's own
+    `endpoint_access` lines, and the byte/row quotas.
+  - **What `genetics-results-suite-4h6.14` owes, stated as a specification** (also in the
+    `sdk/client.py` header, so the ticket inherits a design rather than a puzzle):
+    1. **The supervisor reads the fd and enforces on the read end.** The child holds only the
+       write end; the rate cap, byte cap and per-line length cap are applied by the supervisor
+       as it reads, where no code in the child can raise, reset or bypass them, and overrun is
+       the supervisor's decision to record and act on.
+    2. **The supervisor stamps identity.** `[user=…] [session=…] [execution=…]` must be written
+       by the process holding the sandbox token, from its `sub`/`sid`/`jti` claims. The child
+       must not be asked to state who it is.
+    3. **The child's framing is untrusted input.** The supervisor parses each line, rejects
+       what it cannot parse, and re-emits it in its own framing.
+  - `scripts/analyze_conversations.py --sdk-log PATH` parses these lines back into per-session
+    SDK stats reported **alongside**, never folded into, the tool counts: a tool call is one
+    model decision, an SDK call is one line of a script. The source is a log, not
+    `chat_history.db` — the calls happen in another process and are never persisted as message
+    content — so with no `--sdk-log` the report states the log is absent instead of printing zero.
+    It also reads the log-level notices: a shared-stream warning makes the whole SDK section
+    say the counts are an upper bound over forgeable lines, truncation records say how many
+    executions lost their tail, and refusals are counted separately from data accesses. The
+    per-session `sdk_sequence` is bounded to the first 50 calls with the elided count appended
+    (a script can make thousands, and the untrimmed join was a ~150 KB cell in every metrics row
+    and CSV); the per-function totals in the report come from the exact `sdk_function_counts`
+    column instead, which is bounded by the number of SDK functions.
 - **Importable standalone.** Nothing under `sdk/` imports the chat backend, the LLM service,
   the MCP server or the SQLite databases, so the package can be installed into a sandbox image
   on its own. `test_sdk.py` asserts this in a subprocess.
