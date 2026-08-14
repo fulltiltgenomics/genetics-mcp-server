@@ -1592,7 +1592,7 @@ For simple single-gene or single-variant lookups, prefer specialized tools (get_
 
 **IMPORTANT: Always call get_database_schema FIRST** to discover all available tables and their columns. The database contains more tables than just credible sets — including exome/burden test results and other data types.
 
-Use fully qualified view names (e.g., `genetics_results.credible_sets_v`).
+Refer to views by their bare name (e.g., `credible_sets_v`) — do NOT prefix them with a project or dataset.
 Views include a `resource` column (finngen, ukbb, open_targets, etc.) for filtering by data source.
 Always include a LIMIT clause in your SQL to control how many rows are shown to the user.
 The download file automatically includes all matching rows (up to 100,000) regardless of the SQL LIMIT.
@@ -1600,7 +1600,7 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
         "parameters": {
             "sql": {
                 "type": "string",
-                "description": "SQL query to execute. Use fully qualified view names (e.g., genetics_results.credible_sets_v). Call get_database_schema first to discover available tables. Always include LIMIT clause.",
+                "description": "SQL query to execute. Refer to views by their bare name (e.g., credible_sets_v) — do not prefix them with a project or dataset. Call get_database_schema first to discover available tables. Always include LIMIT clause.",
                 "required": True,
             },
             "max_rows": {

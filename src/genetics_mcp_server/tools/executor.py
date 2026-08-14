@@ -615,7 +615,7 @@ class ToolExecutor:
         return (
             f"WITH g AS ("
             f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = {gene_literal} GROUP BY chr"
+            f"  FROM gene_annotations_v WHERE symbol = {gene_literal} GROUP BY chr"
             f") "
         )
 
@@ -1234,7 +1234,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.asm_qtl_v` a "
+            f"SELECT a.* FROM asm_qtl_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{dataset_filter} "
@@ -1385,7 +1385,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.open_chromatin_v` a "
+            f"SELECT a.* FROM open_chromatin_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.peak_start <= g.gend + {window_sql} AND a.peak_end >= g.gstart - {window_sql} "
             f"WHERE TRUE{resource_filter} "
@@ -1453,7 +1453,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.variant_effect_v` a "
+            f"SELECT a.* FROM variant_effect_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{resource_filter} "
@@ -1539,7 +1539,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.mpra_v` a "
+            f"SELECT a.* FROM mpra_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{resource_filter} "
@@ -1651,7 +1651,7 @@ class ToolExecutor:
         sql = (
             f"SELECT phenotype, gene, allele, mlog10p, pval, beta, se, "
             f"af, af_cases, af_controls, info "
-            f"FROM `genetics_results.hla_associations_v` "
+            f"FROM hla_associations_v "
             f"WHERE allele = '{name}' AND resource = {resource_lit} "
             f"AND mlog10p >= {float(min_mlogp)}{info_filter} "
             f"ORDER BY mlog10p DESC LIMIT {limit_sql}"
@@ -1704,15 +1704,15 @@ class ToolExecutor:
 
             WITH g AS (
               SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend
-              FROM `genetics_results.gene_annotations_v`
+              FROM gene_annotations_v
               WHERE symbol = 'PCSK9' GROUP BY chr
             )
             SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type,
                    m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort
-            FROM `genetics_results.credible_sets_v` c
+            FROM credible_sets_v c
             JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING)
               AND c.pos BETWEEN g.gstart - 500000 AND g.gend + 500000
-            JOIN `genetics_results.mpra_v` m
+            JOIN mpra_v m
               ON m.variant = c.variant AND m.cell_line = 'meta'
             WHERE c.resource = 'finngen' AND c.pip >= 0.1
             ORDER BY m.emVar DESC, c.pip DESC
@@ -1734,10 +1734,10 @@ class ToolExecutor:
             f"SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type, "
             f"c.mlog10p AS gwas_mlog10p, c.beta, "
             f"m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort "
-            f"FROM `genetics_results.credible_sets_v` c "
+            f"FROM credible_sets_v c "
             f"JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND c.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
-            f"JOIN `genetics_results.mpra_v` m "
+            f"JOIN mpra_v m "
             f"ON m.variant = c.variant AND m.cell_line = 'meta' "
             f"WHERE c.resource = {resource_lit} AND c.pip >= {min_pip_sql} "
             f"ORDER BY m.emVar DESC, c.pip DESC LIMIT {limit_sql}"
@@ -5218,8 +5218,9 @@ class ToolExecutor:
           per-execution byte quotas, and the SDK's own row ceilings.
 
         Rewriting the docstrings is a separate decision (it would also drift the generated
-        sandbox stubs). `genetics_results.<view>` names are NOT in this list: they already
-        appear in MCP tool descriptions, so they are not new disclosure.
+        sandbox stubs). Bare `<view>` names are NOT in this list: they already appear in
+        MCP tool descriptions, so they are not new disclosure. The dataset that backs them
+        is never named — db-api resolves it — so it cannot leak here either.
         """
         try:
             return _sdk_capabilities(module)

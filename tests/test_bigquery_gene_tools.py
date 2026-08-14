@@ -6,6 +6,7 @@ returns rows under 'rows', not 'results').
 """
 
 import contextlib
+import re
 from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
@@ -267,3 +268,92 @@ async def test_limit_is_honoured_by_the_statement_and_the_row_cap():
         sql = executor.query_database.await_args.args[0]
         assert sql.endswith("LIMIT 5000")
         assert executor.query_database.await_args.kwargs["max_rows"] == 5000
+
+
+# db-api owns the dataset identity: it rewrites bare view names to
+# `{PROJECT_ID}.{DATASET_ID}.{view}` before the allow-list check, so one binary serves
+# dev and production. Its rewrite regex is `\b(FROM|JOIN)(\s+)<name>\b`, which does NOT
+# match a backtick after the whitespace — so a name that is unqualified but backticked
+# sails past the rewrite untouched and then fails at BigQuery as a missing table. The two
+# assertions below are one guard: qualifying is wrong, and so is backticking.
+_TABLE_REF = re.compile(r"\b(?:FROM|JOIN)\s+(\S+)", re.IGNORECASE)
+
+# a CTE is referenced by FROM/JOIN exactly like a view, so it has to be excluded from the
+# check — but excluding it by hard-coded name means a second CTE either fails the check
+# spuriously or, once added to the skip list, silently stops it noticing anything.
+_CTE_DECL = re.compile(r"[()]|[A-Za-z_]\w*\s+AS\s*\(", re.IGNORECASE)
+
+
+def _cte_names(sql: str) -> set[str]:
+    """Names declared by the SQL's WITH clause, if it has one."""
+    if not re.match(r"\s*WITH\b", sql, re.IGNORECASE):
+        return set()
+    names: set[str] = set()
+    depth = 0
+    # only a declaration at paren depth 0 is a CTE; `<name> AS (` deeper in is a subquery
+    for match in _CTE_DECL.finditer(sql):
+        text = match.group()
+        if text == "(":
+            depth += 1
+        elif text == ")":
+            depth -= 1
+        else:
+            if depth == 0:
+                names.add(text.split()[0])
+            depth += 1  # the declaration match consumed its own opening paren
+    return names
+
+
+def _emits_via_query(method: str, *args, **kwargs):
+    """Adapter for the methods that reach BigQuery: returns the SQL they sent."""
+
+    async def emit(executor):
+        await getattr(executor, method)(*args, **kwargs)
+        assert executor.query_database.await_args is not None, (
+            f"{method} rejected its arguments before building SQL"
+        )
+        return executor.query_database.await_args.args[0]
+
+    return emit
+
+
+async def _emits_gene_window_cte(executor):
+    return executor._gene_window_cte("'APOE'")
+
+
+# every method that puts a view name into SQL, each carrying its own arguments — the
+# earlier positional `(gene)` call shape could not reach get_hla_by_allele, which takes
+# an allele, and so left one of the rewritten `FROM` sites uncovered
+_SQL_EMITTERS = [
+    ("_gene_window_cte", _emits_gene_window_cte),
+    ("get_asm_qtl_by_gene", _emits_via_query("get_asm_qtl_by_gene", "APOE")),
+    ("get_open_chromatin_by_gene", _emits_via_query("get_open_chromatin_by_gene", "APOE")),
+    ("get_variant_effect_by_gene", _emits_via_query("get_variant_effect_by_gene", "APOE")),
+    ("get_mpra_by_gene", _emits_via_query("get_mpra_by_gene", "APOE")),
+    (
+        "get_mpra_pip_concordance_by_gene",
+        _emits_via_query("get_mpra_pip_concordance_by_gene", "APOE"),
+    ),
+    ("get_hla_by_allele", _emits_via_query("get_hla_by_allele", "DRB1*15:01")),
+]
+
+
+@pytest.mark.parametrize(
+    "method,emit", _SQL_EMITTERS, ids=[name for name, _ in _SQL_EMITTERS]
+)
+async def test_generated_sql_names_views_bare_and_unbackticked(method, emit):
+    async with _stubbed_executor() as executor:
+        sql = await emit(executor)
+
+        ctes = _cte_names(sql)
+        refs = [r for r in _TABLE_REF.findall(sql) if r not in ctes]
+        assert refs, f"{method} generated no table reference to check: {sql}"
+        for ref in refs:
+            assert "`" not in ref, (
+                f"{method} backticked {ref!r}; db-api's rewrite skips it and BigQuery "
+                f"then cannot resolve the view"
+            )
+            assert "." not in ref, (
+                f"{method} qualified {ref!r}; the dataset name must come from db-api's "
+                f"DATASET_ID, not from the emitted SQL"
+            )

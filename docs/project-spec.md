@@ -276,8 +276,10 @@ attempted twice and been incomplete both times):
   byte quotas, and the SDK's own row ceilings.
 
 Rewriting them is a separate decision (it would also drift the generated
-`sandbox/stubs/*.pyi`). `genetics_results.<view>` names are deliberately absent from that
-list: they already appear in MCP tool descriptions, so they are not new disclosure.
+`sandbox/stubs/*.pyi`). Bare `<view>` names are deliberately absent from that list: they
+already appear in MCP tool descriptions, so they are not new disclosure. The dataset
+holding them is never named anywhere this server emits — SQL leaves here unqualified and
+db-api resolves it against its own `DATASET_ID` — so there is nothing to disclose.
 
 **Where the artifact read happens**: `read_artifact` reads the single directory named by
 `SANDBOX_ARTIFACTS_DIR`, and returns "code execution is not enabled" when it is unset —
@@ -608,7 +610,7 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
     genetics-results-suite `docs/code-execution-security.md` §6.2's "what did that script
     read?" — it answers only "how much". Logging the raw query would reintroduce exactly the
     injection the summary exists to prevent, so it is not the fix; what would close it is a
-    bounded, allow-list-derived summary — the `genetics_results.<view>` names a query
+    bounded, allow-list-derived summary — the bare `<view>` names a query
     references, emitted only when the extracted name is on a shipped view allow-list, so no
     attacker-chosen text can reach the line. This repo has no such allow-list today
     (`tools/sql_safety.py` allow-lists *values*, not views; the view list is db-api's), so the
