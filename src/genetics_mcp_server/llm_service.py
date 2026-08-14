@@ -889,11 +889,21 @@ class LLMService:
                 # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
                 context_tokens = input_tok + cache_read + cache_create
                 context_window = get_context_window(model)
+                # `input_tokens` here is the whole context, NOT the billed uncached input
+                # — it is what the browser's context meter renders against context_window,
+                # so its meaning is fixed. `cache_read` and `cache_create` are the two
+                # cached components of it, reported separately because they differ by more
+                # than 12x in price: billed uncached input is
+                # `input_tokens - cache_read - cache_create`, which is exactly the
+                # per-iteration increment of `total_input_tokens`. A consumer with no
+                # database row (secret chat writes none) needs all three to price a turn.
                 yield StreamChunk(
                     type="usage",
                     content=json.dumps({
                         "iteration": iteration,
                         "input_tokens": context_tokens,
+                        "cache_read": cache_read,
+                        "cache_create": cache_create,
                         "output_tokens": output_tok,
                         "total_input_tokens": total_input_tokens,
                         "total_output_tokens": total_output_tokens,

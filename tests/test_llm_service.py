@@ -11,6 +11,7 @@ line is logged, driving the same `_stream_anthropic` harness test_stream_truncat
 uses.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -460,3 +461,84 @@ class TestTurnMetrics:
         assert row["session_id"] is None
         assert row["message_id"] is None
         assert row["iterations"] == 1
+
+
+class TestUsageChunk:
+    """The per-iteration `usage` chunk the replay benchmark reads cost off.
+
+    A benchmark run is secret=true, which writes no chat_turn_metrics row, so the
+    stream is the only place its cache split can come from. Cache reads and cache
+    creations differ by more than 12x in price, so folding them into one number makes
+    an exact cost underivable — they have to arrive as separate fields.
+    """
+
+    def _patch_db(self, db):
+        return patch(
+            "genetics_mcp_server.db.chat_history_db.get_chat_history_db",
+            return_value=db,
+        )
+
+    @staticmethod
+    def _payloads(chunks):
+        return [json.loads(c.content) for c in chunks if c.type == "usage"]
+
+    @staticmethod
+    def _two_turns():
+        return [
+            _tool_turn("t1", input_tokens=100, output_tokens=50, cache_read=900, cache_create=40),
+            _answer_turn(input_tokens=200, output_tokens=80, cache_read=1100, cache_create=7),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reports_the_cache_split_per_iteration(self, chat_history_db):
+        svc = _with_tools(_service(self._two_turns()))
+
+        with self._patch_db(chat_history_db):
+            chunks = await _run(svc, tool_profile="bigquery")
+
+        payloads = self._payloads(chunks)
+        assert len(payloads) == 2
+        first, second = payloads
+
+        assert first["iteration"] == 1
+        assert first["cache_read"] == 900
+        assert first["cache_create"] == 40
+        assert first["output_tokens"] == 50
+        assert first["total_input_tokens"] == 100
+        # deliberately unchanged: input_tokens is the whole context, what the browser's
+        # context meter renders against context_window
+        assert first["input_tokens"] == 100 + 900 + 40
+
+        assert second["iteration"] == 2
+        assert second["cache_read"] == 1100
+        assert second["cache_create"] == 7
+        assert second["total_input_tokens"] == 300
+        assert second["input_tokens"] == 200 + 1100 + 7
+
+    @pytest.mark.asyncio
+    async def test_the_stream_alone_reproduces_the_recorded_cost(self, chat_history_db):
+        """The point of the split: cost computed from the chunks must equal the cost the
+        metrics row records, exactly, not an interval bracketing it.
+
+        This pins the payload arithmetic, not the completeness of the accounting. Both
+        sides share the same blind spots — subagent calls and retried attempts are absent
+        from the stream and from `total_cost` alike — so equality here says the three
+        token components round-trip, not that either number is the turn's true spend.
+        """
+        svc = _with_tools(_service(self._two_turns()))
+
+        with self._patch_db(chat_history_db):
+            chunks = await _run(svc, tool_profile="bigquery")
+
+        from_stream = sum(
+            estimate_cost(
+                MODEL,
+                p["input_tokens"] - p["cache_read"] - p["cache_create"],
+                p["output_tokens"],
+                p["cache_read"],
+                p["cache_create"],
+            )
+            for p in self._payloads(chunks)
+        )
+        recorded = chat_history_db.get_turn_metrics("sess1")[0]["cost_usd"]
+        assert from_stream == pytest.approx(recorded)

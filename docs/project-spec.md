@@ -985,21 +985,55 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 |------------|-------------|--------------------|
 | `content` | Streamed text token from the LLM response | `content` (string) |
 | `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
-| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
+| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
 | `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
 | `error` | Error message from the backend | `content` (error string) |
 | `done` | Signals the stream is complete | `message_content` (assistant text + `tool_use` blocks for persistence), `tool_results` (the `tool_result` blocks for this turn, for persistence) |
 
 The `usage` event is emitted by `_stream_anthropic()` in `llm_service.py` after token accounting in each iteration of the agentic loop. It is yielded as a `StreamChunk(type="usage")` with a JSON-serialized payload. The `event_generator()` in `chat_api.py` forwards it as an SSE event, spreading the usage fields into the top-level payload alongside `"type": "usage"`.
 
-Payload fields for `usage`:
+Payload fields for `usage`. Every token count is for the **current** API call unless its
+name says `total_`:
 - `iteration` — current agentic loop iteration number
-- `input_tokens` — input tokens consumed in the current API call
-- `output_tokens` — output tokens generated in the current API call
-- `total_input_tokens` — cumulative input tokens across all iterations
+- `input_tokens` — the **whole context** sent in this call, i.e. Anthropic's
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. It is **not**
+  the billed uncached input, and it is not comparable to `total_input_tokens`, which
+  accumulates only the uncached part. Named for what the frontend meter renders; its
+  meaning is deliberately frozen (`genetics-results-suite-n3p`)
+- `cache_read` — the part of `input_tokens` served from the prompt cache
+- `cache_create` — the part of `input_tokens` written into the prompt cache. Kept apart
+  from `cache_read` because the two differ by more than 12x in price, so folding them
+  together makes an exact cost underivable
+- `output_tokens` — output tokens generated in this call
+- `total_input_tokens` — cumulative **billed uncached** input across all iterations so
+  far, i.e. the running sum of `input_tokens - cache_read - cache_create`
 - `total_output_tokens` — cumulative output tokens across all iterations
 - `context_window` — total context window size for the model (from `get_context_window()`)
-- `context_percent` — percentage of context window consumed (`total_input_tokens / context_window * 100`)
+- `context_percent` — percentage of the context window this call filled
+  (`input_tokens / context_window * 100`)
+
+A consumer can therefore price **the main agentic loop's Anthropic API calls** exactly
+from the stream alone, with no `chat_turn_metrics` row: uncached input is
+`input_tokens - cache_read - cache_create`, and the three components go to
+`estimate_cost()` unchanged. This matters because secret chat — which every
+replay-benchmark request uses — writes no metrics row at all.
+
+That is not the same as pricing the whole turn. Four things sit outside the sum, and the
+first two sit outside the `chat_turn_metrics` row as well, so the stream and the row
+agree with each other while both understate what was billed:
+
+- **Subagent calls.** `subagent.py` issues its own `messages.create` and keeps private
+  token counters; `_stream_anthropic()` accumulates only `iter_cost` into `total_cost`.
+  A turn that calls `launch_subagents` costs strictly more than either source reports.
+- **Retried attempts.** A mid-stream overload/529 is retried in place, and only the
+  succeeding attempt's `message.usage` is ever read. Tokens burned by the abandoned
+  attempts are billed and invisible.
+- **The OpenAI path emits no `usage` chunk at all.** `_stream_openai()` yields text and
+  `done` only, so this whole section is Anthropic-path-only. `replay_benchmark.py`
+  handles that case with a `no_usage_chunks` status rather than a zero.
+- **The stream carries no model name.** `estimate_cost()` falls back to Sonnet pricing
+  for anything unrecognised (`has_pricing()` exists so callers can refuse instead), so
+  the consumer must learn the model out-of-band and pass it in.
 
 The frontend uses `usage` events to render a live progress bar showing how much of the model's context window has been consumed during the conversation.
 
@@ -1647,11 +1681,14 @@ harness issues two arms per case. `--base-url` therefore defaults to
 - **The `usage` chunk's `input_tokens` is the whole context**, i.e.
   `input_tokens + cache_read + cache_creation`, while `total_input_tokens`
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
-  derived as `sum(per-iteration input_tokens) - total_input_tokens`, and cache reads
-  cannot be separated from cache creations — they differ by more than 12x in price.
-  **Cost is consequently reported as an interval**, `cost_usd_min` (all cached
+  derived as `sum(per-iteration input_tokens) - total_input_tokens`. The harness
+  cannot split that into cache reads and cache creations, which differ by more than
+  12x in price, so **cost is reported as an interval**, `cost_usd_min` (all cached
   tokens priced as cache reads) to `cost_usd_max` (all priced as cache creations),
-  never as a single fabricated number. Pricing also needs a model name the pricing
+  never as a single fabricated number. The chunk itself no longer forces this:
+  `genetics-results-suite-n3p` added `cache_read` and `cache_create` to the `usage`
+  payload, so an exact figure is now derivable and the harness can drop the interval
+  — it has not been switched over yet. Pricing also needs a model name the pricing
   table actually knows: without `--model`, *or* with a model `cost.has_pricing()`
   cannot match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
   ("not priced") with a warning, not `0` and not silently priced at the
