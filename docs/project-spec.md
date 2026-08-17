@@ -1158,6 +1158,8 @@ src/genetics_mcp_server/
 ├── rate_limit.py        # per-user sliding window rate limiter
 ├── cost.py              # Anthropic API cost estimation
 ├── download_store.py    # disk-persisted download storage for TSV files
+├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
+├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py      # configuration dataclass
@@ -1211,6 +1213,40 @@ src/genetics_mcp_server/
 2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
 4. **SDK mode**: script → `genetics_mcp_server.sdk` → GeneticsClient → ToolExecutor → Genetics API / BigQuery. Same executor, different entry point: no tool schema, no context row cap, polars frames instead of result envelopes.
+
+### Sandbox transport (`sandbox_client.py`)
+
+The client half of the seam between chat-backend and the code-execution sandbox. The wire
+contract lives in `docs/code-execution-security.md` §2 of **genetics-results-suite**, not
+here, and that is structural rather than an oversight: the sandbox image pip-installs only
+the SDK's import closure and prunes the rest, so the supervisor and this client cannot share
+a module and the document is the only definition both ends can read. Every number the two
+sides must agree on is a named constant at the top of `sandbox_client.py` rather than a
+literal at a call site.
+
+- **One credential per execution, minted at the last possible moment.** `execute()` calls
+  `mint_execution_tokens` *inside* the retry loop. The tokens live 300s and a queued
+  execution eats that slack (a full queued wait then a full run leaves ~60s of token life),
+  so a pair minted before a wait would spend itself on the wait.
+- **Fail closed.** `SandboxTokenUnavailable` is never caught. With no signing key there is no
+  execution — the alternatives are sending no credential or sending `INTERNAL_API_SECRET`,
+  which are the two outcomes the mechanism exists to prevent. Tokens are never logged, and a
+  token echoed back by the supervisor in **either** half of an error object — `error.type` as
+  well as `error.message` — is scrubbed and capped before any error text is built or attached
+  to the exception (`error.type` is carried onto `SandboxError.error_type`, so scrubbing only
+  the formatted message would have left the raw value on the exception).
+- **A retry always mints a fresh `execution_id`.** A repeated id is refused with
+  `409 DuplicateExecutionId`, so reusing one after a `429` would turn a queue collision into
+  a hard failure. `409 TokenExpired` is the opposite case and is retried immediately.
+- **"No sandbox" is a distinct failure from "your script failed".** `SandboxUnavailable`
+  covers a refused connection, `503 NotReady` and gateway errors, because `strategy: Recreate`
+  plus a 130s termination grace leaves no sandbox at all for up to ~130s of a deploy. The read
+  deadline is queue wait **plus** the full run plus margin, so it clears the supervisor's own
+  worst case; a script that runs too long is a `200` with `status: "timeout"`, never an
+  exception here.
+- **Transport only.** The supervisor's result object is returned unchanged for the tool layer
+  to render. `error.type` is treated as an open string — the reserved supervisor names are
+  branched on, anything else is carried through as an opaque label.
 
 ### Turn termination and truncation
 
@@ -1432,6 +1468,8 @@ All configuration is via environment variables (`.env` file supported):
 | `GENETICS_PUBLIC_API_URL` | Externally reachable base URL used when building download links shown to users; falls back to `GENETICS_API_URL`, which in a cluster is an internal address | `GENETICS_API_URL` |
 | `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info; the pruned sandbox install holds none by design and is exempt | - |
 | `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
+| `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments | `http://127.0.0.1:8080` |
+| `SANDBOX_TOKEN_SIGNING_KEY` | HS256 key for the per-execution sandbox tokens, held only by chat-backend (mint) and db-api/results-api (verify). Separate from `INTERNAL_API_SECRET` on purpose: separate blast radius, independent rotation, and the sandbox holds neither. Unset means **no execution runs** — `mint_execution_tokens` raises `SandboxTokenUnavailable` rather than returning `None`, since every fallback is either "send no credential" or "send the shared secret" | - |
 
 ### LLM providers (for chat API)
 
@@ -1779,6 +1817,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
+| `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
 | `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both, and the comment and tool-history reads degrade the same way), chat-history write transaction safety (every write accessor over a failed DML and a failed commit, the retained lock, and the multi-DML writes rolled back whole), and the zone the write path returns (the saves, the version history and `add_user_comment` hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
