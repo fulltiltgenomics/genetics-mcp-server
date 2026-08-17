@@ -924,14 +924,22 @@ class GeneticsClient:
 # against it. Until then this is "audited if you use the recommended surface", not
 # "unbypassable", and nothing should cite it as the latter.
 #
-# WHERE THE LINE GOES, AND WHETHER IT CAN BE TRUSTED. In-process (chat-backend, tests) it is
+# WHERE THE LINE GOES, AND WHAT HAPPENS TO IT THERE. In-process (chat-backend, tests) it is
 # an ordinary record on `genetics_mcp_server.sdk.audit` and lands wherever `Executing tool:`
 # lands. In the sandbox the SDK runs in a forked child that configures no logging at all, so
-# a handler is installed on first use. Only ONE of those shapes is tamper-evident:
+# a handler is installed on first use. The two shapes are not equivalent:
 #
-#   dedicated fd (GENETICS_SDK_AUDIT_FD) — the supervisor holds the write end and the child
-#       writes nothing else to it; propagation is switched off so inherited handlers cannot
-#       put the records back on a shared stream.
+#   dedicated fd (GENETICS_SDK_AUDIT_FD) — a pipe whose READ END the supervisor holds
+#       (genetics-results-suite-4h6.45, `sandbox/supervisor.py` `_AuditForwarder`).
+#       Propagation is switched off so inherited handlers cannot put the records back on a
+#       shared stream. What the supervisor does with what arrives is the part that matters
+#       here: it treats this stream as UNTRUSTED INPUT. Each line is re-parsed, matched whole
+#       against the shapes below, and re-emitted in the supervisor's own framing on the POD'S
+#       STDOUT — everything before the marker, including the `[user=…] [session=…]
+#       [execution=…]` prefix rendered below, is DISCARDED and replaced with the sandbox
+#       token's `sub`/`sid`/`jti`. The rate, byte and per-line caps are applied there too. So
+#       on this path the identity in the collected record is the supervisor's, and the shape
+#       below is what makes a record admissible rather than what makes it true.
 #   anything else — the records share a stream (stderr, or the host's logging config) that
 #       the audited script writes to itself with `print(..., file=sys.stderr)`. Per-value
 #       escaping is irrelevant when the writer owns the stream: a forged line parses cleanly
@@ -940,11 +948,13 @@ class GeneticsClient:
 #       `_warn_shared_stream` — and `scripts/analyze_conversations.py` repeats the warning in
 #       any report built from such a log.
 #
-# THE SUPERVISOR HALF DOES NOT EXIST YET (genetics-results-suite-4h6.7 / .14): nothing sets
-# GENETICS_SDK_AUDIT_FD, and nothing forwards the child's audit stream to the pod's stdout
-# where the cluster's logging agent would collect it. So today every emitted record is on the
-# untrusted side of that line, and this module is honest about it rather than claiming a
-# tamper-evident trail it cannot provide.
+# WHICH SIDE IS AUTHORITATIVE, since this file and the supervisor both render the identity: ON
+# THE FD PATH, THE SUPERVISOR'S STAMP IS. It comes from the token's signed claims; the values
+# below come from `SANDBOX_USER`/`SANDBOX_SESSION_ID`/`SANDBOX_EXECUTION_ID`, which the
+# supervisor sets from the same claims but the audited script owns and can rewrite between two
+# calls. They are still rendered — the in-process path has no supervisor to stamp anything —
+# but on the fd path they never leave the pod. THE ENV PREFIX AND THE SIGNED CLAIMS ARE NOT
+# THE SAME EVIDENCE, and only one of them survives to a collector.
 #
 # AND NOTHING IN THIS FILE CAN CHANGE THAT. The audited script shares this address space, so
 # every in-process control here is reachable from the code it is supposed to constrain. This
@@ -968,22 +978,24 @@ class GeneticsClient:
 # against a hostile script are the ones outside the process: the sandbox's network policy,
 # db-api's own `endpoint_access` lines, and the byte/row quotas.
 #
-# WHAT WOULD ACTUALLY WORK, AND IS THE SPECIFICATION FOR genetics-results-suite-4h6.45:
+# WHAT ACTUALLY WORKS IS OUT HERE, AND genetics-results-suite-4h6.45 HAS LANDED IT:
 #
 #   1. THE SUPERVISOR READS THE FD AND ENFORCES ON THE READ END. The child holds only the
 #      write end; the rate cap, the byte cap and the per-line length cap are applied by the
 #      supervisor as it reads, where no code in the child can raise, reset or bypass them.
-#      Overrun is the supervisor's decision to record and act on (drop with a counted notice,
-#      or fail the execution) — not the child's.
-#   2. THE SUPERVISOR STAMPS IDENTITY. `[user=…] [session=…] [execution=…]` must be written by
-#      the process that holds the sandbox token, from its `sub`/`sid`/`jti` claims, on lines
-#      it accepts from the child. The child must not be asked to state who it is — see
-#      `_audit_identity` below, which reads exactly what the script can rewrite.
-#   3. THE CHILD'S FRAMING IS UNTRUSTED INPUT. The supervisor parses each line, rejects any it
-#      cannot parse, and re-emits it in its own framing. The sanitisation below reduces the
-#      damage a malformed line does; it is not a substitute for the supervisor re-framing it.
+#      Overrun is the supervisor's decision — it drops, counts, announces the cut once and
+#      emits a per-execution summary — not the child's.
+#   2. THE SUPERVISOR STAMPS IDENTITY, from the sandbox token's `sub`/`sid`/`jti`, over
+#      whatever `_audit_identity` below rendered. The child is not asked who it is.
+#   3. THE CHILD'S FRAMING IS UNTRUSTED INPUT. The supervisor matches each line whole against
+#      the record shapes, drops what does not match, and re-emits the rest in its own framing.
+#      The sanitisation below reduces the damage a malformed line does in the SHARED-stream
+#      case; it is not what makes the collected record safe.
 #
-# Until all three exist, the honest statement is the one at the top of this paragraph.
+# WHAT STILL DOES NOT FOLLOW, so that nothing reads the paragraph above as more than it says:
+# these records still do not bound what a hostile script DID. It can emit well-formed records
+# for calls it never made, and `_executor` reads nothing here can see. The supervisor bounds
+# who a record is attributed to and what shape it may take — not whether it happened.
 _audit_logger = logging.getLogger("genetics_mcp_server.sdk.audit")
 
 # A logger with no level of its own inherits root's. A host that leaves root at WARNING would
@@ -1003,8 +1015,10 @@ _AUDIT_FD_ENV = "GENETICS_SDK_AUDIT_FD"
 SHARED_STREAM_WARNING = (
     "SDK audit records here are NOT a tamper-evident audit trail: no "
     f"{_AUDIT_FD_ENV} was configured, so they share a stream the audited script can write to "
-    "itself. Any line below may be forged, including its user and session. Delivering a "
-    "dedicated audit fd to the sandbox child is genetics-results-suite-4h6.45."
+    "itself. Any line below may be forged, including its user and session. A log collected "
+    "from the sandbox does NOT look like this: there the supervisor holds the fd's read end, "
+    "re-frames every record and stamps identity from the token (4h6.45), so this warning "
+    "appearing at all means the stream came from somewhere else."
 )
 
 # WHAT IS BOUNDED, AND WHAT MUST NEVER BE. Only records for calls that NEVER REACHED THE
@@ -1201,12 +1215,14 @@ def _audit_identity() -> tuple[str, str, str]:
     controls, which is why the supervisor, not the child, has to stamp identity (`4h6.45`; see
     the module header). Sanitising here bounds the damage; it does not make the values true.
 
-    ALL THREE ARE `unknown` TODAY. The values are the sandbox token's `sub`, `sid` and `jti`
-    claims (genetics-results-suite docs/code-execution-security.md §4), and the SDK does not
-    yet receive that token — `4h6.43` writes it into the execution's token file and `4h6.44`
-    makes the SDK read and send it. `jti` is also the
-    `/scratch/<execution-id>` directory name, which is what makes this line joinable with
-    db-api's `endpoint_access` lines and with chat-backend's own.
+    IN THE SANDBOX ALL THREE ARE SET AND NONE OF THEM IS WHAT GETS COLLECTED. The supervisor
+    puts the sandbox token's `sub`, `sid` and `jti` into the child's environment
+    (`ExecutionDirs.child_env`), so the line renders; and then, on the dedicated-fd path, it
+    DISCARDS this prefix and re-stamps from the same claims on its own side (`4h6.45`).
+    Reading them here is for the in-process path and for the shape of the line — never for
+    attribution, because the script owns this environment. `jti` is also the
+    `/scratch/<execution-id>` directory name, which is what makes the collected line joinable
+    with db-api's `endpoint_access` lines and with chat-backend's own.
     """
     env = os.environ
     return (
@@ -1244,6 +1260,10 @@ def _summarize_value(value: Any) -> str:
         return repr(value) if _AUDIT_SAFE_VALUE_RE.match(value) else f"<str:{len(value)}>"
     if isinstance(value, (list, tuple, set, frozenset, dict)):
         return f"<{type(value).__name__}:{len(value)}>"
+    # `__name__` is whatever the caller's class says it is — arbitrary text, including
+    # non-ASCII — so this line is NOT a bound, and the charset above does not cover it. The
+    # sandbox supervisor's read end is where that is held (printable ASCII minus brackets and
+    # backslash); on any shared stream nothing holds it at all.
     return f"<{type(value).__name__}>"
 
 
@@ -1259,6 +1279,13 @@ def _summarize_arguments(signature: inspect.Signature, args: tuple, kwargs: dict
         bound = signature.bind_partial(None, *args, **kwargs)
     except TypeError:
         # the call is about to raise anyway; the attempt is still worth a line
+        #
+        # THIS SHAPE HAS NO BRACES, and it is on the sandbox supervisor's admit-list for that
+        # reason (genetics-results-suite, supervisor.py `_AUDIT_ARGS_RE`): the read end matches
+        # every line whole and drops what does not match, so a `{...}`-only pattern there put
+        # the record of an ordinary argument mistake — one extra positional, one unknown
+        # keyword — into `dropped_unparseable`, which an operator reads as tampering. Changing
+        # this string is changing that wire shape.
         return "<unavailable>"
     items = [
         f"{name!r}: {_summarize_value(value)}"
