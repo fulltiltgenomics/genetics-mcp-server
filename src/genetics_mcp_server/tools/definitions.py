@@ -1533,9 +1533,11 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
     # "general": these hand work to another runtime instead of fetching data themselves,
     # which is what launch_subagents is. The category alone excludes nothing from subagents
     # — TOOL_PROFILES includes "orchestration" in both the api and bigquery profiles —
-    # so subagent.py names all three orchestration tools in its `disabled` set, which is
-    # what keeps a subagent from retrieving another execution's artifacts or being told how
-    # to start one. read_artifact is additionally in mcp_server.py's _mcp_disabled.
+    # so subagent.py names all four orchestration tools in its `disabled` set, which is
+    # what keeps a subagent from executing code, retrieving another execution's artifacts
+    # or being told how to start one. run_analysis and read_artifact are additionally in
+    # mcp_server.py's _mcp_disabled; run_analysis on top of that has no register_mcp_tools
+    # block at all, so no disabled_tools set can register it (see the comment there).
     {
         "name": "list_capabilities",
         "category": "orchestration",
@@ -1556,13 +1558,49 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
         },
     },
     {
+        "name": "run_analysis",
+        "category": "orchestration",
+        "description": (
+            "Run a Python script against the genetics data in a sandbox and get back what it "
+            "printed. Use this instead of chaining data-access tools: one script can query, "
+            "join, filter and summarise in a single call.\n\n"
+            "Write the script against the `genetics` SDK — call list_capabilities first for the "
+            "exact signatures rather than guessing. PRINT EVERYTHING YOU WANT TO SEE: only the "
+            "script's output comes back (stdout and stderr interleaved, capped at 64 KiB with "
+            "the middle elided). The value of the last expression is not returned.\n\n"
+            "Files the script writes to its artifacts directory are reported as a manifest of "
+            "names and sizes, but their CONTENTS CANNOT BE RETRIEVED — so a plot or a table that "
+            "matters must also be summarised in what the script prints.\n\n"
+            "Each run is independent: no variables, files or imports survive from one call to "
+            "the next, so a follow-up script must redo the work it needs."
+        ),
+        "parameters": {
+            "code": {
+                "type": "string",
+                "description": "Python source to run. Print the results you want to see.",
+                "required": True,
+            },
+            "timeout_s": {
+                "type": "integer",
+                "description": (
+                    "Wall-clock seconds allowed for the script, 1-120 (default 60). Raise it "
+                    "only for a script you expect to be slow; a larger value does not make a "
+                    "queued run start sooner."
+                ),
+                "default": 60,
+            },
+        },
+    },
+    {
         "name": "read_artifact",
         "category": "orchestration",
         "description": (
-            "Read a named file an analysis script wrote to its artifacts directory (a plot, "
-            "a TSV). Takes the artifact NAME exactly as reported in the run's artifact "
-            "manifest — never a path and never an execution id. Returns text inline, and "
-            "binary content base64-encoded with its content type."
+            "Read a named file from this server's local artifacts directory. Takes the "
+            "artifact NAME exactly as reported in a manifest — never a path and never an "
+            "execution id. Returns text inline, and binary content base64-encoded with its "
+            "content type. It CANNOT retrieve artifacts written by run_analysis: those live "
+            "in the sandbox and no retrieval path to them exists yet. Do not call it for a "
+            "run_analysis artifact — have the script print what you need instead."
         ),
         "parameters": {
             "name": {
@@ -2351,6 +2389,16 @@ def register_mcp_tools(
             """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors') as signatures with docstrings. Omit module for the index."""
             return await executor.list_capabilities(module=module)
 
+    # run_analysis has NO block here, deliberately, and the omission is the point.
+    # docs/code-execution-security.md §5 makes membership of mcp_server.py's _mcp_disabled
+    # the sole registration-layer control and then says layer 1 is assumed defeatable. A
+    # missing block is a second, independent registration-layer control that no set passed
+    # to this function can undo: `disabled_tools` can only subtract. It also matches what
+    # the tool needs — the handler is given the authenticated user and the chat session id
+    # by the caller, and an MCP session has neither, so a registered wrapper could only
+    # ever pass identity it does not have. Keep _mcp_disabled's entry as well: it is the
+    # named control the security doc and the tests reason about, and it is what catches a
+    # future block added here without this comment being read.
     if "read_artifact" not in _disabled:
 
         @mcp.tool()

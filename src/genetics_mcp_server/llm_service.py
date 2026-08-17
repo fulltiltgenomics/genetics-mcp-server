@@ -240,6 +240,10 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
 # missed before a stalled stream is declared dead.
 _THINKING_KEEPALIVE_SECONDS = 10.0
 
+# run_analysis accepts up to 256 KiB of source; the tool-use indicator and its log line
+# exist to say what is running, not to carry the whole script into either
+_DISPLAY_CODE_CHARS = 400
+
 
 
 @dataclass
@@ -1000,6 +1004,19 @@ class LLMService:
                         effective_input.pop("backend", None)
                         if literature_backend:
                             effective_input["backend"] = literature_backend
+                    if tool_use.name == "run_analysis":
+                        # mirror the execution-side strip in _execute_tool: a model-invented
+                        # identity is discarded before the call, so logging or showing it
+                        # would make a forged `user` read as identity in a log join. The
+                        # authenticated pair is already on every line via log_prefix.
+                        effective_input.pop("user", None)
+                        effective_input.pop("session_id", None)
+                        code = effective_input.get("code")
+                        if isinstance(code, str) and len(code) > _DISPLAY_CODE_CHARS:
+                            effective_input["code"] = (
+                                f"{code[:_DISPLAY_CODE_CHARS]}"
+                                f"...[{len(code)} chars total]"
+                            )
                     if secret:
                         logger.info(f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)")
                     else:
@@ -1053,7 +1070,7 @@ class LLMService:
                     if regular_tool_uses:
                         regular_task = asyncio.create_task(
                             asyncio.gather(
-                                *(self._execute_tool(tu.name, tu.input, literature_backend) for tu in regular_tool_uses)
+                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id) for tu in regular_tool_uses)
                             )
                         )
                     else:
@@ -1076,7 +1093,7 @@ class LLMService:
                 else:
                     # no subagent tool — execute all tools in parallel as before
                     regular_results = await asyncio.gather(
-                        *(self._execute_tool(tu.name, tu.input, literature_backend) for tu in regular_tool_uses)
+                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id) for tu in regular_tool_uses)
                     )
                     for tu, res in zip(regular_tool_uses, regular_results):
                         raw_results_map[tu.id] = res
@@ -1226,6 +1243,8 @@ class LLMService:
         tool_name: str,
         tool_input: dict,
         literature_backend: str | None = None,
+        user: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Execute a tool by name using the executor or external proxy."""
         try:
@@ -1272,6 +1291,18 @@ class LLMService:
                 tool_input = {k: v for k, v in tool_input.items() if k != "backend"}
                 if literature_backend:
                     tool_input["backend"] = literature_backend
+
+            # the identity a sandbox execution runs as is the authenticated one, never the
+            # model's: it becomes the subject and session of the per-execution credential and
+            # of the audit trail. The tool exposes no such arguments, but tool_input is
+            # splatted verbatim, so a model-invented `user` would otherwise arrive here —
+            # stripped first, then the real pair injected, same as `backend` above.
+            if tool_name == "run_analysis":
+                tool_input = {
+                    k: v for k, v in tool_input.items() if k not in ("user", "session_id")
+                }
+                tool_input["user"] = user
+                tool_input["session_id"] = session_id
 
             return await method(**tool_input)
 

@@ -416,9 +416,11 @@ class TestOrchestrationCategoryExclusion:
         """The orchestration *category* excludes nothing — the name list does.
 
         TOOL_PROFILES puts "orchestration" in both the api and bigquery profiles, so
-        read_artifact and list_capabilities reach three of the five skills unless
-        subagent.py names them. A subagent must not be able to retrieve another
-        execution's artifacts (genetics-results-suite-4h6).
+        run_analysis, read_artifact and list_capabilities reach three of the five skills
+        unless subagent.py names them. A subagent must not be able to execute code or to
+        retrieve another execution's artifacts (genetics-results-suite-4h6): it has no
+        session of its own, and the session is what the per-execution credential is minted
+        against.
         """
         mock_client = MagicMock()
         mock_executor = MagicMock()
@@ -437,12 +439,96 @@ class TestOrchestrationCategoryExclusion:
                 tools = service._get_tool_definitions(skill)
 
             tool_names = {t["name"] for t in tools}
+            assert "run_analysis" not in tool_names, (
+                f"run_analysis should be excluded for skill '{skill_name}'"
+            )
             assert "read_artifact" not in tool_names, (
                 f"read_artifact should be excluded for skill '{skill_name}'"
             )
             assert "list_capabilities" not in tool_names, (
                 f"list_capabilities should be excluded for skill '{skill_name}'"
             )
+
+
+class TestSubagentDispatchAllowList:
+    """The dispatcher refuses any tool the skill's own definitions did not declare.
+
+    Excluding a tool from _get_tool_definitions only stops it being *offered*. The local
+    branch of _execute_subagent_tool resolves the model's tool_name against the executor
+    by getattr, so without an allow-list a subagent could call an excluded tool anyway by
+    naming it — and the subagent's task text is written by the parent model, which does
+    have run_analysis declared.
+    """
+
+    def _settings(self, mock_settings):
+        settings = MagicMock()
+        settings.disabled_tools = set()
+        settings.enable_subagents = True
+        settings.enable_script_execution = False
+        settings.subagent_allowed_paths_list = []
+        mock_settings.return_value = settings
+
+    @pytest.mark.asyncio
+    async def test_run_analysis_forgery_never_reaches_handler(self):
+        """A model-supplied identity on an excluded tool must not reach the executor.
+
+        run_analysis passes `user`/`session_id` to mint_execution_tokens, where they
+        become the sub/sid of both per-execution JWTs and of every audit record.
+        """
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.run_analysis = AsyncMock(return_value={"success": True})
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("genetics_data_extraction")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            result = await service._execute_subagent_tool(
+                "run_analysis",
+                {
+                    "code": "print(1)",
+                    "user": "attacker@evil.example",
+                    "session_id": "other-sid",
+                },
+                skill,
+            )
+
+        mock_executor.run_analysis.assert_not_awaited()
+        assert result["success"] is False
+        assert "run_analysis" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_undeclared_executor_attribute_refused(self):
+        """getattr on the executor is not an authorization decision."""
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.close = AsyncMock(return_value={"success": True})
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("genetics_data_extraction")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            result = await service._execute_subagent_tool("close", {}, skill)
+
+        mock_executor.close.assert_not_awaited()
+        assert result["success"] is False
+        assert "not available to this subagent" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_declared_tool_still_dispatches(self):
+        """The guard must not break a skill calling a tool its definitions do produce."""
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.list_datasets = AsyncMock(return_value={"success": True, "datasets": []})
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("genetics_data_extraction")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            result = await service._execute_subagent_tool("list_datasets", {}, skill)
+
+        mock_executor.list_datasets.assert_awaited_once()
+        assert result["success"] is True
 
 
 class TestDownloadHintProcessing:
@@ -454,7 +540,7 @@ class TestDownloadHintProcessing:
         mock_client = MagicMock()
         mock_executor = MagicMock()
         raw_result = {"success": True, "data": "test"}
-        mock_executor.some_tool = AsyncMock(return_value=raw_result)
+        mock_executor.list_datasets = AsyncMock(return_value=raw_result)
 
         service = SubagentService(mock_client, mock_executor)
         skill = get_skill("genetics_data_extraction")
@@ -471,10 +557,10 @@ class TestDownloadHintProcessing:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._execute_subagent_tool("some_tool", {}, skill)
+            result = await service._execute_subagent_tool("list_datasets", {}, skill)
 
         # the tool name is passed so a download failure names its producer in the log
-        mock_hints.assert_called_once_with(raw_result, tool_name="some_tool")
+        mock_hints.assert_called_once_with(raw_result, tool_name="list_datasets")
         assert result["success"] is True
 
     @pytest.mark.asyncio
@@ -487,7 +573,7 @@ class TestDownloadHintProcessing:
             "_download_url": "https://example.com/api/download?id=123",
             "count": 5,
         }
-        mock_executor.my_tool = AsyncMock(return_value=raw_result)
+        mock_executor.search_genes = AsyncMock(return_value=raw_result)
 
         service = SubagentService(mock_client, mock_executor)
         skill = get_skill("genetics_data_extraction")
@@ -500,7 +586,7 @@ class TestDownloadHintProcessing:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._execute_subagent_tool("my_tool", {}, skill)
+            result = await service._execute_subagent_tool("search_genes", {}, skill)
 
         assert "INCLUDE_IN_RESPONSE" in result
         assert "Download" in result["INCLUDE_IN_RESPONSE"]
@@ -512,7 +598,7 @@ class TestDownloadHintProcessing:
         mock_client = MagicMock()
         mock_executor = MagicMock()
         raw_result = {"success": False, "error": "something broke"}
-        mock_executor.fail_tool = AsyncMock(return_value=raw_result)
+        mock_executor.search_phenotypes = AsyncMock(return_value=raw_result)
 
         service = SubagentService(mock_client, mock_executor)
         skill = get_skill("genetics_data_extraction")
@@ -525,7 +611,7 @@ class TestDownloadHintProcessing:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._execute_subagent_tool("fail_tool", {}, skill)
+            result = await service._execute_subagent_tool("search_phenotypes", {}, skill)
 
         assert result == raw_result
         assert "INCLUDE_IN_RESPONSE" not in result

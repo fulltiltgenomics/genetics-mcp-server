@@ -150,8 +150,10 @@ class TestMCPToolRegistration:
             # fallback: just verify registration didn't fail
             registered_names = set()
 
-        # verify expected tools are registered
-        expected = {t["name"] for t in TOOL_DEFINITIONS}
+        # verify expected tools are registered. run_analysis is the one definition with no
+        # registration block at all — see the comment in register_mcp_tools; it is a
+        # security control, so this exemption is the assertion, not a gap in it.
+        expected = {t["name"] for t in TOOL_DEFINITIONS} - {"run_analysis"}
 
         # if we have tool manager access, verify all tools
         if registered_names:
@@ -270,9 +272,59 @@ class TestMCPDisabledTools:
         register_mcp_tools(mcp, executor, disabled_tools=mcp_server._mcp_disabled)
 
         registered = self._registered_names(mcp)
+        assert "run_analysis" not in registered
         assert "read_artifact" not in registered
         # the catalogue is signatures only and stays available
         assert "list_capabilities" in registered
+
+    def test_run_analysis_cannot_be_registered_by_any_disabled_set(self):
+        """The second registration-layer control, and the one a config change cannot undo.
+
+        docs/code-execution-security.md §5 assumes layer 1 is defeatable and asks the other
+        two layers to still hold. _mcp_disabled is assembled at runtime from an env-driven
+        set unioned with a literal, so it is the changeable half; register_mcp_tools has no
+        block for run_analysis at all, and `disabled_tools` can only subtract. This asserts
+        the stronger property: even the empty set does not register it.
+        """
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        mcp = FastMCP("Test Server")
+        register_mcp_tools(mcp, ToolExecutor(), disabled_tools=set())
+        assert "run_analysis" not in self._registered_names(mcp)
+
+    def test_run_analysis_is_named_in_the_hardcoded_exclusion_set(self):
+        """Belt and braces on the above: the entry is what §5 names, what an operator
+
+        greps for, and what catches a register_mcp_tools block added later.
+        """
+        from genetics_mcp_server import mcp_server
+
+        assert "run_analysis" in mcp_server._mcp_disabled
+
+    def test_the_mcp_app_has_no_route_that_reaches_the_sandbox(self):
+        """A tool excluded from /mcp but reachable at some other path is the same failure
+
+        with a different URL. mcp_server builds the FastMCP app alone — chat_api.py is a
+        separate ASGI app in the same image, never mounted here — so the check is that
+        nothing in this module's import graph pulls in the sandbox transport.
+        """
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys; import genetics_mcp_server.mcp_server; "
+            "print('genetics_mcp_server.sandbox_client' in sys.modules)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=180
+        )
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "False", (
+            "importing the MCP server pulled in the sandbox transport; something on that "
+            "app's import graph can now reach the sandbox"
+        )
 
 
 @pytest.mark.integration

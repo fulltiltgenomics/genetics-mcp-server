@@ -5485,6 +5485,340 @@ class ToolExecutor:
             "truncated": truncated,
         }
 
+    # The whole chat turn's budget for one run_analysis call, across every retry the client
+    # makes. The client bounds each ATTEMPT correctly and deliberately offers no total: its
+    # per-attempt read deadline is derived from the supervisor's own worst-case hold time
+    # (120s queued + timeout_s + 15s margin) and must not be shortened. But the attempts sum:
+    # connect 5 + write 10 + read 255 + a 60s Retry-After + a second 270 is ~585s, and ten
+    # minutes inside a single tool call is not a chat turn. This layer owns that budget, so
+    # the cap is here.
+    #
+    # 300 is the smallest value that never truncates a legitimate single attempt: at the
+    # maximum timeout_s of 120 one attempt is at most 5 + 10 + 255 = 270s. At the default
+    # timeout_s of 60 an attempt is at most 210s, so 300 still leaves room for a 429's
+    # Retry-After wait and a partial retry. Raising timeout_s therefore trades away the
+    # retry, which is the right way round: a script that asked for the full 120s has already
+    # been promised most of the turn.
+    _RUN_ANALYSIS_DEADLINE_S = 300
+
+    # error types that say the script called the SDK wrong rather than that the data was
+    # wrong. Advisory only — `error.type` is an OPEN string (the child's own exception class
+    # name), so this is used to ADD a hint, never to decide whether something is an error.
+    _SDK_MISUSE_ERROR_TYPES = frozenset(
+        {"TypeError", "AttributeError", "NameError", "ImportError", "ModuleNotFoundError"}
+    )
+
+    @cached_property
+    def _sandbox(self) -> Any:
+        """The sandbox transport, imported lazily and built once.
+
+        Deferred import for the same reason `read_artifact` defers its own: this module is
+        imported by the standalone MCP server, and the sandbox client has no business in
+        that import graph. Tests replace this by assigning to the attribute.
+        """
+        from genetics_mcp_server.sandbox_client import SandboxClient
+
+        return SandboxClient()
+
+    async def run_analysis(
+        self,
+        code: str,
+        timeout_s: int | None = None,
+        *,
+        user: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run one script in the sandbox and render the supervisor's result for the model.
+
+        `user` and `session_id` are supplied by the CALLER, never by the model: they are the
+        subject and the session of the per-execution credential, and llm_service strips any
+        same-named key the model emits before injecting the authenticated pair. A tool
+        invocation with neither is a wiring fault, not a script fault, and is reported as one.
+
+        **There is deliberately no `except Exception` in this method**, which is a departure
+        from the ~40 handlers above it. `mint_execution_tokens` raises `SandboxTokenUnavailable`
+        — a plain `RuntimeError` — when `SANDBOX_TOKEN_SIGNING_KEY` is unset, and the house
+        style would catch it and hand the model an ordinary "tool failed". That is not a
+        security hole (the client raises before any request, so no credential is ever sent)
+        but it converts an OPERATOR-VISIBLE misconfiguration into a MODEL-VISIBLE failure the
+        model then retries, forever, against a sandbox that cannot work. It is caught here
+        first and by name, and reported with `retryable: False`; anything genuinely unforeseen
+        propagates rather than being flattened into that same shape.
+
+        The 200 body is rendered field by field rather than passed through. Two reasons, and
+        neither is that the contract's field set is closed — it is not, and an unknown
+        `status` or `error.type` renders as itself instead of crashing. First, `execution_id`
+        must not reach the model: it is the join key for the audit trail and for the manifest
+        chat-backend records against the `jti`/`sid`, and putting it in context invites a
+        model-supplied one back in, which is exactly what artifact resolution rules out.
+        Second, an artifact entry is `name`/`size`/`content_type` and nothing else — no path,
+        no id, no URL — so it is rebuilt to that shape rather than forwarded.
+        """
+        from genetics_mcp_server.sandbox_client import (
+            MAX_TIMEOUT_S,
+            SandboxBusy,
+            SandboxDeadlineExceeded,
+            SandboxError,
+            SandboxRejected,
+            SandboxUnavailable,
+        )
+        from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
+
+        if not isinstance(code, str) or not code.strip():
+            return {
+                "success": False,
+                "error": "A non-empty Python script is required.",
+                "retryable": True,
+            }
+        if not user or not session_id:
+            # the identity is the credential's subject; without it there is nothing to mint
+            # against and the fault is in the wiring, not in anything the model can change
+            logger.error(
+                "run_analysis called without an authenticated identity "
+                "(user=%s session=%s); the caller must supply both",
+                bool(user),
+                bool(session_id),
+            )
+            return self._sandbox_operator_error(
+                "Code execution is not available in this context: no authenticated session."
+            )
+
+        try:
+            result = await asyncio.wait_for(
+                self._sandbox.execute(
+                    code=code,
+                    user=user,
+                    session_id=session_id,
+                    timeout_s=timeout_s,
+                ),
+                timeout=self._RUN_ANALYSIS_DEADLINE_S,
+            )
+        except SandboxTokenUnavailable as e:
+            # FIRST, and by name. See the docstring: this is the one failure that must not
+            # read to the model as a retryable tool error.
+            logger.error("run_analysis cannot mint execution tokens: %s", e)
+            return self._sandbox_operator_error(
+                "Code execution is not configured on this server, so no script can run. "
+                "This is a server configuration fault and will not be fixed by retrying."
+            )
+        except asyncio.TimeoutError:
+            # our own cap, not the client's per-attempt one: the sandbox may still be running
+            # or queueing this script. Deliberately not framed as a script failure.
+            logger.warning(
+                "run_analysis exceeded the %ss turn budget (session=%s)",
+                self._RUN_ANALYSIS_DEADLINE_S,
+                session_id,
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"The analysis did not finish within {self._RUN_ANALYSIS_DEADLINE_S}s of "
+                    "this turn's budget, which includes time spent queued behind another run. "
+                    "The script itself may still be running. Try again with a smaller job."
+                ),
+                "error_type": "TurnBudgetExceeded",
+                "retryable": True,
+            }
+        except SandboxUnavailable as e:
+            # NOT a script failure, and it must never be worded as one: `strategy: Recreate`
+            # plus terminationGracePeriodSeconds 130 means a deploy landing on an in-flight
+            # execution leaves no sandbox at all for up to ~130s.
+            logger.warning("sandbox unavailable for run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox is temporarily unavailable — this is not a problem "
+                    "with the script. It is usually a restart and clears within a couple of "
+                    "minutes; wait and try the same script again, or answer from other tools."
+                ),
+                "error_type": "SandboxUnavailable",
+                "retryable": True,
+            }
+        except SandboxBusy as e:
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox is busy with other runs and could not take this one. "
+                    "Wait a moment and retry the same script, or use other tools."
+                ),
+                "error_type": "SandboxBusy",
+                "retry_after_s": e.retry_after,
+                "retryable": True,
+            }
+        except SandboxDeadlineExceeded as e:
+            logger.warning("sandbox did not answer run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox accepted the script but never answered. The script "
+                    "may still be running; do not assume it failed."
+                ),
+                "error_type": "SandboxDeadlineExceeded",
+                "retryable": True,
+            }
+        except SandboxRejected as e:
+            # a caller bug — including a timeout_s or a script size this client refused to
+            # send. Actionable, because the model chose the value.
+            logger.warning("sandbox refused run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    f"The analysis request was rejected: {e}. Fix the request rather than "
+                    f"repeating it — timeout_s must be 1-{MAX_TIMEOUT_S} seconds."
+                ),
+                "error_type": "SandboxRejected",
+                "retryable": False,
+            }
+        except SandboxError as e:
+            # SandboxInternalError, SandboxProtocolError, and any subclass added later. An
+            # unrecognised member of the family is reported, never dropped.
+            logger.error("sandbox error in run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox failed to run the script. This is a server-side "
+                    "fault rather than an error in the script."
+                ),
+                "error_type": type(e).__name__,
+                "retryable": True,
+            }
+
+        return self._render_analysis(result)
+
+    @staticmethod
+    def _sandbox_operator_error(message: str) -> dict[str, Any]:
+        """A misconfiguration the model cannot route around, marked so it stops trying."""
+        return {
+            "success": False,
+            "error": message,
+            "error_type": "SandboxNotConfigured",
+            "retryable": False,
+        }
+
+    def _render_analysis(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Turn the supervisor's 200 body into the tool result the model reads.
+
+        Tolerant by construction: every field is read defensively, an unknown `status` is
+        reported as itself and counts as not-ok, and an unrecognised `error.type` is a label
+        to display. The contract reserves the supervisor's names as a MINIMUM.
+        """
+        status = result.get("status")
+        status_text = status if isinstance(status, str) else "unknown"
+        ok = status_text == "ok"
+
+        artifacts = []
+        raw_artifacts = result.get("artifacts")
+        if isinstance(raw_artifacts, list):
+            for entry in raw_artifacts:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                size = entry.get("size")
+                content_type = entry.get("content_type")
+                artifacts.append(
+                    {
+                        "name": name,
+                        "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                        "content_type": content_type if isinstance(content_type, str) else None,
+                    }
+                )
+
+        rendered: dict[str, Any] = {
+            "success": ok,
+            "status": status_text,
+            "output": result.get("output") if isinstance(result.get("output"), str) else "",
+            "output_truncated": bool(result.get("output_truncated")),
+            "artifacts": artifacts,
+        }
+        duration_ms = result.get("duration_ms")
+        if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
+            rendered["duration_ms"] = duration_ms
+        omitted = result.get("artifacts_omitted")
+        if isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0:
+            rendered["artifacts_omitted"] = omitted
+        if artifacts:
+            # said once, here, rather than left to the model to infer from the manifest: the
+            # HTTP retrieval path is genetics-results-suite-4h6.52 and does not exist, and
+            # read_artifact in this process reads a local directory that is not the sandbox's
+            # /scratch. Promising a fetch that returns "not enabled here" costs a roundtrip.
+            rendered["artifacts_note"] = (
+                "Artifact contents cannot be retrieved. Print anything from the script that "
+                "you need to read."
+            )
+
+        if not ok:
+            rendered.update(self._analysis_error_fields(result, status_text))
+
+        return rendered
+
+    def _analysis_error_fields(self, result: dict[str, Any], status_text: str) -> dict[str, Any]:
+        """The actionable half of a failed run: what raised, where, and which limit fired.
+
+        A failing script costs a whole model roundtrip, and the measured distribution of
+        roundtrips has a tail at 8+ that burns a third of the spend — so the error carries
+        the exception type, the traceback tail and the specific limit rather than a summary,
+        on the theory that the model repairs in one attempt instead of three.
+        """
+        error = result.get("error")
+        error = error if isinstance(error, dict) else {}
+        error_type = error.get("type")
+        error_type = error_type if isinstance(error_type, str) else None
+        message = error.get("message")
+        tb = error.get("traceback")
+        limit = error.get("limit")
+
+        fields: dict[str, Any] = {
+            "error": message if isinstance(message, str) and message else f"Script {status_text}",
+        }
+        if error_type:
+            fields["error_type"] = error_type
+        if isinstance(tb, str) and tb:
+            fields["traceback"] = tb
+        if isinstance(limit, str) and limit:
+            fields["limit_exceeded"] = limit
+
+        hint = self._analysis_hint(status_text, error_type, limit)
+        if hint:
+            fields["hint"] = hint
+        # a script that ran and failed is repairable by rewriting it, which is the model's
+        # job; that is a different thing from the transport failures above, where retrying
+        # the SAME script is the correct move.
+        fields["retryable"] = False
+        return fields
+
+    @staticmethod
+    def _analysis_hint(status_text: str, error_type: str | None, limit: Any) -> str | None:
+        if status_text == "timeout":
+            return (
+                "The wall clock fired. Narrow the query or process fewer rows; raising "
+                "timeout_s only helps if the script was genuinely close to finishing."
+            )
+        limit_name = limit if isinstance(limit, str) else error_type
+        if status_text == "limit":
+            limits = {
+                "OutputLimit": "The script printed too much. Print a summary, not every row.",
+                "MemoryLimit": "The script ran out of memory. Aggregate in the query rather "
+                "than pulling every row into memory.",
+                "ArtifactQuota": "The script wrote more artifact bytes than one execution is "
+                "allowed. Write fewer or smaller files.",
+                "ScratchQuota": "The script wrote more scratch bytes than one execution is "
+                "allowed.",
+                "PidLimit": "The script started too many processes. It should not need "
+                "subprocesses at all.",
+            }
+            return limits.get(
+                limit_name or "",
+                f"A sandbox limit fired ({limit_name or 'unknown'}). Do less work per run.",
+            )
+        if error_type in ToolExecutor._SDK_MISUSE_ERROR_TYPES:
+            return (
+                "This looks like the SDK being called differently from how it is defined. "
+                "Call list_capabilities for the exact signatures before rewriting."
+            )
+        return None
+
 
 # --------------------------------------------------------------------------- SDK catalogue
 

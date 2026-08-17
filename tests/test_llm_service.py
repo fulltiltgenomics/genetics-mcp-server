@@ -12,6 +12,7 @@ uses.
 """
 
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -265,7 +266,9 @@ def _with_tools(svc):
     executor itself is irrelevant to what is being counted."""
     svc.executor = object()
 
-    async def _execute(name, tool_input, literature_backend=None):
+    async def _execute(name, tool_input, literature_backend=None, user=None, session_id=None):
+        # the signature stays exact: the loop calls this positionally, so a widened
+        # *args stub would silently accept a call shape production could never make
         return {"success": True, "rows": []}
 
     svc._execute_tool = _execute
@@ -542,3 +545,64 @@ class TestUsageChunk:
         )
         recorded = chat_history_db.get_turn_metrics("sess1")[0]["cost_usd"]
         assert from_stream == pytest.approx(recorded)
+
+
+class TestRunAnalysisDisplayInput:
+    """The tool-use indicator and its log line mirror the execution-side identity strip.
+
+    _execute_tool discards a model-supplied `user`/`session_id` before calling
+    run_analysis, but the indicator is rendered from the raw tool_use input — so a forged
+    identity would still be logged and streamed as if it were a real argument, which is
+    exactly what a log join reads as identity.
+    """
+
+    def _patch_db(self, db):
+        return patch(
+            "genetics_mcp_server.db.chat_history_db.get_chat_history_db",
+            return_value=db,
+        )
+
+    def _turns(self, tool_input):
+        blocks = [_Block("tool_use", id="t1", name="run_analysis", input=tool_input)]
+        return [
+            ([], _usage(_FakeMessage(blocks, "tool_use"), input_tokens=1, output_tokens=1)),
+            _answer_turn(input_tokens=1, output_tokens=1),
+        ]
+
+    def _streamed(self, chunks):
+        return "".join(c.content for c in chunks if c.type == "text")
+
+    @pytest.mark.asyncio
+    async def test_forged_identity_is_neither_streamed_nor_logged(self, chat_history_db, caplog):
+        turns = self._turns({
+            "code": "print(1)",
+            "user": "attacker@evil.example",
+            "session_id": "other-sid",
+        })
+        svc = _with_tools(_service(turns))
+
+        with self._patch_db(chat_history_db), caplog.at_level(
+            logging.INFO, logger="genetics_mcp_server.llm_service"
+        ):
+            chunks = await _run(svc, enable_tools=True)
+
+        streamed = self._streamed(chunks)
+        assert "attacker@evil.example" not in streamed
+        assert "other-sid" not in streamed
+        assert "attacker@evil.example" not in caplog.text
+        assert "run_analysis" in streamed
+
+    @pytest.mark.asyncio
+    async def test_long_script_is_truncated_for_display(self, chat_history_db, caplog):
+        code = "x = 1  # padding\n" * 4000
+        svc = _with_tools(_service(self._turns({"code": code})))
+
+        with self._patch_db(chat_history_db), caplog.at_level(
+            logging.INFO, logger="genetics_mcp_server.llm_service"
+        ):
+            chunks = await _run(svc, enable_tools=True)
+
+        streamed = self._streamed(chunks)
+        assert len(streamed) < len(code)
+        assert f"{len(code)} chars total" in streamed
+        assert len(caplog.text) < len(code)

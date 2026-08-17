@@ -1,11 +1,14 @@
-"""Tests for the code-execution tool halves: list_capabilities and read_artifact.
+"""Tests for the code-execution tools: list_capabilities, read_artifact, run_analysis.
 
-genetics-results-suite-4h6.15. The sandbox is not deployed, so these exercise the tool
-layer only: the SDK catalogue rendering, and the artifact read together with the path
-validation it borrows from skills/sandbox_tools.py.
+genetics-results-suite-4h6.15 and -4h6.48. The sandbox is not deployed, so these exercise
+the tool layer only: the SDK catalogue rendering, the artifact read together with the path
+validation it borrows from skills/sandbox_tools.py, and run_analysis against a stubbed
+transport — no live sandbox, no credentials.
 """
 
+import asyncio
 import base64
+import inspect
 import os
 import signal
 
@@ -492,3 +495,398 @@ class TestArtifactsDirectoryChecks:
         result = await executor.read_artifact(name="chat_history.db")
         assert result["success"] is False
         assert "not enabled" in result["error"]
+
+
+# --------------------------------------------------------------------------- run_analysis
+# genetics-results-suite-4h6.48. The tool layer over sandbox_client (4h6.47). Everything
+# below runs with NO sandbox and NO credentials: the transport is either a stub `execute`
+# or httpx.MockTransport, and the one test that needs a signing key is the one asserting
+# what happens when there isn't one.
+
+
+class _StubSandbox:
+    """Stands in for SandboxClient. Records what it was asked and replays one outcome."""
+
+    def __init__(self, result=None, raises=None):
+        self.result = result
+        self.raises = raises
+        self.calls = []
+
+    async def execute(self, *, code, user, session_id, timeout_s=None, execution_id=None):
+        self.calls.append(
+            {
+                "code": code,
+                "user": user,
+                "session_id": session_id,
+                "timeout_s": timeout_s,
+                "execution_id": execution_id,
+            }
+        )
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+def _result_body(**overrides):
+    body = {
+        "execution_id": "8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b",
+        "status": "ok",
+        "exit_code": 0,
+        "signal": None,
+        "duration_ms": 1234,
+        "output": "rows: 12\n",
+        "output_bytes": 9,
+        "output_truncated": False,
+        "error": None,
+        "artifacts": [],
+        "artifacts_omitted": 0,
+    }
+    body.update(overrides)
+    return body
+
+
+async def _run(executor, sandbox, **kwargs):
+    executor._sandbox = sandbox
+    kwargs.setdefault("code", "print('hi')")
+    kwargs.setdefault("user", "u@finngen.fi")
+    kwargs.setdefault("session_id", "conv-9")
+    return await executor.run_analysis(**kwargs)
+
+
+class TestRunAnalysisDefinition:
+    def test_defined_as_an_orchestration_tool(self):
+        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        assert by_name["run_analysis"]["category"] == "orchestration"
+
+    def test_takes_code_and_a_timeout_and_no_identity(self):
+        """The identity is the caller's, never the model's: it is not an argument."""
+        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        params = by_name["run_analysis"]["parameters"]
+        assert params["code"]["required"] is True
+        assert params["timeout_s"]["type"] == "integer"
+        assert "user" not in params and "session_id" not in params
+
+    def test_does_not_promise_artifact_contents(self):
+        """The HTTP retrieval path is 4h6.52 and does not exist; read_artifact in this
+        process reads a local directory that is not the sandbox's /scratch. Telling the
+        model it can fetch a plot costs a roundtrip to find out it cannot.
+        """
+        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        description = by_name["run_analysis"]["description"]
+        assert "CANNOT BE RETRIEVED" in description
+        assert "read_artifact" not in description
+
+    def test_reaches_the_chat_tool_list(self):
+        names = {t["name"] for t in get_anthropic_tools()}
+        assert "run_analysis" in names
+
+
+class TestRunAnalysisFailsClosed:
+    """The one hazard that is neither a script failure nor a security hole.
+
+    An unset SANDBOX_TOKEN_SIGNING_KEY makes every execution impossible. No credential is
+    ever sent — the client raises before the request — so this cannot leak anything. What
+    it must not do is arrive at the model as an ordinary "tool failed", because the model
+    then retries, repeatedly, against a sandbox that can never work.
+    """
+
+    async def test_an_unset_signing_key_is_an_operator_error_and_sends_nothing(
+        self, executor, monkeypatch
+    ):
+        import httpx
+
+        from genetics_mcp_server.config import settings as settings_module
+        from genetics_mcp_server.sandbox_client import SandboxClient
+
+        settings_module.get_settings.cache_clear()
+        monkeypatch.delenv("SANDBOX_TOKEN_SIGNING_KEY", raising=False)
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=_result_body())
+
+        try:
+            executor._sandbox = SandboxClient(
+                "http://sandbox:8080", transport=httpx.MockTransport(handler)
+            )
+            result = await executor.run_analysis(
+                code="print(1)", user="u@finngen.fi", session_id="conv-9"
+            )
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert requests == [], "fail-closed must mean no request at all"
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+
+    async def test_the_house_error_style_does_not_swallow_it(self, executor):
+        """~40 handlers in this module wrap their body in `except Exception`, and
+        SandboxTokenUnavailable is a plain RuntimeError. Written that way, this handler
+        would report the generic internal-error message and the model would retry it.
+        """
+        from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
+
+        sandbox = _StubSandbox(raises=SandboxTokenUnavailable("no signing key"))
+        result = await _run(executor, sandbox)
+
+        assert result["error"] != executor_module.INTERNAL_ERROR_MSG
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+
+    def test_the_handler_has_no_blanket_exception_clause(self):
+        """Structural, because ordering is what would break: a later edit that adds
+        `except Exception` above the named clause reintroduces the swallow silently, and
+        no behavioural test of the current ordering would notice.
+        """
+        import ast
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(ToolExecutor.run_analysis)))
+        tries = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+        assert len(tries) == 1
+        caught = [
+            ast.unparse(handler.type) if handler.type else "BARE"
+            for handler in tries[0].handlers
+        ]
+        assert "Exception" not in caught and "BARE" not in caught
+        assert caught[0] == "SandboxTokenUnavailable", (
+            "the fail-closed exception must be caught before anything broader"
+        )
+
+    async def test_a_missing_identity_is_also_an_operator_error(self, executor):
+        """Nothing to mint against. A wiring fault, not something the model can fix."""
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run(executor, sandbox, user=None)
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+        assert sandbox.calls == []
+
+
+class TestRunAnalysisTurnBudget:
+    """4h6.47 bounds each ATTEMPT and deliberately offers no total; this layer owns it."""
+
+    def test_the_cap_admits_one_full_attempt_and_bounds_the_retry_chain(self):
+        from genetics_mcp_server import sandbox_client
+
+        worst_single_attempt = (
+            sandbox_client.CONNECT_TIMEOUT_S
+            + sandbox_client.BODY_WRITE_DEADLINE_S
+            + sandbox_client.client_deadline_s(sandbox_client.MAX_TIMEOUT_S)
+        )
+        worst_uncapped = (
+            worst_single_attempt + sandbox_client.MAX_RETRY_WAIT_S + worst_single_attempt
+        )
+        deadline = ToolExecutor._RUN_ANALYSIS_DEADLINE_S
+
+        assert deadline >= worst_single_attempt, (
+            "a cap below one attempt's worst case would abandon executions the supervisor "
+            "is about to answer"
+        )
+        assert deadline < worst_uncapped, "the whole point is that the attempts do not sum"
+
+    async def test_exceeding_it_is_not_reported_as_a_script_failure(self, executor, monkeypatch):
+        monkeypatch.setattr(ToolExecutor, "_RUN_ANALYSIS_DEADLINE_S", 0.05)
+
+        class _Hangs:
+            async def execute(self, **kwargs):
+                await asyncio.sleep(10)
+
+        executor._sandbox = _Hangs()
+        result = await executor.run_analysis(
+            code="print(1)", user="u@finngen.fi", session_id="conv-9"
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "TurnBudgetExceeded"
+        assert result["retryable"] is True
+        assert "may still be running" in result["error"]
+
+
+class TestRunAnalysisTransportFailures:
+    async def test_an_unavailable_sandbox_does_not_read_as_a_broken_script(self, executor):
+        """strategy Recreate + terminationGracePeriodSeconds 130 leaves no sandbox for
+        ~130s when a deploy lands on an in-flight execution. That is a wait-and-retry
+        condition, not a defect in the code the model wrote.
+        """
+        from genetics_mcp_server.sandbox_client import SandboxUnavailable
+
+        result = await _run(executor, _StubSandbox(raises=SandboxUnavailable("no route")))
+        assert result["error_type"] == "SandboxUnavailable"
+        assert result["retryable"] is True
+        assert "not a problem with the script" in result["error"]
+
+    async def test_busy_carries_the_retry_after(self, executor):
+        from genetics_mcp_server.sandbox_client import SandboxBusy
+
+        result = await _run(executor, _StubSandbox(raises=SandboxBusy("full", retry_after=42)))
+        assert result["error_type"] == "SandboxBusy"
+        assert result["retry_after_s"] == 42
+
+    async def test_a_rejection_is_not_retryable(self, executor):
+        from genetics_mcp_server.sandbox_client import SandboxRejected
+
+        result = await _run(
+            executor, _StubSandbox(raises=SandboxRejected("timeout_s must be 1-120"))
+        )
+        assert result["error_type"] == "SandboxRejected"
+        assert result["retryable"] is False
+
+    async def test_an_unrecognised_member_of_the_family_is_still_reported(self, executor):
+        """SandboxError subclasses are not a closed set either."""
+        from genetics_mcp_server.sandbox_client import SandboxError
+
+        class _NewFailure(SandboxError):
+            pass
+
+        result = await _run(executor, _StubSandbox(raises=_NewFailure("something new")))
+        assert result["success"] is False
+        assert result["error_type"] == "_NewFailure"
+
+
+class TestRunAnalysisRendering:
+    async def test_a_successful_run_returns_what_the_script_printed(self, executor):
+        result = await _run(executor, _StubSandbox(result=_result_body()))
+        assert result["success"] is True
+        assert result["status"] == "ok"
+        assert result["output"] == "rows: 12\n"
+        assert result["duration_ms"] == 1234
+
+    async def test_the_execution_id_never_reaches_the_model(self, executor):
+        """It is the audit join key and the manifest's key. A model-visible id invites a
+        model-SUPPLIED one back in, which is what artifact resolution rules out.
+        """
+        result = await _run(executor, _StubSandbox(result=_result_body()))
+        assert "8f14e45f" not in str(result)
+
+    async def test_the_manifest_is_name_size_content_type_and_nothing_else(self, executor):
+        body = _result_body(
+            artifacts=[
+                {
+                    "name": "manhattan.png",
+                    "size": 2048,
+                    "content_type": "image/png",
+                    "path": "/scratch/8f14e45f/artifacts/manhattan.png",
+                    "url": "http://sandbox/artifacts/8f14e45f/manhattan.png",
+                }
+            ]
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        assert result["artifacts"] == [
+            {"name": "manhattan.png", "size": 2048, "content_type": "image/png"}
+        ]
+        assert "/scratch/" not in str(result)
+
+    async def test_the_manifest_says_the_contents_cannot_be_fetched(self, executor):
+        body = _result_body(
+            artifacts=[{"name": "plot.png", "size": 10, "content_type": "image/png"}]
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        assert "cannot be retrieved" in result["artifacts_note"]
+
+    async def test_a_malformed_manifest_entry_is_dropped_not_fatal(self, executor):
+        body = _result_body(artifacts=["plot.png", {"size": 3}, {"name": "ok.tsv"}])
+        result = await _run(executor, _StubSandbox(result=body))
+        assert [a["name"] for a in result["artifacts"]] == ["ok.tsv"]
+
+    async def test_a_failing_script_carries_the_type_and_the_traceback(self, executor):
+        body = _result_body(
+            status="error",
+            exit_code=1,
+            output="Traceback...\n",
+            error={
+                "type": "ValueError",
+                "message": "no such phenotype",
+                "traceback": '  File "<script>", line 3\nValueError: no such phenotype',
+                "limit": None,
+            },
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        assert result["success"] is False
+        assert result["status"] == "error"
+        assert result["error_type"] == "ValueError"
+        assert "line 3" in result["traceback"]
+        assert result["error"] == "no such phenotype"
+
+    async def test_an_sdk_misuse_is_pointed_at_the_catalogue(self, executor):
+        body = _result_body(
+            status="error",
+            error={"type": "TypeError", "message": "unexpected keyword 'pheno'"},
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        assert "list_capabilities" in result["hint"]
+
+    async def test_a_limit_says_which_limit_fired(self, executor):
+        body = _result_body(
+            status="limit",
+            error={"type": "OutputLimit", "message": "output cap", "limit": "OutputLimit"},
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        assert result["limit_exceeded"] == "OutputLimit"
+        assert "summary" in result["hint"]
+
+    async def test_an_unknown_error_type_is_rendered_not_switched_on(self, executor):
+        """`error.type` is an OPEN string — half its range is the child's own exception
+        class name — so an unrecognised value is a label to display, never a crash.
+        """
+        body = _result_body(
+            status="limit",
+            error={"type": "SomethingNew", "message": "?", "limit": "SomethingNew"},
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        assert result["error_type"] == "SomethingNew"
+        assert result["limit_exceeded"] == "SomethingNew"
+        assert result["hint"]
+
+    async def test_an_unknown_status_is_not_a_success(self, executor):
+        result = await _run(executor, _StubSandbox(result=_result_body(status="quarantined")))
+        assert result["success"] is False
+        assert result["status"] == "quarantined"
+
+    async def test_a_body_missing_optional_fields_does_not_crash(self, executor):
+        result = await _run(executor, _StubSandbox(result={"status": "ok"}))
+        assert result["success"] is True
+        assert result["output"] == ""
+        assert result["artifacts"] == []
+
+    async def test_unknown_top_level_fields_are_ignored(self, executor):
+        result = await _run(
+            executor, _StubSandbox(result=_result_body(sandbox_host="sandbox-0", cost_usd=1))
+        )
+        assert result["success"] is True
+        assert "sandbox-0" not in str(result)
+
+
+class TestRunAnalysisIdentity:
+    async def test_the_caller_identity_is_what_reaches_the_client(self, executor):
+        sandbox = _StubSandbox(result=_result_body())
+        await _run(executor, sandbox, user="real@finngen.fi", session_id="conv-7")
+        assert sandbox.calls[0]["user"] == "real@finngen.fi"
+        assert sandbox.calls[0]["session_id"] == "conv-7"
+
+    async def test_llm_service_strips_a_model_supplied_identity(self):
+        """tool_input is splatted verbatim into the handler, and the model can emit keys
+        the schema does not declare. Same shape as the literature `backend` strip.
+        """
+        from genetics_mcp_server.llm_service import LLMService
+
+        seen = {}
+
+        class _Recorder:
+            async def run_analysis(self, **kwargs):
+                seen.update(kwargs)
+                return {"success": True}
+
+        service = LLMService.__new__(LLMService)
+        service.executor = _Recorder()
+        service.subagent_service = None
+
+        await service._execute_tool(
+            "run_analysis",
+            {"code": "print(1)", "user": "attacker@evil.example", "session_id": "other"},
+            None,
+            "real@finngen.fi",
+            "conv-7",
+        )
+        assert seen["user"] == "real@finngen.fi"
+        assert seen["session_id"] == "conv-7"

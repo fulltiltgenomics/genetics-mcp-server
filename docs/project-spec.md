@@ -230,28 +230,112 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 ### Code execution tools
 
 Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
-not deployed, so `run_analysis` does not exist yet and `read_artifact` has nothing to read
-in any running service.
+not deployed, so every `run_analysis` call fails at the transport today and
+`read_artifact` has nothing to read in any running service.
 
 | Tool | Description |
 |------|-------------|
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Chat-backend only; not registered on the MCP server at all |
 | `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
-| `read_artifact` | Read one named file an analysis script wrote to its artifacts directory. Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Chat-backend only — excluded from MCP server |
+| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note`. Chat-backend only — excluded from MCP server |
 
-**Both are category `orchestration`**, not `general`: they hand work to another runtime
-rather than fetching data, which is what `launch_subagents` is. The category by itself
-excludes nothing — `TOOL_PROFILES` includes `orchestration` in both the `api` and
+**All three are category `orchestration`**, not `general`: they hand work to another
+runtime rather than fetching data, which is what `launch_subagents` is. The category by
+itself excludes nothing — `TOOL_PROFILES` includes `orchestration` in both the `api` and
 `bigquery` profiles, so it reaches three of the five subagent skills — so `subagent.py`
-names all three orchestration tools explicitly:
-`disabled |= {"launch_subagents", "read_artifact", "list_capabilities"}`. That name list,
-not the category, is what keeps a subagent from retrieving another execution's artifacts
-or being told how to start one; `tests/test_subagent.py` pins it.
+names all four orchestration tools explicitly:
+`disabled |= {"launch_subagents", "run_analysis", "read_artifact", "list_capabilities"}`.
+That name list, not the category, is what keeps a subagent from executing code, retrieving
+another execution's artifacts or being told how to start one; `tests/test_subagent.py`
+pins it. For `run_analysis` the exclusion is also a correctness point: a subagent has no
+session of its own, and the session is what the per-execution credential is minted against.
 
-**Exposure decision**: `read_artifact` is in the `_mcp_disabled` literal in
-`mcp_server.py`. This is a security control, not a product decision — the user requires
-that code execution is not reachable via MCP — and it is the *only* registration-layer
-control, since `register_mcp_tools` is called with no profile and `tool_profile=None`
-means no filtering at all. `run_analysis` joins the set with `4h6.16`.
+**Dropping a tool from the list only stops it being offered — the dispatcher is what
+enforces it.** `subagent.py:_execute_subagent_tool` used to resolve the model's
+`tool_name` against the executor with `getattr`, so any executor attribute could be
+called by naming it, whether or not the skill declared it — and a subagent's task text is
+written by the main agent, which *does* have `run_analysis`. It now refuses (and logs at
+`WARNING`) any `tool_name` absent from the set `_get_tool_definitions(skill)` produced for
+that skill, which covers the local, sandbox and external branches at once. Without it the
+`run_analysis` handler was reachable with a model-supplied `user`/`session_id`, which
+`mint_execution_tokens` would have made the `sub`/`sid` of both per-execution JWTs and of
+every audit record — the forgery the `llm_service` strip exists to prevent, on the same
+tool. `tests/test_subagent.py::TestSubagentDispatchAllowList` pins the refusal, the
+by-name case, and that a declared tool still dispatches.
+
+#### What `run_analysis` returns, and why it is rendered rather than forwarded
+
+`sandbox_client.execute` returns the supervisor's 200 body **unchanged**; the handler
+rebuilds it field by field into `success` / `status` / `output` / `output_truncated` /
+`artifacts` (+ `duration_ms`, `artifacts_omitted`), and on a non-`ok` status adds
+`error`, `error_type`, `traceback`, `limit_exceeded` and a `hint`. Two reasons for the
+rebuild, and neither is that the contract's field set is closed — it is not, an unknown
+`status` renders as itself and counts as not-ok, and an unrecognised `error.type` is a
+label to display rather than something switched on:
+
+- **`execution_id` must not reach the model.** It is the join key for the audit trail and
+  for the manifest chat-backend records against the `jti`/`sid`; putting it in context
+  invites a model-*supplied* one back in, which is what artifact resolution rules out.
+- **A manifest entry is `name`/`size`/`content_type` and nothing else** — no path, no id,
+  no URL — so entries are rebuilt to that shape and malformed ones dropped.
+
+The failure half is deliberately as detailed as the success half: a failing script costs a
+full model roundtrip, and the epic's measurements put a third of all spend in the tail of
+turns with 6+ roundtrips. So the error carries the exception type, the traceback tail, and
+which limit fired, plus a hint that points at `list_capabilities` when the type suggests
+the SDK was called differently from how it is defined.
+
+**Artifacts are listed but not retrievable, and both tools say so.** `run_analysis`'s
+description and its `artifacts_note` state it, and `read_artifact`'s own description now
+carries the same caveat — the two sit in the same chat tool list, and the more specific
+tool promising a fetch is what the note exists to prevent. `read_artifact` in the
+chat-backend process reads a local directory that is not the sandbox's `/scratch` — the
+HTTP proxy is `genetics-results-suite-4h6.52` and does not exist, and
+`SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment. A model told it can fetch a plot
+spends a roundtrip finding out it cannot.
+
+**The tool-use indicator mirrors the identity strip, and truncates the script.** The
+`*[Using tool: ...]*` chunk and its log line are rendered from the raw `tool_use.input`,
+one layer above the strip in `_execute_tool`, so a model-invented `user` would be logged
+and streamed as if it were a real argument even though it never reaches the handler — and
+in a log join that reads as identity. `_stream_anthropic` drops `user`/`session_id` from
+the displayed input for `run_analysis` (the authenticated pair is already on every line
+via `log_prefix`) and cuts `code` to `_DISPLAY_CODE_CHARS` (400) with a total-length
+marker, so a 256 KiB script does not land in one log line and in the streamed markdown.
+
+**The turn budget is this layer's, not the transport's** (`ToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
+300 s, applied with `asyncio.wait_for`). `sandbox_client` bounds each *attempt* correctly
+and deliberately offers no total, because its per-attempt read deadline is derived from the
+supervisor's own worst-case hold time (120 s queued + `timeout_s` + 15 s margin). The
+attempts sum, though: 5 + 10 + 255, a 60 s `Retry-After`, then another 270 is ~585 s, and
+ten minutes inside one tool call is not a chat turn. 300 s is the smallest cap that never
+truncates a legitimate single attempt (270 s at the maximum `timeout_s`), so raising
+`timeout_s` trades away the retry rather than the run. Exceeding it reports
+`TurnBudgetExceeded` and says the script may still be running — it is not a script failure,
+and neither is `SandboxUnavailable`, which means a deploy left no sandbox for up to ~130 s
+(`strategy: Recreate` plus `terminationGracePeriodSeconds: 130`).
+
+**`SandboxTokenUnavailable` is caught first and by name, and `run_analysis` has no
+`except Exception` at all** — a deliberate departure from the ~40 handlers around it.
+`mint_execution_tokens` raises it (a plain `RuntimeError`) when `SANDBOX_TOKEN_SIGNING_KEY`
+is unset. The house style would catch it and hand the model an ordinary "tool failed";
+that is not a security hole, since the client raises before any request and no credential
+is ever sent, but it turns an operator-visible misconfiguration into a model-visible
+failure the model then retries against a sandbox that can never work. It is reported as
+`SandboxNotConfigured` with `retryable: False`, and `tests/test_code_execution_tools.py`
+pins both the behaviour and — by parsing the handler's AST — the clause ordering.
+
+**Exposure decision**: `run_analysis` and `read_artifact` are in the `_mcp_disabled`
+literal in `mcp_server.py`. This is a security control, not a product decision — the user
+requires that code execution is not reachable via MCP. `run_analysis` additionally has
+**no `register_mcp_tools` block at all**, which is a second registration-layer control
+that no configuration can undo, since `disabled_tools` can only subtract: the entry in
+`_mcp_disabled` is the half an env-driven `disabled_tools` and a future refactor can
+disturb, and it is what would catch a block added later. Both are asserted against the
+*registered tool list* rather than against the constant. Note what does **not** protect
+anything here: `register_mcp_tools` is called with no profile, and `tool_profile=None`
+means no filtering at all, so "the MCP server does not select the `code` profile" is
+precisely the condition under which an unguarded tool would be registered.
 `list_capabilities` is deliberately **not** excluded: what it renders is per-function SDK
 signatures and docstrings, which describe the SDK's shape rather than data, session state
 or any execution, and an exclusion set padded with harmless names stops reading as a
@@ -363,7 +447,7 @@ Each tool has a `category` field in its definition:
 | `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
-| `orchestration` | Main-agent-only tools: launch_subagents, list_capabilities, read_artifact. `subagent.py` drops all three **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches and to keep a subagent away from another execution's artifacts. |
+| `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
 
 ### Profile behavior
 
@@ -1247,6 +1331,10 @@ literal at a call site.
 - **Transport only.** The supervisor's result object is returned unchanged for the tool layer
   to render. `error.type` is treated as an open string — the reserved supervisor names are
   branched on, anything else is carried through as an opaque label.
+- **No total deadline, deliberately.** Each attempt is bounded; the sum is not (~585 s worst
+  case). The cap belongs to whoever owns the chat turn, and that is `run_analysis` — see
+  `ToolExecutor._RUN_ANALYSIS_DEADLINE_S` under Code execution tools. Its only caller is that
+  handler.
 
 ### Turn termination and truncation
 
@@ -1818,6 +1906,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
+| `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s descriptor-based read and its path allow-list, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair |
 | `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both, and the comment and tool-history reads degrade the same way), chat-history write transaction safety (every write accessor over a failed DML and a failed commit, the retained lock, and the multi-DML writes rolled back whole), and the zone the write path returns (the saves, the version history and `add_user_comment` hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |

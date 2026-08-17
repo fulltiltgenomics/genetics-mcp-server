@@ -397,13 +397,20 @@ class SubagentService:
         else:
             tool_profile = "rag"  # general-only
 
-        # exclude orchestration tools to prevent recursive subagent launches, and to keep a
-        # subagent away from another execution's artifacts. The exclusion is by NAME, not
+        # exclude orchestration tools to prevent recursive subagent launches, to keep a
+        # subagent away from another execution's artifacts, and to keep code execution on
+        # the one path that holds the authenticated identity the per-execution credential is
+        # minted from — a subagent has no session of its own. The exclusion is by NAME, not
         # by category: TOOL_PROFILES puts "orchestration" in both the api and bigquery
         # profiles, so the category is present in three of the five skills and every
         # orchestration tool must be listed here individually to actually be dropped
         disabled = set(settings.disabled_tools) if settings.disabled_tools else set()
-        disabled |= {"launch_subagents", "read_artifact", "list_capabilities"}
+        disabled |= {
+            "launch_subagents",
+            "run_analysis",
+            "read_artifact",
+            "list_capabilities",
+        }
 
         tools = get_anthropic_tools(
             tool_profile=tool_profile,
@@ -446,6 +453,23 @@ class SubagentService:
         settings = get_settings()
 
         try:
+            # dispatch only what this skill actually declared. Without this the local-tool
+            # branch below calls any executor attribute the model names, which makes the
+            # by-name exclusion in _get_tool_definitions advisory rather than enforced: a
+            # subagent whose task text is written by a model that DOES have run_analysis
+            # could name it here and reach mint_execution_tokens under a `user` it supplied,
+            # forging the subject of both per-execution JWTs and the audit trail
+            declared = {t["name"] for t in self._get_tool_definitions(skill)}
+            if tool_name not in declared:
+                logger.warning(
+                    f"Subagent skill '{skill.name}' requested undeclared tool "
+                    f"'{tool_name}'; refusing to dispatch"
+                )
+                return {
+                    "success": False,
+                    "error": f"Tool '{tool_name}' is not available to this subagent",
+                }
+
             # sandbox tools
             if tool_name == "read_file":
                 allowed = skill.allowed_paths or settings.subagent_allowed_paths_list
