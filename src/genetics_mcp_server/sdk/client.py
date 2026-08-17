@@ -959,7 +959,7 @@ class GeneticsClient:
 # against a hostile script are the ones outside the process: the sandbox's network policy,
 # db-api's own `endpoint_access` lines, and the byte/row quotas.
 #
-# WHAT WOULD ACTUALLY WORK, AND IS THE SPECIFICATION FOR genetics-results-suite-4h6.14:
+# WHAT WOULD ACTUALLY WORK, AND IS THE SPECIFICATION FOR genetics-results-suite-4h6.45:
 #
 #   1. THE SUPERVISOR READS THE FD AND ENFORCES ON THE READ END. The child holds only the
 #      write end; the rate cap, the byte cap and the per-line length cap are applied by the
@@ -995,7 +995,7 @@ SHARED_STREAM_WARNING = (
     "SDK audit records here are NOT a tamper-evident audit trail: no "
     f"{_AUDIT_FD_ENV} was configured, so they share a stream the audited script can write to "
     "itself. Any line below may be forged, including its user and session. Delivering a "
-    "dedicated audit fd to the sandbox child is genetics-results-suite-4h6.14."
+    "dedicated audit fd to the sandbox child is genetics-results-suite-4h6.45."
 )
 
 # WHAT IS BOUNDED, AND WHAT MUST NEVER BE. Only records for calls that NEVER REACHED THE
@@ -1189,12 +1189,13 @@ def _audit_identity() -> tuple[str, str, str]:
     Read from the environment per call rather than cached: the supervisor sets them on the
     forked child, and the SDK may well be imported before that happens. Which also means the
     audited script can rewrite them at will — this function reads exactly what the script
-    controls, which is why the supervisor, not the child, has to stamp identity (`4h6.14`; see
+    controls, which is why the supervisor, not the child, has to stamp identity (`4h6.45`; see
     the module header). Sanitising here bounds the damage; it does not make the values true.
 
     ALL THREE ARE `unknown` TODAY. The values are the sandbox token's `sub`, `sid` and `jti`
     claims (genetics-results-suite docs/code-execution-security.md §4), and the SDK does not
-    yet receive that token — `4h6.14` owns delivering it. `jti` is also the
+    yet receive that token — `4h6.43` writes it into the execution's token file and `4h6.44`
+    makes the SDK read and send it. `jti` is also the
     `/scratch/<execution-id>` directory name, which is what makes this line joinable with
     db-api's `endpoint_access` lines and with chat-backend's own.
     """

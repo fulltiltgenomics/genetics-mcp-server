@@ -509,7 +509,8 @@ def build_session_sdk_stats(calls: list[dict]) -> pl.DataFrame:
     """Per-session SDK usage, shaped like build_session_tool_stats so it joins the same way.
 
     A session with `unknown` for its session id is kept rather than dropped: until
-    `4h6.14` delivers the sandbox token's `sid` to the SDK, that is what every line carries,
+    `4h6.43`/`4h6.44` deliver the sandbox token's `sid` to the SDK, that is what every line
+    carries,
     and silently discarding them would report "no script access happened".
     """
     if not calls:
@@ -1638,7 +1639,7 @@ def generate_report(
                 "to itself: any line here — including its user and session — may have been "
                 "written by the script rather than by the SDK, and the counts below are an "
                 "upper bound on what actually happened. Delivering a dedicated fd is "
-                "genetics-results-suite-4h6.14."
+                "genetics-results-suite-4h6.45."
             )
         if notices.get("truncated"):
             lines.append("")
@@ -1668,7 +1669,8 @@ def generate_report(
                 f"_{logged_calls - attributed} of {logged_calls} SDK calls match no session in "
                 "this DB — `session=unknown`, or a session outside the analyzed range. The "
                 "sandbox does not yet receive the token whose `sid` claim identifies the "
-                "session (genetics-results-suite-4h6.14), so today every line is `unknown`._"
+                "session (genetics-results-suite-4h6.43 and -4h6.44), so today every line "
+                "is `unknown`._"
             )
     lines.append("")
 

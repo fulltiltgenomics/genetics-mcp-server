@@ -5250,7 +5250,10 @@ class ToolExecutor:
         chat-backend it is unset, so this method refuses; retrieval there goes over HTTP
         to the sandbox pod, which is where the filesystem read and the validation below
         happen (genetics-results-suite docs/code-execution-security.md, section 6). The
-        HTTP client and the session-scoped name resolution belong to 4h6.11, not here.
+        Neither the HTTP client nor the session-scoped name resolution exists yet:
+        genetics-results-suite-4h6.52 owns both. Earlier comments named 4h6.11, which was
+        the SDK extraction and closed without doing either — do not read its closed state
+        as evidence the proxy is in place.
 
         Two structural checks, both of which fail closed to "" (= not enabled):
 
@@ -5330,8 +5333,9 @@ class ToolExecutor:
         Cross-execution scoping is NOT implemented here: there is no session or execution
         parameter, so which execution's artifacts are reachable rests entirely on that env
         var pointing at the right directory. Resolving a name against a session belongs to
-        4h6.11, and until it exists this tool reads whatever directory it is pointed at
-        (subject to `_artifacts_dir`'s structural checks).
+        genetics-results-suite-4h6.52 and is NOT implemented anywhere today; until it lands
+        this tool reads whatever directory it is pointed at (subject to `_artifacts_dir`'s
+        structural checks).
 
         `name` is a bare file name, never a path and never an execution id: the model
         learns names from the run's artifact manifest, and nothing else is addressable.

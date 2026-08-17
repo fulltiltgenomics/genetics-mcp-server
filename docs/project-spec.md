@@ -284,8 +284,10 @@ db-api resolves it against its own `DATASET_ID` — so there is nothing to discl
 **Where the artifact read happens**: `read_artifact` reads the single directory named by
 `SANDBOX_ARTIFACTS_DIR`, and returns "code execution is not enabled" when it is unset —
 which is everywhere today. Chat-backend never sets it; retrieval there proxies over HTTP
-to the sandbox pod, where the filesystem read happens (`4h6.11` owns that client and the
-session-scoped name resolution). The allow-list is its own variable on purpose: the
+to the sandbox pod, where the filesystem read happens — except that **no such client exists**:
+`genetics-results-suite-4h6.52` owns that proxy hop and the session-scoped name resolution, and
+neither is implemented. Earlier drafts named `4h6.11`, which was the SDK extraction and closed
+without doing either. The allow-list is its own variable on purpose: the
 obvious alternative, `SUBAGENT_ALLOWED_PATHS`, is `/data` in the deployment — the PVC
 holding `chat_history.db` and `llm_config.db` — so wiring artifact reads to it would hand
 the model every conversation in the deployment.
@@ -337,7 +339,7 @@ symlink; a dangling symlink takes the same fast path, so it is not an existence 
 **Not implemented**: cross-execution scoping. `read_artifact` takes no session or execution
 argument, so which execution's artifacts are reachable rests entirely on
 `SANDBOX_ARTIFACTS_DIR` pointing at the right directory. Resolving a name against a session
-belongs to `4h6.11`.
+belongs to `genetics-results-suite-4h6.52` and has not been implemented.
 
 #### Open Targets Platform MCP
 
@@ -637,7 +639,7 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
     lines/s, higher than before the ceiling existed). Measured after the change, with the
     execution id rotated on every call: 1001 lines / ~206 KB total, then a flat zero. The cost
     is that a supervisor reusing one process across executions shares one refusal budget;
-    fixing that belongs on the supervisor's side of the fd (`4h6.14`), not here.
+    fixing that belongs on the supervisor's side of the fd (`4h6.45`), not here.
   - **The meta channel is bounded too, and carries no script-chosen text**
     (`_AUDIT_MAX_META_RECORDS`, `_emit_meta`). The truncation notice used to interpolate
     `[execution=…]` — i.e. whatever the script last wrote to `SANDBOX_EXECUTION_ID` — and
@@ -664,7 +666,7 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   - **Identity is `unknown` today**, and the line says so rather than omitting the fields. The
     values are the sandbox token's `sub`/`sid`/`jti` claims, read from `SANDBOX_USER`,
     `SANDBOX_SESSION_ID` and `SANDBOX_EXECUTION_ID`; delivering the token to the child is
-    `genetics-results-suite-4h6.14`.
+    `genetics-results-suite-4h6.43`, and reading and sending it is `-4h6.44`.
   - **The identity fields are sanitised like any other script-authored value**
     (`_audit_identifier`). They come from the environment, which the audited script writes, so
     they get the same `[A-Za-z0-9_.:/@|+-]{1,64}\Z` charset and length cap as an argument, and
@@ -692,8 +694,8 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
     both the module's state and the parent's handlers survive `fork()` — the earlier one-shot
     guard made the fd path unreachable in exactly the shape it exists for. **Nothing sets that
     fd today, and nothing forwards the child's stream to the pod's stdout for the cluster's
-    logging agent: the supervisor does not exist yet (`4h6.7` / `4h6.14`), so every record
-    emitted today is on the untrusted side of this line.**
+    logging agent: the supervisor does not exist yet (`4h6.39`, with the fd and the forwarding
+    in `4h6.45`), so every record emitted today is on the untrusted side of this line.**
   - **These records are a best-effort observability signal, not a security control, and no
     in-process change can make them one.** The audited script shares the address space with
     the code that emits them, so every control in `sdk/client.py` is reachable from the code it
@@ -708,7 +710,7 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
     may cite it as evidence under an assumption of compromise. The controls that hold against a
     hostile script are outside the process: the sandbox network policy, db-api's own
     `endpoint_access` lines, and the byte/row quotas.
-  - **What `genetics-results-suite-4h6.14` owes, stated as a specification** (also in the
+  - **What `genetics-results-suite-4h6.45` owes, stated as a specification** (also in the
     `sdk/client.py` header, so the ticket inherits a design rather than a puzzle):
     1. **The supervisor reads the fd and enforces on the read end.** The child holds only the
        write end; the rate cap, byte cap and per-line length cap are applied by the supervisor

@@ -178,7 +178,7 @@ def test_report_lists_sdk_functions_when_a_log_is_supplied():
 
 
 def test_calls_matching_no_session_are_reported_not_dropped():
-    """Until 4h6.14 delivers the token, every line says session=unknown."""
+    """Until 4h6.43/4h6.44 deliver the token, every line says session=unknown."""
     sessions, messages = _sessions_and_messages()
     sdk_stats = build_session_sdk_stats([
         {"session_id": "unknown", "user": "unknown", "execution_id": "unknown",

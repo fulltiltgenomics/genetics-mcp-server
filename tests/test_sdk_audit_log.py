@@ -288,7 +288,7 @@ class TestFloodBound:
         Keying the budget on SANDBOX_EXECUTION_ID gave a script a reset button — a loop that
         rewrote the variable restored the flood at a HIGHER rate than before the ceiling
         existed. The supervisor-reuse case that motivated per-execution budgets is real, but
-        it has to be solved on the supervisor's side of the fd (`4h6.14`), because in here the
+        it has to be solved on the supervisor's side of the fd (`4h6.45`), because in here the
         key and the flooder are the same program.
         """
         monkeypatch.setattr(sdk_client, "_AUDIT_MAX_REFUSALS", 2)
