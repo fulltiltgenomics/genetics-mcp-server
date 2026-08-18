@@ -1995,6 +1995,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling (runs a local stub SSE server) |
+| `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded, length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
 
 Run tests:
 ```bash
@@ -2017,6 +2018,12 @@ SQLite DB, persists per-conversation analysis results back into that DB (the
 report (`report.md`) plus an eval dataset. With `--output-dir` it also writes a
 local-dev `metrics.json` (consumed by `plot_conversation_scores.py` for
 quality-over-time plots).
+
+Its quality judge scores **one conversation at a time, absolutely**, which is the right
+instrument for sampling and for tracking quality over time and the wrong one for
+comparing two arms' answers to the same question — see *Paired Quality Judging* below,
+which is a separate instrument over the replay benchmark's own transcripts and does not
+read this DB.
 
 - **Eval export** (`export_eval_dataset()` → `eval_dataset.json`) picks representative
   conversations per topic and, besides the display transcript (`turns`, capped at 2,000
@@ -2338,12 +2345,164 @@ harness issues two arms per case. `--base-url` therefore defaults to
   The SSE dispatch in `chat_api.py` is an `if/elif` chain with no default, so the
   chunk needs an explicit branch there; without it `llm_service` would emit it
   perfectly well and the harness would still print `NOT MEASURED`.
+- **Every `ok` turn also records `user_question` and `final_answer`**, the two things
+  the quality judge below needs. `final_answer` is the text blocks *after the last
+  `tool_use` block* of `message_content` — what the user is left with, not the running
+  commentary and not the tool trace. `user_question` comes from the replayed dataset
+  and is therefore identical on both arms, which is what makes a pair a pair. They are
+  in the report so a saved run can be judged later without replaying anything.
 - **Output** is a JSON report (`--output`) carrying the config, the per-case arm
   order, the matched-pair headline summaries, the unmatched per-arm marginals and
-  every individual turn record (including the per-iteration usage detail), plus a
-  human-readable summary on stdout.
+  every individual turn record (including the per-iteration usage detail and the two
+  fields above), plus a human-readable summary on stdout. When `--judge` ran, the
+  report also carries a `judging` block and the summary prints its section.
 - Authentication, when the target requires it, comes from `$REPLAY_AUTH_TOKEN` and is
   sent as a bearer token; it is never written into the report or logged.
+
+## Paired Quality Judging
+
+`scripts/pairwise_judge.py` answers the half of `genetics-results-suite-4h6.23`'s kill
+criterion the benchmark's own metrics cannot: "must not **regress** quality". It is
+**off by default** (`--judge` on the benchmark, or
+`python -m genetics_mcp_server.scripts.pairwise_judge --report <file>` over a report
+already written) — a run produces cost and latency numbers with no judge call at all.
+
+- **Paired, not absolute — and deliberately not the Conversation Analysis rubric.**
+  `analyze_conversations` scores one conversation at a time on a 1–5 rubric; it was
+  built for sampling and for tracking quality over time. Scoring each arm absolutely
+  and comparing means is a weak test here: the rubric is coarse, the expected
+  between-arm difference is small, and per-question difficulty dominates the score, so
+  a real regression sits inside the noise at the `n` a local run produces. Judging the
+  two answers to the *same* question side by side cancels that difficulty. The absolute
+  rubric remains worth adding later — it is the only thing comparable with historical
+  production numbers — but it answers a different question and is not blocking.
+- **The input is the harness's own matched pairs.** `matched_pairs()` already keeps
+  only the `(case_id, turn_index)` keys that came back `ok` on *both* arms; the judge
+  calls it rather than re-deriving the set, so the pairing rule ("an arm is not
+  rewarded for failing on the hard turns") has one definition.
+- **Blind, and the arm cannot leak through the content.** The judge sees the user
+  question, the earlier *user* turns of that case for context, and two answers labelled
+  only "Answer 1" and "Answer 2". No arm name, tool profile, model or mechanism appears
+  in the prompt, and only the **final answers** are shown — never the tool trace. That
+  choice is the point rather than a simplification: a `run_analysis` call carrying
+  Python identifies the code arm outright and a screenful of `get_*` calls identifies
+  the all-tools arm, so blinding the judge while showing it the trace would be theatre.
+  The cost is stated rather than hidden — the judge cannot see that one arm reached its
+  answer through six roundtrips and the other through one — and it is accepted because
+  efficiency is what the benchmark measures *exactly*, while the judge is asked only
+  about the thing no metric can see. Prior *assistant* turns are withheld for the same
+  reason: they differ per arm. Answers over 12,000 characters are elided in the
+  **middle** (head and conclusion preserved) and the count is reported **per arm**, not
+  as a pair count: the rule is applied identically to both arms but does not *fire*
+  equally, and "6 pairs were elided" reads as symmetric information loss when it can
+  mean one arm was judged on a third of what it wrote and the other on all of it.
+- **The answer-slicing rule is not neutral between the arms, so its cost is measured.**
+  The "final answer" is the text after the **last** `tool_use` block, which is right for
+  intermediate commentary ("let me query BigQuery for that") and wrong for substantive
+  content that happens to precede a late tool call — a turn that lays out a table, calls
+  one more tool and closes with "In summary, yes." is judged on the closing sentence, and
+  a turn whose last block *is* the `tool_use` is judged on nothing. An arm that makes one
+  **early** call keeps nearly all its prose; an arm whose last call is **late** loses
+  whatever it wrote between calls, and nothing in the win/loss table can distinguish that
+  handicap from worse answers, because `answer_chars` and the whole length diagnostic are
+  computed on the already-sliced text. So `final_answer_split` returns the number of
+  characters it discarded, `replay_benchmark` records it per turn
+  (`final_answer_dropped_chars`), and the report prints the **per-arm median** beside the
+  length check. Materially different medians mean the verdict is partly measuring this
+  rule rather than answer quality.
+- **Judged both ways, and a disagreement is a tie.** Position bias in pairwise LLM
+  judging is large, so every pair is judged twice with the answers swapped. A pair is a
+  win only when **both** orders name the same answer; both-tie, one-tie-one-winner and
+  the two orders naming *different* answers are all ties, reported separately
+  (`tie_agreed` / `tie_unstable` / `tie_position_flip`) so an unstable verdict is
+  visible rather than averaged away. `tie_position_flip` is the direct measurement of
+  position bias in the run. This doubles judge cost and is the cheapest defence there
+  is.
+- **The presentation order is seeded from the pair, not drawn at random.** Which arm is
+  shown first in pass 1 is `sha256("<case_id>|<turn_index>")` — not `hash()`, whose
+  per-process salt would make the same report judge differently on every run, and not a
+  global RNG, whose draw depends on how many pairs happened to precede this one. With
+  both-ways judging the order cannot change a verdict, so this is not the primary
+  defence; it is what makes a run reproducible, fixes which order is attempted first so
+  a pair whose second pass fails is not resolved from an arbitrary position, and is
+  recorded per pair.
+- **Ties are first-class** in the prompt and in the report. Forcing a winner on two
+  equally good answers manufactures signal.
+- **The distribution is reported, never a bare win rate**: wins per arm with clear /
+  slight / **none** margins (they sum to the win count — a win *can* carry `none`, since
+  the weaker of the two passes' margins is quoted and an unrecognised strength word
+  normalises to it; the words the judge actually used that were not recognised are
+  listed rather than dropped), ties split by kind, unresolved pairs, and per-pair detail
+  carrying both passes' verdicts and the judge's own one-line reason — because the
+  criterion is about the **loss tail**, which is reported in **both directions** rather
+  than assuming from the arm order which arm is the candidate, and only reads as a list.
+  The rate is accompanied by an exact two-sided **sign test** over decisive pairs (ties
+  excluded, not split), and below `MIN_DECISIVE_PAIRS` — 6, the smallest n at which a
+  sign test can reach p ≤ 0.05 *at all* — the report prints
+  `NOT CONCLUSIVE AT ANY OUTCOME`, **no p-value and no win rate**: "1 win = 100.0% of
+  decisive" above a NOT CONCLUSIVE line is exactly the solid-looking number the rule
+  exists to forbid. The same power rule travels with every **restricted** table into the
+  saved JSON (each carries `underpowered` and the threshold), so the printed report and
+  the JSON cannot disagree about whether a number is quotable.
+- **Ties are a statement about the instrument, not only about the arms**, and the report
+  says so where they are printed. Every tie counts toward passing "must not regress", but
+  a large `tie_position_flip` count means position moved this judge more than the answers
+  did — i.e. a regression of that size *could not have been detected*, which is not the
+  same as there not being one.
+- **A failed or unparseable judge call leaves the pair `unresolved`**, in neither the
+  win nor the tie totals, and the second call is skipped when the first already failed.
+  A pair judged once is a pair judged from one position.
+- **The known confounds are measured, not assumed away.** Pairwise judges favour
+  length, so the report states how often the longer answer won and each arm's median
+  answer length — computed on the text **as shown to the judge**, after middle-elision,
+  because 40,000 and 20,000 characters both arrive as 12,000 in the prompt and the one
+  diagnostic whose job is to warn "your judge is rewarding length" must not report a
+  difference elision had already removed. The raw medians are kept beside them, labelled
+  as the lengths the judge did *not* see.
+- **Provenance markers are detected, never scrubbed — and the audit states its own
+  asymmetry where the numbers are.** Text in which an answer names its own machinery
+  ("I ran a script", "the sandbox", a Python fence, and the iteration-cap notice
+  `[Max tool iterations reached]`, which survives the slicing rule verbatim and is a
+  near-perfect tell for the many-roundtrip arm) is detected per answer, counted **per
+  arm** — a pooled `sandbox=7` cannot say whether all seven were the same arm's, and
+  one-sidedness is the entire question — and the whole win/loss/tie table is printed a
+  second time over the pairs where **neither** answer carried any. Such text is
+  deliberately **not** scrubbed: rewriting an answer changes what is being judged, and a
+  regex editing model prose will eventually delete something load-bearing. The printed
+  block states that the marker list **is asymmetric and cannot be otherwise** — most
+  markers are tells for the arm that writes code, and no phrase reliably marks an answer
+  assembled from many small tool calls — so the restricted subset drops one arm's pairs
+  preferentially and a gap between the two tables is evidence about the **judge**, not
+  about the arms. (The `artifact` pattern is deliberately narrow: in genetics prose
+  "artifact" means a spurious signal far more often than a sandbox file, and a bare
+  `\bartifacts?\b` fires on both arms, shrinking the clean control subset for a reason
+  that has nothing to do with guessing an arm.)
+- **A pair the harness broke is not a pair an arm lost.** An answer that could not be
+  extracted is shown to the judge as empty and reads as a loss, which is right for a turn
+  that answered nothing and wrong for an extraction failure — and eight one-sided empty
+  answers are enough to manufacture a clean sweep with a significant p-value. So pairs
+  carrying an empty answer get the same treatment provenance gets rather than a footnote:
+  the whole table again over the pairs where **both** arms produced text, with the same
+  power rule. Empty answers are further split by whether the turn *had* produced text
+  before its last tool call, which separates a silent model (a quality finding) from the
+  slicing rule having thrown the answer away (a bug). Judging is refused outright when
+  **every** matched pair is missing at least one arm's answer — not only when both are
+  missing, since the half-missing case is the catastrophic one.
+- **Cost is its own line item, priced before it spends.** Judging is Opus-5 spend on
+  top of the benchmark's (~$2.01/turn × 2 arms), doubled by the second pass. The
+  estimate is printed **before the first call** — exactly, from the prompts that will
+  actually be sent, with output priced at the `max_tokens` ceiling so the USD figure is
+  an upper bound; `--dry-run --judge` prints a *nominal* estimate over the turn count
+  since no answer exists yet. A judge model `cost.has_pricing()` cannot match reports
+  `NOT PRICED` rather than a guess. After the run the actual spend is priced from the
+  API's own usage counts and printed in the footer as a **separate** figure that is
+  never folded into any arm's `cost_usd`: the arms' USD is what the answers cost, the
+  judge's is what grading them cost.
+- **The benchmark stays write-free.** `secret: true` is unchanged and the judge reads
+  the harness's in-memory (or saved) transcripts, so no replayed turn is written into
+  any chat history. `analyze_conversations` is not run in this environment, but the
+  reason survives: the moment this points at a deployment whose history *is* sampled
+  into the next `eval_dataset.json`, replayed turns would corrupt the sample.
 
 ## Development Workflow
 

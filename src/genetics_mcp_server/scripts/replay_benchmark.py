@@ -30,9 +30,16 @@ row (genetics-results-suite-4h6.1) — a benchmark must never leave a trace in a
 user's history, so the stream is the only honest source. It also means the harness
 works against any deployment without database access.
 
+Quality is a SEPARATE, OPTIONAL pass: `--judge` hands the matched pairs to
+`pairwise_judge`, which compares the two arms' FINAL ANSWERS blind, in both presentation
+orders, and reports wins/losses/ties. It is off by default — cost and latency are measured
+with no judge call at all — and a saved report can be judged later without replaying
+anything.
+
 RUNNING THIS COSTS REAL MONEY: production averaged $2.01 per turn. The target URL
 defaults to localhost and there is a --dry-run that resolves the whole plan without
-issuing a single request.
+issuing a single request. `--judge` is Opus-5 spend ON TOP of that, doubled by the second
+presentation order, and is priced before the first call.
 """
 
 import argparse
@@ -253,6 +260,22 @@ class TurnRecord:
     script_outcomes: dict[str, int] = field(default_factory=dict)
 
     iterations_detail: list[dict[str, Any]] = field(default_factory=list)
+
+    # the paired judge's input (genetics-results-suite-4h6.72), recorded here so a saved
+    # report can be judged later without replaying anything. `final_answer` is the text
+    # AFTER the last tool_use block — what the user is left with, and deliberately not the
+    # tool trace, which would name the arm to a supposedly blind judge; see
+    # `pairwise_judge.final_answer_split`. `user_question` comes from the replayed dataset
+    # and is therefore identical on both arms, which is what makes the pair a pair.
+    #
+    # `final_answer_dropped_chars` is how much text that rule THREW AWAY — the prose written
+    # before the last tool call. It is recorded because the rule is not neutral between the
+    # arms: one early tool call keeps almost everything, one late tool call discards whatever
+    # was written between calls. The judge's report prints the per-arm median so a verdict
+    # produced by the slicing rule cannot be mistaken for one about quality.
+    user_question: str | None = None
+    final_answer: str | None = None
+    final_answer_dropped_chars: int = 0
 
 
 @dataclass
@@ -525,12 +548,18 @@ async def replay_turn(
     next turn (None if the turn did not complete), and the tool_result blocks that answer
     that message's tool_use blocks (empty when the turn used no tools).
     """
+    # imported here, not at module scope: pairwise_judge imports `matched_pairs` from this
+    # module (the pairing rule has one definition), so a module-level import back would be a
+    # cycle. Same lazy-import shape analyze_conversations uses for its own heavy deps.
+    from genetics_mcp_server.scripts.pairwise_judge import final_answer_split, user_question_text
+
     record = TurnRecord(
         case_id=case_id,
         arm=arm,
         arm_position=arm_position,
         turn_index=turn_index,
         status="incomplete",
+        user_question=user_question_text(messages[-1].get("content") if messages else None),
     )
 
     body: dict[str, Any] = {
@@ -751,6 +780,9 @@ async def replay_turn(
 
     if record.status == "ok":
         record.tool_calls = count_tool_calls(message_content)
+        record.final_answer, record.final_answer_dropped_chars = final_answer_split(
+            message_content
+        )
     else:
         # the flag is only meaningful for a turn that finished; an aborted one never got
         # far enough for the absence of the marker to mean anything
@@ -1295,6 +1327,13 @@ def format_summary(report: dict[str, Any]) -> str:
         lines.extend(_iteration_timing_lines(s))
         lines.append("")
 
+    if report.get("judging"):
+        # imported here for the same cycle reason as in replay_turn
+        from genetics_mcp_server.scripts.pairwise_judge import format_judging
+
+        lines.extend(format_judging(report["judging"]))
+        lines.append("")
+
     lines.append("=" * 78)
     lines.append("SECONDARY — UNMATCHED MARGINALS (each arm's own ok turns)")
     lines.append(
@@ -1340,6 +1379,17 @@ def format_summary(report: dict[str, Any]) -> str:
             "than that — output tokens and uncached input are in both endpoints — but it is "
             "wide enough to matter. They are NOT in the cost_usd distribution — do not read "
             "a mixed run's cost_usd as covering every turn."
+        )
+    judging = report.get("judging")
+    if judging:
+        actual = judging.get("cost_actual") or {}
+        usd = actual.get("usd")
+        lines.append(
+            "judging cost is a SEPARATE line item and is NOT in any cost_usd figure above: "
+            f"{judging['judge_calls']} judge call(s), {actual.get('input_tokens', 0):,} in + "
+            f"{actual.get('output_tokens', 0):,} out tokens = "
+            + ("NOT PRICED" if usd is None else f"${usd:,.2f}")
+            + ". The arms' USD above is what the ANSWERS cost; this is what grading them cost."
         )
     return "\n".join(lines)
 
@@ -1487,6 +1537,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")
     parser.add_argument("--dry-run", action="store_true", help="resolve the plan, issue no requests")
+    parser.add_argument(
+        "--judge",
+        action="store_true",
+        help="after the benchmark, judge the matched pairs blind and pairwise "
+        "(genetics-results-suite-4h6.72). OFF by default and independently skippable: cost "
+        "and latency are measured with no judge call at all. This is Opus-5 spend ON TOP OF "
+        "the benchmark's, doubled by judging every pair in both presentation orders; the "
+        "estimate is printed before the first call. A saved report can also be judged later "
+        "with `python -m genetics_mcp_server.scripts.pairwise_judge --report <file>`.",
+    )
+    parser.add_argument("--judge-model", default=None, help="judge model (default claude-opus-5)")
+    parser.add_argument("--judge-concurrency", type=int, default=4, help="judge calls in flight")
     return parser
 
 
@@ -1510,6 +1572,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    from genetics_mcp_server.scripts import pairwise_judge
+
+    judge_model = args.judge_model or pairwise_judge.DEFAULT_JUDGE_MODEL
+
     if args.dry_run:
         cases = load_cases(args.dataset, args.limit)
         turns = sum(
@@ -1520,6 +1586,14 @@ def main(argv: list[str] | None = None) -> int:
         for i, c in enumerate(cases):
             order = arm_order_for_case(arms, i)
             print(f"  {i:>3} {c.get('session_id')} order={order[0]},{order[1]}")
+        if args.judge:
+            # the ceiling: every turn matching on both arms. Turns that fail on one arm are
+            # not judged, so the real pair count can only be lower — an over-estimate is the
+            # safe direction for a number a reader uses to decide whether to spend.
+            for line in pairwise_judge.estimate_lines(
+                pairwise_judge.estimate_judging_cost(None, judge_model, pair_count=turns)
+            ):
+                print(line)
         return 0
 
     report = asyncio.run(
@@ -1536,6 +1610,18 @@ def main(argv: list[str] | None = None) -> int:
             provider=args.provider,
         )
     )
+
+    if args.judge:
+        # after the benchmark and before the JSON is written, so the saved report carries the
+        # judging block; a failure here still leaves the cost/latency report printed below
+        try:
+            asyncio.run(
+                pairwise_judge.judge_report(
+                    report, model=judge_model, concurrency=args.judge_concurrency
+                )
+            )
+        except Exception as e:
+            logger.error("judging failed (%s: %s); the benchmark report is unaffected", type(e).__name__, e)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
