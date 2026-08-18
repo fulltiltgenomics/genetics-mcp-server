@@ -118,7 +118,7 @@ def mint_execution_tokens(
     execution_id: str | None = None,
     ttl_seconds: int = TTL_SECONDS,
 ) -> SandboxTokens:
-    """Mint the pair of tokens for one execution — the entry point `4h6.14` calls.
+    """Mint the pair of tokens for one execution — the entry point `4h6.47` calls.
 
     One token per audience so a token captured from a results-api request cannot be replayed
     at db-api. Both carry the same ``jti``.

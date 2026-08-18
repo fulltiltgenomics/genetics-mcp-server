@@ -139,7 +139,7 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
 
 For database queries, always call get_database_schema first to discover all available tables and their columns.
 The database contains tables for credible sets, colocalization, exome/burden test results, and more.
-Use fully qualified view names (e.g., `genetics_results.credible_sets_v`). Views include a `resource` column for filtering by data source.
+Refer to views by their bare name (e.g., `credible_sets_v`) — do NOT prefix them with a project or dataset. The database resolves the dataset itself. Views include a `resource` column for filtering by data source.
 Filter by data source using `WHERE resource = '<resource>'` (look up the resource via `list_datasets`) rather than matching dataset names directly.
 A single resource often contains multiple datasets (e.g. `finngen` includes the core GWAS, Kanta lab tests, Olink pQTL, etc.) — call `list_datasets` to see what's there.
 
@@ -151,8 +151,8 @@ Do NOT break down by dataset for datasets flagged `collection: true` (e.g. eQTL 
 **To find signals (GWAS or QTL) near a gene, filter by genomic coordinates, NOT by `gene_most_severe`.** The `gene_most_severe` column is per-variant most-severe-consequence attribution: it is unreliable for regulatory/intronic variants and systematically misses signals that sit near — but not inside — the gene (e.g. a long-range regulatory variant several hundred kb away whose credible set is the strongest signal for the gene). Instead JOIN `gene_annotations_v` to get the gene body and filter on a coordinate window (gene_start − window .. gene_end + window) with a generous window (≈ 500 kb), e.g.:
 ```sql
 WITH g AS (SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend
-           FROM `genetics_results.gene_annotations_v` WHERE symbol = 'VAV3' GROUP BY chr)
-SELECT c.* FROM `genetics_results.credible_sets_v` c
+           FROM gene_annotations_v WHERE symbol = 'VAV3' GROUP BY chr)
+SELECT c.* FROM credible_sets_v c
 JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING)
        AND c.pos BETWEEN g.gstart - 500000 AND g.gend + 500000;
 ```

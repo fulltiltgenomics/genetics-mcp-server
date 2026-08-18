@@ -117,19 +117,48 @@ def test_importing_the_sdk_does_not_need_dotenv():
     assert result.returncode == 0, result.stderr
 
 
-def test_the_executor_can_be_built_and_used_without_config_settings():
+def test_the_executor_can_be_built_and_used_without_config_settings(tmp_path):
     """The sandbox deletes config/settings.py, so `ToolExecutor()` — which the SDK builds
     on first use — must not reach for it. Blocking the import here reproduces that image
-    without needing one."""
+    without needing one.
+
+    The probe runs BOTH credential states of that image, because the settings resolution is
+    what both of them turn on:
+
+    * with no token file, `_build_client` must reach `_PRUNED_INSTALL_SETTINGS`, read its
+      empty `internal_api_secret` and refuse (genetics-results-suite-4h6.44) — reaching the
+      `settings is _PRUNED_INSTALL_SETTINGS` discriminator at all is the proof that the
+      import was deferred rather than merely absent;
+    * with the token file the supervisor actually writes, the client builds, and the
+      per-destination auth means there is still no default Authorization header.
+
+    Neither the URL reads nor `uniprot` short-circuit on the token path, so the assertions
+    that the deferred resolution survives config/settings.py's absence are unchanged.
+    """
+    tokens = tmp_path / "tokens.json"
+    tokens.write_text(json.dumps({"db-api": "db.token", "results-api": "results.token"}))
     probe = (
         _ORIGIN_GUARD
-        + """
+        + f"""
 import sys
 sys.modules["genetics_mcp_server.config"] = None
 sys.modules["genetics_mcp_server.config.settings"] = None
 import genetics_mcp_server.sdk as genetics  # noqa: F401
-from genetics_mcp_server.tools.executor import ToolExecutor
+import os
+from genetics_mcp_server.tools import executor as executor_mod
+from genetics_mcp_server.tools.executor import SandboxCredentialError, ToolExecutor
 
+os.environ.pop("SANDBOX_TOKEN_FILE", None)
+os.environ.pop("INTERNAL_API_SECRET", None)
+try:
+    ToolExecutor(row_limit=None).client
+except SandboxCredentialError:
+    pass
+else:
+    raise AssertionError("a pruned install with no token file must not go uncredentialed")
+
+executor_mod._reset_sandbox_tokens()
+os.environ["SANDBOX_TOKEN_FILE"] = {str(tokens)!r}
 executor = ToolExecutor(row_limit=None)
 assert "Authorization" not in executor.client.headers
 assert executor.uniprot._uniprot_url == "https://rest.uniprot.org"

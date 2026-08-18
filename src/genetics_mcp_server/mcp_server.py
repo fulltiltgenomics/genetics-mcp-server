@@ -91,6 +91,26 @@ _mcp_disabled = _settings.disabled_tools | {
     "map_protein_variants",
     "get_variant_protein_effect",
     "search_uniprot",
+    # SECURITY CONTROL, not a product decision: code execution must not be reachable via
+    # MCP (genetics-results-suite-4h6). run_analysis IS code execution; read_artifact
+    # returns files a script wrote for the chat session that ran it, and resolving a name
+    # to an execution requires the session identity only chat-backend holds. run_analysis
+    # additionally has no register_mcp_tools block at all (see definitions.py), so this
+    # entry is the second registration-layer control rather than the only one — but it is
+    # the one §5 names and the one tests/test_mcp_server.py enumerates the tool list
+    # against. This literal is the hardcoded half deliberately —
+    # _settings.disabled_tools is env-driven and changeable without a code review — and it
+    # is layer 1 of three; layers 2 and 3 are the sandbox NetworkPolicy and the test in
+    # tests/test_mcp_server.py. run_analysis joins this set with 4h6.16.
+    # list_capabilities is NOT here: it renders per-function SDK signatures and docstrings
+    # from the source, which describe the SDK's shape rather than data, session state or
+    # any execution. That surface IS new disclosure to an MCP client — the SDK is not the
+    # MCP tool surface — and is judged acceptable on its content, not on being visible
+    # elsewhere. Module docstrings are stripped from its output (they name
+    # INTERNAL_API_SECRET and the endpoint env vars); function docstrings still mention
+    # db-api, the execution quotas and the sandbox, which is accepted, not denied.
+    "read_artifact",
+    "run_analysis",
 }
 register_mcp_tools(mcp, executor, disabled_tools=_mcp_disabled)
 

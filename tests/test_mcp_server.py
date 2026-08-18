@@ -150,8 +150,10 @@ class TestMCPToolRegistration:
             # fallback: just verify registration didn't fail
             registered_names = set()
 
-        # verify expected tools are registered
-        expected = {t["name"] for t in TOOL_DEFINITIONS}
+        # verify expected tools are registered. run_analysis is the one definition with no
+        # registration block at all — see the comment in register_mcp_tools; it is a
+        # security control, so this exemption is the assertion, not a gap in it.
+        expected = {t["name"] for t in TOOL_DEFINITIONS} - {"run_analysis"}
 
         # if we have tool manager access, verify all tools
         if registered_names:
@@ -211,11 +213,25 @@ class TestMCPDisabledTools:
         search_uniprot) are chat-backend only by explicit requirement: they
         must stay defined for the chat backend but never reach standalone
         MCP clients.
+
+        read_artifact is there for a stronger reason: code execution must not
+        be reachable via MCP (genetics-results-suite-4h6), and membership of
+        this literal is the sole registration-layer control.
         """
         from genetics_mcp_server import mcp_server
 
         assert "search_mgi" in mcp_server._mcp_disabled
         assert "get_myvariant_annotations" in mcp_server._mcp_disabled
+        assert "read_artifact" in mcp_server._mcp_disabled
+        # list_capabilities renders per-function SDK signatures and docstrings — the SDK's
+        # shape, not data, session state or any execution — so it is deliberately NOT
+        # excluded; an exclusion set padded with harmless names stops reading as a
+        # security control. That surface is genuinely new to an MCP client rather than a
+        # restatement of the tool list, which is why module docstrings — the credential
+        # and endpoint env var names — are stripped from its output. Function docstrings
+        # still name db-api, the execution quotas and the sandbox; that is accepted, not
+        # denied (see TestListCapabilities in tests/test_code_execution_tools.py)
+        assert "list_capabilities" not in mcp_server._mcp_disabled
 
         names = {t["name"] for t in TOOL_DEFINITIONS}
         for tool_name in ("get_protein_annotations", "map_protein_variants", "search_uniprot"):
@@ -238,6 +254,77 @@ class TestMCPDisabledTools:
 
         registered = self._registered_names(mcp)
         assert not (uniprot_tools & registered)
+
+    def test_code_execution_tools_absent_from_the_registered_tool_list(self):
+        """Assert on the tool list, not on the constant.
+
+        Asserting on _mcp_disabled tests that someone typed the name; asserting on what
+        the registration path produced tests the property the user actually requires —
+        that code execution is not reachable via MCP (genetics-results-suite-4h6).
+        """
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server import mcp_server
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools=mcp_server._mcp_disabled)
+
+        registered = self._registered_names(mcp)
+        assert "run_analysis" not in registered
+        assert "read_artifact" not in registered
+        # the catalogue is signatures only and stays available
+        assert "list_capabilities" in registered
+
+    def test_run_analysis_cannot_be_registered_by_any_disabled_set(self):
+        """The second registration-layer control, and the one a config change cannot undo.
+
+        docs/code-execution-security.md §5 assumes layer 1 is defeatable and asks the other
+        two layers to still hold. _mcp_disabled is assembled at runtime from an env-driven
+        set unioned with a literal, so it is the changeable half; register_mcp_tools has no
+        block for run_analysis at all, and `disabled_tools` can only subtract. This asserts
+        the stronger property: even the empty set does not register it.
+        """
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        mcp = FastMCP("Test Server")
+        register_mcp_tools(mcp, ToolExecutor(), disabled_tools=set())
+        assert "run_analysis" not in self._registered_names(mcp)
+
+    def test_run_analysis_is_named_in_the_hardcoded_exclusion_set(self):
+        """Belt and braces on the above: the entry is what §5 names, what an operator
+
+        greps for, and what catches a register_mcp_tools block added later.
+        """
+        from genetics_mcp_server import mcp_server
+
+        assert "run_analysis" in mcp_server._mcp_disabled
+
+    def test_the_mcp_app_has_no_route_that_reaches_the_sandbox(self):
+        """A tool excluded from /mcp but reachable at some other path is the same failure
+
+        with a different URL. mcp_server builds the FastMCP app alone — chat_api.py is a
+        separate ASGI app in the same image, never mounted here — so the check is that
+        nothing in this module's import graph pulls in the sandbox transport.
+        """
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys; import genetics_mcp_server.mcp_server; "
+            "print('genetics_mcp_server.sandbox_client' in sys.modules)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=180
+        )
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "False", (
+            "importing the MCP server pulled in the sandbox transport; something on that "
+            "app's import graph can now reach the sandbox"
+        )
 
 
 @pytest.mark.integration

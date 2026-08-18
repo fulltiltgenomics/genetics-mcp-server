@@ -1,7 +1,7 @@
 """Tests for minting the per-execution sandbox tokens.
 
 Design of record: docs/code-execution-security.md section 4 in genetics-results-suite. The
-contract these tests pin is what `4h6.14` consumes: two audience-bound tokens per execution,
+contract these tests pin is what `4h6.47` consumes: two audience-bound tokens per execution,
 sharing one `jti` that is also the `/scratch/<execution-id>` directory name, a 5-minute
 lifetime, and a hard failure — never a fallback to a service credential — when no signing key
 is configured.

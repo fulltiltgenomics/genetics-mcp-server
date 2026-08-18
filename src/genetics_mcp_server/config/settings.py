@@ -49,6 +49,14 @@ class Settings:
         default_factory=lambda: os.environ.get("SANDBOX_TOKEN_SIGNING_KEY", "")
     )
 
+    # base URL of the sandbox supervisor (docs/code-execution-security.md §2, the HTTP
+    # contract). ONE value: the in-cluster Service in production, the local Docker container
+    # in dev — the contract is identical in both, so nothing downstream may branch on which
+    # one this points at. The default is the dev container; the cluster sets it explicitly.
+    sandbox_url: str = field(
+        default_factory=lambda: os.environ.get("SANDBOX_URL", "http://127.0.0.1:8080")
+    )
+
     # web search
     tavily_api_key: str | None = field(
         default_factory=lambda: os.environ.get("TAVILY_API_KEY")

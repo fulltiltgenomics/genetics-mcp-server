@@ -1529,6 +1529,87 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             },
         },
     },
+    # Code execution (genetics-results-suite-4h6). Category "orchestration" rather than
+    # "general": these hand work to another runtime instead of fetching data themselves,
+    # which is what launch_subagents is. The category alone excludes nothing from subagents
+    # — TOOL_PROFILES includes "orchestration" in both the api and bigquery profiles —
+    # so subagent.py names all four orchestration tools in its `disabled` set, which is
+    # what keeps a subagent from executing code, retrieving another execution's artifacts
+    # or being told how to start one. run_analysis and read_artifact are additionally in
+    # mcp_server.py's _mcp_disabled; run_analysis on top of that has no register_mcp_tools
+    # block at all, so no disabled_tools set can register it (see the comment there).
+    {
+        "name": "list_capabilities",
+        "category": "orchestration",
+        "description": (
+            "List the `genetics` SDK surface available to analysis scripts, one module at a "
+            "time. Returns signatures with their docstrings. Call this before writing a "
+            "script instead of guessing function names. Modules: 'genetics' (the sync functions a "
+            "script calls), 'client' (the awaitable GeneticsClient form), 'errors' (what a "
+            "script catches). Omit `module` for a cheap index of module names and the "
+            "functions each exports."
+        ),
+        "parameters": {
+            "module": {
+                "type": "string",
+                "description": "SDK module to describe. Omit for the index.",
+                "enum": ["genetics", "client", "errors"],
+            },
+        },
+    },
+    {
+        "name": "run_analysis",
+        "category": "orchestration",
+        "description": (
+            "Run a Python script against the genetics data in a sandbox and get back what it "
+            "printed. Use this instead of chaining data-access tools: one script can query, "
+            "join, filter and summarise in a single call.\n\n"
+            "Write the script against the `genetics` SDK — call list_capabilities first for the "
+            "exact signatures rather than guessing. PRINT EVERYTHING YOU WANT TO SEE: only the "
+            "script's output comes back (stdout and stderr interleaved, capped at 64 KiB with "
+            "the middle elided). The value of the last expression is not returned.\n\n"
+            "Files the script writes to its artifacts directory are reported as a manifest of "
+            "names and sizes, but their CONTENTS CANNOT BE RETRIEVED — so a plot or a table that "
+            "matters must also be summarised in what the script prints.\n\n"
+            "Each run is independent: no variables, files or imports survive from one call to "
+            "the next, so a follow-up script must redo the work it needs."
+        ),
+        "parameters": {
+            "code": {
+                "type": "string",
+                "description": "Python source to run. Print the results you want to see.",
+                "required": True,
+            },
+            "timeout_s": {
+                "type": "integer",
+                "description": (
+                    "Wall-clock seconds allowed for the script, 1-120 (default 60). Raise it "
+                    "only for a script you expect to be slow; a larger value does not make a "
+                    "queued run start sooner."
+                ),
+                "default": 60,
+            },
+        },
+    },
+    {
+        "name": "read_artifact",
+        "category": "orchestration",
+        "description": (
+            "Read a named file from this server's local artifacts directory. Takes the "
+            "artifact NAME exactly as reported in a manifest — never a path and never an "
+            "execution id. Returns text inline, and binary content base64-encoded with its "
+            "content type. It CANNOT retrieve artifacts written by run_analysis: those live "
+            "in the sandbox and no retrieval path to them exists yet. Do not call it for a "
+            "run_analysis artifact — have the script print what you need instead."
+        ),
+        "parameters": {
+            "name": {
+                "type": "string",
+                "description": "Artifact file name from the run's manifest, e.g. 'manhattan.png'.",
+                "required": True,
+            },
+        },
+    },
 ]
 
 # BigQuery tools for advanced queries
@@ -1549,7 +1630,7 @@ For simple single-gene or single-variant lookups, prefer specialized tools (get_
 
 **IMPORTANT: Always call get_database_schema FIRST** to discover all available tables and their columns. The database contains more tables than just credible sets — including exome/burden test results and other data types.
 
-Use fully qualified view names (e.g., `genetics_results.credible_sets_v`).
+Refer to views by their bare name (e.g., `credible_sets_v`) — do NOT prefix them with a project or dataset.
 Views include a `resource` column (finngen, ukbb, open_targets, etc.) for filtering by data source.
 Always include a LIMIT clause in your SQL to control how many rows are shown to the user.
 The download file automatically includes all matching rows (up to 100,000) regardless of the SQL LIMIT.
@@ -1557,7 +1638,7 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
         "parameters": {
             "sql": {
                 "type": "string",
-                "description": "SQL query to execute. Use fully qualified view names (e.g., genetics_results.credible_sets_v). Call get_database_schema first to discover available tables. Always include LIMIT clause.",
+                "description": "SQL query to execute. Refer to views by their bare name (e.g., credible_sets_v) — do not prefix them with a project or dataset. Call get_database_schema first to discover available tables. Always include LIMIT clause.",
                 "required": True,
             },
             "max_rows": {
@@ -1627,11 +1708,40 @@ Available skills:
     },
 ]
 
-# valid tool profiles and which categories each profile includes
+# valid tool profiles and which categories each profile includes. Every profile here is a
+# union of whole categories, so each necessarily contains all 18 "general" tools.
 TOOL_PROFILES: dict[str, set[str]] = {
     "api": {"general", "api", "orchestration"},
     "bigquery": {"general", "bigquery", "orchestration"},
     "rag": {"general"},
+}
+
+# profiles named as an explicit allow-list of tool NAMES rather than categories. A profile
+# here takes precedence over TOOL_PROFILES and resolves to exactly these names — nothing
+# else, general tools included.
+#
+# This second mechanism exists because the "code" surface is not expressible as categories
+# and recategorising tools to make it so was ruled out: a tool's category also decides what
+# the api/bigquery chat profiles advertise and what subagent skills declaring
+# tool_categories={"general","api"} can call (skills/definitions.py), so moving one to suit
+# a profile silently changes live chat behaviour. Naming the tools here changes nothing
+# about how any existing profile resolves.
+#
+# "code" (genetics-results-suite-4h6.16) is the minimal code-execution surface: run an
+# analysis script instead of chaining data tools, plus the entity lookups a script needs a
+# human-readable id for. launch_subagents is deliberately absent even though it shares the
+# "orchestration" category — this profile is measuring what one agent does with a sandbox,
+# not what a fan-out does. Ships dark: nothing defaults to it, selection is per request.
+TOOL_PROFILE_TOOLS: dict[str, set[str]] = {
+    "code": {
+        "run_analysis",
+        "list_capabilities",
+        "read_artifact",
+        "search_genes",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "lookup_variants_by_rsid",
+    },
 }
 
 
@@ -1645,10 +1755,17 @@ def get_anthropic_tools(
 
     Args:
         custom_descriptions: Optional dict mapping tool names to custom descriptions
-        tool_profile: Profile controlling which tool categories to include.
-            None = all tools, "api" = general+api, "bigquery" = general+bigquery,
-            "rag" = general only (RAG tools are external, handled separately).
-        disabled_tools: Optional set of tool names to exclude.
+        tool_profile: Profile controlling which tools to include.
+            None = all tools (no filtering at all, not a union of the profiles),
+            "api" = general+api, "bigquery" = general+bigquery,
+            "rag" = general only (RAG tools are external, handled separately),
+            "code" = the seven names in TOOL_PROFILE_TOOLS.
+            An unrecognised string degrades to general-only rather than raising, so a
+            typo costs the model most of its tools silently — deliberate, because the
+            value is persisted per message and read back from rows written by older
+            clients.
+        disabled_tools: Optional set of tool names to exclude. Applied before the
+            profile filter, so a disabled tool stays out of an explicit profile too.
     """
     anthropic_tools = []
 
@@ -1658,8 +1775,12 @@ def get_anthropic_tools(
         all_tools = [t for t in all_tools if t["name"] not in disabled_tools]
 
     if tool_profile is not None:
-        allowed_categories = TOOL_PROFILES.get(tool_profile, {"general"})
-        all_tools = [t for t in all_tools if t.get("category") in allowed_categories]
+        allowed_names = TOOL_PROFILE_TOOLS.get(tool_profile)
+        if allowed_names is not None:
+            all_tools = [t for t in all_tools if t["name"] in allowed_names]
+        else:
+            allowed_categories = TOOL_PROFILES.get(tool_profile, {"general"})
+            all_tools = [t for t in all_tools if t.get("category") in allowed_categories]
 
     for tool_def in all_tools:
         # build input_schema from parameters
@@ -2300,6 +2421,30 @@ def register_mcp_tools(
             return await executor.get_myvariant_annotations(
                 variant=variant, variants=variants, fields=fields
             )
+
+    if "list_capabilities" not in _disabled:
+
+        @mcp.tool()
+        async def list_capabilities(module: str | None = None) -> dict:
+            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors') as signatures with docstrings. Omit module for the index."""
+            return await executor.list_capabilities(module=module)
+
+    # run_analysis has NO block here, deliberately, and the omission is the point.
+    # docs/code-execution-security.md §5 makes membership of mcp_server.py's _mcp_disabled
+    # the sole registration-layer control and then says layer 1 is assumed defeatable. A
+    # missing block is a second, independent registration-layer control that no set passed
+    # to this function can undo: `disabled_tools` can only subtract. It also matches what
+    # the tool needs — the handler is given the authenticated user and the chat session id
+    # by the caller, and an MCP session has neither, so a registered wrapper could only
+    # ever pass identity it does not have. Keep _mcp_disabled's entry as well: it is the
+    # named control the security doc and the tests reason about, and it is what catches a
+    # future block added here without this comment being read.
+    if "read_artifact" not in _disabled:
+
+        @mcp.tool()
+        async def read_artifact(name: str) -> dict:
+            """Read a named file an analysis script wrote to its artifacts directory."""
+            return await executor.read_artifact(name=name)
 
     # BigQuery tools - available via MCP server for direct SQL queries
     @mcp.tool()

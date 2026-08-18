@@ -68,7 +68,7 @@ class MessageResponse(BaseModel):
     thumbs_up: Optional[bool] = None
     content_json: Optional[str] = None  # JSON string of full message content blocks
     literature_backend: Optional[str] = None  # europepmc or perplexity
-    tool_profile: Optional[str] = None  # api, bigquery, rag, or None (all)
+    tool_profile: Optional[str] = None  # api, bigquery, rag, code, or None (all)
     tool_results_json: Optional[str] = None  # JSON string of tool_result blocks for this assistant turn
     instruction_set_id: Optional[str] = None  # user instruction set in force for this turn
     verbosity: Optional[str] = None  # answer detail in force for this turn: brief or detailed
@@ -100,7 +100,7 @@ class MessageSaveRequest(BaseModel):
     content: str
     content_json: Optional[str] = Field(None, description="JSON string of full message content blocks")
     literature_backend: Optional[str] = Field(None, description="Literature search backend: europepmc or perplexity")
-    tool_profile: Optional[str] = Field(None, description="Tool profile: api, bigquery, rag, or null (all)")
+    tool_profile: Optional[str] = Field(None, description="Tool profile: api, bigquery, rag, code, or null (all)")
     tool_results_json: Optional[str] = Field(None, description="JSON string of tool_result blocks for this assistant turn")
     # add_message re-saves the whole row on conflict, so a re-save that omits this clears the
     # stored value — same semantics as tool_profile above. Every save of a message must carry it

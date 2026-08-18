@@ -33,7 +33,7 @@ def _client(body, headers=None) -> GeneticsClient:
         return httpx.Response(200, json=body, headers=headers or {})
 
     client = GeneticsClient()
-    client.executor.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client._executor.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return client
 
 
@@ -110,8 +110,8 @@ def test_a_default_executor_adds_nothing_to_its_result_dicts():
 
 
 def test_the_sdk_builds_an_executor_that_exposes_columns():
-    assert GeneticsClient().executor._expose_columns is True
-    assert GeneticsClient(executor=ToolExecutor()).executor._expose_columns is False
+    assert GeneticsClient()._executor._expose_columns is True
+    assert GeneticsClient(executor=ToolExecutor())._executor._expose_columns is False
 
 
 # ------------------------------------------------------------------ _frame
