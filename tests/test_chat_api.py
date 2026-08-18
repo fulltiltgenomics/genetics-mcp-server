@@ -455,10 +455,36 @@ class TestChatEndpointProviders:
 
         assert response.status_code == 200
         settings = chat_api.get_settings()
+        # enable_tools=False resolves to no tools, so the prompt carries no tool guidance
         assert service.kwargs["system_prompt"] == default_system_prompt(
-            settings.app_name
+            settings.app_name, tool_names=set()
         ) + verbosity_prompt(None)
         assert injected not in service.kwargs["system_prompt"]
+
+    def test_system_prompt_follows_the_requested_tool_profile(self, test_client):
+        """The prompt is assembled from the tool list the request will actually get.
+
+        genetics-results-suite-4h6.69: before this, the endpoint built the prompt with no
+        reference to the profile, so the `code` arm was told to prefer API tools it had
+        not been given — which is exactly what the 4h6.23 A/B measures.
+        """
+        from genetics_mcp_server import chat_api
+
+        service = _CapturingService()
+        with patch.object(chat_api, "get_llm_service", return_value=service):
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "tool_profile": "code",
+                },
+            )
+
+        assert response.status_code == 200
+        prompt = service.kwargs["system_prompt"]
+        assert "run_analysis" in prompt
+        assert "get_credible_sets_by_gene" not in prompt
+        assert "Prefer the dedicated API tools" not in prompt
 
     def test_chat_with_tool_profile(self, test_client):
         """Test providing tool_profile parameter."""
@@ -808,7 +834,21 @@ class _CapturingService:
     def __init__(self):
         self.anthropic_client = object()
         self.openai_client = object()
+        # deliberately LIVE: with it None, `Settings.enable_subagents` defaulting false and
+        # the service-liveness check would both be hiding launch_subagents at once, and no
+        # test here could tell which one did it. Subagent guidance is absent from these
+        # prompts because of the flag, and only the flag.
+        self.subagent_service = object()
         self.kwargs = None
+
+    def resolve_local_tool_names(self, tool_profile=None, enable_tools=True):
+        """The real resolution, not a stub: the endpoint assembles the system prompt from
+        it (genetics-results-suite-4h6.69), so a stub here would stop these tests from
+        seeing the prompt the endpoint actually sends."""
+        from genetics_mcp_server.llm_service import LLMService
+
+        self._disabled_tools = lambda: LLMService._disabled_tools(self)
+        return LLMService.resolve_local_tool_names(self, tool_profile, enable_tools)
 
     def stream_chat(self, **kwargs):
         self.kwargs = kwargs

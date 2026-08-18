@@ -518,7 +518,14 @@ async def stream_chat(
     # travel separately and land in their own cache block after this one, which both
     # keeps the shared block cacheable across users and puts the envelope's guardrail
     # postamble last, where recency favours it.
-    system_prompt = default_system_prompt(settings.app_name)
+    # assembled against the tool list THIS request will actually get, so the prompt never
+    # documents a tool the model was not given (genetics-results-suite-4h6.69). Resolution
+    # goes through the service rather than being recomputed here: one home for the
+    # profile + feature-flag + subagent-liveness filtering that also builds the tool list.
+    system_prompt = default_system_prompt(
+        settings.app_name,
+        tool_names=service.resolve_local_tool_names(request.tool_profile, request.enable_tools),
+    )
     system_prompt += verbosity_prompt(request.verbosity)
     user_instructions = _resolve_user_instructions(
         user, request.instruction_set_id, secret=request.secret

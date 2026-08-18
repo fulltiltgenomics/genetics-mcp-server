@@ -1171,8 +1171,76 @@ replace the entire prompt for their turn and discard every grounding, citation, 
 out-of-scope rule, bypassing all of the care above with a field two lines away from it. The field
 was removed rather than gated; nothing in the suite ever sent it. Pydantic ignores unknown keys, so
 a caller still sending one is silently ignored rather than 422'd. The prompt handed to
-`llm_service.stream_chat(system_prompt=...)` is always `default_system_prompt(app_name)` plus the
-verbosity fragment — that parameter is the internal channel `chat_api` assembles, not an override.
+`llm_service.stream_chat(system_prompt=...)` is always
+`default_system_prompt(app_name, tool_names=...)` plus the verbosity fragment — that parameter is
+the internal channel `chat_api` assembles, not an override.
+
+**The prompt is assembled from the tool list in force** (`genetics-results-suite-4h6.69`).
+`config/defaults.py` holds `_PROMPT_BLOCKS`, a tuple of `_Block`s rather than one string; a block
+is emitted only if every tool name appearing in its text is in `tool_names`, with `excludes`,
+`requires_any` and `requires_all` as further subtractive gates. `chat_api` gets that list from
+`LLMService.resolve_local_tool_names(tool_profile, enable_tools)`, the same profile +
+`settings.disabled_tools` + subagent-liveness resolution that builds the tool list itself, so on
+the **Anthropic** path the prompt cannot describe a tool the model was not given. It does not
+hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor `tool_profile`
+and never sets `tools`, so that provider receives the prompt assembled for the full local set
+while getting no tools at all — pre-existing, and unchanged by 4h6.69. Consequences on the
+Anthropic path: the "Subagent Orchestration" section and the "variant_list_analysis skill"
+reference disappear with `ENABLE_SUBAGENTS=false`, "Phenotype Reports" with
+`ENABLE_PHENOTYPE_REPORT=false`, and every per-tool routing section under `tool_profile="code"`.
+`tool_names=None` skips the filtering entirely and emits every block.
+
+Because a block is dropped for ANY unavailable name in it, a tool named in passing would take
+its whole block with it — a parenthetical, an example or a negation is enough. **Domain science
+and grounding rules are therefore written into blocks that name no tool**, with only the "which
+tool" clause split into its own gated block: the HLA section, the pseudo-credible-set labelling
+obligation, the case-sensitive `data_type` values and the membership / re-query rules all survive
+on `bigquery` and `code`, which reach `credible_sets_v` and `hla_associations_v` through SQL.
+Section headings follow the same rule — `## Data Sources and Resource Names` is its own ungated
+block, because a gated heading over an ungated body reparents the body under the section before it.
+
+`tests/test_system_prompt.py` pins three properties across the `None`/`api`/`bigquery`/`rag`/`code`
+profiles with `ENABLE_SUBAGENTS` both true and false: **absence** (every tool name in the emitted
+prompt is in the resolved list, tokenising independently of the gate's own matcher), **presence**
+(emitted headings pinned per profile, load-bearing science and grounding strings asserted present
+— absence-only assertions cannot see text going missing), and **structure** (no body line lands
+under a different heading than it has in the unfiltered text, no heading is emitted empty). It
+also asserts the `run_analysis` bullet is byte-identical across every arm that carries it, which
+is what makes the `code`-vs-baseline A/B a comparison of tools rather than of wording.
+A fourth property is deliberately NOT parametrised over the five profiles, because that is what
+missed the defect it guards: `TestEverySurfaceWithADataPathIsRouted` drives ~80 tool sets off the
+full list — every single-tool removal plus flag-shaped family removals and their pairs — and
+asserts each surface reaching data through `get_credible_sets_by_gene`, `query_database` or
+`run_analysis` emits **exactly one** arm-routing sentence, never zero and never two. Every profile
+happens to carry all three tools the API-preference bullet cited as examples, so the bullet's
+hostage dependence on them was invisible profile-by-profile.
+`tests/test_llm_service.py::TestResolveLocalToolNames` pins the resolution itself: `MCP_ENABLED=false`
+advertises nothing, and `ENABLE_SUBAGENTS=true` with a dead `subagent_service` still hides
+`launch_subagents`. Those two disabling reasons must remain distinguishable in tests, so
+`_CapturingService` in `tests/test_chat_api.py` holds a live `subagent_service`.
+
+**Routing arbitration has one home.** The preference between "call a dedicated API tool", "write
+SQL" and "write one script" is stated once, in the prompt's "Choosing How to Get Data" section,
+in the variant matching the tools present. It used to live half in the prompt ("prefer API tools
+over the database") and half inside `run_analysis`'s description ("use this instead of chaining
+data-access tools"), which contradicted it and was invisible to anyone reading the prompt.
+`run_analysis`'s description now states its capability only. Preconditions of a single tool stay
+in that tool's description, where they travel with it and reach MCP clients too — which is why
+"call `get_database_schema` first" lives in `query_database`'s description and is no longer
+repeated in the prompt. A surface with `run_analysis` but no `query_database` (profiles `api`
+and `code`) has neither that tool nor `get_database_schema` yet still reads all the SQL
+guidance, so it gets the SDK's own route — `genetics.schema()` / `genetics.schema('<view>')`,
+emitted only there.
+
+Which routing variant is emitted turns on two facts about the surface: whether the per-entity API
+tools are present (`get_credible_sets_by_gene` is the sentinel the database-only variant already
+excludes on) and whether `query_database` is. Both API-side variants used to encode the first fact
+only by NAMING those tools in an illustrative `(e.g. …)` list, so removing any one example — a
+flag in front of `get_gene_based_results`, say — dropped the sentence on the text gate while the
+other variants stayed suppressed by their own `excludes`, and the whole API-vs-database
+arbitration disappeared, leaving the `run_analysis` bullet unopposed on a benchmark built to
+compare exactly those two. The precondition is now an explicit `requires_all` and each `(e.g. …)`
+list is its own block: an absent example costs the examples, never the arbitration.
 
 The same capability had a second form: a client-sent **system-role message**. `ChatMessage.role`
 was an unvalidated `str`, and `_stream_openai` forwarded the caller's messages verbatim after
@@ -1575,7 +1643,7 @@ partial findings instead of treating a fragment as the subagent's complete answe
 5. A sentinel `None` signals all subagents have finished, ending the drain loop
 6. Regular tools and subagents run concurrently — regular tool tasks are gathered alongside the subagent task
 
-**System prompt orchestration guidance**: The default system prompt (`config/defaults.py`) includes a "Subagent Orchestration" section that tells the LLM:
+**System prompt orchestration guidance**: The default system prompt (`config/defaults.py`) includes a "Subagent Orchestration" section — emitted **only when `launch_subagents` is in the resolved tool list**, so with `ENABLE_SUBAGENTS=false` the model is neither given the tool nor told about it — that tells the LLM:
 - When to use subagents vs direct tool calls (parallel independent tasks vs simple lookups)
 - Available skills and their best use cases
 - How to structure subagent tasks (self-contained questions, pass context explicitly, split by skill not entity)

@@ -588,6 +588,39 @@ class LLMService:
         if external_tool_count > 0:
             logger.info(f"Initialized {external_tool_count} tools from external MCP servers")
 
+    def _disabled_tools(self) -> set[str]:
+        """Tools this service must not advertise, whatever the profile.
+
+        Single source of truth: never advertise launch_subagents unless the subagent
+        service actually initialized. settings.disabled_tools gates only on the
+        enable_subagents flag, but the service also requires a live anthropic client +
+        executor; advertising a tool the service can't run is what produced the confusing
+        "subagent service isn't available" error when a call came back.
+        """
+        disabled = set(get_settings().disabled_tools)
+        if self.subagent_service is None:
+            disabled.add("launch_subagents")
+        return disabled
+
+    def resolve_local_tool_names(
+        self, tool_profile: str | None = None, enable_tools: bool = True
+    ) -> set[str]:
+        """Local tool names this service would advertise for such a request.
+
+        Exists so the system prompt can be assembled against the SAME resolution the
+        tool list comes from (genetics-results-suite-4h6.69) instead of being built
+        independently and drifting from it. External and RAG tools are excluded: they
+        are proxied surfaces the system prompt does not name tool-by-tool.
+        """
+        if not (enable_tools and get_settings().mcp_enabled):
+            return set()
+        return {
+            t["name"]
+            for t in get_anthropic_tools(
+                tool_profile=tool_profile, disabled_tools=self._disabled_tools()
+            )
+        }
+
     async def stream_chat(
         self,
         messages: list[dict],
@@ -795,15 +828,7 @@ class LLMService:
         # add tool definitions if enabled
         tool_definitions = None
         if enable_tools and settings.mcp_enabled:
-            # single source of truth: never advertise launch_subagents unless the
-            # subagent service actually initialized. settings.disabled_tools gates
-            # only on the enable_subagents flag, but the service also requires a
-            # live anthropic client + executor; advertising a tool the service
-            # can't run is what produced the confusing "subagent service isn't
-            # available" error when a call came back.
-            disabled = set(settings.disabled_tools)
-            if self.subagent_service is None:
-                disabled.add("launch_subagents")
+            disabled = self._disabled_tools()
 
             # get local tools filtered by profile
             tool_definitions = get_anthropic_tools(

@@ -1561,9 +1561,15 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
         "name": "run_analysis",
         "category": "orchestration",
         "description": (
+            # the "use this INSTEAD OF chaining data-access tools" arbitration that used to
+            # live here moved into the system prompt's "Choosing How to Get Data" section
+            # (genetics-results-suite-4h6.69): a preference BETWEEN tools cannot be stated
+            # inside one tool's description, where it is invisible to the prompt and
+            # contradicted whatever the prompt said about the other path. Nothing is lost
+            # for MCP clients, which never see this tool at all — run_analysis has no
+            # register_mcp_tools block.
             "Run a Python script against the genetics data in a sandbox and get back what it "
-            "printed. Use this instead of chaining data-access tools: one script can query, "
-            "join, filter and summarise in a single call.\n\n"
+            "printed. One script can query, join, filter and summarise in a single call.\n\n"
             "Write the script against the `genetics` SDK — call list_capabilities first for the "
             "exact signatures rather than guessing. PRINT EVERYTHING YOU WANT TO SEE: only the "
             "script's output comes back (stdout and stderr interleaved, capped at 64 KiB with "
