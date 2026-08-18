@@ -570,6 +570,17 @@ async def stream_chat(
                         "event": "message",
                         "data": json.dumps({"type": "usage", **json.loads(chunk.content)}),
                     }
+                elif chunk.type == "script_result":
+                    # one per completed run_analysis. Metadata only (outcome, exception type,
+                    # duration) — the script's source and output travel in the tool_result,
+                    # not here. Unhandled chunk types are dropped silently by this dispatch,
+                    # which is why the replay benchmark's script metrics need this branch.
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(
+                            {"type": "script_result", **json.loads(chunk.content)}
+                        ),
+                    }
                 elif chunk.type == "done":
                     yield {
                         "event": "message",

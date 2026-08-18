@@ -5858,9 +5858,13 @@ class ToolExecutor:
         from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
 
         if not isinstance(code, str) or not code.strip():
+            # error_type is not decoration: without it this shape reaches the `script_result`
+            # SSE chunk as a bare "unknown", indistinguishable from a transport fault, and a
+            # benchmark then books the model emitting no code as the sandbox being flaky
             return {
                 "success": False,
                 "error": "A non-empty Python script is required.",
+                "error_type": "EmptyScript",
                 "retryable": True,
             }
         if not user or not session_id:

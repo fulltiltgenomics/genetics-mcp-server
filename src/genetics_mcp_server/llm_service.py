@@ -240,6 +240,12 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
 # missed before a stalled stream is declared dead.
 _THINKING_KEEPALIVE_SECONDS = 10.0
 
+# Appended to the turn when the agentic loop stops at `mcp_max_iterations`. It is the ONLY
+# signal a stream consumer has that the final iteration ran tools whose phase was never
+# closed by a following model call — replay_benchmark keys its timing on it — so the text is
+# a constant here rather than a literal repeated at both emission sites.
+MAX_ITERATIONS_NOTICE = "\n\n*[Max tool iterations reached]*\n"
+
 # run_analysis accepts up to 256 KiB of source; the tool-use indicator and its log line
 # exist to say what is running, not to carry the whole script into either
 _DISPLAY_CODE_CHARS = 400
@@ -250,7 +256,7 @@ _DISPLAY_CODE_CHARS = 400
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "thinking", "done", "image", "usage"
+    type: str  # "text", "thinking", "done", "image", "usage", "script_result"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -485,6 +491,49 @@ def _process_download_hints(result: dict, owner: str | None = None, tool_name: s
             return _add_include_in_response(result, DOWNLOAD_FAILED_NOTE)
 
     return result
+
+
+def _script_result_payload(iteration: int, result: dict[str, Any]) -> dict[str, Any]:
+    """Summarise one `run_analysis` outcome for the `script_result` SSE chunk.
+
+    THE SANDBOX HAS NO EXIT CODE. The supervisor answers with a `status` of `ok`, `error`,
+    `timeout` or `limit` (sandbox_client._result), so an `exit_code` here would be invented
+    rather than measured, and a consumer that read `exit_code == 0` as "the script worked"
+    would be reading a constant. `ok` is the field that carries the outcome.
+
+    `ran` says exactly one thing: did the SANDBOX execute this script. `_render_analysis`
+    always sets `status`, and every shape `run_analysis` returns without reaching the
+    supervisor has no `status` key at all, so the absence is a reliable discriminator for
+    THAT question.
+
+    IT IS NOT A DISCRIMINATOR FOR WHOSE FAULT IT WAS, and reading it as one flatters the
+    code arm. `ran: False` covers a restarting sandbox and a full queue, which say nothing
+    about the model's script — but it also covers `EmptyScript` (the model emitted blank or
+    non-string `code`) and `SandboxRejected` (the model chose a `timeout_s` outside 1..120,
+    or oversize code), which are the model's doing entirely. `status` carries the executor's
+    `error_type` for those, so a consumer classifies on the STATUS STRING, never on `ran`
+    alone. Every non-run shape sets `error_type`, so the `"unknown"` fallback below means a
+    genuinely unrecognised shape rather than "a blank script got here".
+    """
+    status = result.get("status")
+    ran = isinstance(status, str)
+    ok = bool(result.get("success"))
+    error_type = result.get("error_type")
+    error_type = error_type if isinstance(error_type, str) else None
+    limit = result.get("limit_exceeded")
+    duration_ms = result.get("duration_ms")
+    return {
+        "iteration": iteration,
+        "ran": ran,
+        "ok": ok,
+        "status": status if ran else (error_type or "unknown"),
+        # the script's OWN wall clock, not this process's turn budget and not the client's
+        # per-attempt read deadline: both of those leave the script possibly still running
+        "timed_out": ran and status == "timeout",
+        "exception": None if ok else error_type,
+        "limit": limit if isinstance(limit, str) else None,
+        "duration_ms": duration_ms if isinstance(duration_ms, int) and not isinstance(duration_ms, bool) else None,
+    }
 
 
 class LLMService:
@@ -819,8 +868,13 @@ class LLMService:
             while iteration < max_iterations:
                 iteration += 1
 
+                # spans EVERY attempt of the retry loop below, backoff sleeps included, so
+                # `turn_elapsed_ms` minus this is the wall time that was NOT the model call
+                model_started = time.monotonic()
+
                 # retry transient Anthropic errors with exponential backoff
                 max_retries = 3
+                attempt = 0
                 for attempt in range(max_retries + 1):
                     text_yielded_this_attempt = False
                     try:
@@ -873,6 +927,9 @@ class LLMService:
                             )
                         await asyncio.sleep(wait)
 
+                model_ms = int((time.monotonic() - model_started) * 1000)
+                model_attempts = attempt + 1
+
                 # log token usage and cost for this iteration
                 usage = message.usage
                 input_tok = usage.input_tokens
@@ -903,6 +960,27 @@ class LLMService:
                 # `input_tokens - cache_read - cache_create`, which is exactly the
                 # per-iteration increment of `total_input_tokens`. A consumer with no
                 # database row (secret chat writes none) needs all three to price a turn.
+                #
+                # The two timing fields are deliberately named for their epoch, because
+                # "elapsed" alone is ambiguous and a reader guessing wrong gets a wrong
+                # bottleneck:
+                #   `turn_elapsed_ms` — since the TURN started (the same monotonic zero as
+                #     the `wall_ms` written to chat_turn_metrics), sampled at the moment this
+                #     iteration's model response completed. Cumulative, so it only rises.
+                #   `model_ms` — the wall time of THIS iteration's model call. NOT model
+                #     latency: the span encloses the whole retry loop, so a transient error
+                #     puts its 1/2/4s backoff sleep inside the figure, and because this is
+                #     an async generator yielding per delta it also carries downstream SSE
+                #     serialisation and socket backpressure. `model_attempts` is emitted
+                #     beside it so a retry-inflated reading is identifiable rather than
+                #     merely disclaimed: > 1 means the backoff is in there.
+                #   `model_attempts` — how many times the streaming call was attempted this
+                #     iteration, 1 when it succeeded first time.
+                # Everything else is derivable from the pair: iteration N's segment is
+                # turn_elapsed_ms[N] - turn_elapsed_ms[N-1] (with [0] = 0), and the part of
+                # that segment which was not the model call is that difference minus
+                # model_ms[N] — which for N > 1 is exactly iteration N-1's tool phase, since
+                # this chunk is emitted before any tool of iteration N runs.
                 yield StreamChunk(
                     type="usage",
                     content=json.dumps({
@@ -915,6 +993,9 @@ class LLMService:
                         "total_output_tokens": total_output_tokens,
                         "context_window": context_window,
                         "context_percent": round(context_tokens / context_window * 100, 1),
+                        "turn_elapsed_ms": int((time.monotonic() - turn_started) * 1000),
+                        "model_ms": model_ms,
+                        "model_attempts": model_attempts,
                     }),
                 )
 
@@ -1106,6 +1187,14 @@ class LLMService:
                 # process results: extract images, truncate, build tool_results
                 tool_results = []
                 for tool_use, result in zip(tool_uses, raw_results):
+                    if tool_use.name == "run_analysis" and isinstance(result, dict):
+                        # metadata only, and emitted before the result is rendered into the
+                        # tool_result block: the benchmark needs to know a script ran and how
+                        # it ended, and nothing here carries source, output or artifact names
+                        yield StreamChunk(
+                            type="script_result",
+                            content=json.dumps(_script_result_payload(iteration, result)),
+                        )
                     if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
                         image_data = result["image_base64"]
                         image_format = result.get("image_format", "png")
@@ -1158,10 +1247,8 @@ class LLMService:
                 all_content_blocks.append({"type": "text", "text": notice})
 
             if iteration >= max_iterations:
-                yield StreamChunk(type="text", content="\n\n*[Max tool iterations reached]*\n")
-                all_content_blocks.append(
-                    {"type": "text", "text": "\n\n*[Max tool iterations reached]*\n"}
-                )
+                yield StreamChunk(type="text", content=MAX_ITERATIONS_NOTICE)
+                all_content_blocks.append({"type": "text", "text": MAX_ITERATIONS_NOTICE})
 
             logger.info(
                 f"{log_prefix}Chat complete: model={model} iterations={iteration} "

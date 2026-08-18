@@ -311,9 +311,13 @@ attempts sum, though: 5 + 10 + 255, a 60 s `Retry-After`, then another 270 is ~5
 ten minutes inside one tool call is not a chat turn. 300 s is the smallest cap that never
 truncates a legitimate single attempt (270 s at the maximum `timeout_s`), so raising
 `timeout_s` trades away the retry rather than the run. Exceeding it reports
-`TurnBudgetExceeded` and says the script may still be running — it is not a script failure,
-and neither is `SandboxUnavailable`, which means a deploy left no sandbox for up to ~130 s
-(`strategy: Recreate` plus `terminationGracePeriodSeconds: 130`).
+`TurnBudgetExceeded` and says the script may still be running — a shape the benchmark
+buckets on its own, since it is neither cleanly a script failure nor cleanly an
+infrastructure fault (a single script cannot reach a 300 s cap against a 120 s
+`MAX_TIMEOUT_S`). `SandboxUnavailable` is unambiguously infrastructure: a deploy left no
+sandbox for up to ~130 s (`strategy: Recreate` plus `terminationGracePeriodSeconds: 130`).
+`SandboxRejected` and the blank-script `EmptyScript`, by contrast, are the model's own
+doing — it chose the `timeout_s`, the code size or the empty string.
 
 **`SandboxTokenUnavailable` is caught first and by name, and `run_analysis` has no
 `except Exception` at all** — a deliberate departure from the ~40 handlers around it.
@@ -1413,7 +1417,8 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 |------------|-------------|--------------------|
 | `content` | Streamed text token from the LLM response | `content` (string) |
 | `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
-| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
+| `usage` | Context usage and timing snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent`, `turn_elapsed_ms`, `model_ms`, `model_attempts` |
+| `script_result` | Outcome of one completed `run_analysis`, emitted before the next iteration's `usage` | `iteration`, `ran`, `ok`, `status`, `timed_out`, `exception`, `limit`, `duration_ms` |
 | `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
 | `error` | Error message from the backend | `content` (error string) |
 | `done` | Signals the stream is complete | `message_content` (assistant text + `tool_use` blocks for persistence), `tool_results` (the `tool_result` blocks for this turn, for persistence) |
@@ -1439,6 +1444,47 @@ name says `total_`:
 - `context_window` — total context window size for the model (from `get_context_window()`)
 - `context_percent` — percentage of the context window this call filled
   (`input_tokens / context_window * 100`)
+- `turn_elapsed_ms` — milliseconds **since the turn started** (the same monotonic zero as
+  the `wall_ms` written to `chat_turn_metrics`), sampled the moment this iteration's model
+  response completed. Cumulative, not a per-iteration delta — the delta is the difference
+  between consecutive values, so both readings are available and neither has to be guessed
+- `model_ms` — wall time of **this iteration's model call**, which is *not* the same as
+  model latency: the timed span encloses the whole transient-error retry loop, so a retry's
+  1/2/4 s backoff sleep is inside the figure, and because the producer is an async generator
+  yielding per delta it also carries downstream SSE serialisation and socket backpressure.
+  `turn_elapsed_ms` minus the previous iteration's `turn_elapsed_ms` minus this `model_ms`
+  is exactly the previous iteration's tool phase, because this chunk is emitted before any
+  tool of its own iteration runs
+- `model_attempts` — how many times the streaming call was attempted this iteration (`1`
+  when it succeeded first time). Emitted so that a retry-inflated `model_ms` is
+  *identifiable* rather than merely disclaimed; the backoff schedule is deterministic
+  (1 + 2 + 4 s), so an attempt count bounds how much of the figure is sleep
+
+Payload fields for `script_result`, one per completed `run_analysis` call:
+- `iteration` — the agentic-loop iteration whose model response requested the script
+- `ran` — whether the **sandbox executed** the script at all. That is the only question it
+  answers. It is **not** a verdict on whose fault a non-run was: `false` covers a restarting
+  sandbox, a full queue and an unminted signing key, which say nothing about the script —
+  but it also covers `EmptyScript` (the model emitted blank or non-string `code`) and
+  `SandboxRejected` (the model chose a `timeout_s` outside 1..120, or oversize code), which
+  are the model's doing entirely. A consumer splitting model faults from infrastructure
+  faults classifies on `status`, never on `ran` alone
+- `ok` — whether the script succeeded. **There is no `exit_code`**: the supervisor answers
+  with a status string, so an exit code would be invented rather than measured
+- `status` — the supervisor's `ok` / `error` / `timeout` / `limit` when `ran`, otherwise
+  the executor's error type (`EmptyScript`, `SandboxRejected`, `SandboxUnavailable`,
+  `SandboxBusy`, `SandboxNotConfigured`, `TurnBudgetExceeded`, …). Every non-run shape sets
+  one — the blank-script shape gained `EmptyScript` for exactly this reason, since without
+  it the chunk read `unknown`, indistinguishable from a genuine transport fault
+- `timed_out` — the **script's own** wall clock fired; not the turn budget, whose expiry
+  leaves the script possibly still running
+- `exception` — the script's exception type when it failed, else `null`
+- `limit` — which sandbox limit fired (`OutputLimit`, `MemoryLimit`, …), else `null`
+- `duration_ms` — the sandbox's own measured execution time when it reported one
+
+The chunk carries metadata only: the script's source, its output and its artifact names
+stay in the `tool_result` the model reads. It is what `replay_benchmark.py` counts script
+failures and retry loops from.
 
 A consumer can therefore price **the main agentic loop's Anthropic API calls** exactly
 from the stream alone, with no `chat_turn_metrics` row: uncached input is
@@ -2107,25 +2153,102 @@ harness issues two arms per case. `--base-url` therefore defaults to
   deliberately writes no `chat_turn_metrics` row, so the DB is not an option — see
   the `chat_turn_metrics` section. `llm_service` yields a `usage` chunk per model
   roundtrip; the harness reads `iteration`, per-iteration `input_tokens`,
-  `total_input_tokens`, `total_output_tokens` and `context_percent` from it, and
-  takes the tool-call count from the `done` chunk's `message_content` by counting
+  `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`,
+  `total_output_tokens`, `context_percent`, `turn_elapsed_ms` and `model_ms` from it,
+  and takes the tool-call count from the `done` chunk's `message_content` by counting
   real `tool_use` blocks (never the `*[Using tool: …]*` display markers, which the
   model has been observed to imitate as prose).
 - **The `usage` chunk's `input_tokens` is the whole context**, i.e.
   `input_tokens + cache_read + cache_creation`, while `total_input_tokens`
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
-  derived as `sum(per-iteration input_tokens) - total_input_tokens`. The harness
-  cannot split that into cache reads and cache creations, which differ by more than
-  12x in price, so **cost is reported as an interval**, `cost_usd_min` (all cached
-  tokens priced as cache reads) to `cost_usd_max` (all priced as cache creations),
-  never as a single fabricated number. The chunk itself no longer forces this:
-  `genetics-results-suite-n3p` added `cache_read` and `cache_create` to the `usage`
-  payload, so an exact figure is now derivable and the harness can drop the interval
-  — it has not been switched over yet. Pricing also needs a model name the pricing
-  table actually knows: without `--model`, *or* with a model `cost.has_pricing()`
-  cannot match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
-  ("not priced") with a warning, not `0` and not silently priced at the
-  `_match_pricing` Sonnet fallback.
+  derived as `sum(per-iteration input_tokens) - total_input_tokens`.
+- **Cost is exact when the stream carries the cache split, and an interval when it
+  does not — and the report says which.** Cache reads and cache creations differ by
+  more than 12x in price, so the sum alone can only be bracketed. Since
+  `genetics-results-suite-n3p` the `usage` payload reports `cache_read` and
+  `cache_create` separately, and the harness prices the three token classes
+  separately into `cost_usd` (`cost_basis: "exact"`). `cost_usd_min` / `cost_usd_max`
+  are still computed as the fallback bracket and as a sanity range the exact figure
+  must sit inside. A turn is priced exactly only when **every** one of its `usage`
+  chunks carried the split; one chunk without it demotes the whole turn to
+  `cost_basis: "interval"` with `cost_usd = null`, because a turn priced exactly in
+  part and by assumption in the rest is a mixed number wearing an exact label. The
+  per-arm summary counts turns by basis and the printed footer states how many turns
+  are exact and how many only bracketed, so a mixed run cannot be read as if
+  `cost_usd` covered all of it. Pricing also needs a model name the pricing table
+  actually knows: without `--model`, *or* with a model `cost.has_pricing()` cannot
+  match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
+  ("not priced", `cost_basis: "unpriced"`) with a warning, not `0` and not silently
+  priced at the `_match_pricing` Sonnet fallback.
+- **Per-iteration timing localises a slow turn.** `ms_to_first_token` and
+  `ms_to_done` are per *turn* and cannot say which roundtrip was slow, which matters
+  because context roughly triples between iteration 1 and 7+. The `usage` chunk
+  therefore carries two timings, each named for its epoch:
+  `turn_elapsed_ms` is **cumulative from the start of the turn** (the same monotonic
+  zero as `chat_turn_metrics.wall_ms`), sampled when that iteration's model response
+  completed; `model_ms` is that iteration's model call, retry backoff and SSE
+  delivery included — it is deliberately *not* labelled model latency, and
+  `model_attempts` rides beside it so a retry-inflated reading is identifiable.
+  Everything else is derived rather than guessed:
+  - `segment_ms` is the difference between consecutive `turn_elapsed_ms` (first
+    iteration measured from 0). It is named for its **epoch**, not for an iteration,
+    because it is not one: it is `model_ms[N]` plus the tool phase of `N-1`.
+  - `pre_model_ms` is `segment_ms - model_ms` — the turn's setup for iteration 1 and
+    the *previous* iteration's tool phase thereafter, since the chunk is emitted
+    before any tool of its own iteration runs.
+  - `tool_phase_ms` re-attributes that span to the iteration whose tools it was
+    (`null` on the last iteration, which answered). On the `max_tokens`
+    *continuation* path the same span is continuation bookkeeping rather than tool
+    time; read it as "what happened between the two model calls".
+  - `iteration_ms` is that iteration's own **roundtrip**, `model_ms[N] +
+    tool_phase_ms[N]`, so the printed row sums and `slowest_iteration` names the
+    roundtrip a reader should go and look at. Deriving it from `segment_ms` (as it
+    was before) charged iteration N with iteration N-1's tools — already printed on
+    row N-1 — and named the bottleneck one roundtrip too late, which is precisely the
+    localisation the field exists to provide. It is `null` whenever either half is
+    unmeasured, rather than topping up an unobserved tool phase with `0`.
+    The **last** iteration is two cases and only one of them is an absence.
+    `llm_service` leaves the loop after a `usage` chunk in exactly four ways: no
+    `tool_use` blocks, the `max_tokens` continuation budget exhausted, the
+    unfilled-result continuation budget exhausted, or the iteration ceiling. The
+    first three ran **no tools**, so that iteration's tool phase is a measured
+    **zero** and `iteration_ms` is `model_ms`. Only the ceiling ran tools whose phase
+    no following model call ever closed, and reaching the ceiling is exactly what
+    appends the `Max tool iterations reached` notice — so tools-after-the-last-usage-
+    chunk implies the marker, and there is no false negative from the server. The
+    harness therefore imputes the zero only for turns that are `ok` **and** carry no
+    marker; an error or timeout mid-turn can land after tools ran with no marker and
+    no `done`, and a false *positive* (a model quoting the text back, or the ceiling
+    reached on a turn that then answered without tools) yields `null`, the safe
+    direction. Collapsing both cases into `null` would drop every single-iteration
+    turn — ~36% of production turns — out of `slowest_iteration_ms` and make a slow
+    final roundtrip, the one answering against the largest context (median 39k → 117k
+    tokens by iteration 7+), structurally invisible. The marker text is a constant in
+    `llm_service` (`MAX_ITERATIONS_NOTICE`) and a deliberately separate literal in the
+    harness (`MAX_ITERATIONS_MARKER`, since it parses a *remote* server's stream),
+    pinned to each other by a test so a rename fails loudly rather than silently
+    mis-timing final iterations.
+    `tool_phase_ms` stays `null` in **both** cases even though the first one's is
+    zero: that column means "a tool phase that was measured", and seeding it with one
+    `0` per turn would drag every by-index median toward zero for a reason unrelated
+    to how long tools take.
+  A **gap** breaks the timeline rather than being papered over: an untimed `usage`
+  chunk resets the baseline, so the *following* iteration reports `null` instead of a
+  segment silently spanning two iterations (which would also misname
+  `slowest_iteration`). That is the same standard the cost path applies when one
+  chunk lacks the cache split.
+  The per-turn record adds `model_ms_total`, `slowest_iteration`,
+  `slowest_iteration_ms` and `iterations_with_model_retries`; the per-arm summary
+  adds `iteration_timing`, a distribution over all iterations plus the same broken
+  out by iteration index, printed as a timeline table. That table prints **one `n`
+  per column**, not one per row — `tool_phase_ms` is `null` for every turn that ended
+  at that index, so its sample is strictly smaller than `model_ms`'s at the same
+  index — and marks any percentile `distribution()` already flagged as unreliable
+  with a `*`, matching the rest of the report. A field the stream did not carry stays
+  `null` and is excluded from the distributions rather than imputed as `0`.
+  Per-*tool* timing is deliberately not here (`genetics-results-suite-4h6.73` fix 3):
+  tools are gathered concurrently with `asyncio.gather`, so per-tool wall times
+  overlap and do not sum to the iteration's tool phase.
 - **A turn that reaches `done` without a single `usage` chunk is `no_usage_chunks`,
   not `ok`.** Iterations, tokens and cost are all unmeasurable for it, so counting
   its (necessarily zero) `tool_use` blocks would push a fake `0` into the tool-call
@@ -2159,18 +2282,62 @@ harness issues two arms per case. `--base-url` therefore defaults to
   `error` record per `(arm, turn_index)` over its planned turns, in that case's
   alternated arm order — not two `turn_index=0` records, which would under-report
   `turns_attempted` and hide the loss from the per-status table.
-- **Script-failure and retry-loop counters are declared but not yet emitted.**
+- **Script-failure and retry-loop counters read the `script_result` chunk.**
   A code-execution arm scores ~1 tool call by construction, so tool-call count alone
   is a dishonest win condition; the counters exist to price the failure modes that
-  offset it. Nothing on the chat stream emits script results today, so the harness
-  looks for a `script_result` chunk (`exit_code` / `timed_out` / `exception`) and,
-  when it sees none, reports `null` and prints `NOT MEASURED` with the reason —
-  deliberately *not* `0`, which would read as "measured, no failures". Once the
-  sandbox arm emits the chunk the fields populate, and a run with scripts that all
-  succeeded then reports a real `0`. The `NOT MEASURED` branch keys on `script_runs
-  is None`, never on `script_failure_rate is None`: the rate is also `None` for an arm
-  that *was* measured and ran zero scripts, and printing that as unmeasured would
-  defeat the whole point of distinguishing the two states.
+  offset it. `llm_service` emits one `script_result` chunk per completed
+  `run_analysis`, carrying `iteration`, `ran`, `ok`, `status`, `timed_out`,
+  `exception`, `limit` and `duration_ms` — metadata only; the script's source and
+  output travel in the `tool_result`, not on this chunk. **There is no `exit_code`**:
+  the sandbox supervisor answers with a `status` of `ok` / `error` / `timeout` /
+  `limit`, so an exit code would be invented rather than measured. `ok` is the
+  outcome field.
+  **Classification keys on `status`, not on `ran`.** `ran: false` says only that the
+  sandbox did not execute the script; it does not say whose fault that was, and
+  reading it as "infrastructure" flatters the code arm on the very metric that exists
+  to price its characteristic risk. `EmptyScript` (blank or non-string `code`) and
+  `SandboxRejected` (a model-chosen `timeout_s` outside 1..120, or oversize code)
+  arrive with `ran: false` and are the **model's** doing, so they are counted as
+  script failures, in both the numerator and the denominator. Left in the
+  infrastructure bucket they produced the exact inversion of the truth: a model
+  asking for `timeout_s: 300` twice per case reported
+  `failures=0 rate=0.000, sandbox faults=2N`, and a reader concluded the scripts
+  never fail and the sandbox is flaky. Genuine faults — restarting sandbox, full
+  queue, unminted signing key — stay in `script_infra_errors`, outside the rate, so a
+  deploy landing mid-run cannot decide the rollout.
+  Every distinct shape is also reported verbatim and individually in
+  `script_outcomes`, and the rate is printed with its numerator and denominator
+  spelled out beside it:
+  `script_failure_rate = (executed_failed + model_rejected) / (executed_ok +
+  executed_failed + model_rejected)`. That is what settles `TurnBudgetExceeded`,
+  which two reviewers classified in opposite directions — the ~300 s turn budget
+  against the sandbox's own 120 s `MAX_TIMEOUT_S`, so a single script cannot trigger
+  it. Rather than picking a side invisibly it gets its own bucket
+  (`script_budget_exceeded`), in *neither* the numerator nor the denominator, and a
+  reader who classifies it differently can redo the arithmetic from numbers already
+  on the page.
+  A **retry loop** is any non-successful script outcome followed by a further `usage`
+  chunk, i.e. a wasted model roundtrip at full context — counted at most once per
+  iteration, since two scripts failing in the same iteration still cost exactly one
+  extra roundtrip, and not at all when the failure was the turn's last iteration.
+  Because the causes are not the same kind of fact, the count is split into
+  `retry_loops_script`, `retry_loops_disputed` and `retry_loops_infra` (summing to
+  `retry_loops`), attributed by precedence script > disputed > infra so a wasted
+  roundtrip is never credited to the platform when the model's own script also
+  failed. It over-counts in one known way, in the safe direction: if one of two
+  *parallel* scripts fails while the other succeeds, the next roundtrip is booked as
+  a retry loop even though the model may simply be consuming the successful result.
+  That penalises the code arm, so it is left rather than guessed at.
+  An arm that emitted no `script_result` chunk at all reports `null` and prints
+  `NOT MEASURED` with the reason, deliberately *not* `0`, which would read as
+  "measured, no failures" — expected for an arm whose profile has no code-execution
+  tool. The `NOT MEASURED` branch keys on `script_runs is None`, never on
+  `script_failure_rate is None`: the rate is also `None` for an arm that *was*
+  measured and ran zero scripts, and printing that as unmeasured would defeat the
+  whole point of distinguishing the two states.
+  The SSE dispatch in `chat_api.py` is an `if/elif` chain with no default, so the
+  chunk needs an explicit branch there; without it `llm_service` would emit it
+  perfectly well and the harness would still print `NOT MEASURED`.
 - **Output** is a JSON report (`--output`) carrying the config, the per-case arm
   order, the matched-pair headline summaries, the unmatched per-arm marginals and
   every individual turn record (including the per-iteration usage detail), plus a
@@ -2195,7 +2362,7 @@ harness issues two arms per case. `--base-url` therefore defaults to
 1. **Shared tool definitions**: Single source of truth in `definitions.py` prevents drift between MCP and LLM service
 2. **Async throughout**: All I/O uses async/await for concurrent tool execution
 3. **Graceful degradation**: External service failures don't crash the server; fallbacks are used where available
-4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `usage`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
+4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `thinking`, `usage`, `script_result`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
 6. **Retry on transient errors**: Anthropic API calls are retried up to 3 times with exponential backoff (1s, 2s, 4s) for transient errors. Retryability is detected two ways because of a streaming quirk: connection errors and `APIStatusError` with HTTP status 500/502/503/529, **and** by the error type carried in the body (`overloaded_error`, `api_error`, `internal_server_error`). The latter is essential — errors that arrive mid-stream (after the SSE connection returns HTTP 200) surface as a base `APIStatusError` with `status_code=200`, so status-code matching alone misses them (`anthropic_error_type()` in `llm_service.py` reads the real type from the body). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. When retries are exhausted, `_classify_error` (in `chat_api.py`) maps the error to a user-facing message keyed on the same body type: overload → "Claude is temporarily overloaded… please wait a moment and resend"; internal/upstream → "Claude had a temporary upstream error." Non-retryable errors (auth, bad request, rate limit) propagate immediately.
 7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow. The cap is `settings.mcp_max_result_size` (50,000 chars) applied to the serialized tool result in `llm_service.py`. The notice is built by `_truncation_notice()`, which states that what survives is an ordered PREFIX rather than a sample, that entire categories may be invisible, and that the result must not be used to count, to enumerate, or to conclude absence — pointing instead at narrower arguments, `summarize=true`, or the download link. Its item count comes from `_count_result_items()`, which understands every shape the data tools return (`results`, `rows`/`total_rows`, and `n_cs`/`cs`); counting only `results` previously dropped the count for exactly the credible-set summaries, degrading the notice to a bare "response too large". The system prompt carries the matching rule (`config/defaults.py`, under Tool Usage Guidelines). Truncation is positional, so it interacts badly with server-side row ordering: an unfiltered `get_credible_sets_by_qtl_gene` for a well-studied gene returns thousands of rows sorted by chromosome/position, and the tail — which may be the only rows of the requested data type — is cut before the model sees it. This produced a real wrong answer ("no caQTL rows at all" for IL7R, which in fact has 3,058). The fix is to filter server-side: the `data_types` parameter on `get_credible_sets_by_gene` / `_by_variant` / `_by_qtl_gene` is now a real API query parameter (previously it was sent and silently ignored by the results-api, which is also why the truncation was reached), and the results-api rejects undeclared query parameters with 422 so this class of drift cannot recur silently. `get_credible_sets_by_qtl_gene` also now defaults `summarize=True`, matching its sibling credible-set tools; it was the only one defaulting to variant-level rows, which is how a routine gene query reached 1.57 M chars. The summary is credible set-level, sorted by `mlog10p` and grouped by `data_type`, so what truncation drops is the weakest-signal tail rather than an entire chromosome's worth of rows. **A credible set is keyed by `(resource, dataset, trait, cell_type, cs_id)`, never by `cs_id` alone** — `cs_id` is unique only within one dataset's fine-mapping run of one trait in one cell type. caQTL `cs_id`s are derived from the chromatin peak and recur in every cell type the peak was tested in; eQTL Catalogue `cs_id`s like `ENSG00000187608_L1` recur across QTD studies. `_summarize_credible_sets_simple` grouped on `cs_id` alone, merging those into one row each: for IL7R caQTL it reported 46 credible sets across 9 cell types where the data holds 129 across 13, and PCSK9 caQTL came out at 78 instead of 359. Both aggregations now run in a single `group_by` on the full key — joining them would have to match on `cell_type`, which is null for GWAS, where `null != null` silently drops rows. `_summarize_credible_sets_trait` (used only by `get_credible_sets_by_phenotype`, a single resource and phenotype per call) is unaffected, since `cs_id` genuinely is unique in that scope. The summary also carries a `counts` block (`_summary_counts`) of per-data-type distinct totals — credible sets, associations (variant-level rows, matching an equivalent BigQuery `COUNT(*)`), variants, traits, cell types, datasets, plus `n_peaks` from `trait_original` for caQTL, whose molecular trait is a chromatin peak. It is emitted before `cs` in the dict so it survives truncation: at ~500 bytes for all data types it always fits, which means "how many peaks / cell types / associations" is answerable even on a result 28x over the cap, instead of the model counting whatever credible sets happened to fit

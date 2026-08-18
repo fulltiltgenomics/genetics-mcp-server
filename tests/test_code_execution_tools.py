@@ -14,6 +14,7 @@ import signal
 
 import pytest
 
+from genetics_mcp_server.llm_service import _script_result_payload
 from genetics_mcp_server.tools import ToolExecutor
 from genetics_mcp_server.tools import executor as executor_module
 from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS, get_anthropic_tools
@@ -890,3 +891,84 @@ class TestRunAnalysisIdentity:
         )
         assert seen["user"] == "real@finngen.fi"
         assert seen["session_id"] == "conv-7"
+
+
+# ------------------------------------------------- the script_result SSE payload (4h6.71)
+
+
+def test_script_result_payload_marks_a_successful_run_as_not_a_failure(executor):
+    payload = _script_result_payload(
+        3, executor._render_analysis({"status": "ok", "duration_ms": 812})
+    )
+    assert payload == {
+        "iteration": 3,
+        "ran": True,
+        "ok": True,
+        "status": "ok",
+        "timed_out": False,
+        "exception": None,
+        "limit": None,
+        "duration_ms": 812,
+    }
+
+
+def test_script_result_payload_reports_a_script_exception(executor):
+    rendered = executor._render_analysis(
+        {
+            "status": "error",
+            "error": {"type": "ValueError", "message": "bad", "traceback": "..."},
+            "duration_ms": 40,
+        }
+    )
+    payload = _script_result_payload(1, rendered)
+    assert payload["ran"] is True
+    assert payload["ok"] is False
+    assert payload["exception"] == "ValueError"
+    assert payload["timed_out"] is False
+
+
+def test_script_result_payload_distinguishes_timeout_from_a_limit(executor):
+    timed_out = _script_result_payload(1, executor._render_analysis({"status": "timeout"}))
+    assert timed_out["timed_out"] is True and timed_out["ok"] is False
+
+    limited = executor._render_analysis(
+        {"status": "limit", "error": {"type": "OutputLimit", "limit": "OutputLimit"}}
+    )
+    payload = _script_result_payload(1, limited)
+    assert payload["timed_out"] is False
+    assert payload["limit"] == "OutputLimit"
+    assert payload["status"] == "limit"
+
+
+async def test_a_blank_script_is_reported_as_its_own_shape_not_as_unknown(executor):
+    """`ran: False` is not a verdict on whose fault it was, so the shape has to be readable.
+
+    Without an error_type this arrives on the wire as `status: "unknown"` — the same string
+    a genuinely unrecognised transport fault produces — and a benchmark reading it books the
+    model emitting no code as the sandbox being flaky.
+    """
+    for blank in ("", "   \n\t", None, 42):
+        result = await executor.run_analysis(code=blank, user="u@finngen.fi", session_id="c1")
+        assert result["success"] is False
+        assert result["error_type"] == "EmptyScript", blank
+        assert _script_result_payload(1, result)["status"] == "EmptyScript"
+
+
+def test_script_result_payload_marks_a_sandbox_fault_as_not_run(executor):
+    """A restarting sandbox is not a failed script and must not enter the failure rate."""
+    for shape in (
+        {
+            "success": False,
+            "error": "unavailable",
+            "error_type": "SandboxUnavailable",
+            "retryable": True,
+        },
+        executor._sandbox_operator_error("not configured"),
+    ):
+        payload = _script_result_payload(1, shape)
+        assert payload["ran"] is False, shape
+        assert payload["ok"] is False
+        assert payload["timed_out"] is False
+
+    # ...whereas anything the supervisor itself answered carries a status, so it did run
+    assert _script_result_payload(1, executor._render_analysis({"status": "error"}))["ran"] is True

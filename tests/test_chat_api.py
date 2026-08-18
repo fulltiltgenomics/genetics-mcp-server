@@ -8,7 +8,22 @@ from unittest.mock import patch
 import pytest
 from conftest import settings_env
 
+from genetics_mcp_server import rate_limit
 from genetics_mcp_server.llm_service import StreamChunk
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limit_window():
+    """Every test starts with an empty rate-limit window.
+
+    The counter is process-global and every /chat/v1/chat post in this file shares
+    user=anonymous, so without this the file is one test away from its 20/hour default at
+    all times — and the request that tips it over fails a LATER, unrelated test with a 429.
+    No test here exercises the limit itself; it is incidental state, so it is reset.
+    """
+    rate_limit._requests.clear()
+    yield
+    rate_limit._requests.clear()
 
 
 class TestStatusEndpoint:
@@ -288,6 +303,57 @@ class TestChatEndpoint:
         # verify done event also present
         done_events = [e for e in events if e.get("type") == "done"]
         assert len(done_events) == 1
+
+    def test_chat_stream_forwards_script_result_event(self, test_client):
+        """A script_result chunk must reach the wire.
+
+        The SSE dispatch is an if/elif chain with no default, so an unhandled chunk type is
+        dropped in silence — the replay benchmark would go on printing NOT MEASURED with
+        llm_service emitting the chunk perfectly well.
+        """
+        payload = {
+            "iteration": 2,
+            "ran": True,
+            "ok": False,
+            "status": "error",
+            "timed_out": False,
+            "exception": "ValueError",
+            "limit": None,
+            "duration_ms": 1234,
+        }
+
+        async def mock_stream(**kwargs):
+            yield StreamChunk(type="script_result", content=json.dumps(payload))
+            yield StreamChunk(
+                type="done",
+                content="",
+                message_content=[{"type": "text", "text": "done"}],
+            )
+
+        with patch("genetics_mcp_server.chat_api.get_llm_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                },
+            )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line[len("data:"):].strip())
+            for line in response.text.splitlines()
+            if line.startswith("data:") and line[len("data:"):].strip()
+        ]
+        script_events = [e for e in events if e.get("type") == "script_result"]
+        assert len(script_events) == 1
+        assert script_events[0] == {"type": "script_result", **payload}
 
     def test_chat_stream_forwards_thinking_keepalive(self, test_client):
         """A thinking chunk reaches the client so a long reasoning phase keeps the
