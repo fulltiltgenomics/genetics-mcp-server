@@ -4,6 +4,7 @@ from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
     SUBAGENT_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
+    TOOL_PROFILE_TOOLS,
     TOOL_PROFILES,
     get_anthropic_tools,
     register_mcp_tools,
@@ -16,6 +17,7 @@ __all__ = [
     "BIGQUERY_TOOL_DEFINITIONS",
     "SUBAGENT_TOOL_DEFINITIONS",
     "TOOL_PROFILES",
+    "TOOL_PROFILE_TOOLS",
     "register_mcp_tools",
     "get_anthropic_tools",
 ]

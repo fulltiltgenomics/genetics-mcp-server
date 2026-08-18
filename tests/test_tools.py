@@ -10,6 +10,7 @@ from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
     SUBAGENT_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
+    TOOL_PROFILE_TOOLS,
     TOOL_PROFILES,
     get_anthropic_tools,
 )
@@ -808,6 +809,203 @@ class TestVariantAnnotationTools:
             assert "_download_data" in result
 
 
+# Frozen expected name sets for the category-based profiles, recorded 2026-08-18.
+#
+# These are literals on purpose. Deriving them from TOOL_DEFINITIONS at test time makes
+# both sides of the comparison move together, so recategorising a tool - the very change
+# that was ruled out when the code profile was made an explicit allow-list - could not
+# fail the test. A literal fails on any substitution, not only on ones that change a count.
+# Update them only alongside a deliberate, reviewed change to a tool's category.
+_PROFILE_NONE_NAMES = {
+    "analyze_variant_list",
+    "create_phewas_plot",
+    "get_asm_qtl_by_gene",
+    "get_asm_qtl_by_variant",
+    "get_colocalization",
+    "get_colocalization_by_credible_set",
+    "get_credible_set_by_id",
+    "get_credible_set_leads_by_phenotype",
+    "get_credible_sets_by_gene",
+    "get_credible_sets_by_phenotype",
+    "get_credible_sets_by_qtl_gene",
+    "get_credible_sets_by_region",
+    "get_credible_sets_by_variant",
+    "get_credible_sets_stats",
+    "get_database_schema",
+    "get_dataset_display_names",
+    "get_exome_results_by_gene",
+    "get_exome_results_by_phenotype",
+    "get_exome_results_by_region",
+    "get_exome_results_by_variant",
+    "get_gene_based_results",
+    "get_gene_based_results_by_phenotype",
+    "get_gene_disease_associations",
+    "get_gene_expression",
+    "get_gene_group_members",
+    "get_gene_to_peaks",
+    "get_genes_in_region",
+    "get_hla_by_allele",
+    "get_hla_by_phenotype",
+    "get_ld_between_variants",
+    "get_mpra_by_gene",
+    "get_mpra_by_region",
+    "get_mpra_by_variant",
+    "get_mpra_pip_concordance_by_gene",
+    "get_myvariant_annotations",
+    "get_nearest_genes",
+    "get_open_chromatin_by_gene",
+    "get_open_chromatin_by_peak",
+    "get_open_chromatin_by_region",
+    "get_open_chromatin_by_variant",
+    "get_peak_to_genes",
+    "get_phenotype_report",
+    "get_protein_annotations",
+    "get_resource_metadata",
+    "get_summary_stats",
+    "get_summary_stats_by_region",
+    "get_variant_annotations",
+    "get_variant_effect_by_gene",
+    "get_variant_effect_by_variant",
+    "get_variant_protein_effect",
+    "get_variants_in_ld",
+    "launch_subagents",
+    "list_capabilities",
+    "list_datasets",
+    "lookup_phenotype_names",
+    "lookup_variants_by_rsid",
+    "map_protein_variants",
+    "normalize_gene_symbols",
+    "query_database",
+    "read_artifact",
+    "run_analysis",
+    "search_cbioportal",
+    "search_genes",
+    "search_mgi",
+    "search_phenotypes",
+    "search_scientific_literature",
+    "search_uniprot",
+    "web_search",
+}
+
+_PROFILE_API_NAMES = {
+    "analyze_variant_list",
+    "create_phewas_plot",
+    "get_asm_qtl_by_gene",
+    "get_asm_qtl_by_variant",
+    "get_colocalization",
+    "get_colocalization_by_credible_set",
+    "get_credible_set_by_id",
+    "get_credible_set_leads_by_phenotype",
+    "get_credible_sets_by_gene",
+    "get_credible_sets_by_phenotype",
+    "get_credible_sets_by_qtl_gene",
+    "get_credible_sets_by_region",
+    "get_credible_sets_by_variant",
+    "get_credible_sets_stats",
+    "get_dataset_display_names",
+    "get_exome_results_by_gene",
+    "get_exome_results_by_phenotype",
+    "get_exome_results_by_region",
+    "get_exome_results_by_variant",
+    "get_gene_based_results",
+    "get_gene_based_results_by_phenotype",
+    "get_gene_disease_associations",
+    "get_gene_expression",
+    "get_gene_group_members",
+    "get_gene_to_peaks",
+    "get_genes_in_region",
+    "get_hla_by_allele",
+    "get_hla_by_phenotype",
+    "get_ld_between_variants",
+    "get_mpra_by_gene",
+    "get_mpra_by_region",
+    "get_mpra_by_variant",
+    "get_mpra_pip_concordance_by_gene",
+    "get_myvariant_annotations",
+    "get_nearest_genes",
+    "get_open_chromatin_by_gene",
+    "get_open_chromatin_by_peak",
+    "get_open_chromatin_by_region",
+    "get_open_chromatin_by_variant",
+    "get_peak_to_genes",
+    "get_phenotype_report",
+    "get_protein_annotations",
+    "get_resource_metadata",
+    "get_summary_stats",
+    "get_summary_stats_by_region",
+    "get_variant_annotations",
+    "get_variant_effect_by_gene",
+    "get_variant_effect_by_variant",
+    "get_variant_protein_effect",
+    "get_variants_in_ld",
+    "launch_subagents",
+    "list_capabilities",
+    "list_datasets",
+    "lookup_phenotype_names",
+    "lookup_variants_by_rsid",
+    "map_protein_variants",
+    "normalize_gene_symbols",
+    "read_artifact",
+    "run_analysis",
+    "search_cbioportal",
+    "search_genes",
+    "search_mgi",
+    "search_phenotypes",
+    "search_scientific_literature",
+    "search_uniprot",
+    "web_search",
+}
+
+_PROFILE_BIGQUERY_NAMES = {
+    "create_phewas_plot",
+    "get_database_schema",
+    "get_dataset_display_names",
+    "get_gene_group_members",
+    "get_protein_annotations",
+    "get_resource_metadata",
+    "get_variant_protein_effect",
+    "launch_subagents",
+    "list_capabilities",
+    "list_datasets",
+    "lookup_phenotype_names",
+    "lookup_variants_by_rsid",
+    "map_protein_variants",
+    "normalize_gene_symbols",
+    "query_database",
+    "read_artifact",
+    "run_analysis",
+    "search_cbioportal",
+    "search_genes",
+    "search_mgi",
+    "search_phenotypes",
+    "search_scientific_literature",
+    "search_uniprot",
+    "web_search",
+}
+
+# also the resolved set for any unrecognised profile string, which degrades to general-only
+_PROFILE_RAG_NAMES = {
+    "create_phewas_plot",
+    "get_dataset_display_names",
+    "get_gene_group_members",
+    "get_protein_annotations",
+    "get_resource_metadata",
+    "get_variant_protein_effect",
+    "list_datasets",
+    "lookup_phenotype_names",
+    "lookup_variants_by_rsid",
+    "map_protein_variants",
+    "normalize_gene_symbols",
+    "search_cbioportal",
+    "search_genes",
+    "search_mgi",
+    "search_phenotypes",
+    "search_scientific_literature",
+    "search_uniprot",
+    "web_search",
+}
+
+
 class TestToolDefinitions:
     """Tests for tool definitions and profile filtering."""
 
@@ -876,8 +1074,124 @@ class TestToolDefinitions:
         assert "get_credible_sets_by_gene" not in names
         assert "query_database" not in names
 
+    def test_code_profile_resolves_to_exactly_its_seven_tools(self):
+        """The code profile is an explicit allow-list, not a category union.
+
+        Asserting the SET rather than the count so a silent substitution — one tool
+        renamed or swapped for another — fails instead of passing on arithmetic.
+        """
+        names = {t["name"] for t in get_anthropic_tools(tool_profile="code")}
+
+        assert names == {
+            "run_analysis",
+            "list_capabilities",
+            "read_artifact",
+            "search_genes",
+            "search_phenotypes",
+            "search_scientific_literature",
+            "lookup_variants_by_rsid",
+        }
+
+    def test_code_profile_excludes_launch_subagents(self):
+        """launch_subagents shares the orchestration category with run_analysis but is
+        deliberately not in the code profile: this profile measures one agent with a
+        sandbox, not a fan-out. It is the case a category-based profile could not express.
+        """
+        names = {t["name"] for t in get_anthropic_tools(tool_profile="code")}
+
+        assert "launch_subagents" not in names
+        assert "run_analysis" in names  # same category, still included
+
+    def test_explicit_profile_respects_disabled_tools(self):
+        """disabled_tools is applied before the profile filter, so a deployment flag or
+        the env-driven disable list still removes a tool the profile names."""
+        names = {
+            t["name"]
+            for t in get_anthropic_tools(tool_profile="code", disabled_tools={"read_artifact"})
+        }
+
+        assert "read_artifact" not in names
+        assert "run_analysis" in names
+
+    def test_existing_profiles_unchanged_by_the_code_profile(self):
+        """Adding an explicit-allow-list profile must not move any existing profile.
+
+        Compares whole NAME SETS against frozen literals rather than counts: swapping two
+        tools between categories keeps every count identical while changing what each
+        profile actually sends to the model, and that is exactly the accident this test
+        exists to catch.
+        """
+        assert {t["name"] for t in get_anthropic_tools()} == _PROFILE_NONE_NAMES
+        assert {
+            t["name"] for t in get_anthropic_tools(tool_profile="api")
+        } == _PROFILE_API_NAMES
+        assert {
+            t["name"] for t in get_anthropic_tools(tool_profile="bigquery")
+        } == _PROFILE_BIGQUERY_NAMES
+        assert {
+            t["name"] for t in get_anthropic_tools(tool_profile="rag")
+        } == _PROFILE_RAG_NAMES
+
+    def test_unknown_profile_still_degrades_silently_to_general(self):
+        """Pinned deliberately: an unrecognised profile name does not raise.
+
+        The value is persisted per message in chat_messages.tool_profile and read back
+        from rows written by older clients, so raising would turn a stale row into a 500.
+        The cost is that a typo silently drops 50 tools — documented, not accidental.
+
+        Compared against the frozen literal rather than a set recomputed from
+        TOOL_DEFINITIONS, so a recategorisation cannot move both sides at once.
+        """
+        assert {
+            t["name"] for t in get_anthropic_tools(tool_profile="cdoe")
+        } == _PROFILE_RAG_NAMES
+        assert {t["name"] for t in get_anthropic_tools(tool_profile="")} == _PROFILE_RAG_NAMES
+
+    def test_explicit_and_category_profiles_have_disjoint_names(self):
+        """No profile name may appear in both dicts.
+
+        get_anthropic_tools checks TOOL_PROFILE_TOOLS first and returns on a hit, so a
+        name present in both silently redefines the category-based profile: the entry in
+        TOOL_PROFILES becomes dead code and the profile starts sending a different tool
+        set with nothing else failing.
+        """
+        overlap = set(TOOL_PROFILE_TOOLS) & set(TOOL_PROFILES)
+
+        assert not overlap, (
+            f"profile name(s) {sorted(overlap)} defined in both TOOL_PROFILE_TOOLS and "
+            "TOOL_PROFILES; the explicit allow-list wins and silently overrides the "
+            "category-based definition"
+        )
+
+    def test_explicit_profiles_only_name_tools_that_exist(self):
+        """Every name in every explicit allow-list must resolve to a real tool.
+
+        A typo or a renamed tool leaves the profile quietly one tool short, and the filter
+        cannot detect it: it intersects, so a name matching nothing simply drops out. This
+        covers all explicit profiles, not just the one that has its own resolution test.
+        """
+        defined = {
+            t["name"]
+            for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS + SUBAGENT_TOOL_DEFINITIONS
+        }
+
+        for profile, names in TOOL_PROFILE_TOOLS.items():
+            assert names, f"explicit profile {profile} names no tools"
+            missing = set(names) - defined
+            assert not missing, (
+                f"profile {profile} names non-existent tool(s) {sorted(missing)}"
+            )
+            resolved = {t["name"] for t in get_anthropic_tools(tool_profile=profile)}
+            assert resolved == set(names), (
+                f"profile {profile} resolved to {sorted(resolved)}, expected {sorted(names)}"
+            )
+
     def test_general_tools_present_in_all_profiles(self):
-        """General tools should appear in every profile."""
+        """General tools should appear in every category-based profile.
+
+        TOOL_PROFILE_TOOLS profiles are excluded by construction: they name their tools
+        explicitly and the code profile takes only 4 of the 18 general tools.
+        """
         general_tools = {t["name"] for t in TOOL_DEFINITIONS if t["category"] == "general"}
         assert len(general_tools) > 0
 

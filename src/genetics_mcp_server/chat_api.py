@@ -283,9 +283,10 @@ class ChatRequest(BaseModel):
     )
     tool_profile: str | None = Field(
         None,
-        description="Tool profile controlling which tool categories are available. "
+        description="Tool profile controlling which tools are available. "
         "None = all tools, 'api' = general+API tools, 'bigquery' = general+BigQuery, "
-        "'rag' = general+RAG external tools.",
+        "'rag' = general+RAG external tools, 'code' = the seven-tool code-execution "
+        "surface (no external tools). Unrecognised values degrade to general-only.",
     )
     verbosity: str | None = Field(
         None,

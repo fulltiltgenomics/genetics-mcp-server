@@ -35,7 +35,7 @@ from genetics_mcp_server.mcp_proxy import (
     is_external_tool,
 )
 from genetics_mcp_server.subagent import SubagentService
-from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools import TOOL_PROFILE_TOOLS, ToolExecutor, get_anthropic_tools
 
 logger = logging.getLogger(__name__)
 
@@ -764,9 +764,11 @@ class LLMService:
             )
             local_count = len(tool_definitions)
 
-            # always-on external tools (gnomAD, Open Targets) excluded in RAG profile
+            # always-on external tools (gnomAD, Open Targets) excluded in RAG profile, and
+            # in any explicit-allow-list profile: those name their surface exactly, so
+            # re-adding ~20 proxied tools would defeat the surface they exist to measure
             external_tools = []
-            if tool_profile != "rag":
+            if tool_profile != "rag" and tool_profile not in TOOL_PROFILE_TOOLS:
                 external_tools = get_external_anthropic_tools()
                 tool_definitions.extend(external_tools)
 

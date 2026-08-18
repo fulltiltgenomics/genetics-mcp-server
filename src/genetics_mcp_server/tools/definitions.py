@@ -1708,11 +1708,40 @@ Available skills:
     },
 ]
 
-# valid tool profiles and which categories each profile includes
+# valid tool profiles and which categories each profile includes. Every profile here is a
+# union of whole categories, so each necessarily contains all 18 "general" tools.
 TOOL_PROFILES: dict[str, set[str]] = {
     "api": {"general", "api", "orchestration"},
     "bigquery": {"general", "bigquery", "orchestration"},
     "rag": {"general"},
+}
+
+# profiles named as an explicit allow-list of tool NAMES rather than categories. A profile
+# here takes precedence over TOOL_PROFILES and resolves to exactly these names — nothing
+# else, general tools included.
+#
+# This second mechanism exists because the "code" surface is not expressible as categories
+# and recategorising tools to make it so was ruled out: a tool's category also decides what
+# the api/bigquery chat profiles advertise and what subagent skills declaring
+# tool_categories={"general","api"} can call (skills/definitions.py), so moving one to suit
+# a profile silently changes live chat behaviour. Naming the tools here changes nothing
+# about how any existing profile resolves.
+#
+# "code" (genetics-results-suite-4h6.16) is the minimal code-execution surface: run an
+# analysis script instead of chaining data tools, plus the entity lookups a script needs a
+# human-readable id for. launch_subagents is deliberately absent even though it shares the
+# "orchestration" category — this profile is measuring what one agent does with a sandbox,
+# not what a fan-out does. Ships dark: nothing defaults to it, selection is per request.
+TOOL_PROFILE_TOOLS: dict[str, set[str]] = {
+    "code": {
+        "run_analysis",
+        "list_capabilities",
+        "read_artifact",
+        "search_genes",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "lookup_variants_by_rsid",
+    },
 }
 
 
@@ -1726,10 +1755,17 @@ def get_anthropic_tools(
 
     Args:
         custom_descriptions: Optional dict mapping tool names to custom descriptions
-        tool_profile: Profile controlling which tool categories to include.
-            None = all tools, "api" = general+api, "bigquery" = general+bigquery,
-            "rag" = general only (RAG tools are external, handled separately).
-        disabled_tools: Optional set of tool names to exclude.
+        tool_profile: Profile controlling which tools to include.
+            None = all tools (no filtering at all, not a union of the profiles),
+            "api" = general+api, "bigquery" = general+bigquery,
+            "rag" = general only (RAG tools are external, handled separately),
+            "code" = the seven names in TOOL_PROFILE_TOOLS.
+            An unrecognised string degrades to general-only rather than raising, so a
+            typo costs the model most of its tools silently — deliberate, because the
+            value is persisted per message and read back from rows written by older
+            clients.
+        disabled_tools: Optional set of tool names to exclude. Applied before the
+            profile filter, so a disabled tool stays out of an explicit profile too.
     """
     anthropic_tools = []
 
@@ -1739,8 +1775,12 @@ def get_anthropic_tools(
         all_tools = [t for t in all_tools if t["name"] not in disabled_tools]
 
     if tool_profile is not None:
-        allowed_categories = TOOL_PROFILES.get(tool_profile, {"general"})
-        all_tools = [t for t in all_tools if t.get("category") in allowed_categories]
+        allowed_names = TOOL_PROFILE_TOOLS.get(tool_profile)
+        if allowed_names is not None:
+            all_tools = [t for t in all_tools if t["name"] in allowed_names]
+        else:
+            allowed_categories = TOOL_PROFILES.get(tool_profile, {"general"})
+            all_tools = [t for t in all_tools if t.get("category") in allowed_categories]
 
     for tool_def in all_tools:
         # build input_schema from parameters

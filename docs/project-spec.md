@@ -436,7 +436,9 @@ belongs to `genetics-results-suite-4h6.52` and has not been implemented.
 
 ## Tool Profiles
 
-The chat API supports a `tool_profile` parameter that controls which tool categories are available per request. This enables A/B testing of different tool strategies (API vs BigQuery vs RAG) by sending identical prompts with different profiles.
+The chat API supports a `tool_profile` parameter that controls which tools are available per request. This enables A/B testing of different tool strategies (API vs BigQuery vs RAG vs code execution) by sending identical prompts with different profiles.
+
+Two mechanisms resolve a profile, in `tools/definitions.py`. `TOOL_PROFILES` maps a profile to whole **categories**; `TOOL_PROFILE_TOOLS` maps a profile to an explicit list of tool **names** and takes precedence. The second exists for `code`, whose surface cannot be written as categories — its orchestration tools share a category with `launch_subagents`, which must stay out — and recategorising tools to make it fit was ruled out, since a tool's `category` also decides what the `api` profile advertises and what subagent skills declaring `tool_categories={"general","api"}` can call.
 
 ### Tool categories
 
@@ -453,12 +455,16 @@ Each tool has a `category` field in its definition:
 
 | `tool_profile` value | Local tools | External tools |
 |----------------------|-------------|----------------|
-| `null` (default) | general + api + bigquery + orchestration | always-on (gnomAD, OT) + RAG |
+| `null` (default) | no filtering at all — every definition | always-on (gnomAD, OT) + RAG |
 | `"api"` | general + api + orchestration | always-on only |
 | `"bigquery"` | general + bigquery + orchestration | always-on only |
 | `"rag"` | general only | RAG only |
+| `"code"` | exactly 7 by name: run_analysis, list_capabilities, read_artifact, search_genes, search_phenotypes, search_scientific_literature, lookup_variants_by_rsid | **none** |
+| any other string | general only (silent fallback, no error) | always-on only |
 
-Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"`. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"` and the explicit-allow-list profiles — a `code` profile that named seven tools would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+
+`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default is still `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
 
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
