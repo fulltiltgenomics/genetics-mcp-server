@@ -198,6 +198,21 @@ def render(report: dict[str, Any], csv: bool = False) -> str:
         )
 
     notes = []
+    # a run the server refused partway through is not a slightly incomplete run: the cases
+    # replayed before the refusal keep their cost while everything after cascades, so the
+    # report looks complete and compares almost nothing. Say so before any number is read.
+    limited = [
+        t for t in report.get("turns", [])
+        if t.get("status") == "error" and "429" in str(t.get("error") or "")
+    ]
+    if limited:
+        comparable = len([r for r in rows if not r["blockers"]])
+        notes.append(
+            f"!! THIS RUN WAS RATE-LIMITED: {len(limited)} turn(s) came back HTTP 429, so "
+            f"only {comparable} of {len(rows)} cases are comparable and the numbers below "
+            "are not a benchmark. Raise RATE_LIMIT_PER_HOUR / RATE_LIMIT_PER_DAY on the "
+            "chat service above the whole plan, restart it, and re-run."
+        )
     skipped = [r for r in rows if r["blockers"]]
     if skipped:
         notes.append(

@@ -643,6 +643,18 @@ async def replay_turn(
                     await response.aread()
                     record.status = "error"
                     record.error = f"HTTP {response.status_code}: {response.text[:300]}"
+                    if response.status_code == 429:
+                        # NOT a per-turn failure. The server is refusing everything now, so
+                        # every remaining turn will fail the same way and the cases already
+                        # replayed become uncomparable as their later turns cascade to
+                        # not_attempted. Measured 2026-08-19: a 20-turn run against the
+                        # default RATE_LIMIT_PER_HOUR=20 produced 8 ok / 16 error /
+                        # 29 not_attempted per arm and a report that still looked plausible
+                        # -- 20 cases, both arms, correct arm_tools -- while carrying 8 of
+                        # 53 matched pairs. Raising it to the whole run is the only useful
+                        # response, so stop here rather than spending the rest of the plan
+                        # discovering it 45 more times.
+                        raise RateLimitedError(record.error)
                     return record, None, []
 
                 async for event, data in _sse_events(response.aiter_lines()):
@@ -708,6 +720,10 @@ async def replay_turn(
                         record.ms_to_done = (time.perf_counter() - started) * 1000
                         record.status = "ok"
                         break
+    except RateLimitedError:
+        # the ONE exception to "a broken turn must not abort the run" below: this is not a
+        # broken turn, it is the server refusing every turn from here on
+        raise
     except (httpx.TimeoutException, asyncio.TimeoutError) as e:
         record.status = "timeout"
         record.error = f"{type(e).__name__}: {e}"[:500]
@@ -1160,6 +1176,10 @@ RESOLVED_TOOLS_PATH = "/chat/v1/tools/resolved"
 
 class ArmResolutionError(RuntimeError):
     """An arm does not name a profile the target server knows."""
+
+
+class RateLimitedError(RuntimeError):
+    """The chat service refused a turn with 429. Run-invalidating, not per-turn."""
 
 
 async def resolve_arm_tools(
@@ -1730,20 +1750,40 @@ def main(argv: list[str] | None = None) -> int:
                 print(line)
         return 0
 
-    report = asyncio.run(
-        run_benchmark(
-            dataset=args.dataset,
-            base_url=args.base_url.rstrip("/"),
-            arms=arms,
-            limit=args.limit,
-            concurrency=args.concurrency,
-            model=args.model,
-            timeout=args.timeout,
-            max_turns=args.max_turns,
-            auth_token=os.environ.get("REPLAY_AUTH_TOKEN"),
-            provider=args.provider,
+    try:
+        report = asyncio.run(
+            run_benchmark(
+                dataset=args.dataset,
+                base_url=args.base_url.rstrip("/"),
+                arms=arms,
+                limit=args.limit,
+                concurrency=args.concurrency,
+                model=args.model,
+                timeout=args.timeout,
+                max_turns=args.max_turns,
+                auth_token=os.environ.get("REPLAY_AUTH_TOKEN"),
+                provider=args.provider,
+            )
         )
-    )
+    except RateLimitedError as exc:
+        turns_needed = sum(
+            len((c.get("user_turns") or [])[: args.max_turns])
+            for c in load_cases(args.dataset, args.limit)
+        ) * 2
+        print(
+            f"\nABORTED: the chat service is rate-limiting this run.\n  {exc}\n\n"
+            f"This plan needs {turns_needed} requests; the service's default is "
+            "RATE_LIMIT_PER_HOUR=20 and RATE_LIMIT_PER_DAY=100, both counted per user. A "
+            "run that hits this does not fail cleanly — the turns already replayed keep "
+            "their cost while their later turns cascade to not_attempted, so the report "
+            "looks complete and carries almost no matched pairs.\n\n"
+            "Raise the limits above the whole plan and restart the chat service:\n"
+            f"  RATE_LIMIT_PER_HOUR={max(2000, turns_needed * 2)} "
+            f"RATE_LIMIT_PER_DAY={max(10000, turns_needed * 10)} "
+            "scripts/dev-stack.sh up chat-api\n",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.judge:
         # after the benchmark and before the JSON is written, so the saved report carries the

@@ -110,6 +110,23 @@ def test_an_unjudged_report_says_so_rather_than_showing_an_empty_column():
     assert "has not been judged" in render(_report(turns))
 
 
+def test_a_rate_limited_run_is_called_out_before_any_number_is_read():
+    # the shape measured on 2026-08-19: the server refuses partway, the cases already
+    # replayed keep their cost, everything after cascades, and the report still looks whole
+    turns = [
+        _turn("done", "nocode", 0),
+        _turn("done", "code", 0),
+        _turn("refused", "nocode", 0, status="error"),
+        _turn("refused", "code", 0, status="error"),
+    ]
+    for t in turns[2:]:
+        t["error"] = 'HTTP 429: {"detail":"Rate limit exceeded (hourly limit 20/hour)."}'
+    out = render(_report(turns))
+    assert "RATE-LIMITED" in out
+    assert "1 of 2 cases are comparable" in out
+    assert "RATE_LIMIT_PER_HOUR" in out, "the note must name the knob that fixes it"
+
+
 def test_a_report_judged_without_per_pair_rows_is_distinguished_from_an_unjudged_one():
     turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
     out = render(_report(turns, judging={"arms": ["nocode", "code"], "wins": {}}))
