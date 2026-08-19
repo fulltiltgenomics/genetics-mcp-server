@@ -48,6 +48,7 @@ from genetics_mcp_server.routers import (
     llm_config_router,
 )
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
+from genetics_mcp_server.tools.definitions import TOOL_PROFILE_TOOLS, TOOL_PROFILES
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +397,44 @@ async def chat_status(
 async def list_tools(user: str | None = Depends(auth_required)) -> list[dict[str, Any]]:
     """List available MCP tools with their descriptions and parameters."""
     return TOOL_DEFINITIONS
+
+
+@app.get("/chat/v1/tools/resolved")
+async def list_resolved_tools(
+    tool_profile: str | None = None,
+    enable_tools: bool = True,
+    user: str | None = Depends(auth_required),
+) -> dict[str, Any]:
+    """The LOCAL tool names a chat request with these settings would actually be given.
+
+    `/chat/v1/tools` above answers a different question — it returns TOOL_DEFINITIONS raw,
+    with no profile filter, no feature flags, and neither the BigQuery nor the subagent
+    definition list — so it cannot be used to check what an arm of a benchmark ran with.
+    This one resolves through `service.resolve_local_tool_names`, the SAME call the system
+    prompt is assembled from (genetics-results-suite-4h6.69), so what it reports is what the
+    model was handed.
+
+    IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `get_anthropic_tools` degrades an
+    unrecognised profile to general-only rather than raising, deliberately, because the
+    value is read back from `chat_messages` rows written by older clients — so a typo costs
+    the model most of its tools and nothing anywhere says so. A benchmark arm misspelled
+    that way runs fine and reports plausible numbers. `known_profile: false` is the flag
+    that turns that into something a caller can see.
+
+    `count` is LOCAL tools only. External (gnomAD / Open Targets) and RAG tools are proxied
+    surfaces resolved separately and are not included; see docs/chat-tool-reference.md § 3
+    for the per-profile external/RAG columns.
+    """
+    service = get_llm_service()
+    names = sorted(service.resolve_local_tool_names(tool_profile, enable_tools))
+    known = tool_profile is None or tool_profile in TOOL_PROFILES or tool_profile in TOOL_PROFILE_TOOLS
+    return {
+        "tool_profile": tool_profile,
+        "enable_tools": enable_tools,
+        "known_profile": known,
+        "count": len(names),
+        "names": names,
+    }
 
 
 @app.get("/chat/v1/schema")

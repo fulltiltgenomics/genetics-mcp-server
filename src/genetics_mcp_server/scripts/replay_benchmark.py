@@ -1117,6 +1117,87 @@ def matched_pairs(
     return matched, dropped
 
 
+RESOLVED_TOOLS_PATH = "/chat/v1/tools/resolved"
+
+
+class ArmResolutionError(RuntimeError):
+    """An arm does not name a profile the target server knows."""
+
+
+async def resolve_arm_tools(
+    client: httpx.AsyncClient, base_url: str, arms: tuple[str, str]
+) -> dict[str, Any]:
+    """Ask the SERVER what each arm actually resolves to, before spending anything.
+
+    Two things this prevents, both of which produce a run that looks fine and means nothing:
+
+    1. A MISSPELLED ARM. `get_anthropic_tools` degrades an unrecognised profile to
+       general-only rather than raising — deliberately, because the value comes back from
+       rows written by older clients — so `--arm-a nocod` silently yields an 18-tool
+       baseline and reports plausible numbers against it. `known_profile: false` is fatal
+       here: refusing to start costs nothing, and the alternative is discovering it after
+       the spend.
+    2. A SERVER RUNNING OLDER CODE. The profile is resolved in the chat service's process,
+       which imports the definitions at startup. A profile added on disk but not yet loaded
+       by a running server resolves through the same silent fallback, and locally that is
+       one forgotten restart away.
+
+    The resolved counts and names are recorded in the report so a saved run PROVES what each
+    arm was given, rather than leaving it to be re-derived later from a tree that has since
+    moved. `count` is local tools only; external and RAG surfaces resolve separately.
+
+    A server without the endpoint (older build) is a WARNING, not a failure — the run is
+    still valid, it just cannot carry the proof. Silence would be the wrong trade in the
+    other direction.
+    """
+    out: dict[str, Any] = {}
+    unknown: list[str] = []
+    for arm in arms:
+        params = {} if arm == ALL_TOOLS_ARM else {"tool_profile": arm}
+        try:
+            resp = await client.get(f"{base_url}{RESOLVED_TOOLS_PATH}", params=params)
+        except httpx.HTTPError as exc:
+            logger.warning("could not resolve arm %r against %s: %s", arm, base_url, exc)
+            out[arm] = {"error": str(exc)}
+            continue
+        if resp.status_code == 404:
+            logger.warning(
+                "%s has no %s endpoint, so this report cannot record what each arm was "
+                "given. The run is still valid; verify the arms by hand.",
+                base_url,
+                RESOLVED_TOOLS_PATH,
+            )
+            return {"unavailable": f"{base_url} has no {RESOLVED_TOOLS_PATH}"}
+        if resp.status_code != 200:
+            logger.warning("resolving arm %r returned HTTP %s", arm, resp.status_code)
+            out[arm] = {"error": f"HTTP {resp.status_code}"}
+            continue
+        data = resp.json()
+        out[arm] = {
+            "count": data.get("count"),
+            "known_profile": data.get("known_profile"),
+            "names": data.get("names"),
+        }
+        if data.get("known_profile") is False:
+            unknown.append(arm)
+        else:
+            logger.info("arm %r resolves to %s local tools", arm, data.get("count"))
+    if unknown:
+        raise ArmResolutionError(
+            f"{base_url} does not recognise these arm profiles: {', '.join(unknown)}. "
+            "An unrecognised profile silently degrades to general-only (18 tools), so this "
+            "run would have measured a surface you did not intend. Check the spelling, and "
+            "check the server has been restarted since the profile was added."
+        )
+    return out
+
+
+async def _dry_run_resolve(base_url: str, arms: tuple[str, str]) -> dict[str, Any]:
+    """resolve_arm_tools with its own short-lived client, for the --dry-run path."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await resolve_arm_tools(client, base_url, arms)
+
+
 def build_report(
     cases: list[CaseResult], arms: tuple[str, str], config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1423,6 +1504,7 @@ async def run_benchmark(
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async with httpx.AsyncClient(headers=headers, timeout=timeout) as client:
+        arm_tools = await resolve_arm_tools(client, base_url, arms)
 
         async def guarded(index: int, case: dict[str, Any]) -> CaseResult:
             # the semaphore is held for the WHOLE case so both arms stay adjacent in time
@@ -1490,6 +1572,9 @@ async def run_benchmark(
             "max_turns": max_turns,
             "timeout_s": timeout,
             "secret": True,
+            # what the SERVER said each arm resolves to, asked before the run rather than
+            # re-derived afterwards from a tree that may have moved
+            "arm_tools": arm_tools,
         },
     )
 
@@ -1583,6 +1668,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"{len(cases)} cases, {turns} turns per arm, {turns * 2} model turns total")
         print(f"arms: {arms[0]} vs {arms[1]}   target: {args.base_url}")
+        # the cheapest place a misspelled arm can possibly be caught, so catch it here too
+        # rather than only in the paid path. Reaches the server but spends nothing.
+        try:
+            resolved = asyncio.run(_dry_run_resolve(args.base_url.rstrip("/"), arms))
+        except ArmResolutionError as exc:
+            print(f"\nERROR: {exc}", file=sys.stderr)
+            return 2
+        for arm in arms:
+            info = resolved.get(arm) or {}
+            if "count" in info:
+                print(f"  {arm:>8} resolves to {info['count']} local tools")
         for i, c in enumerate(cases):
             order = arm_order_for_case(arms, i)
             print(f"  {i:>3} {c.get('session_id')} order={order[0]},{order[1]}")
