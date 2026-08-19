@@ -577,6 +577,25 @@ def summarize_verdicts(
     return {
         "model": model,
         "arms": list(arms),
+        # the per-pair outcomes behind every aggregate below. Persisted because the
+        # aggregates answer "which arm won" and cannot answer "on WHICH questions", which is
+        # the actionable half: an arm that loses four of twenty is a different problem from
+        # one that loses uniformly, and only this list distinguishes them. Kept deliberately
+        # narrow — the judge's prose `reason` and the raw passes stay out, since this rides
+        # inside every saved report.
+        "pairs": [
+            {
+                "case_id": v.case_id,
+                "turn_index": v.turn_index,
+                "outcome": v.outcome,
+                "winner": v.winner,
+                "margin": v.margin,
+                # a verdict the blinding failed on is still reported, flagged rather than
+                # dropped, so a scorecard cannot present it as clean
+                "arm_identifiable": v.arm_identifiable,
+            }
+            for v in verdicts
+        ],
         "pairs_offered": len(verdicts),
         "pairs_judged": len(judged),
         "pairs_unresolved": len(verdicts) - len(judged),
