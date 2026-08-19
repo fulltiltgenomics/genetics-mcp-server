@@ -199,6 +199,10 @@ class TurnRecord:
 
     iterations: int | None = None
     tool_calls: int | None = None
+    # the calls behind that count: name, arguments and order, one entry per tool_use block.
+    # `tool_calls` is len() of this, so a count that disagrees with the listing is
+    # impossible. See `extract_tool_calls` for what is and is not kept.
+    tool_calls_detail: list[dict[str, Any]] = field(default_factory=list)
     hit_max_iterations: bool = False
 
     ms_to_first_token: float | None = None
@@ -325,16 +329,49 @@ def _sse_events(lines: AsyncIterator[str]) -> Any:
     return gen()
 
 
-def count_tool_calls(message_content: list[dict[str, Any]] | None) -> int:
-    """Count real tool_use blocks in a done chunk's message_content.
+def extract_tool_calls(message_content: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Every tool_use block in a done chunk, in the order the model emitted them.
 
     Deliberately not the '*[Using tool: X]*' text markers: those are display prose the
     model has been observed to imitate (analyze_conversations, genetics-results-suite-4h6.2).
-    message_content carries the actual blocks from every iteration of the turn.
+    message_content carries the actual blocks from every iteration of the turn, so this is
+    the whole turn's call sequence, in order, with the arguments each was given.
+
+    THE ARGUMENTS ARE KEPT VERBATIM AND UNTRUNCATED, including `run_analysis`'s entire
+    script. That is the point: a tool-call count says the code arm made one call where the
+    baseline made six, and cannot say whether the one call asked for the right thing. Only
+    the arguments distinguish "one good script" from "one wrong script the model never
+    recovered from", and that distinction is most of what a losing case needs explaining.
+
+    Results are NOT recorded, only calls. `tool_results` can carry thousands of data rows
+    per call, which would make a report unreadable and unopenable, and the question this
+    answers is what the model ASKED for.
+
+    `secret=true` does not redact these: llm_service omits tool input from its LOG line, not
+    from the `done` chunk (`block.model_dump(exclude_none=True)`). Verified 2026-08-19. A
+    benchmark dataset is replayed questions, not user data — but note that anything in a
+    replayed question's arguments does land in the report.
     """
     if not message_content:
-        return 0
-    return sum(1 for b in message_content if isinstance(b, dict) and b.get("type") == "tool_use")
+        return []
+    calls = []
+    for block in message_content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        calls.append(
+            {
+                "seq": len(calls),
+                "name": block.get("name"),
+                "id": block.get("id"),
+                "input": block.get("input"),
+            }
+        )
+    return calls
+
+
+def count_tool_calls(message_content: list[dict[str, Any]] | None) -> int:
+    """Count real tool_use blocks. Defined via the extractor so the two cannot disagree."""
+    return len(extract_tool_calls(message_content))
 
 
 def _opt_int(data: dict[str, Any], key: str) -> int | None:
@@ -779,7 +816,8 @@ async def replay_turn(
         )
 
     if record.status == "ok":
-        record.tool_calls = count_tool_calls(message_content)
+        record.tool_calls_detail = extract_tool_calls(message_content)
+        record.tool_calls = len(record.tool_calls_detail)
         record.final_answer, record.final_answer_dropped_chars = final_answer_split(
             message_content
         )

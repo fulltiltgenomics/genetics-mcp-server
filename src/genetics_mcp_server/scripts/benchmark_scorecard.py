@@ -235,18 +235,83 @@ def render(report: dict[str, Any], csv: bool = False) -> str:
     return "\n".join(lines + [""] + notes)
 
 
+def _arg_preview(value: Any, width: int) -> str:
+    """One line of an argument, marked when shortened so nothing reads as complete."""
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def render_tool_calls(report: dict[str, Any], width: int = 100, case: str | None = None) -> str:
+    """The ordered call sequence per case and arm, for reading a result by hand.
+
+    Previews are ELIDED, and say so with a `…`. The untruncated arguments — including
+    `run_analysis`'s whole script — are in the report:
+
+        jq '.turns[] | select(.case_id=="<case>") | {arm, turn_index, tool_calls_detail}' report.json
+    """
+    arms = list(report.get("arms") or [])
+    by_case = _turns_by_case(report, arms)
+    out: list[str] = []
+    for case_id in sorted(by_case):
+        if case and case_id != case:
+            continue
+        out.append(f"\n=== {case_id}")
+        for arm in arms:
+            for t in by_case[case_id][arm]:
+                calls = t.get("tool_calls_detail")
+                turn = f"  [{arm}] turn {t.get('turn_index')}"
+                if t.get("status") != OK:
+                    out.append(f"{turn}: {t.get('status')} — {t.get('error') or 'no detail'}")
+                    continue
+                if calls is None:
+                    out.append(f"{turn}: no tool_calls_detail (report predates it)")
+                    continue
+                if not calls:
+                    out.append(f"{turn}: answered with no tool calls")
+                    continue
+                out.append(f"{turn}: {len(calls)} call(s)")
+                for c in calls:
+                    args = c.get("input") or {}
+                    if isinstance(args, dict) and args:
+                        for k, v in args.items():
+                            out.append(f"      {c['seq']}. {c.get('name')}  {k}={_arg_preview(v, width)}")
+                            break
+                        for k, v in list(args.items())[1:]:
+                            out.append(f"         {' ' * len(str(c['seq']))}   {k}={_arg_preview(v, width)}")
+                    else:
+                        out.append(f"      {c['seq']}. {c.get('name')}  (no arguments)")
+    if not out:
+        return "no matching cases"
+    out.append(
+        "\nArguments above are elided to fit; `…` marks it. Full, untruncated arguments:\n"
+        "  jq '.turns[] | select(.case_id==\"<case>\") | {arm, turn_index, tool_calls_detail}' <report>"
+    )
+    return "\n".join(out)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Per-question side-by-side scorecard from a saved replay_benchmark report."
     )
     p.add_argument("report", type=Path, help="JSON written by replay_benchmark --output")
     p.add_argument("--csv", action="store_true", help="emit CSV instead of a table")
+    p.add_argument(
+        "--tools",
+        action="store_true",
+        help="print each case's ordered tool-call sequence with arguments, instead of the table",
+    )
+    p.add_argument("--case", default=None, help="with --tools, restrict to one case_id")
+    p.add_argument("--arg-width", type=int, default=100, help="argument preview width for --tools")
     args = p.parse_args(argv)
     try:
         report = json.loads(args.report.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         print(f"cannot read {args.report}: {exc}", file=sys.stderr)
         return 1
+    if args.tools:
+        print(render_tool_calls(report, width=args.arg_width, case=args.case))
+        return 0
     print(render(report, csv=args.csv))
     return 0
 
