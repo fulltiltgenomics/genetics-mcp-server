@@ -55,11 +55,18 @@ def anthropic_error_type(e: Exception) -> str | None:
     return None
 
 
-# matches the display-only tool-use marker injected during streaming (see the
-# StreamChunk emitted in _stream_anthropic). non-greedy up to the closing ']*' so
-# an embedded ']' in params (e.g. SQL) doesn't truncate the match; DOTALL because
-# params can span multiple lines.
-_TOOL_USE_MARKER_RE = re.compile(r"\*\[Using tool:.*?\]\*", re.DOTALL)
+# the display-only tool-use markers that end up in stored assistant `content`. Two shapes:
+#
+#  *[Using tool: name; k: v]*  — what this service streamed as prose until
+#    genetics-results-suite-inp. Non-greedy up to the closing ']*' so an embedded ']' in
+#    params (e.g. SQL) doesn't truncate the match; DOTALL because params can span lines.
+#  [TOOLUSE:<base64>]          — written by the CLIENT from the structured `tool_use` chunk
+#    that replaced it, so the disclosure survives a reload the same way [IMAGE:...] does.
+#
+# Both still occur: the first across all stored history, the second in everything new.
+_TOOL_USE_MARKER_RE = re.compile(
+    r"\*\[Using tool:.*?\]\*|\[TOOLUSE:[A-Za-z0-9+/=]*\]", re.DOTALL
+)
 
 # a cell the model wrote as a stand-in for data it never fetched, e.g. "*[from query]*"
 _PLACEHOLDER_CELL_RE = re.compile(
@@ -246,17 +253,31 @@ _THINKING_KEEPALIVE_SECONDS = 10.0
 # a constant here rather than a literal repeated at both emission sites.
 MAX_ITERATIONS_NOTICE = "\n\n*[Max tool iterations reached]*\n"
 
-# run_analysis accepts up to 256 KiB of source; the tool-use indicator and its log line
-# exist to say what is running, not to carry the whole script into either
-_DISPLAY_CODE_CHARS = 400
+# run_analysis accepts up to 256 KiB of source; the log line exists to say what is running,
+# not to carry the whole script into the log. This is a LOG cap only. It used to bound the
+# streamed display too, back when the tool call reached the client as markdown prose with no
+# way to expand it — which meant the one field the user most needed to read was the one field
+# guaranteed to be cut off (genetics-results-suite-inp). The `tool_use` chunk carries the
+# whole script and the client renders it collapsed.
+_LOG_CODE_CHARS = 400
 
+
+def _loggable_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Tool input with an oversize `code` capped, for the log line only."""
+    code = tool_input.get("code")
+    if isinstance(code, str) and len(code) > _LOG_CODE_CHARS:
+        return {
+            **tool_input,
+            "code": f"{code[:_LOG_CODE_CHARS]}...[{len(code)} chars total]",
+        }
+    return tool_input
 
 
 @dataclass
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "thinking", "done", "image", "usage", "script_result"
+    type: str  # "text", "thinking", "done", "image", "usage", "script_result", "tool_use"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -493,7 +514,9 @@ def _process_download_hints(result: dict, owner: str | None = None, tool_name: s
     return result
 
 
-def _script_result_payload(iteration: int, result: dict[str, Any]) -> dict[str, Any]:
+def _script_result_payload(
+    iteration: int, result: dict[str, Any], *, tool_use_id: str | None = None
+) -> dict[str, Any]:
     """Summarise one `run_analysis` outcome for the `script_result` SSE chunk.
 
     THE SANDBOX HAS NO EXIT CODE. The supervisor answers with a `status` of `ok`, `error`,
@@ -524,6 +547,9 @@ def _script_result_payload(iteration: int, result: dict[str, Any]) -> dict[str, 
     duration_ms = result.get("duration_ms")
     return {
         "iteration": iteration,
+        # the `tool_use` chunk this outcome belongs to. An iteration can hold more than one
+        # run_analysis call, so the iteration number alone does not identify one.
+        "tool_use_id": tool_use_id,
         "ran": ran,
         "ok": ok,
         "status": status if ran else (error_type or "unknown"),
@@ -1119,19 +1145,27 @@ class LLMService:
                         # authenticated pair is already on every line via log_prefix.
                         effective_input.pop("user", None)
                         effective_input.pop("session_id", None)
-                        code = effective_input.get("code")
-                        if isinstance(code, str) and len(code) > _DISPLAY_CODE_CHARS:
-                            effective_input["code"] = (
-                                f"{code[:_DISPLAY_CODE_CHARS]}"
-                                f"...[{len(code)} chars total]"
-                            )
                     if secret:
                         logger.info(f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)")
                     else:
-                        logger.info(f"{log_prefix}Executing tool: {tool_use.name} with input: {effective_input}")
-                    params_str = ", ".join(f"{k}: {v}" for k, v in effective_input.items())
+                        logger.info(
+                            f"{log_prefix}Executing tool: {tool_use.name} with input: "
+                            f"{_loggable_tool_input(effective_input)}"
+                        )
+                    # structured, and carrying the input WHOLE: the client renders it as a
+                    # collapsed disclosure it can expand, so nothing here needs to be sized
+                    # for reading inline. `id` is what a later `script_result` correlates
+                    # against to attach the outcome to this specific call.
                     yield StreamChunk(
-                        type="text", content=f"\n\n*[Using tool: {tool_use.name}; {params_str}]*\n\n"
+                        type="tool_use",
+                        content=json.dumps(
+                            {
+                                "id": tool_use.id,
+                                "name": tool_use.name,
+                                "input": effective_input,
+                            },
+                            default=str,
+                        ),
                     )
 
                 # separate subagent tool from regular tools for progress streaming
@@ -1218,8 +1252,52 @@ class LLMService:
                         # it ended, and nothing here carries source, output or artifact names
                         yield StreamChunk(
                             type="script_result",
-                            content=json.dumps(_script_result_payload(iteration, result)),
+                            content=json.dumps(
+                                _script_result_payload(
+                                    iteration, result, tool_use_id=tool_use.id
+                                )
+                            ),
                         )
+                    # run_analysis returns a LIST: a script can write several figures, and
+                    # unlike the single-plot tools it names each one. Stripped from the result
+                    # for the same reason `image_base64` is — base64 in the tool_result is
+                    # tokens the model pays for and cannot see.
+                    if isinstance(result, dict) and isinstance(result.get("images"), list):
+                        streamed_any = False
+                        for image in result["images"]:
+                            if not isinstance(image, dict):
+                                continue
+                            image_data = image.get("content_base64")
+                            if not isinstance(image_data, str) or len(image_data) <= 100:
+                                logger.warning(
+                                    "invalid image artifact from %s: size=%s",
+                                    tool_use.name,
+                                    len(image_data) if isinstance(image_data, str) else 0,
+                                )
+                                continue
+                            content_type = image.get("content_type") or "image/png"
+                            name = image.get("name") or f"{tool_use.name} result"
+                            logger.info(
+                                "Streaming artifact image: name=%s type=%s size=%d chars",
+                                name,
+                                content_type,
+                                len(image_data),
+                            )
+                            yield StreamChunk(
+                                type="image",
+                                content=image_data,
+                                image_format=content_type.split("/", 1)[-1],
+                                image_alt=str(name),
+                            )
+                            streamed_any = True
+                        result = {k: v for k, v in result.items() if k != "images"}
+                        if streamed_any:
+                            result["note"] = (
+                                "The image artifacts have been displayed to the user above. Do "
+                                "not output any image placeholder or markdown - just describe "
+                                "what the plot shows."
+                            )
+
                     if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
                         image_data = result["image_base64"]
                         image_format = result.get("image_format", "png")

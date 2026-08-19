@@ -571,7 +571,16 @@ class TestRunAnalysisDisplayInput:
         ]
 
     def _streamed(self, chunks):
-        return "".join(c.content for c in chunks if c.type == "text")
+        """Everything that reaches the client, whatever chunk type carried it.
+
+        Deliberately not just the text chunks: the identity strip below is a claim about
+        what the USER can see, so narrowing it to one chunk type would let a forged
+        `user` pass simply by moving to another one.
+        """
+        return "".join(c.content for c in chunks if c.type in ("text", "tool_use"))
+
+    def _tool_uses(self, chunks):
+        return [json.loads(c.content) for c in chunks if c.type == "tool_use"]
 
     @pytest.mark.asyncio
     async def test_forged_identity_is_neither_streamed_nor_logged(self, chat_history_db, caplog):
@@ -591,10 +600,23 @@ class TestRunAnalysisDisplayInput:
         assert "attacker@evil.example" not in streamed
         assert "other-sid" not in streamed
         assert "attacker@evil.example" not in caplog.text
-        assert "run_analysis" in streamed
+
+        (tool_use,) = self._tool_uses(chunks)
+        assert tool_use["name"] == "run_analysis"
+        assert tool_use["id"] == "t1"
+        assert "user" not in tool_use["input"]
+        assert "session_id" not in tool_use["input"]
 
     @pytest.mark.asyncio
-    async def test_long_script_is_truncated_for_display(self, chat_history_db, caplog):
+    async def test_the_whole_script_is_streamed_while_the_log_line_stays_capped(
+        self, chat_history_db, caplog
+    ):
+        """The cap is a log concern, not a display one (genetics-results-suite-inp).
+
+        It used to bound both, which meant the one field the user most needed to read was
+        the one field guaranteed to be cut off. The client renders this collapsed, so
+        size is not a reason to withhold it.
+        """
         code = "x = 1  # padding\n" * 4000
         svc = _with_tools(_service(self._turns({"code": code})))
 
@@ -603,10 +625,12 @@ class TestRunAnalysisDisplayInput:
         ):
             chunks = await _run(svc, enable_tools=True)
 
-        streamed = self._streamed(chunks)
-        assert len(streamed) < len(code)
-        assert f"{len(code)} chars total" in streamed
+        (tool_use,) = self._tool_uses(chunks)
+        assert tool_use["input"]["code"] == code
+        assert "chars total" not in tool_use["input"]["code"]
+
         assert len(caplog.text) < len(code)
+        assert f"{len(code)} chars total" in caplog.text
 
 
 class TestResolveLocalToolNames:

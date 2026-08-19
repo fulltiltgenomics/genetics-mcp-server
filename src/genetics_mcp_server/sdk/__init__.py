@@ -1,9 +1,17 @@
 """The `genetics` SDK — importable data access for scripts.
 
-    import genetics_mcp_server.sdk as genetics
+    import genetics                       # inside a run_analysis script
+    import genetics_mcp_server.sdk        # the package itself, anywhere else
 
     df = genetics.credible_sets(gene="IL7R")
     df.filter(pl.col("pip") > 0.5)
+
+`genetics` is an alias the sandbox image installs (`sandbox/genetics_alias.py`), aliased
+through `sys.modules` so both names are the same object rather than two copies of the
+client state. It exists because every surface a script's author can read already calls this
+package `genetics` and the import path did not, which cost every session several executions
+of probing to discover (genetics-results-suite-706). Outside the sandbox only the package
+name works.
 
 A script needs no knowledge of HTTP, tokens, base URLs or result envelopes: endpoints come
 from the environment (GENETICS_API_URL, BIGQUERY_API_URL), every function returns a polars

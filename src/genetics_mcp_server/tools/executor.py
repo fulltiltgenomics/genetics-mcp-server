@@ -5980,7 +5980,61 @@ class ToolExecutor:
                 "retryable": True,
             }
 
-        return self._render_analysis(result)
+        return self._render_analysis(result, images=await self._fetch_analysis_images(result))
+
+    # How many image artifacts one script may have shown for it. A script that writes fifty
+    # PNGs is not asking for fifty pictures in the transcript, and each one is a fetch the
+    # user waits through after the analysis has already finished.
+    _MAX_ANALYSIS_IMAGES = 4
+
+    async def _fetch_analysis_images(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pull the image artifacts of a completed execution back out of the sandbox.
+
+        Automatic rather than a tool the model calls: an image is for the USER to look at,
+        and routing it through the model would cost a roundtrip to fetch something the model
+        cannot see anyway. Everything else in `artifacts/` still has to be printed by the
+        script — this is not general artifact retrieval (`genetics-results-suite-4h6.52`).
+
+        `execution_id` comes from the supervisor's own echoed response and is used here and
+        nowhere else; `_render_analysis` still keeps it out of what the model reads.
+        """
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return []
+        execution_id = result.get("execution_id")
+        if not isinstance(execution_id, str) or not execution_id:
+            return []
+        entries = result.get("artifacts")
+        if not isinstance(entries, list):
+            return []
+
+        from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
+
+        wanted = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            content_type = entry.get("content_type")
+            size = entry.get("size")
+            if not isinstance(name, str) or not name:
+                continue
+            if not isinstance(content_type, str) or not content_type.startswith("image/"):
+                continue
+            # skipped locally rather than fetched and refused: the supervisor would answer
+            # 413 and the round trip buys nothing
+            if isinstance(size, int) and not isinstance(size, bool) and size > ARTIFACT_READ_MAX_BYTES:
+                logger.info("skipping oversize image artifact %s (%d bytes)", name, size)
+                continue
+            wanted.append(name)
+            if len(wanted) >= self._MAX_ANALYSIS_IMAGES:
+                break
+
+        images = []
+        for name in wanted:
+            fetched = await self._sandbox.fetch_artifact(execution_id, name)
+            if fetched:
+                images.append(fetched)
+        return images
 
     @staticmethod
     def _sandbox_operator_error(message: str) -> dict[str, Any]:
@@ -5992,7 +6046,9 @@ class ToolExecutor:
             "retryable": False,
         }
 
-    def _render_analysis(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _render_analysis(
+        self, result: dict[str, Any], images: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         """Turn the supervisor's 200 body into the tool result the model reads.
 
         Tolerant by construction: every field is read defensively, an unknown `status` is
@@ -6035,15 +6091,41 @@ class ToolExecutor:
         omitted = result.get("artifacts_omitted")
         if isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0:
             rendered["artifacts_omitted"] = omitted
+        if images:
+            # base64 payloads, stripped by llm_service before this dict is serialised into the
+            # tool_result — they are for the browser, and the model cannot see an image it is
+            # handed as base64 anyway. The note that replaces them is set there too.
+            rendered["images"] = images
+
         if artifacts:
-            # said once, here, rather than left to the model to infer from the manifest: the
-            # HTTP retrieval path is genetics-results-suite-4h6.52 and does not exist, and
-            # read_artifact in this process reads a local directory that is not the sandbox's
-            # /scratch. Promising a fetch that returns "not enabled here" costs a roundtrip.
-            rendered["artifacts_note"] = (
-                "Artifact contents cannot be retrieved. Print anything from the script that "
-                "you need to read."
-            )
+            # said once, here, rather than left to the model to infer from the manifest.
+            # Images are fetched automatically (see `_fetch_analysis_images`); everything else
+            # still has no retrieval path — `genetics-results-suite-4h6.52` owns general
+            # artifact reads, and `read_artifact` in this process reads a local directory that
+            # is not the sandbox's /scratch. Promising a fetch that returns "not enabled here"
+            # costs a roundtrip.
+            shown = {
+                image["name"]
+                for image in images or []
+                if isinstance(image, dict) and isinstance(image.get("name"), str)
+            }
+            unretrievable = [entry["name"] for entry in artifacts if entry["name"] not in shown]
+            if shown:
+                rendered["artifacts_note"] = (
+                    "Image artifacts have been displayed to the user already; describe what "
+                    "the plot shows rather than emitting a placeholder or a markdown image."
+                )
+                if unretrievable:
+                    rendered["artifacts_note"] += (
+                        " The contents of the other artifacts cannot be retrieved — print "
+                        "anything from the script that you need to read."
+                    )
+            else:
+                rendered["artifacts_note"] = (
+                    "Artifact contents cannot be retrieved. Print anything from the script "
+                    "that you need to read. An image artifact would have been shown to the "
+                    "user automatically."
+                )
 
         if not ok:
             rendered.update(self._analysis_error_fields(result, status_text))
@@ -6203,6 +6285,24 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
     ]
 
 
+# The import line, on EVERY response rather than only the index (genetics-results-suite-706).
+# It used to appear only when `module` was omitted — but a model that knows which module it
+# wants calls straight through with `module="genetics"`, and that response carried signatures
+# and nothing about how to reach them. The one other place the line exists is `sdk.__doc__`,
+# which this catalogue deliberately strips (see `_SDK_MODULE_SUMMARIES`), so there was no
+# reachable statement of it at all and sessions opened by probing `pkgutil.iter_modules()`.
+#
+# It names BOTH forms on purpose. `genetics` is the sandbox alias — the name every tool
+# description, stub file and schema doc already uses, and the one a `run_analysis` script
+# should write. `genetics_mcp_server.sdk` is the package, and is what an MCP client reading
+# this catalogue outside the sandbox would have to import, since the alias ships only in the
+# sandbox image.
+_SDK_USAGE = (
+    "import genetics  (in a run_analysis script; the package itself is "
+    "genetics_mcp_server.sdk)"
+)
+
+
 def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
     from genetics_mcp_server.sdk import client as sdk_client
 
@@ -6214,7 +6314,7 @@ def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
     if module is None:
         return {
             "success": True,
-            "usage": "import genetics_mcp_server.sdk as genetics",
+            "usage": _SDK_USAGE,
             "modules": [
                 {
                     "module": name,
@@ -6237,5 +6337,6 @@ def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
     return {
         "success": True,
         "module": module,
+        "usage": _SDK_USAGE,
         "signatures": "\n\n".join(blocks),
     }

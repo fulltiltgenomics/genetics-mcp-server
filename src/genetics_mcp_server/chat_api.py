@@ -565,6 +565,18 @@ async def stream_chat(
                             "image_alt": chunk.image_alt or "Generated image",
                         }),
                     }
+                elif chunk.type == "tool_use":
+                    # one per tool call, carrying the input WHOLE — a run_analysis script is
+                    # the thing the user most needs to read, and the prose marker this
+                    # replaced cut it off at 400 chars with no way to expand it. The client
+                    # renders a collapsed disclosure; a client that does not know this type
+                    # drops it and simply shows no tool indicator.
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(
+                            {"type": "tool_use", **json.loads(chunk.content)}
+                        ),
+                    }
                 elif chunk.type == "thinking":
                     # keepalive only: carries no reasoning content, and exists so a long
                     # thinking phase doesn't read as a stalled stream to the client

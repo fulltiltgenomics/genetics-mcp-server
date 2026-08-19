@@ -23,7 +23,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
 - **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. `_validate_request_size` bounds the request as a whole — total text across **all** messages (`MAX_REQUEST_CHARS`, default 2M, images excluded) and message count (`MAX_MESSAGES_PER_REQUEST`, default 500) — because the per-message check only ever inspects the newest *user* message, leaving a client-sent assistant turn and every replayed history turn unbounded (`genetics-results-suite-e0u`). Applying the per-message cap to every message would have been the tighter rule and the wrong one: replayed tool results are routinely larger than any typed message, so it would reject ordinary long conversations. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) are inlined by the frontend as text blocks prefixed `[File: <name>]` — both are counted toward the attachment limit, not the character limit. The frontend (`LLMChat.tsx`) mirrors these limits for immediate feedback. Bulk data should be attached as a file rather than pasted
-- **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, since sessions are created lazily after the first exchange and no `session_id` exists at first send. The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
+- **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, so a first send needs no upload endpoint and therefore no session. (The original reason was stronger — sessions were created lazily *after* the first exchange, so there was no `session_id` to upload against at all. That is no longer true: `genetics-results-suite-vda` moved creation ahead of the request, because `run_analysis` refuses a turn whose `session_id` is null. The client-side parse is kept on its own merits, one fewer round trip.) The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens). During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
 - **Chat history persistence**: SQLite-based storage of conversation threads. Assistant turns persist both their content blocks (`content_json`: text + `tool_use`) and the tool outputs (`tool_results_json`: the `tool_result` blocks). Persisting tool results means a **resumed** conversation replays the actual data the model saw, not just its prose summary — preventing factual drift across turns/sessions (see "Tool result persistence" under Architecture decisions)
@@ -235,9 +235,9 @@ not deployed, so every `run_analysis` call fails at the transport today and
 
 | Tool | Description |
 |------|-------------|
-| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Chat-backend only; not registered on the MCP server at all |
-| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
-| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note`. Chat-backend only — excluded from MCP server |
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed but unreadable. Chat-backend only; not registered on the MCP server at all |
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`). Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note` — the sandbox's `GET /artifact` route exists but this tool does not use it, and the model cannot reach it at all. Chat-backend only — excluded from MCP server |
 
 **All three are category `orchestration`**, not `general`: they hand work to another
 runtime rather than fetching data, which is what `launch_subagents` is. The category by
@@ -285,23 +285,71 @@ turns with 6+ roundtrips. So the error carries the exception type, the traceback
 which limit fired, plus a hint that points at `list_capabilities` when the type suggests
 the SDK was called differently from how it is defined.
 
-**Artifacts are listed but not retrievable, and both tools say so.** `run_analysis`'s
-description and its `artifacts_note` state it, and `read_artifact`'s own description now
-carries the same caveat — the two sit in the same chat tool list, and the more specific
-tool promising a fetch is what the note exists to prevent. `read_artifact` in the
-chat-backend process reads a local directory that is not the sandbox's `/scratch` — the
-HTTP proxy is `genetics-results-suite-4h6.52` and does not exist, and
-`SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment. A model told it can fetch a plot
-spends a roundtrip finding out it cannot.
+**Image artifacts come back automatically; nothing else comes back at all, and every tool
+description says so.** After a `status: ok` run, `_fetch_analysis_images` reads the manifest,
+takes up to four entries whose `content_type` starts with `image/` and whose listed size is
+under the sandbox's 512 KiB per-read cap, and fetches each over the supervisor's
+`GET /artifact` route (`genetics-results-suite-8z1`; contract in
+`genetics-results-suite/docs/code-execution-security.md` §2). They ride on the result under
+`images`, and `_stream_anthropic` streams each as an `image` chunk and **strips the key
+before the dict is serialised into the `tool_result`** — base64 in context is tokens paid for
+something the model cannot see. The `execution_id` used for the fetch comes from the
+supervisor's own echoed response and is still kept out of everything the model reads.
 
-**The tool-use indicator mirrors the identity strip, and truncates the script.** The
-`*[Using tool: ...]*` chunk and its log line are rendered from the raw `tool_use.input`,
+Every **other** artifact's contents remain unretrievable, and `run_analysis`'s description,
+its `artifacts_note` and `read_artifact`'s description all say so. `read_artifact` is
+unchanged and does **not** use the new route: it reads a local directory in this process that
+is not the sandbox's `/scratch`, and `SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment.
+General artifact reads and the sid-scoped resolution are still
+`genetics-results-suite-4h6.52`. A model told it can fetch a table spends a roundtrip finding
+out it cannot.
+
+**The SDK is importable as `genetics`, which is what everything already called it.** The
+package is `genetics_mcp_server.sdk`; the sandbox image installs a `sys.modules` alias
+(`sandbox/genetics_alias.py` in genetics-results-suite) so `import genetics` resolves to
+the same object — not a copy, which would give `configure()` two pieces of client state.
+Before that, every tool description, the `list_capabilities` module enum, the shipped
+`genetics.pyi` stub and the schema README all said `genetics` while only
+`genetics_mcp_server.sdk` imported, and the one place the true line lived — `sdk.__doc__` —
+is deliberately stripped from the catalogue. Nothing reachable from inside an execution
+stated it, so every measured session opened with `import genetics` → `ModuleNotFoundError`,
+a second wrong guess and three `pkgutil` probes: six executions before any real work
+(`genetics-results-suite-706`). The catalogue now also returns the import line on every
+response, so the fix does not depend on the image alone.
+
+**`run_analysis` is the one tool that fails closed without a chat session, and a client
+must have one before it sends the turn.** The executor refuses a call with no `user` or no
+`session_id` — `SandboxNotConfigured`, `retryable: False` — because those two become the
+`sub`/`sid` of the per-execution JWTs and so of every audit record, the artifact retention
+scope and the per-`jti` budgets. There is no placeholder that would be honest. The failure
+is a **wiring** fault, not a script fault, and is logged at `ERROR` as
+`run_analysis called without an authenticated identity (user=… session=…)` with the two
+booleans, precisely so an operator can tell which half is missing.
+
+That made the browser's lazy session creation a bug rather than a preference
+(`genetics-results-suite-vda`): a chat started by typing created its session *after* the
+exchange, so the first turn arrived with `session_id: null` and could not run code, while
+every other tool worked and hid it. The client now resolves the session before the request
+(`LLMChat`'s `onEnsureSession`). Any other surface embedding the chat needs the same — a
+session id, or a client-minted conversation id as secret chats use.
+
+**The tool-use indicator mirrors the identity strip; the length cap is a log concern
+only.** The `tool_use` chunk and its log line are rendered from the raw `tool_use.input`,
 one layer above the strip in `_execute_tool`, so a model-invented `user` would be logged
 and streamed as if it were a real argument even though it never reaches the handler — and
 in a log join that reads as identity. `_stream_anthropic` drops `user`/`session_id` from
 the displayed input for `run_analysis` (the authenticated pair is already on every line
-via `log_prefix`) and cuts `code` to `_DISPLAY_CODE_CHARS` (400) with a total-length
-marker, so a 256 KiB script does not land in one log line and in the streamed markdown.
+via `log_prefix`). `_loggable_tool_input` cuts `code` to `_LOG_CODE_CHARS` (400) with a
+total-length marker so a 256 KiB script does not land in one log line.
+
+The **stream** carries the input whole (`genetics-results-suite-inp`). Until then the tool
+call reached the client as markdown prose — `*[Using tool: name; code: …]*` — truncated to
+the same 400 chars, which meant the field the user most needed to read was the one field
+guaranteed to be cut off, with nothing to expand. It is now a structured `tool_use` SSE
+event the client renders as a collapsed disclosure. Stored history still holds the prose
+markers for every turn predating the change; `_TOOL_USE_MARKER_RE` matches both those and
+the client-written `[TOOLUSE:<base64>]` marker that replaced them, so neither shape reaches
+the model on replay.
 
 **The turn budget is this layer's, not the transport's** (`ToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
 300 s, applied with `asyncio.wait_for`). `sandbox_client` bounds each *attempt* correctly
@@ -1486,8 +1534,9 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 | `content` | Streamed text token from the LLM response | `content` (string) |
 | `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
 | `usage` | Context usage and timing snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent`, `turn_elapsed_ms`, `model_ms`, `model_attempts` |
-| `script_result` | Outcome of one completed `run_analysis`, emitted before the next iteration's `usage` | `iteration`, `ran`, `ok`, `status`, `timed_out`, `exception`, `limit`, `duration_ms` |
-| `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
+| `tool_use` | One per tool call, emitted before the tool runs. Carries the input **whole** — the client renders it as a collapsed disclosure, so nothing is sized for reading inline. `input` has had `user`/`session_id` dropped for `run_analysis` and `backend` resolved for `search_scientific_literature` | `id` (the `tool_use` block id, what `script_result` correlates against), `name`, `input` (object) |
+| `script_result` | Outcome of one completed `run_analysis`, emitted before the next iteration's `usage` | `iteration`, `tool_use_id`, `ran`, `ok`, `status`, `timed_out`, `exception`, `limit`, `duration_ms` |
+| `image` | Base64-encoded image (e.g., PheWAS plot) | `image_data` (base64 string), `image_format`, `image_alt` |
 | `error` | Error message from the backend | `content` (error string) |
 | `done` | Signals the stream is complete | `message_content` (assistant text + `tool_use` blocks for persistence), `tool_results` (the `tool_result` blocks for this turn, for persistence) |
 

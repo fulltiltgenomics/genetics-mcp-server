@@ -28,6 +28,8 @@ Two rules this module exists to keep:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import re
@@ -102,6 +104,15 @@ MAX_ERROR_TYPE_CHARS = 256
 so it gets the same scrub-and-cap treatment; the cap is smaller because it is a label."""
 
 MAX_ERROR_MESSAGE_CHARS = 2048
+
+ARTIFACT_READ_MAX_BYTES = 512 * 1024
+"""``ARTIFACT_READ_MAX_BYTES`` in ``sandbox/supervisor.py``. Mirrored so an oversize artifact
+is skipped locally instead of costing a round trip that can only come back 413."""
+
+ARTIFACT_FETCH_TIMEOUT_S = 10.0
+"""``GET /artifact`` reads one already-written file from tmpfs and does not queue behind an
+execution, so it gets nothing like the execute deadline. The caller is holding a finished
+chat turn open while this runs, which is the reason it is short rather than generous."""
 
 
 def client_deadline_s(timeout_s: int) -> float:
@@ -313,6 +324,71 @@ class SandboxClient:
             queued=queued if isinstance(queued, int) and not isinstance(queued, bool) else None,
             http_status=response.status_code,
         )
+
+    async def fetch_artifact(self, execution_id: str, name: str) -> dict[str, Any] | None:
+        """One artifact of a completed execution, or ``None`` if it cannot be served.
+
+        **Never raises.** This runs after the script has already succeeded and its result is
+        on its way to the model; the artifact is an extra. A 404 (reaped, or evicted by the
+        retained-size ceiling), a 413, a restarted sandbox and a malformed body all mean the
+        same thing to the caller — there is no picture to show — and none of them is a reason
+        to fail the analysis that produced it.
+
+        `execution_id` comes from the result the supervisor just echoed back, never from the
+        model: it is the whole authorisation for the read (see `Supervisor.read_artifact`).
+        """
+        if not EXECUTION_ID_PATTERN.fullmatch(execution_id or ""):
+            logger.error("refusing to fetch an artifact for a malformed execution_id")
+            return None
+        timeout = httpx.Timeout(
+            ARTIFACT_FETCH_TIMEOUT_S,
+            connect=CONNECT_TIMEOUT_S,
+            read=ARTIFACT_FETCH_TIMEOUT_S,
+        )
+        try:
+            async with self._client(timeout) as client:
+                response = await client.get(
+                    "/artifact", params={"execution_id": execution_id, "name": name}
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("artifact fetch failed for %s: %s", name, type(exc).__name__)
+            return None
+
+        if response.status_code != 200:
+            _, message = _error_fields(response)
+            logger.info(
+                "sandbox did not serve artifact %s: HTTP %s %s",
+                name,
+                response.status_code,
+                message,
+            )
+            return None
+        try:
+            body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("artifact response for %s was not JSON", name)
+            return None
+        if not isinstance(body, dict):
+            return None
+        encoded = body.get("content_base64")
+        if not isinstance(encoded, str) or not encoded:
+            return None
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            logger.warning("artifact %s did not decode as base64", name)
+            return None
+        if len(data) > ARTIFACT_READ_MAX_BYTES:
+            # the supervisor caps this too; disagreeing is a contract drift worth a log line
+            logger.warning("artifact %s came back over the size cap: %d bytes", name, len(data))
+            return None
+        content_type = body.get("content_type")
+        return {
+            "name": name,
+            "content_type": content_type if isinstance(content_type, str) else None,
+            "content_base64": encoded,
+            "size": len(data),
+        }
 
     async def execute(
         self,

@@ -161,6 +161,19 @@ class TestListCapabilities:
             for token in forbidden:
                 assert token not in rendered, f"{token!r} leaked for module {module!r}"
 
+    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors"])
+    async def test_every_response_says_how_to_import_the_sdk(self, executor, module):
+        """genetics-results-suite-706: the catalogue is the only reachable place that can.
+
+        `sdk.__doc__` carries the import line and is deliberately stripped (the test above),
+        so a script's author had no way to learn it — every session opened with
+        `import genetics` -> ModuleNotFoundError and several `pkgutil` probes. The line used
+        to be on the index only, which is the response a model that already knows its module
+        never asks for.
+        """
+        result = await executor.list_capabilities(module=module)
+        assert "import genetics" in result["usage"]
+
     async def test_index_summaries_do_not_come_from_module_docstrings(self, executor):
         from genetics_mcp_server import sdk
 
@@ -508,10 +521,14 @@ class TestArtifactsDirectoryChecks:
 class _StubSandbox:
     """Stands in for SandboxClient. Records what it was asked and replays one outcome."""
 
-    def __init__(self, result=None, raises=None):
+    def __init__(self, result=None, raises=None, artifacts=None):
         self.result = result
         self.raises = raises
         self.calls = []
+        # name -> what fetch_artifact answers. The default is None for every name, which is
+        # the real client's answer for a reaped, evicted, oversize or unservable artifact.
+        self.artifacts = artifacts or {}
+        self.fetched = []
 
     async def execute(self, *, code, user, session_id, timeout_s=None, execution_id=None):
         self.calls.append(
@@ -526,6 +543,10 @@ class _StubSandbox:
         if self.raises is not None:
             raise self.raises
         return self.result
+
+    async def fetch_artifact(self, execution_id, name):
+        self.fetched.append((execution_id, name))
+        return self.artifacts.get(name)
 
 
 def _result_body(**overrides):
@@ -785,6 +806,108 @@ class TestRunAnalysisRendering:
         result = await _run(executor, _StubSandbox(result=body))
         assert "cannot be retrieved" in result["artifacts_note"]
 
+
+def _image(name="plot.png", content_type="image/png", data="aW1hZ2UtYnl0ZXM="):
+    return {"name": name, "content_type": content_type, "content_base64": data, "size": 11}
+
+
+class TestRunAnalysisImages:
+    """Image artifacts come back automatically; nothing else does.
+
+    Automatic because the picture is for the USER: routing it through a tool the model calls
+    spends a roundtrip fetching something the model cannot look at. The base64 rides on the
+    result under `images` and llm_service strips it before the tool_result is serialised —
+    tested there, since this layer is what produces it.
+    """
+
+    async def test_an_image_artifact_is_fetched_and_attached(self, executor):
+        body = _result_body(
+            artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}]
+        )
+        sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        result = await _run(executor, sandbox)
+
+        assert [i["name"] for i in result["images"]] == ["plot.png"]
+        assert sandbox.fetched == [("8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b", "plot.png")]
+        assert "displayed to the user" in result["artifacts_note"]
+
+    async def test_only_image_content_types_are_fetched(self, executor):
+        body = _result_body(
+            artifacts=[
+                {"name": "table.csv", "size": 9, "content_type": "text/csv"},
+                {"name": "plot.png", "size": 11, "content_type": "image/png"},
+                {"name": "notes.txt", "size": 4, "content_type": None},
+            ]
+        )
+        sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        result = await _run(executor, sandbox)
+
+        assert [name for _, name in sandbox.fetched] == ["plot.png"]
+        # the note has to say BOTH things: the plot is shown, the csv still has to be printed
+        assert "displayed to the user" in result["artifacts_note"]
+        assert "cannot be retrieved" in result["artifacts_note"]
+
+    async def test_an_oversize_image_is_not_even_requested(self, executor):
+        from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
+
+        body = _result_body(
+            artifacts=[
+                {
+                    "name": "huge.png",
+                    "size": ARTIFACT_READ_MAX_BYTES + 1,
+                    "content_type": "image/png",
+                }
+            ]
+        )
+        sandbox = _StubSandbox(result=body)
+        result = await _run(executor, sandbox)
+        assert sandbox.fetched == []
+        assert "images" not in result
+
+    async def test_the_number_of_images_is_bounded(self, executor):
+        names = [f"p{i}.png" for i in range(10)]
+        body = _result_body(
+            artifacts=[{"name": n, "size": 11, "content_type": "image/png"} for n in names]
+        )
+        sandbox = _StubSandbox(result=body, artifacts={n: _image(name=n) for n in names})
+        result = await _run(executor, sandbox)
+        assert len(result["images"]) == executor._MAX_ANALYSIS_IMAGES
+        assert len(sandbox.fetched) == executor._MAX_ANALYSIS_IMAGES
+
+    async def test_an_artifact_the_sandbox_will_not_serve_costs_only_the_picture(self, executor):
+        """The reaper, the retained-size ceiling and a restart all answer None here."""
+        body = _result_body(
+            artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}]
+        )
+        result = await _run(executor, _StubSandbox(result=body, artifacts={}))
+        assert result["success"] is True
+        assert result["output"] == "rows: 12\n"
+        assert "images" not in result
+        assert "cannot be retrieved" in result["artifacts_note"]
+
+    async def test_a_failed_run_fetches_nothing(self, executor):
+        """A killed script's artifacts/ has been trimmed and the run has no picture to show;
+        asking anyway spends a round trip per artifact on the path that is already slowest."""
+        body = _result_body(
+            status="error",
+            error={"type": "ValueError", "message": "boom", "traceback": None, "limit": None},
+            artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}],
+        )
+        sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        result = await _run(executor, sandbox)
+        assert sandbox.fetched == []
+        assert "images" not in result
+
+    async def test_the_execution_id_still_never_reaches_the_model(self, executor):
+        """It is used to fetch and is not part of what is rendered."""
+        body = _result_body(
+            artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}]
+        )
+        result = await _run(
+            executor, _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        )
+        assert "8f14e45f" not in str(result)
+
     async def test_a_malformed_manifest_entry_is_dropped_not_fatal(self, executor):
         body = _result_body(artifacts=["plot.png", {"size": 3}, {"name": "ok.tsv"}])
         result = await _run(executor, _StubSandbox(result=body))
@@ -898,10 +1021,11 @@ class TestRunAnalysisIdentity:
 
 def test_script_result_payload_marks_a_successful_run_as_not_a_failure(executor):
     payload = _script_result_payload(
-        3, executor._render_analysis({"status": "ok", "duration_ms": 812})
+        3, executor._render_analysis({"status": "ok", "duration_ms": 812}), tool_use_id="t7"
     )
     assert payload == {
         "iteration": 3,
+        "tool_use_id": "t7",
         "ran": True,
         "ok": True,
         "status": "ok",

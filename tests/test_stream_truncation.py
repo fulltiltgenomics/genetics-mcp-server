@@ -482,6 +482,71 @@ async def test_run_analysis_emits_one_script_result_chunk_before_the_next_usage(
 
 
 @pytest.mark.asyncio
+async def test_the_script_result_names_the_tool_use_it_belongs_to():
+    """An iteration can hold more than one run_analysis, so the iteration number does not
+    identify one. The client attaches the outcome to a specific collapsed tool call."""
+    turns = [_run_analysis_turn(tool_use_id="ra-7"), _text_turn("done")]
+    svc = _tooled_service(turns, {"success": True, "status": "ok", "output": "1"})
+    chunks = await _collect_with_tool(svc)
+
+    payload = json.loads(next(c.content for c in chunks if c.type == "script_result"))
+    tool_use = json.loads(next(c.content for c in chunks if c.type == "tool_use"))
+    assert payload["tool_use_id"] == "ra-7" == tool_use["id"]
+
+
+@pytest.mark.asyncio
+async def test_image_artifacts_are_streamed_and_never_reach_the_tool_result():
+    """The base64 is for the browser. In the tool_result it is tokens the model pays for
+    and cannot see — the same reason `image_base64` is stripped on the single-plot path."""
+    data = "aW1hZ2UtYnl0ZXM" + "A" * 200
+    turns = [_run_analysis_turn(), _text_turn("the plot shows a peak")]
+    svc = _tooled_service(
+        turns,
+        {
+            "success": True,
+            "status": "ok",
+            "output": "done\n",
+            "images": [
+                {"name": "locus.png", "content_type": "image/png", "content_base64": data},
+                {"name": "qq.svg", "content_type": "image/svg+xml", "content_base64": data},
+            ],
+        },
+    )
+    chunks = await _collect_with_tool(svc)
+
+    images = [c for c in chunks if c.type == "image"]
+    assert [c.image_alt for c in images] == ["locus.png", "qq.svg"]
+    assert [c.image_format for c in images] == ["png", "svg+xml"]
+    assert all(c.content == data for c in images)
+
+    done = next(c for c in chunks if c.type == "done")
+    serialised = json.dumps(done.tool_results)
+    assert data not in serialised
+    assert "images" not in serialised
+    assert "displayed to the user" in serialised
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_image_entry_is_skipped_without_losing_the_result():
+    turns = [_run_analysis_turn(), _text_turn("done")]
+    svc = _tooled_service(
+        turns,
+        {
+            "success": True,
+            "status": "ok",
+            "output": "done\n",
+            "images": ["not a dict", {"name": "x.png"}, {"content_base64": "tiny"}],
+        },
+    )
+    chunks = await _collect_with_tool(svc)
+
+    assert not [c for c in chunks if c.type == "image"]
+    done = next(c for c in chunks if c.type == "done")
+    (result,) = done.tool_results
+    assert json.loads(result["content"])["output"] == "done\n"
+
+
+@pytest.mark.asyncio
 async def test_a_tool_that_is_not_run_analysis_emits_no_script_result_chunk():
     block = _Block("tool_use", id="t1", name="get_variants", input={})
     turns = [([], _FakeMessage([block], "tool_use")), _text_turn("answer")]
