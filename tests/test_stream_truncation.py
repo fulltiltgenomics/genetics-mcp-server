@@ -5,6 +5,8 @@ These cover `LLMService._stream_anthropic`, which the rest of the suite bypasses
 mocking `stream_chat` wholesale.
 """
 
+import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -344,3 +346,210 @@ async def test_adaptive_thinking_omitted_for_older_model():
     ):
         pass
     assert "thinking" not in svc.anthropic_client.messages.calls[0]
+
+
+# ------------------------------- per-iteration timing and the script_result chunk (4h6.73, 4h6.71)
+
+
+_TOOL_PHASE_S = 0.12
+
+
+def _run_analysis_turn(tool_use_id="ra-1"):
+    block = _Block("tool_use", id=tool_use_id, name="run_analysis", input={"code": "print(1)"})
+    return ([], _FakeMessage([block], "tool_use"))
+
+
+async def _collect_with_tool(svc):
+    chunks = []
+    async for chunk in svc._stream_anthropic(
+        messages=[{"role": "user", "content": "hi"}],
+        model="claude-opus-5",
+        system_prompt=None,
+        enable_tools=False,
+    ):
+        chunks.append(chunk)
+    return chunks
+
+
+def _tooled_service(turns, tool_result):
+    """A service whose only tool call is `run_analysis`, answered by `tool_result`.
+
+    `_execute_tool` is replaced rather than the executor stubbed: the point of these tests
+    is the streaming loop's chunk emission and its clock, not tool dispatch. The sleep makes
+    the tool phase measurable, which is what separates `model_ms` from `turn_elapsed_ms`.
+    """
+    svc = _service(turns, executor=SimpleNamespace())
+
+    async def _execute_tool(name, tool_input, *args, **kwargs):
+        await asyncio.sleep(_TOOL_PHASE_S)
+        return tool_result
+
+    svc._execute_tool = _execute_tool
+    return svc
+
+
+@pytest.mark.asyncio
+async def test_usage_chunks_carry_turn_elapsed_and_model_time_separately():
+    """`turn_elapsed_ms` is cumulative from the turn's start; `model_ms` is this call alone.
+
+    The tool phase sits BETWEEN iteration 1's usage chunk and iteration 2's model call, so
+    it must appear in the growth of turn_elapsed_ms and must NOT appear in either model_ms.
+    That is the property that tells the two epochs apart: were turn_elapsed_ms a
+    per-iteration delta, or model_ms measured across the tool phase, this would fail.
+    """
+    turns = [_run_analysis_turn(), _text_turn("answer")]
+    svc = _tooled_service(turns, {"success": True, "status": "ok", "output": "1"})
+    chunks = await _collect_with_tool(svc)
+
+    usages = [json.loads(c.content) for c in chunks if c.type == "usage"]
+    assert len(usages) == 2
+    first, second = usages
+
+    assert first["turn_elapsed_ms"] < second["turn_elapsed_ms"]
+    # each model call is bounded by the elapsed reading taken right after it
+    assert first["model_ms"] <= first["turn_elapsed_ms"]
+    assert second["model_ms"] <= second["turn_elapsed_ms"] - first["turn_elapsed_ms"] + 1
+
+    tool_phase_ms = second["turn_elapsed_ms"] - first["turn_elapsed_ms"] - second["model_ms"]
+    assert tool_phase_ms >= _TOOL_PHASE_S * 1000 * 0.9
+    # the sleep is in the tool phase, not in either model call
+    assert second["model_ms"] < _TOOL_PHASE_S * 1000
+
+
+@pytest.mark.asyncio
+async def test_model_attempts_makes_a_retry_inflated_model_ms_identifiable():
+    """`model_ms` is not model latency: the span encloses the retry loop's backoff sleep.
+
+    One transient failure costs a 1s `asyncio.sleep` that lands inside the figure, so a
+    reader diffing "model time" across arms is diffing something that includes it. The
+    attempt count is on the wire beside it precisely so that reading is identifiable rather
+    than merely disclaimed. Both halves are asserted: the inflation is real, and the field
+    reports it.
+    """
+    import httpx
+    from anthropic import APIConnectionError
+
+    turns = [_text_turn("answer")]
+    svc = _service(turns)
+    inner = svc.anthropic_client.messages
+    failures = {"left": 1}
+
+    def stream(**params):
+        if failures["left"]:
+            failures["left"] -= 1
+            raise APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com"))
+        return _FakeMessages.stream(inner, **params)
+
+    svc.anthropic_client = SimpleNamespace(messages=SimpleNamespace(stream=stream))
+
+    usage = json.loads(next(c.content for c in await _collect(svc) if c.type == "usage"))
+    assert usage["model_attempts"] == 2
+    # the first backoff is 2**0 = 1s, and it is inside model_ms — which is the whole point
+    assert usage["model_ms"] >= 900
+
+
+@pytest.mark.asyncio
+async def test_model_attempts_is_one_when_the_call_succeeds_first_time():
+    usage = json.loads(
+        next(c.content for c in await _collect(_service([_text_turn("hi")])) if c.type == "usage")
+    )
+    assert usage["model_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_analysis_emits_one_script_result_chunk_before_the_next_usage():
+    """Ordering is what the retry-loop counter reads: failure, then a further roundtrip."""
+    turns = [_run_analysis_turn(), _text_turn("sorry")]
+    failed = {
+        "success": False,
+        "status": "error",
+        "output": "",
+        "error": "boom",
+        "error_type": "ValueError",
+        "duration_ms": 7,
+    }
+    svc = _tooled_service(turns, failed)
+    chunks = await _collect_with_tool(svc)
+
+    ordered = [c.type for c in chunks if c.type in ("usage", "script_result", "done")]
+    assert ordered == ["usage", "script_result", "usage", "done"]
+
+    payload = json.loads(next(c.content for c in chunks if c.type == "script_result"))
+    assert payload["iteration"] == 1
+    assert payload["ran"] is True and payload["ok"] is False
+    assert payload["exception"] == "ValueError"
+    assert payload["duration_ms"] == 7
+
+
+@pytest.mark.asyncio
+async def test_the_script_result_names_the_tool_use_it_belongs_to():
+    """An iteration can hold more than one run_analysis, so the iteration number does not
+    identify one. The client attaches the outcome to a specific collapsed tool call."""
+    turns = [_run_analysis_turn(tool_use_id="ra-7"), _text_turn("done")]
+    svc = _tooled_service(turns, {"success": True, "status": "ok", "output": "1"})
+    chunks = await _collect_with_tool(svc)
+
+    payload = json.loads(next(c.content for c in chunks if c.type == "script_result"))
+    tool_use = json.loads(next(c.content for c in chunks if c.type == "tool_use"))
+    assert payload["tool_use_id"] == "ra-7" == tool_use["id"]
+
+
+@pytest.mark.asyncio
+async def test_image_artifacts_are_streamed_and_never_reach_the_tool_result():
+    """The base64 is for the browser. In the tool_result it is tokens the model pays for
+    and cannot see — the same reason `image_base64` is stripped on the single-plot path."""
+    data = "aW1hZ2UtYnl0ZXM" + "A" * 200
+    turns = [_run_analysis_turn(), _text_turn("the plot shows a peak")]
+    svc = _tooled_service(
+        turns,
+        {
+            "success": True,
+            "status": "ok",
+            "output": "done\n",
+            "images": [
+                {"name": "locus.png", "content_type": "image/png", "content_base64": data},
+                {"name": "qq.svg", "content_type": "image/svg+xml", "content_base64": data},
+            ],
+        },
+    )
+    chunks = await _collect_with_tool(svc)
+
+    images = [c for c in chunks if c.type == "image"]
+    assert [c.image_alt for c in images] == ["locus.png", "qq.svg"]
+    assert [c.image_format for c in images] == ["png", "svg+xml"]
+    assert all(c.content == data for c in images)
+
+    done = next(c for c in chunks if c.type == "done")
+    serialised = json.dumps(done.tool_results)
+    assert data not in serialised
+    assert "images" not in serialised
+    assert "displayed to the user" in serialised
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_image_entry_is_skipped_without_losing_the_result():
+    turns = [_run_analysis_turn(), _text_turn("done")]
+    svc = _tooled_service(
+        turns,
+        {
+            "success": True,
+            "status": "ok",
+            "output": "done\n",
+            "images": ["not a dict", {"name": "x.png"}, {"content_base64": "tiny"}],
+        },
+    )
+    chunks = await _collect_with_tool(svc)
+
+    assert not [c for c in chunks if c.type == "image"]
+    done = next(c for c in chunks if c.type == "done")
+    (result,) = done.tool_results
+    assert json.loads(result["content"])["output"] == "done\n"
+
+
+@pytest.mark.asyncio
+async def test_a_tool_that_is_not_run_analysis_emits_no_script_result_chunk():
+    block = _Block("tool_use", id="t1", name="get_variants", input={})
+    turns = [([], _FakeMessage([block], "tool_use")), _text_turn("answer")]
+    svc = _tooled_service(turns, {"success": True, "results": []})
+    chunks = await _collect_with_tool(svc)
+    assert not [c for c in chunks if c.type == "script_result"]

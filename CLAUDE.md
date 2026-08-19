@@ -41,6 +41,7 @@ violate this; it runs from the `pre-commit` hook.
 | `src/genetics_mcp_server/config/**` | `docs/project-spec.md`, `.env.example` | env-var tables, default prompts; every new variable in `.env.example` |
 | `src/genetics_mcp_server/auth/**`, `mcp_server.py`, `mcp_proxy.py` | `docs/project-spec.md`, `README.md` | bearer auth branches, `MCP_API_KEY` being mandatory on remote transports, `MCP_ALLOW_QUERY_TOKEN` gating, external MCP proxying |
 | `src/genetics_mcp_server/scripts/analyze_variants.py` | `docs/variant-list-analysis.md` | CLI flags, input format, output JSON shape |
+| `src/genetics_mcp_server/scripts/replay_benchmark.py`, `pairwise_judge.py` | `docs/project-spec.md` | the Replay Benchmark and Paired Quality Judging sections: what the report enumerates and every hard-coded number quoted there (`MIN_DECISIVE_PAIRS` = 6, the 12,000-character elision limit, the sha256 presentation seed), plus the per-test-file table row for `test_pairwise_judge.py` |
 
 A doc is stale the moment it *enumerates* something the code no longer matches.
 Counts and lists rot silently — tool tables, endpoint lists, env-var tables — so

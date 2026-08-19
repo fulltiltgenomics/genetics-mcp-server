@@ -52,6 +52,10 @@ check '^src/genetics_mcp_server/scripts/analyze_variants\.py$' \
     '^docs/variant-list-analysis\.md$' \
     'scripts/analyze_variants.py -> docs/variant-list-analysis.md (CLI flags, input format, output JSON shape)'
 
+check '^src/genetics_mcp_server/scripts/(replay_benchmark|pairwise_judge)\.py$' \
+    '^docs/project-spec\.md$' \
+    'scripts/replay_benchmark.py, pairwise_judge.py -> docs/project-spec.md (Replay Benchmark + Paired Quality Judging: what the report enumerates, MIN_DECISIVE_PAIRS=6, the 12,000-char elision limit, the sha256 seed, the test-file table row)'
+
 if [ "$found" -eq 1 ]; then
     printf '\n  Update the doc in this commit, or note why it does not apply.\n' >&2
     printf '  Not blocking. Mappings live in CLAUDE.md > Documentation ownership.\n\n' >&2

@@ -575,6 +575,72 @@ class TestHealth:
             await _client(handler).health()
 
 
+class TestFetchArtifact:
+    """`fetch_artifact` runs after the analysis has already succeeded, so it never raises.
+
+    Every failure it can meet — reaped, evicted, oversize, restarted sandbox, a body that is
+    not what the contract says — means the same thing to its caller: there is no picture to
+    show. Turning any of them into an exception would lose the analysis to save the figure.
+    """
+
+    EID = "3f1a2b3c-4d5e-4f60-8a1b-2c3d4e5f6071"
+
+    def _served(self, data: bytes, content_type="image/png"):
+        import base64
+
+        return _Recorder(
+            httpx.Response(
+                200,
+                json={
+                    "execution_id": self.EID,
+                    "name": "plot.png",
+                    "content_type": content_type,
+                    "size": len(data),
+                    "content_base64": base64.b64encode(data).decode("ascii"),
+                },
+            )
+        )
+
+    async def test_returns_the_encoded_bytes_and_asks_by_name(self):
+        recorder = self._served(b"\x89PNG-data")
+        fetched = await _client(recorder).fetch_artifact(self.EID, "plot.png")
+        assert fetched["content_type"] == "image/png"
+        assert fetched["size"] == len(b"\x89PNG-data")
+
+        url = recorder.requests[0].url
+        assert url.path == "/artifact"
+        assert dict(url.params) == {"execution_id": self.EID, "name": "plot.png"}
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            _error_response(404, "NotFound"),
+            _error_response(413, "ArtifactTooLarge"),
+            _error_response(500, "InternalError"),
+            httpx.Response(200, content=b"not json"),
+            httpx.Response(200, json={"execution_id": EID, "content_base64": "!!!not base64"}),
+            httpx.Response(200, json={"execution_id": EID}),
+        ],
+    )
+    async def test_every_refusal_and_malformed_body_is_none_not_an_exception(self, response):
+        assert await _client(_Recorder(response)).fetch_artifact(self.EID, "plot.png") is None
+
+    async def test_an_unreachable_sandbox_is_none(self):
+        def handler(request, parsed=None):
+            raise httpx.ConnectError("refused")
+
+        assert await _client(handler).fetch_artifact(self.EID, "plot.png") is None
+
+    async def test_a_malformed_execution_id_is_never_sent(self):
+        recorder = _Recorder(httpx.Response(200, json={}))
+        assert await _client(recorder).fetch_artifact("../etc", "plot.png") is None
+        assert recorder.requests == []
+
+    async def test_a_body_over_the_size_cap_is_refused_locally(self):
+        oversize = b"x" * (sandbox_client.ARTIFACT_READ_MAX_BYTES + 1)
+        assert await _client(self._served(oversize)).fetch_artifact(self.EID, "plot.png") is None
+
+
 class TestConfiguration:
     def test_the_base_url_is_one_setting_with_no_local_prod_branch(self, monkeypatch):
         settings_module.get_settings.cache_clear()

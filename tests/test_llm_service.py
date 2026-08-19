@@ -21,6 +21,7 @@ from test_stream_truncation import _Block, _delta_event, _FakeMessage, _service
 
 from genetics_mcp_server.cost import estimate_cost
 from genetics_mcp_server.llm_service import (
+    LLMService,
     _count_result_items,
     _mark_history_cache_breakpoint,
     _sanitize_tool_blocks,
@@ -570,7 +571,16 @@ class TestRunAnalysisDisplayInput:
         ]
 
     def _streamed(self, chunks):
-        return "".join(c.content for c in chunks if c.type == "text")
+        """Everything that reaches the client, whatever chunk type carried it.
+
+        Deliberately not just the text chunks: the identity strip below is a claim about
+        what the USER can see, so narrowing it to one chunk type would let a forged
+        `user` pass simply by moving to another one.
+        """
+        return "".join(c.content for c in chunks if c.type in ("text", "tool_use"))
+
+    def _tool_uses(self, chunks):
+        return [json.loads(c.content) for c in chunks if c.type == "tool_use"]
 
     @pytest.mark.asyncio
     async def test_forged_identity_is_neither_streamed_nor_logged(self, chat_history_db, caplog):
@@ -590,10 +600,23 @@ class TestRunAnalysisDisplayInput:
         assert "attacker@evil.example" not in streamed
         assert "other-sid" not in streamed
         assert "attacker@evil.example" not in caplog.text
-        assert "run_analysis" in streamed
+
+        (tool_use,) = self._tool_uses(chunks)
+        assert tool_use["name"] == "run_analysis"
+        assert tool_use["id"] == "t1"
+        assert "user" not in tool_use["input"]
+        assert "session_id" not in tool_use["input"]
 
     @pytest.mark.asyncio
-    async def test_long_script_is_truncated_for_display(self, chat_history_db, caplog):
+    async def test_the_whole_script_is_streamed_while_the_log_line_stays_capped(
+        self, chat_history_db, caplog
+    ):
+        """The cap is a log concern, not a display one (genetics-results-suite-inp).
+
+        It used to bound both, which meant the one field the user most needed to read was
+        the one field guaranteed to be cut off. The client renders this collapsed, so
+        size is not a reason to withhold it.
+        """
         code = "x = 1  # padding\n" * 4000
         svc = _with_tools(_service(self._turns({"code": code})))
 
@@ -602,7 +625,69 @@ class TestRunAnalysisDisplayInput:
         ):
             chunks = await _run(svc, enable_tools=True)
 
-        streamed = self._streamed(chunks)
-        assert len(streamed) < len(code)
-        assert f"{len(code)} chars total" in streamed
+        (tool_use,) = self._tool_uses(chunks)
+        assert tool_use["input"]["code"] == code
+        assert "chars total" not in tool_use["input"]["code"]
+
         assert len(caplog.text) < len(code)
+        assert f"{len(code)} chars total" in caplog.text
+
+
+class TestResolveLocalToolNames:
+    """The system prompt is assembled from this, so it must agree with the tool list.
+
+    Both failure modes below used to survive the whole suite: every test disabled
+    subagents through `Settings.enable_subagents` while ALSO leaving
+    `subagent_service = None`, so the flag and the liveness check were indistinguishable,
+    and nothing exercised `mcp_enabled` here at all.
+    """
+
+    @staticmethod
+    def _svc(*, subagent_service):
+        svc = LLMService.__new__(LLMService)
+        svc.subagent_service = subagent_service
+        return svc
+
+    @staticmethod
+    def _patch_settings(monkeypatch, **overrides):
+        from genetics_mcp_server.config.settings import Settings
+
+        settings = Settings(**overrides)
+        monkeypatch.setattr("genetics_mcp_server.llm_service.get_settings", lambda: settings)
+
+    def test_mcp_disabled_advertises_nothing(self, monkeypatch):
+        """MCP_ENABLED=false hands the model no tools, so the prompt must name none."""
+        self._patch_settings(monkeypatch, mcp_enabled=False)
+        assert self._svc(subagent_service=object()).resolve_local_tool_names() == set()
+
+    def test_mcp_enabled_advertises_tools(self, monkeypatch):
+        self._patch_settings(monkeypatch, mcp_enabled=True)
+        assert len(self._svc(subagent_service=object()).resolve_local_tool_names()) > 20
+
+    def test_enable_tools_false_advertises_nothing(self, monkeypatch):
+        self._patch_settings(monkeypatch, mcp_enabled=True)
+        svc = self._svc(subagent_service=object())
+        assert svc.resolve_local_tool_names(enable_tools=False) == set()
+
+    def test_flag_on_but_service_dead_still_hides_launch_subagents(self, monkeypatch):
+        """ENABLE_SUBAGENTS=true with no live subagent service.
+
+        `Settings.disabled_tools` gates on the flag alone, so only the liveness check
+        removes the tool here. This is the exact drift 4h6.69 exists to prevent: the
+        prompt would otherwise carry the whole Subagent Orchestration section for a tool
+        the model was never handed.
+        """
+        self._patch_settings(monkeypatch, enable_subagents=True)
+        dead = self._svc(subagent_service=None).resolve_local_tool_names()
+        live = self._svc(subagent_service=object()).resolve_local_tool_names()
+        assert "launch_subagents" not in dead
+        assert "launch_subagents" in live
+
+    def test_prompt_matches_the_resolution_when_the_service_is_dead(self, monkeypatch):
+        from genetics_mcp_server.config.defaults import default_system_prompt
+
+        self._patch_settings(monkeypatch, enable_subagents=True)
+        names = self._svc(subagent_service=None).resolve_local_tool_names()
+        prompt = default_system_prompt("FinnGenie", tool_names=names)
+        assert "launch_subagents" not in prompt
+        assert "Subagent Orchestration" not in prompt

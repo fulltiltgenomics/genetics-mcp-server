@@ -48,6 +48,7 @@ from genetics_mcp_server.routers import (
     llm_config_router,
 )
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
+from genetics_mcp_server.tools.definitions import TOOL_PROFILE_TOOLS, TOOL_PROFILES
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +399,44 @@ async def list_tools(user: str | None = Depends(auth_required)) -> list[dict[str
     return TOOL_DEFINITIONS
 
 
+@app.get("/chat/v1/tools/resolved")
+async def list_resolved_tools(
+    tool_profile: str | None = None,
+    enable_tools: bool = True,
+    user: str | None = Depends(auth_required),
+) -> dict[str, Any]:
+    """The LOCAL tool names a chat request with these settings would actually be given.
+
+    `/chat/v1/tools` above answers a different question — it returns TOOL_DEFINITIONS raw,
+    with no profile filter, no feature flags, and neither the BigQuery nor the subagent
+    definition list — so it cannot be used to check what an arm of a benchmark ran with.
+    This one resolves through `service.resolve_local_tool_names`, the SAME call the system
+    prompt is assembled from (genetics-results-suite-4h6.69), so what it reports is what the
+    model was handed.
+
+    IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `get_anthropic_tools` degrades an
+    unrecognised profile to general-only rather than raising, deliberately, because the
+    value is read back from `chat_messages` rows written by older clients — so a typo costs
+    the model most of its tools and nothing anywhere says so. A benchmark arm misspelled
+    that way runs fine and reports plausible numbers. `known_profile: false` is the flag
+    that turns that into something a caller can see.
+
+    `count` is LOCAL tools only. External (gnomAD / Open Targets) and RAG tools are proxied
+    surfaces resolved separately and are not included; see docs/chat-tool-reference.md § 3
+    for the per-profile external/RAG columns.
+    """
+    service = get_llm_service()
+    names = sorted(service.resolve_local_tool_names(tool_profile, enable_tools))
+    known = tool_profile is None or tool_profile in TOOL_PROFILES or tool_profile in TOOL_PROFILE_TOOLS
+    return {
+        "tool_profile": tool_profile,
+        "enable_tools": enable_tools,
+        "known_profile": known,
+        "count": len(names),
+        "names": names,
+    }
+
+
 @app.get("/chat/v1/schema")
 async def get_schema(
     table: str | None = None,
@@ -518,7 +557,14 @@ async def stream_chat(
     # travel separately and land in their own cache block after this one, which both
     # keeps the shared block cacheable across users and puts the envelope's guardrail
     # postamble last, where recency favours it.
-    system_prompt = default_system_prompt(settings.app_name)
+    # assembled against the tool list THIS request will actually get, so the prompt never
+    # documents a tool the model was not given (genetics-results-suite-4h6.69). Resolution
+    # goes through the service rather than being recomputed here: one home for the
+    # profile + feature-flag + subagent-liveness filtering that also builds the tool list.
+    system_prompt = default_system_prompt(
+        settings.app_name,
+        tool_names=service.resolve_local_tool_names(request.tool_profile, request.enable_tools),
+    )
     system_prompt += verbosity_prompt(request.verbosity)
     user_instructions = _resolve_user_instructions(
         user, request.instruction_set_id, secret=request.secret
@@ -558,6 +604,18 @@ async def stream_chat(
                             "image_alt": chunk.image_alt or "Generated image",
                         }),
                     }
+                elif chunk.type == "tool_use":
+                    # one per tool call, carrying the input WHOLE — a run_analysis script is
+                    # the thing the user most needs to read, and the prose marker this
+                    # replaced cut it off at 400 chars with no way to expand it. The client
+                    # renders a collapsed disclosure; a client that does not know this type
+                    # drops it and simply shows no tool indicator.
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(
+                            {"type": "tool_use", **json.loads(chunk.content)}
+                        ),
+                    }
                 elif chunk.type == "thinking":
                     # keepalive only: carries no reasoning content, and exists so a long
                     # thinking phase doesn't read as a stalled stream to the client
@@ -569,6 +627,17 @@ async def stream_chat(
                     yield {
                         "event": "message",
                         "data": json.dumps({"type": "usage", **json.loads(chunk.content)}),
+                    }
+                elif chunk.type == "script_result":
+                    # one per completed run_analysis. Metadata only (outcome, exception type,
+                    # duration) — the script's source and output travel in the tool_result,
+                    # not here. Unhandled chunk types are dropped silently by this dispatch,
+                    # which is why the replay benchmark's script metrics need this branch.
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(
+                            {"type": "script_result", **json.loads(chunk.content)}
+                        ),
                     }
                 elif chunk.type == "done":
                     yield {

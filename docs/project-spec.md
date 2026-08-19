@@ -23,7 +23,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
 - **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. `_validate_request_size` bounds the request as a whole — total text across **all** messages (`MAX_REQUEST_CHARS`, default 2M, images excluded) and message count (`MAX_MESSAGES_PER_REQUEST`, default 500) — because the per-message check only ever inspects the newest *user* message, leaving a client-sent assistant turn and every replayed history turn unbounded (`genetics-results-suite-e0u`). Applying the per-message cap to every message would have been the tighter rule and the wrong one: replayed tool results are routinely larger than any typed message, so it would reject ordinary long conversations. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) are inlined by the frontend as text blocks prefixed `[File: <name>]` — both are counted toward the attachment limit, not the character limit. The frontend (`LLMChat.tsx`) mirrors these limits for immediate feedback. Bulk data should be attached as a file rather than pasted
-- **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, since sessions are created lazily after the first exchange and no `session_id` exists at first send. The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
+- **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, so a first send needs no upload endpoint and therefore no session. (The original reason was stronger — sessions were created lazily *after* the first exchange, so there was no `session_id` to upload against at all. That is no longer true: `genetics-results-suite-vda` moved creation ahead of the request, because `run_analysis` refuses a turn whose `session_id` is null. The client-side parse is kept on its own merits, one fewer round trip.) The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens). During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
 - **Chat history persistence**: SQLite-based storage of conversation threads. Assistant turns persist both their content blocks (`content_json`: text + `tool_use`) and the tool outputs (`tool_results_json`: the `tool_result` blocks). Persisting tool results means a **resumed** conversation replays the actual data the model saw, not just its prose summary — preventing factual drift across turns/sessions (see "Tool result persistence" under Architecture decisions)
@@ -235,9 +235,9 @@ not deployed, so every `run_analysis` call fails at the transport today and
 
 | Tool | Description |
 |------|-------------|
-| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Chat-backend only; not registered on the MCP server at all |
-| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
-| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note`. Chat-backend only — excluded from MCP server |
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed but unreadable. Chat-backend only; not registered on the MCP server at all |
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`). Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note` — the sandbox's `GET /artifact` route exists but this tool does not use it, and the model cannot reach it at all. Chat-backend only — excluded from MCP server |
 
 **All three are category `orchestration`**, not `general`: they hand work to another
 runtime rather than fetching data, which is what `launch_subagents` is. The category by
@@ -285,23 +285,71 @@ turns with 6+ roundtrips. So the error carries the exception type, the traceback
 which limit fired, plus a hint that points at `list_capabilities` when the type suggests
 the SDK was called differently from how it is defined.
 
-**Artifacts are listed but not retrievable, and both tools say so.** `run_analysis`'s
-description and its `artifacts_note` state it, and `read_artifact`'s own description now
-carries the same caveat — the two sit in the same chat tool list, and the more specific
-tool promising a fetch is what the note exists to prevent. `read_artifact` in the
-chat-backend process reads a local directory that is not the sandbox's `/scratch` — the
-HTTP proxy is `genetics-results-suite-4h6.52` and does not exist, and
-`SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment. A model told it can fetch a plot
-spends a roundtrip finding out it cannot.
+**Image artifacts come back automatically; nothing else comes back at all, and every tool
+description says so.** After a `status: ok` run, `_fetch_analysis_images` reads the manifest,
+takes up to four entries whose `content_type` starts with `image/` and whose listed size is
+under the sandbox's 512 KiB per-read cap, and fetches each over the supervisor's
+`GET /artifact` route (`genetics-results-suite-8z1`; contract in
+`genetics-results-suite/docs/code-execution-security.md` §2). They ride on the result under
+`images`, and `_stream_anthropic` streams each as an `image` chunk and **strips the key
+before the dict is serialised into the `tool_result`** — base64 in context is tokens paid for
+something the model cannot see. The `execution_id` used for the fetch comes from the
+supervisor's own echoed response and is still kept out of everything the model reads.
 
-**The tool-use indicator mirrors the identity strip, and truncates the script.** The
-`*[Using tool: ...]*` chunk and its log line are rendered from the raw `tool_use.input`,
+Every **other** artifact's contents remain unretrievable, and `run_analysis`'s description,
+its `artifacts_note` and `read_artifact`'s description all say so. `read_artifact` is
+unchanged and does **not** use the new route: it reads a local directory in this process that
+is not the sandbox's `/scratch`, and `SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment.
+General artifact reads and the sid-scoped resolution are still
+`genetics-results-suite-4h6.52`. A model told it can fetch a table spends a roundtrip finding
+out it cannot.
+
+**The SDK is importable as `genetics`, which is what everything already called it.** The
+package is `genetics_mcp_server.sdk`; the sandbox image installs a `sys.modules` alias
+(`sandbox/genetics_alias.py` in genetics-results-suite) so `import genetics` resolves to
+the same object — not a copy, which would give `configure()` two pieces of client state.
+Before that, every tool description, the `list_capabilities` module enum, the shipped
+`genetics.pyi` stub and the schema README all said `genetics` while only
+`genetics_mcp_server.sdk` imported, and the one place the true line lived — `sdk.__doc__` —
+is deliberately stripped from the catalogue. Nothing reachable from inside an execution
+stated it, so every measured session opened with `import genetics` → `ModuleNotFoundError`,
+a second wrong guess and three `pkgutil` probes: six executions before any real work
+(`genetics-results-suite-706`). The catalogue now also returns the import line on every
+response, so the fix does not depend on the image alone.
+
+**`run_analysis` is the one tool that fails closed without a chat session, and a client
+must have one before it sends the turn.** The executor refuses a call with no `user` or no
+`session_id` — `SandboxNotConfigured`, `retryable: False` — because those two become the
+`sub`/`sid` of the per-execution JWTs and so of every audit record, the artifact retention
+scope and the per-`jti` budgets. There is no placeholder that would be honest. The failure
+is a **wiring** fault, not a script fault, and is logged at `ERROR` as
+`run_analysis called without an authenticated identity (user=… session=…)` with the two
+booleans, precisely so an operator can tell which half is missing.
+
+That made the browser's lazy session creation a bug rather than a preference
+(`genetics-results-suite-vda`): a chat started by typing created its session *after* the
+exchange, so the first turn arrived with `session_id: null` and could not run code, while
+every other tool worked and hid it. The client now resolves the session before the request
+(`LLMChat`'s `onEnsureSession`). Any other surface embedding the chat needs the same — a
+session id, or a client-minted conversation id as secret chats use.
+
+**The tool-use indicator mirrors the identity strip; the length cap is a log concern
+only.** The `tool_use` chunk and its log line are rendered from the raw `tool_use.input`,
 one layer above the strip in `_execute_tool`, so a model-invented `user` would be logged
 and streamed as if it were a real argument even though it never reaches the handler — and
 in a log join that reads as identity. `_stream_anthropic` drops `user`/`session_id` from
 the displayed input for `run_analysis` (the authenticated pair is already on every line
-via `log_prefix`) and cuts `code` to `_DISPLAY_CODE_CHARS` (400) with a total-length
-marker, so a 256 KiB script does not land in one log line and in the streamed markdown.
+via `log_prefix`). `_loggable_tool_input` cuts `code` to `_LOG_CODE_CHARS` (400) with a
+total-length marker so a 256 KiB script does not land in one log line.
+
+The **stream** carries the input whole (`genetics-results-suite-inp`). Until then the tool
+call reached the client as markdown prose — `*[Using tool: name; code: …]*` — truncated to
+the same 400 chars, which meant the field the user most needed to read was the one field
+guaranteed to be cut off, with nothing to expand. It is now a structured `tool_use` SSE
+event the client renders as a collapsed disclosure. Stored history still holds the prose
+markers for every turn predating the change; `_TOOL_USE_MARKER_RE` matches both those and
+the client-written `[TOOLUSE:<base64>]` marker that replaced them, so neither shape reaches
+the model on replay.
 
 **The turn budget is this layer's, not the transport's** (`ToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
 300 s, applied with `asyncio.wait_for`). `sandbox_client` bounds each *attempt* correctly
@@ -311,9 +359,13 @@ attempts sum, though: 5 + 10 + 255, a 60 s `Retry-After`, then another 270 is ~5
 ten minutes inside one tool call is not a chat turn. 300 s is the smallest cap that never
 truncates a legitimate single attempt (270 s at the maximum `timeout_s`), so raising
 `timeout_s` trades away the retry rather than the run. Exceeding it reports
-`TurnBudgetExceeded` and says the script may still be running — it is not a script failure,
-and neither is `SandboxUnavailable`, which means a deploy left no sandbox for up to ~130 s
-(`strategy: Recreate` plus `terminationGracePeriodSeconds: 130`).
+`TurnBudgetExceeded` and says the script may still be running — a shape the benchmark
+buckets on its own, since it is neither cleanly a script failure nor cleanly an
+infrastructure fault (a single script cannot reach a 300 s cap against a 120 s
+`MAX_TIMEOUT_S`). `SandboxUnavailable` is unambiguously infrastructure: a deploy left no
+sandbox for up to ~130 s (`strategy: Recreate` plus `terminationGracePeriodSeconds: 130`).
+`SandboxRejected` and the blank-script `EmptyScript`, by contrast, are the model's own
+doing — it chose the `timeout_s`, the code size or the empty string.
 
 **`SandboxTokenUnavailable` is caught first and by name, and `run_analysis` has no
 `except Exception` at all** — a deliberate departure from the ~40 handlers around it.
@@ -1167,8 +1219,76 @@ replace the entire prompt for their turn and discard every grounding, citation, 
 out-of-scope rule, bypassing all of the care above with a field two lines away from it. The field
 was removed rather than gated; nothing in the suite ever sent it. Pydantic ignores unknown keys, so
 a caller still sending one is silently ignored rather than 422'd. The prompt handed to
-`llm_service.stream_chat(system_prompt=...)` is always `default_system_prompt(app_name)` plus the
-verbosity fragment — that parameter is the internal channel `chat_api` assembles, not an override.
+`llm_service.stream_chat(system_prompt=...)` is always
+`default_system_prompt(app_name, tool_names=...)` plus the verbosity fragment — that parameter is
+the internal channel `chat_api` assembles, not an override.
+
+**The prompt is assembled from the tool list in force** (`genetics-results-suite-4h6.69`).
+`config/defaults.py` holds `_PROMPT_BLOCKS`, a tuple of `_Block`s rather than one string; a block
+is emitted only if every tool name appearing in its text is in `tool_names`, with `excludes`,
+`requires_any` and `requires_all` as further subtractive gates. `chat_api` gets that list from
+`LLMService.resolve_local_tool_names(tool_profile, enable_tools)`, the same profile +
+`settings.disabled_tools` + subagent-liveness resolution that builds the tool list itself, so on
+the **Anthropic** path the prompt cannot describe a tool the model was not given. It does not
+hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor `tool_profile`
+and never sets `tools`, so that provider receives the prompt assembled for the full local set
+while getting no tools at all — pre-existing, and unchanged by 4h6.69. Consequences on the
+Anthropic path: the "Subagent Orchestration" section and the "variant_list_analysis skill"
+reference disappear with `ENABLE_SUBAGENTS=false`, "Phenotype Reports" with
+`ENABLE_PHENOTYPE_REPORT=false`, and every per-tool routing section under `tool_profile="code"`.
+`tool_names=None` skips the filtering entirely and emits every block.
+
+Because a block is dropped for ANY unavailable name in it, a tool named in passing would take
+its whole block with it — a parenthetical, an example or a negation is enough. **Domain science
+and grounding rules are therefore written into blocks that name no tool**, with only the "which
+tool" clause split into its own gated block: the HLA section, the pseudo-credible-set labelling
+obligation, the case-sensitive `data_type` values and the membership / re-query rules all survive
+on `bigquery` and `code`, which reach `credible_sets_v` and `hla_associations_v` through SQL.
+Section headings follow the same rule — `## Data Sources and Resource Names` is its own ungated
+block, because a gated heading over an ungated body reparents the body under the section before it.
+
+`tests/test_system_prompt.py` pins three properties across the `None`/`api`/`bigquery`/`rag`/`code`
+profiles with `ENABLE_SUBAGENTS` both true and false: **absence** (every tool name in the emitted
+prompt is in the resolved list, tokenising independently of the gate's own matcher), **presence**
+(emitted headings pinned per profile, load-bearing science and grounding strings asserted present
+— absence-only assertions cannot see text going missing), and **structure** (no body line lands
+under a different heading than it has in the unfiltered text, no heading is emitted empty). It
+also asserts the `run_analysis` bullet is byte-identical across every arm that carries it, which
+is what makes the `code`-vs-baseline A/B a comparison of tools rather than of wording.
+A fourth property is deliberately NOT parametrised over the five profiles, because that is what
+missed the defect it guards: `TestEverySurfaceWithADataPathIsRouted` drives ~80 tool sets off the
+full list — every single-tool removal plus flag-shaped family removals and their pairs — and
+asserts each surface reaching data through `get_credible_sets_by_gene`, `query_database` or
+`run_analysis` emits **exactly one** arm-routing sentence, never zero and never two. Every profile
+happens to carry all three tools the API-preference bullet cited as examples, so the bullet's
+hostage dependence on them was invisible profile-by-profile.
+`tests/test_llm_service.py::TestResolveLocalToolNames` pins the resolution itself: `MCP_ENABLED=false`
+advertises nothing, and `ENABLE_SUBAGENTS=true` with a dead `subagent_service` still hides
+`launch_subagents`. Those two disabling reasons must remain distinguishable in tests, so
+`_CapturingService` in `tests/test_chat_api.py` holds a live `subagent_service`.
+
+**Routing arbitration has one home.** The preference between "call a dedicated API tool", "write
+SQL" and "write one script" is stated once, in the prompt's "Choosing How to Get Data" section,
+in the variant matching the tools present. It used to live half in the prompt ("prefer API tools
+over the database") and half inside `run_analysis`'s description ("use this instead of chaining
+data-access tools"), which contradicted it and was invisible to anyone reading the prompt.
+`run_analysis`'s description now states its capability only. Preconditions of a single tool stay
+in that tool's description, where they travel with it and reach MCP clients too — which is why
+"call `get_database_schema` first" lives in `query_database`'s description and is no longer
+repeated in the prompt. A surface with `run_analysis` but no `query_database` (profiles `api`
+and `code`) has neither that tool nor `get_database_schema` yet still reads all the SQL
+guidance, so it gets the SDK's own route — `genetics.schema()` / `genetics.schema('<view>')`,
+emitted only there.
+
+Which routing variant is emitted turns on two facts about the surface: whether the per-entity API
+tools are present (`get_credible_sets_by_gene` is the sentinel the database-only variant already
+excludes on) and whether `query_database` is. Both API-side variants used to encode the first fact
+only by NAMING those tools in an illustrative `(e.g. …)` list, so removing any one example — a
+flag in front of `get_gene_based_results`, say — dropped the sentence on the text gate while the
+other variants stayed suppressed by their own `excludes`, and the whole API-vs-database
+arbitration disappeared, leaving the `run_analysis` bullet unopposed on a benchmark built to
+compare exactly those two. The precondition is now an explicit `requires_all` and each `(e.g. …)`
+list is its own block: an absent example costs the examples, never the arbitration.
 
 The same capability had a second form: a client-sent **system-role message**. `ChatMessage.role`
 was an unvalidated `str`, and `_stream_openai` forwarded the caller's messages verbatim after
@@ -1413,8 +1533,10 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 |------------|-------------|--------------------|
 | `content` | Streamed text token from the LLM response | `content` (string) |
 | `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
-| `usage` | Context usage snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent` |
-| `image` | Base64-encoded image (e.g., PheWAS plot) | `content` (base64 string) |
+| `usage` | Context usage and timing snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent`, `turn_elapsed_ms`, `model_ms`, `model_attempts` |
+| `tool_use` | One per tool call, emitted before the tool runs. Carries the input **whole** — the client renders it as a collapsed disclosure, so nothing is sized for reading inline. `input` has had `user`/`session_id` dropped for `run_analysis` and `backend` resolved for `search_scientific_literature` | `id` (the `tool_use` block id, what `script_result` correlates against), `name`, `input` (object) |
+| `script_result` | Outcome of one completed `run_analysis`, emitted before the next iteration's `usage` | `iteration`, `tool_use_id`, `ran`, `ok`, `status`, `timed_out`, `exception`, `limit`, `duration_ms` |
+| `image` | Base64-encoded image (e.g., PheWAS plot) | `image_data` (base64 string), `image_format`, `image_alt` |
 | `error` | Error message from the backend | `content` (error string) |
 | `done` | Signals the stream is complete | `message_content` (assistant text + `tool_use` blocks for persistence), `tool_results` (the `tool_result` blocks for this turn, for persistence) |
 
@@ -1439,6 +1561,47 @@ name says `total_`:
 - `context_window` — total context window size for the model (from `get_context_window()`)
 - `context_percent` — percentage of the context window this call filled
   (`input_tokens / context_window * 100`)
+- `turn_elapsed_ms` — milliseconds **since the turn started** (the same monotonic zero as
+  the `wall_ms` written to `chat_turn_metrics`), sampled the moment this iteration's model
+  response completed. Cumulative, not a per-iteration delta — the delta is the difference
+  between consecutive values, so both readings are available and neither has to be guessed
+- `model_ms` — wall time of **this iteration's model call**, which is *not* the same as
+  model latency: the timed span encloses the whole transient-error retry loop, so a retry's
+  1/2/4 s backoff sleep is inside the figure, and because the producer is an async generator
+  yielding per delta it also carries downstream SSE serialisation and socket backpressure.
+  `turn_elapsed_ms` minus the previous iteration's `turn_elapsed_ms` minus this `model_ms`
+  is exactly the previous iteration's tool phase, because this chunk is emitted before any
+  tool of its own iteration runs
+- `model_attempts` — how many times the streaming call was attempted this iteration (`1`
+  when it succeeded first time). Emitted so that a retry-inflated `model_ms` is
+  *identifiable* rather than merely disclaimed; the backoff schedule is deterministic
+  (1 + 2 + 4 s), so an attempt count bounds how much of the figure is sleep
+
+Payload fields for `script_result`, one per completed `run_analysis` call:
+- `iteration` — the agentic-loop iteration whose model response requested the script
+- `ran` — whether the **sandbox executed** the script at all. That is the only question it
+  answers. It is **not** a verdict on whose fault a non-run was: `false` covers a restarting
+  sandbox, a full queue and an unminted signing key, which say nothing about the script —
+  but it also covers `EmptyScript` (the model emitted blank or non-string `code`) and
+  `SandboxRejected` (the model chose a `timeout_s` outside 1..120, or oversize code), which
+  are the model's doing entirely. A consumer splitting model faults from infrastructure
+  faults classifies on `status`, never on `ran` alone
+- `ok` — whether the script succeeded. **There is no `exit_code`**: the supervisor answers
+  with a status string, so an exit code would be invented rather than measured
+- `status` — the supervisor's `ok` / `error` / `timeout` / `limit` when `ran`, otherwise
+  the executor's error type (`EmptyScript`, `SandboxRejected`, `SandboxUnavailable`,
+  `SandboxBusy`, `SandboxNotConfigured`, `TurnBudgetExceeded`, …). Every non-run shape sets
+  one — the blank-script shape gained `EmptyScript` for exactly this reason, since without
+  it the chunk read `unknown`, indistinguishable from a genuine transport fault
+- `timed_out` — the **script's own** wall clock fired; not the turn budget, whose expiry
+  leaves the script possibly still running
+- `exception` — the script's exception type when it failed, else `null`
+- `limit` — which sandbox limit fired (`OutputLimit`, `MemoryLimit`, …), else `null`
+- `duration_ms` — the sandbox's own measured execution time when it reported one
+
+The chunk carries metadata only: the script's source, its output and its artifact names
+stay in the `tool_result` the model reads. It is what `replay_benchmark.py` counts script
+failures and retry loops from.
 
 A consumer can therefore price **the main agentic loop's Anthropic API calls** exactly
 from the stream alone, with no `chat_turn_metrics` row: uncached input is
@@ -1529,7 +1692,7 @@ partial findings instead of treating a fragment as the subagent's complete answe
 5. A sentinel `None` signals all subagents have finished, ending the drain loop
 6. Regular tools and subagents run concurrently — regular tool tasks are gathered alongside the subagent task
 
-**System prompt orchestration guidance**: The default system prompt (`config/defaults.py`) includes a "Subagent Orchestration" section that tells the LLM:
+**System prompt orchestration guidance**: The default system prompt (`config/defaults.py`) includes a "Subagent Orchestration" section — emitted **only when `launch_subagents` is in the resolved tool list**, so with `ENABLE_SUBAGENTS=false` the model is neither given the tool nor told about it — that tells the LLM:
 - When to use subagents vs direct tool calls (parallel independent tasks vs simple lookups)
 - Available skills and their best use cases
 - How to structure subagent tasks (self-contained questions, pass context explicitly, split by skill not entity)
@@ -1949,6 +2112,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling (runs a local stub SSE server) |
+| `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded, length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
 
 Run tests:
 ```bash
@@ -1971,6 +2135,12 @@ SQLite DB, persists per-conversation analysis results back into that DB (the
 report (`report.md`) plus an eval dataset. With `--output-dir` it also writes a
 local-dev `metrics.json` (consumed by `plot_conversation_scores.py` for
 quality-over-time plots).
+
+Its quality judge scores **one conversation at a time, absolutely**, which is the right
+instrument for sampling and for tracking quality over time and the wrong one for
+comparing two arms' answers to the same question — see *Paired Quality Judging* below,
+which is a separate instrument over the replay benchmark's own transcripts and does not
+read this DB.
 
 - **Eval export** (`export_eval_dataset()` → `eval_dataset.json`) picks representative
   conversations per topic and, besides the display transcript (`turns`, capped at 2,000
@@ -2107,25 +2277,102 @@ harness issues two arms per case. `--base-url` therefore defaults to
   deliberately writes no `chat_turn_metrics` row, so the DB is not an option — see
   the `chat_turn_metrics` section. `llm_service` yields a `usage` chunk per model
   roundtrip; the harness reads `iteration`, per-iteration `input_tokens`,
-  `total_input_tokens`, `total_output_tokens` and `context_percent` from it, and
-  takes the tool-call count from the `done` chunk's `message_content` by counting
+  `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`,
+  `total_output_tokens`, `context_percent`, `turn_elapsed_ms` and `model_ms` from it,
+  and takes the tool-call count from the `done` chunk's `message_content` by counting
   real `tool_use` blocks (never the `*[Using tool: …]*` display markers, which the
   model has been observed to imitate as prose).
 - **The `usage` chunk's `input_tokens` is the whole context**, i.e.
   `input_tokens + cache_read + cache_creation`, while `total_input_tokens`
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
-  derived as `sum(per-iteration input_tokens) - total_input_tokens`. The harness
-  cannot split that into cache reads and cache creations, which differ by more than
-  12x in price, so **cost is reported as an interval**, `cost_usd_min` (all cached
-  tokens priced as cache reads) to `cost_usd_max` (all priced as cache creations),
-  never as a single fabricated number. The chunk itself no longer forces this:
-  `genetics-results-suite-n3p` added `cache_read` and `cache_create` to the `usage`
-  payload, so an exact figure is now derivable and the harness can drop the interval
-  — it has not been switched over yet. Pricing also needs a model name the pricing
-  table actually knows: without `--model`, *or* with a model `cost.has_pricing()`
-  cannot match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
-  ("not priced") with a warning, not `0` and not silently priced at the
-  `_match_pricing` Sonnet fallback.
+  derived as `sum(per-iteration input_tokens) - total_input_tokens`.
+- **Cost is exact when the stream carries the cache split, and an interval when it
+  does not — and the report says which.** Cache reads and cache creations differ by
+  more than 12x in price, so the sum alone can only be bracketed. Since
+  `genetics-results-suite-n3p` the `usage` payload reports `cache_read` and
+  `cache_create` separately, and the harness prices the three token classes
+  separately into `cost_usd` (`cost_basis: "exact"`). `cost_usd_min` / `cost_usd_max`
+  are still computed as the fallback bracket and as a sanity range the exact figure
+  must sit inside. A turn is priced exactly only when **every** one of its `usage`
+  chunks carried the split; one chunk without it demotes the whole turn to
+  `cost_basis: "interval"` with `cost_usd = null`, because a turn priced exactly in
+  part and by assumption in the rest is a mixed number wearing an exact label. The
+  per-arm summary counts turns by basis and the printed footer states how many turns
+  are exact and how many only bracketed, so a mixed run cannot be read as if
+  `cost_usd` covered all of it. Pricing also needs a model name the pricing table
+  actually knows: without `--model`, *or* with a model `cost.has_pricing()` cannot
+  match (`gpt-4o`, a transposed `claude-4-opus`), the USD fields are `null`
+  ("not priced", `cost_basis: "unpriced"`) with a warning, not `0` and not silently
+  priced at the `_match_pricing` Sonnet fallback.
+- **Per-iteration timing localises a slow turn.** `ms_to_first_token` and
+  `ms_to_done` are per *turn* and cannot say which roundtrip was slow, which matters
+  because context roughly triples between iteration 1 and 7+. The `usage` chunk
+  therefore carries two timings, each named for its epoch:
+  `turn_elapsed_ms` is **cumulative from the start of the turn** (the same monotonic
+  zero as `chat_turn_metrics.wall_ms`), sampled when that iteration's model response
+  completed; `model_ms` is that iteration's model call, retry backoff and SSE
+  delivery included — it is deliberately *not* labelled model latency, and
+  `model_attempts` rides beside it so a retry-inflated reading is identifiable.
+  Everything else is derived rather than guessed:
+  - `segment_ms` is the difference between consecutive `turn_elapsed_ms` (first
+    iteration measured from 0). It is named for its **epoch**, not for an iteration,
+    because it is not one: it is `model_ms[N]` plus the tool phase of `N-1`.
+  - `pre_model_ms` is `segment_ms - model_ms` — the turn's setup for iteration 1 and
+    the *previous* iteration's tool phase thereafter, since the chunk is emitted
+    before any tool of its own iteration runs.
+  - `tool_phase_ms` re-attributes that span to the iteration whose tools it was
+    (`null` on the last iteration, which answered). On the `max_tokens`
+    *continuation* path the same span is continuation bookkeeping rather than tool
+    time; read it as "what happened between the two model calls".
+  - `iteration_ms` is that iteration's own **roundtrip**, `model_ms[N] +
+    tool_phase_ms[N]`, so the printed row sums and `slowest_iteration` names the
+    roundtrip a reader should go and look at. Deriving it from `segment_ms` (as it
+    was before) charged iteration N with iteration N-1's tools — already printed on
+    row N-1 — and named the bottleneck one roundtrip too late, which is precisely the
+    localisation the field exists to provide. It is `null` whenever either half is
+    unmeasured, rather than topping up an unobserved tool phase with `0`.
+    The **last** iteration is two cases and only one of them is an absence.
+    `llm_service` leaves the loop after a `usage` chunk in exactly four ways: no
+    `tool_use` blocks, the `max_tokens` continuation budget exhausted, the
+    unfilled-result continuation budget exhausted, or the iteration ceiling. The
+    first three ran **no tools**, so that iteration's tool phase is a measured
+    **zero** and `iteration_ms` is `model_ms`. Only the ceiling ran tools whose phase
+    no following model call ever closed, and reaching the ceiling is exactly what
+    appends the `Max tool iterations reached` notice — so tools-after-the-last-usage-
+    chunk implies the marker, and there is no false negative from the server. The
+    harness therefore imputes the zero only for turns that are `ok` **and** carry no
+    marker; an error or timeout mid-turn can land after tools ran with no marker and
+    no `done`, and a false *positive* (a model quoting the text back, or the ceiling
+    reached on a turn that then answered without tools) yields `null`, the safe
+    direction. Collapsing both cases into `null` would drop every single-iteration
+    turn — ~36% of production turns — out of `slowest_iteration_ms` and make a slow
+    final roundtrip, the one answering against the largest context (median 39k → 117k
+    tokens by iteration 7+), structurally invisible. The marker text is a constant in
+    `llm_service` (`MAX_ITERATIONS_NOTICE`) and a deliberately separate literal in the
+    harness (`MAX_ITERATIONS_MARKER`, since it parses a *remote* server's stream),
+    pinned to each other by a test so a rename fails loudly rather than silently
+    mis-timing final iterations.
+    `tool_phase_ms` stays `null` in **both** cases even though the first one's is
+    zero: that column means "a tool phase that was measured", and seeding it with one
+    `0` per turn would drag every by-index median toward zero for a reason unrelated
+    to how long tools take.
+  A **gap** breaks the timeline rather than being papered over: an untimed `usage`
+  chunk resets the baseline, so the *following* iteration reports `null` instead of a
+  segment silently spanning two iterations (which would also misname
+  `slowest_iteration`). That is the same standard the cost path applies when one
+  chunk lacks the cache split.
+  The per-turn record adds `model_ms_total`, `slowest_iteration`,
+  `slowest_iteration_ms` and `iterations_with_model_retries`; the per-arm summary
+  adds `iteration_timing`, a distribution over all iterations plus the same broken
+  out by iteration index, printed as a timeline table. That table prints **one `n`
+  per column**, not one per row — `tool_phase_ms` is `null` for every turn that ended
+  at that index, so its sample is strictly smaller than `model_ms`'s at the same
+  index — and marks any percentile `distribution()` already flagged as unreliable
+  with a `*`, matching the rest of the report. A field the stream did not carry stays
+  `null` and is excluded from the distributions rather than imputed as `0`.
+  Per-*tool* timing is deliberately not here (`genetics-results-suite-4h6.73` fix 3):
+  tools are gathered concurrently with `asyncio.gather`, so per-tool wall times
+  overlap and do not sum to the iteration's tool phase.
 - **A turn that reaches `done` without a single `usage` chunk is `no_usage_chunks`,
   not `ok`.** Iterations, tokens and cost are all unmeasurable for it, so counting
   its (necessarily zero) `tool_use` blocks would push a fake `0` into the tool-call
@@ -2159,24 +2406,220 @@ harness issues two arms per case. `--base-url` therefore defaults to
   `error` record per `(arm, turn_index)` over its planned turns, in that case's
   alternated arm order — not two `turn_index=0` records, which would under-report
   `turns_attempted` and hide the loss from the per-status table.
-- **Script-failure and retry-loop counters are declared but not yet emitted.**
+- **Script-failure and retry-loop counters read the `script_result` chunk.**
   A code-execution arm scores ~1 tool call by construction, so tool-call count alone
   is a dishonest win condition; the counters exist to price the failure modes that
-  offset it. Nothing on the chat stream emits script results today, so the harness
-  looks for a `script_result` chunk (`exit_code` / `timed_out` / `exception`) and,
-  when it sees none, reports `null` and prints `NOT MEASURED` with the reason —
-  deliberately *not* `0`, which would read as "measured, no failures". Once the
-  sandbox arm emits the chunk the fields populate, and a run with scripts that all
-  succeeded then reports a real `0`. The `NOT MEASURED` branch keys on `script_runs
-  is None`, never on `script_failure_rate is None`: the rate is also `None` for an arm
-  that *was* measured and ran zero scripts, and printing that as unmeasured would
-  defeat the whole point of distinguishing the two states.
+  offset it. `llm_service` emits one `script_result` chunk per completed
+  `run_analysis`, carrying `iteration`, `ran`, `ok`, `status`, `timed_out`,
+  `exception`, `limit` and `duration_ms` — metadata only; the script's source and
+  output travel in the `tool_result`, not on this chunk. **There is no `exit_code`**:
+  the sandbox supervisor answers with a `status` of `ok` / `error` / `timeout` /
+  `limit`, so an exit code would be invented rather than measured. `ok` is the
+  outcome field.
+  **Classification keys on `status`, not on `ran`.** `ran: false` says only that the
+  sandbox did not execute the script; it does not say whose fault that was, and
+  reading it as "infrastructure" flatters the code arm on the very metric that exists
+  to price its characteristic risk. `EmptyScript` (blank or non-string `code`) and
+  `SandboxRejected` (a model-chosen `timeout_s` outside 1..120, or oversize code)
+  arrive with `ran: false` and are the **model's** doing, so they are counted as
+  script failures, in both the numerator and the denominator. Left in the
+  infrastructure bucket they produced the exact inversion of the truth: a model
+  asking for `timeout_s: 300` twice per case reported
+  `failures=0 rate=0.000, sandbox faults=2N`, and a reader concluded the scripts
+  never fail and the sandbox is flaky. Genuine faults — restarting sandbox, full
+  queue, unminted signing key — stay in `script_infra_errors`, outside the rate, so a
+  deploy landing mid-run cannot decide the rollout.
+  Every distinct shape is also reported verbatim and individually in
+  `script_outcomes`, and the rate is printed with its numerator and denominator
+  spelled out beside it:
+  `script_failure_rate = (executed_failed + model_rejected) / (executed_ok +
+  executed_failed + model_rejected)`. That is what settles `TurnBudgetExceeded`,
+  which two reviewers classified in opposite directions — the ~300 s turn budget
+  against the sandbox's own 120 s `MAX_TIMEOUT_S`, so a single script cannot trigger
+  it. Rather than picking a side invisibly it gets its own bucket
+  (`script_budget_exceeded`), in *neither* the numerator nor the denominator, and a
+  reader who classifies it differently can redo the arithmetic from numbers already
+  on the page.
+  A **retry loop** is any non-successful script outcome followed by a further `usage`
+  chunk, i.e. a wasted model roundtrip at full context — counted at most once per
+  iteration, since two scripts failing in the same iteration still cost exactly one
+  extra roundtrip, and not at all when the failure was the turn's last iteration.
+  Because the causes are not the same kind of fact, the count is split into
+  `retry_loops_script`, `retry_loops_disputed` and `retry_loops_infra` (summing to
+  `retry_loops`), attributed by precedence script > disputed > infra so a wasted
+  roundtrip is never credited to the platform when the model's own script also
+  failed. It over-counts in one known way, in the safe direction: if one of two
+  *parallel* scripts fails while the other succeeds, the next roundtrip is booked as
+  a retry loop even though the model may simply be consuming the successful result.
+  That penalises the code arm, so it is left rather than guessed at.
+  An arm that emitted no `script_result` chunk at all reports `null` and prints
+  `NOT MEASURED` with the reason, deliberately *not* `0`, which would read as
+  "measured, no failures" — expected for an arm whose profile has no code-execution
+  tool. The `NOT MEASURED` branch keys on `script_runs is None`, never on
+  `script_failure_rate is None`: the rate is also `None` for an arm that *was*
+  measured and ran zero scripts, and printing that as unmeasured would defeat the
+  whole point of distinguishing the two states.
+  The SSE dispatch in `chat_api.py` is an `if/elif` chain with no default, so the
+  chunk needs an explicit branch there; without it `llm_service` would emit it
+  perfectly well and the harness would still print `NOT MEASURED`.
+- **Every `ok` turn also records `user_question` and `final_answer`**, the two things
+  the quality judge below needs. `final_answer` is the text blocks *after the last
+  `tool_use` block* of `message_content` — what the user is left with, not the running
+  commentary and not the tool trace. `user_question` comes from the replayed dataset
+  and is therefore identical on both arms, which is what makes a pair a pair. They are
+  in the report so a saved run can be judged later without replaying anything.
 - **Output** is a JSON report (`--output`) carrying the config, the per-case arm
   order, the matched-pair headline summaries, the unmatched per-arm marginals and
-  every individual turn record (including the per-iteration usage detail), plus a
-  human-readable summary on stdout.
+  every individual turn record (including the per-iteration usage detail and the two
+  fields above), plus a human-readable summary on stdout. When `--judge` ran, the
+  report also carries a `judging` block and the summary prints its section.
 - Authentication, when the target requires it, comes from `$REPLAY_AUTH_TOKEN` and is
   sent as a bearer token; it is never written into the report or logged.
+
+## Paired Quality Judging
+
+`scripts/pairwise_judge.py` answers the half of `genetics-results-suite-4h6.23`'s kill
+criterion the benchmark's own metrics cannot: "must not **regress** quality". It is
+**off by default** (`--judge` on the benchmark, or
+`python -m genetics_mcp_server.scripts.pairwise_judge --report <file>` over a report
+already written) — a run produces cost and latency numbers with no judge call at all.
+
+- **Paired, not absolute — and deliberately not the Conversation Analysis rubric.**
+  `analyze_conversations` scores one conversation at a time on a 1–5 rubric; it was
+  built for sampling and for tracking quality over time. Scoring each arm absolutely
+  and comparing means is a weak test here: the rubric is coarse, the expected
+  between-arm difference is small, and per-question difficulty dominates the score, so
+  a real regression sits inside the noise at the `n` a local run produces. Judging the
+  two answers to the *same* question side by side cancels that difficulty. The absolute
+  rubric remains worth adding later — it is the only thing comparable with historical
+  production numbers — but it answers a different question and is not blocking.
+- **The input is the harness's own matched pairs.** `matched_pairs()` already keeps
+  only the `(case_id, turn_index)` keys that came back `ok` on *both* arms; the judge
+  calls it rather than re-deriving the set, so the pairing rule ("an arm is not
+  rewarded for failing on the hard turns") has one definition.
+- **Blind, and the arm cannot leak through the content.** The judge sees the user
+  question, the earlier *user* turns of that case for context, and two answers labelled
+  only "Answer 1" and "Answer 2". No arm name, tool profile, model or mechanism appears
+  in the prompt, and only the **final answers** are shown — never the tool trace. That
+  choice is the point rather than a simplification: a `run_analysis` call carrying
+  Python identifies the code arm outright and a screenful of `get_*` calls identifies
+  the all-tools arm, so blinding the judge while showing it the trace would be theatre.
+  The cost is stated rather than hidden — the judge cannot see that one arm reached its
+  answer through six roundtrips and the other through one — and it is accepted because
+  efficiency is what the benchmark measures *exactly*, while the judge is asked only
+  about the thing no metric can see. Prior *assistant* turns are withheld for the same
+  reason: they differ per arm. Answers over 12,000 characters are elided in the
+  **middle** (head and conclusion preserved) and the count is reported **per arm**, not
+  as a pair count: the rule is applied identically to both arms but does not *fire*
+  equally, and "6 pairs were elided" reads as symmetric information loss when it can
+  mean one arm was judged on a third of what it wrote and the other on all of it.
+- **The answer-slicing rule is not neutral between the arms, so its cost is measured.**
+  The "final answer" is the text after the **last** `tool_use` block, which is right for
+  intermediate commentary ("let me query BigQuery for that") and wrong for substantive
+  content that happens to precede a late tool call — a turn that lays out a table, calls
+  one more tool and closes with "In summary, yes." is judged on the closing sentence, and
+  a turn whose last block *is* the `tool_use` is judged on nothing. An arm that makes one
+  **early** call keeps nearly all its prose; an arm whose last call is **late** loses
+  whatever it wrote between calls, and nothing in the win/loss table can distinguish that
+  handicap from worse answers, because `answer_chars` and the whole length diagnostic are
+  computed on the already-sliced text. So `final_answer_split` returns the number of
+  characters it discarded, `replay_benchmark` records it per turn
+  (`final_answer_dropped_chars`), and the report prints the **per-arm median** beside the
+  length check. Materially different medians mean the verdict is partly measuring this
+  rule rather than answer quality.
+- **Judged both ways, and a disagreement is a tie.** Position bias in pairwise LLM
+  judging is large, so every pair is judged twice with the answers swapped. A pair is a
+  win only when **both** orders name the same answer; both-tie, one-tie-one-winner and
+  the two orders naming *different* answers are all ties, reported separately
+  (`tie_agreed` / `tie_unstable` / `tie_position_flip`) so an unstable verdict is
+  visible rather than averaged away. `tie_position_flip` is the direct measurement of
+  position bias in the run. This doubles judge cost and is the cheapest defence there
+  is.
+- **The presentation order is seeded from the pair, not drawn at random.** Which arm is
+  shown first in pass 1 is `sha256("<case_id>|<turn_index>")` — not `hash()`, whose
+  per-process salt would make the same report judge differently on every run, and not a
+  global RNG, whose draw depends on how many pairs happened to precede this one. With
+  both-ways judging the order cannot change a verdict, so this is not the primary
+  defence; it is what makes a run reproducible, fixes which order is attempted first so
+  a pair whose second pass fails is not resolved from an arbitrary position, and is
+  recorded per pair.
+- **Ties are first-class** in the prompt and in the report. Forcing a winner on two
+  equally good answers manufactures signal.
+- **The distribution is reported, never a bare win rate**: wins per arm with clear /
+  slight / **none** margins (they sum to the win count — a win *can* carry `none`, since
+  the weaker of the two passes' margins is quoted and an unrecognised strength word
+  normalises to it; the words the judge actually used that were not recognised are
+  listed rather than dropped), ties split by kind, unresolved pairs, and per-pair detail
+  carrying both passes' verdicts and the judge's own one-line reason — because the
+  criterion is about the **loss tail**, which is reported in **both directions** rather
+  than assuming from the arm order which arm is the candidate, and only reads as a list.
+  The rate is accompanied by an exact two-sided **sign test** over decisive pairs (ties
+  excluded, not split), and below `MIN_DECISIVE_PAIRS` — 6, the smallest n at which a
+  sign test can reach p ≤ 0.05 *at all* — the report prints
+  `NOT CONCLUSIVE AT ANY OUTCOME`, **no p-value and no win rate**: "1 win = 100.0% of
+  decisive" above a NOT CONCLUSIVE line is exactly the solid-looking number the rule
+  exists to forbid. The same power rule travels with every **restricted** table into the
+  saved JSON (each carries `underpowered` and the threshold), so the printed report and
+  the JSON cannot disagree about whether a number is quotable.
+- **Ties are a statement about the instrument, not only about the arms**, and the report
+  says so where they are printed. Every tie counts toward passing "must not regress", but
+  a large `tie_position_flip` count means position moved this judge more than the answers
+  did — i.e. a regression of that size *could not have been detected*, which is not the
+  same as there not being one.
+- **A failed or unparseable judge call leaves the pair `unresolved`**, in neither the
+  win nor the tie totals, and the second call is skipped when the first already failed.
+  A pair judged once is a pair judged from one position.
+- **The known confounds are measured, not assumed away.** Pairwise judges favour
+  length, so the report states how often the longer answer won and each arm's median
+  answer length — computed on the text **as shown to the judge**, after middle-elision,
+  because 40,000 and 20,000 characters both arrive as 12,000 in the prompt and the one
+  diagnostic whose job is to warn "your judge is rewarding length" must not report a
+  difference elision had already removed. The raw medians are kept beside them, labelled
+  as the lengths the judge did *not* see.
+- **Provenance markers are detected, never scrubbed — and the audit states its own
+  asymmetry where the numbers are.** Text in which an answer names its own machinery
+  ("I ran a script", "the sandbox", a Python fence, and the iteration-cap notice
+  `[Max tool iterations reached]`, which survives the slicing rule verbatim and is a
+  near-perfect tell for the many-roundtrip arm) is detected per answer, counted **per
+  arm** — a pooled `sandbox=7` cannot say whether all seven were the same arm's, and
+  one-sidedness is the entire question — and the whole win/loss/tie table is printed a
+  second time over the pairs where **neither** answer carried any. Such text is
+  deliberately **not** scrubbed: rewriting an answer changes what is being judged, and a
+  regex editing model prose will eventually delete something load-bearing. The printed
+  block states that the marker list **is asymmetric and cannot be otherwise** — most
+  markers are tells for the arm that writes code, and no phrase reliably marks an answer
+  assembled from many small tool calls — so the restricted subset drops one arm's pairs
+  preferentially and a gap between the two tables is evidence about the **judge**, not
+  about the arms. (The `artifact` pattern is deliberately narrow: in genetics prose
+  "artifact" means a spurious signal far more often than a sandbox file, and a bare
+  `\bartifacts?\b` fires on both arms, shrinking the clean control subset for a reason
+  that has nothing to do with guessing an arm.)
+- **A pair the harness broke is not a pair an arm lost.** An answer that could not be
+  extracted is shown to the judge as empty and reads as a loss, which is right for a turn
+  that answered nothing and wrong for an extraction failure — and eight one-sided empty
+  answers are enough to manufacture a clean sweep with a significant p-value. So pairs
+  carrying an empty answer get the same treatment provenance gets rather than a footnote:
+  the whole table again over the pairs where **both** arms produced text, with the same
+  power rule. Empty answers are further split by whether the turn *had* produced text
+  before its last tool call, which separates a silent model (a quality finding) from the
+  slicing rule having thrown the answer away (a bug). Judging is refused outright when
+  **every** matched pair is missing at least one arm's answer — not only when both are
+  missing, since the half-missing case is the catastrophic one.
+- **Cost is its own line item, priced before it spends.** Judging is Opus-5 spend on
+  top of the benchmark's (~$2.01/turn × 2 arms), doubled by the second pass. The
+  estimate is printed **before the first call** — exactly, from the prompts that will
+  actually be sent, with output priced at the `max_tokens` ceiling so the USD figure is
+  an upper bound; `--dry-run --judge` prints a *nominal* estimate over the turn count
+  since no answer exists yet. A judge model `cost.has_pricing()` cannot match reports
+  `NOT PRICED` rather than a guess. After the run the actual spend is priced from the
+  API's own usage counts and printed in the footer as a **separate** figure that is
+  never folded into any arm's `cost_usd`: the arms' USD is what the answers cost, the
+  judge's is what grading them cost.
+- **The benchmark stays write-free.** `secret: true` is unchanged and the judge reads
+  the harness's in-memory (or saved) transcripts, so no replayed turn is written into
+  any chat history. `analyze_conversations` is not run in this environment, but the
+  reason survives: the moment this points at a deployment whose history *is* sampled
+  into the next `eval_dataset.json`, replayed turns would corrupt the sample.
 
 ## Development Workflow
 
@@ -2195,7 +2638,7 @@ harness issues two arms per case. `--base-url` therefore defaults to
 1. **Shared tool definitions**: Single source of truth in `definitions.py` prevents drift between MCP and LLM service
 2. **Async throughout**: All I/O uses async/await for concurrent tool execution
 3. **Graceful degradation**: External service failures don't crash the server; fallbacks are used where available
-4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `usage`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
+4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `thinking`, `usage`, `script_result`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
 6. **Retry on transient errors**: Anthropic API calls are retried up to 3 times with exponential backoff (1s, 2s, 4s) for transient errors. Retryability is detected two ways because of a streaming quirk: connection errors and `APIStatusError` with HTTP status 500/502/503/529, **and** by the error type carried in the body (`overloaded_error`, `api_error`, `internal_server_error`). The latter is essential — errors that arrive mid-stream (after the SSE connection returns HTTP 200) surface as a base `APIStatusError` with `status_code=200`, so status-code matching alone misses them (`anthropic_error_type()` in `llm_service.py` reads the real type from the body). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. When retries are exhausted, `_classify_error` (in `chat_api.py`) maps the error to a user-facing message keyed on the same body type: overload → "Claude is temporarily overloaded… please wait a moment and resend"; internal/upstream → "Claude had a temporary upstream error." Non-retryable errors (auth, bad request, rate limit) propagate immediately.
 7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow. The cap is `settings.mcp_max_result_size` (50,000 chars) applied to the serialized tool result in `llm_service.py`. The notice is built by `_truncation_notice()`, which states that what survives is an ordered PREFIX rather than a sample, that entire categories may be invisible, and that the result must not be used to count, to enumerate, or to conclude absence — pointing instead at narrower arguments, `summarize=true`, or the download link. Its item count comes from `_count_result_items()`, which understands every shape the data tools return (`results`, `rows`/`total_rows`, and `n_cs`/`cs`); counting only `results` previously dropped the count for exactly the credible-set summaries, degrading the notice to a bare "response too large". The system prompt carries the matching rule (`config/defaults.py`, under Tool Usage Guidelines). Truncation is positional, so it interacts badly with server-side row ordering: an unfiltered `get_credible_sets_by_qtl_gene` for a well-studied gene returns thousands of rows sorted by chromosome/position, and the tail — which may be the only rows of the requested data type — is cut before the model sees it. This produced a real wrong answer ("no caQTL rows at all" for IL7R, which in fact has 3,058). The fix is to filter server-side: the `data_types` parameter on `get_credible_sets_by_gene` / `_by_variant` / `_by_qtl_gene` is now a real API query parameter (previously it was sent and silently ignored by the results-api, which is also why the truncation was reached), and the results-api rejects undeclared query parameters with 422 so this class of drift cannot recur silently. `get_credible_sets_by_qtl_gene` also now defaults `summarize=True`, matching its sibling credible-set tools; it was the only one defaulting to variant-level rows, which is how a routine gene query reached 1.57 M chars. The summary is credible set-level, sorted by `mlog10p` and grouped by `data_type`, so what truncation drops is the weakest-signal tail rather than an entire chromosome's worth of rows. **A credible set is keyed by `(resource, dataset, trait, cell_type, cs_id)`, never by `cs_id` alone** — `cs_id` is unique only within one dataset's fine-mapping run of one trait in one cell type. caQTL `cs_id`s are derived from the chromatin peak and recur in every cell type the peak was tested in; eQTL Catalogue `cs_id`s like `ENSG00000187608_L1` recur across QTD studies. `_summarize_credible_sets_simple` grouped on `cs_id` alone, merging those into one row each: for IL7R caQTL it reported 46 credible sets across 9 cell types where the data holds 129 across 13, and PCSK9 caQTL came out at 78 instead of 359. Both aggregations now run in a single `group_by` on the full key — joining them would have to match on `cell_type`, which is null for GWAS, where `null != null` silently drops rows. `_summarize_credible_sets_trait` (used only by `get_credible_sets_by_phenotype`, a single resource and phenotype per call) is unaffected, since `cs_id` genuinely is unique in that scope. The summary also carries a `counts` block (`_summary_counts`) of per-data-type distinct totals — credible sets, associations (variant-level rows, matching an equivalent BigQuery `COUNT(*)`), variants, traits, cell types, datasets, plus `n_peaks` from `trait_original` for caQTL, whose molecular trait is a chromatin peak. It is emitted before `cs` in the dict so it survives truncation: at ~500 bytes for all data types it always fits, which means "how many peaks / cell types / associations" is answerable even on a result 28x over the cap, instead of the model counting whatever credible sets happened to fit

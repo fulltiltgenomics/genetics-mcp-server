@@ -19,6 +19,7 @@ from genetics_mcp_server.llm_service import _sanitize_tool_blocks
 from genetics_mcp_server.scripts.replay_benchmark import (
     ALL_TOOLS_ARM,
     MIN_N_FOR_PERCENTILE,
+    _iteration_timing_lines,
     _script_lines,
     build_parser,
     count_tool_calls,
@@ -749,10 +750,16 @@ async def test_measured_zero_script_runs_is_not_printed_as_not_measured(
     assert measured["script_runs"] == 1 and measured["script_failure_rate"] == 0.0
 
     # the same arm restricted to zero runs must still read as measured, not NOT MEASURED
-    zero_runs = dict(measured, script_runs=0, script_failures=0, script_failure_rate=None)
+    zero_runs = dict(
+        measured,
+        script_runs=0,
+        script_attempts=0,
+        script_failures=0,
+        script_failure_rate=None,
+    )
     lines = "\n".join(_script_lines(zero_runs))
     assert "NOT MEASURED" not in lines
-    assert "script runs=0" in lines
+    assert "script attempts=0 (executed=0)" in lines
     assert "NOT MEASURED" in "\n".join(
         _script_lines(report["per_arm"]["bigquery"])
     ), "an arm with no script chunk at all must still read as unmeasured"
@@ -868,3 +875,641 @@ async def test_unpriceable_model_reports_no_cost_rather_than_sonnet_prices(
     )
     assert all(t["cost_usd_min"] is None and t["cost_usd_max"] is None for t in report["turns"])
     assert report["per_arm"][ALL_TOOLS_ARM]["distributions"]["cost_usd_min"]["n"] == 0
+
+
+# ------------------------- exact cost, per-iteration timing and real script_result chunks
+
+
+def _usage_v2(
+    iteration,
+    input_tokens,
+    output_tokens,
+    total_in,
+    total_out,
+    *,
+    cache_read,
+    cache_create,
+    turn_elapsed_ms,
+    model_ms,
+):
+    """A usage chunk as the current llm_service emits it: cache split plus timing."""
+    return {
+        **_usage(iteration, input_tokens, output_tokens, total_in, total_out),
+        "cache_read": cache_read,
+        "cache_create": cache_create,
+        "turn_elapsed_ms": turn_elapsed_ms,
+        "model_ms": model_ms,
+    }
+
+
+# two iterations whose uncached input (context - cache_read - cache_create) is exactly the
+# increment of total_input_tokens, which is the invariant llm_service's comment states
+_SPLIT_TURN = [
+    _usage_v2(
+        1, 40_000, 500, 10_000, 500,
+        cache_read=25_000, cache_create=5_000, turn_elapsed_ms=1_200, model_ms=1_000,
+    ),
+    _usage_v2(
+        2, 60_000, 300, 22_000, 800,
+        cache_read=45_000, cache_create=3_000, turn_elapsed_ms=9_000, model_ms=2_000,
+    ),
+]
+
+
+async def _one_case(stub_server, tmp_path, plan, model="claude-opus-4-5"):
+    stub_server.plan = plan
+    return await run_benchmark(
+        dataset=write_dataset(tmp_path, [make_case("s1")]),
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model=model,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+    )
+
+
+async def test_cache_split_prices_the_turn_exactly(stub_server, tmp_path):
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [*_SPLIT_TURN, _done()],
+            "bigquery": [_usage(1, 1_000, 10, 1_000, 10), _done()],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+
+    assert turn["cache_read_tokens"] == 70_000
+    assert turn["cache_create_tokens"] == 8_000
+    # the split must reconcile with the figure derived by subtraction, or one of the two
+    # is measuring something other than what its name says
+    assert turn["cached_input_tokens"] == 70_000 + 8_000
+
+    # opus pricing per Mtok: 5 in / 25 out / 0.5 cache read / 6.25 cache creation
+    expected = (22_000 * 5 + 800 * 25 + 70_000 * 0.5 + 8_000 * 6.25) / 1e6
+    assert turn["cost_usd"] == pytest.approx(expected)
+    assert turn["cost_basis"] == "exact"
+    # the exact figure sits inside the bracket the harness used to report on its own
+    assert turn["cost_usd_min"] < turn["cost_usd"] < turn["cost_usd_max"]
+    # ...and the bracket really is wide enough that the difference matters
+    assert turn["cost_usd_max"] > 3 * turn["cost_usd_min"]
+
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["cost_basis"] == {"exact": 1, "interval": 0, "unpriced": 0}
+    assert arm["distributions"]["cost_usd"]["n"] == 1
+
+
+async def test_a_stream_without_the_cache_split_falls_back_to_the_interval_and_says_so(
+    stub_server, tmp_path
+):
+    """An older server emits no cache_read/cache_create. Silence would price it as if
+    nothing were cached, which is the confidently-wrong number the interval exists to avoid.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [_usage(1, 40_000, 500, 10_000, 500), _done()],
+            "bigquery": [*_SPLIT_TURN, _done()],
+        },
+    )
+    interval_turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    assert interval_turn["cost_usd"] is None
+    assert interval_turn["cost_basis"] == "interval"
+    assert interval_turn["cache_read_tokens"] is None
+    assert interval_turn["cost_usd_min"] < interval_turn["cost_usd_max"]
+
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["cost_basis"] == {"exact": 0, "interval": 1, "unpriced": 0}
+    # an interval turn contributes nothing to the exact distribution rather than a wrong 0
+    assert arm["distributions"]["cost_usd"]["n"] == 0
+
+    text = format_summary(report)
+    assert "cost_usd is UNAVAILABLE for 1 turn(s)" in text
+    assert "cost_usd is EXACT for 1 turn(s)" in text
+
+
+async def test_one_iteration_carrying_no_split_demotes_the_whole_turn(
+    stub_server, tmp_path
+):
+    """Pricing part of a turn exactly and the rest by assumption is not an exact turn."""
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [_SPLIT_TURN[0], _usage(2, 60_000, 300, 22_000, 800), _done()],
+            "bigquery": [_usage(1, 1_000, 10, 1_000, 10), _done()],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    assert turn["cost_basis"] == "interval"
+    assert turn["cost_usd"] is None
+
+
+async def test_per_iteration_timeline_separates_model_time_from_the_tool_phase(
+    stub_server, tmp_path
+):
+    """turn_elapsed_ms is cumulative, so the SEGMENT between chunks is its difference, and
+    the part of each difference that was not the model call is the PRECEDING tool phase.
+
+    `iteration_ms` must therefore not be that difference. Ground truth here: iteration 1's
+    model call took 1000ms and its tools 5800ms, iteration 2's model call 2000ms and it
+    answered. Iteration 2's own work is 2000ms; the 5800 belongs to iteration 1 and is
+    already printed on iteration 1's row. Deriving iteration_ms from the segment named
+    iteration 2 as the slowest at 7800 — the localisation pointed one roundtrip too late.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [*_SPLIT_TURN, _done()],
+            "bigquery": [_usage(1, 1_000, 10, 1_000, 10), _done()],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    first, second = turn["iterations_detail"]
+
+    assert first["turn_elapsed_ms"] == 1_200 and second["turn_elapsed_ms"] == 9_000
+    assert first["segment_ms"] == 1_200
+    assert second["segment_ms"] == 7_800  # 9000 - 1200, NOT 9000
+    assert first["pre_model_ms"] == 200  # turn setup before the first model call
+    assert second["pre_model_ms"] == 5_800  # 7800 - 2000: iteration 1's tools
+    # the same 5800 attributed to the iteration whose tool calls it was
+    assert first["tool_phase_ms"] == 5_800
+    assert second["tool_phase_ms"] is None  # the last iteration answered; it ran no tools
+
+    # the row sums: model + that iteration's OWN tools
+    assert first["iteration_ms"] == 1_000 + 5_800
+    # this turn ended because the model stopped calling tools, so iteration 2's tool phase
+    # is a measured ZERO rather than an unknown, and its roundtrip is its model call
+    assert second["iteration_ms"] == 2_000
+
+    assert turn["model_ms_total"] == 3_000
+    assert turn["slowest_iteration"] == 1
+    assert turn["slowest_iteration_ms"] == 6_800
+
+    timing = report["per_arm"][ALL_TOOLS_ARM]["iteration_timing"]
+    assert timing["iterations"] == 2
+    assert [row["iteration"] for row in timing["by_iteration_index"]] == [1, 2]
+    assert timing["by_iteration_index"][0]["model_ms"]["p50"] == 1_000
+    # ...but the tools COLUMN still records no observation: a 0 there would drag every
+    # by-index median toward zero for a reason unrelated to how long tools take
+    assert timing["by_iteration_index"][1]["tool_phase_ms"]["n"] == 0
+    assert timing["by_iteration_index"][1]["iteration_ms"]["n"] == 1
+    assert "per-iteration timeline" in format_summary(report)
+
+
+def test_the_harness_and_llm_service_agree_on_the_max_iterations_marker():
+    """The marker decides whether the final iteration's tool phase is 0 or unmeasured.
+
+    The harness keeps its own literal because it parses a remote server's stream, so a
+    rename in llm_service would not fail an import — it would silently start imputing 0 to
+    turns whose tools really did run past the last usage chunk. This is the pin that makes
+    that a red test instead.
+    """
+    from genetics_mcp_server.llm_service import MAX_ITERATIONS_NOTICE
+    from genetics_mcp_server.scripts.replay_benchmark import MAX_ITERATIONS_MARKER
+
+    assert MAX_ITERATIONS_MARKER in MAX_ITERATIONS_NOTICE
+
+
+async def test_a_turn_stopped_at_the_iteration_ceiling_keeps_an_unmeasured_final_phase(
+    stub_server, tmp_path
+):
+    """The other half of the final-iteration discrimination.
+
+    Here tools DID run on the last iteration and no following model call ever closed the
+    span, so 2000 would be a fabricated roundtrip. The same two usage chunks as the test
+    above; only the marker differs, which is exactly the signal being relied on.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                *_SPLIT_TURN,
+                _done([{"type": "text", "text": "\n\n*[Max tool iterations reached]*\n"}]),
+            ],
+            "bigquery": [_usage(1, 1_000, 10, 1_000, 10), _done()],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    assert turn["hit_max_iterations"] is True
+    assert turn["iterations_detail"][1]["iteration_ms"] is None
+    # iteration 1 is unaffected: its tool phase was measured by iteration 2's usage chunk
+    assert turn["iterations_detail"][0]["iteration_ms"] == 6_800
+    assert turn["slowest_iteration"] == 1
+
+
+async def test_a_single_iteration_turn_still_reports_a_roundtrip(stub_server, tmp_path):
+    """~36% of production turns are single-iteration. Reporting None for all of them would
+    drop them out of slowest_iteration_ms entirely and make a slow final roundtrip — the one
+    answering against the largest context — structurally invisible.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage_v2(
+                    1, 40_000, 500, 10_000, 500,
+                    cache_read=0, cache_create=0, turn_elapsed_ms=3_100, model_ms=3_000,
+                ),
+                _done(),
+            ],
+            "bigquery": [
+                _usage_v2(
+                    1, 1_000, 10, 1_000, 10,
+                    cache_read=0, cache_create=0, turn_elapsed_ms=900, model_ms=800,
+                ),
+                _done(),
+            ],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    assert turn["iterations_detail"][0]["iteration_ms"] == 3_000
+    assert turn["slowest_iteration"] == 1 and turn["slowest_iteration_ms"] == 3_000
+    assert report["per_arm"][ALL_TOOLS_ARM]["distributions"]["slowest_iteration_ms"]["n"] == 1
+
+
+async def test_the_timeline_prints_each_column_its_own_n_and_flags_thin_percentiles(
+    stub_server, tmp_path
+):
+    """One n per row would quote the tools p90 as if it rested on the row's iteration count.
+
+    At index 1 there are 2 model observations and 1 tool-phase observation, and a p90 over
+    n=1 IS the maximum. distribution() already computes unreliable_percentiles; the timeline
+    is the only table in the report that used to drop it on the floor.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [*_SPLIT_TURN, _done()],
+            "bigquery": [
+                _usage_v2(
+                    1, 1_000, 10, 1_000, 10,
+                    cache_read=0, cache_create=0, turn_elapsed_ms=500, model_ms=400,
+                ),
+                _done(),
+            ],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    index_1 = arm["iteration_timing"]["by_iteration_index"][0]
+    assert index_1["model_ms"]["n"] == 1 and index_1["tool_phase_ms"]["n"] == 1
+
+    lines = _iteration_timing_lines(arm)
+    header = lines[1]
+    assert "model n" in header and "tools n" in header and "iter n" in header
+    # the flag is present because p50/p90 over n=1 cannot be told from the max
+    assert any("*" in line for line in lines)
+    assert "not distinguishable from the column's maximum" in "\n".join(lines)
+    assert "model_attempts" in "\n".join(lines)
+
+
+async def test_an_untimed_chunk_in_the_middle_does_not_merge_two_iterations(
+    stub_server, tmp_path
+):
+    """A gap must break the timeline, not be papered over.
+
+    Advancing the baseline only on timed chunks would make iteration 3's segment span
+    iterations 2 AND 3 (9000 - 1000 = 8000) and hand slowest_iteration the wrong index. The
+    cost path demotes a whole turn when one chunk lacks the cache split; the timeline has to
+    apply the same standard.
+    """
+    middle_untimed = [
+        _usage_v2(
+            1, 10_000, 100, 1_000, 100,
+            cache_read=0, cache_create=0, turn_elapsed_ms=1_000, model_ms=800,
+        ),
+        _usage(2, 20_000, 100, 2_000, 200),  # no turn_elapsed_ms, no model_ms
+        _usage_v2(
+            3, 30_000, 100, 3_000, 300,
+            cache_read=0, cache_create=0, turn_elapsed_ms=9_000, model_ms=500,
+        ),
+    ]
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [*middle_untimed, _done()],
+            "bigquery": [_usage(1, 1_000, 10, 1_000, 10), _done()],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    rows = turn["iterations_detail"]
+
+    assert rows[0]["segment_ms"] == 1_000
+    assert rows[1]["segment_ms"] is None  # the chunk itself carried no clock
+    assert rows[2]["segment_ms"] is None, "8000 here would span iterations 2 and 3"
+    assert rows[2]["pre_model_ms"] is None
+    # ...so neither iteration on the far side of the gap can claim a roundtrip
+    assert rows[0]["iteration_ms"] is None  # its tool phase would have to come from row 1
+    assert rows[1]["iteration_ms"] is None  # the chunk carried no model_ms either
+    # iteration 3 is still measurable on its own terms: it ended the turn without tools, so
+    # its tool phase is a measured zero and its model call is its whole roundtrip. The gap
+    # cost the SEGMENT, not this.
+    assert rows[2]["iteration_ms"] == 500
+    assert turn["slowest_iteration"] == 3 and turn["slowest_iteration_ms"] == 500
+
+
+async def test_an_untimed_usage_chunk_leaves_the_timeline_empty_not_zero(
+    stub_server, tmp_path
+):
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [_usage(1, 100, 10, 100, 10), _done()],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
+    assert turn["iterations_detail"][0]["iteration_ms"] is None
+    assert turn["model_ms_total"] is None
+    assert report["per_arm"][ALL_TOOLS_ARM]["iteration_timing"]["distributions"][
+        "iteration_ms"
+    ]["n"] == 0
+
+
+def _script(iteration, *, ok=True, ran=True, exception=None, status=None, timed_out=False):
+    """A script_result chunk in the shape llm_service._script_result_payload emits."""
+    return {
+        "type": "script_result",
+        "iteration": iteration,
+        "ran": ran,
+        "ok": ok,
+        "status": status or ("ok" if ok else "error"),
+        "timed_out": timed_out,
+        "exception": exception,
+        "limit": None,
+        "duration_ms": 42,
+    }
+
+
+def test_the_harness_reads_the_chunk_the_chat_backend_actually_emits():
+    """Pins the two ends of the wire together.
+
+    The harness's predicates and llm_service's payload are in different repositories' worth
+    of distance from each other; a fabricated chunk in a test proves only that the harness
+    reads what the TEST writes. This drives the real producer.
+    """
+    from genetics_mcp_server.llm_service import _script_result_payload
+    from genetics_mcp_server.scripts.replay_benchmark import (
+        OUTCOME_EXECUTED_FAILED,
+        OUTCOME_EXECUTED_OK,
+        OUTCOME_INFRA,
+        _script_ok,
+        _script_outcome,
+        _script_ran,
+    )
+    from genetics_mcp_server.tools import ToolExecutor
+
+    render = ToolExecutor()._render_analysis
+    ok = _script_result_payload(1, render({"status": "ok", "duration_ms": 5}))
+    failed = _script_result_payload(
+        1, render({"status": "error", "error": {"type": "ValueError", "message": "x"}})
+    )
+    infra = _script_result_payload(
+        1, {"success": False, "error": "gone", "error_type": "SandboxUnavailable"}
+    )
+
+    assert _script_ran(ok) and _script_ok(ok)
+    assert _script_ran(failed) and not _script_ok(failed)
+    assert not _script_ran(infra) and not _script_ok(infra)
+
+    assert _script_outcome(ok) == (OUTCOME_EXECUTED_OK, "ok")
+    assert _script_outcome(failed) == (OUTCOME_EXECUTED_FAILED, "error")
+    assert _script_outcome(infra) == (OUTCOME_INFRA, "SandboxUnavailable")
+
+
+async def test_the_model_caused_non_run_shapes_the_real_executor_emits_are_not_infra():
+    """Drives the REAL run_analysis for the two shapes a fabricated chunk cannot vouch for.
+
+    Both reach the wire with `ran: False`. Classifying on that alone books the model
+    emitting no code, and the model choosing timeout_s=300, as sandbox flakiness. The
+    shapes are read out of the executor rather than written into the test, so a rename
+    there fails here instead of quietly re-inflating the infra bucket.
+    """
+    import httpx
+
+    from genetics_mcp_server.llm_service import _script_result_payload
+    from genetics_mcp_server.sandbox_client import SandboxClient
+    from genetics_mcp_server.scripts.replay_benchmark import (
+        OUTCOME_MODEL_REJECTED,
+        _script_outcome,
+    )
+    from genetics_mcp_server.tools import ToolExecutor
+
+    executor = ToolExecutor()
+    # a transport that would fail the test if it were ever reached: neither shape below is
+    # allowed to leave this process, which is exactly why the sandbox cannot be blamed
+    executor._sandbox = SandboxClient(
+        "http://sandbox.invalid",
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail("no request may be sent for a caller-side rejection")
+        ),
+    )
+
+    blank = _script_result_payload(
+        1, await executor.run_analysis(code="   ", user="u@finngen.fi", session_id="c1")
+    )
+    oversize_timeout = _script_result_payload(
+        2,
+        await executor.run_analysis(
+            code="print(1)", user="u@finngen.fi", session_id="c1", timeout_s=300
+        ),
+    )
+
+    assert blank["ran"] is False and oversize_timeout["ran"] is False
+    # the blank script used to arrive as a bare "unknown", indistinguishable in the JSON
+    # from a transport fault, so even a careful reader could not separate them
+    assert blank["status"] == "EmptyScript"
+    assert oversize_timeout["status"] == "SandboxRejected"
+    assert _script_outcome(blank) == (OUTCOME_MODEL_REJECTED, "EmptyScript")
+    assert _script_outcome(oversize_timeout) == (OUTCOME_MODEL_REJECTED, "SandboxRejected")
+
+
+async def test_a_successful_script_is_not_counted_as_a_failure(stub_server, tmp_path):
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage(1, 100, 10, 100, 10),
+                _script(1, ok=True),
+                _usage(2, 200, 10, 200, 20),
+                _done(),
+            ],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["script_runs"] == 1
+    assert arm["script_failures"] == 0
+    assert arm["script_failure_rate"] == 0.0
+    # a further roundtrip after a SUCCESSFUL script is the model reading the result, not a
+    # retry; counting it would make every code-arm turn look like a retry loop
+    assert arm["retry_loops"] == 0
+    assert arm["script_infra_errors"] == 0
+
+
+async def test_a_failed_then_retried_script_is_exactly_one_retry_loop(stub_server, tmp_path):
+    """Two failures inside one iteration still cost one extra roundtrip, not two."""
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage(1, 100, 10, 100, 10),
+                _script(1, ok=False, exception="ValueError"),
+                _script(1, ok=False, exception="KeyError"),
+                _usage(2, 200, 10, 200, 20),
+                _script(2, ok=True),
+                _usage(3, 300, 10, 300, 30),
+                _done(),
+            ],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["script_runs"] == 3
+    assert arm["script_failures"] == 2
+    assert arm["retry_loops"] == 1
+
+
+async def test_a_failure_on_the_last_iteration_is_not_a_retry_loop(stub_server, tmp_path):
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage(1, 100, 10, 100, 10),
+                _script(1, ok=False, exception="ValueError"),
+                _done(),
+            ],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["script_failures"] == 1
+    assert arm["retry_loops"] == 0
+
+
+async def test_a_sandbox_fault_is_not_charged_to_the_scripts_failure_rate(
+    stub_server, tmp_path
+):
+    """A restarting sandbox says nothing about the model's script. Counting it would let a
+    deploy landing mid-run decide the rollout.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage(1, 100, 10, 100, 10),
+                _script(1, ok=False, ran=False, status="SandboxUnavailable"),
+                _usage(2, 200, 10, 200, 20),
+                _script(2, ok=True),
+                _usage(3, 300, 10, 300, 30),
+                _done(),
+            ],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["script_runs"] == 1  # the fault never ran, so it is not in the denominator
+    assert arm["script_attempts"] == 1
+    assert arm["script_failures"] == 0
+    assert arm["script_failure_rate"] == 0.0
+    assert arm["script_infra_errors"] == 1
+    # it still burned a roundtrip, which is a latency and cost fact even if not a script fact
+    assert arm["retry_loops"] == 1
+    # ...but it is not the same fact as a retry after the model's own script failed, so the
+    # printed number says which it was
+    assert arm["retry_loops_infra"] == 1 and arm["retry_loops_script"] == 0
+    text = "\n".join(_script_lines(arm))
+    assert "sandbox faults (not script failures, not in the rate)=1" in text
+    assert "after a sandbox fault=1" in text
+    assert "SandboxUnavailable=1" in text
+
+
+async def test_a_model_caused_rejection_is_a_script_failure_not_a_sandbox_fault(
+    stub_server, tmp_path
+):
+    """`ran: False` is not the same question as "whose fault".
+
+    A model asking for timeout_s=300 gets SandboxRejected, and a blank `code` gets
+    EmptyScript — neither reaches the sandbox, so both used to be booked as infrastructure.
+    That reports failures=0 rate=0.000 beside a pile of "sandbox faults" and tells a reader
+    the scripts never fail and the platform is flaky, which is the exact inversion of what
+    happened, on the metric that exists to price the code arm's own risk.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage(1, 100, 10, 100, 10),
+                _script(1, ok=False, ran=False, status="SandboxRejected"),
+                _usage(2, 200, 10, 200, 20),
+                _script(2, ok=False, ran=False, status="EmptyScript"),
+                _usage(3, 300, 10, 300, 30),
+                _script(3, ok=True),
+                _usage(4, 400, 10, 400, 40),
+                _done(),
+            ],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["script_infra_errors"] == 0, "neither shape is the platform's doing"
+    assert arm["script_runs"] == 1  # only the third reached the sandbox
+    # both rejections are in the numerator AND the denominator, so the rate cannot exceed 1
+    assert arm["script_attempts"] == 3
+    assert arm["script_failures"] == 2
+    assert arm["script_failure_rate"] == pytest.approx(2 / 3)
+    assert arm["retry_loops_script"] == 2 and arm["retry_loops_infra"] == 0
+
+    text = "\n".join(_script_lines(arm))
+    assert "SandboxRejected=1" in text and "EmptyScript=1" in text and "ok=1" in text
+    assert "(executed_failed + model_rejected)" in text
+
+
+async def test_the_disputed_deadline_shape_is_bucketed_with_neither_side(
+    stub_server, tmp_path
+):
+    """TurnBudgetExceeded is classified differently by different readers, so it is reported
+    on its own line and left out of both the numerator and the denominator. Whichever way a
+    reader classifies it, the arithmetic is available on the page.
+    """
+    report = await _one_case(
+        stub_server,
+        tmp_path,
+        {
+            None: [
+                _usage(1, 100, 10, 100, 10),
+                _script(1, ok=False, ran=False, status="TurnBudgetExceeded"),
+                _usage(2, 200, 10, 200, 20),
+                _script(2, ok=True),
+                _usage(3, 300, 10, 300, 30),
+                _done(),
+            ],
+            "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+        },
+    )
+    arm = report["per_arm"][ALL_TOOLS_ARM]
+    assert arm["script_budget_exceeded"] == 1
+    assert arm["script_infra_errors"] == 0 and arm["script_failures"] == 0
+    assert arm["script_attempts"] == 1 and arm["script_failure_rate"] == 0.0
+    assert arm["script_outcomes"] == {"TurnBudgetExceeded": 1, "ok": 1}
+    # the wasted roundtrip is attributed to it specifically, not merged into either side
+    assert arm["retry_loops"] == 1 and arm["retry_loops_disputed"] == 1
+    assert arm["retry_loops_script"] == 0 and arm["retry_loops_infra"] == 0
+
+    text = "\n".join(_script_lines(arm))
+    assert "TurnBudgetExceeded (classified by neither, not in the rate)=1" in text

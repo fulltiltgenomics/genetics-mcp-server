@@ -139,3 +139,68 @@ Respond with JSON:
 Conversation:
 {conversation}
 """
+
+# PAIRED, not absolute. QUALITY_ASSESSMENT_PROMPT above scores one conversation on a 1-5
+# rubric, which is the right instrument for sampling and for tracking quality over time and
+# the wrong one for "is arm B worse than arm A on THIS turn": the rubric is coarse, the
+# expected between-arm difference is small, and per-question difficulty dominates the score.
+# Judging the two answers side by side cancels that difficulty, which is why A/B evaluations
+# are done pairwise (genetics-results-suite-4h6.72).
+#
+# The two answers are labelled only "Answer 1" / "Answer 2". Nothing in this prompt names an
+# arm, a tool profile, a model or a mechanism, and the caller shows FINAL ANSWERS ONLY — see
+# `pairwise_judge.final_answer_text` for why tool traces are withheld.
+PAIRWISE_ANSWER_JUDGE_PROMPT = """\
+You are comparing two candidate answers from an AI genetics assistant to the SAME user
+question. Today's date is {today}.
+
+Decide which answer serves the user better, or whether they are equally good.
+
+IMPORTANT — what you can and cannot verify:
+- You are shown only the answers, NOT the raw output of the data tools behind them. The
+  assistant queries REAL genetics databases (FinnGen, GWAS summary statistics, BigQuery
+  and others). Specific, precise figures (sample sizes, variant counts, p-values, effect
+  sizes) and recent dates are EXPECTED and are almost always real tool output.
+- Do NOT prefer an answer merely because it contains more numbers, tables or citations,
+  and do NOT call something fabricated merely because it is precise or you cannot verify
+  it. Only treat a claim as unsupported when there is clear internal evidence (the answer
+  contradicts itself, or reports a result it also says it could not obtain).
+- Dates in 2025 or early 2026 are in the PAST relative to today's date above.
+
+JUDGE ON, in this order of weight:
+1. Correctness and internal consistency of what is claimed.
+2. Whether it actually answers what was asked, including every part of a multi-part
+   question.
+3. Whether conclusions are supported by what the answer itself presents, and whether real
+   limitations are stated.
+4. Usefulness to a genetics researcher: is there an interpretation, or only raw output?
+
+EXPLICITLY DO NOT JUDGE ON:
+- Length. A longer answer is not a better answer; a short, complete, correct answer beats
+  a long one that pads. Only prefer the longer answer when the extra content is content
+  the question asked for.
+- Formatting, tables, headings, bullets, markdown polish or tone.
+- Confidence of phrasing. Appropriate hedging about a genuine uncertainty is a merit, not
+  a fault; unnecessary hedging about something the answer establishes is a fault.
+- How the answer was produced, or any hint of what machinery was used. If one answer
+  mentions its own mechanism and the other does not, that is NOT a quality difference and
+  must not move your verdict.
+- Which answer is shown first. Position carries no information.
+
+CALL A TIE whenever the two answers are of comparable quality, including when they differ
+in style, in length or in emphasis but not in substance, and when both are equally wrong
+or equally unhelpful. A tie is a real, expected outcome — do not invent a winner.
+
+Respond with JSON only:
+{{"verdict": "1|2|tie", "margin": "none|slight|clear", "reason": "one or two sentences naming the specific difference that decided it"}}
+Use "margin": "none" exactly when "verdict" is "tie".
+
+USER QUESTION:
+{question}
+{prior_context}
+--- ANSWER 1 ---
+{answer_1}
+
+--- ANSWER 2 ---
+{answer_2}
+"""

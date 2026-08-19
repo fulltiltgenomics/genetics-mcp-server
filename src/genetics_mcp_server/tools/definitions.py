@@ -1543,7 +1543,8 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
         "category": "orchestration",
         "description": (
             "List the `genetics` SDK surface available to analysis scripts, one module at a "
-            "time. Returns signatures with their docstrings. Call this before writing a "
+            "time. Returns signatures with their docstrings, and the `usage` line saying "
+            "exactly how to import it. Call this before writing a "
             "script instead of guessing function names. Modules: 'genetics' (the sync functions a "
             "script calls), 'client' (the awaitable GeneticsClient form), 'errors' (what a "
             "script catches). Omit `module` for a cheap index of module names and the "
@@ -1561,16 +1562,25 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
         "name": "run_analysis",
         "category": "orchestration",
         "description": (
+            # the "use this INSTEAD OF chaining data-access tools" arbitration that used to
+            # live here moved into the system prompt's "Choosing How to Get Data" section
+            # (genetics-results-suite-4h6.69): a preference BETWEEN tools cannot be stated
+            # inside one tool's description, where it is invisible to the prompt and
+            # contradicted whatever the prompt said about the other path. Nothing is lost
+            # for MCP clients, which never see this tool at all — run_analysis has no
+            # register_mcp_tools block.
             "Run a Python script against the genetics data in a sandbox and get back what it "
-            "printed. Use this instead of chaining data-access tools: one script can query, "
-            "join, filter and summarise in a single call.\n\n"
-            "Write the script against the `genetics` SDK — call list_capabilities first for the "
-            "exact signatures rather than guessing. PRINT EVERYTHING YOU WANT TO SEE: only the "
+            "printed. One script can query, join, filter and summarise in a single call.\n\n"
+            "Write the script against the `genetics` SDK — `import genetics` — and call "
+            "list_capabilities first for the exact signatures rather than guessing. PRINT "
+            "EVERYTHING YOU WANT TO SEE: only the "
             "script's output comes back (stdout and stderr interleaved, capped at 64 KiB with "
             "the middle elided). The value of the last expression is not returned.\n\n"
             "Files the script writes to its artifacts directory are reported as a manifest of "
-            "names and sizes, but their CONTENTS CANNOT BE RETRIEVED — so a plot or a table that "
-            "matters must also be summarised in what the script prints.\n\n"
+            "names and sizes. An IMAGE artifact is fetched and shown to the user automatically "
+            "— save a figure and it appears, so do not also render the plot as text or emit a "
+            "markdown image placeholder for it. Every OTHER artifact's contents CANNOT BE "
+            "RETRIEVED, so a table that matters must also be printed.\n\n"
             "Each run is independent: no variables, files or imports survive from one call to "
             "the next, so a follow-up script must redo the work it needs."
         ),
@@ -1599,8 +1609,9 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "artifact NAME exactly as reported in a manifest — never a path and never an "
             "execution id. Returns text inline, and binary content base64-encoded with its "
             "content type. It CANNOT retrieve artifacts written by run_analysis: those live "
-            "in the sandbox and no retrieval path to them exists yet. Do not call it for a "
-            "run_analysis artifact — have the script print what you need instead."
+            "in the sandbox and this tool does not reach it. Do not call it for a "
+            "run_analysis artifact — image artifacts are shown to the user automatically, and "
+            "for anything else have the script print what you need instead."
         ),
         "parameters": {
             "name": {
@@ -1714,6 +1725,33 @@ TOOL_PROFILES: dict[str, set[str]] = {
     "api": {"general", "api", "orchestration"},
     "bigquery": {"general", "bigquery", "orchestration"},
     "rag": {"general"},
+    # the pre-code-execution surface, and the ONLY honest baseline arm for the
+    # genetics-results-suite-4h6.23 A/B. `tool_profile: null` ("all") is NOT that baseline:
+    # it contains run_analysis, so an arm asked to represent "the old implementation" can
+    # reach for the very mechanism under test. Measured 2026-08-19 — all=68 tools with
+    # run_analysis, api=66 with it, bigquery=24 with it; only `rag` (18) excluded it, and
+    # rag is far too narrow to stand in for the old surface.
+    #
+    # WHY EXCLUDING `orchestration` IS SAFE HERE, stated carefully because the obvious
+    # version of this claim is FALSE. `orchestration` holds FOUR tools, not three: the code
+    # trio plus launch_subagents. Excluding the category therefore drops launch_subagents
+    # too — which would make this a surface nobody ever shipped, if launch_subagents were
+    # ever advertised. It is not: enable_subagents defaults to false (settings.py), so
+    # settings.disabled_tools contains launch_subagents and llm_service._disabled_tools
+    # strips it again whenever the subagent service did not initialize — both BEFORE the
+    # profile filter, on every arm.
+    #
+    # So the equivalence holds through a runtime flag, not through the category. MEASURED
+    # as a live request resolves them, with disabled_tools applied: all=65, nocode=62, and
+    # `all - nocode` is exactly {run_analysis, list_capabilities, read_artifact}.
+    # RE-MEASURE rather than trusting this line if enable_subagents is ever turned on, or if
+    # a non-code tool is filed under `orchestration` — either one silently widens the gap
+    # between the arms into something the A/B was not meant to measure.
+    #
+    # No prompt work is needed to go with it. Since genetics-results-suite-4h6.69 the system
+    # prompt is assembled from the tool list in force, so this profile also loses the
+    # run_analysis steering automatically rather than being told about a tool it lacks.
+    "nocode": {"general", "api", "bigquery"},
 }
 
 # profiles named as an explicit allow-list of tool NAMES rather than categories. A profile
