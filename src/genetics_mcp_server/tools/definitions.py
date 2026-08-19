@@ -1725,6 +1725,33 @@ TOOL_PROFILES: dict[str, set[str]] = {
     "api": {"general", "api", "orchestration"},
     "bigquery": {"general", "bigquery", "orchestration"},
     "rag": {"general"},
+    # the pre-code-execution surface, and the ONLY honest baseline arm for the
+    # genetics-results-suite-4h6.23 A/B. `tool_profile: null` ("all") is NOT that baseline:
+    # it contains run_analysis, so an arm asked to represent "the old implementation" can
+    # reach for the very mechanism under test. Measured 2026-08-19 — all=68 tools with
+    # run_analysis, api=66 with it, bigquery=24 with it; only `rag` (18) excluded it, and
+    # rag is far too narrow to stand in for the old surface.
+    #
+    # WHY EXCLUDING `orchestration` IS SAFE HERE, stated carefully because the obvious
+    # version of this claim is FALSE. `orchestration` holds FOUR tools, not three: the code
+    # trio plus launch_subagents. Excluding the category therefore drops launch_subagents
+    # too — which would make this a surface nobody ever shipped, if launch_subagents were
+    # ever advertised. It is not: enable_subagents defaults to false (settings.py), so
+    # settings.disabled_tools contains launch_subagents and llm_service._disabled_tools
+    # strips it again whenever the subagent service did not initialize — both BEFORE the
+    # profile filter, on every arm.
+    #
+    # So the equivalence holds through a runtime flag, not through the category. MEASURED
+    # as a live request resolves them, with disabled_tools applied: all=65, nocode=62, and
+    # `all - nocode` is exactly {run_analysis, list_capabilities, read_artifact}.
+    # RE-MEASURE rather than trusting this line if enable_subagents is ever turned on, or if
+    # a non-code tool is filed under `orchestration` — either one silently widens the gap
+    # between the arms into something the A/B was not meant to measure.
+    #
+    # No prompt work is needed to go with it. Since genetics-results-suite-4h6.69 the system
+    # prompt is assembled from the tool list in force, so this profile also loses the
+    # run_analysis steering automatically rather than being told about a tool it lacks.
+    "nocode": {"general", "api", "bigquery"},
 }
 
 # profiles named as an explicit allow-list of tool NAMES rather than categories. A profile
