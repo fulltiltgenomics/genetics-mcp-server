@@ -4,7 +4,13 @@ Everything else it does is arithmetic on a saved report; the property worth pinn
 an arm which did not finish never appears cheaper or faster than one that did.
 """
 
-from genetics_mcp_server.scripts.benchmark_scorecard import render
+import json
+
+from genetics_mcp_server.scripts.benchmark_scorecard import (
+    main,
+    render,
+    render_markdown,
+)
 
 
 def _turn(case, arm, i, status="ok", ms=1000.0, tools=2, cost=0.5, bracket=None):
@@ -131,3 +137,106 @@ def test_a_report_judged_without_per_pair_rows_is_distinguished_from_an_unjudged
     turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
     out = render(_report(turns, judging={"arms": ["nocode", "code"], "wins": {}}))
     assert "did not persist" in out
+
+
+def test_markdown_reproduces_a_script_whole_where_the_terminal_views_elide_it():
+    # the reason this renderer exists: `--tools`/`--transcript` are width-bound, and the one
+    # argument worth reading when the code arm loses is exactly the one that never fits
+    script = "\n".join(f"print({i})  # {'x' * 300}" for i in range(40))
+    turns = [
+        _turn("c", "nocode", 0),
+        _turn("c", "code", 0),
+    ]
+    turns[1]["tool_calls_detail"] = [
+        {"seq": 0, "name": "run_analysis", "iteration": 2, "input": {"code": script},
+         "script_duration_ms": 1200.0, "script_status": "ok"}
+    ]
+    turns[1]["final_answer"] = "42"
+    out = render_markdown(_report(turns))
+    assert script in out, "the script must appear verbatim, not elided"
+    assert "…" not in out
+    assert "```python" in out
+    assert "sandbox 1.2s, `ok`" in out
+
+
+def test_markdown_fence_survives_an_argument_that_contains_a_fence():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[1]["tool_calls_detail"] = [
+        {"seq": 0, "name": "run_analysis", "input": {"code": "x = '''```'''\ny = 1"}}
+    ]
+    out = render_markdown(_report(turns))
+    body = out.split("- `code`:")[1]
+    fence = body.strip().splitlines()[0]
+    assert fence.startswith("````"), f"fence must outgrow the value's own backticks: {fence!r}"
+    assert body.count(fence.rstrip("python")) >= 2
+
+
+def test_markdown_says_what_the_report_could_not_keep():
+    # a turn whose prose was thrown away at capture must not present its remainder as the
+    # whole reply, and no report holds tool RESULTS at all
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[0]["final_answer"] = "In summary, yes."
+    turns[0]["final_answer_dropped_chars"] = 900
+    out = render_markdown(_report(turns))
+    assert "900 character(s)" in out
+    assert "Tool *results* are not in the report" in out
+
+
+def test_markdown_marks_an_uncomparable_case_and_shows_the_failed_arm() -> None:
+    turns = [
+        _turn("broken", "nocode", 0),
+        _turn("broken", "code", 0, status="timeout"),
+    ]
+    turns[1]["error"] = "wall-clock deadline"
+    out = render_markdown(_report(turns))
+    assert "NOT COMPARABLE" in out
+    assert "code: 1 turn(s) timeout" in out
+    assert "wall-clock deadline" in out, "the failed arm must show why, not an empty section"
+
+
+def test_markdown_refuses_a_case_that_is_not_in_the_report():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    out = render_markdown(_report(turns), case="other")
+    assert out.startswith("no case matching"), "main() keys the non-zero exit off this shape"
+
+
+def test_a_one_arm_markdown_holds_only_that_arm_but_still_states_comparability():
+    # dropping the pairing from a one-arm file would let an arm whose partner fell over read
+    # as a clean run — the property belongs to the pair, not to the arm
+    turns = [
+        _turn("broken", "nocode", 0),
+        _turn("broken", "code", 0, status="timeout"),
+    ]
+    turns[0]["final_answer"] = "the nocode answer"
+    out = render_markdown(_report(turns), only_arm="nocode")
+    assert "arm `code`" not in out, "the other arm's turns must not be in a one-arm file"
+    assert "the nocode answer" in out
+    assert "NOT COMPARABLE" in out and "code: 1 turn(s) timeout" in out
+
+
+def test_a_one_arm_markdown_keeps_the_question_even_when_only_the_other_arm_recorded_it():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0, status="error")]
+    turns[0]["user_question"] = "what chromosome is PCSK9 on?"
+    out = render_markdown(_report(turns), only_arm="code")
+    assert "what chromosome is PCSK9 on?" in out
+
+
+def test_markdown_refuses_an_arm_that_is_not_in_the_report():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    assert render_markdown(_report(turns), only_arm="rag").startswith("no arm 'rag'")
+
+
+def test_markdown_writes_one_file_per_arm_beside_the_paired_one(tmp_path):
+    report = _report([_turn("c", "nocode", 0), _turn("c", "code", 0)])
+    report["config"] = {"run_id": "abc123"}
+    src = tmp_path / "report.json"
+    src.write_text(json.dumps(report))
+    out = tmp_path / "transcripts.md"
+
+    assert main([str(src), "--markdown", str(out)]) == 0
+
+    assert out.exists()
+    for arm in ("nocode", "code"):
+        per_arm = tmp_path / f"transcripts.{arm}.md"
+        assert per_arm.exists(), f"{arm} got no file of its own"
+        assert f"arm `{arm}` only" in per_arm.read_text()

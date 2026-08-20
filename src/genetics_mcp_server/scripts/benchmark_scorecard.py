@@ -26,6 +26,7 @@ shows a tally across its turns.
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -511,6 +512,193 @@ def render_transcript(
     return "\n".join(out + notes)
 
 
+def _fence(text: str, lang: str = "") -> list[str]:
+    """A fenced block whose fence is longer than any backtick run inside it.
+
+    Arguments are reproduced VERBATIM here — this renderer's whole reason to exist is that
+    the terminal views elide, and an elided script cannot be read. A value containing
+    ```` ``` ```` would otherwise close the block early and silently reflow the rest of the
+    document as prose, so the fence grows instead.
+    """
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    bar = "`" * max(3, longest + 1)
+    return [f"{bar}{lang}", text.rstrip("\n"), bar]
+
+
+def _md_arg(key: str, value: Any) -> list[str]:
+    """One tool argument, whole. Long or multi-line values become blocks, short ones inline."""
+    if isinstance(value, str):
+        text, lang = value, "python" if key in ("script", "code") else ""
+    else:
+        text, lang = json.dumps(value, indent=2, default=str), "json"
+    # a backtick in a short value would end the inline span mid-argument, so it takes the
+    # block path too rather than being rendered as half a value plus stray markup
+    if "\n" in text or len(text) > 160 or "`" in text:
+        return [f"- `{key}`:"] + _fence(text, lang)
+    return [f"- `{key}`: `{text}`"]
+
+
+def _md_call(call: dict) -> list[str]:
+    head = f"**{call.get('seq')}. `{call.get('name')}`**"
+    if call.get("iteration") is not None:
+        head = f"**[iteration {call['iteration']}] {call.get('seq')}. `{call.get('name')}`**"
+    if call.get("script_duration_ms") is not None:
+        status = call.get("script_status") or ("ok" if call.get("script_ok") else "?")
+        head += f" — sandbox {_secs(call['script_duration_ms'])}, `{status}`"
+    elif call.get("script_status") is not None:
+        head += f" — sandbox `{call['script_status']}`"
+    lines = [head, ""]
+    args = call.get("input")
+    if not isinstance(args, dict) or not args:
+        return lines + ["- (no arguments)", ""]
+    for key, value in args.items():
+        lines += _md_arg(key, value)
+    return lines + [""]
+
+
+def _md_turn_arm(turn: dict | None, arm: str) -> list[str]:
+    lines = [f"#### arm `{arm}`", ""]
+    if turn is None:
+        return lines + ["*this arm has no turn here.*", ""]
+    lines += [f"> {line}" for line in _turn_summary(turn)] + [""]
+    if turn.get("status") != OK:
+        return lines
+    calls = turn.get("tool_calls_detail")
+    if calls is None:
+        lines += ["*no `tool_calls_detail` — this report predates it.*", ""]
+    elif not calls:
+        lines += ["*answered with no tool calls.*", ""]
+    else:
+        lines += ["<details><summary>" f"{len(calls)} tool call(s)" "</summary>", ""]
+        for call in calls:
+            lines += _md_call(call)
+        lines += ["</details>", ""]
+    dropped = turn.get("final_answer_dropped_chars") or 0
+    if dropped:
+        # the discarded text is not recoverable from the report — only its length was kept,
+        # so saying "answer" without saying this would present a fragment as the whole reply
+        lines += [
+            f"*{dropped} character(s) of assistant prose written before the last tool call "
+            "were discarded at capture (see `pairwise_judge.final_answer_split`) and are "
+            "not in the report.*",
+            "",
+        ]
+    lines += ["**Answer**", ""]
+    answer = (turn.get("final_answer") or "").strip()
+    lines += ([answer] if answer else ["*(empty)*"]) + [""]
+    return lines
+
+
+def _md_judge(pairs: list[dict], turn_index: int) -> list[str]:
+    """The pairwise verdict for one turn, with both presentation orders' reasoning."""
+    rows = [p for p in pairs if p.get("turn_index") == turn_index]
+    if not rows:
+        return []
+    lines = ["#### judge", ""]
+    for row in rows:
+        winner = row.get("winner") or "tie"
+        margin = f", margin {row['margin']}" if row.get("margin") else ""
+        lines.append(f"- **{winner}**{margin} (`{row.get('outcome')}`)")
+        for p in row.get("passes") or []:
+            order = " vs ".join(p.get("order") or [])
+            reason = " ".join(str(p.get("reason") or "").split())
+            lines.append(f"    - shown *{order}* → **{p.get('verdict')}**: {reason}")
+        if row.get("arm_identifiable"):
+            lines.append("    - ⚠ the judge could name an arm from the answer text: blinding failed here.")
+    return lines + [""]
+
+
+def render_markdown(
+    report: dict[str, Any], case: str | None = None, only_arm: str | None = None
+) -> str:
+    """Every case's conversation, both arms, as markdown — nothing elided.
+
+    The terminal views (`--tools`, `--transcript`) are shaped by a column width and
+    therefore truncate: a `run_analysis` script, the one argument most worth reading when an
+    arm loses, is exactly the value that never fits. This view has no width, so the
+    arguments are whole and the answers are verbatim, and the file can be read, diffed or
+    handed to someone who was not at the terminal.
+
+    WHAT A REPORT CANNOT GIVE THIS, stated here rather than discovered halfway down the
+    file. `replay_benchmark` persists the user question, the assistant's tool_use blocks and
+    the final answer; it does NOT persist **tool results**, and it keeps only the LENGTH of
+    any assistant prose written before the last tool call. So this is the full conversation
+    as recorded — question, calls, answer — not a wire log: what a tool returned is absent,
+    and a turn that wrote a table before its last call shows the character count it lost.
+
+    `only_arm` renders ONE arm's side of the same run: the questions in the same order, that
+    arm's calls and answers, and the pairwise verdict that still names the other arm because
+    there is no per-arm quality number to put in its place. Comparability is still stated on
+    every case — the property belongs to the PAIR, and a one-arm file that dropped it would
+    read as a clean run of an arm whose partner fell over.
+    """
+    arms = list(report.get("arms") or [])
+    if len(arms) != 2:
+        return f"expected 2 arms, report has {arms!r}"
+    if only_arm is not None and only_arm not in arms:
+        return f"no arm {only_arm!r} in this report; it has: " + ", ".join(arms)
+    shown = [only_arm] if only_arm else arms
+    cfg = report.get("config") or {}
+    by_case = _turns_by_case(report, arms)
+    judge, judged = _judge_by_case(report)
+    selected = [c for c in sorted(by_case) if not case or c == case]
+    if not selected:
+        return f"no case matching {case!r}; report has: " + ", ".join(sorted(by_case))
+
+    title = f"# Benchmark transcripts — run `{cfg.get('run_id', '?')}`"
+    if only_arm:
+        title += f" — arm `{only_arm}` only"
+    out = [
+        title,
+        "",
+        (f"- arm: `{only_arm}` (of `{arms[0]}` vs `{arms[1]}`)" if only_arm
+         else f"- arms: `{arms[0]}` vs `{arms[1]}`")
+        + "".join(
+            f" · `{a}` = {(cfg.get('arm_tools') or {}).get(a, {}).get('count', '?')} tools"
+            for a in arms
+        ),
+        f"- model: `{cfg.get('model') or 'deployment default'}`"
+        f" · provider: `{cfg.get('provider') or 'deployment default'}`",
+        f"- dataset: `{cfg.get('dataset', '?')}`",
+        f"- cases: {len(selected)}"
+        + ("" if judged else " · **not judged** — the judge sections are absent"),
+        "",
+        "Tool **arguments and answers are verbatim**. Tool *results* are not in the report, "
+        "and assistant prose written before a turn's last tool call was discarded at "
+        "capture with only its length kept — where that happened the turn says so.",
+        "",
+    ]
+    if len(selected) > 1:
+        out += ["## Contents", ""]
+        out += [f"- [{c}](#{c.lower().replace(' ', '-')})" for c in selected] + [""]
+
+    for case_id in selected:
+        per_arm = by_case[case_id]
+        out += ["---", "", f"## {case_id}", ""]
+        blockers = _blockers(per_arm, arms)
+        if blockers:
+            out += [f"> **NOT COMPARABLE**: {'; '.join(blockers)}", ""]
+        for index in range(max(len(per_arm[a]) for a in arms)):
+            turns = {
+                arm: (per_arm[arm][index] if index < len(per_arm[arm]) else None)
+                for arm in arms
+            }
+            # the question comes from EITHER arm's record even in a one-arm file: both
+            # replayed the same dataset turn, and the arm being rendered may be the one that
+            # never got far enough to have recorded it
+            question = next(
+                (t.get("user_question") for t in turns.values() if t and t.get("user_question")),
+                "",
+            )
+            out += [f"### Turn {index}", "", "**User**", ""]
+            out += [f"> {line}" for line in str(question).splitlines() or [""]] + [""]
+            for arm in shown:
+                out += _md_turn_arm(turns[arm], arm)
+            out += _md_judge(judge.get(case_id, []), index)
+
+    return "\n".join(out).rstrip() + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Per-question side-by-side scorecard from a saved replay_benchmark report."
@@ -527,7 +715,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print both arms' call sequences side by side, per case and turn, with per-turn timing",
     )
-    p.add_argument("--case", default=None, help="with --tools/--transcript, restrict to one case_id")
+    p.add_argument(
+        "--markdown",
+        type=Path,
+        metavar="FILE",
+        default=None,
+        help="write every case's full conversation (both arms, nothing elided) to FILE as "
+        "markdown, plus one file per arm beside it (FILE.<arm>.md); `-` writes the paired "
+        "document to stdout and no per-arm files",
+    )
+    p.add_argument(
+        "--case", default=None, help="with --tools/--transcript/--markdown, restrict to one case_id"
+    )
     p.add_argument("--arg-width", type=int, default=100, help="argument preview width for --tools")
     p.add_argument("--width", type=int, default=200, help="total width for --transcript")
     p.add_argument(
@@ -539,6 +738,44 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"cannot read {args.report}: {exc}", file=sys.stderr)
         return 1
+    if args.markdown:
+        text = render_markdown(report, case=args.case)
+        if not text.startswith("#"):
+            # render_markdown returned a refusal (wrong arm count, no such case) rather than
+            # a document; writing that into the requested file would leave a plausible-looking
+            # artefact whose one line says nothing was rendered
+            print(text, file=sys.stderr)
+            return 1
+        if str(args.markdown) == "-":
+            # the per-arm files are files by definition; a single stream cannot be three of
+            # them, so stdout gets the side-by-side document alone rather than a silent
+            # concatenation that would read as one transcript
+            print(text)
+            print(
+                "(per-arm files are written only when --markdown names a path)",
+                file=sys.stderr,
+            )
+            return 0
+        # one file per arm beside the paired one: the paired document answers "why did this
+        # case go differently", and a single arm's file is what gets read on its own or
+        # diffed against the same arm from another run, where the other arm's calls are noise
+        written = [(args.markdown, text)] + [
+            (
+                args.markdown.with_name(
+                    f"{args.markdown.stem}.{arm}{args.markdown.suffix or '.md'}"
+                ),
+                render_markdown(report, case=args.case, only_arm=arm),
+            )
+            for arm in (report.get("arms") or [])
+        ]
+        for path, body in written:
+            try:
+                path.write_text(body)
+            except OSError as exc:
+                print(f"cannot write {path}: {exc}", file=sys.stderr)
+                return 1
+            print(f"wrote {path} ({len(body):,} chars)")
+        return 0
     if args.transcript:
         print(
             render_transcript(

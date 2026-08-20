@@ -2153,7 +2153,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
 | `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to `{"general"}`, and records each arm's resolved tool list in the report |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
-| `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read |
+| `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
 | `test_benchmark_transcript.py` | The side-by-side transcript carries what distinguishes a *wide* arm from a *slow* one (per-call iteration, retry loops, script shapes) and never invents a measurement it lacks — an unattributed call has no iteration, and the final iteration's absent tool phase is not reported as a gap |
 | `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded, length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
 
@@ -2570,6 +2570,25 @@ failures by shape, and the retry loops a failed script bought. Both elide long a
 visibly (`…`) and point at the `jq` that yields the whole value. `tool phases` sums the
 per-iteration phases and is **not** the sum of per-call durations, which nothing measures; a
 `+` marks a total some iteration's phase was missing from.
+
+`--markdown FILE` writes the same conversations as a document instead of a terminal view
+(`-` for stdout, `--case` to restrict it): per case and turn, the question, each arm's timing
+line, every tool call with its arguments **whole**, and both final answers verbatim, followed
+by the judge's verdict with the reasoning from both presentation orders. It also writes
+**one file per arm** beside it — `FILE.<arm>.md`, the same cases and questions with only that
+arm's calls and answers — because the paired document answers "why did this case go
+differently" while a single arm's file is what is read alone or diffed against the same arm
+from another run, where the other arm's calls are noise. A one-arm file still carries the
+case's comparability line and the pairwise verdict naming the other arm: the property being
+reported belongs to the **pair**, and a one-arm file that dropped it would present an arm
+whose partner fell over as a clean run. `-` prints the paired document only, since a single
+stream cannot be three files. The elision is what
+the file exists to remove — the two column views are width-bound, and a `run_analysis` script
+is precisely the argument that never fits, so an argument's fence grows past any backticks
+inside it rather than the value being cut. What a saved report cannot supply is stated in the
+document itself rather than left to be discovered: **tool results are not recorded at all**,
+and assistant prose written before a turn's last tool call was discarded at capture by
+`final_answer_split` with only its length kept, so a turn that lost text says how much.
 - Authentication, when the target requires it, comes from `$REPLAY_AUTH_TOKEN` and is
   sent as a bearer token; it is never written into the report or logged.
 
