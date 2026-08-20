@@ -2111,7 +2111,11 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
-| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling (runs a local stub SSE server) |
+| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
+| `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to `{"general"}`, and records each arm's resolved tool list in the report |
+| `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
+| `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read |
+| `test_benchmark_transcript.py` | The side-by-side transcript carries what distinguishes a *wide* arm from a *slow* one (per-call iteration, retry loops, script shapes) and never invents a measurement it lacks — an unattributed call has no iteration, and the final iteration's absent tool phase is not reported as a gap |
 | `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded, length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
 
 Run tests:
@@ -2468,11 +2472,65 @@ harness issues two arms per case. `--base-url` therefore defaults to
   commentary and not the tool trace. `user_question` comes from the replayed dataset
   and is therefore identical on both arms, which is what makes a pair a pair. They are
   in the report so a saved run can be judged later without replaying anything.
+- **Every `ok` turn records its whole tool-call sequence** in `tool_calls_detail` — one
+  entry per `tool_use` block of `message_content`, in emission order, with `tool_calls`
+  defined as its length so the count and the listing cannot disagree. Arguments are kept
+  **verbatim and untruncated**, `run_analysis`'s entire script included: a count says one
+  arm made one call where the other made six and cannot say whether that call asked for the
+  right thing. Tool *results* are deliberately not recorded — one call can return thousands
+  of rows, and the question this answers is what the model **asked for**.
+
+  Two fields come from the SSE stream's *ordering* rather than the `done` chunk, which
+  flattens every iteration's blocks into one list with no boundary between them: `iteration`
+  (the roundtrip a call belongs to — without it, six calls in one parallel iteration are
+  indistinguishable from six iterations of one call each, which was ambiguous on 46 of 106
+  turns of the 2026-08-19 run) and, for `run_analysis` only, `script_duration_ms` /
+  `script_status` from its `script_result` chunk, correlated by `tool_use_id`. **No other
+  tool is timed on the wire**: an iteration's calls are dispatched with `asyncio.gather`, so
+  only the whole phase is measured. `attach_call_metadata` correlates on `id` alone and
+  never takes arguments from the streamed copy — `llm_service` rewrites that copy before
+  emitting it (substituting `search_scientific_literature`'s backend, stripping
+  `run_analysis`'s model-invented `user`/`session_id`), so it is what the server ran rather
+  than what the model asked for. Absent stays absent: against a server that emits no
+  `tool_use` chunks the keys are simply missing, never imputed.
+
+  `secret=true` does not redact any of this. `llm_service` omits tool input from its log
+  line, not from the `done` chunk.
 - **Output** is a JSON report (`--output`) carrying the config, the per-case arm
   order, the matched-pair headline summaries, the unmatched per-arm marginals and
   every individual turn record (including the per-iteration usage detail and the two
   fields above), plus a human-readable summary on stdout. When `--judge` ran, the
   report also carries a `judging` block and the summary prints its section.
+- **A 429 aborts the run** rather than being recorded as one broken turn. It is not a turn
+  failing, it is the server refusing everything from here on, and the turns already replayed
+  keep their cost while every later turn of their cases cascades to `not_attempted` —
+  measured against the default `RATE_LIMIT_PER_HOUR=20`, a 20-case run saved a report that
+  still looked complete (20 cases, both arms, correct `arm_tools`) while carrying 8 of 53
+  matched pairs. `RateLimitedError` is the one exception the "a broken turn must not abort
+  the run" handler re-raises; `main()` exits 2 after computing the plan's request count and
+  printing the `RATE_LIMIT_*` values that would cover it.
+
+### Per-question scorecard
+
+`scripts/benchmark_scorecard.py` reads a saved report and re-measures nothing, so it is free
+to run and re-run. The default view is one row per case, both arms side by side, over wall
+clock, USD, tool calls and the judge's pairwise verdict — the distributions answer "which arm
+is cheaper", not "on which questions".
+
+A case whose turns did not all succeed on **both** arms is marked and excluded from the
+totals, with the reason printed: an arm that aborted early spent less of everything, and
+summing it beside one that finished scores failure as efficiency. A report containing 429s
+is called out above the table for the same reason. The judge column is a tally of pairwise
+verdicts, never a score — `pairwise_judge` picks a winner or a tie per turn and produces no
+per-arm scale to put in a column.
+
+`--tools` prints each case's ordered call sequence with arguments. `--transcript` puts the
+two arms in **two columns aligned turn by turn**, with the timing that explains each turn
+above its calls: model time vs summed tool phases, the slowest iteration, script attempts and
+failures by shape, and the retry loops a failed script bought. Both elide long arguments
+visibly (`…`) and point at the `jq` that yields the whole value. `tool phases` sums the
+per-iteration phases and is **not** the sum of per-call durations, which nothing measures; a
+`+` marks a total some iteration's phase was missing from.
 - Authentication, when the target requires it, comes from `$REPLAY_AUTH_TOKEN` and is
   sent as a bearer token; it is never written into the report or logged.
 
