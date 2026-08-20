@@ -5847,6 +5847,10 @@ class ToolExecutor:
         Second, an artifact entry is `name`/`size`/`content_type` and nothing else — no path,
         no id, no URL — so it is rebuilt to that shape rather than forwarded.
         """
+        # auth.core is deferred for the same reason the sandbox imports are: it pulls
+        # FastAPI in, and this module is imported by the standalone MCP server, whose
+        # import graph has no business with either
+        from genetics_mcp_server.auth.core import SERVICE_IDENTITY
         from genetics_mcp_server.sandbox_client import (
             MAX_TIMEOUT_S,
             SandboxBusy,
@@ -5878,6 +5882,34 @@ class ToolExecutor:
             )
             return self._sandbox_operator_error(
                 "Code execution is not available in this context: no authenticated session."
+            )
+        if user == SERVICE_IDENTITY:
+            # THE MCP EXCLUSION BOUNDARY, enforced here rather than at the HTTP route
+            # (genetics-results-suite-4h6.27). The NetworkPolicy closes mcp-server -> sandbox
+            # but not mcp-server -> chat-backend -> sandbox: mcp-server holds
+            # INTERNAL_API_SECRET and is admitted to chat-backend:8000, and a valid marker
+            # with no identity header resolves to exactly this one service string
+            # (genetics-results-suite-th2). So "authenticated caller" is not the property
+            # this dispatch needs — a real person is, because `user` becomes the `sub` of
+            # both per-execution JWTs, the artifact retention scope and every audit record,
+            # and a service marker names nobody to attribute or revoke.
+            #
+            # At the dispatch and not at the route because THIS is the narrow waist every
+            # sandbox execution passes through — the streaming and non-streaming chat paths,
+            # subagent dispatch and any future caller — and because it sits immediately
+            # before mint_execution_tokens, so no credential can be minted for a subject
+            # that was refused. A route-level check would guard only the routes someone
+            # remembered to decorate and would also refuse chat itself, which the marker
+            # identity is legitimately allowed to use.
+            logger.error(
+                "run_analysis refused for the %s service identity (session=%s): code "
+                "execution requires an authenticated user",
+                SERVICE_IDENTITY,
+                session_id,
+            )
+            return self._sandbox_operator_error(
+                "Code execution requires an authenticated user session and is not available "
+                "to service callers."
             )
 
         try:

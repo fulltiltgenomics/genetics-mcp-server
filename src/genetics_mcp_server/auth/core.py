@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 IDENTITY_HEADER = "X-Goog-Authenticated-User-Email"
 INTERNAL_MARKER_HEADER = "X-Internal-Auth"
 
+# what a caller resolves to when it presents the marker and asserts NO identity
+# (`auth_required` case 3). It names a service, not a person, and every holder of
+# INTERNAL_API_SECRET resolves to this one string — mcp-server included. Anything that must
+# act for a real user has to reject it; `ToolExecutor.run_analysis` does, because the
+# NetworkPolicy admits mcp-server to chat-backend and chat-backend is the pod admitted to
+# the sandbox (genetics-results-suite-4h6.27, genetics-results-suite-th2).
+SERVICE_IDENTITY = "mcp-tool"
+
 
 def is_internal_caller(request: Request) -> bool:
     """True when the request carries the shared internal secret in either accepted transport.

@@ -461,13 +461,7 @@ class TestChatEndpointProviders:
         ) + verbosity_prompt(None)
         assert injected not in service.kwargs["system_prompt"]
 
-    def test_system_prompt_follows_the_requested_tool_profile(self, test_client):
-        """The prompt is assembled from the tool list the request will actually get.
-
-        genetics-results-suite-4h6.69: before this, the endpoint built the prompt with no
-        reference to the profile, so the `code` arm was told to prefer API tools it had
-        not been given — which is exactly what the 4h6.23 A/B measures.
-        """
+    def _code_arm_prompt(self, test_client):
         from genetics_mcp_server import chat_api
 
         service = _CapturingService()
@@ -479,12 +473,49 @@ class TestChatEndpointProviders:
                     "tool_profile": "code",
                 },
             )
-
         assert response.status_code == 200
-        prompt = service.kwargs["system_prompt"]
+        return service.kwargs["system_prompt"]
+
+    def test_system_prompt_follows_the_requested_tool_profile(self, test_client, monkeypatch):
+        """The prompt is assembled from the tool list the request will actually get.
+
+        genetics-results-suite-4h6.69: before this, the endpoint built the prompt with no
+        reference to the profile, so the `code` arm was told to prefer API tools it had
+        not been given — which is exactly what the 4h6.23 A/B measures.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+
+        monkeypatch.setenv("SANDBOX_ENABLED", "true")
+        settings_module.get_settings.cache_clear()
+        try:
+            prompt = self._code_arm_prompt(test_client)
+        finally:
+            settings_module.get_settings.cache_clear()
+
         assert "run_analysis" in prompt
         assert "get_credible_sets_by_gene" not in prompt
         assert "Prefer the dedicated API tools" not in prompt
+
+    def test_the_sandbox_flag_reaches_the_prompt_this_endpoint_sends(
+        self, test_client, monkeypatch
+    ):
+        """genetics-results-suite-4h6.56 end to end, on the route rather than in a unit.
+
+        With SANDBOX_ENABLED false the tool is withheld, and because the prompt is built
+        from the resolved list the steering goes with it — no prompt edit, no second place
+        to remember. This is the assertion that would catch a future prompt that hard-codes
+        run_analysis guidance again.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+        settings_module.get_settings.cache_clear()
+        try:
+            prompt = self._code_arm_prompt(test_client)
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert "run_analysis" not in prompt
 
     def test_chat_with_tool_profile(self, test_client):
         """Test providing tool_profile parameter."""

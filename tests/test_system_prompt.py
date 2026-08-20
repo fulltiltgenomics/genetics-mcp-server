@@ -41,21 +41,24 @@ def tool_names_mentioned(text: str) -> set[str]:
     return tokens & ALL_TOOL_NAMES
 
 
-def flag_disabled_tools(*, subagents: bool) -> set[str]:
+def flag_disabled_tools(*, subagents: bool, sandbox: bool = True) -> set[str]:
     """The disabled set the deployment flags actually produce.
 
     Derived from Settings rather than hard-coded, so a flag added in front of another
-    tool (genetics-results-suite-4h6.56 proposes one for run_analysis) is picked up here
-    without editing this file.
+    tool is picked up here without editing this file. `sandbox` defaults to True — the
+    opposite of the deployed default — because everything below is about what the prompt
+    says when a tool IS present; the flag-off direction is asserted explicitly instead
+    (genetics-results-suite-4h6.56).
     """
-    return Settings(enable_subagents=subagents).disabled_tools
+    return Settings(enable_subagents=subagents, sandbox_enabled=sandbox).disabled_tools
 
 
-def resolve(profile: str | None, *, subagents: bool) -> set[str]:
+def resolve(profile: str | None, *, subagents: bool, sandbox: bool = True) -> set[str]:
     return {
         t["name"]
         for t in get_anthropic_tools(
-            tool_profile=profile, disabled_tools=flag_disabled_tools(subagents=subagents)
+            tool_profile=profile,
+            disabled_tools=flag_disabled_tools(subagents=subagents, sandbox=sandbox),
         )
     }
 
@@ -88,8 +91,25 @@ class TestPromptNamesOnlyAvailableTools:
         assert "variant_list_analysis" in on
         assert "variant_list_analysis" not in off
 
+    def test_the_sandbox_flag_takes_the_guidance_with_the_tool(self):
+        """4h6.56 cashed in: SANDBOX_ENABLED=false must silence the prompt too.
+
+        Asserted through Settings and the real resolution rather than by subtracting the
+        name by hand, because the whole point of the flag is that ONE value moves both the
+        tool list and the prompt. A prompt that kept steering toward run_analysis while the
+        tool was gone would be the worst of the three states.
+        """
+        off = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False, sandbox=False))
+        assert "run_analysis" not in off
+        assert "Choosing How to Get Data" in off, "the other paths still need routing"
+        # the default profile is not the only surface: the code arm resolves to nothing it
+        # can steer toward either
+        code_off = resolve("code", subagents=False, sandbox=False)
+        assert "run_analysis" not in code_off
+        assert "run_analysis" not in default_system_prompt("FinnGenie", tool_names=code_off)
+
     def test_run_analysis_guidance_follows_the_tool(self):
-        """The gate is what makes a future run_analysis flag (4h6.56) free."""
+        """The gate is what makes the run_analysis flag (4h6.56) free."""
         with_tool = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False))
         assert "run_analysis" in with_tool
         without = default_system_prompt(

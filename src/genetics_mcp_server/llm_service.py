@@ -1440,6 +1440,37 @@ class LLMService:
     ) -> dict[str, Any]:
         """Execute a tool by name using the executor or external proxy."""
         try:
+            # dispatch only what the resolved tool list actually advertised, the same
+            # allowlist shape subagent.py's `_execute_subagent_tool` carries and for the
+            # same reason: the local branch below calls any executor attribute the model
+            # names, which makes withholding a tool advisory rather than enforced. The
+            # model does not have to invent the name — ChatMessage.content accepts raw
+            # blocks and _sanitize_tool_blocks drops only ORPHANED tool_use, so a
+            # client-supplied history with a paired run_analysis tool_use/tool_result
+            # survives verbatim and primes the model for a tool it was not given.
+            # disabled_tools is the profile-independent complement (it is applied before
+            # the profile filter at the resolution site above), so a name in it is
+            # advertised by no profile.
+            disabled = get_settings().disabled_tools
+            if tool_name in disabled:
+                logger.warning(
+                    f"Refusing to dispatch '{tool_name}': not enabled in this deployment"
+                )
+                return {
+                    "success": False,
+                    "error": f"Tool '{tool_name}' is not available in this deployment.",
+                    # run_analysis carries the sandbox's own operator-error type because
+                    # that is what the script_result chunk and the benchmark read; the
+                    # point of both is that a withheld tool must not look transient, or
+                    # the model retries a deployment fact (genetics-results-suite-4h6.56)
+                    "error_type": (
+                        "SandboxNotConfigured"
+                        if tool_name == "run_analysis"
+                        else "ToolNotEnabled"
+                    ),
+                    "retryable": False,
+                }
+
             # subagent tool
             if tool_name == "launch_subagents":
                 if not self.subagent_service:

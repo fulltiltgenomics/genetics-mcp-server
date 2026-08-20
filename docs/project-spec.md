@@ -230,8 +230,30 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 ### Code execution tools
 
 Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
-not deployed, so every `run_analysis` call fails at the transport today and
-`read_artifact` has nothing to read in any running service.
+not deployed, so `read_artifact` has nothing to read in any running service — and
+**`run_analysis` is withheld entirely until `SANDBOX_ENABLED` is true**
+(`genetics-results-suite-4h6.56`). The flag is a deployment fact, not a preference: with
+no sandbox at `SANDBOX_URL` the transport fails as `SandboxUnavailable` with
+`retryable: True`, which reads as a passing outage, while the system prompt tells the
+model to *prefer* the tool — so an ungated deployment steers every turn into a tool that
+always fails and asks to be retried. `settings.disabled_tools` carries the exclusion, so
+it applies **before** the profile filter and no `tool_profile` (including the name-listed
+`code` arm) can restore it, and because the prompt is assembled from the resolved tool
+list the "Choosing How to Get Data" steering disappears with the tool rather than being
+edited separately. Only `run_analysis` is gated: `list_capabilities` and `read_artifact`
+are inert without a sandbox rather than broken by it, and neither is a tool the prompt
+prefers. Enabling it means setting `SANDBOX_ENABLED=true` on chat-backend, the same value
+db-api and results-api already gate sandbox-token verification on.
+
+Withholding the name from the list is not sufficient on its own, so `_execute_tool`
+refuses to dispatch anything in `settings.disabled_tools` before it resolves a handler —
+the same allowlist shape `subagent.py` carries for the same reason. Without it the
+`getattr(self.executor, tool_name)` lookup runs whatever the model names: `ChatMessage`
+accepts raw content blocks and `_sanitize_tool_blocks` drops only *orphaned* `tool_use`,
+so a client-supplied history containing a paired `run_analysis` `tool_use`/`tool_result`
+survives verbatim and primes the model for a tool it was never given. The refusal is
+`retryable: false` (`SandboxNotConfigured` for `run_analysis`, `ToolNotEnabled` otherwise)
+because a withheld tool is a deployment fact and must not read as a passing outage.
 
 | Tool | Description |
 |------|-------------|
@@ -325,6 +347,21 @@ scope and the per-`jti` budgets. There is no placeholder that would be honest. T
 is a **wiring** fault, not a script fault, and is logged at `ERROR` as
 `run_analysis called without an authenticated identity (user=… session=…)` with the two
 booleans, precisely so an operator can tell which half is missing.
+
+**An authenticated caller is not enough — the dispatch requires a real person.** The
+executor also refuses a `run_analysis` whose `user` is the `mcp-tool` service identity
+(`auth.core.SERVICE_IDENTITY`), with the same `SandboxNotConfigured` / `retryable: false`
+shape and an `ERROR` log line. This is the MCP-exclusion boundary, and it is one hop
+longer than the network layer covers (`genetics-results-suite-4h6.27`): the NetworkPolicy
+closes mcp-server → sandbox, but mcp-server holds `INTERNAL_API_SECRET` and is admitted to
+chat-backend:8000, and a valid marker with no identity header resolves to exactly that one
+service string (`genetics-results-suite-th2`) — so mcp-server → chat-backend → sandbox was
+open. The check sits at the **tool dispatch**, not on the HTTP route, because that is the
+narrow waist every execution passes (streaming chat, non-streaming chat, subagent
+dispatch, anything added later) and because it sits immediately before
+`mint_execution_tokens`, so no credential can be minted for a subject that was refused. A
+route-level check would guard only the routes someone remembered to decorate, and would
+also refuse plain chat, which the marker identity may legitimately use.
 
 That made the browser's lazy session creation a bug rather than a preference
 (`genetics-results-suite-vda`): a chat started by typing created its session *after* the
@@ -1737,6 +1774,7 @@ All configuration is via environment variables (`.env` file supported):
 | `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info. The pruned sandbox install holds none by design and uses `SANDBOX_TOKEN_FILE` instead; since `genetics-results-suite-4h6.44` it is no longer exempt from needing *a* credential — a pruned install with neither raises `SandboxCredentialError` at client construction | - |
 | `SANDBOX_TOKEN_FILE` | Path (never the tokens) to the per-execution token file the sandbox supervisor writes before it forks — a JSON object keyed by audience, `{"db-api": ..., "results-api": ...}`. Read **once** and unlinked on the first client build (`tools/executor.py`), then attached per request bound to the destination's audience; mutually exclusive with `INTERNAL_API_SECRET`, and a file that does not yield a usable pair raises rather than degrading to no credential. Set only by the supervisor in the sandbox image; unset everywhere else. Read-once-and-unlink is **not** an exposure bound — see `genetics-results-suite-4h6.55` | - |
 | `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
+| `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. False withholds `run_analysis` from every resolved tool list — and, since the prompt is built from that list, its guidance too. A deployment fact, flipped by the deploy that creates the sandbox | `false` |
 | `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments | `http://127.0.0.1:8080` |
 | `SANDBOX_TOKEN_SIGNING_KEY` | HS256 key for the per-execution sandbox tokens, held only by chat-backend (mint) and db-api/results-api (verify). Separate from `INTERNAL_API_SECRET` on purpose: separate blast radius, independent rotation, and the sandbox holds neither. Unset means **no execution runs** — `mint_execution_tokens` raises `SandboxTokenUnavailable` rather than returning `None`, since every fallback is either "send no credential" or "send the shared secret" | - |
 
@@ -2039,6 +2077,7 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `EXTERNAL_MCP_EXCLUDE_TOOLS` | Tool names to exclude from proxying |
 | `ENABLE_CREDIBLE_SETS_STATS` | Enable `get_credible_sets_stats` tool (default `false`) |
 | `ENABLE_PHENOTYPE_REPORT` | Enable `get_phenotype_report` tool (default `false`) |
+| `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
 
 These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which the MCP server, the chat API and the subagents all read, so a disabled tool is invisible on every surface rather than only unregistered on one.

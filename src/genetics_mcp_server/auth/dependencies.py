@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, Request
 
 from genetics_mcp_server.auth.core import (
     IDENTITY_HEADER,
+    SERVICE_IDENTITY,
     get_authenticated_user,
     is_internal_caller,
 )
@@ -78,7 +79,7 @@ async def auth_required(request: Request) -> str | None:
             if user is None:
                 raise HTTPException(status_code=401, detail="Not authenticated")
             return user
-        return "mcp-tool"  # case 3
+        return SERVICE_IDENTITY  # case 3
 
     user = get_authenticated_user(request)  # case 4, always None without the marker
     if user is None:

@@ -57,6 +57,25 @@ class Settings:
         default_factory=lambda: os.environ.get("SANDBOX_URL", "http://127.0.0.1:8080")
     )
 
+    # whether a sandbox supervisor is actually deployed at sandbox_url. A DEPLOYMENT FACT,
+    # not a preference, and false until the deploy that creates the sandbox sets it — the
+    # same env var name db-api and results-api already gate their token verification on, so
+    # one value describes the sandbox's existence across the three services that care.
+    #
+    # While it is false `run_analysis` is absent from `disabled_tools`' complement, so no
+    # resolved tool list contains it (genetics-results-suite-4h6.56). Shipping it enabled
+    # ahead of the sandbox is the expensive failure, not the safe one: the system prompt
+    # tells the model to PREFER it, and an unreachable sandbox classifies as
+    # SandboxUnavailable with retryable: True, so every chat turn is steered into a tool
+    # that always fails and invites a retry. Removing it from the list also removes the
+    # prompt's guidance for it, because the prompt is assembled from the tool list in force
+    # (genetics-results-suite-4h6.69) — there is deliberately no prompt edit to remember.
+    sandbox_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "SANDBOX_ENABLED", "false"
+        ).lower() in ("1", "true", "yes")
+    )
+
     # web search
     tavily_api_key: str | None = field(
         default_factory=lambda: os.environ.get("TAVILY_API_KEY")
@@ -346,6 +365,10 @@ class Settings:
             disabled.add("get_phenotype_report")
         if not self.enable_subagents:
             disabled.add("launch_subagents")
+        if not self.sandbox_enabled:
+            # only run_analysis: list_capabilities and read_artifact are inert without a
+            # sandbox rather than broken by it, and neither is a tool the prompt prefers
+            disabled.add("run_analysis")
         return disabled
 
 

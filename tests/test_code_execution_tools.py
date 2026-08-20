@@ -14,6 +14,7 @@ import signal
 
 import pytest
 
+from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.llm_service import _script_result_payload
 from genetics_mcp_server.tools import ToolExecutor
 from genetics_mcp_server.tools import executor as executor_module
@@ -598,9 +599,113 @@ class TestRunAnalysisDefinition:
         assert "CANNOT BE RETRIEVED" in description
         assert "read_artifact" not in description
 
-    def test_reaches_the_chat_tool_list(self):
-        names = {t["name"] for t in get_anthropic_tools()}
+    def test_reaches_the_chat_tool_list_when_the_sandbox_is_enabled(self):
+        """Registered unconditionally; it is `disabled_tools` that withholds it, so the
+        unfiltered registry is NOT what chat resolves (see TestRunAnalysisSandboxFlag).
+        """
+        assert "run_analysis" in {t["name"] for t in get_anthropic_tools()}
+        enabled = Settings(sandbox_enabled=True).disabled_tools
+        names = {t["name"] for t in get_anthropic_tools(disabled_tools=enabled)}
         assert "run_analysis" in names
+
+
+class TestRunAnalysisSandboxFlag:
+    """genetics-results-suite-4h6.56: no sandbox deployed, no tool offered.
+
+    The failure this prevents is not "a tool errors". An unreachable sandbox classifies as
+    SandboxUnavailable with `retryable: True`, and the prompt tells the model to PREFER
+    run_analysis — so before the flag, every chat turn on a sandbox-less deployment was
+    steered into a tool that always failed and asked to be retried.
+    """
+
+    def test_the_flag_is_off_unless_the_environment_says_otherwise(self, monkeypatch):
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+        assert Settings().sandbox_enabled is False
+        monkeypatch.setenv("SANDBOX_ENABLED", "true")
+        assert Settings().sandbox_enabled is True
+
+    def test_the_default_deployment_withholds_the_tool(self, monkeypatch):
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+        assert "run_analysis" in Settings().disabled_tools
+
+    def test_no_profile_can_put_it_back(self):
+        """disabled_tools is applied BEFORE the profile filter, including for the
+        name-listed `code` profile, so the flag is not something a request can route
+        around by asking for a different surface.
+        """
+        disabled = Settings(sandbox_enabled=False).disabled_tools
+        for profile in (None, "api", "bigquery", "rag", "code"):
+            names = {
+                t["name"]
+                for t in get_anthropic_tools(tool_profile=profile, disabled_tools=disabled)
+            }
+            assert "run_analysis" not in names, profile
+
+    def test_the_other_two_code_tools_are_not_gated(self):
+        """They are inert without a sandbox rather than broken by it — list_capabilities
+        renders from the local SDK and read_artifact reads this process's own directory —
+        and neither is a tool the prompt steers toward, which is what made run_analysis
+        expensive to ship early.
+        """
+        disabled = Settings(sandbox_enabled=False).disabled_tools
+        assert "list_capabilities" not in disabled
+        assert "read_artifact" not in disabled
+
+    def test_the_flag_reaches_the_service_that_advertises_tools(self, monkeypatch):
+        """settings.disabled_tools is what llm_service resolves against, so the gate has
+        to hold through that path and not only in the settings object.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+        from genetics_mcp_server.llm_service import LLMService
+
+        service = LLMService.__new__(LLMService)
+        service.subagent_service = None
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+        settings_module.get_settings.cache_clear()
+        try:
+            assert "run_analysis" in service._disabled_tools()
+        finally:
+            settings_module.get_settings.cache_clear()
+
+    async def test_a_model_emitted_call_is_refused_without_dispatching(self, monkeypatch):
+        """Withholding the tool from the list is not enough on its own.
+
+        _execute_tool resolves the handler by getattr on the executor, so a tool_use the
+        model emits anyway reaches the sandbox client regardless of what was advertised —
+        and the model does not have to invent the name: a client-supplied history with a
+        paired run_analysis tool_use/tool_result survives _sanitize_tool_blocks verbatim
+        and primes it. In a deployment with no sandbox that lands on SandboxUnavailable
+        with retryable: True, which is the exact failure 4h6.56 exists to prevent.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+        from genetics_mcp_server.llm_service import LLMService
+
+        dispatched = []
+
+        class _Recorder:
+            async def run_analysis(self, **kwargs):
+                dispatched.append(kwargs)
+                return {"success": True}
+
+        service = LLMService.__new__(LLMService)
+        service.executor = _Recorder()
+        service.subagent_service = None
+
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+        settings_module.get_settings.cache_clear()
+        try:
+            result = await service._execute_tool(
+                "run_analysis", {"code": "print(1)"}, None, "real@finngen.fi", "conv-7"
+            )
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert dispatched == []
+        assert result["success"] is False
+        # the refusal must not read as transient, or the model spends the turn retrying
+        assert result["retryable"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert _script_result_payload(1, result)["status"] == "SandboxNotConfigured"
 
 
 class TestRunAnalysisFailsClosed:
@@ -981,6 +1086,61 @@ class TestRunAnalysisImages:
         assert "sandbox-0" not in str(result)
 
 
+class TestRunAnalysisRequiresARealUser:
+    """genetics-results-suite-4h6.27: the MCP exclusion boundary is one hop long.
+
+    The NetworkPolicy closes mcp-server -> sandbox, but mcp-server holds
+    INTERNAL_API_SECRET and is admitted to chat-backend:8000, and chat-backend is the pod
+    admitted to the sandbox. A valid marker with no identity header resolves to exactly
+    `mcp-tool` (genetics-results-suite-th2), so "the caller authenticated" is not the
+    property this dispatch needs — a real person is.
+    """
+
+    async def test_the_service_identity_cannot_execute_code(self, executor):
+        from genetics_mcp_server.auth.core import SERVICE_IDENTITY
+
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run(executor, sandbox, user=SERVICE_IDENTITY)
+
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+        assert sandbox.calls == [], "nothing may be dispatched, and nothing minted"
+
+    async def test_the_refusal_is_the_one_auth_required_actually_returns(self):
+        """Pinned against the resolver rather than a literal: if case 3 ever returns a
+        different string, this test fails instead of the guard silently missing it.
+        """
+        from genetics_mcp_server.auth import dependencies
+
+        source = inspect.getsource(dependencies.auth_required)
+        assert "return SERVICE_IDENTITY  # case 3" in source
+
+    async def test_a_real_user_still_runs(self, executor):
+        """The guard must be a rejection of one identity, not of service-shaped ones."""
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run(executor, sandbox, user="real@finngen.fi")
+        assert result["success"] is True
+        assert len(sandbox.calls) == 1
+
+    def test_the_guard_runs_before_anything_is_minted(self):
+        """Structural: the check sits above the try block, so no reordering can leave a
+        credential minted for a subject that was then refused.
+        """
+        import ast
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(ToolExecutor.run_analysis)))
+        body = tree.body[0].body
+        guard_index = next(
+            i
+            for i, node in enumerate(body)
+            if isinstance(node, ast.If) and "SERVICE_IDENTITY" in ast.unparse(node.test)
+        )
+        try_index = next(i for i, node in enumerate(body) if isinstance(node, ast.Try))
+        assert guard_index < try_index
+
+
 class TestRunAnalysisIdentity:
     async def test_the_caller_identity_is_what_reaches_the_client(self, executor):
         sandbox = _StubSandbox(result=_result_body())
@@ -988,10 +1148,11 @@ class TestRunAnalysisIdentity:
         assert sandbox.calls[0]["user"] == "real@finngen.fi"
         assert sandbox.calls[0]["session_id"] == "conv-7"
 
-    async def test_llm_service_strips_a_model_supplied_identity(self):
+    async def test_llm_service_strips_a_model_supplied_identity(self, monkeypatch):
         """tool_input is splatted verbatim into the handler, and the model can emit keys
         the schema does not declare. Same shape as the literature `backend` strip.
         """
+        from genetics_mcp_server.config import settings as settings_module
         from genetics_mcp_server.llm_service import LLMService
 
         seen = {}
@@ -1005,13 +1166,20 @@ class TestRunAnalysisIdentity:
         service.executor = _Recorder()
         service.subagent_service = None
 
-        await service._execute_tool(
-            "run_analysis",
-            {"code": "print(1)", "user": "attacker@evil.example", "session_id": "other"},
-            None,
-            "real@finngen.fi",
-            "conv-7",
-        )
+        # the dispatch allowlist refuses a withheld tool before any of this, so the strip
+        # is only observable on a deployment that has the sandbox
+        monkeypatch.setenv("SANDBOX_ENABLED", "true")
+        settings_module.get_settings.cache_clear()
+        try:
+            await service._execute_tool(
+                "run_analysis",
+                {"code": "print(1)", "user": "attacker@evil.example", "session_id": "other"},
+                None,
+                "real@finngen.fi",
+                "conv-7",
+            )
+        finally:
+            settings_module.get_settings.cache_clear()
         assert seen["user"] == "real@finngen.fi"
         assert seen["session_id"] == "conv-7"
 
