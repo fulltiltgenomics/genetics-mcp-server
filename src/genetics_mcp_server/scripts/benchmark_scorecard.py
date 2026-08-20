@@ -305,6 +305,212 @@ def render_tool_calls(report: dict[str, Any], width: int = 100, case: str | None
     return "\n".join(out)
 
 
+def _secs(ms: Any) -> str:
+    """Milliseconds as seconds, or `?` when the wire never carried the measurement."""
+    if not isinstance(ms, (int, float)) or isinstance(ms, bool):
+        return "?"
+    return f"{ms / 1000.0:.1f}s"
+
+
+def _tool_phase_total(turn: dict) -> tuple[float | None, bool]:
+    """Summed per-iteration tool phase, and whether any iteration's was unmeasured.
+
+    NOT the sum of per-call durations, which nothing measures. An iteration's tools are
+    dispatched with `asyncio.gather`, so its phase is roughly the SLOWEST call plus dispatch
+    and result rendering, not the total work done in it. Two arms with the same tool-phase
+    total can therefore have made very different numbers of calls, which is exactly the
+    comparison this view exists to let a reader make by eye.
+    """
+    rows = turn.get("iterations_detail") or []
+    measured = [r.get("tool_phase_ms") for r in rows if r.get("tool_phase_ms") is not None]
+    # the final iteration's phase is None by construction (it answered rather than calling
+    # tools), so its absence is not a gap; any OTHER None is
+    gaps = any(r.get("tool_phase_ms") is None for r in rows[:-1])
+    return (sum(measured) if measured else None), gaps
+
+
+def _turn_summary(turn: dict) -> list[str]:
+    """The numbers that explain a turn's wall clock, above its call list."""
+    if turn.get("status") != OK:
+        return [f"!! {turn.get('status')}: {str(turn.get('error') or 'no detail')[:200]}"]
+    phase, gaps = _tool_phase_total(turn)
+    lines = [
+        f"{_secs(turn.get('ms_to_done'))} wall  ·  {turn.get('iterations')} iters  ·  "
+        f"{turn.get('tool_calls')} calls",
+        f"  model {_secs(turn.get('model_ms_total'))}  ·  tool phases "
+        f"{_secs(phase)}{'+' if gaps else ''}"
+        + (
+            f"  ·  slowest iter {turn.get('slowest_iteration')} "
+            f"({_secs(turn.get('slowest_iteration_ms'))})"
+            if turn.get("slowest_iteration")
+            else ""
+        ),
+    ]
+    if turn.get("script_attempts"):
+        outcomes = turn.get("script_outcomes") or {}
+        shapes = ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
+        lines.append(
+            f"  scripts: {turn.get('script_attempts')} attempted, "
+            f"{turn.get('script_failures') or 0} failed"
+            + (f"  [{shapes}]" if shapes else "")
+        )
+    if turn.get("retry_loops"):
+        # the iterations bought by a failed script rather than by the question: this is the
+        # first thing to look at when the code arm is slower than the arm without it
+        lines.append(f"  retry loops: {turn.get('retry_loops')} (extra roundtrips after a script failed)")
+    if turn.get("hit_max_iterations"):
+        lines.append("  !! hit the iteration ceiling — the answer is whatever it had by then")
+    return lines
+
+
+def _call_lines(call: dict, width: int, arg_lines: int) -> list[str]:
+    """One call: its position, name, what it cost if that is knowable, then its arguments."""
+    head = f"{call.get('seq')}. {call.get('name')}"
+    if call.get("iteration") is not None:
+        head = f"[i{call['iteration']}] " + head
+    if call.get("script_duration_ms") is not None:
+        status = call.get("script_status") or ("ok" if call.get("script_ok") else "?")
+        head += f"  (sandbox {_secs(call['script_duration_ms'])}, {status})"
+    elif call.get("script_status") is not None:
+        head += f"  (sandbox {call['script_status']})"
+    lines = [head]
+    args = call.get("input")
+    if not isinstance(args, dict) or not args:
+        lines.append("     (no arguments)")
+        return lines
+    for key, value in args.items():
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        # newlines are KEPT for script arguments: a script's shape is most of what makes it
+        # readable, and rewrapping it into a paragraph destroys exactly that
+        body = f"{key}={text}".replace("\t", "    ")
+        wrapped: list[str] = []
+        for para in body.split("\n"):
+            para = para.rstrip()
+            if not para:
+                wrapped.append("")
+                continue
+            while para:
+                wrapped.append(para[: width - 5])
+                para = para[width - 5 :]
+        if len(wrapped) > arg_lines:
+            wrapped = wrapped[:arg_lines]
+            wrapped[-1] = wrapped[-1][: width - 6] + "…"
+        lines += [f"     {line}" for line in wrapped]
+    return lines
+
+
+def _two_column(left: list[str], right: list[str], colw: int) -> list[str]:
+    out = []
+    for i in range(max(len(left), len(right))):
+        lhs = (left[i] if i < len(left) else "")[:colw]
+        rhs = (right[i] if i < len(right) else "")[:colw]
+        out.append(f"{lhs:<{colw}} | {rhs}".rstrip())
+    return out
+
+
+def render_transcript(
+    report: dict[str, Any],
+    width: int = 200,
+    case: str | None = None,
+    arg_lines: int = 6,
+) -> str:
+    """Both arms' call sequences for one case, aligned turn by turn in two columns.
+
+    The scorecard says the code arm made more calls and took longer. It cannot say WHY, and
+    the distributions cannot either — the answer is always in one case's sequence: a script
+    that failed and was rewritten, a tool called twice with the same arguments, a wide
+    parallel fan-out the baseline did serially. This is that sequence, with the per-turn
+    timing beside it so a slow turn can be attributed to model time or to tool time.
+
+    WHAT IS AND IS NOT MEASURED per call. `run_analysis` reports the sandbox's own wall
+    clock, so those calls carry a duration. NOTHING ELSE ON THE WIRE DOES: every other call
+    shows only its position and arguments, and the time it took is inside its iteration's
+    tool phase together with every other call of that iteration, which ran in parallel with
+    it. `[iN]` is the iteration a call belongs to, recorded from the stream's ordering; a
+    report replayed before that was captured shows no `[iN]` and says so at the end.
+    """
+    arms = list(report.get("arms") or [])
+    if len(arms) != 2:
+        return f"expected 2 arms, report has {arms!r}"
+    a, b = arms
+    colw = max(28, (width - 3) // 2)
+    by_case = _turns_by_case(report, arms)
+    selected = [c for c in sorted(by_case) if not case or c == case]
+    if not selected:
+        return f"no case matching {case!r}; report has: " + ", ".join(sorted(by_case))
+
+    out: list[str] = []
+    saw_iteration = False
+    saw_script_timing = False
+    for case_id in selected:
+        per_arm = by_case[case_id]
+        out.append("")
+        out.append("=" * (colw * 2 + 3))
+        out.append(f"CASE {case_id}")
+        blockers = _blockers(per_arm, arms)
+        if blockers:
+            out.append(f"  NOT COMPARABLE: {'; '.join(blockers)}")
+        out.append(f"{a:^{colw}} | {b:^{colw}}")
+        out.append("-" * (colw * 2 + 3))
+        for index in range(max(len(per_arm[a]), len(per_arm[b]))):
+            turns = {
+                arm: (per_arm[arm][index] if index < len(per_arm[arm]) else None) for arm in arms
+            }
+            question = next(
+                (t.get("user_question") for t in turns.values() if t and t.get("user_question")),
+                "",
+            )
+            out.append("")
+            out.append(f"--- turn {index}: {' '.join(str(question).split())[: width - 16]}")
+            sides = []
+            for arm in arms:
+                turn = turns[arm]
+                if turn is None:
+                    sides.append(["(this arm has no turn here)"])
+                    continue
+                lines = _turn_summary(turn)
+                calls = turn.get("tool_calls_detail")
+                if calls is None:
+                    lines.append("  (no tool_calls_detail — report predates it)")
+                elif not calls:
+                    lines.append("  answered with no tool calls")
+                else:
+                    lines.append("")
+                    for call in calls:
+                        saw_iteration = saw_iteration or call.get("iteration") is not None
+                        saw_script_timing = (
+                            saw_script_timing or call.get("script_duration_ms") is not None
+                        )
+                        lines += _call_lines(call, colw, arg_lines)
+                sides.append(lines)
+            out += _two_column(sides[0], sides[1], colw)
+
+    notes = [
+        "",
+        "-" * (colw * 2 + 3),
+        "Per-call durations are NOT measured for ordinary tools — an iteration's calls are "
+        "dispatched in parallel and only the whole phase is timed, so `tool phases` is the "
+        "sum of those phases, not of the calls.",
+    ]
+    if not saw_iteration:
+        notes.append(
+            "No call carries `[iN]`: this report predates the iteration attribution, so the "
+            "call list is in order but does not show where each roundtrip began. Re-run to "
+            "capture it."
+        )
+    if not saw_script_timing:
+        notes.append(
+            "No call carries a sandbox duration. `run_analysis` is the one tool that reports "
+            "its own wall clock; either this arm ran none, or the report predates capturing it."
+        )
+    notes.append(
+        f"Arguments are wrapped to {arg_lines} line(s) and elided with `…`. Whole values, "
+        "including entire scripts:\n"
+        "  jq '.turns[] | select(.case_id==\"<case>\") | {arm, turn_index, tool_calls_detail}' <report>"
+    )
+    return "\n".join(out + notes)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Per-question side-by-side scorecard from a saved replay_benchmark report."
@@ -316,14 +522,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print each case's ordered tool-call sequence with arguments, instead of the table",
     )
-    p.add_argument("--case", default=None, help="with --tools, restrict to one case_id")
+    p.add_argument(
+        "--transcript",
+        action="store_true",
+        help="print both arms' call sequences side by side, per case and turn, with per-turn timing",
+    )
+    p.add_argument("--case", default=None, help="with --tools/--transcript, restrict to one case_id")
     p.add_argument("--arg-width", type=int, default=100, help="argument preview width for --tools")
+    p.add_argument("--width", type=int, default=200, help="total width for --transcript")
+    p.add_argument(
+        "--arg-lines", type=int, default=6, help="lines per argument value for --transcript"
+    )
     args = p.parse_args(argv)
     try:
         report = json.loads(args.report.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         print(f"cannot read {args.report}: {exc}", file=sys.stderr)
         return 1
+    if args.transcript:
+        print(
+            render_transcript(
+                report, width=args.width, case=args.case, arg_lines=args.arg_lines
+            )
+        )
+        return 0
     if args.tools:
         print(render_tool_calls(report, width=args.arg_width, case=args.case))
         return 0

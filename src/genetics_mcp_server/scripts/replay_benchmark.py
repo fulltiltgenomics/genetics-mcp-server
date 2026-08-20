@@ -374,6 +374,52 @@ def count_tool_calls(message_content: list[dict[str, Any]] | None) -> int:
     return len(extract_tool_calls(message_content))
 
 
+def attach_call_metadata(
+    calls: list[dict[str, Any]],
+    call_iteration: dict[str, int],
+    script_by_call: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Join the STREAM's per-call metadata onto calls extracted from the `done` chunk.
+
+    Two things the done chunk structurally cannot answer, and one it must keep answering:
+
+      * WHICH ITERATION A CALL BELONGS TO. `message_content` is every iteration's blocks
+        flattened into one list with no boundary between them, so a reader cannot tell six
+        calls in one parallel iteration from six iterations of one call each — which is the
+        whole difference between a wide arm and a slow one. llm_service emits its `tool_use`
+        chunks after the iteration's `usage` chunk and before any of that iteration's tools
+        run, so the count of usage chunks seen at that moment IS the iteration.
+      * HOW LONG A `run_analysis` CALL TOOK. Its `script_result` chunk carries the sandbox's
+        own wall clock keyed by `tool_use_id`. No other tool reports a duration on the wire.
+
+    ARGUMENTS ARE NOT TAKEN FROM THE STREAM, only correlated by id. llm_service rewrites the
+    copy it streams before emitting it — it substitutes `search_scientific_literature`'s
+    backend and strips `run_analysis`'s model-invented `user`/`session_id` — so the streamed
+    input is what the SERVER ran, not what the MODEL asked for, and the second is what a
+    losing case needs explaining.
+
+    Absent stays absent. Against a server that emits no `tool_use` chunks the key is simply
+    missing rather than guessed, and benchmark_scorecard says the report predates it instead
+    of printing an iteration nobody measured.
+    """
+    for call in calls:
+        call_id = call.get("id")
+        if not isinstance(call_id, str):
+            continue
+        if call_id in call_iteration:
+            call["iteration"] = call_iteration[call_id]
+        script = script_by_call.get(call_id)
+        if script is None:
+            continue
+        # the SCRIPT's own wall clock inside the sandbox (_script_result_payload), which is
+        # NOT the iteration's tool phase: that also covers dispatch, the other tools of the
+        # same iteration running alongside it, and rendering the result.
+        call["script_duration_ms"] = script.get("duration_ms")
+        call["script_status"] = script.get("status")
+        call["script_ok"] = script.get("ok")
+    return calls
+
+
 def _opt_int(data: dict[str, Any], key: str) -> int | None:
     """The field as an int, or None when the chunk did not carry it.
 
@@ -626,6 +672,9 @@ async def replay_turn(
     # the outcome categories seen since the last usage chunk, i.e. within the current
     # iteration. Non-empty at the next usage chunk means that roundtrip was spent on them.
     pending_causes: set[str] = set()
+    # per-call metadata that only exists in the STREAM's ordering; see attach_call_metadata
+    call_iteration: dict[str, int] = {}
+    script_by_call: dict[str, dict[str, Any]] = {}
     message_content: list[dict[str, Any]] | None = None
     tool_results: list[dict[str, Any]] = []
     started = time.perf_counter()
@@ -701,8 +750,19 @@ async def replay_turn(
                             )
                             retry_loops_by_cause[cause] = retry_loops_by_cause.get(cause, 0) + 1
                             pending_causes.clear()
+                    elif dtype == "tool_use":
+                        # emitted after this iteration's usage chunk and before any of its
+                        # tools run, so the iteration in force is the one that call belongs
+                        # to. Read off the usage chunk rather than counted, so a server that
+                        # renumbers iterations stays authoritative over the harness.
+                        tool_use_id = data.get("id")
+                        if isinstance(tool_use_id, str) and usages:
+                            call_iteration[tool_use_id] = usages[-1].iteration
                     elif dtype == SCRIPT_RESULT_CHUNK_TYPE:
                         saw_script_chunk = True
+                        script_tool_use_id = data.get("tool_use_id")
+                        if isinstance(script_tool_use_id, str):
+                            script_by_call[script_tool_use_id] = data
                         category, shape = _script_outcome(data)
                         script_categories[category] = script_categories.get(category, 0) + 1
                         script_outcomes[shape] = script_outcomes.get(shape, 0) + 1
@@ -832,7 +892,9 @@ async def replay_turn(
         )
 
     if record.status == "ok":
-        record.tool_calls_detail = extract_tool_calls(message_content)
+        record.tool_calls_detail = attach_call_metadata(
+            extract_tool_calls(message_content), call_iteration, script_by_call
+        )
         record.tool_calls = len(record.tool_calls_detail)
         record.final_answer, record.final_answer_dropped_chars = final_answer_split(
             message_content

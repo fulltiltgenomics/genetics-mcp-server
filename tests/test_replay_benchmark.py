@@ -1513,3 +1513,127 @@ async def test_the_disputed_deadline_shape_is_bucketed_with_neither_side(
 
     text = "\n".join(_script_lines(arm))
     assert "TurnBudgetExceeded (classified by neither, not in the rate)=1" in text
+
+
+async def test_a_call_is_attributed_to_its_iteration_over_the_real_wire(stub_server, tmp_path):
+    """The done chunk cannot answer this and the stream's ORDERING is the only thing that can.
+
+    `message_content` flattens every iteration's blocks into one list, so three calls made in
+    one parallel roundtrip and three roundtrips of one call each are indistinguishable in it
+    — and that is precisely the difference between an arm that is wide and one that is slow.
+    llm_service emits each `tool_use` chunk after its iteration's `usage` chunk and before any
+    of that iteration's tools run, so the iteration in force when the chunk arrives is the
+    one the call belongs to.
+    """
+    stub_server.plan = {
+        None: [
+            _usage(1, 100, 10, 100, 10),
+            {"type": "tool_use", "id": "a", "name": "search_genes", "input": {"query": "FOXP3"}},
+            {"type": "tool_use", "id": "b", "name": "get_gene_to_peaks", "input": {"gene": "F"}},
+            _usage(2, 200, 10, 200, 20),
+            {"type": "tool_use", "id": "c", "name": "run_analysis", "input": {"code": "x"}},
+            {
+                "type": "script_result",
+                "tool_use_id": "c",
+                "iteration": 2,
+                "ran": True,
+                "ok": True,
+                "status": "ok",
+                "duration_ms": 1420,
+            },
+            _usage(3, 300, 10, 300, 30),
+            _done(
+                blocks=[
+                    {"type": "tool_use", "id": "a", "name": "search_genes", "input": {"query": "FOXP3"}},
+                    {"type": "tool_use", "id": "b", "name": "get_gene_to_peaks", "input": {"gene": "F"}},
+                    {"type": "tool_use", "id": "c", "name": "run_analysis", "input": {"code": "x"}},
+                    {"type": "text", "text": "answer"},
+                ]
+            ),
+        ],
+        "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+    }
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+    )
+
+    calls = [t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM][0]["tool_calls_detail"]
+    assert [c["iteration"] for c in calls] == [1, 1, 2], "two calls shared a roundtrip; one did not"
+    # only run_analysis reports a duration on the wire, and it is the SANDBOX's own clock
+    assert calls[2]["script_duration_ms"] == 1420 and calls[2]["script_status"] == "ok"
+    assert "script_duration_ms" not in calls[0], "no other tool is timed; absent must stay absent"
+
+
+async def test_the_arguments_come_from_the_done_chunk_not_the_streamed_copy(stub_server, tmp_path):
+    """llm_service REWRITES the input it streams; the model's own is what explains a failure.
+
+    It substitutes `search_scientific_literature`'s backend and strips `run_analysis`'s
+    model-invented `user`/`session_id` before emitting the `tool_use` chunk, so the streamed
+    copy is what the server ran. Taking arguments from there would silently answer a
+    different question than "what did the model ask for" — which is the question a losing
+    case needs answered.
+    """
+    stub_server.plan = {
+        None: [
+            _usage(1, 100, 10, 100, 10),
+            {"type": "tool_use", "id": "z", "name": "run_analysis", "input": {"code": "SERVER"}},
+            _usage(2, 200, 10, 200, 20),
+            _done(
+                blocks=[
+                    {
+                        "type": "tool_use",
+                        "id": "z",
+                        "name": "run_analysis",
+                        "input": {"code": "MODEL", "user": "forged"},
+                    }
+                ]
+            ),
+        ],
+        "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+    }
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+    )
+
+    call = [t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM][0]["tool_calls_detail"][0]
+    assert call["input"] == {"code": "MODEL", "user": "forged"}
+    assert call["iteration"] == 1, "the id still correlates the iteration"
+
+
+def test_the_harness_reads_the_tool_use_chunk_the_chat_backend_actually_emits():
+    """Pins the attribution to the real producer, as the script_result contract test does.
+
+    A fabricated chunk in a test proves the harness reads what the TEST writes. chat_api
+    builds this chunk by splatting llm_service's JSON over `{"type": "tool_use"}`, so the
+    key the harness correlates on is `id` — if either end renames it, every call silently
+    loses its iteration and the transcript quietly stops showing roundtrips.
+    """
+    import inspect
+
+    from genetics_mcp_server import chat_api, llm_service
+
+    producer = inspect.getsource(llm_service.LLMService)
+    assert '"id": tool_use.id' in producer, "llm_service must still key the chunk on `id`"
+    assert '{"type": "tool_use", **json.loads(chunk.content)}' in inspect.getsource(chat_api), (
+        "chat_api must still forward the tool_use chunk's fields verbatim"
+    )
