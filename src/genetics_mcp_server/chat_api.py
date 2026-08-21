@@ -322,6 +322,14 @@ class ChatRequest(BaseModel):
         description="Client conversation id. Logged (id only, never content) so distinct "
         "conversations can be counted, including secret ones.",
     )
+    capture_thinking: bool = Field(
+        False,
+        description="Stream each iteration's summarized reasoning as `thinking_summary` "
+        "chunks in addition to the contentless `thinking` keepalive. Off for the UI, which "
+        "asks for neither; set by the replay benchmark so a transcript can show the "
+        "reasoning that produced each tool call. Never affects what is persisted: the text "
+        "is not part of `message_content`.",
+    )
     message_id: str | None = Field(
         None,
         max_length=64,
@@ -527,6 +535,8 @@ async def stream_chat(
     The response is a stream of JSON objects:
     - {"type": "content", "content": "text chunk"}
     - {"type": "thinking"}  (keepalive while the model reasons; no content)
+    - {"type": "thinking_summary", "iteration": N, "text": "..."}  (only when the request
+      set `capture_thinking`; the model's SUMMARIZED reasoning, never the raw chain)
     - {"type": "done", "message_content": [...]}
     - {"type": "error", "error": "message"}
     """
@@ -599,6 +609,7 @@ async def stream_chat(
                 session_id=request.session_id,
                 user_instructions=user_instructions,
                 message_id=request.message_id,
+                capture_thinking=request.capture_thinking,
                 gateway_asserted=gateway_asserted,
             ):
                 if chunk.type == "text":
@@ -636,6 +647,15 @@ async def stream_chat(
                     yield {
                         "event": "message",
                         "data": json.dumps({"type": "thinking"}),
+                    }
+                elif chunk.type == "thinking_summary":
+                    # only reached when the request opted in; the browser never does, so this
+                    # branch is dead for ordinary chats rather than something they filter out
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(
+                            {"type": "thinking_summary", **json.loads(chunk.content)}
+                        ),
                     }
                 elif chunk.type == "usage":
                     yield {

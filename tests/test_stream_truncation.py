@@ -88,13 +88,14 @@ def _text_turn(text, stop_reason="end_turn"):
     return ([_delta_event("text_delta", text)], _FakeMessage([_Block("text", text=text)], stop_reason))
 
 
-async def _collect(svc):
+async def _collect(svc, **kwargs):
     chunks = []
     async for chunk in svc._stream_anthropic(
         messages=[{"role": "user", "content": "hi"}],
         model="claude-opus-5",
         system_prompt=None,
         enable_tools=False,
+        **kwargs,
     ):
         chunks.append(chunk)
     return chunks
@@ -142,6 +143,60 @@ async def test_thinking_blocks_are_not_persisted():
     chunks = await _collect(_service(turns))
     done = next(c for c in chunks if c.type == "done")
     assert [b["type"] for b in done.message_content] == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_text_needs_an_explicit_opt_in():
+    """The UI path: without capture_thinking the summary leaves the process nowhere."""
+    turns = [(
+        [_delta_event("text_delta", "answer")],
+        _FakeMessage(
+            [_Block("thinking", thinking="secret", signature="sig"), _Block("text", text="answer")],
+            "end_turn",
+        ),
+    )]
+    chunks = await _collect(_service(turns))
+    assert not [c for c in chunks if c.type == "thinking_summary"]
+    assert "secret" not in "".join(c.content for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_capture_thinking_emits_the_summary_and_still_never_persists_it():
+    """The benchmark's opt-in changes what is EMITTED, never what is stored: a caller that
+    asks for reasoning must not be able to write it into a conversation or replay it."""
+    turns = [(
+        [_delta_event("text_delta", "answer")],
+        _FakeMessage(
+            [_Block("thinking", thinking="secret", signature="sig"), _Block("text", text="answer")],
+            "end_turn",
+        ),
+    )]
+    chunks = await _collect(_service(turns), capture_thinking=True)
+
+    summaries = [c for c in chunks if c.type == "thinking_summary"]
+    assert len(summaries) == 1
+    payload = json.loads(summaries[0].content)
+    assert payload["text"] == "secret"
+    assert payload["iteration"] == 1
+
+    done = next(c for c in chunks if c.type == "done")
+    assert [b["type"] for b in done.message_content] == ["text"], (
+        "thinking must stay out of message_content even when it is being streamed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_redacted_thinking_is_not_emitted_as_an_empty_summary():
+    """Its payload is encrypted, so there is no text to show and no chunk to send."""
+    turns = [(
+        [_delta_event("text_delta", "answer")],
+        _FakeMessage(
+            [_Block("redacted_thinking", data="ENCRYPTED"), _Block("text", text="answer")],
+            "end_turn",
+        ),
+    )]
+    chunks = await _collect(_service(turns), capture_thinking=True)
+    assert not [c for c in chunks if c.type == "thinking_summary"]
 
 
 @pytest.mark.asyncio

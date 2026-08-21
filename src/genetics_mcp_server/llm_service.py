@@ -277,7 +277,8 @@ def _loggable_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "thinking", "done", "image", "usage", "script_result", "tool_use"
+    type: str  # "text", "thinking", "thinking_summary", "done", "image", "usage",
+    # "script_result", "tool_use"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -662,6 +663,7 @@ class LLMService:
         session_id: str | None = None,
         user_instructions: str | None = None,
         message_id: str | None = None,
+        capture_thinking: bool = False,
         gateway_asserted: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         """
@@ -689,8 +691,17 @@ class LLMService:
             message_id: Client-generated id of the assistant message this turn will become,
                 used only to key the recorded turn metrics to chat_messages. Optional: the
                 metrics row is still written without it, it just cannot be joined.
+            capture_thinking: emit each iteration's summarized reasoning as a
+                `thinking_summary` chunk. OFF for every ordinary chat: the browser asks for
+                the contentless `thinking` keepalive and nothing else, and this text is never
+                added to `message_content`, so it is never persisted or replayed either way.
+                Set by the replay benchmark, which needs the reasoning in its transcripts.
             gateway_asserted: whether `user` was asserted by auth-gateway having verified an
+                oauth2-proxy session, rather than by some other holder of INTERNAL_API_SECRET.
+                Carried alongside `user` — never derived from it — and consumed only by
+                `run_analysis`, which will not dispatch without it
                 (genetics-results-suite-4h6.84). Defaults False so a caller that does not
+                state a provenance loses code execution rather than being trusted.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -707,7 +718,7 @@ class LLMService:
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
                 literature_backend, tool_profile, secret, user, session_id,
-                user_instructions, message_id,
+                user_instructions, message_id, capture_thinking,
                 gateway_asserted=gateway_asserted,
             ):
                 yield chunk
@@ -783,6 +794,7 @@ class LLMService:
         session_id: str | None = None,
         user_instructions: str | None = None,
         message_id: str | None = None,
+        capture_thinking: bool = False,
         gateway_asserted: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
@@ -1058,8 +1070,27 @@ class LLMService:
                 # add this iteration's content blocks. Thinking blocks are deliberately
                 # not persisted: they are only replayable to the model that produced them,
                 # and the sanitizers that rewrite stored turns don't know about them.
+                #
+                # `capture_thinking` changes what is EMITTED, never what is persisted: the
+                # text goes out as its own chunk and still never enters all_content_blocks,
+                # so a caller that asks for it cannot accidentally write reasoning into a
+                # stored conversation or replay it to the model. Off by default, so the UI
+                # keeps receiving only the contentless `thinking` keepalive above.
+                #
+                # `redacted_thinking` is skipped rather than emitted empty: its payload is
+                # encrypted and carries no readable text, so there is nothing to show.
+                # What DOES come through is the SUMMARY — `display: "summarized"` above —
+                # since no model exposes the raw chain of thought.
                 for block in message.content:
                     if block.type in ("thinking", "redacted_thinking"):
+                        summary = getattr(block, "thinking", "") or ""
+                        if capture_thinking and summary:
+                            yield StreamChunk(
+                                type="thinking_summary",
+                                content=json.dumps(
+                                    {"iteration": iteration, "text": summary}
+                                ),
+                            )
                         continue
                     all_content_blocks.append(block.model_dump(exclude_none=True))
 

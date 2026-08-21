@@ -556,6 +556,39 @@ def _md_call(call: dict) -> list[str]:
     return lines + [""]
 
 
+def _thinking_iterations(turn: dict) -> list[Any]:
+    """The iterations this turn recorded reasoning for, in order, each once.
+
+    `_md_thinking` renders every row of the iteration it is given, so visiting an iteration
+    twice would print its reasoning twice.
+    """
+    seen: list[Any] = []
+    for row in turn.get("thinking_detail") or []:
+        if row.get("iteration") not in seen:
+            seen.append(row.get("iteration"))
+    return seen
+
+
+def _md_thinking(turn: dict, iteration: Any) -> list[str]:
+    """The reasoning recorded for one iteration, if the run captured any.
+
+    Interleaved with the calls rather than collected at the top of the turn, because the
+    point of having it is to read the reasoning immediately before the calls it produced.
+    `iteration is None` selects the entries whose iteration the stream never carried, so a
+    partially-attributed report still shows its text instead of dropping it.
+    """
+    rows = [
+        r for r in (turn.get("thinking_detail") or []) if r.get("iteration") == iteration
+    ]
+    if not rows:
+        return []
+    label = f"thinking · iteration {iteration}" if iteration is not None else "thinking"
+    lines = [f"<details><summary>{label}</summary>", ""]
+    for row in rows:
+        lines += [(row.get("text") or "").strip(), ""]
+    return lines + ["</details>", ""]
+
+
 def _md_turn_arm(turn: dict | None, arm: str) -> list[str]:
     lines = [f"#### arm `{arm}`", ""]
     if turn is None:
@@ -568,11 +601,25 @@ def _md_turn_arm(turn: dict | None, arm: str) -> list[str]:
         lines += ["*no `tool_calls_detail` — this report predates it.*", ""]
     elif not calls:
         lines += ["*answered with no tool calls.*", ""]
+        for iteration in _thinking_iterations(turn):
+            lines += _md_thinking(turn, iteration)
     else:
         lines += ["<details><summary>" f"{len(calls)} tool call(s)" "</summary>", ""]
+        seen_iterations: list[Any] = []
         for call in calls:
+            iteration = call.get("iteration")
+            if iteration not in seen_iterations:
+                seen_iterations.append(iteration)
+                lines += _md_thinking(turn, iteration)
             lines += _md_call(call)
         lines += ["</details>", ""]
+        # the reasoning of iterations that called nothing — including the final one, which
+        # answered — belongs to the turn just as much, and is where a turn that went wrong
+        # without ever calling a tool explains itself
+        for iteration in _thinking_iterations(turn):
+            if iteration not in seen_iterations:
+                seen_iterations.append(iteration)
+                lines += _md_thinking(turn, iteration)
     dropped = turn.get("final_answer_dropped_chars") or 0
     if dropped:
         # the discarded text is not recoverable from the report — only its length was kept,

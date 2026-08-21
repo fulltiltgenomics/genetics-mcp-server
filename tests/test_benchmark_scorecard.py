@@ -240,3 +240,59 @@ def test_markdown_writes_one_file_per_arm_beside_the_paired_one(tmp_path):
         per_arm = tmp_path / f"transcripts.{arm}.md"
         assert per_arm.exists(), f"{arm} got no file of its own"
         assert f"arm `{arm}` only" in per_arm.read_text()
+
+
+def test_markdown_interleaves_thinking_with_the_calls_it_produced():
+    # the value of having the reasoning is reading it immediately BEFORE the calls it
+    # explains; collected at the top of the turn it answers nothing
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[1]["tool_calls_detail"] = [
+        {"seq": 0, "name": "search_genes", "iteration": 1, "input": {"query": "LDLR"}},
+        {"seq": 1, "name": "run_analysis", "iteration": 2, "input": {"code": "print(1)"}},
+    ]
+    turns[1]["thinking_detail"] = [
+        {"iteration": 1, "text": "resolve the symbol first"},
+        {"iteration": 2, "text": "now aggregate the burden rows"},
+    ]
+    out = render_markdown(_report(turns))
+
+    first = out.index("resolve the symbol first")
+    call_one = out.index("search_genes")
+    second = out.index("now aggregate the burden rows")
+    call_two = out.index("run_analysis")
+    assert first < call_one < second < call_two
+
+
+def test_markdown_shows_the_reasoning_of_iterations_that_called_nothing():
+    # the final iteration answers rather than calling tools, and a turn that went wrong
+    # without calling anything explains itself only here
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[1]["tool_calls_detail"] = [
+        {"seq": 0, "name": "search_genes", "iteration": 1, "input": {"query": "LDLR"}}
+    ]
+    turns[1]["thinking_detail"] = [
+        {"iteration": 1, "text": "look it up"},
+        {"iteration": 2, "text": "that is enough to answer"},
+    ]
+    turns[0]["tool_calls_detail"] = []
+    turns[0]["thinking_detail"] = [{"iteration": 1, "text": "I already know this one"}]
+    out = render_markdown(_report(turns))
+
+    assert "that is enough to answer" in out
+    assert "I already know this one" in out
+
+
+def test_markdown_prints_each_iteration_of_reasoning_once():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[1]["tool_calls_detail"] = [
+        {"seq": 0, "name": "a", "iteration": 1, "input": {}},
+        {"seq": 1, "name": "b", "iteration": 1, "input": {}},
+    ]
+    turns[1]["thinking_detail"] = [{"iteration": 1, "text": "fan these out together"}]
+    assert render_markdown(_report(turns)).count("fan these out together") == 1
+
+
+def test_markdown_of_a_report_without_captured_thinking_is_unchanged():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[1]["tool_calls_detail"] = [{"seq": 0, "name": "a", "iteration": 1, "input": {}}]
+    assert "thinking" not in render_markdown(_report(turns))

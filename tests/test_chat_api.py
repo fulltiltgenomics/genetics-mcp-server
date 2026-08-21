@@ -396,6 +396,76 @@ class TestChatEndpoint:
         assert len(thinking_events) == 1
         assert thinking_events[0] == {"type": "thinking"}
 
+    def test_a_default_request_asks_for_no_reasoning_text(self, test_client):
+        """The UI path must be untouched by --capture-thinking: a request that does not ask
+        for reasoning must not get it, and must not even request it of the service."""
+        seen = {}
+
+        async def mock_stream(**kwargs):
+            seen.update(kwargs)
+            yield StreamChunk(type="thinking")
+            yield StreamChunk(
+                type="thinking_summary",
+                content=json.dumps({"iteration": 1, "text": "should never be forwarded"}),
+            )
+            yield StreamChunk(type="done", message_content=[{"type": "text", "text": "a"}])
+
+        with patch("genetics_mcp_server.chat_api.get_llm_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                },
+            )
+
+        assert response.status_code == 200
+        # what keeps the UI silent is the flag it never sets; the service is mocked here, so
+        # it emits the chunk anyway and the forwarding branch is covered by the next test
+        assert seen["capture_thinking"] is False, "the UI must not opt in by default"
+
+    def test_capture_thinking_forwards_the_summary_with_its_iteration(self, test_client):
+        async def mock_stream(**kwargs):
+            assert kwargs["capture_thinking"] is True
+            yield StreamChunk(
+                type="thinking_summary",
+                content=json.dumps({"iteration": 2, "text": "check the burden table first"}),
+            )
+            yield StreamChunk(type="done", message_content=[{"type": "text", "text": "a"}])
+
+        with patch("genetics_mcp_server.chat_api.get_llm_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                    "capture_thinking": True,
+                },
+            )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line[len("data:"):].strip())
+            for line in response.text.splitlines()
+            if line.startswith("data:") and line[len("data:"):].strip()
+        ]
+        summaries = [e for e in events if e.get("type") == "thinking_summary"]
+        assert summaries == [
+            {"type": "thinking_summary", "iteration": 2, "text": "check the burden table first"}
+        ]
+
 
 class TestChatEndpointProviders:
     """Tests for chat endpoint provider configuration."""

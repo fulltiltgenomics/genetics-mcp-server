@@ -1598,7 +1598,8 @@ The chat API streams responses as Server-Sent Events (SSE). Each event is a JSON
 | Event type | Description | Key payload fields |
 |------------|-------------|--------------------|
 | `content` | Streamed text token from the LLM response | `content` (string) |
-| `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s | none |
+| `thinking` | Keepalive emitted while the model reasons. Carries no reasoning content — thinking deltas do not reach the text stream, so without this tick a long reasoning phase reads as a stalled connection to the client's inactivity timeout. Rate-limited to one per 10s. The reasoning text itself travels only as `thinking_summary`, and only on request | none |
+| `thinking_summary` | The iteration's **summarized** reasoning, emitted only when the request set `capture_thinking`. The browser never sets it, so this event does not exist on the UI path; the replay benchmark does, so a transcript can show the reasoning behind each tool call. Never the raw chain of thought — no model exposes it — and never persisted: the text is deliberately kept out of `message_content` even while it is being streamed, so a caller that asks for it cannot write reasoning into a stored conversation or replay it to the model. `redacted_thinking` blocks emit nothing, their payload being encrypted | `iteration`, `text` |
 | `usage` | Context usage and timing snapshot after each agentic loop iteration | `iteration`, `input_tokens`, `cache_read`, `cache_create`, `output_tokens`, `total_input_tokens`, `total_output_tokens`, `context_window`, `context_percent`, `turn_elapsed_ms`, `model_ms`, `model_attempts` |
 | `tool_use` | One per tool call, emitted before the tool runs. Carries the input **whole** — the client renders it as a collapsed disclosure, so nothing is sized for reading inline. `input` has had `user`/`session_id` dropped for `run_analysis` and `backend` resolved for `search_scientific_literature` | `id` (the `tool_use` block id, what `script_result` correlates against), `name`, `input` (object) |
 | `script_result` | Outcome of one completed `run_analysis`, emitted before the next iteration's `usage` | `iteration`, `tool_use_id`, `ran`, `ok`, `status`, `timed_out`, `exception`, `limit`, `duration_ms` |
@@ -2163,7 +2164,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | Test file | Coverage |
 |-----------|----------|
 | `test_mcp_server.py` | MCP server initialization and tool registration |
-| `test_chat_api.py` | FastAPI endpoints (status, tools, chat) |
+| `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration |
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
@@ -2174,6 +2175,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
 | `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
+| `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
 | `test_phewas_categories.py` | PheWAS category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
@@ -2191,7 +2193,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
-| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
+| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
 | `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to `{"general"}`, and records each arm's resolved tool list in the report |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
 | `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
@@ -2366,6 +2368,18 @@ harness issues two arms per case. `--base-url` therefore defaults to
   and takes the tool-call count from the `done` chunk's `message_content` by counting
   real `tool_use` blocks (never the `*[Using tool: …]*` display markers, which the
   model has been observed to imitate as prose).
+- **`--capture-thinking` records the model's reasoning, and nothing else changes.** Off by
+  default. When set, the request carries `capture_thinking: true`, `llm_service` emits a
+  `thinking_summary` chunk per reasoning iteration, and each turn keeps them in
+  `thinking_detail` (`{iteration, text}`) for `benchmark_scorecard --markdown` to show
+  beside the calls they produced. It is a run-level flag rather than a per-turn option
+  because it changes what the stream carries, not what the model is asked — no metric moves
+  either way, since thinking tokens are already inside `output_tokens` and are billed
+  whether or not the summary is returned. The cost is report size, which is why it is opt-in.
+  What is recorded is the **summary**: `display: "summarized"` is what the deployment asks
+  for, and the raw chain of thought is exposed by no model. The judge is never shown it —
+  reasoning names tools and scripts outright, and would identify the arm at once. A server
+  that predates the field ignores it and the run records nothing rather than failing.
 - **The `usage` chunk's `input_tokens` is the whole context**, i.e.
   `input_tokens + cache_read + cache_creation`, while `total_input_tokens`
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
@@ -2626,7 +2640,11 @@ whose partner fell over as a clean run. `-` prints the paired document only, sin
 stream cannot be three files. The elision is what
 the file exists to remove — the two column views are width-bound, and a `run_analysis` script
 is precisely the argument that never fits, so an argument's fence grows past any backticks
-inside it rather than the value being cut. What a saved report cannot supply is stated in the
+inside it rather than the value being cut. When the run was made with
+`replay_benchmark --capture-thinking`, each iteration's summarized reasoning appears in the
+call list immediately **before** the calls it produced — collected at the top of a turn it
+would answer nothing — and iterations that called no tool, the final answering one included,
+show their reasoning after the calls. What a saved report cannot supply is stated in the
 document itself rather than left to be discovered: **tool results are not recorded at all**,
 and assistant prose written before a turn's last tool call was discarded at capture by
 `final_answer_split` with only its length kept, so a turn that lost text says how much.

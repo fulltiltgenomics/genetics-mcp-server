@@ -1637,3 +1637,94 @@ def test_the_harness_reads_the_tool_use_chunk_the_chat_backend_actually_emits():
     assert '{"type": "tool_use", **json.loads(chunk.content)}' in inspect.getsource(chat_api), (
         "chat_api must still forward the tool_use chunk's fields verbatim"
     )
+
+
+async def test_thinking_is_neither_requested_nor_recorded_by_default(stub_server, tmp_path):
+    # the default run must leave the server's UI behaviour alone: it asks for no reasoning,
+    # and a server that volunteers some is not what makes a report carry it
+    stub_server.plan = {
+        None: [_usage(1, 100, 10, 100, 10), _done()],
+        "bigquery": [_usage(1, 100, 10, 100, 10), _done()],
+    }
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model="claude-opus-5",
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+    )
+
+    assert all(b["capture_thinking"] is False for b in stub_server.requests)
+    assert report["config"]["capture_thinking"] is False
+    assert all(t["thinking_detail"] == [] for t in report["turns"])
+
+
+async def test_capture_thinking_records_the_summary_against_its_iteration(
+    stub_server, tmp_path
+):
+    turn = [
+        _usage(1, 100, 10, 100, 10),
+        {"type": "thinking_summary", "iteration": 1, "text": "check burden first"},
+        _usage(2, 200, 20, 300, 30),
+        {"type": "thinking_summary", "iteration": 2, "text": "the table answers it"},
+        _done(),
+    ]
+    stub_server.plan = {None: list(turn), "bigquery": list(turn)}
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model="claude-opus-5",
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+        capture_thinking=True,
+    )
+
+    assert all(b["capture_thinking"] is True for b in stub_server.requests)
+    for turn_record in report["turns"]:
+        assert turn_record["thinking_detail"] == [
+            {"iteration": 1, "text": "check burden first"},
+            {"iteration": 2, "text": "the table answers it"},
+        ]
+
+
+async def test_a_summary_without_an_iteration_falls_back_to_the_usage_count(
+    stub_server, tmp_path
+):
+    # absent stays usable rather than being dropped: the harness keeps the text and
+    # attributes it to the iteration in force, the same rule tool_use attribution uses
+    turn = [
+        _usage(1, 100, 10, 100, 10),
+        {"type": "thinking_summary", "text": "no iteration on this chunk"},
+        _done(),
+    ]
+    stub_server.plan = {None: list(turn), "bigquery": list(turn)}
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model="claude-opus-5",
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+        capture_thinking=True,
+    )
+
+    assert report["turns"][0]["thinking_detail"] == [
+        {"iteration": 1, "text": "no iteration on this chunk"}
+    ]

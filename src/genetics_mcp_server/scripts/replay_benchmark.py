@@ -281,6 +281,15 @@ class TurnRecord:
     final_answer: str | None = None
     final_answer_dropped_chars: int = 0
 
+    # one entry per iteration that reasoned, {"iteration", "text"}, and EMPTY unless the run
+    # asked for it with --capture-thinking. Populated from the `thinking_summary` chunks,
+    # which the server emits only on request: the text exists nowhere else, since llm_service
+    # keeps thinking blocks out of `message_content` and the ordinary `thinking` chunk is a
+    # contentless keepalive. It is the model's SUMMARIZED reasoning — no model exposes the
+    # raw chain of thought — and it is never shown to the judge, which would see tool and
+    # script names in it and stop being blind.
+    thinking_detail: list[dict[str, Any]] = field(default_factory=list)
+
 
 @dataclass
 class CaseResult:
@@ -624,6 +633,7 @@ async def replay_turn(
     model: str | None,
     provider: str | None,
     timeout: float,
+    capture_thinking: bool = False,
 ) -> tuple[TurnRecord, list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Send one turn and read its metrics off the stream.
 
@@ -656,6 +666,10 @@ async def replay_turn(
         "verbosity": options.get("verbosity"),
         "instruction_set_id": options.get("instruction_set_id"),
         "literature_backend": options.get("literature_backend"),
+        # a run-level choice, not a per-turn option: it changes what the stream carries, not
+        # what the model is asked. A server that predates the field ignores it and the run
+        # simply records no reasoning, which the scorecard then says outright.
+        "capture_thinking": capture_thinking,
     }
     if model:
         body["model"] = model
@@ -758,6 +772,19 @@ async def replay_turn(
                         tool_use_id = data.get("id")
                         if isinstance(tool_use_id, str) and usages:
                             call_iteration[tool_use_id] = usages[-1].iteration
+                    elif dtype == "thinking_summary":
+                        # emitted per iteration as its blocks are collected, i.e. after that
+                        # iteration's usage chunk, so the server's own `iteration` is
+                        # authoritative and the usage count is only the fallback
+                        text = data.get("text")
+                        if isinstance(text, str) and text:
+                            record.thinking_detail.append(
+                                {
+                                    "iteration": data.get("iteration")
+                                    or (usages[-1].iteration if usages else None),
+                                    "text": text,
+                                }
+                            )
                     elif dtype == SCRIPT_RESULT_CHUNK_TYPE:
                         saw_script_chunk = True
                         script_tool_use_id = data.get("tool_use_id")
@@ -938,6 +965,7 @@ async def replay_case_arm(
     provider: str | None,
     timeout: float,
     max_turns: int | None,
+    capture_thinking: bool = False,
 ) -> list[TurnRecord]:
     """Replay one case's whole user-turn sequence under one arm."""
     case_id = str(case.get("session_id") or case.get("id") or "unknown")
@@ -980,6 +1008,7 @@ async def replay_case_arm(
             model=model,
             provider=provider,
             timeout=timeout,
+            capture_thinking=capture_thinking,
         )
         records.append(record)
         if message_content is None:
@@ -1013,6 +1042,7 @@ async def replay_case(
     provider: str | None,
     timeout: float,
     max_turns: int | None,
+    capture_thinking: bool = False,
 ) -> CaseResult:
     """Run both arms of one case back to back, in an alternating order."""
     order = arm_order_for_case(arms, case_index)
@@ -1034,6 +1064,7 @@ async def replay_case(
                 provider=provider,
                 timeout=timeout,
                 max_turns=max_turns,
+                capture_thinking=capture_thinking,
             )
         )
     return result
@@ -1617,6 +1648,7 @@ async def run_benchmark(
     max_turns: int | None,
     auth_token: str | None,
     provider: str | None = None,
+    capture_thinking: bool = False,
 ) -> dict[str, Any]:
     cases = load_cases(dataset, limit)
     run_id = uuid.uuid4().hex[:8]
@@ -1640,6 +1672,7 @@ async def run_benchmark(
                     provider=provider,
                     timeout=timeout,
                     max_turns=max_turns,
+                    capture_thinking=capture_thinking,
                 )
 
         results = await asyncio.gather(
@@ -1692,6 +1725,7 @@ async def run_benchmark(
             "max_turns": max_turns,
             "timeout_s": timeout,
             "secret": True,
+            "capture_thinking": capture_thinking,
             # what the SERVER said each arm resolves to, asked before the run rather than
             # re-derived afterwards from a tree that may have moved
             "arm_tools": arm_tools,
@@ -1739,6 +1773,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=900.0,
         help="per-turn wall-clock deadline, seconds (not a per-read timeout: SSE "
         "keepalives would reset that indefinitely)",
+    )
+    parser.add_argument(
+        "--capture-thinking",
+        action="store_true",
+        help="ask the server to stream each iteration's summarized reasoning and record it "
+        "per turn, so benchmark_scorecard --markdown can show the thinking behind each "
+        "tool call. Off by default: it multiplies the report's size and is not needed for "
+        "any metric — thinking tokens are already inside output_tokens either way",
     )
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")
     parser.add_argument("--dry-run", action="store_true", help="resolve the plan, issue no requests")
@@ -1825,6 +1867,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=args.max_turns,
                 auth_token=os.environ.get("REPLAY_AUTH_TOKEN"),
                 provider=args.provider,
+                capture_thinking=args.capture_thinking,
             )
         )
     except RateLimitedError as exc:
