@@ -363,6 +363,35 @@ dispatch, anything added later) and because it sits immediately before
 route-level check would guard only the routes someone remembered to decorate, and would
 also refuse plain chat, which the marker identity may legitimately use.
 
+**And the dispatch requires a secret only auth-gateway holds, not merely a marker**
+(`genetics-results-suite-4h6.84`). The guard above catches the marker-*alone* caller, i.e.
+`auth_required`'s case 3. Case 1 beats case 3: an identity header, once present, decides the
+outcome, so any holder of `INTERNAL_API_SECRET` could send
+`X-Goog-Authenticated-User-Email: someone@finngen.fi` alongside the marker, resolve to that
+address rather than to `mcp-tool`, and have both per-execution JWTs minted with `sub` set to
+the address it typed — `session_id` being client-supplied, the artifact scope and the audit
+trail would then name a person who never asked. `run_analysis` therefore takes a keyword-only
+`gateway_asserted`, defaulting **False** so that a caller which states no provenance is refused
+rather than trusted, and refuses with the same `SandboxNotConfigured` / `retryable: false`
+shape when it is not set. `auth/dependencies.py:gateway_asserted_identity` computes it from
+the request — `X-Gateway-Auth: $GATEWAY_IDENTITY_SECRET` **and** an identity header, the pair
+that only a verified browser session produces — and `POST /chat/v1/chat` plumbs it through
+`stream_chat` → `_stream_anthropic` → `_execute_tool`, where it is injected alongside the
+authenticated `user`/`session_id` and stripped from the model's input for the same reason they
+are. `GATEWAY_IDENTITY_SECRET` is a **distinct secret** from `INTERNAL_API_SECRET`
+(`gateway-identity-secret` in `genetics-secrets`), mounted into auth-gateway and chat-backend
+only; `auth/core.py:is_gateway_caller` compares it constant-time and answers **False** whenever
+it is unset, so a deployment that never provisioned it refuses code execution rather than
+admitting everyone. The first version of this gate keyed on the *transport* — the marker
+arriving in `X-Internal-Auth` rather than `Authorization: Bearer` — and was measurably
+bypassable, because mcp-server and results-api hold `INTERNAL_API_SECRET` by design and pick
+their own header names; a header name is not a secret. Bound, so it is not read as more than it
+is: a compromised auth-gateway, or a leak of `GATEWAY_IDENTITY_SECRET` to any pod that can
+reach chat-backend:8000, still reaches this dispatch, and it is gated on `REQUIRE_AUTH` exactly
+as `auth_required`'s first branch is — under `REQUIRE_AUTH=false` there is no proxy to assert
+anything and it stands down with the rest of authentication. The suite spec's
+`docs/code-execution-security.md` §5 "Layer 2c" owns the cross-repo statement.
+
 That made the browser's lazy session creation a bug rather than a preference
 (`genetics-results-suite-vda`): a chat started by typing created its session *after* the
 exchange, so the first turn arrived with `session_id: null` and could not run code, while
@@ -1776,6 +1805,7 @@ All configuration is via environment variables (`.env` file supported):
 | `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. False withholds `run_analysis` from every resolved tool list — and, since the prompt is built from that list, its guidance too. A deployment fact, flipped by the deploy that creates the sandbox | `false` |
 | `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments | `http://127.0.0.1:8080` |
+| `GATEWAY_IDENTITY_SECRET` | The provenance secret auth-gateway sends as `X-Gateway-Auth` on its two chat locations, after it has verified an oauth2-proxy session. Held by auth-gateway and chat-backend **only** — not mcp-server, not results-api, not the sandbox — which is what makes it a fact those services cannot forge by choosing a header. Sandbox dispatch (`run_analysis`) requires it; nothing else does. Unset or non-ASCII under `REQUIRE_AUTH=true` refuses every dispatch and logs an `ERROR` at startup, never the reverse | - |
 | `SANDBOX_TOKEN_SIGNING_KEY` | HS256 key for the per-execution sandbox tokens, held only by chat-backend (mint) and db-api/results-api (verify). Separate from `INTERNAL_API_SECRET` on purpose: separate blast radius, independent rotation, and the sandbox holds neither. Unset means **no execution runs** — `mint_execution_tokens` raises `SandboxTokenUnavailable` rather than returning `None`, since every fallback is either "send no credential" or "send the shared secret" | - |
 
 ### LLM providers (for chat API)
@@ -2018,6 +2048,17 @@ accepts the marker in either transport:
   their sessions, messages, downloads and API tokens permanently.
 - `Authorization: Bearer <secret>` — results-api's and mcp-server's, unchanged. Service-to-service
   callers with no `Authorization` of their own to displace.
+
+The two are equivalent **here** — this answers "is the caller in-cluster", and both are.
+Deliberately so: the transport carries no authority, since any holder of the secret can pick
+either one. Sandbox dispatch keys on a different fact and a different key
+(`genetics-results-suite-4h6.84`): `auth/core.py:is_gateway_caller` compares
+`GATEWAY_IDENTITY_SECRET` from `X-Gateway-Auth` — a secret auth-gateway and chat-backend hold
+and mcp-server and results-api do not — and `auth/dependencies.py:gateway_asserted_identity`
+reduces "that secret **and** an identity header" to one boolean, which `POST /chat/v1/chat`
+passes down to `run_analysis` (see "the dispatch requires a secret only auth-gateway holds"
+above). `auth_required`'s precedence is unchanged: every route other than sandbox dispatch is
+legitimately reachable by any marker holder.
 
 Both compare as **bytes**: `hmac.compare_digest` on `str` raises `TypeError` for a non-ASCII value,
 and a 500 from a forged header is a worse failure mode than a 401. **The two sides use different

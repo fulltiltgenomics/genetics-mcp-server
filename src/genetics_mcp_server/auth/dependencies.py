@@ -8,6 +8,7 @@ from genetics_mcp_server.auth.core import (
     IDENTITY_HEADER,
     SERVICE_IDENTITY,
     get_authenticated_user,
+    is_gateway_caller,
     is_internal_caller,
 )
 
@@ -85,6 +86,41 @@ async def auth_required(request: Request) -> str | None:
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+
+async def gateway_asserted_identity(request: Request) -> bool:
+    """Whether THIS request's identity was asserted by auth-gateway, having verified a session.
+
+    Sandbox dispatch keys on this and nothing else (genetics-results-suite-4h6.84). It is a
+    separate dependency rather than a change to `auth_required` on purpose: `auth_required`'s
+    precedence is unchanged and still resolves cases 1-4 exactly as before, because every
+    route other than sandbox dispatch is legitimately reachable by any marker holder. What
+    this adds is a second, narrower fact about the same request, consumed only where the
+    identity has to be a person the gateway just authenticated rather than one a marker
+    holder typed.
+
+    Requires BOTH halves. The gateway secret alone is case 3 (`mcp-tool`), which names no
+    person; the identity header alone is case 4, already a 401. Only the pair is a browser
+    session.
+
+    `is_gateway_caller` compares GATEWAY_IDENTITY_SECRET, a secret held by auth-gateway and
+    chat-backend and by nothing else — NOT the header the marker arrived in. An earlier draft
+    keyed on the header name and was measurably bypassable: mcp-server and results-api hold
+    INTERNAL_API_SECRET by design and can write it under any header they choose.
+
+    Unset gateway secret + REQUIRE_AUTH=true answers False for every request, so the
+    misconfigured deployment refuses code execution instead of admitting it.
+
+    REQUIRE_AUTH=false is "no authentication at all" — local dev with no oauth2-proxy, no
+    gateway and no secret to send. `auth_required` already honours the bare header there and
+    returns `anonymous` otherwise, so demanding a marker no one can produce would only make
+    code execution undevelopable locally without protecting a deployment that has switched
+    authentication off in the first place. Production sets REQUIRE_AUTH=true
+    (k8s/deployments/chat-backend.yaml), which is where the gate binds.
+    """
+    if not auth_is_required():
+        return True
+    return bool(request.headers.get(IDENTITY_HEADER)) and is_gateway_caller(request)
 
 
 async def admin_required(

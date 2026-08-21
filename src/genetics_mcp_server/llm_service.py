@@ -662,6 +662,7 @@ class LLMService:
         session_id: str | None = None,
         user_instructions: str | None = None,
         message_id: str | None = None,
+        gateway_asserted: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -688,6 +689,8 @@ class LLMService:
             message_id: Client-generated id of the assistant message this turn will become,
                 used only to key the recorded turn metrics to chat_messages. Optional: the
                 metrics row is still written without it, it just cannot be joined.
+            gateway_asserted: whether `user` was asserted by auth-gateway having verified an
+                (genetics-results-suite-4h6.84). Defaults False so a caller that does not
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -705,6 +708,7 @@ class LLMService:
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
                 literature_backend, tool_profile, secret, user, session_id,
                 user_instructions, message_id,
+                gateway_asserted=gateway_asserted,
             ):
                 yield chunk
         else:
@@ -779,6 +783,7 @@ class LLMService:
         session_id: str | None = None,
         user_instructions: str | None = None,
         message_id: str | None = None,
+        gateway_asserted: bool = False,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -1212,7 +1217,7 @@ class LLMService:
                     if regular_tool_uses:
                         regular_task = asyncio.create_task(
                             asyncio.gather(
-                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id) for tu in regular_tool_uses)
+                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
                             )
                         )
                     else:
@@ -1235,7 +1240,7 @@ class LLMService:
                 else:
                     # no subagent tool — execute all tools in parallel as before
                     regular_results = await asyncio.gather(
-                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id) for tu in regular_tool_uses)
+                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
                     )
                     for tu, res in zip(regular_tool_uses, regular_results):
                         raw_results_map[tu.id] = res
@@ -1437,6 +1442,7 @@ class LLMService:
         literature_backend: str | None = None,
         user: str | None = None,
         session_id: str | None = None,
+        gateway_asserted: bool = False,
     ) -> dict[str, Any]:
         """Execute a tool by name using the executor or external proxy."""
         try:
@@ -1522,10 +1528,15 @@ class LLMService:
             # stripped first, then the real pair injected, same as `backend` above.
             if tool_name == "run_analysis":
                 tool_input = {
-                    k: v for k, v in tool_input.items() if k not in ("user", "session_id")
+                    k: v
+                    for k, v in tool_input.items()
+                    if k not in ("user", "session_id", "gateway_asserted")
                 }
                 tool_input["user"] = user
                 tool_input["session_id"] = session_id
+                # the provenance of `user`, not a claim about it: a model that emitted this
+                # key is stripped above alongside the identity pair, for the same reason
+                tool_input["gateway_asserted"] = gateway_asserted
 
             return await method(**tool_input)
 

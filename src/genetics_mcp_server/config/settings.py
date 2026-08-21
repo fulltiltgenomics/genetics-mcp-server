@@ -1,5 +1,6 @@
 """Configuration settings for genetics MCP server."""
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -8,6 +9,8 @@ from functools import lru_cache
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,6 +42,16 @@ class Settings:
     # cannot disagree, and so no value can be snapshotted before config/settings.py's load_dotenv()
     internal_api_secret: str = field(
         default_factory=lambda: os.environ.get("INTERNAL_API_SECRET", "")
+    )
+
+    # auth-gateway's provenance secret (genetics-results-suite-4h6.84). Held by auth-gateway
+    # and chat-backend ONLY — not by mcp-server, not by results-api, not by the sandbox — so
+    # its presence on a request is a fact about who relayed it that no other holder of
+    # internal_api_secret can forge by choosing a different header. Separate from
+    # internal_api_secret for exactly the reason sandbox_token_signing_key is: a distinct
+    # blast radius and independent rotation.
+    gateway_identity_secret: str = field(
+        default_factory=lambda: os.environ.get("GATEWAY_IDENTITY_SECRET", "")
     )
 
     # signing key for the per-execution sandbox tokens (docs/code-execution-security.md §4).
@@ -426,6 +439,47 @@ def model_rejects_disabled_thinking(model: str) -> bool:
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+def warn_unless_gateway_identity_secret(component: str) -> None:
+    """Log loudly when the gateway provenance secret is missing. Deliberately NOT fatal.
+
+    genetics-results-suite-4h6.84 requires the unset case to FAIL CLOSED, and it does —
+    structurally, at dispatch: `auth.core._expected_gateway_marker` answers None, so
+    `is_gateway_caller` answers False for every request and `run_analysis` refuses. That
+    refusal is unconditional and needs no startup check to hold; this function only makes the
+    misconfiguration legible instead of presenting as "code execution mysteriously stopped".
+
+    A startup refusal (`require_internal_api_secret`'s shape) was considered and rejected on
+    blast radius. That secret is load-bearing for EVERY outbound call this process makes, so
+    a pod without it is useless and crash-looping is the honest outcome. This one gates ONE
+    tool: crashing chat-backend over it would turn a code-execution outage into a total chat
+    outage, and it would do so in exactly the window where the gateway leads the backend in a
+    rollout. The operator-facing gate lives where it can act before anything is applied —
+    scripts/deploy.sh refuses to apply when the `gateway-identity-secret` key of
+    genetics-secrets is absent or empty, and k8s/deployments/chat-backend.yaml declares the
+    secretKeyRef non-optional so the kubelet holds the pod at CreateContainerConfigError
+    rather than starting it blind.
+    """
+    settings = get_settings()
+    if not settings.require_auth:
+        return
+    secret = settings.gateway_identity_secret
+    if not secret.strip():
+        logger.error(
+            "GATEWAY_IDENTITY_SECRET is unset or empty in %s, so no request can be shown to "
+            "have come from auth-gateway and code execution (run_analysis) will refuse every "
+            "dispatch. In the cluster this is the gateway-identity-secret key of the "
+            "genetics-secrets Secret, mounted by auth-gateway and chat-backend only.",
+            component,
+        )
+    elif not secret.isascii():
+        logger.error(
+            "GATEWAY_IDENTITY_SECRET contains non-ASCII characters in %s. HTTP clients "
+            "disagree on how to encode a non-ASCII header value, so it is treated as unset "
+            "and code execution will refuse every dispatch. Rotate it to an ASCII value.",
+            component,
+        )
 
 
 def require_internal_api_secret(component: str) -> str:

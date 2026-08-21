@@ -5820,6 +5820,7 @@ class ToolExecutor:
         *,
         user: str | None = None,
         session_id: str | None = None,
+        gateway_asserted: bool = False,
     ) -> dict[str, Any]:
         """Run one script in the sandbox and render the supervisor's result for the model.
 
@@ -5827,6 +5828,11 @@ class ToolExecutor:
         subject and the session of the per-execution credential, and llm_service strips any
         same-named key the model emits before injecting the authenticated pair. A tool
         invocation with neither is a wiring fault, not a script fault, and is reported as one.
+
+        `gateway_asserted` says WHERE `user` came from — auth-gateway having verified an
+        oauth2-proxy session, or some other holder of INTERNAL_API_SECRET simply asserting an
+        address. It defaults to False so that a caller which does not state a provenance is
+        refused rather than trusted (genetics-results-suite-4h6.84).
 
         **There is deliberately no `except Exception` in this method**, which is a departure
         from the ~40 handlers above it. `mint_execution_tokens` raises `SandboxTokenUnavailable`
@@ -5905,6 +5911,52 @@ class ToolExecutor:
                 "run_analysis refused for the %s service identity (session=%s): code "
                 "execution requires an authenticated user",
                 SERVICE_IDENTITY,
+                session_id,
+            )
+            return self._sandbox_operator_error(
+                "Code execution requires an authenticated user session and is not available "
+                "to service callers."
+            )
+        if not gateway_asserted and getattr(_resolve_settings(), "require_auth", True):
+            # THE RESIDUAL THE GUARD ABOVE DOES NOT COVER (genetics-results-suite-4h6.84).
+            # `user == SERVICE_IDENTITY` catches the marker-ALONE caller — auth_required's
+            # case 3. It does not catch case 1: marker PLUS an identity header wins over
+            # case 3, so any holder of INTERNAL_API_SECRET (mcp-server included, and the
+            # NetworkPolicy admits it to chat-backend:8000) could send
+            #     X-Internal-Auth: <secret>  +  X-Goog-Authenticated-User-Email: anyone@…
+            # and arrive here as `anyone@…`, indistinguishable from a browser session. Both
+            # per-execution JWTs would then carry that `sub`, and `session_id` is
+            # client-supplied, so the artifact scope AND the audit trail would name a person
+            # who never made the request.
+            #
+            # What separates the two is a SECOND SECRET the other holders do not have:
+            # auth-gateway sends `X-Gateway-Auth: <GATEWAY_IDENTITY_SECRET>` on the two
+            # locations that proxy here, after an `auth_request /oauth2/auth`, and that key
+            # is mounted only into auth-gateway and chat-backend.
+            # `auth.dependencies.gateway_asserted_identity` reduces it to this bool, and the
+            # chat route passes it down. Defaulting it False makes a caller that never states
+            # a provenance fail closed rather than inherit trust.
+            #
+            # NOT a check on the transport. The first draft of this gate demanded that the
+            # marker arrive in `X-Internal-Auth` rather than in `Authorization: Bearer`, and
+            # that was measurably bypassable: mcp-server and results-api hold
+            # INTERNAL_API_SECRET by design and can copy it into any header they choose, so
+            # the gate asked them to not rename a header. A header name is not a secret.
+            #
+            # Bound, stated so nobody reads it as more than it is: a compromised auth-gateway
+            # — or GATEWAY_IDENTITY_SECRET leaked to another pod, which can then reach
+            # chat-backend:8000 directly — still reaches this dispatch, and the identity it
+            # asserts is still only allow-list-checked. It closes the transitive
+            # mcp-server -> chat-backend -> sandbox path, which is what 4h6.84 is about; it
+            # is not authentication.
+            #
+            # Gated on require_auth for the same reason auth_required's first branch is:
+            # REQUIRE_AUTH=false means there is no oauth2-proxy and no gateway to assert
+            # anything, so this could never be true in local dev. Production sets it true.
+            logger.error(
+                "run_analysis refused for an identity the gateway did not assert "
+                "(session=%s): the caller presented the internal marker without the "
+                "auth-gateway provenance secret",
                 session_id,
             )
             return self._sandbox_operator_error(

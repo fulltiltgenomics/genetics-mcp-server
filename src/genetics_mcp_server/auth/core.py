@@ -4,6 +4,12 @@ The header alone is not a credential — anything that can reach chat-backend on
 can set it to any string. It is honoured only when the request also carries the internal shared
 secret, which marks the caller as one of the in-cluster proxies, and the identity it asserts is
 then held to the same allow-list oauth2-proxy applies at the edge.
+
+Two secrets live here and they answer different questions. INTERNAL_API_SECRET answers "is the
+caller in-cluster" — auth-gateway, results-api and mcp-server all hold it, in either transport.
+GATEWAY_IDENTITY_SECRET answers "did auth-gateway relay this after verifying a session", which
+is strictly stronger because only auth-gateway and chat-backend hold it; sandbox dispatch keys
+on that one (genetics-results-suite-4h6.84).
 """
 
 import hmac
@@ -16,6 +22,14 @@ logger = logging.getLogger(__name__)
 IDENTITY_HEADER = "X-Goog-Authenticated-User-Email"
 INTERNAL_MARKER_HEADER = "X-Internal-Auth"
 
+# auth-gateway's provenance marker. It carries GATEWAY_IDENTITY_SECRET — a DIFFERENT secret
+# from INTERNAL_API_SECRET, held by auth-gateway and chat-backend and by nothing else
+# (k8s/deployments/auth-gateway.yaml, k8s/deployments/chat-backend.yaml). The header NAME is
+# not the security property and never was: mcp-server and results-api hold INTERNAL_API_SECRET
+# by design and are admitted to chat-backend:8000 by the NetworkPolicy, so either could put it
+# under any header it likes. What they cannot do is produce a secret they do not have.
+GATEWAY_MARKER_HEADER = "X-Gateway-Auth"
+
 # what a caller resolves to when it presents the marker and asserts NO identity
 # (`auth_required` case 3). It names a service, not a person, and every holder of
 # INTERNAL_API_SECRET resolves to this one string — mcp-server included. Anything that must
@@ -25,27 +39,13 @@ INTERNAL_MARKER_HEADER = "X-Internal-Auth"
 SERVICE_IDENTITY = "mcp-tool"
 
 
-def is_internal_caller(request: Request) -> bool:
-    """True when the request carries the shared internal secret in either accepted transport.
-
-    This is the trusted-proxy marker: only in-cluster services holding INTERNAL_API_SECRET
-    (auth-gateway's chat locations, results-api, mcp-server) can produce it, so a pod that
-    merely has network reach to chat-backend:8000 cannot.
-
-    Two transports, deliberately:
-      * `X-Internal-Auth` — auth-gateway's, on the browser-facing chat locations. A dedicated
-        header keeps the marker off the caller's `Authorization`, so a chat-backend that has
-        not yet rolled to this version simply ignores it and behaves exactly as before rather
-        than collapsing every browser session onto the `mcp-tool` service identity during the
-        gateway-leads-backend window.
-      * `Authorization: Bearer` — results-api's and mcp-server's, unchanged. Those are
-        service-to-service callers with no `Authorization` of their own to displace.
-    """
+def _expected_marker() -> bytes | None:
+    """The configured INTERNAL_API_SECRET as comparison bytes, or None when unset."""
     from genetics_mcp_server.config import get_settings
 
     secret = get_settings().internal_api_secret
     if not secret:
-        return False
+        return None
     # compare as bytes: compare_digest on str raises TypeError for non-ASCII, and a 500 from a
     # forged header would be a worse failure mode than a 401.
     #
@@ -65,7 +65,104 @@ def is_internal_caller(request: Request) -> bool:
     # No try/except on the re-encodes, unlike results-api's is_internal_caller: this takes a
     # starlette Request, so the only strs it can see came from starlette's own latin-1 decode
     # and re-encode by construction. Add the guard if a str-taking entry point is introduced.
-    expected = secret.encode("utf-8")
+    return secret.encode("utf-8")
+
+
+def _expected_gateway_marker() -> bytes | None:
+    """The configured GATEWAY_IDENTITY_SECRET as comparison bytes, or None when unusable.
+
+    None is the fail-closed answer and the only one available when the deployment has not
+    provisioned the secret: `is_gateway_caller` then answers False for every request, so an
+    unset gateway secret refuses sandbox dispatch rather than admitting it. Nothing in the
+    configuration space turns that around.
+
+    Non-ASCII is treated as unusable for the same reason `require_internal_api_secret`
+    refuses it at startup (genetics-results-suite-ctq): HTTP clients disagree on how to put a
+    non-ASCII header value on the wire, so no server-side codec recovers the same secret from
+    every caller and the comparison below would be well defined for none of them. Here it
+    degrades to "no gateway caller exists" instead of a startup refusal — see the note on
+    `warn_unless_gateway_identity_secret`. The render-config initContainer in
+    k8s/deployments/auth-gateway.yaml rejects such a value outright, so a cluster cannot reach
+    this branch with a gateway that is also running.
+    """
+    from genetics_mcp_server.config import get_settings
+
+    secret = get_settings().gateway_identity_secret
+    # must agree with warn_unless_gateway_identity_secret's `secret.strip()` check: a value
+    # the startup warning calls "unset or empty" cannot be a live, trivially guessable secret
+    # here (whitespace-only was measured to dispatch against a whitespace-only header).
+    if not secret.strip():
+        return None
+    if not secret.isascii():
+        logger.error(
+            "GATEWAY_IDENTITY_SECRET is non-ASCII, so no header encoding recovers it "
+            "reliably; treating it as unset, which refuses sandbox dispatch"
+        )
+        return None
+    # see the codec note in _expected_marker: utf-8 here, latin-1 on the header, and the two
+    # coincide because of the ASCII check above
+    return secret.encode("utf-8")
+
+
+def is_gateway_caller(request: Request) -> bool:
+    """True when the request carries GATEWAY_IDENTITY_SECRET, which only auth-gateway holds.
+
+    STRICTLY NARROWER than `is_internal_caller`, and it is narrower by a SECRET rather than
+    by a convention. auth-gateway sets this header on the two locations that proxy to
+    chat-backend (`location /chat/v1/` and `location = /status`), after an
+    `auth_request /oauth2/auth`, from a key that is mounted into auth-gateway and
+    chat-backend and into no other Deployment. So a true answer means the identity header on
+    this request was written by the proxy that had just verified an oauth2-proxy session for
+    that address — not merely by *some* holder of INTERNAL_API_SECRET.
+
+    That distinction is what `ToolExecutor.run_analysis` needs and what `is_internal_caller`
+    cannot give it (genetics-results-suite-4h6.84): every marker holder can assert any
+    allow-listed identity, so without this the sandbox's `sub`, artifact scope and audit
+    trail rest on mcp-server *choosing* not to assert one.
+
+    The FIRST attempt at this gated on the header NAME instead — the marker arriving in
+    `X-Internal-Auth` rather than in `Authorization: Bearer`. Measured end to end, that
+    refused a bearer caller and admitted the same caller after it copied its own secret into
+    `X-Internal-Auth`, which mcp-server and results-api can both do unilaterally. A header
+    name is not a secret; it replaced "mcp-server chooses not to assert an identity" with
+    "mcp-server chooses not to rename a header". Do not reintroduce a name-based check here.
+
+    nginx `proxy_set_header` redefines rather than appends, so a client-supplied
+    `X-Gateway-Auth` cannot survive the gateway hop; a caller reaching chat-backend directly
+    can set the header freely and still fails the comparison.
+    """
+    expected = _expected_gateway_marker()
+    if expected is None:
+        return False
+    marker = request.headers.get(GATEWAY_MARKER_HEADER)
+    return bool(marker) and hmac.compare_digest(marker.encode("latin-1"), expected)
+
+
+def is_internal_caller(request: Request) -> bool:
+    """True when the request carries the shared internal secret in either accepted transport.
+
+    This is the trusted-proxy marker: only in-cluster services holding INTERNAL_API_SECRET
+    (auth-gateway's chat locations, results-api, mcp-server) can produce it, so a pod that
+    merely has network reach to chat-backend:8000 cannot.
+
+    Two transports, deliberately:
+      * `X-Internal-Auth` — auth-gateway's, on the browser-facing chat locations. A dedicated
+        header keeps the marker off the caller's `Authorization`, so a chat-backend that has
+        not yet rolled to this version simply ignores it and behaves exactly as before rather
+        than collapsing every browser session onto the `mcp-tool` service identity during the
+        gateway-leads-backend window.
+      * `Authorization: Bearer` — results-api's and mcp-server's, unchanged. Those are
+        service-to-service callers with no `Authorization` of their own to displace.
+
+    The two are equivalent HERE — this answers "is the caller in-cluster", and both are.
+    Deliberately so: the transport carries no authority, because any holder of the secret can
+    choose either one. `is_gateway_caller` above does not tell these two apart; it asks for a
+    second, different secret that neither results-api nor mcp-server holds, and that is what
+    sandbox dispatch keys on.
+    """
+    expected = _expected_marker()
+    if expected is None:
+        return False
 
     marker = request.headers.get(INTERNAL_MARKER_HEADER)
     if marker and hmac.compare_digest(marker.encode("latin-1"), expected):

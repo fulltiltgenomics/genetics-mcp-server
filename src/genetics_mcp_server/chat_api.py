@@ -28,8 +28,17 @@ from genetics_mcp_server.logging_config import setup_logging
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
-from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
-from genetics_mcp_server.config import get_settings, require_internal_api_secret
+from genetics_mcp_server.auth import (
+    auth_required,
+    gateway_asserted_identity,
+    get_authenticated_user,
+    is_public,
+)
+from genetics_mcp_server.config import (
+    get_settings,
+    require_internal_api_secret,
+    warn_unless_gateway_identity_secret,
+)
 from genetics_mcp_server.config.defaults import (
     default_system_prompt,
     instruction_envelope,
@@ -202,6 +211,9 @@ async def lifespan(app: FastAPI):
     # "true" in k8s/deployments/chat-backend.yaml and false everywhere else.
     if get_settings().require_auth:
         require_internal_api_secret("chat-backend")
+    # NOT fatal, unlike the line above — see warn_unless_gateway_identity_secret for why the
+    # unset case is fail-closed at dispatch rather than at startup.
+    warn_unless_gateway_identity_secret("chat-backend")
     configure_rate_limit(
         max_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", "20")),
         max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "100")),
@@ -507,6 +519,7 @@ def _resolve_user_instructions(
 async def stream_chat(
     request: ChatRequest,
     user: str | None = Depends(auth_required),
+    gateway_asserted: bool = Depends(gateway_asserted_identity),
 ):
     """
     Stream chat responses as Server-Sent Events (SSE).
@@ -586,6 +599,7 @@ async def stream_chat(
                 session_id=request.session_id,
                 user_instructions=user_instructions,
                 message_id=request.message_id,
+                gateway_asserted=gateway_asserted,
             ):
                 if chunk.type == "text":
                     yield {

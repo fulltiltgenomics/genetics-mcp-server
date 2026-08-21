@@ -13,6 +13,8 @@ import os
 import signal
 
 import pytest
+from conftest import settings_env
+from fastapi import Request
 
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.llm_service import _script_result_payload
@@ -588,6 +590,10 @@ class TestRunAnalysisDefinition:
         assert params["code"]["required"] is True
         assert params["timeout_s"]["type"] == "integer"
         assert "user" not in params and "session_id" not in params
+        # nor the provenance of the identity, for the same reason and one more: a schema key
+        # is an invitation to emit it, and `_execute_tool` strips it precisely so a model
+        # cannot vouch for its own caller
+        assert "gateway_asserted" not in params
 
     def test_does_not_promise_artifact_contents(self):
         """The HTTP retrieval path is 4h6.52 and does not exist; read_artifact in this
@@ -1116,10 +1122,21 @@ class TestRunAnalysisRequiresARealUser:
         source = inspect.getsource(dependencies.auth_required)
         assert "return SERVICE_IDENTITY  # case 3" in source
 
-    async def test_a_real_user_still_runs(self, executor):
-        """The guard must be a rejection of one identity, not of service-shaped ones."""
+    async def test_a_real_user_the_gateway_asserted_still_runs(self, executor):
+        """The guard must be a rejection of one identity, not of service-shaped ones.
+
+        QUALIFIED for genetics-results-suite-4h6.84, and the qualification is the point.
+        This used to assert only `user="real@finngen.fi"` and could therefore not tell a
+        browser session from an address any marker holder typed into the identity header —
+        `auth_required` case 1 turns both into exactly this call. `gateway_asserted` is now
+        the thing that separates them, so a positive test has to state it; the negative twin
+        is TestSandboxDispatchRequiresTheGatewaySecret below.
+        """
         sandbox = _StubSandbox(result=_result_body())
-        result = await _run(executor, sandbox, user="real@finngen.fi")
+        with settings_env(REQUIRE_AUTH="true"):
+            result = await _run(
+                executor, sandbox, user="real@finngen.fi", gateway_asserted=True
+            )
         assert result["success"] is True
         assert len(sandbox.calls) == 1
 
@@ -1139,6 +1156,208 @@ class TestRunAnalysisRequiresARealUser:
         )
         try_index = next(i for i, node in enumerate(body) if isinstance(node, ast.Try))
         assert guard_index < try_index
+
+
+_INTERNAL_SECRET = "test-internal-secret"
+# a DIFFERENT value, and the difference is the entire mechanism under test: mcp-server and
+# results-api hold the first by design and neither holds the second
+_GATEWAY_SECRET = "test-gateway-identity-secret"
+
+
+def _marked_request(headers: dict[str, str]) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/chat/v1/chat",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        }
+    )
+
+
+class TestSandboxDispatchRequiresTheGatewaySecret:
+    """genetics-results-suite-4h6.84: the residual TestRunAnalysisRequiresARealUser leaves.
+
+    That class refuses `mcp-tool` — `auth_required` case 3, the marker with no identity
+    header. Case 1 beats case 3: marker PLUS an allow-listed identity header resolves to
+    that address, and never to SERVICE_IDENTITY, so the guard above evaluates False. Every
+    holder of INTERNAL_API_SECRET can produce that request, mcp-server included, and the
+    NetworkPolicy admits it to chat-backend:8000. The `sub` of both per-execution JWTs, the
+    artifact scope and the audit trail would then name someone who never asked.
+
+    THE FIRST FIX FOR THAT WAS WRONG AND THESE TESTS ARE SHAPED BY HOW IT FAILED. It keyed
+    on the marker's TRANSPORT — `X-Internal-Auth` (auth-gateway's) versus
+    `Authorization: Bearer` (mcp-server's and results-api's) — which measured, end to end,
+    as: bearer refused, and the same caller admitted the moment it copied its own secret
+    into `X-Internal-Auth`. A header name is not a secret, and both of those services hold
+    INTERNAL_API_SECRET by design.
+
+    What separates the callers now is a second secret, GATEWAY_IDENTITY_SECRET, mounted only
+    into auth-gateway and chat-backend. Each test below therefore states, independently and
+    unconditionally, that a caller holding INTERNAL_API_SECRET is refused however it presents
+    it — including both transports at once, which is the exact request that defeated the
+    previous fix.
+    """
+
+    @staticmethod
+    async def _dispatch(executor, sandbox, headers: dict[str, str], gateway_secret=_GATEWAY_SECRET):
+        """The full production chain: headers -> dependency -> _execute_tool -> run_analysis."""
+        from genetics_mcp_server.auth.dependencies import gateway_asserted_identity
+        from genetics_mcp_server.llm_service import LLMService
+
+        executor._sandbox = sandbox
+        service = LLMService.__new__(LLMService)
+        service.executor = executor
+        service.subagent_service = None
+
+        with settings_env(
+            REQUIRE_AUTH="true",
+            INTERNAL_API_SECRET=_INTERNAL_SECRET,
+            GATEWAY_IDENTITY_SECRET=gateway_secret,
+            ALLOWED_EMAIL_DOMAINS="finngen.fi",
+            SANDBOX_ENABLED="true",
+        ):
+            request = _marked_request(
+                {
+                    **headers,
+                    "X-Goog-Authenticated-User-Email": "anyone@finngen.fi",
+                }
+            )
+            asserted = await gateway_asserted_identity(request)
+            result = await service._execute_tool(
+                "run_analysis",
+                {"code": "print(1)"},
+                None,
+                "anyone@finngen.fi",
+                "anything",
+                asserted,
+            )
+        return asserted, result
+
+    @staticmethod
+    def _assert_refused(asserted, result, sandbox):
+        assert asserted is False
+        assert sandbox.calls == [], "nothing may be dispatched, and nothing minted"
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+
+    async def test_a_bearer_marker_asserting_an_identity_is_refused(self, executor):
+        """The bead's exact request, in the transport mcp-server and results-api use."""
+        sandbox = _StubSandbox(result=_result_body())
+        asserted, result = await self._dispatch(
+            executor, sandbox, {"Authorization": f"Bearer {_INTERNAL_SECRET}"}
+        )
+        self._assert_refused(asserted, result, sandbox)
+
+    async def test_the_internal_marker_header_asserting_an_identity_is_refused(self, executor):
+        """PROBE-B: the same caller, having simply renamed its own header.
+
+        This is what the transport-based fix admitted. Nothing stops mcp-server from writing
+        the secret it already holds into auth-gateway's header name.
+        """
+        sandbox = _StubSandbox(result=_result_body())
+        asserted, result = await self._dispatch(
+            executor, sandbox, {"X-Internal-Auth": _INTERNAL_SECRET}
+        )
+        self._assert_refused(asserted, result, sandbox)
+
+    async def test_both_internal_transports_at_once_are_refused(self, executor):
+        """PROBE-D, the request that broke the previous fix: a bearer caller that also adds
+        `X-Internal-Auth`. Under the transport check this dispatched.
+        """
+        sandbox = _StubSandbox(result=_result_body())
+        asserted, result = await self._dispatch(
+            executor,
+            sandbox,
+            {
+                "Authorization": f"Bearer {_INTERNAL_SECRET}",
+                "X-Internal-Auth": _INTERNAL_SECRET,
+            },
+        )
+        self._assert_refused(asserted, result, sandbox)
+
+    async def test_the_internal_secret_in_the_gateway_header_is_refused(self, executor):
+        """And renaming the header the other way does not help either: the value is compared,
+        so a caller holding only INTERNAL_API_SECRET fails even in auth-gateway's own header.
+        """
+        sandbox = _StubSandbox(result=_result_body())
+        asserted, result = await self._dispatch(
+            executor, sandbox, {"X-Gateway-Auth": _INTERNAL_SECRET}
+        )
+        self._assert_refused(asserted, result, sandbox)
+
+    async def test_the_gateway_secret_is_what_dispatches(self, executor):
+        """The control. Identical request, carrying the secret only auth-gateway holds.
+
+        If this fails the refusals above prove nothing, because something other than the
+        gateway secret would be stopping all of them.
+        """
+        sandbox = _StubSandbox(result=_result_body())
+        asserted, result = await self._dispatch(
+            executor, sandbox, {"X-Gateway-Auth": _GATEWAY_SECRET}
+        )
+
+        assert asserted is True
+        assert len(sandbox.calls) == 1
+        assert sandbox.calls[0]["user"] == "anyone@finngen.fi"
+        assert result["success"] is True
+
+    async def test_an_unprovisioned_gateway_secret_refuses_rather_than_admits(self, executor):
+        """Fail closed on misconfiguration: with GATEWAY_IDENTITY_SECRET unset under
+        REQUIRE_AUTH, even a request carrying the header is refused. The alternative — an
+        unset secret degrading to "everyone is the gateway" — is the failure this whole bead
+        exists to prevent, and it would arrive silently on a deploy that forgot the key.
+        """
+        sandbox = _StubSandbox(result=_result_body())
+        asserted, result = await self._dispatch(
+            executor, sandbox, {"X-Gateway-Auth": _GATEWAY_SECRET}, gateway_secret=""
+        )
+        self._assert_refused(asserted, result, sandbox)
+
+    async def test_the_dispatch_refuses_on_its_own_without_the_dependency(self, executor):
+        """The guard is at the waist, not at the route: calling run_analysis directly with
+        no stated provenance is refused too, so a future caller that forgets to plumb the
+        flag loses code execution rather than inheriting trust.
+        """
+        sandbox = _StubSandbox(result=_result_body())
+        with settings_env(REQUIRE_AUTH="true"):
+            result = await _run(executor, sandbox, user="real@finngen.fi")
+
+        assert sandbox.calls == []
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+
+    async def test_the_chat_route_supplies_the_provenance(self):
+        """Structural, and it earned its place: the first draft of this change declared the
+        dependency on the route and never forwarded it to `stream_chat`, so every execution
+        would have run on the default `False` and code execution would have been dead in
+        production while the two tests above stayed green. Both halves are asserted —
+        resolving it, and passing it on.
+        """
+        from genetics_mcp_server import chat_api
+        from genetics_mcp_server.auth.dependencies import gateway_asserted_identity
+
+        parameter = inspect.signature(chat_api.stream_chat).parameters["gateway_asserted"]
+        assert parameter.default.dependency is gateway_asserted_identity
+        source = inspect.getsource(chat_api.stream_chat)
+        assert "gateway_asserted=gateway_asserted" in source
+
+    async def test_the_gateway_secret_alone_does_not_assert_an_identity(self):
+        """Case 3 is `mcp-tool`, which names nobody: the gateway secret by itself is not an
+        assertion about a person, so it must not satisfy this dependency either.
+        """
+        from genetics_mcp_server.auth.dependencies import gateway_asserted_identity
+
+        with settings_env(
+            REQUIRE_AUTH="true",
+            INTERNAL_API_SECRET=_INTERNAL_SECRET,
+            GATEWAY_IDENTITY_SECRET=_GATEWAY_SECRET,
+        ):
+            asserted = await gateway_asserted_identity(
+                _marked_request({"X-Gateway-Auth": _GATEWAY_SECRET})
+            )
+        assert asserted is False
 
 
 class TestRunAnalysisIdentity:
