@@ -280,6 +280,14 @@ class TurnRecord:
     user_question: str | None = None
     final_answer: str | None = None
     final_answer_dropped_chars: int = 0
+    # ...and the discarded text ITSELF, with the call it followed, so a transcript can put it
+    # back where the model wrote it. Same boundary as the count above (one definition, in
+    # `pairwise_judge.dropped_prose_blocks`), and kept for the READER only: the judge is
+    # still shown `final_answer` alone, since this half names tools and scripts and would
+    # identify the arm on sight. Always captured — it is the model's own visible output, it
+    # is small next to the tool arguments already in the report, and its absence made the
+    # transcript claim a fragment was the whole reply.
+    final_answer_dropped_prose: list[dict[str, Any]] = field(default_factory=list)
 
     # one entry per iteration that reasoned, {"iteration", "text"}, and EMPTY unless the run
     # asked for it with --capture-thinking. Populated from the `thinking_summary` chunks,
@@ -644,7 +652,11 @@ async def replay_turn(
     # imported here, not at module scope: pairwise_judge imports `matched_pairs` from this
     # module (the pairing rule has one definition), so a module-level import back would be a
     # cycle. Same lazy-import shape analyze_conversations uses for its own heavy deps.
-    from genetics_mcp_server.scripts.pairwise_judge import final_answer_split, user_question_text
+    from genetics_mcp_server.scripts.pairwise_judge import (
+        dropped_prose_blocks,
+        final_answer_split,
+        user_question_text,
+    )
 
     record = TurnRecord(
         case_id=case_id,
@@ -926,6 +938,7 @@ async def replay_turn(
         record.final_answer, record.final_answer_dropped_chars = final_answer_split(
             message_content
         )
+        record.final_answer_dropped_prose = dropped_prose_blocks(message_content)
     else:
         # the flag is only meaningful for a turn that finished; an aborted one never got
         # far enough for the absence of the marker to mean anything

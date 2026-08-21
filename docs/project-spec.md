@@ -2193,12 +2193,12 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
-| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
+| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
 | `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to `{"general"}`, and records each arm's resolved tool list in the report |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
 | `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
 | `test_benchmark_transcript.py` | The side-by-side transcript carries what distinguishes a *wide* arm from a *slow* one (per-call iteration, retry loops, script shapes) and never invents a measurement it lacks — an unattributed call has no iteration, and the final iteration's absent tool phase is not reported as a gap |
-| `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded, length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
+| `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded (and `dropped_prose_blocks` returning that same text with the call it followed, for the transcript and never for the judge), length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
 
 Run tests:
 ```bash
@@ -2368,6 +2368,15 @@ harness issues two arms per case. `--base-url` therefore defaults to
   and takes the tool-call count from the `done` chunk's `message_content` by counting
   real `tool_use` blocks (never the `*[Using tool: …]*` display markers, which the
   model has been observed to imitate as prose).
+- **The prose the answer-slicing rule discards is recorded too, with its position.** Every
+  turn keeps `final_answer_dropped_prose` — `{after_call, text}` per block — alongside the
+  `final_answer_dropped_chars` count, from the same boundary (`dropped_prose_blocks`, beside
+  `final_answer_split`, so the two cannot disagree about what was dropped). Always captured,
+  no flag: it is the model's own **visible** output, it is small next to the tool arguments
+  already in the report, and without it the transcript could only apologise for a missing
+  table while presenting the remainder as the whole reply. It is for the reader alone — the
+  judge is still shown `final_answer` only, since this half is running commentary about
+  tools and scripts and names the arm on sight.
 - **`--capture-thinking` records the model's reasoning, and nothing else changes.** Off by
   default. When set, the request carries `capture_thinking: true`, `llm_service` emits a
   `thinking_summary` chunk per reasoning iteration, and each turn keeps them in
@@ -2640,8 +2649,12 @@ whose partner fell over as a clean run. `-` prints the paired document only, sin
 stream cannot be three files. The elision is what
 the file exists to remove — the two column views are width-bound, and a `run_analysis` script
 is precisely the argument that never fits, so an argument's fence grows past any backticks
-inside it rather than the value being cut. When the run was made with
-`replay_benchmark --capture-thinking`, each iteration's summarized reasoning appears in the
+inside it rather than the value being cut. Prose the answer-slicing rule
+discarded is printed **where the model wrote it** — before the first call, or after the call
+it followed — rather than appended, since "written after call 3" is most of what it means; a
+report predating its capture says so instead, and names re-running as the fix. When the run
+was made with `replay_benchmark --capture-thinking`, each iteration's summarized reasoning
+appears in the
 call list immediately **before** the calls it produced — collected at the top of a turn it
 would answer nothing — and iterations that called no tool, the final answering one included,
 show their reasoning after the calls. What a saved report cannot supply is stated in the

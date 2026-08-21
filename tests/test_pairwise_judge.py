@@ -36,6 +36,7 @@ from genetics_mcp_server.scripts.pairwise_judge import (
     elide_middle,
     estimate_judging_cost,
     estimate_lines,
+    dropped_prose_blocks,
     final_answer_split,
     final_answer_text,
     format_judging,
@@ -1002,3 +1003,37 @@ def test_a_saved_report_can_be_priced_without_re_running_the_benchmark(tmp_path,
     assert pairwise_judge.main(["--report", str(path), "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "JUDGING ESTIMATE: 1 matched pairs x 2 passes = 2 calls" in out
+
+
+def test_dropped_prose_is_returned_with_the_call_it_followed():
+    blocks = [
+        {"type": "text", "text": "Let me look that up."},
+        {"type": "tool_use", "id": "t1", "name": "search_genes", "input": {}},
+        {"type": "text", "text": "| gene | p |\n| LDLR | 1e-58 |"},
+        {"type": "tool_use", "id": "t2", "name": "get_burden", "input": {}},
+        {"type": "text", "text": "In summary, yes."},
+    ]
+    assert dropped_prose_blocks(blocks) == [
+        {"after_call": None, "text": "Let me look that up."},
+        {"after_call": 0, "text": "| gene | p |\n| LDLR | 1e-58 |"},
+    ]
+    # the boundary is the one final_answer_split uses, so the two cannot disagree
+    kept, dropped_chars = final_answer_split(blocks)
+    assert kept == "In summary, yes."
+    assert dropped_chars > 0
+
+
+def test_dropped_prose_is_empty_when_the_rule_discards_nothing():
+    assert dropped_prose_blocks([{"type": "text", "text": "no tools needed"}]) == []
+    assert dropped_prose_blocks(None) == []
+
+
+def test_dropped_prose_keeps_everything_when_the_last_block_is_the_call():
+    blocks = [
+        {"type": "text", "text": "here is the table"},
+        {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+    ]
+    assert dropped_prose_blocks(blocks) == [
+        {"after_call": None, "text": "here is the table"}
+    ]
+    assert final_answer_split(blocks)[0] == ""

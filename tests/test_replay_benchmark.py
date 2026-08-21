@@ -1728,3 +1728,49 @@ async def test_a_summary_without_an_iteration_falls_back_to_the_usage_count(
     assert report["turns"][0]["thinking_detail"] == [
         {"iteration": 1, "text": "no iteration on this chunk"}
     ]
+
+
+async def test_prose_discarded_from_the_answer_is_kept_with_its_position(
+    stub_server, tmp_path
+):
+    # the harness records the text, not only how much of it there was: the transcript's
+    # apology for a missing table is worth less than the table
+    turn = [
+        _usage(1, 100, 10, 100, 10),
+        _done(
+            blocks=[
+                {"type": "text", "text": "Let me look that up."},
+                {"type": "tool_use", "id": "t1", "name": "get_variants", "input": {}},
+                {"type": "text", "text": "| gene | p |"},
+                {"type": "tool_use", "id": "t2", "name": "get_burden", "input": {}},
+                {"type": "text", "text": "In summary, yes."},
+            ],
+            tool_results=[
+                {"type": "tool_result", "tool_use_id": "t1", "content": "{}"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "{}"},
+            ],
+        ),
+    ]
+    stub_server.plan = {None: list(turn), "bigquery": list(turn)}
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM, "bigquery"),
+        limit=None,
+        concurrency=1,
+        model="claude-opus-5",
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+    )
+
+    record = report["turns"][0]
+    assert record["final_answer"] == "In summary, yes."
+    assert record["final_answer_dropped_prose"] == [
+        {"after_call": None, "text": "Let me look that up."},
+        {"after_call": 0, "text": "| gene | p |"},
+    ]
+    # the count and the text describe the same discard
+    assert record["final_answer_dropped_chars"] > 0

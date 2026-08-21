@@ -259,6 +259,47 @@ def final_answer_text(message_content: list[dict[str, Any]] | None) -> str:
     return final_answer_split(message_content)[0]
 
 
+def dropped_prose_blocks(
+    message_content: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """The text `final_answer_split` discards, kept as blocks WITH THEIR POSITION.
+
+    Same boundary as that function — everything before the last `tool_use` — so the two can
+    never disagree about what was dropped; this one returns the text instead of its length.
+    `after_call` is the number of tool calls that preceded the block, i.e. `null` for prose
+    written before any call and `2` for prose written after the third, which is what lets a
+    transcript put it back where the model wrote it rather than in a lump at the end.
+
+    NOT for the judge, ever. This is precisely the material `final_answer_split` withholds:
+    it is running commentary about tools and scripts, and it names the arm outright. It
+    exists so a HUMAN reading a transcript sees the whole turn — the discarded half is
+    frequently the table an arm laid out before one last call.
+    """
+    if not message_content:
+        return []
+    last_tool_use = -1
+    for index, block in enumerate(message_content):
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            last_tool_use = index
+
+    blocks: list[dict[str, Any]] = []
+    calls_so_far = 0
+    for block in message_content[: last_tool_use + 1]:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use":
+            calls_so_far += 1
+            continue
+        if block.get("type") != "text":
+            continue
+        text = (block.get("text") or "").strip()
+        if text:
+            blocks.append(
+                {"after_call": calls_so_far - 1 if calls_so_far else None, "text": text}
+            )
+    return blocks
+
+
 def user_question_text(content: Any) -> str:
     """The user turn's text, whether it was recorded as a string or as content blocks."""
     if isinstance(content, str):

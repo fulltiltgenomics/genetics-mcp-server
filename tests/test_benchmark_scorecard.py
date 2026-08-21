@@ -296,3 +296,37 @@ def test_markdown_of_a_report_without_captured_thinking_is_unchanged():
     turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
     turns[1]["tool_calls_detail"] = [{"seq": 0, "name": "a", "iteration": 1, "input": {}}]
     assert "thinking" not in render_markdown(_report(turns))
+
+
+def test_markdown_shows_the_discarded_prose_where_it_was_written():
+    # the table an arm laid out before one last call is not commentary; presenting the
+    # remainder as "the answer" without it presents a fragment as the whole reply
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[0]["tool_calls_detail"] = [
+        {"seq": 0, "name": "search_genes", "input": {"query": "LDLR"}},
+        {"seq": 1, "name": "get_burden", "input": {}},
+    ]
+    turns[0]["final_answer"] = "In summary, yes."
+    turns[0]["final_answer_dropped_chars"] = 260
+    turns[0]["final_answer_dropped_prose"] = [
+        {"after_call": None, "text": "Let me look that up."},
+        {"after_call": 0, "text": "| gene | p |"},
+    ]
+    out = render_markdown(_report(turns))
+
+    assert "Let me look that up." in out
+    assert "| gene | p |" in out
+    # position is most of the meaning: the second block sits between the two calls
+    assert out.index("search_genes") < out.index("| gene | p |") < out.index("get_burden")
+    assert out.index("Let me look that up.") < out.index("search_genes")
+    assert "260 character(s)" not in out, "the text is here, so the apology must be gone"
+    assert "2 prose block(s)" in out
+
+
+def test_markdown_still_declares_prose_a_report_kept_only_the_length_of():
+    turns = [_turn("c", "nocode", 0), _turn("c", "code", 0)]
+    turns[0]["tool_calls_detail"] = [{"seq": 0, "name": "a", "input": {}}]
+    turns[0]["final_answer_dropped_chars"] = 260
+    out = render_markdown(_report(turns))
+    assert "260 character(s)" in out
+    assert "predates their capture" in out

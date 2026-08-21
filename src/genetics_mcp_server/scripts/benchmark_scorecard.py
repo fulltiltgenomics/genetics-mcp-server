@@ -589,6 +589,33 @@ def _md_thinking(turn: dict, iteration: Any) -> list[str]:
     return lines + ["</details>", ""]
 
 
+def _md_prose(turn: dict, after_call: Any) -> list[str]:
+    """Assistant prose the answer-slicing rule discarded, at the position it was written.
+
+    This is the model's own VISIBLE output, not reasoning — the running commentary between
+    calls, and often the table an arm laid out before making one last call. It is shown
+    inline rather than appended, because "written after call 3" is most of what it means.
+    """
+    rows = [
+        r
+        for r in (turn.get("final_answer_dropped_prose") or [])
+        if r.get("after_call") == after_call
+    ]
+    if not rows:
+        return []
+    where = (
+        "before its first tool call"
+        if after_call is None
+        else f"after call {after_call}"
+    )
+    lines = []
+    for row in rows:
+        lines += [f"> *the assistant wrote, {where} — text the Answer below does not "
+                  "include:*", ""]
+        lines += [f"> {line}" for line in (row.get("text") or "").splitlines()] + [""]
+    return lines
+
+
 def _md_turn_arm(turn: dict | None, arm: str) -> list[str]:
     lines = [f"#### arm `{arm}`", ""]
     if turn is None:
@@ -604,14 +631,21 @@ def _md_turn_arm(turn: dict | None, arm: str) -> list[str]:
         for iteration in _thinking_iterations(turn):
             lines += _md_thinking(turn, iteration)
     else:
-        lines += ["<details><summary>" f"{len(calls)} tool call(s)" "</summary>", ""]
+        prose = turn.get("final_answer_dropped_prose") or []
+        summary = f"{len(calls)} tool call(s)"
+        if prose:
+            summary += f", {len(prose)} prose block(s) between them"
+        lines += [f"<details><summary>{summary}</summary>", ""]
         seen_iterations: list[Any] = []
-        for call in calls:
+        # anything written before the first call belongs above it
+        lines += _md_prose(turn, None)
+        for index, call in enumerate(calls):
             iteration = call.get("iteration")
             if iteration not in seen_iterations:
                 seen_iterations.append(iteration)
                 lines += _md_thinking(turn, iteration)
             lines += _md_call(call)
+            lines += _md_prose(turn, index)
         lines += ["</details>", ""]
         # the reasoning of iterations that called nothing — including the final one, which
         # answered — belongs to the turn just as much, and is where a turn that went wrong
@@ -621,13 +655,14 @@ def _md_turn_arm(turn: dict | None, arm: str) -> list[str]:
                 seen_iterations.append(iteration)
                 lines += _md_thinking(turn, iteration)
     dropped = turn.get("final_answer_dropped_chars") or 0
-    if dropped:
-        # the discarded text is not recoverable from the report — only its length was kept,
-        # so saying "answer" without saying this would present a fragment as the whole reply
+    if dropped and not turn.get("final_answer_dropped_prose"):
+        # a report from before the text was captured: only the LENGTH was kept, so it cannot
+        # be shown, and saying "answer" without saying this presents a fragment as the whole
+        # reply. Reports written since carry the prose itself, rendered among the calls above.
         lines += [
             f"*{dropped} character(s) of assistant prose written before the last tool call "
-            "were discarded at capture (see `pairwise_judge.final_answer_split`) and are "
-            "not in the report.*",
+            "were discarded at capture (see `pairwise_judge.final_answer_split`) and are not "
+            "in this report — it predates their capture. Re-running records them.*",
             "",
         ]
     lines += ["**Answer**", ""]
