@@ -17,7 +17,12 @@ import re
 
 import pytest
 
-from genetics_mcp_server.config.defaults import _assemble, _Block, default_system_prompt
+from genetics_mcp_server.config.defaults import (
+    _SUMMARIZE_PARAM_TOOLS,
+    _assemble,
+    _Block,
+    default_system_prompt,
+)
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
@@ -525,3 +530,217 @@ class TestRunAnalysisWordingIsArmNeutral:
     def test_the_bullet_is_absent_where_the_tool_is(self):
         prompt = default_system_prompt("FinnGenie", tool_names=resolve("rag", subagents=False))
         assert _RUN_ANALYSIS_BULLET_START not in prompt
+
+
+def _tools_with_parameter(param: str) -> set[str]:
+    """Tool names whose schema actually declares `param`, read from the definitions.
+
+    Derived rather than listed so that a parameter added to (or dropped from) a tool moves
+    this set, and the gate keyed on it is checked against reality instead of a copy.
+    """
+    return {
+        t["name"]
+        for t in get_anthropic_tools()
+        if param in t.get("input_schema", {}).get("properties", {})
+    }
+
+
+_TRUNCATION_RULE = "is a PREFIX of an ordered result"
+_SUMMARIZE_REMEDY = "or with `summarize=true` until the result is complete"
+_GENERIC_REMEDY = "Narrow the request until the result is complete."
+_DB_COUNT_REMEDY = "Query the database for the count directly"
+_SDK_COUNT_REMEDY = "Count the rows in a script with `genetics.sql(...)`"
+_PRODUCTS_IMPERATIVE = "always check each dataset's `products` field"
+_PRODUCTS_KNOWLEDGE = "but its `products` field determines what you can actually *query*"
+_SDK_CATALOG_ROUTE = "`genetics.datasets(resource=..., include_stats=True)` inside a script"
+
+
+class TestGuidanceKeyedOnAParameterOrAFieldIsGated:
+    """genetics-results-suite-4h6.75.
+
+    The gate matches TOOL NAMES, so a block whose actionability rests on a PARAMETER or an
+    OUTPUT FIELD names no tool and was emitted unconditionally — telling `code` to pass
+    `summarize=true` to tools it does not have, and `rag` to query a database it cannot
+    reach. Everything below reads the RENDERED PROMPT per profile: asserting on `_Block`
+    metadata would only restate the constant that was changed.
+    """
+
+    def test_the_pinned_summarize_tool_set_still_matches_the_real_schemas(self):
+        assert _SUMMARIZE_PARAM_TOOLS == _tools_with_parameter("summarize")
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_summarize_remedy_reaches_exactly_the_surfaces_with_the_parameter(self, profile):
+        available = resolve(profile, subagents=False)
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        reachable = bool(_tools_with_parameter("summarize") & available)
+        assert (_SUMMARIZE_REMEDY in prompt) is reachable
+        # and the surfaces without it are still told to narrow, rather than left with the
+        # prohibition and no way out
+        assert (_GENERIC_REMEDY in prompt) is not reachable
+        assert _TRUNCATION_RULE in prompt
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_count_remedy_names_the_database_route_the_surface_actually_has(self, profile):
+        available = resolve(profile, subagents=False)
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert (_DB_COUNT_REMEDY in prompt) is ("query_database" in available)
+        assert (_SDK_COUNT_REMEDY in prompt) is (
+            "run_analysis" in available and "query_database" not in available
+        )
+
+    def test_rag_is_told_to_count_by_neither_route_because_it_has_neither(self):
+        available = resolve("rag", subagents=False)
+        assert not {"query_database", "run_analysis"} & available
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert _TRUNCATION_RULE in prompt
+        assert _DB_COUNT_REMEDY not in prompt
+        assert _SDK_COUNT_REMEDY not in prompt
+        assert "query the database" not in prompt
+
+    @pytest.mark.parametrize("sandbox", [True, False], ids=["sandbox_on", "sandbox_off"])
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_products_imperative_reaches_only_surfaces_that_can_read_the_field(
+        self, profile, sandbox
+    ):
+        """Two routes read `products`, not one: `list_datasets`, and the SDK's
+        `genetics.datasets()` — which delegates to the same executor method and the same
+        `/v1/datasets` response, whose per-dataset payload carries `products`. Gating on
+        `list_datasets` alone dropped the guidance from the sandboxed arm."""
+        available = resolve(profile, subagents=False, sandbox=sandbox)
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        reachable = bool({"list_datasets", "run_analysis"} & available)
+        assert (_PRODUCTS_IMPERATIVE in prompt) is reachable
+        assert ("always mention which products each dataset supports" in prompt) is reachable
+        # and a surface reaching the catalog only through the SDK is told which call that is
+        assert (_SDK_CATALOG_ROUTE in prompt) is (
+            "run_analysis" in available and "list_datasets" not in available
+        )
+        # the products-vs-data_type distinction is knowledge about the data and must not
+        # have gone with the imperative
+        assert _PRODUCTS_KNOWLEDGE in prompt
+
+
+_ANNOTATION_PROHIBITION = "you must NEVER query the database for them"
+_ANNOTATION_TOOL_ROUTE = "Those per-variant annotations come from `get_variant_annotations`"
+# the SDK remedy has two wordings: one for a surface that ALSO has the protein-effect tool
+# and one for a surface that has only the SDK. The second's "clinical significance ... is
+# not in the database either" is true only where nothing returns it.
+_ANNOTATION_SDK_AND_PROTEIN = "Fetch consequence, allele frequency and gene in a script instead"
+_ANNOTATION_SDK_ONLY = "Fetch them in a script instead: `genetics.variant_annotation("
+_ANNOTATION_DB_PROTEIN_ROUTE = "The database is not an alternative route to them. For a coding SNV"
+_ANNOTATION_NO_ROUTE = "there is no variant-annotation tool on this surface"
+_ANNOTATION_ROUTES = (
+    _ANNOTATION_TOOL_ROUTE,
+    _ANNOTATION_SDK_AND_PROTEIN,
+    _ANNOTATION_SDK_ONLY,
+    _ANNOTATION_DB_PROTEIN_ROUTE,
+    _ANNOTATION_NO_ROUTE,
+)
+
+# A refusal sentence paired with the LOCAL tool whose presence in the SAME rendered prompt
+# would make it false. This is the defect class of genetics-results-suite-4h6.76's second
+# half: a prompt that tells the model to say something is unavailable while itself
+# documenting the tool that returns it. Nothing pinned it before — the no-route variant
+# shipped on `bigquery`, which has `get_variant_protein_effect`.
+_REFUSAL_CONTRADICTED_BY = {
+    _ANNOTATION_NO_ROUTE: "get_variant_protein_effect",
+    "What it does not cover — clinical significance, pathogenicity scores, multi-population"
+    " frequencies — is not in the database either": "get_variant_protein_effect",
+}
+
+
+class TestTheAnnotationProhibitionAlwaysCarriesARoute:
+    """genetics-results-suite-4h6.76.
+
+    The prohibition ("NEVER query the database for consequence / AF / rsID") is gated on
+    `query_database` or `run_analysis`; its remedy NAMES the two annotation tools, so the
+    text gate dropped the remedy on every surface without them — measured on `bigquery` and
+    on `code` — leaving a dead end. Each surface must now get the route it has, or be told
+    plainly that it has none.
+    """
+
+    @pytest.mark.parametrize("sandbox", [True, False], ids=["sandbox_on", "sandbox_off"])
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_no_surface_gets_the_prohibition_without_a_route(self, profile, sandbox):
+        available = resolve(profile, subagents=False, sandbox=sandbox)
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        emitted = sum(r in prompt for r in _ANNOTATION_ROUTES)
+        if _ANNOTATION_PROHIBITION not in prompt:
+            assert emitted == 0, f"{profile}/{sandbox}: a route with no prohibition to answer"
+            return
+        assert emitted == 1, f"{profile}/{sandbox}: not exactly one route"
+
+    @pytest.mark.parametrize("sandbox", [True, False], ids=["sandbox_on", "sandbox_off"])
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_no_prompt_refuses_what_the_same_prompt_explains_how_to_get(self, profile, sandbox):
+        """The defect class, pinned directly: a refusal sentence and the tool that
+        contradicts it must never appear in the same rendered prompt."""
+        available = resolve(profile, subagents=False, sandbox=sandbox)
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        for refusal, tool in _REFUSAL_CONTRADICTED_BY.items():
+            assert not (refusal in prompt and tool in prompt), (
+                f"{profile}/{sandbox}: prompt refuses what {tool} returns"
+            )
+
+    @pytest.mark.parametrize("profile", [None, "api"], ids=["None", "api"])
+    def test_surfaces_with_the_annotation_tools_are_pointed_at_them(self, profile):
+        available = resolve(profile, subagents=False)
+        assert "get_variant_annotations" in available
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert _ANNOTATION_TOOL_ROUTE in prompt
+
+    def test_the_sandbox_surface_with_the_protein_tool_gets_both_halves(self):
+        """`bigquery` + sandbox: the SDK covers consequence/AF/gene, and
+        `get_variant_protein_effect` covers a coding SNV's ClinVar significance and rsID.
+        The earlier wording asserted clinical significance was unavailable here."""
+        available = resolve("bigquery", subagents=False)
+        assert not {"get_variant_annotations", "get_myvariant_annotations"} & available
+        assert {"run_analysis", "get_variant_protein_effect"} <= available
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert _ANNOTATION_PROHIBITION in prompt
+        assert _ANNOTATION_SDK_AND_PROTEIN in prompt
+        assert "get_variant_protein_effect` adds the amino-acid change" in prompt
+        assert _ANNOTATION_SDK_ONLY not in prompt
+        assert _ANNOTATION_TOOL_ROUTE not in prompt
+
+    def test_the_sandbox_surface_without_the_protein_tool_gets_the_sdk_alone(self):
+        """`code`: seven tools, no annotation tool of any kind, so the SDK is the whole
+        route and "clinical significance is not available" is true as written."""
+        available = resolve("code", subagents=False)
+        assert not {
+            "get_variant_annotations",
+            "get_myvariant_annotations",
+            "get_variant_protein_effect",
+        } & available
+        assert "run_analysis" in available
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert _ANNOTATION_PROHIBITION in prompt
+        assert _ANNOTATION_SDK_ONLY in prompt
+        assert _ANNOTATION_SDK_AND_PROTEIN not in prompt
+
+    def test_the_database_only_surface_is_pointed_at_the_protein_tool_it_has(self):
+        """`bigquery` with the sandbox flag off — what chat-backend.yaml declares today.
+        `query_database` keeps the prohibition alive while `run_analysis` is gone, but
+        `get_variant_protein_effect` is still there, so telling the model to say a coding
+        SNV's consequence is unavailable would be false on the deployed surface."""
+        available = resolve("bigquery", subagents=False, sandbox=False)
+        assert "run_analysis" not in available
+        assert {"query_database", "get_variant_protein_effect"} <= available
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert _ANNOTATION_PROHIBITION in prompt
+        assert _ANNOTATION_DB_PROTEIN_ROUTE in prompt
+        assert _ANNOTATION_NO_ROUTE not in prompt
+        assert _ANNOTATION_SDK_ONLY not in prompt
+
+    def test_a_surface_with_no_route_at_all_is_told_so(self):
+        """The blanket refusal is not dead: it is what a database-only surface WITHOUT
+        the protein-effect tool gets. No shipped profile is that shape today, so this
+        drives the assembly directly rather than through a profile."""
+        available = resolve("bigquery", subagents=False, sandbox=False) - {
+            "get_variant_protein_effect"
+        }
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert _ANNOTATION_PROHIBITION in prompt
+        assert _ANNOTATION_NO_ROUTE in prompt
+        assert _ANNOTATION_DB_PROTEIN_ROUTE not in prompt
+        assert _ANNOTATION_SDK_ONLY not in prompt

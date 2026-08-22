@@ -942,14 +942,18 @@ class _CapturingService:
         self.subagent_service = object()
         self.kwargs = None
 
-    def resolve_local_tool_names(self, tool_profile=None, enable_tools=True):
+    def resolve_local_tools(
+        self, tool_profile=None, enable_tools=True, custom_tool_descriptions=None
+    ):
         """The real resolution, not a stub: the endpoint assembles the system prompt from
         it (genetics-results-suite-4h6.69), so a stub here would stop these tests from
         seeing the prompt the endpoint actually sends."""
         from genetics_mcp_server.llm_service import LLMService
 
         self._disabled_tools = lambda: LLMService._disabled_tools(self)
-        return LLMService.resolve_local_tool_names(self, tool_profile, enable_tools)
+        return LLMService.resolve_local_tools(
+            self, tool_profile, enable_tools, custom_tool_descriptions
+        )
 
     def stream_chat(self, **kwargs):
         self.kwargs = kwargs

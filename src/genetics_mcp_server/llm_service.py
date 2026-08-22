@@ -563,6 +563,26 @@ def _script_result_payload(
     }
 
 
+@dataclass(frozen=True)
+class ResolvedLocalTools:
+    """One request's local tool definitions, with the names projected off them.
+
+    `names` is deliberately NOT stored: it is computed from `definitions` on every
+    access, so there is no way to hold an object whose names describe a different tool
+    set than the one it hands the model (genetics-results-suite-4h6.77). The invariant
+    rests on that projection, not on `frozen=True`: freezing only prevents rebinding the
+    field, and `definitions` is a plain list whose contents can still be mutated in place
+    (`tests/test_tool_resolution_single_source.py` does exactly that to prove `names`
+    follows).
+    """
+
+    definitions: list[dict[str, Any]]
+
+    @property
+    def names(self) -> set[str]:
+        return {t["name"] for t in self.definitions}
+
+
 class LLMService:
     """Service for LLM chat streaming with multi-provider support."""
 
@@ -629,24 +649,40 @@ class LLMService:
             disabled.add("launch_subagents")
         return disabled
 
+    def resolve_local_tools(
+        self,
+        tool_profile: str | None = None,
+        enable_tools: bool = True,
+        custom_tool_descriptions: dict[str, str] | None = None,
+    ) -> ResolvedLocalTools:
+        """Resolve this request's local tool definitions ONCE.
+
+        The prompt gate (genetics-results-suite-4h6.69) requires the system prompt to be
+        assembled against the tools the model is actually handed. Returning one object
+        that carries the definitions and projects the names off them is what makes that
+        structural rather than conventional: a caller builds the prompt from `.names` and
+        hands the SAME object to `stream_chat`, so there is one derivation and no second
+        one to drift from it (genetics-results-suite-4h6.77).
+        """
+        if not (enable_tools and get_settings().mcp_enabled):
+            return ResolvedLocalTools([])
+        return ResolvedLocalTools(
+            get_anthropic_tools(
+                custom_tool_descriptions,
+                tool_profile=tool_profile,
+                disabled_tools=self._disabled_tools(),
+            )
+        )
+
     def resolve_local_tool_names(
         self, tool_profile: str | None = None, enable_tools: bool = True
     ) -> set[str]:
         """Local tool names this service would advertise for such a request.
 
-        Exists so the system prompt can be assembled against the SAME resolution the
-        tool list comes from (genetics-results-suite-4h6.69) instead of being built
-        independently and drifting from it. External and RAG tools are excluded: they
-        are proxied surfaces the system prompt does not name tool-by-tool.
+        External and RAG tools are excluded: they are proxied surfaces the system prompt
+        does not name tool-by-tool.
         """
-        if not (enable_tools and get_settings().mcp_enabled):
-            return set()
-        return {
-            t["name"]
-            for t in get_anthropic_tools(
-                tool_profile=tool_profile, disabled_tools=self._disabled_tools()
-            )
-        }
+        return self.resolve_local_tools(tool_profile, enable_tools).names
 
     async def stream_chat(
         self,
@@ -665,6 +701,7 @@ class LLMService:
         message_id: str | None = None,
         capture_thinking: bool = False,
         gateway_asserted: bool = False,
+        local_tools: ResolvedLocalTools | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -702,6 +739,11 @@ class LLMService:
                 `run_analysis`, which will not dispatch without it
                 (genetics-results-suite-4h6.84). Defaults False so a caller that does not
                 state a provenance loses code execution rather than being trusted.
+            local_tools: the already-resolved local tool set, from `resolve_local_tools`.
+                Pass it whenever `system_prompt` was assembled against a tool list: the
+                model is then handed the very definitions those names were projected off,
+                so prompt and tools cannot disagree (genetics-results-suite-4h6.77).
+                None resolves here instead, for callers that supply no tool-gated prompt.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -720,6 +762,7 @@ class LLMService:
                 literature_backend, tool_profile, secret, user, session_id,
                 user_instructions, message_id, capture_thinking,
                 gateway_asserted=gateway_asserted,
+                local_tools=local_tools,
             ):
                 yield chunk
         else:
@@ -796,6 +839,7 @@ class LLMService:
         message_id: str | None = None,
         capture_thinking: bool = False,
         gateway_asserted: bool = False,
+        local_tools: ResolvedLocalTools | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -871,14 +915,27 @@ class LLMService:
         # add tool definitions if enabled
         tool_definitions = None
         if enable_tools and settings.mcp_enabled:
-            disabled = self._disabled_tools()
-
-            # get local tools filtered by profile
-            tool_definitions = get_anthropic_tools(
-                custom_tool_descriptions,
-                tool_profile=tool_profile,
-                disabled_tools=disabled,
+            # the caller's resolution when it has one, so the tools the model gets are the
+            # same objects the system prompt's tool names were projected off; resolving
+            # here as well would be the second derivation 4h6.77 exists to delete
+            # supplying `local_tools` together with `custom_tool_descriptions` or a
+            # differing `enable_tools` is a CALLER ERROR: both are inputs to the
+            # resolution, and a caller that already resolved has consumed them. Neither
+            # diverges today, but both silently would:
+            #   - `custom_tool_descriptions` is read only on this fallback, so it is
+            #     dropped whenever `local_tools` is supplied (pre-4h6.77 it was always
+            #     applied here). Dormant: chat_api does not pass it, and nothing loads
+            #     those rows into the chat path at all (see routers/llm_config.py). If
+            #     they are ever wired in, `chat_api` must pass them to
+            #     `resolve_local_tools`, which already accepts them — NOT to `stream_chat`.
+            #   - same shape for `enable_tools`: resolving with False and then calling
+            #     `stream_chat(enable_tools=True, local_tools=...)` yields external+RAG
+            #     tools and zero local ones, where pre-4h6.77 it yielded the full local
+            #     set. Dormant: chat_api passes `request.enable_tools` to both.
+            resolved = local_tools if local_tools is not None else self.resolve_local_tools(
+                tool_profile, enable_tools, custom_tool_descriptions
             )
+            tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
 
             # always-on external tools (gnomAD, Open Targets) excluded in RAG profile, and

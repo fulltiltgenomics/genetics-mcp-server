@@ -1313,6 +1313,59 @@ on `bigquery` and `code`, which reach `credible_sets_v` and `hla_associations_v`
 Section headings follow the same rule — `## Data Sources and Resource Names` is its own ungated
 block, because a gated heading over an ungated body reparents the body under the section before it.
 
+**The gate matches tool NAMES, so guidance whose actionability rests on a PARAMETER or an output
+FIELD is invisible to it** (`genetics-results-suite-4h6.75`) — such a block names no tool, so it is
+emitted everywhere. Two were: the truncation remedy told surfaces with neither a `summarize`
+parameter nor a database to use both, and the `products` imperative told `code` to check a field
+only `list_datasets` returns. The remedy sentence is now split so each clause carries the gate for
+the capability it names — `_SUMMARIZE_PARAM_TOOLS` for `summarize=true`, `query_database` or
+`run_analysis` for the two ways of counting rows directly, and a generic "narrow the request"
+fallback where neither applies — and the `products` imperative is gated on the two routes that
+actually return the field, `list_datasets` and `run_analysis` (the SDK's `genetics.datasets()`
+delegates to the same executor method and the same `/v1/datasets` response, which carries
+`products` per dataset), with a further block naming that call on a surface that has only the SDK.
+The products-vs-`data_type` distinction stays ungated, being knowledge about the data rather than
+about a tool. `_SUMMARIZE_PARAM_TOOLS` is spelled out in `defaults.py` (importing
+`tools.definitions` at module scope would make `config` depend on `tools`) and is checked against
+the real input schemas by `tests/test_system_prompt.py`, so a parameter added to or dropped from a
+tool cannot leave the gate behind.
+
+**A prohibition is emitted with a route or not at all, and the route it names must be true on the
+surface that gets it** (`genetics-results-suite-4h6.76`). The "NEVER query the database for
+consequence / allele frequency / rsID / pathogenicity" block is gated on `query_database` or
+`run_analysis`, but the sentence naming where those annotations DO come from names
+`get_variant_annotations` and `get_myvariant_annotations` — so the text gate dropped the remedy on
+`bigquery` and on `code` and left the prohibition standing with no way out. Four variants now
+follow it, split by the two capabilities that differ across those surfaces — the sandbox, and
+`get_variant_protein_effect`, which returns a coding SNV's amino-acid change with its curated
+ClinVar significance, population frequency and rsID:
+
+- with the annotation tools (`None`, `api`) — pointed at `get_variant_annotations` /
+  `get_myvariant_annotations`;
+- with the sandbox and `get_variant_protein_effect` (`bigquery`) — pointed at
+  `genetics.variant_annotation(...)` for consequence/AF/gene and at `get_variant_protein_effect`
+  for a coding SNV's clinical annotation;
+- with the sandbox but no annotation tool at all (`code`, seven tools) — pointed at
+  `genetics.variant_annotation(...)`, and told that clinical significance and pathogenicity are
+  genuinely unavailable, which is true only there;
+- with `query_database` alone and `get_variant_protein_effect` (`bigquery` with
+  `SANDBOX_ENABLED=false`, what `chat-backend.yaml` declares today) — pointed at
+  `get_variant_protein_effect` for coding SNVs and told to say so for everything else.
+
+The blanket "there is no variant-annotation tool on this surface" wording survives only for a
+surface with `query_database`, no sandbox and no `get_variant_protein_effect` — no shipped profile
+today, so its test drives the assembly directly. Naming `get_variant_protein_effect` in the two
+bigquery-facing variants makes them self-gating under the text rule, which is exactly their
+precondition. All of this reasons about LOCAL tools: the always-on external MCP servers attached in
+`llm_service.py` (gnomAD, Open Targets) never appear in the prompt's tool list, so an annotation
+route they might add is not accounted for here.
+`TestTheAnnotationProhibitionAlwaysCarriesARoute` asserts exactly one of the routes is emitted
+wherever the prohibition is — and, in the other direction, that no rendered prompt tells the model
+to refuse something the same prompt documents a tool for — and `TestGuidanceKeyedOnAParameterOrAFieldIsGated` asserts
+each remedy clause reaches exactly the profiles whose tools can act on it — both read the rendered
+prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
+was changed.
+
 `tests/test_system_prompt.py` pins three properties across the `None`/`api`/`bigquery`/`rag`/`code`
 profiles with `ENABLE_SUBAGENTS` both true and false: **absence** (every tool name in the emitted
 prompt is in the resolved list, tokenising independently of the gate's own matcher), **presence**

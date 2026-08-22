@@ -430,9 +430,10 @@ async def list_resolved_tools(
     `/chat/v1/tools` above answers a different question — it returns TOOL_DEFINITIONS raw,
     with no profile filter, no feature flags, and neither the BigQuery nor the subagent
     definition list — so it cannot be used to check what an arm of a benchmark ran with.
-    This one resolves through `service.resolve_local_tool_names`, the SAME call the system
-    prompt is assembled from (genetics-results-suite-4h6.69), so what it reports is what the
-    model was handed.
+    This one resolves through `service.resolve_local_tool_names`, a one-line delegate to the
+    SAME derivation the system prompt is assembled from — the prompt takes its names from
+    `resolve_local_tools(...).names` (genetics-results-suite-4h6.69, -4h6.77) — so what it
+    reports is what the model was handed.
 
     IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `get_anthropic_tools` degrades an
     unrecognised profile to general-only rather than raising, deliberately, because the
@@ -581,12 +582,14 @@ async def stream_chat(
     # keeps the shared block cacheable across users and puts the envelope's guardrail
     # postamble last, where recency favours it.
     # assembled against the tool list THIS request will actually get, so the prompt never
-    # documents a tool the model was not given (genetics-results-suite-4h6.69). Resolution
-    # goes through the service rather than being recomputed here: one home for the
-    # profile + feature-flag + subagent-liveness filtering that also builds the tool list.
+    # documents a tool the model was not given (genetics-results-suite-4h6.69). The SAME
+    # resolved object is handed to stream_chat below, so the names the prompt is built
+    # from are projected off the very definitions the model receives — one derivation, not
+    # two that happen to agree (genetics-results-suite-4h6.77).
+    local_tools = service.resolve_local_tools(request.tool_profile, request.enable_tools)
     system_prompt = default_system_prompt(
         settings.app_name,
-        tool_names=service.resolve_local_tool_names(request.tool_profile, request.enable_tools),
+        tool_names=local_tools.names,
     )
     system_prompt += verbosity_prompt(request.verbosity)
     user_instructions = _resolve_user_instructions(
@@ -611,6 +614,7 @@ async def stream_chat(
                 message_id=request.message_id,
                 capture_thinking=request.capture_thinking,
                 gateway_asserted=gateway_asserted,
+                local_tools=local_tools,
             ):
                 if chunk.type == "text":
                     yield {
