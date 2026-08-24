@@ -1366,15 +1366,20 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` pins three properties across the `None`/`api`/`bigquery`/`rag`/`code`
-profiles with `ENABLE_SUBAGENTS` both true and false: **absence** (every tool name in the emitted
-prompt is in the resolved list, tokenising independently of the gate's own matcher), **presence**
+`tests/test_system_prompt.py` pins three properties across the
+`None`/`api`/`bigquery`/`rag`/`code`/`nocode` profiles (`nocode`, the `code` arm's
+comparator, was added to `PROFILES` by `genetics-results-suite-4h6.78`/`.79`), the first
+and the heading-body half of the third with `ENABLE_SUBAGENTS` both true and false:
+**absence** (every tool name in the emitted prompt is in the resolved list, tokenising
+independently of the gate's own matcher — independently on the algorithm, not on the
+normalisation: neither sees a plural or suffixed name, so `_Block`'s docstring tells prompt
+authors to name tools verbatim), **presence**
 (emitted headings pinned per profile, load-bearing science and grounding strings asserted present
 — absence-only assertions cannot see text going missing), and **structure** (no body line lands
 under a different heading than it has in the unfiltered text, no heading is emitted empty). It
 also asserts the `run_analysis` bullet is byte-identical across every arm that carries it, which
 is what makes the `code`-vs-baseline A/B a comparison of tools rather than of wording.
-A fourth property is deliberately NOT parametrised over the five profiles, because that is what
+A fourth property is deliberately NOT parametrised over the six profiles, because that is what
 missed the defect it guards: `TestEverySurfaceWithADataPathIsRouted` drives ~80 tool sets off the
 full list — every single-tool removal plus flag-shaped family removals and their pairs — and
 asserts each surface reaching data through `get_credible_sets_by_gene`, `query_database` or

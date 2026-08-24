@@ -36,8 +36,9 @@ ALL_TOOL_NAMES = frozenset(
 )
 
 # every profile the chat surface can be asked for. `None` is the deployed default (no
-# filtering at all); "code" is the A/B arm from genetics-results-suite-4h6.16.
-PROFILES = [None, "api", "bigquery", "rag", "code"]
+# filtering at all); "code" is the A/B arm from genetics-results-suite-4h6.16 and "nocode"
+# is the arm it is measured against, so both have to be exercised here.
+PROFILES = [None, "api", "bigquery", "rag", "code", "nocode"]
 
 
 def tool_names_mentioned(text: str) -> set[str]:
@@ -430,6 +431,24 @@ _EXPECTED_HEADINGS = {
         "## Choosing How to Get Data",
         *_SHARED_TAIL,
     ],
+    # the `code` arm's comparator: everything except the code trio, so it currently emits
+    # the same sections as the unfiltered prompt. Pinned separately anyway — the point of
+    # this dict is that a section disappearing from one arm is a decision, and the two
+    # lists coinciding today is a fact about the tool split, not something to rely on.
+    "nocode": [
+        "## Core Principles",
+        "## Analyzing data",
+        "## Tool Usage Guidelines",
+        "### Mouse Model Evidence (search_mgi)",
+        "## Variant Annotation Sources",
+        "### Functional / Regulatory Readouts",
+        "### HLA / the MHC region",
+        "### Protein Annotation (UniProt)",
+        "## Data Sources and Resource Names",
+        "### Pseudo Credible Sets",
+        "## Choosing How to Get Data",
+        *_SHARED_TAIL,
+    ],
 }
 
 # Domain science and grounding rules, with the surfaces that must carry each. These were
@@ -454,7 +473,10 @@ _REQUIRED_WITH_A_DATA_PATH = [
     "`pval` underflows to 0",
     "low **`info`** (imputation quality)",
 ]
-_WITH_A_DATA_PATH = [None, "api", "bigquery", "code"]
+# derived from tool resolution, not prompt text, so a profile gaining or losing a data-path
+# tool is picked up here without editing this list by hand — that hand-maintenance is what
+# let `nocode` (routed through both get_credible_sets_by_gene and query_database) go unwritten
+_WITH_A_DATA_PATH = [p for p in PROFILES if _DATA_PATH_TOOLS & resolve(p, subagents=False)]
 
 
 class TestLoadBearingTextIsPresent:
