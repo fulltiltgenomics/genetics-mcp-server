@@ -36,6 +36,7 @@ from genetics_mcp_server.mcp_proxy import (
 )
 from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import TOOL_PROFILE_TOOLS, ToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools.executor import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
 
@@ -429,7 +430,7 @@ def _truncation_notice(result: Any) -> str:
     """
     total = _count_result_items(result)
     scope = f"{total} total items" if total else "a larger result"
-    return (
+    notice = (
         f"\n\n[TRUNCATED: this is the beginning of {scope}, cut off mid-structure. "
         "The data is ORDERED, so the rows you cannot see are not a random sample -- entire "
         "categories (data types, resources, cell types, chromosomes) may be missing from the "
@@ -438,6 +439,23 @@ def _truncation_notice(result: Any) -> str:
         "(e.g. data_types, resource) or with summarize=true, or use the download link above "
         "for the complete data.]"
     )
+    if isinstance(result, dict) and result.get("artifacts_retained_in_clear") is True:
+        # RE-ATTACHED, because truncation must not be able to DELETE A SECURITY FIELD
+        # (genetics-results-suite-4h6.97). The prefix above is cut at a byte offset, and
+        # `output` in a run_analysis result is script-controlled up to 64 KiB — so a script
+        # that both provokes the retained-in-clear condition and prints ~50 KB would otherwise
+        # cut its own warning out of what the model reads, behind a generic "[TRUNCATED: ...]"
+        # that says nothing about a dropped field. `_render_analysis` also orders the field
+        # ahead of `output` for the same reason; that defence depends on json.dumps preserving
+        # insertion order, and this one does not, which is why both exist. `result` here is the
+        # WHOLE pre-truncation dict, so the flag is read from what the executor produced rather
+        # than from the surviving prefix.
+        notice += (
+            "\n\n[SECURITY NOTE PRESERVED THROUGH TRUNCATION: "
+            + ARTIFACTS_RETAINED_IN_CLEAR_NOTE
+            + "]"
+        )
+    return notice
 
 
 DOWNLOAD_FAILED_NOTE = (
@@ -1625,6 +1643,17 @@ class LLMService:
                 # the provenance of `user`, not a claim about it: a model that emitted this
                 # key is stripped above alongside the identity pair, for the same reason
                 tool_input["gateway_asserted"] = gateway_asserted
+
+            # read_artifact resolves a model-supplied NAME against the executions this SESSION
+            # ran (genetics-results-suite-4h6.52), so the session is the authorization and is
+            # injected the same way — stripped first, because the tool declares only `name`
+            # and tool_input is splatted verbatim. A model-supplied session_id would be a
+            # cross-session read of another conversation's artifacts.
+            if tool_name == "read_artifact":
+                tool_input = {
+                    k: v for k, v in tool_input.items() if k not in ("user", "session_id")
+                }
+                tool_input["session_id"] = session_id
 
             return await method(**tool_input)
 

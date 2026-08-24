@@ -9,15 +9,15 @@ transport — no live sandbox, no credentials.
 import asyncio
 import base64
 import inspect
-import os
-import signal
+import json
 
 import pytest
 from conftest import settings_env
 from fastapi import Request
 
 from genetics_mcp_server.config.settings import Settings
-from genetics_mcp_server.llm_service import _script_result_payload
+from genetics_mcp_server.llm_service import _script_result_payload, _truncation_notice
+from genetics_mcp_server.sandbox_client import ArtifactResult
 from genetics_mcp_server.tools import ToolExecutor
 from genetics_mcp_server.tools import executor as executor_module
 from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS, get_anthropic_tools
@@ -30,24 +30,12 @@ def executor():
     return ToolExecutor()
 
 
-@pytest.fixture
-def scratch(tmp_path, monkeypatch):
-    """A tmp stand-in for the hardcoded /scratch prefix an artifacts dir must sit under."""
-    root = os.path.realpath(tmp_path / "scratch")
-    os.makedirs(root, exist_ok=True)
-    monkeypatch.setattr(executor_module, "_ARTIFACTS_DIR_PREFIX", root + "/")
-    return root
-
-
-@pytest.fixture
-def artifacts(tmp_path, scratch, monkeypatch):
-    """A configured artifacts directory, plus a sibling nobody may reach from it."""
-    artifacts_dir = tmp_path / "scratch" / "exec-1" / "artifacts"
-    artifacts_dir.mkdir(parents=True)
-    (tmp_path / "scratch" / "exec-1" / "secret.txt").write_text("working files")
-    (tmp_path / "chat_history.db").write_text("crown jewels")
-    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(artifacts_dir))
-    return artifacts_dir
+@pytest.fixture(autouse=True)
+def _clean_manifest_registry():
+    """The sid -> execution map is process-wide state; no test may see another's rows."""
+    executor_module._ARTIFACT_MANIFESTS.clear()
+    yield
+    executor_module._ARTIFACT_MANIFESTS.clear()
 
 
 class TestToolDefinitions:
@@ -185,340 +173,352 @@ class TestListCapabilities:
         assert summaries["genetics"] not in (sdk.__doc__ or "")
 
 
-class TestReadArtifact:
-    async def test_refuses_when_no_artifacts_directory_is_configured(
-        self, executor, monkeypatch
-    ):
-        """chat-backend's own environment: nothing to read, and no local read attempted."""
-        monkeypatch.delenv("SANDBOX_ARTIFACTS_DIR", raising=False)
-        result = await executor.read_artifact(name="manhattan.png")
-        assert result["success"] is False
-        assert "not enabled" in result["error"]
+EXEC_A = "8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b"
+EXEC_B = "1c1c1c1c-2d2d-4e4e-8f8f-9a9a9a9a9a9a"
 
-    async def test_reads_a_text_artifact(self, executor, artifacts):
-        (artifacts / "hits.tsv").write_text("gene\tpip\nIL7R\t0.9\n")
-        result = await executor.read_artifact(name="hits.tsv")
+
+class _ArtifactSandbox:
+    """Stands in for SandboxClient's artifact half. Replays one outcome per (id, name)."""
+
+    def __init__(self, answers=None):
+        # (execution_id, name) -> ArtifactResult, or name -> ArtifactResult
+        self.answers = answers or {}
+        self.asked = []
+
+    async def get_artifact(self, execution_id, name):
+        self.asked.append((execution_id, name))
+        answer = self.answers.get((execution_id, name), self.answers.get(name))
+        if answer is None:
+            return ArtifactResult(ok=False, name=name, status_code=404, error_type="NotFound")
+        return answer
+
+    async def fetch_artifact(self, execution_id, name):
+        result = await self.get_artifact(execution_id, name)
+        if not result.ok or result.data is None:
+            return None
+        return {
+            "name": name,
+            "content_type": result.content_type,
+            "content_base64": result.content_base64,
+            "size": len(result.data),
+        }
+
+
+def _served(name, data, content_type=None):
+    return ArtifactResult(
+        ok=True,
+        name=name,
+        status_code=200,
+        content_type=content_type,
+        data=data,
+        content_base64=base64.b64encode(data).decode("ascii"),
+    )
+
+
+def _record(session_id, execution_id, *names):
+    executor_module._ARTIFACT_MANIFESTS.record(session_id, execution_id, names)
+
+
+class TestReadArtifactProxiesOverHTTP:
+    """genetics-results-suite-4h6.52. The read leaves this process; nothing local is opened."""
+
+    async def test_reads_a_text_artifact_of_this_session(self, executor):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rsid\tpval\n")})
+        executor._sandbox = sandbox
+
+        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
         assert result["success"] is True
-        assert result["content"] == "gene\tpip\nIL7R\t0.9\n"
         assert result["encoding"] == "utf-8"
+        assert result["content"] == "rsid\tpval\n"
+        assert result["size"] == 10
         assert result["truncated"] is False
-        assert result["content_type"] == "text/tab-separated-values"
+        assert sandbox.asked == [(EXEC_A, "hits.tsv")]
 
-    async def test_reads_a_binary_artifact_as_base64(self, executor, artifacts):
-        (artifacts / "manhattan.png").write_bytes(PNG_HEADER)
-        result = await executor.read_artifact(name="manhattan.png")
-        assert result["success"] is True
+    async def test_binary_comes_back_base64(self, executor):
+        _record("conv-9", EXEC_A, "manhattan.png")
+        executor._sandbox = _ArtifactSandbox(
+            {"manhattan.png": _served("manhattan.png", PNG_HEADER, "image/png")}
+        )
+        result = await executor.read_artifact(name="manhattan.png", session_id="conv-9")
         assert result["encoding"] == "base64"
-        assert result["content_type"] == "image/png"
         assert base64.b64decode(result["content"]) == PNG_HEADER
+        assert result["content_type"] == "image/png"
 
-    async def test_truncates_a_long_text_artifact_and_says_so(self, executor, artifacts):
-        (artifacts / "big.txt").write_text("x" * (ToolExecutor._MAX_ARTIFACT_TEXT_CHARS + 10))
-        result = await executor.read_artifact(name="big.txt")
-        assert result["truncated"] is True
-        assert len(result["content"]) == ToolExecutor._MAX_ARTIFACT_TEXT_CHARS
+    async def test_the_model_never_supplies_an_execution_id(self):
+        """The declared schema is one parameter. The id is resolved server-side or nowhere."""
+        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        params = by_name["read_artifact"]["parameters"]
+        assert set(params) == {"name"}
+        signature = inspect.signature(ToolExecutor.read_artifact)
+        assert signature.parameters["session_id"].kind is inspect.Parameter.KEYWORD_ONLY
 
-    async def test_refuses_an_oversized_artifact_rather_than_cutting_it(
-        self, executor, artifacts
-    ):
-        (artifacts / "huge.png").write_bytes(b"\x00" * (ToolExecutor._MAX_ARTIFACT_BYTES + 1))
-        result = await executor.read_artifact(name="huge.png")
+    async def test_no_local_filesystem_read_happens(self, executor, tmp_path, monkeypatch):
+        """The whole point of the change: chat-backend's own /data holds chat_history.db.
+
+        Pointing the old environment variable at a directory that HAS the name asked for must
+        produce nothing, because there is no reader left to point.
+        """
+        planted = tmp_path / "artifacts"
+        planted.mkdir()
+        (planted / "hits.tsv").write_text("crown jewels")
+        monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(planted))
+        monkeypatch.setenv("SUBAGENT_ALLOWED_PATHS", str(tmp_path))
+        executor._sandbox = _ArtifactSandbox()
+
+        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
         assert result["success"] is False
-        assert "read limit" in result["error"]
-
-    async def test_the_oversize_refusal_is_not_a_size_oracle(self, executor, artifacts):
-        """The refusal states the limit, never the file's own size."""
-        size = ToolExecutor._MAX_ARTIFACT_BYTES + 12345
-        (artifacts / "huge2.png").write_bytes(b"\x00" * size)
-        result = await executor.read_artifact(name="huge2.png")
-        assert result["success"] is False
-        assert str(size) not in result["error"]
-
-    async def test_missing_artifact(self, executor, artifacts):
-        result = await executor.read_artifact(name="nope.tsv")
-        assert result["success"] is False
-        assert result["error"] == "Artifact not found: nope.tsv"
-
-    async def test_directory_is_not_an_artifact(self, executor, artifacts):
-        (artifacts / "plots").mkdir()
-        result = await executor.read_artifact(name="plots")
-        assert result["success"] is False
-        assert "not found" in result["error"]
+        assert "crown jewels" not in str(result)
+        # nothing was even asked of the sandbox: the name resolves to no execution
+        assert executor._sandbox.asked == []
 
     @pytest.mark.parametrize(
         "name",
         [
             "../secret.txt",
-            "../../chat_history.db",
-            "..",
-            ".",
-            "sub/hits.tsv",
             "/etc/passwd",
-            "..\\secret.txt",
-            "hits.tsv\x00.png",
-            "",
-            "   ",
+            "sub/dir.txt",
+            "back\\slash.txt",
+            ".",
+            "..",
+            "  ",
+            "",  # the empty name, refused before the manifest lookup
+            "hits.tsv\x00.png",  # NUL truncation: the C-level name would be "hits.tsv"
+            "../../chat_history.db",  # the crown jewels, by the traversal that names them
         ],
     )
-    async def test_rejects_anything_that_is_not_a_bare_name(self, executor, artifacts, name):
-        result = await executor.read_artifact(name=name)
+    async def test_rejects_anything_that_is_not_a_bare_name(self, executor, name):
+        _record("conv-9", EXEC_A, name)
+        executor._sandbox = _ArtifactSandbox({name: _served(name, b"x")})
+        result = await executor.read_artifact(name=name, session_id="conv-9")
         assert result["success"] is False
-        assert result["error"].startswith(("Invalid artifact name", "An artifact name"))
+        assert executor._sandbox.asked == []
 
-    async def test_traversal_cannot_reach_the_execution_scratch_dir(
-        self, executor, artifacts
+
+class TestReadArtifactSessionScoping:
+    async def test_another_sessions_artifact_is_indistinguishable_from_a_missing_one(
+        self, executor
     ):
-        """The sibling file exists and is readable by the process; the tool still refuses."""
-        assert (artifacts.parent / "secret.txt").is_file()
-        result = await executor.read_artifact(name="../secret.txt")
-        assert result["success"] is False
-        assert "working files" not in str(result)
-
-    async def test_symlink_out_of_the_artifacts_dir_is_refused(self, executor, artifacts):
-        """The name is bare and the file exists; only _validate_path's resolve catches it.
-
-        A script can write whatever it likes into its own artifacts directory, symlinks
-        included, so the name check alone is not enough.
+        """Byte-for-byte the same answer, because "that name exists somewhere" is itself a
+        cross-session fact.
         """
-        (artifacts / "leak.txt").symlink_to(artifacts.parent.parent.parent / "chat_history.db")
-        result = await executor.read_artifact(name="leak.txt")
-        assert result["success"] is False
-        assert result["error"] == "Artifact not found: leak.txt"
-        assert "crown jewels" not in str(result)
+        _record("other-conv", EXEC_A, "secrets.tsv")
+        executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
 
-    async def test_does_not_read_subagent_allowed_paths(
-        self, executor, tmp_path, monkeypatch
+        theirs = await executor.read_artifact(name="secrets.tsv", session_id="conv-9")
+        never = await executor.read_artifact(name="no-such-file.tsv", session_id="conv-9")
+        assert theirs["success"] is False
+        assert theirs["error"].replace("secrets.tsv", "X") == never["error"].replace(
+            "no-such-file.tsv", "X"
+        )
+        assert theirs["error_type"] == never["error_type"] == "ArtifactNotFound"
+        assert executor._sandbox.asked == []
+
+    async def test_a_name_collision_resolves_to_the_most_recent_execution(self, executor):
+        _record("conv-9", EXEC_A, "manhattan.png")
+        _record("conv-9", EXEC_B, "manhattan.png")
+        executor._sandbox = _ArtifactSandbox(
+            {
+                (EXEC_A, "manhattan.png"): _served("manhattan.png", b"old"),
+                (EXEC_B, "manhattan.png"): _served("manhattan.png", b"new"),
+            }
+        )
+        result = await executor.read_artifact(name="manhattan.png", session_id="conv-9")
+        assert result["content"] == "new"
+        assert executor._sandbox.asked == [(EXEC_B, "manhattan.png")]
+
+    async def test_an_older_execution_still_answers_for_a_name_the_newer_one_lacks(
+        self, executor
     ):
-        """SUBAGENT_ALLOWED_PATHS is /data in the deployment; it must gain no new reader."""
-        monkeypatch.delenv("SANDBOX_ARTIFACTS_DIR", raising=False)
-        monkeypatch.setenv("SUBAGENT_ALLOWED_PATHS", str(tmp_path))
-        (tmp_path / "chat_history.db").write_text("crown jewels")
-        result = await executor.read_artifact(name="chat_history.db")
-        assert result["success"] is False
-        assert "crown jewels" not in str(result)
-
-    async def test_hardlink_to_an_outside_file_is_refused(self, executor, artifacts, tmp_path):
-        """A hardlink has nothing to resolve, so both path layers see an in-tree path.
-
-        The name is bare and the resolved path is inside the allow-list; only the link
-        count taken off the open fd tells the inode apart from a genuine artifact.
-        """
-        os.link(tmp_path / "chat_history.db", artifacts / "hard.db")
-        result = await executor.read_artifact(name="hard.db")
-        assert result["success"] is False
-        assert result["error"] == "Artifact not found: hard.db"
-        assert "crown jewels" not in str(result)
-
-    async def test_a_hardlinked_artifact_is_refused_even_inside_the_dir(
-        self, executor, artifacts
-    ):
-        """st_nlink != 1 is stated here rather than inherited from fs.protected_hardlinks."""
-        (artifacts / "hits.tsv").write_text("gene\tpip\n")
-        os.link(artifacts / "hits.tsv", artifacts / "alias.tsv")
-        result = await executor.read_artifact(name="alias.tsv")
-        assert result["success"] is False
-
-    async def test_the_read_opens_once_with_o_nofollow(self, executor, artifacts, monkeypatch):
-        """Every decision is taken off one fd; nothing is re-opened by path."""
-        (artifacts / "hits.tsv").write_text("gene\tpip\n")
-        calls = []
-        real_open = os.open
-
-        def recording_open(path, flags, *args, **kwargs):
-            calls.append((str(path), flags))
-            return real_open(path, flags, *args, **kwargs)
-
-        monkeypatch.setattr(os, "open", recording_open)
-        result = await executor.read_artifact(name="hits.tsv")
+        _record("conv-9", EXEC_A, "hits.tsv")
+        _record("conv-9", EXEC_B, "manhattan.png")
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
         assert result["success"] is True
-        artifact_opens = [c for c in calls if c[0].endswith("hits.tsv")]
-        assert len(artifact_opens) == 1
-        assert artifact_opens[0][1] & os.O_NOFOLLOW
+        assert executor._sandbox.asked == [(EXEC_A, "hits.tsv")]
 
-    async def test_a_swap_after_the_open_cannot_leak(
-        self, executor, artifacts, tmp_path, monkeypatch
-    ):
-        """TOCTOU: the script owns the directory and can swap the name mid-read.
+    async def test_a_call_with_no_session_reads_nothing(self, executor):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        result = await executor.read_artifact(name="hits.tsv", session_id=None)
+        assert result["success"] is False
+        assert executor._sandbox.asked == []
 
-        The swap is performed inside os.open, i.e. after the path-based layers have
-        resolved the name and before any byte is read. Whatever the outcome, the bytes
-        can only come from the fd that was opened, never from the symlink's target.
-        """
-        (artifacts / "hits.tsv").write_text("gene\tpip\n")
-        real_open = os.open
-        swapped = []
+    async def test_run_analysis_is_what_records_the_mapping(self, executor):
+        body = _result_body(
+            artifacts=[{"name": "hits.tsv", "size": 4, "content_type": "text/tab-separated-values"}]
+        )
+        sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        sandbox.result = body
+        sandbox.calls = []
 
-        def swapping_open(path, flags, *args, **kwargs):
-            fd = real_open(path, flags, *args, **kwargs)
-            if str(path).endswith("hits.tsv") and not swapped:
-                swapped.append(True)
-                decoy = artifacts / "decoy"
-                decoy.symlink_to(tmp_path / "chat_history.db")
-                os.replace(decoy, artifacts / "hits.tsv")
-            return fd
+        async def execute(**kwargs):
+            return body
 
-        monkeypatch.setattr(os, "open", swapping_open)
-        result = await executor.read_artifact(name="hits.tsv")
-        assert swapped
-        assert "crown jewels" not in str(result)
+        sandbox.execute = execute
+        executor._sandbox = sandbox
+        await executor.run_analysis(code="x", user="u@finngen.fi", session_id="conv-9")
 
-    async def test_the_file_is_opened_relative_to_the_directory_fd(
-        self, executor, artifacts, monkeypatch
-    ):
-        """Nothing is addressed by path after the directory check: the name is opened
-        against the verified dirfd, so an intermediate component cannot be swapped."""
-        (artifacts / "hits.tsv").write_text("gene\tpip\n")
-        calls = []
-        real_open = os.open
-
-        def recording_open(path, flags, *args, **kwargs):
-            calls.append((str(path), flags, kwargs.get("dir_fd")))
-            return real_open(path, flags, *args, **kwargs)
-
-        monkeypatch.setattr(os, "open", recording_open)
-        result = await executor.read_artifact(name="hits.tsv")
+        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
         assert result["success"] is True
-        dir_opens = [c for c in calls if c[1] & os.O_DIRECTORY]
-        assert len(dir_opens) == 1
-        assert dir_opens[0][1] & os.O_NOFOLLOW
-        # the bare name, resolved against a dir_fd — not an absolute path
-        artifact_opens = [c for c in calls if c[0] == "hits.tsv"]
-        assert len(artifact_opens) == 1
-        assert isinstance(artifact_opens[0][2], int)
-        assert artifact_opens[0][1] & os.O_NOFOLLOW
-        assert artifact_opens[0][1] & os.O_NONBLOCK
+        # ...and only for that session
+        assert (await executor.read_artifact(name="hits.tsv", session_id="conv-8"))[
+            "success"
+        ] is False
 
-    async def test_a_directory_swap_after_the_check_cannot_leak(
-        self, executor, artifacts, tmp_path, monkeypatch
-    ):
-        """TOCTOU one level up: the swapped component is the artifacts DIRECTORY.
 
-        O_NOFOLLOW guards only the final component and `_validate_path` resolves both
-        sides through the same swapped link, so both agree. Only holding the directory
-        open and resolving the name from that fd refuses this.
+class TestReadArtifactLifetime:
+    """The map must not outlive what it points at (RETENTION_S in sandbox/supervisor.py)."""
+
+    def test_the_ttl_matches_the_supervisors_retention(self):
+        assert executor_module.ARTIFACT_RETENTION_S == 300
+        assert executor_module._ArtifactManifests()._ttl_s == 300
+
+    async def test_a_row_expires_with_the_artifact_it_points_at(self, executor, monkeypatch):
+        registry = executor_module._ArtifactManifests(ttl_s=60)
+        monkeypatch.setattr(executor_module, "_ARTIFACT_MANIFESTS", registry)
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock["now"])
+
+        registry.record("conv-9", EXEC_A, ["hits.tsv"])
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        assert (await executor.read_artifact(name="hits.tsv", session_id="conv-9"))["success"]
+
+        clock["now"] += 61
+        expired = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        assert expired["success"] is False
+        assert expired["error_type"] == "ArtifactNotFound"
+
+    def test_the_map_is_bounded_in_both_dimensions(self):
+        registry = executor_module._ArtifactManifests()
+        for i in range(registry._MAX_SESSIONS + 50):
+            registry.record(f"conv-{i}", EXEC_A, ["a.txt"])
+        assert len(registry._sessions) == registry._MAX_SESSIONS
+        # the oldest sessions were dropped, the newest kept
+        assert "conv-0" not in registry._sessions
+        assert f"conv-{registry._MAX_SESSIONS + 49}" in registry._sessions
+
+        for i in range(registry._MAX_EXECUTIONS + 20):
+            registry.record("conv-x", f"{i:08d}-0000-4000-8000-000000000000", ["a.txt"])
+        assert len(registry._sessions["conv-x"]) == registry._MAX_EXECUTIONS
+
+    def test_nothing_persists_the_map(self):
+        """A persisted row would outlive both the artifacts and the supervisor-memory key
+        that decrypts them, promising reads that can only 404 or 409.
         """
-        real_open = os.open
-        swapped = []
+        source = inspect.getsource(executor_module._ArtifactManifests)
+        assert "sqlite" not in source.lower() and "open(" not in source
 
-        def swapping_open(path, flags, *args, **kwargs):
-            fd = real_open(path, flags, *args, **kwargs)
-            if flags & os.O_DIRECTORY and not swapped:
-                swapped.append(True)
-                os.rename(artifacts, artifacts.parent / "artifacts.orig")
-                os.symlink(tmp_path, artifacts)
-            return fd
 
-        monkeypatch.setattr(os, "open", swapping_open)
-        result = await executor.read_artifact(name="chat_history.db")
-        assert swapped
-        assert result["success"] is False
-        assert "crown jewels" not in str(result)
-
-    async def test_a_fifo_is_refused_without_blocking(self, executor, artifacts):
-        """O_RDONLY on a writerless FIFO blocks in the kernel before S_ISREG is reached.
-
-        A script can mkfifo any name in its own artifacts directory, so without O_NONBLOCK
-        one read_artifact call hangs the calling coroutine — and the chat backend with it —
-        forever. SIGALRM rather than asyncio.wait_for on purpose: the open blocks inside
-        the coroutine's own thread, so only a signal can break a regression out of it.
+class TestReadArtifactCaps:
+    def test_the_byte_cap_is_the_transports(self):
+        """4 MiB -> 512 KiB, a deliberate REDUCTION: the supervisor 413s above its own cap,
+        so a larger number here would only promise bytes the sandbox refuses.
         """
-        os.mkfifo(artifacts / "results.tsv")
+        from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
 
-        def _blew_the_deadline(signum, frame):
-            raise TimeoutError("read_artifact blocked on a FIFO")
+        assert ToolExecutor._MAX_ARTIFACT_BYTES == ARTIFACT_READ_MAX_BYTES == 512 * 1024
+        assert executor_module.ARTIFACT_READ_MAX_BYTES == ARTIFACT_READ_MAX_BYTES
 
-        previous = signal.signal(signal.SIGALRM, _blew_the_deadline)
-        signal.setitimer(signal.ITIMER_REAL, 5.0)
-        try:
-            result = await executor.read_artifact(name="results.tsv")
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, previous)
-
-        assert result["success"] is False
-        assert result["error"] == "Artifact not found: results.tsv"
-
-    async def test_the_reported_size_is_the_payload_not_the_stat(
-        self, executor, artifacts, monkeypatch
-    ):
-        """A file that grows between the fstat and the read must not report st_size."""
-        target = artifacts / "hits.tsv"
-        target.write_text("gene\tpip\n")
-        real_fstat = os.fstat
-
-        def growing_fstat(fd, *args, **kwargs):
-            st = real_fstat(fd, *args, **kwargs)
-            return os.stat_result(
-                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
-                 st.st_size + 1_000_000, st.st_atime, st.st_mtime, st.st_ctime)
-            )
-
-        monkeypatch.setattr(os, "fstat", growing_fstat)
-        result = await executor.read_artifact(name="hits.tsv")
-        assert result["success"] is True
-        assert result["size"] == len(result["content"])
-
-
-class TestArtifactsDirectoryChecks:
-    """`_artifacts_dir` fails closed before a name is looked at."""
-
-    def test_the_required_prefix_is_the_scratch_mount(self):
-        """Pinned so it cannot be widened into a path chat-backend actually has."""
-        assert executor_module._ARTIFACTS_DIR_PREFIX == "/scratch/"
-
-    async def test_a_symlinked_artifacts_dir_is_refused(
-        self, executor, scratch, tmp_path, monkeypatch
-    ):
-        """_validate_path resolves both sides, so a symlinked root validates everything.
-
-        The child uid owns /scratch/<id>, so it can rmdir its artifacts directory and
-        relink it at another execution's retained artifacts.
+    async def test_long_text_is_still_truncated_at_the_character_cap(self, executor):
+        """Survives the move because it bounds the MODEL'S CONTEXT, which no transport cap
+        does: 512 KiB of TSV is well over 100k tokens in one tool result.
         """
-        other = tmp_path / "scratch" / "exec-2" / "artifacts"
-        other.mkdir(parents=True)
-        (other / "chat_history.db").write_text("crown jewels")
-        linked = tmp_path / "scratch" / "exec-1-artifacts"
-        linked.symlink_to(other)
-        monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(linked))
+        _record("conv-9", EXEC_A, "big.txt")
+        payload = ("x" * (ToolExecutor._MAX_ARTIFACT_TEXT_CHARS + 500)).encode()
+        executor._sandbox = _ArtifactSandbox({"big.txt": _served("big.txt", payload)})
+        result = await executor.read_artifact(name="big.txt", session_id="conv-9")
+        assert result["truncated"] is True
+        assert len(result["content"]) == ToolExecutor._MAX_ARTIFACT_TEXT_CHARS
+        assert result["size"] == len(payload)
 
-        result = await executor.read_artifact(name="chat_history.db")
+    async def test_a_413_tells_the_model_to_write_a_smaller_file(self, executor):
+        _record("conv-9", EXEC_A, "huge.bin")
+        executor._sandbox = _ArtifactSandbox(
+            {
+                "huge.bin": ArtifactResult(
+                    ok=False, name="huge.bin", status_code=413, error_type="ArtifactTooLarge"
+                )
+            }
+        )
+        result = await executor.read_artifact(name="huge.bin", session_id="conv-9")
+        assert result["error_type"] == "ArtifactTooLarge"
+        assert result["retryable"] is False
+        assert str(ToolExecutor._MAX_ARTIFACT_BYTES) in result["error"]
+
+
+class TestReadArtifactErrorMapping:
+    """409 and 413 reach this tool for the first time; neither may read as a generic failure."""
+
+    async def test_a_409_is_reported_as_a_modified_artifact_and_is_not_retryable(self, executor):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox(
+            {
+                "hits.tsv": ArtifactResult(
+                    ok=False, name="hits.tsv", status_code=409, error_type="ArtifactModified"
+                )
+            }
+        )
+        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
         assert result["success"] is False
-        assert "not enabled" in result["error"]
-        assert "crown jewels" not in str(result)
+        assert result["error_type"] == "ArtifactModified"
+        assert result["retryable"] is False
+        assert "re-run" in result["error"].lower()
+        assert "not found" not in result["error"].lower()
 
-    async def test_an_artifacts_dir_outside_the_prefix_is_refused(
-        self, executor, scratch, tmp_path, monkeypatch
-    ):
-        """chat-backend has no /scratch volume, so SANDBOX_ARTIFACTS_DIR=/data is inert."""
-        data = tmp_path / "data"
-        data.mkdir()
-        (data / "chat_history.db").write_text("crown jewels")
-        monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(data))
+    async def test_a_404_from_the_sandbox_says_the_window_may_have_passed(self, executor):
+        _record("conv-9", EXEC_A, "gone.tsv")
+        executor._sandbox = _ArtifactSandbox()
+        result = await executor.read_artifact(name="gone.tsv", session_id="conv-9")
+        assert result["error_type"] == "ArtifactNotFound"
+        assert result["retryable"] is False
 
-        result = await executor.read_artifact(name="chat_history.db")
-        assert result["success"] is False
-        assert "not enabled" in result["error"]
-        assert "crown jewels" not in str(result)
+    async def test_an_unreachable_sandbox_is_retryable_and_not_a_missing_name(self, executor):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox(
+            {
+                "hits.tsv": ArtifactResult(
+                    ok=False, name="hits.tsv", error_type="SandboxUnreachable"
+                )
+            }
+        )
+        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        assert result["error_type"] == "ArtifactUnavailable"
+        assert result["retryable"] is True
 
-    async def test_a_prefix_lookalike_directory_is_refused(
-        self, executor, scratch, tmp_path, monkeypatch
-    ):
-        """/scratchpad must not pass a check meant for /scratch/."""
-        lookalike = tmp_path / "scratchpad"
-        lookalike.mkdir()
-        (lookalike / "chat_history.db").write_text("crown jewels")
-        monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(lookalike))
+    async def test_a_malformed_200_body_is_not_retryable(self):
+        """A 200 the client could not parse is DETERMINISTIC: the same id and name produce the
+        same body, so re-asking spends a model roundtrip on something that cannot succeed. This
+        tool has no total budget above it the way run_analysis has its 300s wait_for.
+        """
+        from genetics_mcp_server.sandbox_client import ERROR_MALFORMED_RESPONSE
 
-        result = await executor.read_artifact(name="chat_history.db")
-        assert result["success"] is False
-        assert "not enabled" in result["error"]
+        executor = ToolExecutor()
+        result = executor._artifact_error(
+            "hits.tsv",
+            ArtifactResult(
+                ok=False, name="hits.tsv", status_code=200,
+                error_type=ERROR_MALFORMED_RESPONSE,
+            ),
+        )
+        assert result["error_type"] == "ArtifactUnavailable"
+        assert result["retryable"] is False
+        assert "Do not retry" in result["error"]
 
+    async def test_a_locally_rejected_execution_id_is_not_retryable(self):
+        """The client's own pre-flight refused the id and issued NO request, so a retry
+        re-rejects the identical id. It is our bug, not the model's, so it gets the
+        indistinguishable not-found wording rather than a description of our internals.
+        """
+        from genetics_mcp_server.sandbox_client import ERROR_BAD_EXECUTION_ID
 
-# --------------------------------------------------------------------------- run_analysis
-# genetics-results-suite-4h6.48. The tool layer over sandbox_client (4h6.47). Everything
-# below runs with NO sandbox and NO credentials: the transport is either a stub `execute`
-# or httpx.MockTransport, and the one test that needs a signing key is the one asserting
-# what happens when there isn't one.
+        executor = ToolExecutor()
+        result = executor._artifact_error(
+            "hits.tsv",
+            ArtifactResult(ok=False, name="hits.tsv", error_type=ERROR_BAD_EXECUTION_ID),
+        )
+        assert result["error_type"] == "ArtifactNotFound"
+        assert result["retryable"] is False
 
 
 class _StubSandbox:
@@ -595,15 +595,15 @@ class TestRunAnalysisDefinition:
         # cannot vouch for its own caller
         assert "gateway_asserted" not in params
 
-    def test_does_not_promise_artifact_contents(self):
-        """The HTTP retrieval path is 4h6.52 and does not exist; read_artifact in this
-        process reads a local directory that is not the sandbox's /scratch. Telling the
-        model it can fetch a plot costs a roundtrip to find out it cannot.
+    def test_points_at_the_retrieval_path_that_now_exists(self):
+        """genetics-results-suite-4h6.52 built it. The description said the opposite while
+        the tool read a local directory that was never the sandbox's /scratch; saying so now
+        would cost the model the retrieval it is entitled to.
         """
         by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
         description = by_name["run_analysis"]["description"]
-        assert "CANNOT BE RETRIEVED" in description
-        assert "read_artifact" not in description
+        assert "read_artifact" in description
+        assert "CANNOT BE RETRIEVED" not in description
 
     def test_reaches_the_chat_tool_list_when_the_sandbox_is_enabled(self):
         """Registered unconditionally; it is `disabled_tools` that withholds it, so the
@@ -910,12 +910,13 @@ class TestRunAnalysisRendering:
         ]
         assert "/scratch/" not in str(result)
 
-    async def test_the_manifest_says_the_contents_cannot_be_fetched(self, executor):
+    async def test_the_manifest_says_how_to_read_the_contents(self, executor):
         body = _result_body(
             artifacts=[{"name": "plot.png", "size": 10, "content_type": "image/png"}]
         )
         result = await _run(executor, _StubSandbox(result=body))
-        assert "cannot be retrieved" in result["artifacts_note"]
+        assert "read_artifact" in result["artifacts_note"]
+        assert "5 minutes" in result["artifacts_note"]
 
 
 def _image(name="plot.png", content_type="image/png", data="aW1hZ2UtYnl0ZXM="):
@@ -954,9 +955,9 @@ class TestRunAnalysisImages:
         result = await _run(executor, sandbox)
 
         assert [name for _, name in sandbox.fetched] == ["plot.png"]
-        # the note has to say BOTH things: the plot is shown, the csv still has to be printed
+        # the note has to say BOTH things: the plot is shown, the csv is read by name
         assert "displayed to the user" in result["artifacts_note"]
-        assert "cannot be retrieved" in result["artifacts_note"]
+        assert "read_artifact" in result["artifacts_note"]
 
     async def test_an_oversize_image_is_not_even_requested(self, executor):
         from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
@@ -994,7 +995,9 @@ class TestRunAnalysisImages:
         assert result["success"] is True
         assert result["output"] == "rows: 12\n"
         assert "images" not in result
-        assert "cannot be retrieved" in result["artifacts_note"]
+        # the note still points at read_artifact: this failure was the automatic IMAGE fetch,
+        # and the by-name read may well succeed on a later attempt
+        assert "read_artifact" in result["artifacts_note"]
 
     async def test_a_failed_run_fetches_nothing(self, executor):
         """A killed script's artifacts/ has been trimmed and the run has no picture to show;
@@ -1483,3 +1486,119 @@ def test_script_result_payload_marks_a_sandbox_fault_as_not_run(executor):
 
     # ...whereas anything the supervisor itself answered carries a status, so it did run
     assert _script_result_payload(1, executor._render_analysis({"status": "error"}))["ran"] is True
+
+
+class TestReadArtifactSessionInjection:
+    """The session is the authorization, so it is injected exactly the way run_analysis's is."""
+
+    @staticmethod
+    async def _dispatch(executor, tool_input, session_id="conv-9"):
+        from genetics_mcp_server.llm_service import LLMService
+
+        service = LLMService.__new__(LLMService)
+        service.executor = executor
+        service.subagent_service = None
+        return await service._execute_tool(
+            "read_artifact", tool_input, None, "u@finngen.fi", session_id, False
+        )
+
+    async def test_the_authenticated_session_is_injected(self, executor):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        result = await self._dispatch(executor, {"name": "hits.tsv"})
+        assert result["success"] is True
+
+    async def test_a_model_supplied_session_cannot_reach_another_conversation(self, executor):
+        """tool_input is splatted verbatim, so an unstripped key would be a cross-session read
+        of somebody else's artifacts — the same forgery the run_analysis strip exists for.
+        """
+        _record("other-conv", EXEC_A, "secrets.tsv")
+        executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
+        result = await self._dispatch(
+            executor, {"name": "secrets.tsv", "session_id": "other-conv", "user": "x@y.z"}
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "ArtifactNotFound"
+        assert executor._sandbox.asked == []
+
+
+class TestArtifactsRetainedInClear:
+    """genetics-results-suite-4h6.97: the supervisor's exposure signal must reach the model.
+
+    Rendered only when true, matching artifacts_omitted — a field that is false on every run
+    is noise the model learns to skip past, and this one is adversarial-only in practice.
+    """
+
+    async def test_absent_on_an_ordinary_run(self, executor):
+        result = await _run(executor, _StubSandbox(result=_result_body()))
+        assert "artifacts_retained_in_clear" not in result
+        assert "artifacts_retained_in_clear_note" not in result
+
+    async def test_absent_when_the_supervisor_says_false(self, executor):
+        body = _result_body(artifacts_retained_in_clear=False)
+        result = await _run(executor, _StubSandbox(result=body))
+        assert "artifacts_retained_in_clear" not in result
+
+    async def test_rendered_with_actionable_wording_when_true(self, executor):
+        body = _result_body(artifacts_retained_in_clear=True)
+        result = await _run(executor, _StubSandbox(result=body))
+        assert result["artifacts_retained_in_clear"] is True
+        note = result["artifacts_retained_in_clear_note"]
+        # the honest framing: the exposure is to other code in the sandbox, not to this user,
+        # so the model is told to report a cleanup failure rather than to alarm the user about
+        # their own data
+        assert "other code" in note
+        assert "mention to the user" in note
+        assert result["success"] is True
+
+    async def test_it_is_not_folded_into_artifacts_omitted(self, executor):
+        """Omission is recoverable and says nothing about exposure; conflating them is the
+        whole reason the supervisor keeps them separate.
+        """
+        body = _result_body(artifacts_retained_in_clear=True, artifacts_omitted=0)
+        result = await _run(executor, _StubSandbox(result=body))
+        assert "artifacts_omitted" not in result
+        assert result["artifacts_retained_in_clear"] is True
+
+    async def test_a_non_boolean_is_not_treated_as_the_signal(self, executor):
+        body = _result_body(artifacts_retained_in_clear="yes")
+        result = await _run(executor, _StubSandbox(result=body))
+        assert "artifacts_retained_in_clear" not in result
+
+    async def test_a_large_output_cannot_truncate_the_signal_away(self, executor):
+        """genetics-results-suite-4h6.97: the ANALYSED SCRIPT must not be able to delete it.
+
+        llm_service cuts a serialised tool result over `mcp_max_result_size` (50,000) to a
+        PREFIX, and `output` is script-controlled up to the supervisor's 64 KiB cap. Measured
+        before the fix, with the flag rendered seventh and after `output`: a 66,569-byte result
+        truncated at 50,000 contained NEITHER the flag NOR the note — so a script that both
+        provoked the condition (chmod artifacts/) and printed ~50 KB suppressed its own
+        warning, behind a generic "[TRUNCATED: ...]" that says nothing about a dropped field.
+
+        Both defences are asserted here because they are independent: the field is now ordered
+        AHEAD of `output` (survives the prefix), and `_truncation_notice` re-states the note
+        from the whole pre-truncation dict (survives any ordering).
+        """
+        body = _result_body(
+            artifacts_retained_in_clear=True,
+            output="x" * 64 * 1024,
+            output_truncated=True,
+        )
+        result = await _run(executor, _StubSandbox(result=body))
+        result_json = json.dumps(result)
+        limit = Settings().mcp_max_result_size
+        assert len(result_json) > limit
+
+        # exactly llm_service._execute_tool's truncation
+        truncated = result_json[: limit - 1000] + _truncation_notice(result)
+
+        assert "artifacts_retained_in_clear" in truncated
+        assert "other code running in the sandbox" in truncated
+        # the notice half on its own, so removing the re-attachment fails this even while the
+        # ordering half still carries the note inside the prefix
+        assert "other code running in the sandbox" in _truncation_notice(result)
+        # and the ordering half specifically: the flag is inside the surviving PREFIX, not only
+        # in the appended notice
+        prefix = result_json[: limit - 1000]
+        assert "artifacts_retained_in_clear" in prefix
+        assert prefix.index("artifacts_retained_in_clear") < prefix.index('"output"')

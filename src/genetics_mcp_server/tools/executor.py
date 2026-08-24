@@ -9,10 +9,11 @@ import logging
 import mimetypes
 import os
 import re
-import stat
 import threading
+import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -389,14 +390,139 @@ def _seg(value: Any) -> str:
 # generic error message returned to clients
 INTERNAL_ERROR_MSG = "Internal server error. Check server logs for details."
 
-# SANDBOX_ARTIFACTS_DIR must resolve under this prefix or read_artifact refuses. Without it
-# the only thing between this code and behaviour docs/code-execution-security.md forbids is
-# an env var staying unset: read_artifact is registered in the chat backend, so setting
-# SANDBOX_ARTIFACTS_DIR=/data there would make chat_history.db and llm_config.db readable
-# and base64'd back to the model. chat-backend has no /scratch volume and never will, so
-# hardcoding the prefix makes that misconfiguration unreachable rather than merely unmade.
-# Tests patch this to a temp path; nothing else may.
-_ARTIFACTS_DIR_PREFIX = "/scratch/"
+# Mirrors ARTIFACT_READ_MAX_BYTES in genetics_mcp_server.sandbox_client, which mirrors
+# sandbox/supervisor.py. Duplicated rather than imported ON PURPOSE: this module is imported
+# by the standalone MCP server, and tests/test_mcp_server.py asserts in a subprocess that
+# importing it does not pull sandbox_client into sys.modules. tests/test_code_execution_tools.py
+# asserts the two numbers are equal, so the copy cannot drift silently.
+ARTIFACT_READ_MAX_BYTES = 512 * 1024
+
+# sandbox/supervisor.py's RETENTION_S. THIS IS A LIFETIME, NOT A POLICY KNOB: the supervisor
+# deletes /scratch/<id>/artifacts this many seconds after an execution completes, and the
+# per-execution key that decrypts a sealed artifact lives only in that process's memory. So
+# nothing chat-backend records about an execution can be worth more than this — a longer-lived
+# record would promise reads that can only come back 404 or 409.
+ARTIFACT_RETENTION_S = 300
+
+
+class _ArtifactManifests:
+    """`sid` -> the artifacts each of that session's recent executions reported writing.
+
+    THE AUTHORIZATION STATE FOR `read_artifact` (genetics-results-suite-4h6.52). `run_analysis`
+    records a completed execution's manifest here against the AUTHENTICATED session; the tool
+    resolves a model-supplied NAME against it and can address nothing else. A name recorded
+    under another `sid` is not merely refused, it is invisible: `resolve` looks in one session's
+    rows and returns `None` for everything else, which is the same answer a name that never
+    existed gets.
+
+    IN MEMORY, WITH A TTL MATCHED TO THE SUPERVISOR'S RETENTION, AND DELIBERATELY NOT
+    PERSISTED. The thing this maps to is deleted by the supervisor `ARTIFACT_RETENTION_S`
+    after completion, and its decryption key is held in the supervisor's process memory only,
+    so a row that outlives either — across a restart of this process, or of the sandbox — points
+    at bytes nobody can serve. Persisting the map would buy nothing but a longer window in which
+    `read_artifact` promises a read that ends in a 404 or a 409. Expiring with the artifacts
+    keeps the two sides failing together. `chat-backend` is `replicas: 1` (k8s/deployments/
+    chat-backend.yaml), the same premise db-api's per-execution byte counter and results-api's
+    sandbox budget already run on, so there is no second process to disagree with.
+
+    BOUNDED, because this is per-process state fed by user activity: at most `_MAX_SESSIONS`
+    sessions (LRU by last write) and `_MAX_EXECUTIONS` executions within each. NEITHER BOUND IS
+    ABOVE WHAT THE RETENTION WINDOW CAN HOLD, and the earlier claim that both were ("an
+    execution takes tens of seconds") was false for the scripts that actually run: a trivial
+    script completes in well under a second, so one session can in principle stack ~600
+    executions into a 300 s window. These are MEMORY bounds, but the dominant term is row
+    SIZE, not row COUNT: `record()` puts no cap of its own on a row's name set, which is
+    bounded only by the supervisor's `ARTIFACT_ENTRY_BUDGET = 1024` (sandbox/supervisor.py)
+    x NAME_MAX 255 -- a worst-case row of 328.4 KiB against a typical 487 bytes. The naive
+    512 x 128 x 328.4 KiB product is ~20.5 GiB against chat-backend's `limits.memory: 2Gi`
+    (k8s/deployments/chat-backend.yaml); that is unreachable rather than a live risk, since
+    filling it needs 65,536 executions inside one 300 s TTL through a single serialized
+    sandbox, so the real worst case is throughput-bounded and one session sitting at the cap
+    costs 41 MiB. (The OLD cap of 16 already produced 2.57 GiB on this same naive product, so
+    16 -> 128 did not cross a threshold that 16 was on the safe side of -- `_MAX_EXECUTIONS`
+    was never the binding term.) These are a chosen, benign failure mode, not backstops
+    against a leak:
+
+      * `_MAX_EXECUTIONS = 128` is sized off measurement, not off the window: the epic's
+        benchmark turns reach 58 tool calls, so 128 artifact-producing executions inside one
+        retention window leaves better than 2x headroom over anything observed. Past it the
+        OLDEST row is evicted while its artifacts may still be on the sandbox's disk, and a
+        read of one of those names answers ArtifactNotFound — non-retryable, worded "re-run the
+        script if you need it again", which is the correct instruction for that state. That is
+        the trade: a bounded map, and a legitimate read can 404 in a session that ran more than
+        128 artifact-producing analyses in five minutes.
+      * `_MAX_SESSIONS = 512` is an LRU cap on concurrently active chat sessions, evicted by
+        last write. Rows also expire with the retention window on every `record`/`resolve`, so
+        this only binds when more than 512 sessions are live at once in one replica.
+    """
+
+    _MAX_SESSIONS = 512
+    _MAX_EXECUTIONS = 128
+
+    def __init__(self, ttl_s: float = ARTIFACT_RETENTION_S) -> None:
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+        # sid -> list of (recorded_at, execution_id, {names}), oldest first
+        self._sessions: OrderedDict[str, list[tuple[float, str, set[str]]]] = OrderedDict()
+
+    def record(self, session_id: str, execution_id: str, names: Iterable[str]) -> None:
+        wanted = {n for n in names if isinstance(n, str) and n}
+        if not session_id or not execution_id or not wanted:
+            return
+        now = time.monotonic()
+        with self._lock:
+            rows = self._sessions.get(session_id)
+            if rows is None:
+                rows = []
+                self._sessions[session_id] = rows
+            rows.append((now, execution_id, wanted))
+            # if _MAX_EXECUTIONS is ever set to 0 this is a no-op (rows[:-0] == rows[:0]),
+            # so the trim silently stops trimming; correct at 128, nothing sets it to 0 today
+            del rows[: -self._MAX_EXECUTIONS]
+            self._sessions.move_to_end(session_id)
+            self._expire(now)
+            while len(self._sessions) > self._MAX_SESSIONS:
+                self._sessions.popitem(last=False)
+
+    def resolve(self, session_id: str, name: str) -> str | None:
+        """The execution this session's `name` refers to, or None.
+
+        MOST RECENT WINS. Two executions in one session can both write `manhattan.png`, and the
+        model is asking about the one it was just told about; a stale-first rule would quietly
+        hand back a previous turn's plot under the right name, which is a wrong answer rather
+        than a loud failure.
+        """
+        if not session_id or not name:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            self._expire(now)
+            rows = self._sessions.get(session_id)
+            if not rows:
+                return None
+            for _, execution_id, names in reversed(rows):
+                if name in names:
+                    return execution_id
+        return None
+
+    def _expire(self, now: float) -> None:
+        """Caller holds the lock. Drop rows past the retention window, then empty sessions."""
+        cutoff = now - self._ttl_s
+        for session_id in list(self._sessions):
+            rows = [row for row in self._sessions[session_id] if row[0] > cutoff]
+            if rows:
+                self._sessions[session_id] = rows
+            else:
+                del self._sessions[session_id]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._sessions.clear()
+
+
+# process-wide rather than per-ToolExecutor: the recording call and the resolving call are two
+# different chat turns, and nothing guarantees they are served by the same executor instance
+_ARTIFACT_MANIFESTS = _ArtifactManifests()
 
 # returned when an upstream service (genetics API / BigQuery db) can't be connected to,
 # as opposed to a genuine internal error — lets callers and the UI show something actionable
@@ -453,6 +579,26 @@ class _ResilientAsyncClient(httpx.AsyncClient):
                 headers={_UNREACHABLE_HEADER: "1"},
                 request=httpx.Request(method, url),
             )
+
+
+ARTIFACTS_RETAINED_IN_CLEAR_NOTE = (
+    "The sandbox could not remove this run's output files from its shared scratch "
+    "space, so they remain readable there by other code running in the sandbox "
+    "until they are reaped. Nothing about YOUR data was disclosed to the user's "
+    "detriment by this alone, and the analysis result above still stands — but "
+    "mention to the user that the run's output files could not be cleaned up, do "
+    "not re-read these artifacts as trusted input, and re-run the analysis if a "
+    "conclusion depends on their exact contents."
+)
+"""MODULE-LEVEL BECAUSE llm_service RE-ATTACHES IT AFTER TRUNCATION (4h6.97 round 2).
+
+A tool result over `mcp_max_result_size` is cut to a PREFIX, and `output` is script-
+controlled and can be 64 KiB — so a script that both provokes the retained-in-clear
+condition and prints ~50 KB deletes the warning from what the model reads. Ordering in
+`_render_analysis` puts the field ahead of `output`, and `_truncation_notice` re-states it
+from this constant; the two defences are independent on purpose, because the first relies
+on JSON serialisation order and the second does not.
+"""
 
 
 class ToolExecutor:
@@ -5525,143 +5671,48 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
-    # a read over 4 MiB is not something a chat turn can use; a truncated PNG is garbage
-    # rather than a short answer, so oversized binaries are refused instead of cut
-    _MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+    # THE CAP IS THE TRANSPORT'S, NOT THIS LAYER'S (genetics-results-suite-4h6.52). It used
+    # to be 4 MiB, chosen for a local read that no longer exists: every read now goes over
+    # `GET /artifact`, and the supervisor answers 413 above ARTIFACT_READ_MAX_BYTES, so a
+    # larger number here would only promise the model bytes the sandbox will refuse. This is
+    # a REDUCTION in what `read_artifact` can return — 4 MiB -> 512 KiB — and it is the same
+    # ceiling `_fetch_analysis_images` has always skipped oversize images against. A truncated
+    # PNG is garbage rather than a short answer, so an oversized binary is refused, not cut.
+    _MAX_ARTIFACT_BYTES = ARTIFACT_READ_MAX_BYTES
+
+    # ...but text is still truncated, and the two bounds are not the same bound. The byte cap
+    # is about the wire; this one is about the MODEL'S CONTEXT, which no transport limit
+    # protects — 512 KiB of TSV is well over 100k tokens dropped into one tool result. It
+    # survived the move for that reason, and it is the only cap of the two that a caller can
+    # act on: `truncated: true` tells the model to have the script summarise instead.
     _MAX_ARTIFACT_TEXT_CHARS = 100_000
 
-    @staticmethod
-    def _artifacts_dir() -> str:
-        """The single directory `read_artifact` may read, or "" when there is none.
+    async def read_artifact(self, name: str, *, session_id: str | None = None) -> dict[str, Any]:
+        """Read one artifact of THIS CHAT SESSION'S recent runs, over HTTP from the sandbox.
 
-        This is the allow-list, and it is deliberately its own variable: the obvious
-        alternative, SUBAGENT_ALLOWED_PATHS, is `/data` in the deployment — the PVC
-        holding chat_history.db and llm_config.db — so wiring artifact reads to it would
-        hand the model every conversation in the deployment. It is never read here.
+        `name` is a bare file name, never a path and never an execution id: the model learns
+        names from a run's artifact manifest, and nothing else is addressable. `session_id` is
+        supplied by the CALLER (llm_service injects the authenticated session, and strips any
+        same-named key the model emitted); the declared schema has one parameter, `name`.
 
-        Only the process that owns the scratch directory sets SANDBOX_ARTIFACTS_DIR. In
-        chat-backend it is unset, so this method refuses; retrieval there goes over HTTP
-        to the sandbox pod, which is where the filesystem read and the validation below
-        happen (genetics-results-suite docs/code-execution-security.md, section 6). The
-        Neither the HTTP client nor the session-scoped name resolution exists yet:
-        genetics-results-suite-4h6.52 owns both. Earlier comments named 4h6.11, which was
-        the SDK extraction and closed without doing either — do not read its closed state
-        as evidence the proxy is in place.
+        RESOLUTION IS SERVER-SIDE AND IS THE AUTHORIZATION. The name is resolved against
+        `_ARTIFACT_MANIFESTS`, which `run_analysis` populates with what each execution of this
+        `sid` reported producing. An artifact belonging to another session resolves to nothing
+        and returns the SAME "not found" as a name that never existed — the two are
+        deliberately indistinguishable, because knowing that a name exists somewhere is
+        already a cross-session fact. Within one `sid`, a name that two executions both
+        produced resolves to the most recently completed one still inside the retention
+        window (`_ARTIFACT_MANIFESTS.resolve`).
 
-        Two structural checks, both of which fail closed to "" (= not enabled):
-
-        - the configured directory may not itself be a symlink. `_validate_path` resolves
-          both sides, so a symlinked allow-list root makes *every* file under its target
-          validate. This is reachable, not merely operator error: /scratch/<id> is chown'd
-          to the child uid (code-execution-security.md section 2), so the child can rmdir
-          its `artifacts` and relink it at another execution's retained artifacts — the
-          cross-session channel section 6.4 exists to prevent.
-        - the resolved directory must sit under _ARTIFACTS_DIR_PREFIX.
-
-        Both are advisory: they answer about a PATH, and the answer is stale the moment it
-        returns, because the child owns /scratch/<id> and can swap `artifacts` for a
-        symlink between this check and the open. `_open_artifacts_dir` is the enforcing
-        layer — it checks an open descriptor instead.
+        NO LOCAL FILESYSTEM READ HAPPENS HERE, and that is the point of the change rather
+        than an implementation detail. This process is chat-backend, whose `/data` PVC holds
+        `chat_history.db` and `llm_config.db`; the descriptor-based checks that used to guard
+        a local read (`O_NOFOLLOW` on the directory and on the file, `/proc/self/fd`
+        verification, `S_ISREG`, `st_nlink == 1`) now run INSIDE THE SANDBOX in
+        `read_artifact_bytes`, against `/scratch/<id>/artifacts` — where the hostile party
+        actually is. `SANDBOX_ARTIFACTS_DIR` gains no reader here and neither does
+        `SUBAGENT_ALLOWED_PATHS`.
         """
-        configured = os.environ.get("SANDBOX_ARTIFACTS_DIR", "").strip()
-        if not configured:
-            return ""
-        try:
-            if stat.S_ISLNK(os.lstat(configured).st_mode):
-                logger.error("SANDBOX_ARTIFACTS_DIR is a symlink; refusing artifact reads")
-                return ""
-            resolved = os.path.realpath(configured)
-        except OSError:
-            return ""
-        prefix = _ARTIFACTS_DIR_PREFIX.rstrip("/") + "/"
-        if not resolved.startswith(prefix):
-            logger.error("SANDBOX_ARTIFACTS_DIR is outside %s; refusing artifact reads", prefix)
-            return ""
-        return resolved
-
-    @staticmethod
-    def _open_artifacts_dir() -> int | None:
-        """Open the artifacts directory and verify the DESCRIPTOR, not the path.
-
-        `_artifacts_dir` hands back a path string, and every subsequent use of that string
-        re-walks the directory chain — so the `artifacts` component, which the child uid
-        owns, can be rmdir'd and relinked at another execution's artifacts (or anywhere)
-        after the check passed and before the file is opened. `_validate_path` cannot see
-        it either: it resolves both sides through the same swapped link, so both land on
-        the attacker's target and it agrees.
-
-        So the directory is opened once, with O_NOFOLLOW (the configured name itself may
-        not be a symlink) and O_DIRECTORY, and the prefix check is then made against
-        /proc/self/fd/<dirfd> — the kernel's own name for the inode this fd holds, not a
-        name re-resolved through whatever the directory chain says now. The caller opens
-        the artifact relative to this fd, so a later swap changes a name the read no longer
-        uses. Fails closed to None; the caller must close the fd.
-        """
-        configured = os.environ.get("SANDBOX_ARTIFACTS_DIR", "").strip()
-        if not configured:
-            return None
-        try:
-            dirfd = os.open(configured, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except OSError:
-            return None
-        try:
-            actual = os.readlink(f"/proc/self/fd/{dirfd}")
-        except OSError:
-            # no /proc, or the fd names nothing checkable: there is no way to verify the
-            # descriptor, so there is no read
-            os.close(dirfd)
-            return None
-        prefix = _ARTIFACTS_DIR_PREFIX.rstrip("/") + "/"
-        # " (deleted)" is how the kernel renders an unlinked directory's fd; the path it
-        # prints then describes where the inode used to be, so it proves nothing
-        if not actual.startswith(prefix) or actual.endswith(" (deleted)"):
-            logger.error("artifacts directory fd is outside %s; refusing artifact reads", prefix)
-            os.close(dirfd)
-            return None
-        return dirfd
-
-    async def read_artifact(self, name: str) -> dict[str, Any]:
-        """Read one named file out of the directory named by SANDBOX_ARTIFACTS_DIR.
-
-        Cross-execution scoping is NOT implemented here: there is no session or execution
-        parameter, so which execution's artifacts are reachable rests entirely on that env
-        var pointing at the right directory. Resolving a name against a session belongs to
-        genetics-results-suite-4h6.52 and is NOT implemented anywhere today; until it lands
-        this tool reads whatever directory it is pointed at (subject to `_artifacts_dir`'s
-        structural checks).
-
-        `name` is a bare file name, never a path and never an execution id: the model
-        learns names from the run's artifact manifest, and nothing else is addressable.
-        Validation is layered on purpose, and the layers are not equal. The name check
-        (separators, traversal) and `_validate_path`'s resolved-path check are advisory:
-        both answer about a path, and a script owns the directory, so it can swap either
-        the final component or the `artifacts` directory itself between the check and the
-        read. The enforcing layer is a pair of descriptors — the directory is opened once
-        and verified as an fd (`_open_artifacts_dir`), the artifact is opened *relative to
-        that fd* with O_NOFOLLOW, and every decision after that (regular file, link count,
-        bytes) is taken from that one fd's fstat. After `_open_artifacts_dir` returns,
-        nothing here addresses anything by path again.
-
-        O_NONBLOCK is on the file open because O_RDONLY on a FIFO with no writer blocks in
-        the kernel, before S_ISREG is ever reached — a script that does
-        `os.mkfifo(artifacts/results.tsv)` would otherwise hang the calling coroutine (and
-        so the chat backend) forever. It is inert for regular files, which are all that
-        survives the S_ISREG check.
-
-        Known and accepted: a refusal caused by `_validate_path` returns measurably faster
-        than one caused by the open, so a caller can tell that a name IT planted resolves
-        out of tree. A dangling symlink takes the same fast path, so this is not an
-        existence oracle for anything the caller did not create.
-        """
-        from genetics_mcp_server.skills.sandbox_tools import _validate_path
-
-        artifacts_dir = self._artifacts_dir()
-        if not artifacts_dir:
-            return {
-                "success": False,
-                "error": "Code execution is not enabled here, so there are no artifacts to read.",
-            }
-
         if not isinstance(name, str) or not name.strip():
             return {"success": False, "error": "An artifact name is required."}
         name = name.strip()
@@ -5681,101 +5732,153 @@ class ToolExecutor:
                 ),
             }
 
-        not_found = {"success": False, "error": f"Artifact not found: {name}"}
-        path = os.path.join(artifacts_dir, name)
-        try:
-            # belt and braces: catches a resolved path outside the allow-list before any
-            # open, but its answer is advisory — the fd below is the enforcing layer.
-            # OSError from resolve() is folded in here so it cannot escape carrying the
-            # absolute path in its message
-            _validate_path(path, [artifacts_dir])
-        except (ValueError, OSError):
-            # the same answer as a missing file: which names exist outside the allow-list
-            # is not something a caller gets to learn by probing
+        not_found = {
+            "success": False,
+            "error": (
+                f"Artifact not found: {name}. Artifacts are readable only from analyses run "
+                f"in this conversation, and only for about {ARTIFACT_RETENTION_S // 60} "
+                f"minutes after the run finishes. Re-run the script if you need it again."
+            ),
+            "error_type": "ArtifactNotFound",
+            "retryable": False,
+        }
+
+        if not session_id:
+            # a wiring fault, not a model error: nothing dispatches this tool without a
+            # session today (it is excluded from MCP and from every subagent skill), so
+            # reaching here means a new caller forgot the injection
+            logger.error("read_artifact called with no session; refusing the read")
             return not_found
 
-        dirfd = self._open_artifacts_dir()
-        if dirfd is None:
-            # the directory passed _artifacts_dir a moment ago and does not verify now:
-            # that is either a swap in progress or a teardown, and neither gets an answer
+        execution_id = _ARTIFACT_MANIFESTS.resolve(session_id, name)
+        if execution_id is None:
             return not_found
 
-        try:
-            try:
-                fd = os.open(
-                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dirfd
-                )
-            except OSError:
-                # includes ELOOP: O_NOFOLLOW refuses a symlink at the final component,
-                # which is the swap a script can perform after _validate_path resolved the
-                # name. Resolution starts at dirfd, so the directory cannot be swapped out
-                # from under it either
-                return not_found
+        result = await self._sandbox.get_artifact(execution_id, name)
+        if not result.ok or result.data is None:
+            return self._artifact_error(name, result)
 
-            try:
-                st = os.fstat(fd)
-                if not stat.S_ISREG(st.st_mode):
-                    # FIFOs and devices land here rather than in a blocked open, thanks to
-                    # O_NONBLOCK above
-                    return not_found
-                if st.st_nlink != 1:
-                    # a hardlink has nothing to resolve, so both path layers see an in-tree
-                    # path over an out-of-tree inode. Refusing st_nlink != 1 states the
-                    # property here instead of inheriting it from fs.protected_hardlinks
-                    return not_found
-                if st.st_size > self._MAX_ARTIFACT_BYTES:
-                    return {
-                        "success": False,
-                        # no byte count: an exact size would answer questions about files
-                        # the caller cannot read
-                        "error": (
-                            f"Artifact '{name}' is over the {self._MAX_ARTIFACT_BYTES} byte "
-                            f"read limit. Write a smaller summary from the script instead."
-                        ),
-                    }
-                chunks: list[bytes] = []
-                remaining = self._MAX_ARTIFACT_BYTES
-                while remaining > 0:
-                    chunk = os.read(fd, min(remaining, 1 << 20))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                raw = b"".join(chunks)
-            except OSError as e:
-                logger.error(f"Error reading artifact {name!r}: {e}")
-                return not_found
-            finally:
-                os.close(fd)
-        finally:
-            os.close(dirfd)
-
-        # the size at open can disagree with what was read if the file grew mid-read, so
-        # report the payload rather than the stat
-        size = len(raw)
-
-        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        raw = result.data
+        content_type = result.content_type or (
+            mimetypes.guess_type(name)[0] or "application/octet-stream"
+        )
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             return {
                 "success": True,
                 "name": name,
-                "size": size,
+                "size": len(raw),
                 "content_type": content_type,
                 "encoding": "base64",
-                "content": base64.b64encode(raw).decode("ascii"),
+                "content": result.content_base64,
             }
 
         truncated = len(text) > self._MAX_ARTIFACT_TEXT_CHARS
         return {
             "success": True,
             "name": name,
-            "size": size,
+            "size": len(raw),
             "content_type": content_type,
             "encoding": "utf-8",
             "content": text[: self._MAX_ARTIFACT_TEXT_CHARS],
             "truncated": truncated,
+        }
+
+    def _artifact_error(self, name: str, result: Any) -> dict[str, Any]:
+        """Turn a failed `GET /artifact` into something the model can act on.
+
+        TWO OF THESE STATUSES ARE NEW TO THIS TOOL and neither may arrive as a generic
+        failure. `409 ArtifactModified` is the supervisor refusing to serve bytes that no
+        longer match the manifest it advertised — a same-uid peer rewrote or replaced the file
+        during retention (`4h6.82`/`4h6.88`). It is NOT a transient error and re-asking cannot
+        fix it, so it is reported as non-retryable with the one repair that works: run the
+        analysis again. `413` is now reachable at 512 KiB rather than 4 MiB, and its answer is
+        for the script to write a smaller summary, not for the model to retry the read.
+
+        `retryable` MEANS "A SECOND ASK COULD PLAUSIBLY SUCCEED", and only a transport-level
+        fault qualifies. A malformed 200 body and an execution_id the client itself refused are
+        both DETERMINISTIC — the same body comes back, or the same id is refused again with no
+        request issued — so they are non-retryable even though both look like server-side
+        faults. There is no total budget above this tool, unlike `run_analysis`'s 300s
+        `wait_for`, so a retryable answer here is retried on the model's judgement alone.
+        """
+        from genetics_mcp_server.sandbox_client import (
+            ERROR_BAD_EXECUTION_ID,
+            ERROR_MALFORMED_RESPONSE,
+        )
+
+        status = getattr(result, "status_code", None)
+        error_type = getattr(result, "error_type", None)
+        if status == 409 or error_type == "ArtifactModified":
+            logger.error("sandbox refused artifact %r as modified", name)
+            return {
+                "success": False,
+                "error": (
+                    f"Artifact '{name}' could not be served because its contents no longer "
+                    f"match what the run reported writing, so the sandbox refuses it. Do not "
+                    f"retry the read — re-run the analysis to produce the file again, and "
+                    f"tell the user the earlier output could not be trusted."
+                ),
+                "error_type": "ArtifactModified",
+                "retryable": False,
+            }
+        if status == 413 or error_type == "ArtifactTooLarge":
+            return {
+                "success": False,
+                "error": (
+                    f"Artifact '{name}' is over the {self._MAX_ARTIFACT_BYTES} byte read "
+                    f"limit. Re-run the analysis and have the script print or write a smaller "
+                    f"summary instead."
+                ),
+                "error_type": "ArtifactTooLarge",
+                "retryable": False,
+            }
+        if status in (404, 400) or error_type == ERROR_BAD_EXECUTION_ID:
+            # 400 means the supervisor rejected the execution_id WE resolved, which is our
+            # bug, not the model's; it gets the same answer as a missing name rather than a
+            # description of our internals. ERROR_BAD_EXECUTION_ID is the same fault caught one
+            # hop earlier — the client's own pre-flight refused the id and issued NO request —
+            # so it belongs here rather than in the retryable fallback below: there is no
+            # request to repeat and re-asking would re-reject the identical id
+            # (genetics-results-suite-4h6.52).
+            return {
+                "success": False,
+                "error": (
+                    f"Artifact not found: {name}. It may already have passed the "
+                    f"{ARTIFACT_RETENTION_S // 60}-minute retention window."
+                ),
+                "error_type": "ArtifactNotFound",
+                "retryable": False,
+            }
+        if error_type == ERROR_MALFORMED_RESPONSE:
+            # A 200 WITH AN UNUSABLE BODY IS DETERMINISTIC, not transient: the supervisor
+            # answered, and the same execution_id and name will produce the same body. Marking
+            # it retryable spent model roundtrips on a re-ask that cannot succeed, and this
+            # tool has no total budget above it the way run_analysis has its 300s wait_for
+            # (genetics-results-suite-4h6.52).
+            logger.error("artifact %r came back as a malformed 200 body", name)
+            return {
+                "success": False,
+                "error": (
+                    f"Artifact '{name}' could not be read: the analysis sandbox answered with "
+                    f"a response this server could not parse. Do not retry the read — it will "
+                    f"return the same thing. Re-run the analysis if you need the file."
+                ),
+                "error_type": "ArtifactUnavailable",
+                "retryable": False,
+            }
+        logger.warning(
+            "artifact %r could not be read: status=%s type=%s", name, status, error_type
+        )
+        return {
+            "success": False,
+            "error": (
+                f"Artifact '{name}' could not be read from the analysis sandbox. This is a "
+                f"server-side fault rather than a problem with the name."
+            ),
+            "error_type": "ArtifactUnavailable",
+            "retryable": True,
         }
 
     # The whole chat turn's budget for one run_analysis call, across every retry the client
@@ -6064,7 +6167,34 @@ class ToolExecutor:
                 "retryable": True,
             }
 
+        self._record_artifact_manifest(result, session_id)
         return self._render_analysis(result, images=await self._fetch_analysis_images(result))
+
+    @staticmethod
+    def _record_artifact_manifest(result: dict[str, Any], session_id: str | None) -> None:
+        """Bind what this execution wrote to the session that ran it, for `read_artifact`.
+
+        THE ONLY PLACE THE (sid, execution_id) PAIR EXISTS. `execution_id` is minted per call
+        and deliberately never shown to the model, so this is the last point at which the two
+        halves are both in scope; without the record there is nothing for a name to resolve
+        against and `read_artifact` can only 404.
+
+        Recorded for a FAILED status too, when the supervisor still reported a manifest: a
+        script that raised after writing its plot has produced a real, retained artifact, and
+        the manifest is what the supervisor is willing to serve either way.
+        """
+        if not session_id or not isinstance(result, dict):
+            return
+        execution_id = result.get("execution_id")
+        entries = result.get("artifacts")
+        if not isinstance(execution_id, str) or not isinstance(entries, list):
+            return
+        names = [
+            entry["name"]
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]
+        ]
+        _ARTIFACT_MANIFESTS.record(session_id, execution_id, names)
 
     # How many image artifacts one script may have shown for it. A script that writes fifty
     # PNGs is not asking for fifty pictures in the transcript, and each one is a fetch the
@@ -6076,8 +6206,9 @@ class ToolExecutor:
 
         Automatic rather than a tool the model calls: an image is for the USER to look at,
         and routing it through the model would cost a roundtrip to fetch something the model
-        cannot see anyway. Everything else in `artifacts/` still has to be printed by the
-        script — this is not general artifact retrieval (`genetics-results-suite-4h6.52`).
+        cannot see anyway. `read_artifact` is the general retrieval path for everything else
+        and now goes through the SAME client method (`SandboxClient.get_artifact`) with the
+        same cap, so the two readers cannot drift apart again.
 
         `execution_id` comes from the supervisor's own echoed response and is used here and
         nowhere else; `_render_analysis` still keeps it out of what the model reads.
@@ -6162,13 +6293,42 @@ class ToolExecutor:
                     }
                 )
 
-        rendered: dict[str, Any] = {
-            "success": ok,
-            "status": status_text,
-            "output": result.get("output") if isinstance(result.get("output"), str) else "",
-            "output_truncated": bool(result.get("output_truncated")),
-            "artifacts": artifacts,
-        }
+        rendered: dict[str, Any] = {"success": ok, "status": status_text}
+        if result.get("artifacts_retained_in_clear") is True:
+            # BEFORE `output`, DELIBERATELY, and this is a security ordering rather than a
+            # cosmetic one (genetics-results-suite-4h6.97). llm_service truncates a serialised
+            # tool result over `mcp_max_result_size` to a PREFIX, and `output` is
+            # SCRIPT-CONTROLLED up to the supervisor's 64 KiB cap — so with this field after
+            # it, a script that both provokes the condition and prints ~50 KB cuts the warning
+            # out of what the model reads. MEASURED before the move: a 66,569-byte result
+            # truncated at 50,000 contained neither the flag nor the note. Placing it here
+            # makes that impossible for any output size, since json.dumps preserves insertion
+            # order. It is belt-and-braces with `_truncation_notice`, which re-states the note
+            # from ARTIFACTS_RETAINED_IN_CLEAR_NOTE without depending on ordering at all.
+            #
+            # RENDERED ONLY WHEN TRUE, the same shape `artifacts_omitted` uses: the ordinary
+            # case is every run, and a field that is false on every run is noise the model
+            # learns to skip past.
+            #
+            # WHAT IT MEANS, AND WHO IT IS FOR. The supervisor sets it when the seal pass could
+            # NEITHER encrypt NOR delete this execution's outputs, so they sit in plaintext on
+            # a /scratch that every process at the shared uid can read until the reaper removes
+            # the directory. The primary audience is the OPERATOR and that half already works
+            # (`LOG.error` in the supervisor, and it is adversarial-only in practice — a
+            # same-uid peer chmod-ing artifacts/, not ENOSPC).
+            #
+            # SO THE MODEL'S JOB IS NARROW, AND THE WORDING SAYS SO. The exposure is to OTHER
+            # TENANTS' CODE, not to this user — the user's own artifacts are theirs to see, and
+            # telling them "your results may be compromised" would be wrong on both halves.
+            # What the model can honestly do is (a) say the outputs could not be removed from
+            # shared scratch, and (b) not treat the artifacts as trustworthy inputs to a
+            # further conclusion, because bytes readable by a peer are also writable by one —
+            # which is the same condition `read_artifact`'s 409 exists to catch.
+            rendered["artifacts_retained_in_clear"] = True
+            rendered["artifacts_retained_in_clear_note"] = ARTIFACTS_RETAINED_IN_CLEAR_NOTE
+        rendered["output"] = result.get("output") if isinstance(result.get("output"), str) else ""
+        rendered["output_truncated"] = bool(result.get("output_truncated"))
+        rendered["artifacts"] = artifacts
         duration_ms = result.get("duration_ms")
         if isinstance(duration_ms, int) and not isinstance(duration_ms, bool):
             rendered["duration_ms"] = duration_ms
@@ -6184,32 +6344,30 @@ class ToolExecutor:
         if artifacts:
             # said once, here, rather than left to the model to infer from the manifest.
             # Images are fetched automatically (see `_fetch_analysis_images`); everything else
-            # still has no retrieval path — `genetics-results-suite-4h6.52` owns general
-            # artifact reads, and `read_artifact` in this process reads a local directory that
-            # is not the sandbox's /scratch. Promising a fetch that returns "not enabled here"
-            # costs a roundtrip.
+            # is now readable with `read_artifact` by NAME, resolved against this session
+            # (`genetics-results-suite-4h6.52`). The retention window is stated because it is
+            # short and because the model cannot discover it any other way.
             shown = {
                 image["name"]
                 for image in images or []
                 if isinstance(image, dict) and isinstance(image.get("name"), str)
             }
-            unretrievable = [entry["name"] for entry in artifacts if entry["name"] not in shown]
+            readable = [entry["name"] for entry in artifacts if entry["name"] not in shown]
+            note = ""
             if shown:
-                rendered["artifacts_note"] = (
+                note = (
                     "Image artifacts have been displayed to the user already; describe what "
                     "the plot shows rather than emitting a placeholder or a markdown image."
                 )
-                if unretrievable:
-                    rendered["artifacts_note"] += (
-                        " The contents of the other artifacts cannot be retrieved — print "
-                        "anything from the script that you need to read."
-                    )
-            else:
-                rendered["artifacts_note"] = (
-                    "Artifact contents cannot be retrieved. Print anything from the script "
-                    "that you need to read. An image artifact would have been shown to the "
-                    "user automatically."
+            if readable:
+                note += (
+                    f"{' ' if note else ''}Read any other artifact with read_artifact, passing "
+                    f"its name from this manifest — it is available for about "
+                    f"{ARTIFACT_RETENTION_S // 60} minutes and only from this conversation. "
+                    f"Large files come back truncated, so prefer printing a summary from the "
+                    f"script when you only need a few numbers."
                 )
+            rendered["artifacts_note"] = note
 
         if not ok:
             rendered.update(self._analysis_error_fields(result, status_text))

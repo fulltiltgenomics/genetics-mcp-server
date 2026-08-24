@@ -230,7 +230,7 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 ### Code execution tools
 
 Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
-not deployed, so `read_artifact` has nothing to read in any running service — and
+not deployed, so `read_artifact` has nothing to reach in any running service — and
 **`run_analysis` is withheld entirely until `SANDBOX_ENABLED` is true**
 (`genetics-results-suite-4h6.56`). The flag is a deployment fact, not a preference: with
 no sandbox at `SANDBOX_URL` the transport fails as `SandboxUnavailable` with
@@ -257,9 +257,9 @@ because a withheld tool is a deployment fact and must not read as a passing outa
 
 | Tool | Description |
 |------|-------------|
-| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed but unreadable. Chat-backend only; not registered on the MCP server at all |
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
 | `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`). Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
-| `read_artifact` | Read one named file from **this process's local artifacts directory** (`SANDBOX_ARTIFACTS_DIR`). Takes a bare artifact **name** — never a path, never an execution id. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over 4 MiB is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Its description states outright that it **cannot** retrieve a `run_analysis` artifact, matching that tool's `artifacts_note` — the sandbox's `GET /artifact` route exists but this tool does not use it, and the model cannot reach it at all. Chat-backend only — excluded from MCP server |
+| `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated `session_id`; another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
 **All three are category `orchestration`**, not `general`: they hand work to another
 runtime rather than fetching data, which is what `launch_subagents` is. The category by
@@ -289,11 +289,13 @@ by-name case, and that a declared tool still dispatches.
 
 `sandbox_client.execute` returns the supervisor's 200 body **unchanged**; the handler
 rebuilds it field by field into `success` / `status` / `output` / `output_truncated` /
-`artifacts` (+ `duration_ms`, `artifacts_omitted`), and on a non-`ok` status adds
-`error`, `error_type`, `traceback`, `limit_exceeded` and a `hint`. Two reasons for the
-rebuild, and neither is that the contract's field set is closed — it is not, an unknown
-`status` renders as itself and counts as not-ok, and an unrecognised `error.type` is a
-label to display rather than something switched on:
+`artifacts` / `artifacts_note`, and on a non-`ok` status adds `error`, `error_type`,
+`traceback`, `limit_exceeded` and a `hint`. Three fields are rendered **only when they say
+something**: `duration_ms` when the supervisor reported one, `artifacts_omitted` when it is
+greater than zero, and `artifacts_retained_in_clear` (plus the note that goes with it) when
+it is `true`. Two reasons for the rebuild, and neither is that the contract's field set is
+closed — it is not, an unknown `status` renders as itself and counts as not-ok, and an
+unrecognised `error.type` is a label to display rather than something switched on:
 
 - **`execution_id` must not reach the model.** It is the join key for the audit trail and
   for the manifest chat-backend records against the `jti`/`sid`; putting it in context
@@ -318,13 +320,29 @@ before the dict is serialised into the `tool_result`** — base64 in context is 
 something the model cannot see. The `execution_id` used for the fetch comes from the
 supervisor's own echoed response and is still kept out of everything the model reads.
 
-Every **other** artifact's contents remain unretrievable, and `run_analysis`'s description,
-its `artifacts_note` and `read_artifact`'s description all say so. `read_artifact` is
-unchanged and does **not** use the new route: it reads a local directory in this process that
-is not the sandbox's `/scratch`, and `SANDBOX_ARTIFACTS_DIR` is set nowhere in the deployment.
-General artifact reads and the sid-scoped resolution are still
-`genetics-results-suite-4h6.52`. A model told it can fetch a table spends a roundtrip finding
-out it cannot.
+Every **other** artifact is read back by name with `read_artifact`, which
+`genetics-results-suite-4h6.52` turned into a proxy over the same route. Both readers now go
+through one client method, `SandboxClient.get_artifact`, so the 512 KiB cap and the decode are
+stated once; before that the tool read a local directory in this process that was never the
+sandbox's `/scratch`, and the two disagreed on the cap. `read_artifact`'s **byte** ceiling
+therefore dropped from 4 MiB to the transport's 512 KiB — a reduction, and the honest one,
+because the supervisor answers `413` above its own cap. The 100k-character **text**
+truncation survived the move: it bounds the model's context, which no transport cap does.
+
+**The name is resolved server-side against the session, and nothing else is addressable.**
+`run_analysis` records each completed execution's manifest in `_ArtifactManifests`
+(`tools/executor.py`) against the **authenticated** `session_id`; `llm_service._execute_tool`
+injects that session into `read_artifact` the same way it injects the identity into
+`run_analysis`, stripping any same-named key the model emitted, and the declared schema still
+has exactly one parameter, `name`. A name recorded under another session resolves to nothing
+and returns the **same** "not found" as a name that never existed. Within one session a
+collision resolves to the most recently completed execution that produced the name. The map
+is **in memory, bounded (512 sessions × 128 executions) and expires at the supervisor's
+300-second `RETENTION_S`** — persisting it would outlive both the artifacts and the
+supervisor-memory key that decrypts them, promising reads that can only come back `404` or
+`409`. `409 ArtifactModified` (a same-uid peer altered the file during retention) is surfaced
+as its own non-retryable error telling the model to re-run rather than re-read; `413` tells it
+to write a smaller file.
 
 **The SDK is importable as `genetics`, which is what everything already called it.** The
 package is `genetics_mcp_server.sdk`; the sandbox image installs a `sys.modules` alias
@@ -483,65 +501,45 @@ already appear in MCP tool descriptions, so they are not new disclosure. The dat
 holding them is never named anywhere this server emits — SQL leaves here unqualified and
 db-api resolves it against its own `DATASET_ID` — so there is nothing to disclose.
 
-**Where the artifact read happens**: `read_artifact` reads the single directory named by
-`SANDBOX_ARTIFACTS_DIR`, and returns "code execution is not enabled" when it is unset —
-which is everywhere today. Chat-backend never sets it; retrieval there proxies over HTTP
-to the sandbox pod, where the filesystem read happens — except that **no such client exists**:
-`genetics-results-suite-4h6.52` owns that proxy hop and the session-scoped name resolution, and
-neither is implemented. Earlier drafts named `4h6.11`, which was the SDK extraction and closed
-without doing either. The allow-list is its own variable on purpose: the
-obvious alternative, `SUBAGENT_ALLOWED_PATHS`, is `/data` in the deployment — the PVC
-holding `chat_history.db` and `llm_config.db` — so wiring artifact reads to it would hand
-the model every conversation in the deployment.
+**Where the artifact read happens**: **inside the sandbox pod, never in this process**
+(`genetics-results-suite-4h6.52`). `read_artifact` issues `GET /artifact` through
+`SandboxClient.get_artifact` and opens nothing locally. That is the whole point rather than an
+implementation detail: this process is chat-backend, whose `/data` PVC holds `chat_history.db`
+and `llm_config.db`, and the obvious allow-list an implementer reaches for —
+`SUBAGENT_ALLOWED_PATHS` — is exactly `/data` in the deployment. It gains no reader here, and
+neither does `SANDBOX_ARTIFACTS_DIR`, whose local reader (and the `_ARTIFACTS_DIR_PREFIX`
+guard around it) was removed when the proxy landed.
 
-Two structural checks fail closed to "not enabled" before any name is looked at, both in
-`_artifacts_dir()`. Both are **advisory**: they answer about a path string, and the answer
-is stale the moment it returns (see the descriptor check below).
+The structural checks did not disappear, they **moved to where the hostile party is**. The
+sandbox's `read_artifact_bytes` opens `/scratch/<id>/artifacts` with
+`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`, opens the artifact as a bare name **relative to that
+fd** with `O_NOFOLLOW | O_NONBLOCK`, and takes the regular-file and link-count decisions off
+that one descriptor — plus two things the local reader never had: the name must appear in the
+digest map the manifest was built from (so a **planted** file is a `404` before it is opened)
+and the bytes must still hash to what they hashed to then (so an **altered** one is a `409`).
+See `genetics-results-suite/docs/code-execution-security.md` §6.
 
-- **the configured directory may not itself be a symlink** (`lstat` + `S_ISLNK`).
-  `_validate_path` resolves both sides, so a symlinked allow-list root makes every file
-  under its target validate. The child uid owns `/scratch/<id>`, so it can `rmdir` its
-  `artifacts` and relink it at another execution's retained artifacts — the cross-session
-  channel the suite's `docs/code-execution-security.md` section 6.4 exists to prevent.
-- **the resolved directory must sit under the hardcoded `_ARTIFACTS_DIR_PREFIX`
-  (`/scratch/`)**. `read_artifact` is registered in the chat backend, so without this the
-  only thing preventing `SANDBOX_ARTIFACTS_DIR=/data` from base64'ing `chat_history.db`
-  back to the model is that nobody sets it. chat-backend has no `/scratch` volume, so the
-  misconfiguration is unreachable rather than merely unmade.
+Per read, on this side: the name check still rejects separators, `..`, NUL and absolute paths
+before anything leaves the process — cheap, and it keeps a malformed name off the wire — and
+the session resolution decides which execution, if any, the name belongs to. Responses map as:
 
-Then, per read: the name check rejects separators, `..`, NUL and absolute paths before
-touching the filesystem, and `skills/sandbox_tools.py:_validate_path` re-checks the
-*resolved* path. **Neither is the enforcing layer** — a script owns its artifacts directory
-and can swap what a name resolves through after the check, at the final component *or at
-the `artifacts` directory itself*, and `_validate_path` cannot see the latter because it
-resolves both sides through the same swapped link and they agree. So after those checks
-nothing is addressed by path again:
+| from the sandbox | tool result |
+|---|---|
+| `200` | `content` inline as UTF-8 (truncated at 100k chars, with `truncated: true`) or base64 with its content type |
+| `404`, or a name this session never produced | `ArtifactNotFound`, not retryable — one wording for both, so probing another session discloses nothing |
+| `409 ArtifactModified` | its own non-retryable error: re-run the analysis, do not re-read, and tell the user the earlier output could not be trusted |
+| `413` | `ArtifactTooLarge`, not retryable: have the script write a smaller summary |
+| transport failure or `500` | `ArtifactUnavailable`, **retryable** — a server-side fault, not a bad name |
+| a `200` with an unparseable body (`SandboxProtocol`) | `ArtifactUnavailable`, **not** retryable: the same id and name produce the same body, so a re-ask cannot succeed |
+| an `execution_id` the client's own pre-flight refused (`SandboxBadExecutionId`) | `ArtifactNotFound`, not retryable — no request was issued, and it is our wiring fault rather than the model's, so it gets the same wording as a missing name |
 
-- `_open_artifacts_dir()` opens the directory once with `O_RDONLY | O_DIRECTORY |
-  O_NOFOLLOW` and checks **that descriptor** — `readlink("/proc/self/fd/<dirfd>")` must sit
-  under `_ARTIFACTS_DIR_PREFIX` and must not be `" (deleted)"` — rather than re-resolving
-  the path;
-- the artifact is opened **relative to that fd** (`dir_fd=`) with `O_RDONLY | O_NOFOLLOW |
-  O_NONBLOCK`, so a later directory swap changes a name the read no longer uses;
-- regular-file, link-count and content all come from that one fd's `fstat`. `O_NOFOLLOW`
-  refuses a symlink at the final component; `st_nlink != 1` refuses a hardlink, which has
-  nothing to resolve and so passes both path layers while pointing at an out-of-tree inode;
-  `O_NONBLOCK` is what makes the FIFO case reachable at all — `O_RDONLY` on a writerless
-  FIFO blocks in the kernel before `S_ISREG` is tested, so a script could hang the chat
-  backend with one `mkfifo` in its own artifacts directory.
+`retryable` means "a second ask could plausibly succeed", which only a transport-level fault
+is; there is no total budget above this tool the way `run_analysis` has its 300 s `wait_for`,
+so a retryable answer is retried on the model's judgement alone.
 
-The reported `size` is the payload length, not `st_size`, so a file that grows mid-read
-cannot report a size that disagrees with the bytes returned. Every failure — outside the
-allow-list, symlink, hardlink, FIFO, directory swap, `OSError` — is reported as "not
-found", so probing discloses nothing, and the oversize refusal omits the byte count so it
-is not a size oracle. A `_validate_path` refusal does return measurably faster than one
-from the open, which tells a caller whether a name **it planted** is an out-of-tree
-symlink; a dangling symlink takes the same fast path, so it is not an existence oracle.
-
-**Not implemented**: cross-execution scoping. `read_artifact` takes no session or execution
-argument, so which execution's artifacts are reachable rests entirely on
-`SANDBOX_ARTIFACTS_DIR` pointing at the right directory. Resolving a name against a session
-belongs to `genetics-results-suite-4h6.52` and has not been implemented.
+The reported `size` is the payload length. A call that arrives with no session — which nothing
+does today, since the tool is excluded from MCP and from every subagent skill — is a wiring
+fault and reads as "not found" rather than as a read.
 
 #### Open Targets Platform MCP
 
@@ -2226,7 +2224,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_tools.py` | Tool executor methods |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
-| `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s descriptor-based read and its path allow-list, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair |
+| `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s HTTP proxy and its session-scoped resolution (another session's name indistinguishable from a missing one, the most-recent-wins collision tiebreak, TTL expiry, the bounded map, the 512 KiB cap and the `409`/`413` mappings), the `artifacts_retained_in_clear` signal rendered only when true, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair |
 | `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both, and the comment and tool-history reads degrade the same way), chat-history write transaction safety (every write accessor over a failed DML and a failed commit, the retained lock, and the multi-DML writes rolled back whole), and the zone the write path returns (the saves, the version history and `add_user_comment` hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |
@@ -2887,7 +2885,7 @@ already written) — a run produces cost and latency numbers with no judge call 
 4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `thinking`, `usage`, `script_result`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
 6. **Retry on transient errors**: Anthropic API calls are retried up to 3 times with exponential backoff (1s, 2s, 4s) for transient errors. Retryability is detected two ways because of a streaming quirk: connection errors and `APIStatusError` with HTTP status 500/502/503/529, **and** by the error type carried in the body (`overloaded_error`, `api_error`, `internal_server_error`). The latter is essential — errors that arrive mid-stream (after the SSE connection returns HTTP 200) surface as a base `APIStatusError` with `status_code=200`, so status-code matching alone misses them (`anthropic_error_type()` in `llm_service.py` reads the real type from the body). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. When retries are exhausted, `_classify_error` (in `chat_api.py`) maps the error to a user-facing message keyed on the same body type: overload → "Claude is temporarily overloaded… please wait a moment and resend"; internal/upstream → "Claude had a temporary upstream error." Non-retryable errors (auth, bad request, rate limit) propagate immediately.
-7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow. The cap is `settings.mcp_max_result_size` (50,000 chars) applied to the serialized tool result in `llm_service.py`. The notice is built by `_truncation_notice()`, which states that what survives is an ordered PREFIX rather than a sample, that entire categories may be invisible, and that the result must not be used to count, to enumerate, or to conclude absence — pointing instead at narrower arguments, `summarize=true`, or the download link. Its item count comes from `_count_result_items()`, which understands every shape the data tools return (`results`, `rows`/`total_rows`, and `n_cs`/`cs`); counting only `results` previously dropped the count for exactly the credible-set summaries, degrading the notice to a bare "response too large". The system prompt carries the matching rule (`config/defaults.py`, under Tool Usage Guidelines). Truncation is positional, so it interacts badly with server-side row ordering: an unfiltered `get_credible_sets_by_qtl_gene` for a well-studied gene returns thousands of rows sorted by chromosome/position, and the tail — which may be the only rows of the requested data type — is cut before the model sees it. This produced a real wrong answer ("no caQTL rows at all" for IL7R, which in fact has 3,058). The fix is to filter server-side: the `data_types` parameter on `get_credible_sets_by_gene` / `_by_variant` / `_by_qtl_gene` is now a real API query parameter (previously it was sent and silently ignored by the results-api, which is also why the truncation was reached), and the results-api rejects undeclared query parameters with 422 so this class of drift cannot recur silently. `get_credible_sets_by_qtl_gene` also now defaults `summarize=True`, matching its sibling credible-set tools; it was the only one defaulting to variant-level rows, which is how a routine gene query reached 1.57 M chars. The summary is credible set-level, sorted by `mlog10p` and grouped by `data_type`, so what truncation drops is the weakest-signal tail rather than an entire chromosome's worth of rows. **A credible set is keyed by `(resource, dataset, trait, cell_type, cs_id)`, never by `cs_id` alone** — `cs_id` is unique only within one dataset's fine-mapping run of one trait in one cell type. caQTL `cs_id`s are derived from the chromatin peak and recur in every cell type the peak was tested in; eQTL Catalogue `cs_id`s like `ENSG00000187608_L1` recur across QTD studies. `_summarize_credible_sets_simple` grouped on `cs_id` alone, merging those into one row each: for IL7R caQTL it reported 46 credible sets across 9 cell types where the data holds 129 across 13, and PCSK9 caQTL came out at 78 instead of 359. Both aggregations now run in a single `group_by` on the full key — joining them would have to match on `cell_type`, which is null for GWAS, where `null != null` silently drops rows. `_summarize_credible_sets_trait` (used only by `get_credible_sets_by_phenotype`, a single resource and phenotype per call) is unaffected, since `cs_id` genuinely is unique in that scope. The summary also carries a `counts` block (`_summary_counts`) of per-data-type distinct totals — credible sets, associations (variant-level rows, matching an equivalent BigQuery `COUNT(*)`), variants, traits, cell types, datasets, plus `n_peaks` from `trait_original` for caQTL, whose molecular trait is a chromatin peak. It is emitted before `cs` in the dict so it survives truncation: at ~500 bytes for all data types it always fits, which means "how many peaks / cell types / associations" is answerable even on a result 28x over the cap, instead of the model counting whatever credible sets happened to fit
+7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow. The cap is `settings.mcp_max_result_size` (50,000 chars) applied to the serialized tool result in `llm_service.py`. The notice is built by `_truncation_notice()`, which re-attaches the `artifacts_retained_in_clear` warning when the pre-truncation result carried it — a `run_analysis` result's `output` is script-controlled up to 64 KiB, so without that a script could both provoke the exposure condition and print ~50 KB to cut its own security warning out of the prefix (`_render_analysis` also orders that field ahead of `output` for the same reason; the two defences are independent because only the first depends on serialisation order) — and which states that what survives is an ordered PREFIX rather than a sample, that entire categories may be invisible, and that the result must not be used to count, to enumerate, or to conclude absence — pointing instead at narrower arguments, `summarize=true`, or the download link. Its item count comes from `_count_result_items()`, which understands every shape the data tools return (`results`, `rows`/`total_rows`, and `n_cs`/`cs`); counting only `results` previously dropped the count for exactly the credible-set summaries, degrading the notice to a bare "response too large". The system prompt carries the matching rule (`config/defaults.py`, under Tool Usage Guidelines). Truncation is positional, so it interacts badly with server-side row ordering: an unfiltered `get_credible_sets_by_qtl_gene` for a well-studied gene returns thousands of rows sorted by chromosome/position, and the tail — which may be the only rows of the requested data type — is cut before the model sees it. This produced a real wrong answer ("no caQTL rows at all" for IL7R, which in fact has 3,058). The fix is to filter server-side: the `data_types` parameter on `get_credible_sets_by_gene` / `_by_variant` / `_by_qtl_gene` is now a real API query parameter (previously it was sent and silently ignored by the results-api, which is also why the truncation was reached), and the results-api rejects undeclared query parameters with 422 so this class of drift cannot recur silently. `get_credible_sets_by_qtl_gene` also now defaults `summarize=True`, matching its sibling credible-set tools; it was the only one defaulting to variant-level rows, which is how a routine gene query reached 1.57 M chars. The summary is credible set-level, sorted by `mlog10p` and grouped by `data_type`, so what truncation drops is the weakest-signal tail rather than an entire chromosome's worth of rows. **A credible set is keyed by `(resource, dataset, trait, cell_type, cs_id)`, never by `cs_id` alone** — `cs_id` is unique only within one dataset's fine-mapping run of one trait in one cell type. caQTL `cs_id`s are derived from the chromatin peak and recur in every cell type the peak was tested in; eQTL Catalogue `cs_id`s like `ENSG00000187608_L1` recur across QTD studies. `_summarize_credible_sets_simple` grouped on `cs_id` alone, merging those into one row each: for IL7R caQTL it reported 46 credible sets across 9 cell types where the data holds 129 across 13, and PCSK9 caQTL came out at 78 instead of 359. Both aggregations now run in a single `group_by` on the full key — joining them would have to match on `cell_type`, which is null for GWAS, where `null != null` silently drops rows. `_summarize_credible_sets_trait` (used only by `get_credible_sets_by_phenotype`, a single resource and phenotype per call) is unaffected, since `cs_id` genuinely is unique in that scope. The summary also carries a `counts` block (`_summary_counts`) of per-data-type distinct totals — credible sets, associations (variant-level rows, matching an equivalent BigQuery `COUNT(*)`), variants, traits, cell types, datasets, plus `n_peaks` from `trait_original` for caQTL, whose molecular trait is a chromatin peak. It is emitted before `cs` in the dict so it survives truncation: at ~500 bytes for all data types it always fits, which means "how many peaks / cell types / associations" is answerable even on a result 28x over the cap, instead of the model counting whatever credible sets happened to fit
 8. **Downloadable results**: Tools returning tabular data include `INCLUDE_IN_RESPONSE` download links. Direct API URLs are used for genetics API tools that support TSV format; other tools (BigQuery, LD, summary stats) have their results converted to TSV and stored on disk, served via `/chat/v1/downloads/{id}`. The `_download_url` and `_download_data` hints in tool results are processed by `_process_download_hints()` in `llm_service.py` before being sent to the LLM. All download links use relative URLs (e.g., `/api/v1/...` or `/chat/v1/downloads/...`) so they work correctly regardless of deployment domain. `INCLUDE_IN_RESPONSE` is placed at the front of the result dict so it survives JSON truncation for large results. For BigQuery, trailing SQL `LIMIT` clauses are stripped and `max_rows` is set to 100,000 so the download contains the full result set even when the LLM only displays a subset. The BigQuery proxy (`genetics-results-db`) enforces `MAX_ROWS=100000` as a hard cap. **A download failure is never silent.** `_process_download_hints` used to catch bare `Exception`, log a warning and return the result with `_download_data` already popped, which produced no link, no error to the user and no error to the model — indistinguishable from a result that never warranted a download, so nobody reported it. That hid the identical positional-rows defect twice (`bef`, then `buc` months later). Two things now hold: (1) `_convert_to_tsv` validates both shapes up front — including `filename`, which is `json.dump`ed into the sidecar *after* the `.tsv` is written, so a non-`str` would raise past the allow-list and orphan the data file — and raises `DownloadShapeError` (a `TypeError` subclass) naming the expected and the observed shape; (2) three failure modes are caught, each with its own ERROR log token and its own user-visible `INCLUDE_IN_RESPONSE` note, and **none of them is fatal to the chat turn**. A `DownloadShapeError` is logged as `DOWNLOAD_SHAPE_DEFECT tool=<name> shape=<observed>` with `exc_info=True` and surfaced as `DOWNLOAD_SHAPE_NOTE` (unexpected structure, results unaffected, logged for investigation, explicitly *not* worth re-running). A shape defect is not necessarily a local programming error: only the six BigQuery-backed tools and the UniProt helper build the payload locally, while most of the ~25 producers put the sibling results-api's parsed response body straight into `_download_data` unvalidated (`executor.py` `_get_ld_matrix`, `_get_summary_stats`, …), so a bad shape is as likely to be **upstream drift** — a class of failure this repo has already seen — and coupling chat-turn success to another repo's response shape would trade a missing link for a lost answer. `OSError` (everything the store can fail with — `ENOSPC`, permissions, a storage path that is not a directory) and `UnicodeEncodeError` (upstream JSON can decode lone surrogates that utf-8 cannot encode) keep the `DOWNLOAD_FAILED tool=<name> shape=<observed> error=<type>` token and `DOWNLOAD_FAILED_NOTE`, which now states the effect without asserting a cause (re-running helps for `ENOSPC` but never for an unencodable value). The distinct tokens matter operationally: `genetics-results-suite`'s `scripts/monitor/alerter.py` queries severity ≥ WARNING and pushes new alerts to Slack, so a disk problem and a producer/upstream defect are separable there. Both call sites (`_stream_anthropic`, `subagent._execute_subagent_tool`) pass `tool_name` so the log identifies the producer among the ~25 that emit `_download_data`. A recognized-but-empty payload (`{"results": []}`) still yields no link and no note — there is genuinely nothing to download.
 9. **Tool result persistence (resumed conversations carry the data substrate)**: The chat API is stateless per request — the frontend replays the full conversation each turn. Tool `tool_result` blocks are persisted (`chat_messages.tool_results_json`, added via the standard PRAGMA/ALTER migration) so a resumed conversation replays the actual tool outputs the model saw, not just its prose summary. `_stream_anthropic` collects `all_tool_results` across agentic-loop iterations and emits them in the `done` SSE event; the frontend stores them and, on resume, rebuilds the `assistant(tool_use) → user(tool_result)` pairing (its history builder splits each persisted assistant turn into the assistant message plus a synthetic user message of `tool_result` blocks). The already-truncated, image-base64-stripped result content is stored as-is. **Backward compatible**: conversations saved before this feature have `tool_results_json = NULL`; on resume they emit only the assistant message and `_sanitize_tool_blocks` (in `llm_service.py`) strips the now-orphaned `tool_use` blocks — exactly the prior behavior. **Marker-strip safeguard**: the `*[Using tool: …]*` annotations injected during streaming are display-only, but they are persisted into the assistant text. Before history reaches the model, `_strip_tool_use_markers` (in `llm_service.py`, run just before `_sanitize_tool_blocks`) removes them from replayed assistant content (both string and text-block forms). Without this, a long/repetitive conversation could teach the model to imitate the notation — writing `*[Using tool: X]*` as prose instead of emitting a real `tool_use` block, then fabricating the result (observed in a real session whose tool-less turns predated the persistence fix). Real `tool_use` blocks are left untouched. To offset the larger replayed payload, `_mark_history_cache_breakpoint` adds a `cache_control: ephemeral` breakpoint on the last replayed message (the 3rd of Anthropic's 4 breakpoints, alongside the system prompt and tool definitions). System-prompt guardrails (`config/defaults.py`) additionally instruct the model to treat credible-set membership as distinct from LD and to re-query authoritative tools for count/membership/lead questions rather than relying on earlier summaries.
 

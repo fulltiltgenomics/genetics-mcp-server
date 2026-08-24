@@ -1579,8 +1579,9 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "Files the script writes to its artifacts directory are reported as a manifest of "
             "names and sizes. An IMAGE artifact is fetched and shown to the user automatically "
             "— save a figure and it appears, so do not also render the plot as text or emit a "
-            "markdown image placeholder for it. Every OTHER artifact's contents CANNOT BE "
-            "RETRIEVED, so a table that matters must also be printed.\n\n"
+            "markdown image placeholder for it. Any OTHER artifact can be read back with "
+            "read_artifact by name, for about 5 minutes after the run; printing what you need "
+            "is still cheaper than reading a file back, so print anything small.\n\n"
             "Each run is independent: no variables, files or imports survive from one call to "
             "the next, so a follow-up script must redo the work it needs."
         ),
@@ -1605,13 +1606,15 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
         "name": "read_artifact",
         "category": "orchestration",
         "description": (
-            "Read a named file from this server's local artifacts directory. Takes the "
-            "artifact NAME exactly as reported in a manifest — never a path and never an "
-            "execution id. Returns text inline, and binary content base64-encoded with its "
-            "content type. It CANNOT retrieve artifacts written by run_analysis: those live "
-            "in the sandbox and this tool does not reach it. Do not call it for a "
-            "run_analysis artifact — image artifacts are shown to the user automatically, and "
-            "for anything else have the script print what you need instead."
+            "Read a file that a run_analysis script in THIS conversation wrote to its "
+            "artifacts directory. Takes the artifact NAME exactly as reported in that run's "
+            "manifest — never a path and never an execution id. Returns text inline "
+            "(truncated if very long) and binary content base64-encoded with its content "
+            "type. Artifacts are readable for about 5 minutes after the run finishes and "
+            "only from the conversation that produced them; anything else is 'not found'. "
+            "Image artifacts are already shown to the user automatically, so read one only "
+            "if you need its bytes. For a couple of numbers, printing them from the script "
+            "is cheaper than reading the file back."
         ),
         "parameters": {
             "name": {

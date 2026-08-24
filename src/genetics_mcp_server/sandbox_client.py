@@ -214,6 +214,43 @@ class SandboxHealth:
     http_status: int
 
 
+@dataclass(frozen=True)
+class ArtifactResult:
+    """``GET /artifact``'s outcome, **including its failures** — never an exception.
+
+    The route has two callers with opposite needs. `_fetch_analysis_images` wants "picture or
+    no picture" and treats every failure alike; `read_artifact` has to tell the model *which*
+    failure happened, because a `409 ArtifactModified` and a `404` call for different next
+    moves. Collapsing to `None` served only the first, so the outcome is carried in a value
+    and `fetch_artifact` does the collapsing itself.
+
+    `status_code` is `None` when no HTTP response was obtained at all (connect failure,
+    timeout, transport error); `error_type` then carries this client's own label rather than
+    the supervisor's. `error_type` from the wire is an OPEN string, as everywhere else in this
+    contract — branch on it only for the names the contract reserves.
+    """
+
+    ok: bool
+    name: str
+    status_code: int | None = None
+    error_type: str | None = None
+    content_type: str | None = None
+    data: bytes | None = None
+    content_base64: str | None = None
+
+
+ERROR_UNREACHABLE = "SandboxUnreachable"
+"""Synthesised by this client, not the supervisor: no HTTP response was obtained."""
+
+ERROR_MALFORMED_RESPONSE = "SandboxProtocol"
+# The LOCAL pre-flight rejection of an execution_id, kept distinct from ERROR_UNREACHABLE
+# (genetics-results-suite-4h6.52): no request is issued, so re-asking re-rejects the same id.
+# The caller maps it to a non-retryable answer; a genuine transport failure keeps ERROR_UNREACHABLE
+# and stays retryable.
+ERROR_BAD_EXECUTION_ID = "SandboxBadExecutionId"
+"""Synthesised by this client: a 200 whose body was not a usable artifact envelope."""
+
+
 def _redact(text: str, tokens: SandboxTokens | None) -> str:
     """Defence in depth for the never-log-a-token rule.
 
@@ -325,21 +362,26 @@ class SandboxClient:
             http_status=response.status_code,
         )
 
-    async def fetch_artifact(self, execution_id: str, name: str) -> dict[str, Any] | None:
-        """One artifact of a completed execution, or ``None`` if it cannot be served.
+    async def get_artifact(self, execution_id: str, name: str) -> ArtifactResult:
+        """One artifact of a retained execution, as an outcome value. **Never raises.**
 
-        **Never raises.** This runs after the script has already succeeded and its result is
-        on its way to the model; the artifact is an extra. A 404 (reaped, or evicted by the
-        retained-size ceiling), a 413, a restarted sandbox and a malformed body all mean the
-        same thing to the caller — there is no picture to show — and none of them is a reason
-        to fail the analysis that produced it.
+        THE SINGLE READ PATH. `read_artifact` (scoped to a session by chat-backend) and
+        `_fetch_analysis_images` (automatic, image-only) both come through here, so the caps,
+        the decode and the failure taxonomy are stated once. Before
+        `genetics-results-suite-4h6.52` the tool read chat-backend's own filesystem while the
+        image fetch used this route, and the two disagreed on the size cap and on text
+        truncation — a deviation that could only be half-closed by moving one of them.
 
-        `execution_id` comes from the result the supervisor just echoed back, never from the
-        model: it is the whole authorisation for the read (see `Supervisor.read_artifact`).
+        `execution_id` is resolved server-side — from the run the supervisor just echoed back,
+        or from the session's own manifest registry — and never from the model: it is the whole
+        authorisation for the read on this HTTP surface (see `Supervisor.read_artifact`).
+
+        Failures are values because the two callers need different amounts of them; see
+        `ArtifactResult`.
         """
         if not EXECUTION_ID_PATTERN.fullmatch(execution_id or ""):
             logger.error("refusing to fetch an artifact for a malformed execution_id")
-            return None
+            return ArtifactResult(ok=False, name=name, error_type=ERROR_BAD_EXECUTION_ID)
         timeout = httpx.Timeout(
             ARTIFACT_FETCH_TIMEOUT_S,
             connect=CONNECT_TIMEOUT_S,
@@ -352,42 +394,76 @@ class SandboxClient:
                 )
         except httpx.HTTPError as exc:
             logger.warning("artifact fetch failed for %s: %s", name, type(exc).__name__)
-            return None
+            return ArtifactResult(ok=False, name=name, error_type=ERROR_UNREACHABLE)
 
         if response.status_code != 200:
-            _, message = _error_fields(response)
+            error_type, message = _error_fields(response)
             logger.info(
                 "sandbox did not serve artifact %s: HTTP %s %s",
                 name,
                 response.status_code,
                 message,
             )
-            return None
+            return ArtifactResult(
+                ok=False,
+                name=name,
+                status_code=response.status_code,
+                error_type=error_type,
+            )
+
+        def malformed(reason: str) -> ArtifactResult:
+            logger.warning("artifact response for %s %s", name, reason)
+            return ArtifactResult(
+                ok=False, name=name, status_code=200, error_type=ERROR_MALFORMED_RESPONSE
+            )
+
         try:
             body = response.json()
         except (json.JSONDecodeError, ValueError):
-            logger.warning("artifact response for %s was not JSON", name)
-            return None
+            return malformed("was not JSON")
         if not isinstance(body, dict):
-            return None
+            return malformed("was not an object")
         encoded = body.get("content_base64")
         if not isinstance(encoded, str) or not encoded:
-            return None
+            return malformed("carried no content")
         try:
             data = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError):
-            logger.warning("artifact %s did not decode as base64", name)
-            return None
+            return malformed("did not decode as base64")
         if len(data) > ARTIFACT_READ_MAX_BYTES:
             # the supervisor caps this too; disagreeing is a contract drift worth a log line
             logger.warning("artifact %s came back over the size cap: %d bytes", name, len(data))
-            return None
+            return ArtifactResult(
+                ok=False, name=name, status_code=200, error_type="ArtifactTooLarge"
+            )
         content_type = body.get("content_type")
+        return ArtifactResult(
+            ok=True,
+            name=name,
+            status_code=200,
+            content_type=content_type if isinstance(content_type, str) else None,
+            data=data,
+            content_base64=encoded,
+        )
+
+    async def fetch_artifact(self, execution_id: str, name: str) -> dict[str, Any] | None:
+        """One artifact of a completed execution, or ``None`` if it cannot be served.
+
+        **Never raises.** This runs after the script has already succeeded and its result is
+        on its way to the model; the artifact is an extra. A 404 (reaped, or evicted by the
+        retained-size ceiling), a 413, a restarted sandbox and a malformed body all mean the
+        same thing to the caller — there is no picture to show — and none of them is a reason
+        to fail the analysis that produced it. That collapse is this wrapper's whole job;
+        `get_artifact` keeps the distinctions for the caller that needs them.
+        """
+        result = await self.get_artifact(execution_id, name)
+        if not result.ok or result.data is None:
+            return None
         return {
             "name": name,
-            "content_type": content_type if isinstance(content_type, str) else None,
-            "content_base64": encoded,
-            "size": len(data),
+            "content_type": result.content_type,
+            "content_base64": result.content_base64,
+            "size": len(result.data),
         }
 
     async def execute(
