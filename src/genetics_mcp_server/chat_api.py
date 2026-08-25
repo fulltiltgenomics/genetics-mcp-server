@@ -438,9 +438,12 @@ async def list_resolved_tools(
     IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `get_anthropic_tools` degrades an
     unrecognised profile to general-only rather than raising, deliberately, because the
     value is read back from `chat_messages` rows written by older clients — so a typo costs
-    the model most of its tools and nothing anywhere says so. A benchmark arm misspelled
-    that way runs fine and reports plausible numbers. `known_profile: false` is the flag
-    that turns that into something a caller can see.
+    the model most of its tools while the request itself still succeeds. A benchmark arm
+    misspelled that way runs fine and reports plausible numbers. `known_profile: false` is
+    the flag that turns that into something a caller can see; the resolution path also logs
+    a WARNING once per distinct unknown value, which is the operator-side half of the same
+    signal (genetics-results-suite-4h6.74). The browser calls this endpoint when a profile
+    is picked or restored and shows the user when it comes back false.
 
     `count` is LOCAL tools only. External (gnomAD / Open Targets) and RAG tools are proxied
     surfaces resolved separately and are not included; see docs/chat-tool-reference.md § 3

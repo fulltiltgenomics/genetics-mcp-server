@@ -5,12 +5,15 @@ This module provides tool definitions in two formats:
 2. Anthropic tool format (for LLM service)
 """
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
     from genetics_mcp_server.tools.executor import ToolExecutor
+
+logger = logging.getLogger(__name__)
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -1785,6 +1788,29 @@ TOOL_PROFILE_TOOLS: dict[str, set[str]] = {
     },
 }
 
+# unknown profile values already warned about. The degrade-to-general-only below stays silent
+# to the caller on purpose (see get_anthropic_tools' docstring), but an operator has to be able
+# to see the drift, and the value arrives on EVERY turn of a session that stored it — a
+# per-request warning would bury itself and stop being read. Bounded so a client that invents a
+# new value per request floods neither the log nor this set (genetics-results-suite-4h6.74).
+_WARNED_UNKNOWN_PROFILES: set[str] = set()
+_MAX_WARNED_UNKNOWN_PROFILES = 64
+
+
+def _warn_unknown_profile(tool_profile: str) -> None:
+    if tool_profile in _WARNED_UNKNOWN_PROFILES:
+        return
+    if len(_WARNED_UNKNOWN_PROFILES) >= _MAX_WARNED_UNKNOWN_PROFILES:
+        return
+    _WARNED_UNKNOWN_PROFILES.add(tool_profile)
+    logger.warning(
+        "Unrecognised tool_profile %r - degrading to general-only. Known profiles: %s. "
+        "A client that offers a profile this server does not know has drifted from it; "
+        "GET /chat/v1/tools/resolved?tool_profile=<value> reports the same thing per request.",
+        tool_profile,
+        ", ".join(sorted(set(TOOL_PROFILES) | set(TOOL_PROFILE_TOOLS))),
+    )
+
 
 def get_anthropic_tools(
     custom_descriptions: dict[str, str] | None = None,
@@ -1802,9 +1828,11 @@ def get_anthropic_tools(
             "rag" = general only (RAG tools are external, handled separately),
             "code" = the seven names in TOOL_PROFILE_TOOLS.
             An unrecognised string degrades to general-only rather than raising, so a
-            typo costs the model most of its tools silently — deliberate, because the
-            value is persisted per message and read back from rows written by older
-            clients.
+            typo costs the model most of its tools — deliberate, because the value is
+            persisted per message and read back from rows written by older clients. It is
+            no longer silent to an operator: the first request carrying a given unknown
+            value logs a WARNING naming it and the known set (once per distinct value, not
+            once per request). It is still silent to the model and to the caller.
         disabled_tools: Optional set of tool names to exclude. Applied before the
             profile filter, so a disabled tool stays out of an explicit profile too.
     """
@@ -1820,7 +1848,10 @@ def get_anthropic_tools(
         if allowed_names is not None:
             all_tools = [t for t in all_tools if t["name"] in allowed_names]
         else:
-            allowed_categories = TOOL_PROFILES.get(tool_profile, {"general"})
+            allowed_categories = TOOL_PROFILES.get(tool_profile)
+            if allowed_categories is None:
+                _warn_unknown_profile(tool_profile)
+                allowed_categories = {"general"}
             all_tools = [t for t in all_tools if t.get("category") in allowed_categories]
 
     for tool_def in all_tools:
