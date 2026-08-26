@@ -401,11 +401,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_open_chromatin_by_peak",
         "category": "api",
-        "description": "Get one open-chromatin atlas peak by its peak id (chr-start-end), returning every cell_type/tissue/condition row recorded for it. Use this to follow up a peak id returned by get_open_chromatin_by_variant/_by_region or by a caQTL credible set, when you want that peak's full annotation rather than everything overlapping a position.",
+        "description": "Get one open-chromatin atlas peak by its peak id, returning every cell_type/tissue/condition row recorded for it. Use this to follow up a peak id returned by get_open_chromatin_by_variant/_by_region when you want that peak's full annotation rather than everything overlapping a position. Atlas peak ids are a SEPARATE id space from caQTL/Open4Gene peak ids (credible_sets trait, get_peak_to_genes): those will not be found here, so reach the atlas from a caQTL peak by region overlap (get_open_chromatin_by_region) instead.",
         "parameters": {
             "peak_id": {
                 "type": "string",
-                "description": "Peak ID as chr-start-end (e.g. 'chr5-35482826-35484273')",
+                "description": "Atlas peak ID as chr-start-end with a bare numeric chromosome (e.g. '22-20750312-20751112'; X=23). This endpoint also tolerates a 'chr' prefix, but the open_chromatin_v BigQuery view does not — SQL must use the bare form.",
                 "required": True,
             },
             "resources": {
