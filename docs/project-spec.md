@@ -776,10 +776,20 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   constructs**. An injected executor is never mutated: it may be the running service's shared
   one, and lifting its cap in place would flood the model's context at every MCP call site
   that relies on `_cap_rows`.
-- **Truncation raises rather than returning a prefix.** Silent truncation is the one failure a
-  script cannot detect — the frame is well-formed and merely missing rows, so every downstream
-  count, mean and join is wrong with no signal. `_check_truncation` turns `truncated` /
-  `download_capped_at_100k` into a `GeneticsError`.
+- **Truncation raises rather than returning a prefix, and the error names the cap that was
+  actually applied.** Silent truncation is the one failure a script cannot detect — the frame
+  is well-formed and merely missing rows, so every downstream count, mean and join is wrong
+  with no signal. `_check_truncation` turns `truncated` into a `GeneticsError`, and splits on
+  `capped_by_server` (`genetics-results-suite-4h6.32`): when db-api cut the result set itself
+  the message quotes `server_row_cap` — db-api's `max_rows_applied`, passed through by
+  `query_database` — and says that raising `max_rows` past it does nothing, because the cap is
+  per-credential (25 000 for a sandbox execution) and not the caller's to move. Otherwise the
+  cut is the executor's own LLM-facing slice or a typed endpoint's `limit`, where raising
+  `limit` **is** the remedy, and the message says so. The number is never hardcoded in the SDK:
+  a db-api that does not report it, or a payload from another path, simply loses the number
+  from the sentence. This replaces `download_capped_at_100k`, whose name asserted a 100 000-row
+  ceiling that was wrong for the only caller that could hit it, and which was fed from the same
+  `data["truncated"]` as `truncated` — so its branch was unreachable from `sql()`.
 - **Rows are named from the payload's own columns.** results-api returns JSON objects; db-api
   returns rows **positionally**, with names in a separate `columns` key. Handing positional
   rows to `pl.from_dicts` does not raise — it transposes them into `column_0`/`column_1` with

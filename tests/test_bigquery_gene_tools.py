@@ -357,3 +357,55 @@ async def test_generated_sql_names_views_bare_and_unbackticked(method, emit):
                 f"{method} qualified {ref!r}; the dataset name must come from db-api's "
                 f"DATASET_ID, not from the emitted SQL"
             )
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+async def test_query_database_passes_db_apis_applied_row_cap_through():
+    """db-api reports the row ceiling it actually ran under (`max_rows_applied`); the SDK's
+    truncation error quotes that number rather than hardcoding one. The passthrough is the
+    only link between them, and its absence is invisible — the error simply loses the number.
+    """
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    try:
+        executor.client.post = AsyncMock(return_value=_FakeResponse({
+            "columns": ["x"],
+            "rows": [[1]],
+            "total_rows": 90_000,
+            "bytes_processed": 10,
+            "truncated": True,
+            "max_rows_applied": 25_000,
+        }))
+
+        result = await executor.query_database("SELECT 1", max_rows=10)
+
+        assert result["capped_by_server"] is True
+        assert result["server_row_cap"] == 25_000
+        assert result["truncated"] is True
+        assert "download_capped_at_100k" not in result
+    finally:
+        await executor.close()
+
+
+async def test_query_database_reports_no_cap_when_db_api_does_not_send_one():
+    """An older db-api sends no `max_rows_applied`; nothing may invent a number for it."""
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    try:
+        executor.client.post = AsyncMock(return_value=_FakeResponse({
+            "columns": ["x"], "rows": [[1]], "total_rows": 1, "truncated": False,
+        }))
+
+        result = await executor.query_database("SELECT 1", max_rows=10)
+
+        assert result["capped_by_server"] is False
+        assert result["server_row_cap"] is None
+        assert result["truncated"] is False
+    finally:
+        await executor.close()

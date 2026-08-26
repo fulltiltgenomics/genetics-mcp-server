@@ -974,10 +974,20 @@ class ToolExecutor:
         filtering a no-hit gene gets an empty frame rather than ColumnNotFound. `truncated`
         stays because silent truncation is the one failure a script cannot detect for
         itself. Off by default so the model's payload is not padded with either.
+
+        `capped_by_server`/`server_row_cap` travel with `truncated` because they are what
+        `GeneticsClient._check_truncation` reads to tell db-api's own row cap (raising
+        `limit` does nothing) from the LLM-slice cut (raising `limit` is the remedy). Drop
+        them here and every typed SDK method that reaches db-api through this helper gets
+        the generic "raise `limit`" advice for a ceiling the caller cannot move. Absent
+        keys degrade to the generic message, which is what a pre-`max_rows_applied` db-api
+        or a non-BigQuery payload produces.
         """
         if include:
             payload["columns"] = query_result.get("columns", [])
             payload["truncated"] = query_result.get("truncated", False)
+            payload["capped_by_server"] = query_result.get("capped_by_server", False)
+            payload["server_row_cap"] = query_result.get("server_row_cap")
         return payload
 
     @staticmethod
@@ -1084,6 +1094,12 @@ class ToolExecutor:
             # always fetch up to 100k rows for the download, the LLM
             # result is truncated to max_rows and further by mcp_max_result_size
             download_sql, _ = self._strip_trailing_limit(sql)
+            # 100 000 is at or above every reachable db-api `caps.max_rows` (25 000 for a
+            # sandbox execution, 100 000 relaxed), and that is what makes the `truncated` bit
+            # below mean "the SERVER capped this" rather than "your own max_rows capped this".
+            # Lower `fetch_max` past either of those and `capped_by_server` starts going True
+            # for a cut the caller's own `max_rows` caused, at which point the SDK tells them
+            # "raising `max_rows` does nothing" exactly when raising it is the remedy.
             fetch_max = max(max_rows, 100_000)
 
             resp = await self.client.post(
@@ -1110,7 +1126,12 @@ class ToolExecutor:
             # LLM gets at most max_rows
             llm_rows = all_rows[:max_rows] if len(all_rows) > max_rows else all_rows
 
-            download_capped = data.get("truncated", False)
+            # db-api cut the result set itself. Its cap is per-credential, not the 100 000 of
+            # `fetch_max`: a sandbox execution runs at SANDBOX_MAX_ROWS, a quarter of that. So
+            # the flag is named for WHO capped rather than for a number that is wrong for the
+            # caller that matters, and `server_row_cap` carries the number db-api actually
+            # applied (absent on a db-api that predates the field).
+            capped_by_server = data.get("truncated", False)
             result: dict[str, Any] = {
                 "success": True,
                 "sql": sql,
@@ -1118,9 +1139,13 @@ class ToolExecutor:
                 "rows": llm_rows,
                 "total_rows": data.get("total_rows", 0),
                 "rows_in_download": len(all_rows),
-                "download_capped_at_100k": download_capped,
+                "capped_by_server": capped_by_server,
+                "server_row_cap": data.get("max_rows_applied"),
                 "bytes_processed": data.get("bytes_processed", 0),
-                "truncated": len(all_rows) > max_rows or download_capped,
+                # two different cuts: the LLM slice (raise `max_rows`) and db-api's own row cap
+                # (raising `max_rows` past it does nothing). `capped_by_server` is what tells
+                # them apart downstream — see GeneticsClient._check_truncation.
+                "truncated": len(all_rows) > max_rows or capped_by_server,
             }
             if download_data:
                 result["_download_data"] = download_data
