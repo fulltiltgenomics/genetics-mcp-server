@@ -6,7 +6,9 @@ This module provides tool definitions in two formats:
 """
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
+
+from pydantic import Field
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -14,6 +16,42 @@ if TYPE_CHECKING:
     from genetics_mcp_server.tools.executor import ToolExecutor
 
 logger = logging.getLogger(__name__)
+
+# WHEN A PARAMETER MAY DECLARE `minimum`/`maximum`/`pattern` (genetics-results-suite-4h6.70).
+# get_anthropic_tools copies these three keywords straight into the emitted input_schema, so
+# a bound here is a claim about the SERVER, not a wish. The rule is: declare a bound only
+# where enforcing code already applies it to every path that parameter can take, and derive
+# the number from that code rather than from the description — where the two disagree the
+# enforcement wins.
+#
+# Two different kinds of bound live on this surface, and this comment must not blur them:
+#   - REJECTED: the `sql_int`/`sql_float` sites (the four `window` params, `min_pip`,
+#     `get_hla_by_allele.max_rows`) and the sandbox timeout raise on an out-of-range value.
+#     These are also mirrored onto the MCP surface as pydantic `Field(ge=..., le=...)` —
+#     see the docstring on register_mcp_tools below — because there the identical
+#     rejection just moves earlier.
+#   - CLAMPED: `web_search.max_results`, `search_mgi.max_results`,
+#     `search_cbioportal.max_results`, `search_uniprot.size` never reject; an out-of-range
+#     value is silently coerced into range and the call still succeeds. These are
+#     advisory-only on this surface (they steer the model, nothing enforces them here
+#     directly — the enforcement is downstream) and deliberately NOT mirrored onto the MCP
+#     surface, because rejecting there would break a live client that today sends an
+#     out-of-range value and gets a clamped, successful result back.
+# A CLAMPED `minimum`/`maximum` is only honest if the clamp truly applies to every value
+# that reaches it — see the note beside `search_uniprot.size` below for a case where it
+# does not, and the bound is omitted rather than declared wrong.
+#
+# Each declaration below names its enforcing site; tests/test_tool_schema_bounds.py
+# ties the ones that mirror a named constant back to the constant so the pair cannot drift.
+#
+# Deliberately NOT declared, so the next reader does not "complete" the set:
+#   - search_scientific_literature.max_results — the "max 25" clamp exists only on the
+#     europepmc path (executor.py `_search_europepmc_literature`); the DEFAULT backend is
+#     perplexity, which slices to max_results uncapped.
+#   - query_database.max_rows — capped downstream by db-api on bytes, not here.
+#   - `pattern` on any parameter. The plausible candidates (get_hla_by_allele.allele,
+#     read_artifact.name) are validated AFTER a normalization step that widens what is
+#     accepted, so a regex matching the validator would reject inputs the server handles.
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -312,6 +350,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Flank in bp added on each side of the gene body (default 500000).",
                 "default": 500000,
+                # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
+                "minimum": 0,
+                "maximum": 10_000_000,
             },
         },
     },
@@ -431,6 +472,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Flank in bp added on each side of the gene body (default 500000).",
                 "default": 500000,
+                # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
+                "minimum": 0,
+                "maximum": 10_000_000,
             },
         },
     },
@@ -468,6 +512,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Flank in bp added on each side of the gene body (default 500000).",
                 "default": 500000,
+                # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
+                "minimum": 0,
+                "maximum": 10_000_000,
             },
         },
     },
@@ -531,6 +578,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Flank in bp added on each side of the gene body (default 500000).",
                 "default": 500000,
+                # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
+                "minimum": 0,
+                "maximum": 10_000_000,
             },
         },
     },
@@ -548,6 +598,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Flank in bp added on each side of the gene body (default 500000).",
                 "default": 500000,
+                # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
+                "minimum": 0,
+                "maximum": 10_000_000,
             },
             "resource": {
                 "type": "string",
@@ -558,6 +611,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "number",
                 "description": "Minimum posterior inclusion probability (PIP) to include, so results focus on credibly causal variants (default 0.1).",
                 "default": 0.1,
+                # executor.py sql_float(min_pip, minimum=0.0, maximum=1.0)
+                "minimum": 0.0,
+                "maximum": 1.0,
             },
         },
     },
@@ -902,6 +958,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Maximum results (default 5, max 10)",
                 "default": 5,
+                # executor.web_search caps every backend with min(max_results, 10); no floor is applied
+                "maximum": 10,
             },
             "include_domains": {
                 "type": "array",
@@ -941,6 +999,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "Maximum records to return (default 25, max 100).",
                 "default": 25,
+                # executor.search_mgi: size = max(1, min(max_results, 100))
+                "minimum": 1,
+                "maximum": 100,
             },
         },
     },
@@ -990,6 +1051,9 @@ Frequencies from gene_by_cancer_type are lower bounds: their denominator counts 
                 "type": "integer",
                 "description": "Maximum records to return (default 25, max 100).",
                 "default": 25,
+                # executor.search_cbioportal: size = max(1, min(max_results, 100))
+                "minimum": 1,
+                "maximum": 100,
             },
         },
     },
@@ -1139,6 +1203,12 @@ Do NOT use this to look up a protein you can already name; resolving a gene symb
                 "type": "integer",
                 "description": "Maximum entries to return (default 25, max 500). Use count_only first when the set may be large.",
                 "default": 25,
+                # uniprot.py: size = max(1, min(int(size or _DEFAULT_SEARCH_SIZE), 500)) —
+                # no `minimum` here: `size=0` is falsy, so `size or _DEFAULT_SEARCH_SIZE`
+                # substitutes the default (25) before the floor ever runs, so size=0
+                # returns 25 rows, not 1. A `minimum: 1` declaration would describe a
+                # clamp this code does not actually apply.
+                "maximum": 500,
             },
             "count_only": {
                 "type": "boolean",
@@ -1336,6 +1406,9 @@ Results are filtered to `min_info` (default 0.5) because rare badly-imputed alle
                 "type": "integer",
                 "description": "Maximum phenotypes to return",
                 "default": 200,
+                # executor.py sql_int(max_rows, minimum=1, maximum=ToolExecutor._MAX_SQL_LIMIT)
+                "minimum": 1,
+                "maximum": 100_000,
             },
         },
     },
@@ -1602,6 +1675,9 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
                     "queued run start sooner."
                 ),
                 "default": 60,
+                # sandbox_client._validate rejects outside 1..MAX_TIMEOUT_S
+                "minimum": 1,
+                "maximum": 120,
             },
         },
     },
@@ -1869,6 +1945,13 @@ def get_anthropic_tools(
                 prop["items"] = param_info["items"]
             if param_info.get("enum"):
                 prop["enum"] = param_info["enum"]
+            # bounds are emitted only when a parameter declares them, and a parameter
+            # declares one only where the server already enforces it — see the block
+            # comment above TOOL_DEFINITIONS. `0`/`0.0` are legitimate bounds, so these
+            # test for presence rather than truthiness.
+            for keyword in ("minimum", "maximum", "pattern"):
+                if keyword in param_info:
+                    prop[keyword] = param_info[keyword]
             properties[param_name] = prop
 
             if param_info.get("required"):
@@ -1905,6 +1988,24 @@ def register_mcp_tools(
         mcp: FastMCP server instance
         executor: ToolExecutor instance for making API calls
         disabled_tools: Optional set of tool names to skip registration.
+
+    BOUNDS ON THIS SURFACE ARE NOT THE SAME DECISION AS ON THE ANTHROPIC ONE
+    (genetics-results-suite-4h6.70). FastMCP derives each schema from the signature below,
+    so an `Annotated[..., Field(ge=..., le=...)]` here does not merely advertise a bound —
+    pydantic REJECTS an out-of-range value before the executor sees it. That is why only
+    the parameters the executor ALREADY rejects carry one (the `sql_int`/`sql_float` sites:
+    the four `window` arguments, `min_pip`, `get_hla_by_allele.max_rows`); there the
+    declaration moves the identical rejection earlier, so it is not a breaking change
+    (neither path ever returns success) — but it is not unobservable either: previously
+    an out-of-range call got a normal tool result (`{"success": false, "error": "window
+    must be <= 10000000, got ..."}`), and now pydantic rejects it before the executor
+    runs, surfacing as FastMCP's own `ToolError`/`isError` response instead. A client
+    branching on `result["success"]` sees a different envelope for the same rejection.
+    The CLAMPED parameters — `web_search.max_results`, `search_mgi.max_results`,
+    `search_cbioportal.max_results`, `search_uniprot.size` — are deliberately left bare:
+    the server accepts an over-large value today and silently returns the capped count, so
+    declaring the cap here would turn a working MCP call into a validation error. Their
+    bounds are declared only in `parameters`, where they steer the model without rejecting.
     """
     _disabled = disabled_tools or set()
 
@@ -2021,7 +2122,7 @@ def register_mcp_tools(
     async def get_asm_qtl_by_gene(
         gene: str,
         resources: str | None = None,
-        window: int = 500000,
+        window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
     ) -> dict:
         """Get ASM-QTL data for variants near a gene."""
         return await executor.get_asm_qtl_by_gene(gene, resources, window)
@@ -2056,7 +2157,7 @@ def register_mcp_tools(
     async def get_open_chromatin_by_gene(
         gene: str,
         resources: str | None = None,
-        window: int = 500000,
+        window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
     ) -> dict:
         """Get open-chromatin atlas peaks near a gene."""
         return await executor.get_open_chromatin_by_gene(gene, resources, window)
@@ -2091,7 +2192,7 @@ def register_mcp_tools(
     async def get_variant_effect_by_gene(
         gene: str,
         resources: str | None = None,
-        window: int = 500000,
+        window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
     ) -> dict:
         """Get in-silico predicted variant effects on chromatin accessibility near a gene."""
         return await executor.get_variant_effect_by_gene(gene, resources, window)
@@ -2118,7 +2219,7 @@ def register_mcp_tools(
     async def get_mpra_by_gene(
         gene: str,
         resources: str | None = None,
-        window: int = 500000,
+        window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
     ) -> dict:
         """Get measured MPRA cis-regulatory allelic activity for variants near a gene."""
         return await executor.get_mpra_by_gene(gene, resources, window)
@@ -2126,9 +2227,9 @@ def register_mcp_tools(
     @mcp.tool()
     async def get_mpra_pip_concordance_by_gene(
         gene: str,
-        window: int = 500000,
+        window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
         resource: str = "finngen",
-        min_pip: float = 0.1,
+        min_pip: Annotated[float, Field(ge=0.0, le=1.0)] = 0.1,
     ) -> dict:
         """Cross-reference FinnGen fine-mapped credible-set PIP against measured MPRA emVar calls near a gene."""
         return await executor.get_mpra_pip_concordance_by_gene(gene, window, resource, min_pip)
@@ -2461,7 +2562,7 @@ def register_mcp_tools(
         min_mlogp: float = 7.3,
         min_info: float = 0.5,
         resource: str = "finngen",
-        max_rows: int = 200,
+        max_rows: Annotated[int, Field(ge=1, le=100_000)] = 200,
     ) -> dict:
         """Get every phenotype a classical HLA allele is associated with."""
         return await executor.get_hla_by_allele(

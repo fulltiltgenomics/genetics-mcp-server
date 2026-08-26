@@ -360,6 +360,22 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
     # the same sentences gated it away from exactly the SQL surfaces. Only the authoritative
     # source is per-surface, so only that clause is split out; the rules themselves are
     # written once and gated on having any credible-set path at all.
+    #
+    # THE "When in doubt, verify" SENTENCE BELOW HAS NO SQL VARIANT ON PURPOSE
+    # (genetics-results-suite-4h6.80). It names `get_credible_set_by_id`, so the gate keeps
+    # it off `bigquery`, `code` and `rag` — and that is the intended shape, not an oversight
+    # to be "completed". It only restates the membership rule directly above it, which DOES
+    # have a SQL variant and IS emitted on both SQL surfaces (verified by rendering the
+    # profiles); a SQL-worded copy would be the third statement of one rule on those
+    # surfaces, since the re-query block four `_Block`s later — the r² sanity-check block
+    # sits in between — already tells them to derive membership from a fresh `COUNT` over
+    # `credible_sets_v`.
+    #
+    # THE CONDITION UNDER WHICH THAT STOPS BEING TRUE: the redundancy is a content
+    # judgement, not a structural guarantee. If the membership block above is ever reworded
+    # so it no longer carries "verify before calling anything a member", the SQL surfaces
+    # lose that instruction with nothing to catch it. Reword that block and you must revisit
+    # this one.
     _Block(
         "\n**Membership is NOT the same as LD.** A variant is a member of a credible set ONLY if it is actually returned as a member by `get_credible_set_by_id` (or appears in the `credible_sets_v` rows for that `cs_id`)."
     ),
