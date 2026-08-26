@@ -1763,6 +1763,8 @@ Tools are defined once in `tools/definitions.py` with:
 - Parameter schemas (type, required, defaults)
 - Registration helpers for both FastMCP and Anthropic formats
 
+`get_anthropic_tools` also forwards `minimum`/`maximum`/`pattern` into each parameter's `input_schema`, so a numeric bound is a declared schema constraint rather than prose in the description that the model is merely asked to respect. Which parameters declare one follows the enforcement behind them: a REJECTED bound (the `sql_int`/`sql_float` sites, and the sandbox `timeout_s`) mirrors code that raises, and is also declared on the MCP surface as a pydantic `Annotated[..., Field(ge=, le=)]`, where it actually rejects; a CLAMPED bound (the `max_results`/`size` parameters) mirrors code that silently coerces an out-of-range value into range, so it is advisory-only on the Anthropic surface and deliberately not declared on MCP — rejecting there would break a live client sending a value that works today. A clamped bound is only declared where the clamp applies to every value that reaches it: `search_uniprot.size` declares no `minimum` because `size or _DEFAULT_SEARCH_SIZE` short-circuits on `0` and returns the default (25), not the floor. The full set of declared bounds is enumerated in the suite's `docs/chat-tool-reference.md`.
+
 The `ToolExecutor` class implements each tool as an async method that:
 1. Builds the request to the genetics API
 2. Handles errors and 404 responses gracefully
