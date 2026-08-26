@@ -259,7 +259,7 @@ because a withheld tool is a deployment fact and must not read as a passing outa
 |------|-------------|
 | `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
 | `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`). Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
-| `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated `session_id`; another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
+| `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated **`(sub, session_id)`** pair (`genetics-results-suite-dh3` — `session_id` alone is client-supplied and authorizes nothing); another user's or another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
 **All three are category `orchestration`**, not `general`: they hand work to another
 runtime rather than fetching data, which is what `launch_subagents` is. The category by
@@ -329,15 +329,27 @@ therefore dropped from 4 MiB to the transport's 512 KiB — a reduction, and the
 because the supervisor answers `413` above its own cap. The 100k-character **text**
 truncation survived the move: it bounds the model's context, which no transport cap does.
 
-**The name is resolved server-side against the session, and nothing else is addressable.**
-`run_analysis` records each completed execution's manifest in `_ArtifactManifests`
-(`tools/executor.py`) against the **authenticated** `session_id`; `llm_service._execute_tool`
-injects that session into `read_artifact` the same way it injects the identity into
-`run_analysis`, stripping any same-named key the model emitted, and the declared schema still
-has exactly one parameter, `name`. A name recorded under another session resolves to nothing
-and returns the **same** "not found" as a name that never existed. Within one session a
-collision resolves to the most recently completed execution that produced the name. The map
-is **in memory, bounded (512 sessions × 128 executions) and expires at the supervisor's
+**The name is resolved server-side against the authenticated USER AND session, and nothing
+else is addressable.** `run_analysis` records each completed execution's manifest in
+`_ArtifactManifests` (`tools/executor.py`) under the key **`(sub, sid)`**;
+`llm_service._execute_tool` injects that pair into `read_artifact` exactly as it injects the
+identity into `run_analysis`, stripping any same-named key the model emitted, and the declared
+schema still has exactly one parameter, `name`. **The user term is what makes the key an
+authorization** (`genetics-results-suite-dh3`): `session_id` arrives in the `/v1/chat` body and
+nothing validates it against the caller, so keying on it alone let one user put another's
+session id in their own request and read that user's artifacts; `sub` is server-derived
+(`get_authenticated_user`), so a stolen or guessed
+`sid` now resolves to nothing for anyone but its owner. **Both tools carry the gateway-asserted
+gate** (`genetics-results-suite-4h6.84`), and that is what the user term rests on:
+`get_authenticated_user` honours the proxy identity header from any holder of
+`INTERNAL_API_SECRET`, so a read path without the gate would have made `sub` exactly as
+forgeable as `sid` — `read_artifact` gained the same gate, with the same refusal, under `dh3`. A name recorded under another user or
+another session resolves to nothing and returns the **same** "not found" as a name that never
+existed, and both halves **fail closed**: a call missing either `user` or `session_id` reads
+nothing rather than falling back to the half it has, and a record missing either stores
+nothing. Within one key a collision resolves to the most recently completed execution that
+produced the name. The map is **in memory, bounded (512 `(sub, sid)` keys × 128 executions) and
+expires at the supervisor's
 300-second `RETENTION_S`** — persisting it would outlive both the artifacts and the
 supervisor-memory key that decrypts them, promising reads that can only come back `404` or
 `409`. `409 ArtifactModified` (a same-uid peer altered the file during retention) is surfaced
@@ -1243,9 +1255,13 @@ per turn underivable.
   analysis that was possible anyway, and leaving them would keep a permanent record that the user
   held a conversation and what it cost. The trade is that deleting one conversation also drops the
   opening turns of that user's *other* conversations; privacy wins it until the ids arrive.
-- **`message_id` is bounded at 64 characters** (`Field(None, max_length=64)`; uuid4 is 36). The
-  service has no request-body-size middleware, and unlike `session_id` — which is only logged —
-  this value is written to the shared RWO volume.
+- **`message_id` and `session_id` are each bounded at 64 characters** (`Field(None,
+  max_length=64)`; every producer emits a uuid4, 36 chars — `str(uuid.uuid4())` for persisted
+  sessions, `crypto.randomUUID()` for secret ones). The service has no request-body-size
+  middleware. `message_id` is written to the shared RWO volume; `session_id` used to be "only
+  logged", which is why it was originally unbounded, and is no longer: since
+  `genetics-results-suite-dh3` it is **half the artifact-manifest key**, so an unbounded
+  client-chosen string would be a caller-sized key in an in-memory map.
 - **Secret chat writes nothing**, checked before the database is reached. Counts and costs are not
   content, but a row keyed to a session id still says a conversation happened and what it cost,
   and secret chat is promised to leave no trace.
@@ -2250,7 +2266,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still degrades to general-only but logs a WARNING naming the value and the known set, once per distinct value and bounded, and the full profile key set (`TOOL_PROFILES | TOOL_PROFILE_TOOLS`) is pinned against a literal so adding or renaming one forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts` |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
-| `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s HTTP proxy and its session-scoped resolution (another session's name indistinguishable from a missing one, the most-recent-wins collision tiebreak, TTL expiry, the bounded map, the 512 KiB cap and the `409`/`413` mappings), the `artifacts_retained_in_clear` signal rendered only when true, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair |
+| `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s HTTP proxy and its `(sub, sid)`-scoped resolution (another **user** presenting this session id, and another session's name, both indistinguishable from a missing one — the cross-user negative for `genetics-results-suite-dh3` — the fail-closed answer when either half of the key is absent, the most-recent-wins collision tiebreak, TTL expiry, the bounded map, the 512 KiB cap and the `409`/`413` mappings), the `artifacts_retained_in_clear` signal rendered only when true, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair into **both** `run_analysis` and `read_artifact` |
 | `test_db.py` | Database operations, LLM-config write transaction safety, LLM-config journal mode (WAL, and the reader/writer concurrency it buys), same-second tiebreak in the tool-description, user-setting and user-comment accessors (`changed_at`/`created_at` have one-second resolution, so the later `id` wins; both row orders, blank timestamps, several keys tied at once), and malformed-stamp reads (a NULL or unparseable `changed_at` degrades to the epoch in the singular and plural accessors alike rather than raising or dropping the key, and a group holding both a NULL and a sentinel stamp, `''` or `0` — the one shape that separates the `IS` join from a coalescing one — resolves to the same row in both, and the comment and tool-history reads degrade the same way), chat-history write transaction safety (every write accessor over a failed DML and a failed commit, the retained lock, and the multi-DML writes rolled back whole), and the zone the write path returns (the saves, the version history and `add_user_comment` hand back aware UTC, as the reads do) |
 | `test_chat_history_router.py` | Chat history API |
 | `test_llm_config_router.py` | LLM config API |

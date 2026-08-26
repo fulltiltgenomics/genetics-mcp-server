@@ -1249,11 +1249,16 @@ class LLMService:
                         effective_input.pop("backend", None)
                         if literature_backend:
                             effective_input["backend"] = literature_backend
-                    if tool_use.name == "run_analysis":
+                    if tool_use.name in ("run_analysis", "read_artifact"):
                         # mirror the execution-side strip in _execute_tool: a model-invented
                         # identity is discarded before the call, so logging or showing it
                         # would make a forged `user` read as identity in a log join. The
-                        # authenticated pair is already on every line via log_prefix.
+                        # authenticated pair is already on every line via log_prefix. BOTH
+                        # identity-injected tools, not just run_analysis: execution was never
+                        # affected — _execute_tool strips read_artifact's too — but a model
+                        # emitting read_artifact(name=…, user="victim@…") otherwise put that
+                        # string into the operator log and into the `tool_use` disclosure the
+                        # client renders, which is the exact hazard this comment names.
                         effective_input.pop("user", None)
                         effective_input.pop("session_id", None)
                     if secret:
@@ -1644,16 +1649,28 @@ class LLMService:
                 # key is stripped above alongside the identity pair, for the same reason
                 tool_input["gateway_asserted"] = gateway_asserted
 
-            # read_artifact resolves a model-supplied NAME against the executions this SESSION
-            # ran (genetics-results-suite-4h6.52), so the session is the authorization and is
-            # injected the same way — stripped first, because the tool declares only `name`
-            # and tool_input is splatted verbatim. A model-supplied session_id would be a
-            # cross-session read of another conversation's artifacts.
+            # read_artifact resolves a model-supplied NAME against the executions this USER's
+            # SESSION ran (genetics-results-suite-4h6.52, dh3), so the authenticated pair is the
+            # authorization and is injected the same way as run_analysis's — stripped first,
+            # because the tool declares only `name` and tool_input is splatted verbatim. The
+            # `user` half is what makes the client-supplied `session_id` unusable on its own: a
+            # model- OR client-supplied session id alone would be a cross-user read of another
+            # person's artifacts.
+            #
+            # `gateway_asserted` comes with them, and it is what makes the `user` half mean
+            # anything: `get_authenticated_user` honours the identity header from any holder of
+            # INTERNAL_API_SECRET, so without the provenance flag a marker holder could name the
+            # victim as `user` and read that victim's artifacts. Same three keys as
+            # run_analysis, stripped and injected the same way.
             if tool_name == "read_artifact":
                 tool_input = {
-                    k: v for k, v in tool_input.items() if k not in ("user", "session_id")
+                    k: v
+                    for k, v in tool_input.items()
+                    if k not in ("user", "session_id", "gateway_asserted")
                 }
+                tool_input["user"] = user
                 tool_input["session_id"] = session_id
+                tool_input["gateway_asserted"] = gateway_asserted
 
             return await method(**tool_input)
 

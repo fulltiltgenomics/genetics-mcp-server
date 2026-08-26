@@ -32,7 +32,7 @@ def executor():
 
 @pytest.fixture(autouse=True)
 def _clean_manifest_registry():
-    """The sid -> execution map is process-wide state; no test may see another's rows."""
+    """The (sub, sid) -> execution map is process-wide state; no test may see another's rows."""
     executor_module._ARTIFACT_MANIFESTS.clear()
     yield
     executor_module._ARTIFACT_MANIFESTS.clear()
@@ -215,8 +215,14 @@ def _served(name, data, content_type=None):
     )
 
 
-def _record(session_id, execution_id, *names):
-    executor_module._ARTIFACT_MANIFESTS.record(session_id, execution_id, names)
+# the two identities every artifact test needs: the manifest key is (sub, sid), and USER_B
+# exists to present USER_A's session id (genetics-results-suite-dh3)
+USER_A = "a@finngen.fi"
+USER_B = "b@finngen.fi"
+
+
+def _record(session_id, execution_id, *names, user=USER_A):
+    executor_module._ARTIFACT_MANIFESTS.record(user, session_id, execution_id, names)
 
 
 class TestReadArtifactProxiesOverHTTP:
@@ -227,7 +233,7 @@ class TestReadArtifactProxiesOverHTTP:
         sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rsid\tpval\n")})
         executor._sandbox = sandbox
 
-        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["success"] is True
         assert result["encoding"] == "utf-8"
         assert result["content"] == "rsid\tpval\n"
@@ -240,7 +246,7 @@ class TestReadArtifactProxiesOverHTTP:
         executor._sandbox = _ArtifactSandbox(
             {"manhattan.png": _served("manhattan.png", PNG_HEADER, "image/png")}
         )
-        result = await executor.read_artifact(name="manhattan.png", session_id="conv-9")
+        result = await executor.read_artifact(name="manhattan.png", user=USER_A, session_id="conv-9")
         assert result["encoding"] == "base64"
         assert base64.b64decode(result["content"]) == PNG_HEADER
         assert result["content_type"] == "image/png"
@@ -252,6 +258,7 @@ class TestReadArtifactProxiesOverHTTP:
         assert set(params) == {"name"}
         signature = inspect.signature(ToolExecutor.read_artifact)
         assert signature.parameters["session_id"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert signature.parameters["user"].kind is inspect.Parameter.KEYWORD_ONLY
 
     async def test_no_local_filesystem_read_happens(self, executor, tmp_path, monkeypatch):
         """The whole point of the change: chat-backend's own /data holds chat_history.db.
@@ -266,7 +273,7 @@ class TestReadArtifactProxiesOverHTTP:
         monkeypatch.setenv("SUBAGENT_ALLOWED_PATHS", str(tmp_path))
         executor._sandbox = _ArtifactSandbox()
 
-        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["success"] is False
         assert "crown jewels" not in str(result)
         # nothing was even asked of the sandbox: the name resolves to no execution
@@ -290,7 +297,7 @@ class TestReadArtifactProxiesOverHTTP:
     async def test_rejects_anything_that_is_not_a_bare_name(self, executor, name):
         _record("conv-9", EXEC_A, name)
         executor._sandbox = _ArtifactSandbox({name: _served(name, b"x")})
-        result = await executor.read_artifact(name=name, session_id="conv-9")
+        result = await executor.read_artifact(name=name, user=USER_A, session_id="conv-9")
         assert result["success"] is False
         assert executor._sandbox.asked == []
 
@@ -305,8 +312,8 @@ class TestReadArtifactSessionScoping:
         _record("other-conv", EXEC_A, "secrets.tsv")
         executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
 
-        theirs = await executor.read_artifact(name="secrets.tsv", session_id="conv-9")
-        never = await executor.read_artifact(name="no-such-file.tsv", session_id="conv-9")
+        theirs = await executor.read_artifact(name="secrets.tsv", user=USER_A, session_id="conv-9")
+        never = await executor.read_artifact(name="no-such-file.tsv", user=USER_A, session_id="conv-9")
         assert theirs["success"] is False
         assert theirs["error"].replace("secrets.tsv", "X") == never["error"].replace(
             "no-such-file.tsv", "X"
@@ -323,7 +330,7 @@ class TestReadArtifactSessionScoping:
                 (EXEC_B, "manhattan.png"): _served("manhattan.png", b"new"),
             }
         )
-        result = await executor.read_artifact(name="manhattan.png", session_id="conv-9")
+        result = await executor.read_artifact(name="manhattan.png", user=USER_A, session_id="conv-9")
         assert result["content"] == "new"
         assert executor._sandbox.asked == [(EXEC_B, "manhattan.png")]
 
@@ -333,16 +340,36 @@ class TestReadArtifactSessionScoping:
         _record("conv-9", EXEC_A, "hits.tsv")
         _record("conv-9", EXEC_B, "manhattan.png")
         executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
-        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["success"] is True
         assert executor._sandbox.asked == [(EXEC_A, "hits.tsv")]
 
     async def test_a_call_with_no_session_reads_nothing(self, executor):
         _record("conv-9", EXEC_A, "hits.tsv")
         executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
-        result = await executor.read_artifact(name="hits.tsv", session_id=None)
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id=None)
         assert result["success"] is False
         assert executor._sandbox.asked == []
+
+    async def test_a_call_with_no_user_reads_nothing(self, executor):
+        """Fail CLOSED rather than falling back to session-only keying.
+
+        Nothing dispatches read_artifact without an authenticated user today (the MCP wrapper
+        passes neither half, and the tool is in _mcp_disabled besides), so this is the shape a
+        future unauthenticated or internal-only caller meets: half a key is not a weaker
+        authorization, it is none.
+        """
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        result = await executor.read_artifact(name="hits.tsv", user=None, session_id="conv-9")
+        assert result["success"] is False
+        assert result["error_type"] == "ArtifactNotFound"
+        assert executor._sandbox.asked == []
+
+    async def test_a_record_with_no_user_is_not_stored_at_all(self):
+        """The write half fails closed too, so no row can sit under a user-less key."""
+        _record("conv-9", EXEC_A, "hits.tsv", user=None)
+        assert executor_module._ARTIFACT_MANIFESTS._sessions == {}
 
     async def test_run_analysis_is_what_records_the_mapping(self, executor):
         body = _result_body(
@@ -357,14 +384,276 @@ class TestReadArtifactSessionScoping:
 
         sandbox.execute = execute
         executor._sandbox = sandbox
-        await executor.run_analysis(code="x", user="u@finngen.fi", session_id="conv-9")
+        await executor.run_analysis(code="x", user=USER_A, session_id="conv-9")
 
-        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["success"] is True
         # ...and only for that session
-        assert (await executor.read_artifact(name="hits.tsv", session_id="conv-8"))[
+        assert (await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-8"))[
             "success"
         ] is False
+
+
+class TestReadArtifactIsScopedToTheAuthenticatedUser:
+    """genetics-results-suite-dh3. `session_id` is CLIENT-SUPPLIED and unvalidated.
+
+    It arrives in the /v1/chat body and nothing checks it against the caller, so keying the
+    manifest on it alone let user B put user A's session id in B's own request and have B's
+    model read A's artifacts. The key carries the server-derived `sub` for that reason.
+    """
+
+    async def test_another_user_presenting_this_session_id_resolves_nothing(self, executor):
+        """THE CROSS-USER NEGATIVE. Same sid, different sub: A's artifact is invisible to B.
+
+        Byte-for-byte the same answer B gets for a name that never existed anywhere, because
+        "that name exists somewhere" is itself a cross-user fact.
+        """
+        _record("conv-9", EXEC_A, "secrets.tsv", user=USER_A)
+        executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
+
+        stolen = await executor.read_artifact(name="secrets.tsv", user=USER_B, session_id="conv-9")
+        never = await executor.read_artifact(
+            name="no-such-file.tsv", user=USER_B, session_id="conv-9"
+        )
+        assert stolen["success"] is False
+        assert stolen["error"].replace("secrets.tsv", "X") == never["error"].replace(
+            "no-such-file.tsv", "X"
+        )
+        assert stolen["error_type"] == never["error_type"] == "ArtifactNotFound"
+        assert set(stolen) == set(never)
+        # the sandbox was never asked, so nothing downstream can distinguish them either
+        assert executor._sandbox.asked == []
+
+    async def test_the_owner_still_reads_it(self, executor):
+        """The other half of the same fixture: the fix must not simply break the feature."""
+        _record("conv-9", EXEC_A, "secrets.tsv", user=USER_A)
+        executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
+
+        mine = await executor.read_artifact(name="secrets.tsv", user=USER_A, session_id="conv-9")
+        assert mine["success"] is True
+        assert mine["content"] == "data"
+        assert executor._sandbox.asked == [(EXEC_A, "secrets.tsv")]
+
+    async def test_the_same_name_in_each_users_own_session_stays_separate(self, executor):
+        """Two users, the SAME session id, each with their own row under it."""
+        _record("conv-9", EXEC_A, "report.tsv", user=USER_A)
+        _record("conv-9", EXEC_B, "report.tsv", user=USER_B)
+        executor._sandbox = _ArtifactSandbox(
+            {
+                (EXEC_A, "report.tsv"): _served("report.tsv", b"mine"),
+                (EXEC_B, "report.tsv"): _served("report.tsv", b"theirs"),
+            }
+        )
+        ours = await executor.read_artifact(name="report.tsv", user=USER_A, session_id="conv-9")
+        theirs = await executor.read_artifact(name="report.tsv", user=USER_B, session_id="conv-9")
+        assert ours["content"] == "mine"
+        assert theirs["content"] == "theirs"
+
+    async def test_run_analysis_records_against_the_authenticated_user(self, executor):
+        """End to end through the recording path rather than the registry: what run_analysis
+        writes is keyed on the `user` it was dispatched with.
+        """
+        body = _result_body(
+            artifacts=[{"name": "hits.tsv", "size": 4, "content_type": "text/tab-separated-values"}]
+        )
+        sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+
+        async def execute(**kwargs):
+            return body
+
+        sandbox.execute = execute
+        executor._sandbox = sandbox
+        await executor.run_analysis(code="x", user=USER_A, session_id="conv-9")
+
+        mine = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
+        theirs = await executor.read_artifact(name="hits.tsv", user=USER_B, session_id="conv-9")
+        assert mine["success"] is True
+        assert theirs["success"] is False
+
+    def test_the_manifest_key_carries_a_user_term(self):
+        """A guard on the shape itself: a future refactor back to a bare sid must fail here."""
+        registry = executor_module._ArtifactManifests()
+        registry.record(USER_A, "conv-9", EXEC_A, ["hits.tsv"])
+        assert list(registry._sessions) == [(USER_A, "conv-9")]
+        assert registry.resolve(USER_B, "conv-9", "hits.tsv") is None
+        assert registry.resolve(USER_A, "conv-9", "hits.tsv") == EXEC_A
+
+
+class TestReadArtifactRequiresTheGatewaySecret:
+    """genetics-results-suite-dh3, the half the first pass missed.
+
+    Keying the manifest on `user` is worth nothing while `user` itself is forgeable on the
+    read path. `get_authenticated_user` honours `X-Goog-Authenticated-User-Email` from any
+    caller holding INTERNAL_API_SECRET (mcp-server and results-api do, and the NetworkPolicy
+    admits mcp-server to chat-backend:8000), so before this gate a marker holder could name
+    the victim and read the victim's artifacts — MEASURED: gateway_asserted=False returned
+    the victim's content while the same call to run_analysis was refused. This is the same
+    gate run_analysis has had since genetics-results-suite-4h6.84, in the same shape.
+    """
+
+    @staticmethod
+    def _plant(executor):
+        _record("conv-9", EXEC_A, "secrets.tsv")
+        sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"VICTIM-SECRET")})
+        executor._sandbox = sandbox
+        return sandbox
+
+    async def test_an_identity_the_gateway_did_not_assert_is_refused(self, executor):
+        """The probe, as a test: the victim's own key, and it still reads nothing."""
+        sandbox = self._plant(executor)
+        with settings_env(REQUIRE_AUTH="true"):
+            result = await executor.read_artifact(
+                name="secrets.tsv", user=USER_A, session_id="conv-9"
+            )
+
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+        assert sandbox.asked == [], "nothing may be fetched from the sandbox"
+        assert "VICTIM-SECRET" not in str(result)
+
+    async def test_the_gateway_assertion_is_what_reads(self, executor):
+        """The control. Identical call, stating the provenance auth-gateway alone can state.
+
+        Without this the refusal above would prove nothing — something other than the gate
+        could be stopping it.
+        """
+        sandbox = self._plant(executor)
+        with settings_env(REQUIRE_AUTH="true"):
+            result = await executor.read_artifact(
+                name="secrets.tsv", user=USER_A, session_id="conv-9", gateway_asserted=True
+            )
+
+        assert result["success"] is True
+        assert result["content"] == "VICTIM-SECRET"
+        assert sandbox.asked == [(EXEC_A, "secrets.tsv")]
+
+    async def test_the_refusal_does_not_depend_on_the_name(self, executor):
+        """It is a property of the CALLER, so it cannot be an existence oracle: a name that
+        was never recorded gets the same answer as one that was.
+        """
+        self._plant(executor)
+        with settings_env(REQUIRE_AUTH="true"):
+            recorded = await executor.read_artifact(
+                name="secrets.tsv", user=USER_A, session_id="conv-9"
+            )
+            never = await executor.read_artifact(
+                name="no-such-file.tsv", user=USER_A, session_id="conv-9"
+            )
+        assert recorded == never
+
+    async def test_local_dev_without_a_gateway_still_reads(self, executor):
+        """Gated on require_auth exactly as the dispatch is: REQUIRE_AUTH=false means there
+        is no oauth2-proxy and no gateway, so the flag could never be true there.
+        """
+        self._plant(executor)
+        with settings_env(REQUIRE_AUTH="false"):
+            result = await executor.read_artifact(
+                name="secrets.tsv", user=USER_A, session_id="conv-9"
+            )
+        assert result["success"] is True
+
+    async def test_the_default_is_closed(self):
+        """A future caller that forgets to plumb the flag loses reads rather than inheriting
+        trust, and the model cannot supply it: the declared schema is still one parameter.
+        """
+        signature = inspect.signature(ToolExecutor.read_artifact)
+        parameter = signature.parameters["gateway_asserted"]
+        assert parameter.default is False
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        assert set(by_name["read_artifact"]["parameters"]) == {"name"}
+
+    async def test_llm_service_injects_the_provenance_and_strips_the_models(self, monkeypatch):
+        """The gate is only worth what the wiring is: the chat path must pass the real flag
+        and discard any `gateway_asserted` the model emitted, same as run_analysis's.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+        from genetics_mcp_server.llm_service import LLMService
+
+        seen = {}
+
+        class _Recorder:
+            async def read_artifact(self, **kwargs):
+                seen.update(kwargs)
+                return {"success": True}
+
+        service = LLMService.__new__(LLMService)
+        service.executor = _Recorder()
+        service.subagent_service = None
+
+        monkeypatch.setenv("SANDBOX_ENABLED", "true")
+        settings_module.get_settings.cache_clear()
+        try:
+            await service._execute_tool(
+                "read_artifact",
+                {
+                    "name": "hits.tsv",
+                    "user": "attacker@evil.example",
+                    "session_id": "other",
+                    "gateway_asserted": True,
+                },
+                None,
+                "real@finngen.fi",
+                "conv-7",
+            )
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert seen["user"] == "real@finngen.fi"
+        assert seen["session_id"] == "conv-7"
+        assert seen["gateway_asserted"] is False, "the model's claim is discarded, not honoured"
+
+    def test_the_display_strip_covers_read_artifact_too(self):
+        """Log and disclosure integrity, not access. `_execute_tool` strips the model's
+        `user` before the call either way, but the "Executing tool:" line and the `tool_use`
+        SSE chunk the client renders are built from the model's RAW input, so a model
+        emitting read_artifact(name=…, user="victim@…") put a forged identity into an
+        operator log join. Structural because the strip sits inside a long streaming
+        generator with no seam to call.
+        """
+        from genetics_mcp_server.llm_service import LLMService
+
+        source = inspect.getsource(LLMService._stream_anthropic)
+        assert 'if tool_use.name in ("run_analysis", "read_artifact"):' in source
+        assert 'effective_input.pop("user", None)' in source
+        assert 'effective_input.pop("session_id", None)' in source
+
+
+class TestReadArtifactFailsClosedOnAMalformedIdentity:
+    """The guard is meant to be TOTAL, not total-given-the-current-argument type.
+
+    Unreachable today: `get_authenticated_user` returns `str | None`. But an unhashable
+    identity used to raise out of the `(sub, sid)` tuple lookup, which is a response shape
+    distinct from ArtifactNotFound on a security path.
+    """
+
+    @pytest.mark.parametrize("identity", [["a@finngen.fi"], {"sub": "a"}, 7, object()])
+    async def test_a_non_string_user_reads_nothing(self, executor, identity):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        result = await executor.read_artifact(
+            name="hits.tsv", user=identity, session_id="conv-9", gateway_asserted=True
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "ArtifactNotFound"
+        assert executor._sandbox.asked == []
+
+    @pytest.mark.parametrize("identity", [["conv-9"], {"sid": "conv-9"}, 7])
+    async def test_a_non_string_session_reads_nothing(self, executor, identity):
+        _record("conv-9", EXEC_A, "hits.tsv")
+        executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
+        result = await executor.read_artifact(
+            name="hits.tsv", user=USER_A, session_id=identity, gateway_asserted=True
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "ArtifactNotFound"
+
+    def test_the_store_itself_stores_nothing_for_one(self):
+        registry = executor_module._ArtifactManifests()
+        registry.record(["a@finngen.fi"], "conv-9", EXEC_A, ["hits.tsv"])
+        assert registry._sessions == {}
+        assert registry.resolve(["a@finngen.fi"], "conv-9", "hits.tsv") is None
 
 
 class TestReadArtifactLifetime:
@@ -380,27 +669,27 @@ class TestReadArtifactLifetime:
         clock = {"now": 1000.0}
         monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock["now"])
 
-        registry.record("conv-9", EXEC_A, ["hits.tsv"])
+        registry.record(USER_A, "conv-9", EXEC_A, ["hits.tsv"])
         executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
-        assert (await executor.read_artifact(name="hits.tsv", session_id="conv-9"))["success"]
+        assert (await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9"))["success"]
 
         clock["now"] += 61
-        expired = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        expired = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert expired["success"] is False
         assert expired["error_type"] == "ArtifactNotFound"
 
     def test_the_map_is_bounded_in_both_dimensions(self):
         registry = executor_module._ArtifactManifests()
         for i in range(registry._MAX_SESSIONS + 50):
-            registry.record(f"conv-{i}", EXEC_A, ["a.txt"])
+            registry.record(USER_A, f"conv-{i}", EXEC_A, ["a.txt"])
         assert len(registry._sessions) == registry._MAX_SESSIONS
         # the oldest sessions were dropped, the newest kept
-        assert "conv-0" not in registry._sessions
-        assert f"conv-{registry._MAX_SESSIONS + 49}" in registry._sessions
+        assert (USER_A, "conv-0") not in registry._sessions
+        assert (USER_A, f"conv-{registry._MAX_SESSIONS + 49}") in registry._sessions
 
         for i in range(registry._MAX_EXECUTIONS + 20):
-            registry.record("conv-x", f"{i:08d}-0000-4000-8000-000000000000", ["a.txt"])
-        assert len(registry._sessions["conv-x"]) == registry._MAX_EXECUTIONS
+            registry.record(USER_A, "conv-x", f"{i:08d}-0000-4000-8000-000000000000", ["a.txt"])
+        assert len(registry._sessions[(USER_A, "conv-x")]) == registry._MAX_EXECUTIONS
 
     def test_nothing_persists_the_map(self):
         """A persisted row would outlive both the artifacts and the supervisor-memory key
@@ -427,7 +716,7 @@ class TestReadArtifactCaps:
         _record("conv-9", EXEC_A, "big.txt")
         payload = ("x" * (ToolExecutor._MAX_ARTIFACT_TEXT_CHARS + 500)).encode()
         executor._sandbox = _ArtifactSandbox({"big.txt": _served("big.txt", payload)})
-        result = await executor.read_artifact(name="big.txt", session_id="conv-9")
+        result = await executor.read_artifact(name="big.txt", user=USER_A, session_id="conv-9")
         assert result["truncated"] is True
         assert len(result["content"]) == ToolExecutor._MAX_ARTIFACT_TEXT_CHARS
         assert result["size"] == len(payload)
@@ -441,7 +730,7 @@ class TestReadArtifactCaps:
                 )
             }
         )
-        result = await executor.read_artifact(name="huge.bin", session_id="conv-9")
+        result = await executor.read_artifact(name="huge.bin", user=USER_A, session_id="conv-9")
         assert result["error_type"] == "ArtifactTooLarge"
         assert result["retryable"] is False
         assert str(ToolExecutor._MAX_ARTIFACT_BYTES) in result["error"]
@@ -459,7 +748,7 @@ class TestReadArtifactErrorMapping:
                 )
             }
         )
-        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["success"] is False
         assert result["error_type"] == "ArtifactModified"
         assert result["retryable"] is False
@@ -469,7 +758,7 @@ class TestReadArtifactErrorMapping:
     async def test_a_404_from_the_sandbox_says_the_window_may_have_passed(self, executor):
         _record("conv-9", EXEC_A, "gone.tsv")
         executor._sandbox = _ArtifactSandbox()
-        result = await executor.read_artifact(name="gone.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="gone.tsv", user=USER_A, session_id="conv-9")
         assert result["error_type"] == "ArtifactNotFound"
         assert result["retryable"] is False
 
@@ -482,7 +771,7 @@ class TestReadArtifactErrorMapping:
                 )
             }
         )
-        result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["error_type"] == "ArtifactUnavailable"
         assert result["retryable"] is True
 
@@ -795,7 +1084,7 @@ class TestRunAnalysisFailsClosed:
         monkeypatch.delenv("SANDBOX_URL", raising=False)
         settings_module.get_settings.cache_clear()
         try:
-            result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+            result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         finally:
             settings_module.get_settings.cache_clear()
 
@@ -1538,17 +1827,18 @@ def test_script_result_payload_marks_a_sandbox_fault_as_not_run(executor):
 
 
 class TestReadArtifactSessionInjection:
-    """The session is the authorization, so it is injected exactly the way run_analysis's is."""
+    """The authenticated (user, session) pair is the authorization, so it is injected exactly the
+    way run_analysis's is."""
 
     @staticmethod
-    async def _dispatch(executor, tool_input, session_id="conv-9"):
+    async def _dispatch(executor, tool_input, session_id="conv-9", user=USER_A):
         from genetics_mcp_server.llm_service import LLMService
 
         service = LLMService.__new__(LLMService)
         service.executor = executor
         service.subagent_service = None
         return await service._execute_tool(
-            "read_artifact", tool_input, None, "u@finngen.fi", session_id, False
+            "read_artifact", tool_input, None, user, session_id, False
         )
 
     async def test_the_authenticated_session_is_injected(self, executor):
@@ -1566,6 +1856,19 @@ class TestReadArtifactSessionInjection:
         result = await self._dispatch(
             executor, {"name": "secrets.tsv", "session_id": "other-conv", "user": "x@y.z"}
         )
+        assert result["success"] is False
+        assert result["error_type"] == "ArtifactNotFound"
+        assert executor._sandbox.asked == []
+
+    async def test_a_second_user_dispatching_with_the_first_users_session_reads_nothing(
+        self, executor
+    ):
+        """genetics-results-suite-dh3 through the real dispatch path: `session_id` is what the
+        CLIENT put in the /v1/chat body, so B naming A's session must not reach A's artifacts.
+        """
+        _record("conv-9", EXEC_A, "secrets.tsv", user=USER_A)
+        executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
+        result = await self._dispatch(executor, {"name": "secrets.tsv"}, user=USER_B)
         assert result["success"] is False
         assert result["error_type"] == "ArtifactNotFound"
         assert executor._sandbox.asked == []

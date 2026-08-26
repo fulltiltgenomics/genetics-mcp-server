@@ -405,15 +405,46 @@ ARTIFACT_READ_MAX_BYTES = 512 * 1024
 ARTIFACT_RETENTION_S = 300
 
 
+def _is_identity(value: Any) -> bool:
+    """A usable half of an artifact key: a non-empty string, and nothing else.
+
+    `isinstance` rather than truthiness so every guard below is TOTAL. A non-str identity is
+    unhashable and would raise out of the `(sub, sid)` tuple lookup instead of failing closed
+    — a distinct response shape on a security path. `get_authenticated_user` returns
+    `str | None`, so nothing produces one today; the guard is meant to hold regardless.
+    """
+    return isinstance(value, str) and bool(value)
+
+
 class _ArtifactManifests:
-    """`sid` -> the artifacts each of that session's recent executions reported writing.
+    """`(sub, sid)` -> the artifacts each of that session's recent executions reported writing.
 
     THE AUTHORIZATION STATE FOR `read_artifact` (genetics-results-suite-4h6.52). `run_analysis`
-    records a completed execution's manifest here against the AUTHENTICATED session; the tool
-    resolves a model-supplied NAME against it and can address nothing else. A name recorded
-    under another `sid` is not merely refused, it is invisible: `resolve` looks in one session's
-    rows and returns `None` for everything else, which is the same answer a name that never
-    existed gets.
+    records a completed execution's manifest here against the AUTHENTICATED user AND session;
+    the tool resolves a model-supplied NAME against it and can address nothing else. A name
+    recorded under another key is not merely refused, it is invisible: `resolve` looks in one
+    key's rows and returns `None` for everything else, which is the same answer a name that
+    never existed gets.
+
+    THE KEY CARRIES A USER TERM, AND THAT IS THE WHOLE OF genetics-results-suite-dh3. `sid` is
+    the CLIENT'S value: it arrives in the `/v1/chat` body and is never checked against the
+    caller, so keying on it alone meant user B could put user A's session id in B's own request
+    and have B's model read A's artifacts. `sub` is the half that is not the caller's to choose,
+    but only because BOTH tools that touch this map require the auth-gateway provenance
+    assertion: `get_authenticated_user` honours the proxy identity header from any caller
+    presenting INTERNAL_API_SECRET, so `sub` is exactly as forgeable as `sid` to a marker holder
+    until `gateway_asserted` is required. `run_analysis` has required it since
+    genetics-results-suite-4h6.84 and `read_artifact` now does too — a read path without it made
+    the user term a value the attacker supplied. With the gate on both, pairing the two makes a
+    stolen or guessed `sid` resolve to nothing for anyone but its owner. The
+    supervisor deliberately has no matching check (sandbox/supervisor.py: the sid-scoped
+    resolution "belongs in chat-backend, the only side that knows which session owns which
+    execution"), so this key is the only place the ownership question is asked.
+
+    FAILS CLOSED ON A MISSING USER. `record` with no `sub` stores nothing and `resolve` with no
+    `sub` returns `None`, rather than falling back to a session-only key — an unauthenticated or
+    internal-only caller must not be able to write into, or read out of, a scope that a real
+    user's `sub` would otherwise share.
 
     IN MEMORY, WITH A TTL MATCHED TO THE SUPERVISOR'S RETENTION, AND DELIBERATELY NOT
     PERSISTED. The thing this maps to is deleted by the supervisor `ARTIFACT_RETENTION_S`
@@ -451,9 +482,10 @@ class _ArtifactManifests:
         script if you need it again", which is the correct instruction for that state. That is
         the trade: a bounded map, and a legitimate read can 404 in a session that ran more than
         128 artifact-producing analyses in five minutes.
-      * `_MAX_SESSIONS = 512` is an LRU cap on concurrently active chat sessions, evicted by
-        last write. Rows also expire with the retention window on every `record`/`resolve`, so
-        this only binds when more than 512 sessions are live at once in one replica.
+      * `_MAX_SESSIONS = 512` is an LRU cap on concurrently active `(sub, sid)` KEYS, evicted
+        by last write — one user's one session is one key, so a user with several live chats
+        holds several. Rows also expire with the retention window on every `record`/`resolve`,
+        so this only binds when more than 512 such keys are live at once in one replica.
     """
 
     _MAX_SESSIONS = 512
@@ -462,42 +494,54 @@ class _ArtifactManifests:
     def __init__(self, ttl_s: float = ARTIFACT_RETENTION_S) -> None:
         self._ttl_s = ttl_s
         self._lock = threading.Lock()
-        # sid -> list of (recorded_at, execution_id, {names}), oldest first
-        self._sessions: OrderedDict[str, list[tuple[float, str, set[str]]]] = OrderedDict()
+        # (sub, sid) -> list of (recorded_at, execution_id, {names}), oldest first
+        self._sessions: OrderedDict[tuple[str, str], list[tuple[float, str, set[str]]]] = (
+            OrderedDict()
+        )
 
-    def record(self, session_id: str, execution_id: str, names: Iterable[str]) -> None:
+    def record(
+        self, user: str | None, session_id: str | None, execution_id: str, names: Iterable[str]
+    ) -> None:
         wanted = {n for n in names if isinstance(n, str) and n}
-        if not session_id or not execution_id or not wanted:
+        # no `user` means no owner to attribute the artifacts to, so nothing is recorded
+        # rather than recorded under a session-only key another identity could reach
+        if not _is_identity(user) or not _is_identity(session_id) or not execution_id or not wanted:
             return
+        key = (user, session_id)
         now = time.monotonic()
         with self._lock:
-            rows = self._sessions.get(session_id)
+            rows = self._sessions.get(key)
             if rows is None:
                 rows = []
-                self._sessions[session_id] = rows
+                self._sessions[key] = rows
             rows.append((now, execution_id, wanted))
             # if _MAX_EXECUTIONS is ever set to 0 this is a no-op (rows[:-0] == rows[:0]),
             # so the trim silently stops trimming; correct at 128, nothing sets it to 0 today
             del rows[: -self._MAX_EXECUTIONS]
-            self._sessions.move_to_end(session_id)
+            self._sessions.move_to_end(key)
             self._expire(now)
             while len(self._sessions) > self._MAX_SESSIONS:
                 self._sessions.popitem(last=False)
 
-    def resolve(self, session_id: str, name: str) -> str | None:
-        """The execution this session's `name` refers to, or None.
+    def resolve(self, user: str | None, session_id: str | None, name: str) -> str | None:
+        """The execution this user's session `name` refers to, or None.
 
         MOST RECENT WINS. Two executions in one session can both write `manhattan.png`, and the
         model is asking about the one it was just told about; a stale-first rule would quietly
         hand back a previous turn's plot under the right name, which is a wrong answer rather
         than a loud failure.
+
+        A MISSING `user` RESOLVES TO NOTHING, deliberately and not incidentally: without a
+        server-derived subject there is no authorization to make, and a session-only lookup is
+        exactly the cross-user read this key exists to prevent.
         """
-        if not session_id or not name:
+        if not _is_identity(user) or not _is_identity(session_id) or not name:
             return None
+        key = (user, session_id)
         now = time.monotonic()
         with self._lock:
             self._expire(now)
-            rows = self._sessions.get(session_id)
+            rows = self._sessions.get(key)
             if not rows:
                 return None
             for _, execution_id, names in reversed(rows):
@@ -508,12 +552,12 @@ class _ArtifactManifests:
     def _expire(self, now: float) -> None:
         """Caller holds the lock. Drop rows past the retention window, then empty sessions."""
         cutoff = now - self._ttl_s
-        for session_id in list(self._sessions):
-            rows = [row for row in self._sessions[session_id] if row[0] > cutoff]
+        for key in list(self._sessions):
+            rows = [row for row in self._sessions[key] if row[0] > cutoff]
             if rows:
-                self._sessions[session_id] = rows
+                self._sessions[key] = rows
             else:
-                del self._sessions[session_id]
+                del self._sessions[key]
 
     def clear(self) -> None:
         with self._lock:
@@ -5712,22 +5756,49 @@ class ToolExecutor:
     # act on: `truncated: true` tells the model to have the script summarise instead.
     _MAX_ARTIFACT_TEXT_CHARS = 100_000
 
-    async def read_artifact(self, name: str, *, session_id: str | None = None) -> dict[str, Any]:
-        """Read one artifact of THIS CHAT SESSION'S recent runs, over HTTP from the sandbox.
+    async def read_artifact(
+        self,
+        name: str,
+        *,
+        user: str | None = None,
+        session_id: str | None = None,
+        gateway_asserted: bool = False,
+    ) -> dict[str, Any]:
+        """Read one artifact of THIS USER'S CHAT SESSION'S recent runs, over HTTP from the sandbox.
 
         `name` is a bare file name, never a path and never an execution id: the model learns
-        names from a run's artifact manifest, and nothing else is addressable. `session_id` is
-        supplied by the CALLER (llm_service injects the authenticated session, and strips any
-        same-named key the model emitted); the declared schema has one parameter, `name`.
+        names from a run's artifact manifest, and nothing else is addressable. `user` and
+        `session_id` are supplied by the CALLER (llm_service injects the authenticated pair,
+        and strips any same-named key the model emitted); the declared schema has one
+        parameter, `name`.
 
         RESOLUTION IS SERVER-SIDE AND IS THE AUTHORIZATION. The name is resolved against
         `_ARTIFACT_MANIFESTS`, which `run_analysis` populates with what each execution of this
-        `sid` reported producing. An artifact belonging to another session resolves to nothing
-        and returns the SAME "not found" as a name that never existed — the two are
-        deliberately indistinguishable, because knowing that a name exists somewhere is
-        already a cross-session fact. Within one `sid`, a name that two executions both
-        produced resolves to the most recently completed one still inside the retention
-        window (`_ARTIFACT_MANIFESTS.resolve`).
+        `(sub, sid)` reported producing. An artifact belonging to another user or another
+        session resolves to nothing and returns the SAME "not found" as a name that never
+        existed — the three are deliberately indistinguishable, because knowing that a name
+        exists somewhere is already a cross-session fact. Within one key, a name that two
+        executions both produced resolves to the most recently completed one still inside the
+        retention window (`_ARTIFACT_MANIFESTS.resolve`).
+
+        THE USER TERM IS NOT DECORATION (genetics-results-suite-dh3). `session_id` is
+        client-supplied and unvalidated, so it authorizes nothing on its own; `user` is the
+        subject `get_authenticated_user` produced, the same value that becomes the `sub` of
+        the per-execution credential. A read presenting somebody else's session id lands on a
+        key that does not exist.
+
+        AND `user` IS ONLY UNFORGEABLE BECAUSE OF THE GATE BELOW, which is why this tool has
+        the same one `run_analysis` does. `get_authenticated_user` honours
+        `X-Goog-Authenticated-User-Email` from any caller presenting INTERNAL_API_SECRET —
+        mcp-server and results-api hold it by design and the NetworkPolicy admits mcp-server
+        to chat-backend:8000 — so without `gateway_asserted` a marker holder could name the
+        victim as `user`, supply the victim's `sid`, and the (sub, sid) key would resolve. The
+        write path was gated and the read path was not, which made keying on `user` a
+        statement about a value the attacker chose. `gateway_asserted` is the auth-gateway
+        provenance assertion (genetics-results-suite-4h6.84); it defaults False so a caller
+        that states no provenance fails closed. Nothing legitimate loses access: an artifact
+        only exists to be read because `run_analysis` recorded it, and that dispatch already
+        refused every caller this gate refuses.
 
         NO LOCAL FILESYSTEM READ HAPPENS HERE, and that is the point of the change rather
         than an implementation detail. This process is chat-backend, whose `/data` PVC holds
@@ -5738,6 +5809,29 @@ class ToolExecutor:
         actually is. `SANDBOX_ARTIFACTS_DIR` gains no reader here and neither does
         `SUBAGENT_ALLOWED_PATHS`.
         """
+        if not gateway_asserted and getattr(_resolve_settings(), "require_auth", True):
+            # THE SAME GATE `run_analysis` HAS, for the same reason and in the same shape
+            # (genetics-results-suite-4h6.84, dh3). A holder of INTERNAL_API_SECRET can send
+            #     X-Internal-Auth: <secret>  +  X-Goog-Authenticated-User-Email: victim@…
+            # and arrive with `user` set to anybody; only `X-Gateway-Auth` separates a real
+            # browser session from that, and auth-gateway is the only other holder of it.
+            # Gated on require_auth exactly as the dispatch is: REQUIRE_AUTH=false is local
+            # dev, where there is no gateway to assert anything.
+            #
+            # Refused BEFORE the name is even examined, and with the operator error rather
+            # than `not_found`: this is a property of the caller, not of the name, so it
+            # leaks nothing about what exists — the answer is identical for every `name`.
+            logger.error(
+                "read_artifact refused for an identity the gateway did not assert "
+                "(session=%s): the caller presented the internal marker without the "
+                "auth-gateway provenance secret",
+                session_id,
+            )
+            return self._sandbox_operator_error(
+                "Reading analysis artifacts requires an authenticated user session and is "
+                "not available to service callers."
+            )
+
         if not isinstance(name, str) or not name.strip():
             return {"success": False, "error": "An artifact name is required."}
         name = name.strip()
@@ -5768,14 +5862,28 @@ class ToolExecutor:
             "retryable": False,
         }
 
-        if not session_id:
-            # a wiring fault, not a model error: nothing dispatches this tool without a
-            # session today (it is excluded from MCP and from every subagent skill), so
-            # reaching here means a new caller forgot the injection
-            logger.error("read_artifact called with no session; refusing the read")
+        if not _is_identity(user) or not _is_identity(session_id):
+            # a wiring fault, not a model error: nothing dispatches this tool without an
+            # authenticated user and a session today (it is excluded from MCP and from every
+            # subagent skill), so reaching here means a new caller forgot the injection.
+            # Refused rather than resolved on whichever half arrived — half a key is not a
+            # weaker authorization, it is none.
+            #
+            # `isinstance` and not just truthiness so the guard is TOTAL: a non-str identity
+            # (a list, a dict) is unhashable and would raise out of the tuple lookup instead
+            # of failing closed, giving a caller a response shape distinct from
+            # ArtifactNotFound. `get_authenticated_user` returns `str | None` today, so this
+            # is unreachable — a security guard that is total by construction is worth more
+            # than one that is total by the current type of its argument.
+            logger.error(
+                "read_artifact called without an authenticated identity (user=%s session=%s); "
+                "refusing the read",
+                bool(user),
+                bool(session_id),
+            )
             return not_found
 
-        execution_id = _ARTIFACT_MANIFESTS.resolve(session_id, name)
+        execution_id = _ARTIFACT_MANIFESTS.resolve(user, session_id, name)
         if execution_id is None:
             return not_found
 
@@ -6227,23 +6335,29 @@ class ToolExecutor:
                 "retryable": True,
             }
 
-        self._record_artifact_manifest(result, session_id)
+        self._record_artifact_manifest(result, user, session_id)
         return self._render_analysis(result, images=await self._fetch_analysis_images(result))
 
     @staticmethod
-    def _record_artifact_manifest(result: dict[str, Any], session_id: str | None) -> None:
-        """Bind what this execution wrote to the session that ran it, for `read_artifact`.
+    def _record_artifact_manifest(
+        result: dict[str, Any], user: str | None, session_id: str | None
+    ) -> None:
+        """Bind what this execution wrote to the user and session that ran it, for `read_artifact`.
 
-        THE ONLY PLACE THE (sid, execution_id) PAIR EXISTS. `execution_id` is minted per call
-        and deliberately never shown to the model, so this is the last point at which the two
-        halves are both in scope; without the record there is nothing for a name to resolve
+        THE ONLY PLACE THE (sub, sid, execution_id) TRIPLE EXISTS. `execution_id` is minted per
+        call and deliberately never shown to the model, so this is the last point at which the
+        parts are all in scope; without the record there is nothing for a name to resolve
         against and `read_artifact` can only 404.
+
+        `user` is the same server-derived subject `run_analysis` refused to dispatch without and
+        minted both per-execution JWTs against, so a row can never be attributed to an identity
+        the caller merely asserted (genetics-results-suite-dh3).
 
         Recorded for a FAILED status too, when the supervisor still reported a manifest: a
         script that raised after writing its plot has produced a real, retained artifact, and
         the manifest is what the supervisor is willing to serve either way.
         """
-        if not session_id or not isinstance(result, dict):
+        if not user or not session_id or not isinstance(result, dict):
             return
         execution_id = result.get("execution_id")
         entries = result.get("artifacts")
@@ -6254,7 +6368,7 @@ class ToolExecutor:
             for entry in entries
             if isinstance(entry, dict) and isinstance(entry.get("name"), str) and entry["name"]
         ]
-        _ARTIFACT_MANIFESTS.record(session_id, execution_id, names)
+        _ARTIFACT_MANIFESTS.record(user, session_id, execution_id, names)
 
     # How many image artifacts one script may have shown for it. A script that writes fifty
     # PNGs is not asking for fifty pictures in the transcript, and each one is a fetch the

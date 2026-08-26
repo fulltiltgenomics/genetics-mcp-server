@@ -319,8 +319,14 @@ class ChatRequest(BaseModel):
     )
     session_id: str | None = Field(
         None,
+        max_length=64,
         description="Client conversation id. Logged (id only, never content) so distinct "
-        "conversations can be counted, including secret ones.",
+        "conversations can be counted, including secret ones. Bounded at 64 characters for "
+        "the same reason message_id below is, and since genetics-results-suite-dh3 for a "
+        "second one: this value is now HALF THE ARTIFACT MANIFEST KEY, so an unbounded "
+        "client-chosen string would be a caller-sized key in an in-memory map, and the "
+        "service has no request-body-size middleware. Every producer emits a uuid4 (36 "
+        "chars): persisted ids are str(uuid.uuid4()), secret chats use crypto.randomUUID().",
     )
     capture_thinking: bool = Field(
         False,
