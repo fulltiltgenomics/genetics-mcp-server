@@ -754,6 +754,55 @@ class TestRunAnalysisFailsClosed:
         assert result["error_type"] == "SandboxNotConfigured"
         assert result["retryable"] is False
 
+    async def test_an_unset_sandbox_url_is_an_operator_error_and_sends_nothing(
+        self, executor, monkeypatch
+    ):
+        """The sibling of the signing-key case (genetics-results-suite-6um).
+
+        SANDBOX_URL has no default any more, so an unconfigured deployment cannot build a
+        client at all. SandboxNotConfigured is a SandboxError subclass and the family's
+        fallback clause answers `retryable: True`; this pins the non-retryable answer, so
+        an edit that let the generic clause take this case fails here instead of silently
+        flipping the payload the model reads.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+
+        monkeypatch.delenv("SANDBOX_URL", raising=False)
+        settings_module.get_settings.cache_clear()
+        try:
+            result = await executor.run_analysis(
+                code="print(1)", user="u@finngen.fi", session_id="conv-9"
+            )
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+
+    async def test_read_artifact_answers_the_same_way_rather_than_raising(
+        self, executor, monkeypatch
+    ):
+        """The second toucher of `_sandbox`, and it has no try/except of its own.
+
+        The manifest lookup succeeds before the transport is ever needed, so without the
+        shared guard the cached_property's constructor raises straight out of the tool
+        call — a bare exception where every other failure of this tool is a dict.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+
+        _record("conv-9", EXEC_A, "hits.tsv")
+        monkeypatch.delenv("SANDBOX_URL", raising=False)
+        settings_module.get_settings.cache_clear()
+        try:
+            result = await executor.read_artifact(name="hits.tsv", session_id="conv-9")
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert result["success"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert result["retryable"] is False
+
     async def test_the_house_error_style_does_not_swallow_it(self, executor):
         """~40 handlers in this module wrap their body in `except Exception`, and
         SandboxTokenUnavailable is a plain RuntimeError. Written that way, this handler

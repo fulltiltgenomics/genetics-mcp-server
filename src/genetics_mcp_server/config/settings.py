@@ -65,10 +65,13 @@ class Settings:
     # base URL of the sandbox supervisor (docs/code-execution-security.md §2, the HTTP
     # contract). ONE value: the in-cluster Service in production, the local Docker container
     # in dev — the contract is identical in both, so nothing downstream may branch on which
-    # one this points at. The default is the dev container; the cluster sets it explicitly.
-    sandbox_url: str = field(
-        default_factory=lambda: os.environ.get("SANDBOX_URL", "http://127.0.0.1:8080")
-    )
+    # one this points at. NO DEFAULT, for the same reason sandbox_token_signing_key has none
+    # (genetics-results-suite-6um): the old default 127.0.0.1:8080 is db-api's port on a dev
+    # machine, so an unset SANDBOX_URL sent /execute at a real authenticating service whose
+    # answers classify as confusing sandbox errors instead of "nothing is configured". Empty
+    # here and refused loudly at SandboxClient construction; the cluster sets it explicitly
+    # (k8s/deployments/chat-backend.yaml), dev sets it to what run-sandbox-local.sh publishes.
+    sandbox_url: str = field(default_factory=lambda: os.environ.get("SANDBOX_URL", ""))
 
     # whether a sandbox supervisor is actually deployed at sandbox_url. A DEPLOYMENT FACT,
     # not a preference, and false until the deploy that creates the sandbox sets it — the

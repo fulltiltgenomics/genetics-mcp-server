@@ -189,6 +189,23 @@ class SandboxInternalError(SandboxError):
     """500 ``InternalError`` — a supervisor bug."""
 
 
+class SandboxNotConfigured(SandboxError):
+    """No SANDBOX_URL, so there is no address to talk to and no request is ever sent.
+
+    Deliberately an error at construction rather than a default URL, for the same reason
+    :class:`~genetics_mcp_server.sandbox_token.SandboxTokenUnavailable` is an error rather
+    than a ``None`` key: every fallback from "no sandbox address" points the execute POST at
+    whatever happens to occupy a common port — on a dev machine 127.0.0.1:8080 is db-api,
+    a real authenticating service whose 404s and auth errors classify as sandbox failures
+    and hide the one diagnostic the operator needs (genetics-results-suite-6um).
+
+    A configuration fault, not a transport one: it is in this family so nothing in the
+    request flow escapes ``except SandboxError``, but the executor resolves its transport
+    through one guard (`ToolExecutor._sandbox_or_operator_error`) that catches this by name
+    and reports it non-retryable — a second ask cannot supply a missing address.
+    """
+
+
 class SandboxProtocolError(SandboxError):
     """A response the contract does not describe: unparseable body, wrong shape, or an
     ``execution_id`` that is not the one we sent."""
@@ -316,7 +333,15 @@ class SandboxClient:
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
-        self.base_url = (base_url or get_settings().sandbox_url).rstrip("/")
+        resolved = base_url or get_settings().sandbox_url
+        if not resolved:
+            raise SandboxNotConfigured(
+                "SANDBOX_URL is not set: refusing to guess where the sandbox supervisor is. "
+                "Set it to the in-cluster Service (http://sandbox.genetics.svc.cluster.local"
+                ":8080) or, locally, to what scripts/run-sandbox-local.sh publishes "
+                "(http://127.0.0.1:8081)."
+            )
+        self.base_url = resolved.rstrip("/")
         # injection points for tests, which must run with no sandbox and no credentials
         self._transport = transport
         self._sleep = sleep or asyncio.sleep

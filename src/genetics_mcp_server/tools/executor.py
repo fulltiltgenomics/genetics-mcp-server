@@ -5779,7 +5779,11 @@ class ToolExecutor:
         if execution_id is None:
             return not_found
 
-        result = await self._sandbox.get_artifact(execution_id, name)
+        sandbox, not_configured = self._sandbox_or_operator_error("no artifact can be read")
+        if not_configured is not None:
+            return not_configured
+
+        result = await sandbox.get_artifact(execution_id, name)
         if not result.ok or result.data is None:
             return self._artifact_error(name, result)
 
@@ -5941,6 +5945,33 @@ class ToolExecutor:
 
         return SandboxClient()
 
+    def _sandbox_or_operator_error(
+        self, consequence: str
+    ) -> tuple[Any, dict[str, Any] | None]:
+        """The transport, or — with nothing configured — the shaped error to return in its place.
+
+        THE ONE PLACE `SandboxNotConfigured` STOPS BEING AN EXCEPTION. `_sandbox` is a
+        cached_property, and its constructor now raises when SANDBOX_URL is unset
+        (genetics-results-suite-6um), so "no address" surfaces at a bare ATTRIBUTE ACCESS
+        inside methods that otherwise only ever RETURN a shaped failure. Every entry point
+        resolves the transport through here, so a new one fails in the house style by
+        construction rather than by remembering a handler of its own.
+
+        Caught by name rather than left to `except SandboxError`: it is in that family so
+        nothing in the request flow escapes the family clause, but the family's fallback
+        reports `retryable: True`, and no second ask can supply a missing address.
+        """
+        from genetics_mcp_server.sandbox_client import SandboxNotConfigured
+
+        try:
+            return self._sandbox, None
+        except SandboxNotConfigured as e:
+            logger.error("no sandbox address is configured: %s", e)
+            return None, self._sandbox_operator_error(
+                f"Code execution is not configured on this server, so {consequence}. "
+                "This is a server configuration fault and will not be fixed by retrying."
+            )
+
     async def run_analysis(
         self,
         code: str,
@@ -6092,9 +6123,13 @@ class ToolExecutor:
                 "to service callers."
             )
 
+        sandbox, not_configured = self._sandbox_or_operator_error("no script can run")
+        if not_configured is not None:
+            return not_configured
+
         try:
             result = await asyncio.wait_for(
-                self._sandbox.execute(
+                sandbox.execute(
                     code=code,
                     user=user,
                     session_id=session_id,

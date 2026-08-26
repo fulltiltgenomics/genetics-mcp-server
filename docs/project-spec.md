@@ -461,6 +461,14 @@ failure the model then retries against a sandbox that can never work. It is repo
 `SandboxNotConfigured` with `retryable: False`, and `tests/test_code_execution_tools.py`
 pins both the behaviour and — by parsing the handler's AST — the clause ordering.
 
+**`SandboxNotConfigured` is handled once, at the transport rather than per caller.**
+`_sandbox` is a `cached_property` whose constructor raises when `SANDBOX_URL` is unset, so
+"nothing is configured" would otherwise surface as a bare exception at any attribute access
+— and `read_artifact` touches it in no `try` of its own. Both entry points resolve through
+`ToolExecutor._sandbox_or_operator_error`, which returns the same `SandboxNotConfigured` /
+`retryable: False` shape either way, so a new caller fails in the house style without having
+to remember a handler and there is no clause ordering to get wrong.
+
 **Exposure decision**: `run_analysis` and `read_artifact` are in the `_mcp_disabled`
 literal in `mcp_server.py`. This is a security control, not a product decision — the user
 requires that code execution is not reachable via MCP. `run_analysis` additionally has
@@ -1878,7 +1886,7 @@ All configuration is via environment variables (`.env` file supported):
 | `SANDBOX_TOKEN_FILE` | Path (never the tokens) to the per-execution token file the sandbox supervisor writes before it forks — a JSON object keyed by audience, `{"db-api": ..., "results-api": ...}`. Read **once** and unlinked on the first client build (`tools/executor.py`), then attached per request bound to the destination's audience; mutually exclusive with `INTERNAL_API_SECRET`, and a file that does not yield a usable pair raises rather than degrading to no credential. Set only by the supervisor in the sandbox image; unset everywhere else. Read-once-and-unlink is **not** an exposure bound — see `genetics-results-suite-4h6.55` | - |
 | `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. False withholds `run_analysis` from every resolved tool list — and, since the prompt is built from that list, its guidance too. A deployment fact, flipped by the deploy that creates the sandbox | `false` |
-| `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments | `http://127.0.0.1:8080` |
+| `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments. **No default**: building a `SandboxClient` without it raises `SandboxNotConfigured` before any request is sent (`genetics-results-suite-6um`), because the default it used to carry — `127.0.0.1:8080` — is db-api's port on a dev machine, and a real authenticating service's 404s and auth errors classify as sandbox failures instead of "nothing is configured". Set in the cluster by `k8s/deployments/chat-backend.yaml` (`http://sandbox.genetics.svc.cluster.local:8080`) and locally by `dev-stack.sh` | - |
 | `GATEWAY_IDENTITY_SECRET` | The provenance secret auth-gateway sends as `X-Gateway-Auth` on its two chat locations, after it has verified an oauth2-proxy session. Held by auth-gateway and chat-backend **only** — not mcp-server, not results-api, not the sandbox — which is what makes it a fact those services cannot forge by choosing a header. Sandbox dispatch (`run_analysis`) requires it; nothing else does. Unset or non-ASCII under `REQUIRE_AUTH=true` refuses every dispatch and logs an `ERROR` at startup, never the reverse | - |
 | `SANDBOX_TOKEN_SIGNING_KEY` | HS256 key for the per-execution sandbox tokens, held only by chat-backend (mint) and db-api/results-api (verify). Separate from `INTERNAL_API_SECRET` on purpose: separate blast radius, independent rotation, and the sandbox holds neither. Unset means **no execution runs** — `mint_execution_tokens` raises `SandboxTokenUnavailable` rather than returning `None`, since every fallback is either "send no credential" or "send the shared secret" | - |
 
