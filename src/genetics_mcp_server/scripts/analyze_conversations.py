@@ -879,9 +879,18 @@ def _format_conversation_for_eval(
     tables. Over-long individual messages are middle-elided (head + tail) and
     the total budget is large enough that whole later turns are rarely dropped.
     """
+    # Tiebroken sort: created_at has one-second resolution, so a user turn and its own
+    # reply routinely share a timestamp and reached the judge in the wrong order.
+    # ANALYZER_VERSION is DELIBERATELY NOT BUMPED for this (genetics-results-suite-nb3):
+    # a bump matches every stored row, and the nightly CronJob would re-judge the whole
+    # corpus unattended into a table that is overwritten in place with no history. The
+    # precedent is that the judge model itself already changed twice (sonnet-4.6 ->
+    # opus-4.8 -> opus-5) with no bump and is recorded nowhere per row, so the stored
+    # verdicts already mix models under version 1. Existing verdicts keep the old
+    # ordering; sessions converge on this one as they are re-analysed anyway.
     session_msgs = messages.filter(
         pl.col("session_id") == session_id
-    ).sort("created_at")
+    ).sort(message_sort_keys(messages))
 
     parts = []
     total_len = 0
