@@ -921,6 +921,25 @@ class TestQualityEvaluation:
         text = _format_conversation_for_eval("s9", messages)
         assert "User attached file(s): results.tsv" in text
 
+    def test_format_orders_same_second_turns_by_rowid(self):
+        # created_at has one-second resolution, so a user turn and its own reply routinely
+        # share a timestamp; only rowid separates them. Rows are handed over reply-first so
+        # a sort on created_at alone would leave the answer above the question.
+        messages = pl.DataFrame({
+            "session_id": ["s10", "s10"],
+            "role": ["assistant", "user"],
+            "content": ["BRCA1 is on chromosome 17.", "where is BRCA1?"],
+            "created_at": ["2026-01-01 10:00:00", "2026-01-01 10:00:00"],
+            "content_json": [None, None],
+            "_rowid": [2, 1],
+        })
+        # the guard in message_sort_keys must not have fallen back to the single key
+        assert message_sort_keys(messages) == ["created_at", "_rowid"]
+
+        text = _format_conversation_for_eval("s10", messages)
+        assert text.index("where is BRCA1?") < text.index("BRCA1 is on chromosome 17.")
+        assert text.index("[USER]") < text.index("[ASSISTANT]")
+
     def test_apply_quality_assessments(self):
         metrics = [
             ConversationMetrics(session_id="s1", user_messages=2, total_tool_calls=3),

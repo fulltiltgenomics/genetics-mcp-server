@@ -36,6 +36,7 @@ from genetics_mcp_server.mcp_proxy import (
 )
 from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import TOOL_PROFILE_TOOLS, ToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools.executor import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +278,8 @@ def _loggable_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "thinking", "done", "image", "usage", "script_result", "tool_use"
+    type: str  # "text", "thinking", "thinking_summary", "done", "image", "usage",
+    # "script_result", "tool_use"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -428,7 +430,7 @@ def _truncation_notice(result: Any) -> str:
     """
     total = _count_result_items(result)
     scope = f"{total} total items" if total else "a larger result"
-    return (
+    notice = (
         f"\n\n[TRUNCATED: this is the beginning of {scope}, cut off mid-structure. "
         "The data is ORDERED, so the rows you cannot see are not a random sample -- entire "
         "categories (data types, resources, cell types, chromosomes) may be missing from the "
@@ -437,6 +439,23 @@ def _truncation_notice(result: Any) -> str:
         "(e.g. data_types, resource) or with summarize=true, or use the download link above "
         "for the complete data.]"
     )
+    if isinstance(result, dict) and result.get("artifacts_retained_in_clear") is True:
+        # RE-ATTACHED, because truncation must not be able to DELETE A SECURITY FIELD
+        # (genetics-results-suite-4h6.97). The prefix above is cut at a byte offset, and
+        # `output` in a run_analysis result is script-controlled up to 64 KiB — so a script
+        # that both provokes the retained-in-clear condition and prints ~50 KB would otherwise
+        # cut its own warning out of what the model reads, behind a generic "[TRUNCATED: ...]"
+        # that says nothing about a dropped field. `_render_analysis` also orders the field
+        # ahead of `output` for the same reason; that defence depends on json.dumps preserving
+        # insertion order, and this one does not, which is why both exist. `result` here is the
+        # WHOLE pre-truncation dict, so the flag is read from what the executor produced rather
+        # than from the surviving prefix.
+        notice += (
+            "\n\n[SECURITY NOTE PRESERVED THROUGH TRUNCATION: "
+            + ARTIFACTS_RETAINED_IN_CLEAR_NOTE
+            + "]"
+        )
+    return notice
 
 
 DOWNLOAD_FAILED_NOTE = (
@@ -562,6 +581,26 @@ def _script_result_payload(
     }
 
 
+@dataclass(frozen=True)
+class ResolvedLocalTools:
+    """One request's local tool definitions, with the names projected off them.
+
+    `names` is deliberately NOT stored: it is computed from `definitions` on every
+    access, so there is no way to hold an object whose names describe a different tool
+    set than the one it hands the model (genetics-results-suite-4h6.77). The invariant
+    rests on that projection, not on `frozen=True`: freezing only prevents rebinding the
+    field, and `definitions` is a plain list whose contents can still be mutated in place
+    (`tests/test_tool_resolution_single_source.py` does exactly that to prove `names`
+    follows).
+    """
+
+    definitions: list[dict[str, Any]]
+
+    @property
+    def names(self) -> set[str]:
+        return {t["name"] for t in self.definitions}
+
+
 class LLMService:
     """Service for LLM chat streaming with multi-provider support."""
 
@@ -628,24 +667,40 @@ class LLMService:
             disabled.add("launch_subagents")
         return disabled
 
+    def resolve_local_tools(
+        self,
+        tool_profile: str | None = None,
+        enable_tools: bool = True,
+        custom_tool_descriptions: dict[str, str] | None = None,
+    ) -> ResolvedLocalTools:
+        """Resolve this request's local tool definitions ONCE.
+
+        The prompt gate (genetics-results-suite-4h6.69) requires the system prompt to be
+        assembled against the tools the model is actually handed. Returning one object
+        that carries the definitions and projects the names off them is what makes that
+        structural rather than conventional: a caller builds the prompt from `.names` and
+        hands the SAME object to `stream_chat`, so there is one derivation and no second
+        one to drift from it (genetics-results-suite-4h6.77).
+        """
+        if not (enable_tools and get_settings().mcp_enabled):
+            return ResolvedLocalTools([])
+        return ResolvedLocalTools(
+            get_anthropic_tools(
+                custom_tool_descriptions,
+                tool_profile=tool_profile,
+                disabled_tools=self._disabled_tools(),
+            )
+        )
+
     def resolve_local_tool_names(
         self, tool_profile: str | None = None, enable_tools: bool = True
     ) -> set[str]:
         """Local tool names this service would advertise for such a request.
 
-        Exists so the system prompt can be assembled against the SAME resolution the
-        tool list comes from (genetics-results-suite-4h6.69) instead of being built
-        independently and drifting from it. External and RAG tools are excluded: they
-        are proxied surfaces the system prompt does not name tool-by-tool.
+        External and RAG tools are excluded: they are proxied surfaces the system prompt
+        does not name tool-by-tool.
         """
-        if not (enable_tools and get_settings().mcp_enabled):
-            return set()
-        return {
-            t["name"]
-            for t in get_anthropic_tools(
-                tool_profile=tool_profile, disabled_tools=self._disabled_tools()
-            )
-        }
+        return self.resolve_local_tools(tool_profile, enable_tools).names
 
     async def stream_chat(
         self,
@@ -662,6 +717,9 @@ class LLMService:
         session_id: str | None = None,
         user_instructions: str | None = None,
         message_id: str | None = None,
+        capture_thinking: bool = False,
+        gateway_asserted: bool = False,
+        local_tools: ResolvedLocalTools | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """
         Stream chat responses from LLM provider.
@@ -688,6 +746,22 @@ class LLMService:
             message_id: Client-generated id of the assistant message this turn will become,
                 used only to key the recorded turn metrics to chat_messages. Optional: the
                 metrics row is still written without it, it just cannot be joined.
+            capture_thinking: emit each iteration's summarized reasoning as a
+                `thinking_summary` chunk. OFF for every ordinary chat: the browser asks for
+                the contentless `thinking` keepalive and nothing else, and this text is never
+                added to `message_content`, so it is never persisted or replayed either way.
+                Set by the replay benchmark, which needs the reasoning in its transcripts.
+            gateway_asserted: whether `user` was asserted by auth-gateway having verified an
+                oauth2-proxy session, rather than by some other holder of INTERNAL_API_SECRET.
+                Carried alongside `user` — never derived from it — and consumed only by
+                `run_analysis`, which will not dispatch without it
+                (genetics-results-suite-4h6.84). Defaults False so a caller that does not
+                state a provenance loses code execution rather than being trusted.
+            local_tools: the already-resolved local tool set, from `resolve_local_tools`.
+                Pass it whenever `system_prompt` was assembled against a tool list: the
+                model is then handed the very definitions those names were projected off,
+                so prompt and tools cannot disagree (genetics-results-suite-4h6.77).
+                None resolves here instead, for callers that supply no tool-gated prompt.
 
         Yields:
             StreamChunk objects with text content and final message structure
@@ -704,7 +778,9 @@ class LLMService:
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
                 literature_backend, tool_profile, secret, user, session_id,
-                user_instructions, message_id,
+                user_instructions, message_id, capture_thinking,
+                gateway_asserted=gateway_asserted,
+                local_tools=local_tools,
             ):
                 yield chunk
         else:
@@ -779,6 +855,9 @@ class LLMService:
         session_id: str | None = None,
         user_instructions: str | None = None,
         message_id: str | None = None,
+        capture_thinking: bool = False,
+        gateway_asserted: bool = False,
+        local_tools: ResolvedLocalTools | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat from Anthropic with optional MCP tools and agentic loop."""
         if not self.anthropic_client:
@@ -854,14 +933,27 @@ class LLMService:
         # add tool definitions if enabled
         tool_definitions = None
         if enable_tools and settings.mcp_enabled:
-            disabled = self._disabled_tools()
-
-            # get local tools filtered by profile
-            tool_definitions = get_anthropic_tools(
-                custom_tool_descriptions,
-                tool_profile=tool_profile,
-                disabled_tools=disabled,
+            # the caller's resolution when it has one, so the tools the model gets are the
+            # same objects the system prompt's tool names were projected off; resolving
+            # here as well would be the second derivation 4h6.77 exists to delete
+            # supplying `local_tools` together with `custom_tool_descriptions` or a
+            # differing `enable_tools` is a CALLER ERROR: both are inputs to the
+            # resolution, and a caller that already resolved has consumed them. Neither
+            # diverges today, but both silently would:
+            #   - `custom_tool_descriptions` is read only on this fallback, so it is
+            #     dropped whenever `local_tools` is supplied (pre-4h6.77 it was always
+            #     applied here). Dormant: chat_api does not pass it, and nothing loads
+            #     those rows into the chat path at all (see routers/llm_config.py). If
+            #     they are ever wired in, `chat_api` must pass them to
+            #     `resolve_local_tools`, which already accepts them — NOT to `stream_chat`.
+            #   - same shape for `enable_tools`: resolving with False and then calling
+            #     `stream_chat(enable_tools=True, local_tools=...)` yields external+RAG
+            #     tools and zero local ones, where pre-4h6.77 it yielded the full local
+            #     set. Dormant: chat_api passes `request.enable_tools` to both.
+            resolved = local_tools if local_tools is not None else self.resolve_local_tools(
+                tool_profile, enable_tools, custom_tool_descriptions
             )
+            tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
 
             # always-on external tools (gnomAD, Open Targets) excluded in RAG profile, and
@@ -1053,8 +1145,27 @@ class LLMService:
                 # add this iteration's content blocks. Thinking blocks are deliberately
                 # not persisted: they are only replayable to the model that produced them,
                 # and the sanitizers that rewrite stored turns don't know about them.
+                #
+                # `capture_thinking` changes what is EMITTED, never what is persisted: the
+                # text goes out as its own chunk and still never enters all_content_blocks,
+                # so a caller that asks for it cannot accidentally write reasoning into a
+                # stored conversation or replay it to the model. Off by default, so the UI
+                # keeps receiving only the contentless `thinking` keepalive above.
+                #
+                # `redacted_thinking` is skipped rather than emitted empty: its payload is
+                # encrypted and carries no readable text, so there is nothing to show.
+                # What DOES come through is the SUMMARY — `display: "summarized"` above —
+                # since no model exposes the raw chain of thought.
                 for block in message.content:
                     if block.type in ("thinking", "redacted_thinking"):
+                        summary = getattr(block, "thinking", "") or ""
+                        if capture_thinking and summary:
+                            yield StreamChunk(
+                                type="thinking_summary",
+                                content=json.dumps(
+                                    {"iteration": iteration, "text": summary}
+                                ),
+                            )
                         continue
                     all_content_blocks.append(block.model_dump(exclude_none=True))
 
@@ -1138,11 +1249,16 @@ class LLMService:
                         effective_input.pop("backend", None)
                         if literature_backend:
                             effective_input["backend"] = literature_backend
-                    if tool_use.name == "run_analysis":
+                    if tool_use.name in ("run_analysis", "read_artifact"):
                         # mirror the execution-side strip in _execute_tool: a model-invented
                         # identity is discarded before the call, so logging or showing it
                         # would make a forged `user` read as identity in a log join. The
-                        # authenticated pair is already on every line via log_prefix.
+                        # authenticated pair is already on every line via log_prefix. BOTH
+                        # identity-injected tools, not just run_analysis: execution was never
+                        # affected — _execute_tool strips read_artifact's too — but a model
+                        # emitting read_artifact(name=…, user="victim@…") otherwise put that
+                        # string into the operator log and into the `tool_use` disclosure the
+                        # client renders, which is the exact hazard this comment names.
                         effective_input.pop("user", None)
                         effective_input.pop("session_id", None)
                     if secret:
@@ -1212,7 +1328,7 @@ class LLMService:
                     if regular_tool_uses:
                         regular_task = asyncio.create_task(
                             asyncio.gather(
-                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id) for tu in regular_tool_uses)
+                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
                             )
                         )
                     else:
@@ -1235,7 +1351,7 @@ class LLMService:
                 else:
                     # no subagent tool — execute all tools in parallel as before
                     regular_results = await asyncio.gather(
-                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id) for tu in regular_tool_uses)
+                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
                     )
                     for tu, res in zip(regular_tool_uses, regular_results):
                         raw_results_map[tu.id] = res
@@ -1437,9 +1553,41 @@ class LLMService:
         literature_backend: str | None = None,
         user: str | None = None,
         session_id: str | None = None,
+        gateway_asserted: bool = False,
     ) -> dict[str, Any]:
         """Execute a tool by name using the executor or external proxy."""
         try:
+            # dispatch only what the resolved tool list actually advertised, the same
+            # allowlist shape subagent.py's `_execute_subagent_tool` carries and for the
+            # same reason: the local branch below calls any executor attribute the model
+            # names, which makes withholding a tool advisory rather than enforced. The
+            # model does not have to invent the name — ChatMessage.content accepts raw
+            # blocks and _sanitize_tool_blocks drops only ORPHANED tool_use, so a
+            # client-supplied history with a paired run_analysis tool_use/tool_result
+            # survives verbatim and primes the model for a tool it was not given.
+            # disabled_tools is the profile-independent complement (it is applied before
+            # the profile filter at the resolution site above), so a name in it is
+            # advertised by no profile.
+            disabled = get_settings().disabled_tools
+            if tool_name in disabled:
+                logger.warning(
+                    f"Refusing to dispatch '{tool_name}': not enabled in this deployment"
+                )
+                return {
+                    "success": False,
+                    "error": f"Tool '{tool_name}' is not available in this deployment.",
+                    # run_analysis carries the sandbox's own operator-error type because
+                    # that is what the script_result chunk and the benchmark read; the
+                    # point of both is that a withheld tool must not look transient, or
+                    # the model retries a deployment fact (genetics-results-suite-4h6.56)
+                    "error_type": (
+                        "SandboxNotConfigured"
+                        if tool_name == "run_analysis"
+                        else "ToolNotEnabled"
+                    ),
+                    "retryable": False,
+                }
+
             # subagent tool
             if tool_name == "launch_subagents":
                 if not self.subagent_service:
@@ -1491,10 +1639,38 @@ class LLMService:
             # stripped first, then the real pair injected, same as `backend` above.
             if tool_name == "run_analysis":
                 tool_input = {
-                    k: v for k, v in tool_input.items() if k not in ("user", "session_id")
+                    k: v
+                    for k, v in tool_input.items()
+                    if k not in ("user", "session_id", "gateway_asserted")
                 }
                 tool_input["user"] = user
                 tool_input["session_id"] = session_id
+                # the provenance of `user`, not a claim about it: a model that emitted this
+                # key is stripped above alongside the identity pair, for the same reason
+                tool_input["gateway_asserted"] = gateway_asserted
+
+            # read_artifact resolves a model-supplied NAME against the executions this USER's
+            # SESSION ran (genetics-results-suite-4h6.52, dh3), so the authenticated pair is the
+            # authorization and is injected the same way as run_analysis's — stripped first,
+            # because the tool declares only `name` and tool_input is splatted verbatim. The
+            # `user` half is what makes the client-supplied `session_id` unusable on its own: a
+            # model- OR client-supplied session id alone would be a cross-user read of another
+            # person's artifacts.
+            #
+            # `gateway_asserted` comes with them, and it is what makes the `user` half mean
+            # anything: `get_authenticated_user` honours the identity header from any holder of
+            # INTERNAL_API_SECRET, so without the provenance flag a marker holder could name the
+            # victim as `user` and read that victim's artifacts. Same three keys as
+            # run_analysis, stripped and injected the same way.
+            if tool_name == "read_artifact":
+                tool_input = {
+                    k: v
+                    for k, v in tool_input.items()
+                    if k not in ("user", "session_id", "gateway_asserted")
+                }
+                tool_input["user"] = user
+                tool_input["session_id"] = session_id
+                tool_input["gateway_asserted"] = gateway_asserted
 
             return await method(**tool_input)
 

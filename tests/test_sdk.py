@@ -8,6 +8,7 @@ silently resolved. No network is involved — the executor is faked.
 
 import subprocess
 import sys
+from unittest.mock import AsyncMock
 
 import polars as pl
 import pytest
@@ -289,6 +290,120 @@ async def test_truncated_result_raises_instead_of_returning_a_prefix():
     client, _ = make_client({"success": True, "results": [[1]], "columns": ["x"], "truncated": True})
     with pytest.raises(GeneticsError, match="truncated"):
         await client.mpra(gene="APOE")
+
+
+async def test_sql_truncation_names_the_cap_db_api_actually_applied():
+    """The old message named no number at all, and the only string that did named 100,000 —
+    db-api's relaxed transfer cap, four times what a sandbox execution runs under. The number
+    is db-api's constant, so it is quoted from the response, never hardcoded here."""
+    client, _ = make_client({
+        "success": True,
+        "rows": [[1]],
+        "columns": ["x"],
+        "truncated": True,
+        "capped_by_server": True,
+        "server_row_cap": 25_000,
+    })
+    with pytest.raises(GeneticsError, match=r"row cap of 25,000 rows"):
+        await client.sql("SELECT 1")
+
+
+async def test_sql_truncation_degrades_when_the_cap_is_not_reported():
+    """An older db-api sends no `max_rows_applied`; the error must still fire and still say
+    which ceiling was hit, just without a number."""
+    client, _ = make_client({
+        "success": True,
+        "rows": [[1]],
+        "columns": ["x"],
+        "truncated": True,
+        "capped_by_server": True,
+    })
+    with pytest.raises(GeneticsError, match=r"db-api's row cap, so rows are missing"):
+        await client.sql("SELECT 1")
+
+
+async def test_a_truncation_the_server_did_not_cause_keeps_the_generic_advice():
+    """`truncated` also covers the executor's own LLM-facing slice and the typed endpoints,
+    where raising `limit` IS the remedy. Only the server-capped case says otherwise."""
+    client, _ = make_client({
+        "success": True,
+        "rows": [[1]],
+        "columns": ["x"],
+        "truncated": True,
+        "capped_by_server": False,
+    })
+    with pytest.raises(GeneticsError, match=r"raise `limit`"):
+        await client.sql("SELECT 1")
+
+
+class _FakeDbApiResponse:
+    """One db-api /query response, as httpx would hand it back."""
+
+    def __init__(self, payload):
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _client_over_real_executor(db_api_payload) -> tuple[GeneticsClient, ToolExecutor]:
+    """A GeneticsClient over a REAL ToolExecutor with only the HTTP call faked.
+
+    The two tests above and their counterparts in test_bigquery_gene_tools.py each cover one
+    half — one asserts on `query_database`'s own dict, the other hand-feeds `_check_truncation`
+    a dict that already carries the cap keys — so neither crosses `_query_metadata`, which is
+    exactly where the keys were being dropped for every typed method.
+    """
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    executor.client.post = AsyncMock(return_value=_FakeDbApiResponse(db_api_payload))
+    return GeneticsClient(executor=executor), executor
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        ("mpra", {"gene": "APOE"}),  # via _bq_gene_payload
+        ("hla", {"allele": "DRB1*15:01"}),  # via the HLA branch's own payload
+    ],
+)
+async def test_typed_methods_name_the_cap_end_to_end(method, kwargs):
+    """db-api -> query_database -> _query_metadata -> _check_truncation, unfaked in between.
+
+    A typed method reaches db-api through the same `query_database` as `sql()`, so it must get
+    the same cap-naming message. It did not: `_query_metadata` copied only `columns` and
+    `truncated`, so the cap keys never reached the SDK and the caller was told to "raise
+    `limit`" for a ceiling `limit` cannot move.
+    """
+    client, executor = _client_over_real_executor({
+        "columns": ["x"],
+        "rows": [[1]],
+        "total_rows": 90_000,
+        "bytes_processed": 10,
+        "truncated": True,
+        "max_rows_applied": 25_000,
+    })
+    try:
+        with pytest.raises(GeneticsError, match=r"row cap of 25,000 rows"):
+            await getattr(client, method)(**kwargs)
+    finally:
+        await executor.close()
+
+
+async def test_typed_methods_drop_the_number_when_db_api_does_not_report_a_cap():
+    """A db-api predating `max_rows_applied` reports the cut and no cap. The typed path must
+    still raise and still say which ceiling was hit — just without inventing a number."""
+    client, executor = _client_over_real_executor({
+        "columns": ["x"],
+        "rows": [[1]],
+        "total_rows": 90_000,
+        "truncated": True,
+    })
+    try:
+        with pytest.raises(GeneticsError, match=r"db-api's row cap, so rows are missing"):
+            await client.mpra(gene="APOE")
+    finally:
+        await executor.close()
 
 
 async def test_bigquery_limit_defaults_to_the_row_ceiling_not_500():

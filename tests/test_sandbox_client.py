@@ -25,6 +25,7 @@ from genetics_mcp_server.sandbox_client import (
     SandboxClient,
     SandboxDeadlineExceeded,
     SandboxInternalError,
+    SandboxNotConfigured,
     SandboxProtocolError,
     SandboxRejected,
     SandboxUnavailable,
@@ -652,3 +653,23 @@ class TestConfiguration:
 
     def test_a_trailing_slash_does_not_double_up_the_path(self, monkeypatch):
         assert SandboxClient("http://sandbox:8080/").base_url == "http://sandbox:8080"
+
+    def test_an_unset_sandbox_url_refuses_to_build_a_client(self, monkeypatch):
+        """No default: the old one was db-api's port on a dev machine (`6um`), so "nothing
+        configured" has to be loud rather than a POST at whatever answers on 8080."""
+        settings_module.get_settings.cache_clear()
+        monkeypatch.delenv("SANDBOX_URL", raising=False)
+        try:
+            with pytest.raises(SandboxNotConfigured) as excinfo:
+                SandboxClient()
+            assert "SANDBOX_URL" in str(excinfo.value)
+        finally:
+            settings_module.get_settings.cache_clear()
+
+    def test_an_explicit_base_url_needs_no_environment(self, monkeypatch):
+        settings_module.get_settings.cache_clear()
+        monkeypatch.delenv("SANDBOX_URL", raising=False)
+        try:
+            assert SandboxClient("http://127.0.0.1:8081").base_url == "http://127.0.0.1:8081"
+        finally:
+            settings_module.get_settings.cache_clear()

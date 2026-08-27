@@ -88,7 +88,16 @@ def quote_literal_list(values, *, name: str) -> str:
 
 
 def sql_int(value, *, name: str, minimum: int | None = None, maximum: int | None = None) -> str:
-    """Return `value` as a SQL integer token, or raise."""
+    """Return `value` as a SQL integer token, or raise.
+
+    A token, not a round-trippable number: `_token` parenthesises negatives, so
+    `int(sql_int(-5, name="x"))` raises a bare ValueError. Five `*_by_gene` tools in
+    tools/executor.py do re-parse this return value to recover the clamped limit, and
+    they are safe only because every one of them passes `minimum=1`. Dropping that floor
+    — or adding a re-parsing call site that permits negatives — lets the ValueError past
+    their `except SqlValueError` handlers, which do not catch it, so the tool raises
+    instead of returning {"success": False, ...}.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SqlValueError(f"{name} must be a number, got {type(value).__name__}")
     if isinstance(value, float) and not float(value).is_integer():

@@ -101,7 +101,7 @@ _mcp_disabled = _settings.disabled_tools | {
     # against. This literal is the hardcoded half deliberately —
     # _settings.disabled_tools is env-driven and changeable without a code review — and it
     # is layer 1 of three; layers 2 and 3 are the sandbox NetworkPolicy and the test in
-    # tests/test_mcp_server.py. run_analysis joins this set with 4h6.16.
+    # tests/test_mcp_server.py. run_analysis joins this set with 4h6.48.
     # list_capabilities is NOT here: it renders per-function SDK signatures and docstrings
     # from the source, which describe the SDK's shape rather than data, session state or
     # any execution. That surface IS new disclosure to an MCP client — the SDK is not the

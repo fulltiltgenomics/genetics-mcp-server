@@ -28,8 +28,17 @@ from genetics_mcp_server.logging_config import setup_logging
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
-from genetics_mcp_server.auth import auth_required, get_authenticated_user, is_public
-from genetics_mcp_server.config import get_settings, require_internal_api_secret
+from genetics_mcp_server.auth import (
+    auth_required,
+    gateway_asserted_identity,
+    get_authenticated_user,
+    is_public,
+)
+from genetics_mcp_server.config import (
+    get_settings,
+    require_internal_api_secret,
+    warn_unless_gateway_identity_secret,
+)
 from genetics_mcp_server.config.defaults import (
     default_system_prompt,
     instruction_envelope,
@@ -202,6 +211,9 @@ async def lifespan(app: FastAPI):
     # "true" in k8s/deployments/chat-backend.yaml and false everywhere else.
     if get_settings().require_auth:
         require_internal_api_secret("chat-backend")
+    # NOT fatal, unlike the line above — see warn_unless_gateway_identity_secret for why the
+    # unset case is fail-closed at dispatch rather than at startup.
+    warn_unless_gateway_identity_secret("chat-backend")
     configure_rate_limit(
         max_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", "20")),
         max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "100")),
@@ -307,8 +319,22 @@ class ChatRequest(BaseModel):
     )
     session_id: str | None = Field(
         None,
+        max_length=64,
         description="Client conversation id. Logged (id only, never content) so distinct "
-        "conversations can be counted, including secret ones.",
+        "conversations can be counted, including secret ones. Bounded at 64 characters for "
+        "the same reason message_id below is, and since genetics-results-suite-dh3 for a "
+        "second one: this value is now HALF THE ARTIFACT MANIFEST KEY, so an unbounded "
+        "client-chosen string would be a caller-sized key in an in-memory map, and the "
+        "service has no request-body-size middleware. Every producer emits a uuid4 (36 "
+        "chars): persisted ids are str(uuid.uuid4()), secret chats use crypto.randomUUID().",
+    )
+    capture_thinking: bool = Field(
+        False,
+        description="Stream each iteration's summarized reasoning as `thinking_summary` "
+        "chunks in addition to the contentless `thinking` keepalive. Off for the UI, which "
+        "asks for neither; set by the replay benchmark so a transcript can show the "
+        "reasoning that produced each tool call. Never affects what is persisted: the text "
+        "is not part of `message_content`.",
     )
     message_id: str | None = Field(
         None,
@@ -410,16 +436,20 @@ async def list_resolved_tools(
     `/chat/v1/tools` above answers a different question — it returns TOOL_DEFINITIONS raw,
     with no profile filter, no feature flags, and neither the BigQuery nor the subagent
     definition list — so it cannot be used to check what an arm of a benchmark ran with.
-    This one resolves through `service.resolve_local_tool_names`, the SAME call the system
-    prompt is assembled from (genetics-results-suite-4h6.69), so what it reports is what the
-    model was handed.
+    This one resolves through `service.resolve_local_tool_names`, a one-line delegate to the
+    SAME derivation the system prompt is assembled from — the prompt takes its names from
+    `resolve_local_tools(...).names` (genetics-results-suite-4h6.69, -4h6.77) — so what it
+    reports is what the model was handed.
 
     IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `get_anthropic_tools` degrades an
     unrecognised profile to general-only rather than raising, deliberately, because the
     value is read back from `chat_messages` rows written by older clients — so a typo costs
-    the model most of its tools and nothing anywhere says so. A benchmark arm misspelled
-    that way runs fine and reports plausible numbers. `known_profile: false` is the flag
-    that turns that into something a caller can see.
+    the model most of its tools while the request itself still succeeds. A benchmark arm
+    misspelled that way runs fine and reports plausible numbers. `known_profile: false` is
+    the flag that turns that into something a caller can see; the resolution path also logs
+    a WARNING once per distinct unknown value, which is the operator-side half of the same
+    signal (genetics-results-suite-4h6.74). The browser calls this endpoint when a profile
+    is picked or restored and shows the user when it comes back false.
 
     `count` is LOCAL tools only. External (gnomAD / Open Targets) and RAG tools are proxied
     surfaces resolved separately and are not included; see docs/chat-tool-reference.md § 3
@@ -507,6 +537,7 @@ def _resolve_user_instructions(
 async def stream_chat(
     request: ChatRequest,
     user: str | None = Depends(auth_required),
+    gateway_asserted: bool = Depends(gateway_asserted_identity),
 ):
     """
     Stream chat responses as Server-Sent Events (SSE).
@@ -514,6 +545,8 @@ async def stream_chat(
     The response is a stream of JSON objects:
     - {"type": "content", "content": "text chunk"}
     - {"type": "thinking"}  (keepalive while the model reasons; no content)
+    - {"type": "thinking_summary", "iteration": N, "text": "..."}  (only when the request
+      set `capture_thinking`; the model's SUMMARIZED reasoning, never the raw chain)
     - {"type": "done", "message_content": [...]}
     - {"type": "error", "error": "message"}
     """
@@ -558,12 +591,14 @@ async def stream_chat(
     # keeps the shared block cacheable across users and puts the envelope's guardrail
     # postamble last, where recency favours it.
     # assembled against the tool list THIS request will actually get, so the prompt never
-    # documents a tool the model was not given (genetics-results-suite-4h6.69). Resolution
-    # goes through the service rather than being recomputed here: one home for the
-    # profile + feature-flag + subagent-liveness filtering that also builds the tool list.
+    # documents a tool the model was not given (genetics-results-suite-4h6.69). The SAME
+    # resolved object is handed to stream_chat below, so the names the prompt is built
+    # from are projected off the very definitions the model receives — one derivation, not
+    # two that happen to agree (genetics-results-suite-4h6.77).
+    local_tools = service.resolve_local_tools(request.tool_profile, request.enable_tools)
     system_prompt = default_system_prompt(
         settings.app_name,
-        tool_names=service.resolve_local_tool_names(request.tool_profile, request.enable_tools),
+        tool_names=local_tools.names,
     )
     system_prompt += verbosity_prompt(request.verbosity)
     user_instructions = _resolve_user_instructions(
@@ -586,6 +621,9 @@ async def stream_chat(
                 session_id=request.session_id,
                 user_instructions=user_instructions,
                 message_id=request.message_id,
+                capture_thinking=request.capture_thinking,
+                gateway_asserted=gateway_asserted,
+                local_tools=local_tools,
             ):
                 if chunk.type == "text":
                     yield {
@@ -622,6 +660,15 @@ async def stream_chat(
                     yield {
                         "event": "message",
                         "data": json.dumps({"type": "thinking"}),
+                    }
+                elif chunk.type == "thinking_summary":
+                    # only reached when the request opted in; the browser never does, so this
+                    # branch is dead for ordinary chats rather than something they filter out
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(
+                            {"type": "thinking_summary", **json.loads(chunk.content)}
+                        ),
                     }
                 elif chunk.type == "usage":
                     yield {

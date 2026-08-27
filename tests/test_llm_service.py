@@ -267,9 +267,19 @@ def _with_tools(svc):
     executor itself is irrelevant to what is being counted."""
     svc.executor = object()
 
-    async def _execute(name, tool_input, literature_backend=None, user=None, session_id=None):
+    async def _execute(
+        name,
+        tool_input,
+        literature_backend=None,
+        user=None,
+        session_id=None,
+        gateway_asserted=False,
+    ):
         # the signature stays exact: the loop calls this positionally, so a widened
-        # *args stub would silently accept a call shape production could never make
+        # *args stub would silently accept a call shape production could never make.
+        # `gateway_asserted` is the sixth positional since genetics-results-suite-4h6.84;
+        # it arrives here because the loop forwards it to every tool, and only
+        # run_analysis reads it
         return {"success": True, "rows": []}
 
     svc._execute_tool = _execute

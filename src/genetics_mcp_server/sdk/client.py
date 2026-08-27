@@ -212,17 +212,28 @@ class GeneticsClient:
         and join is wrong with no signal. Raising is the only honest option — the caller
         can lower `limit`, narrow `window` or move to `sql()` once told.
         """
-        if payload.get("truncated"):
+        if not payload.get("truncated"):
+            return
+        # Two different cuts reach this flag, and they need different advice. `capped_by_server`
+        # means db-api itself cut the result set at the row cap for this credential — raising
+        # `limit`/`max_rows` past that cap does nothing, which the old message never said.
+        # The cap's VALUE is db-api's constant (SANDBOX_MAX_ROWS for a sandbox execution, four
+        # times higher for a caller holding INTERNAL_API_SECRET), so it is quoted from the
+        # response rather than hardcoded here; a db-api that does not report it, or a payload
+        # from another path, simply gets the sentence without a number.
+        if payload.get("capped_by_server"):
+            cap = payload.get("server_row_cap")
+            ceiling = f" of {cap:,} rows" if isinstance(cap, int) and cap > 0 else ""
             raise GeneticsError(
-                "result was truncated, so the rows returned are a positional prefix and "
-                "not the whole answer. Narrow the query (smaller window/region, more "
-                "specific resource) or raise `limit`."
+                f"the query hit db-api's row cap{ceiling}, so rows are missing and what came "
+                "back is a positional prefix. Raising `max_rows` past that cap does nothing — "
+                "aggregate or filter in SQL instead of fetching every row."
             )
-        if payload.get("download_capped_at_100k"):
-            raise GeneticsError(
-                "the query hit db-api's 100,000-row transfer cap, so rows are missing. "
-                "Aggregate or filter in SQL instead of fetching every row."
-            )
+        raise GeneticsError(
+            "result was truncated, so the rows returned are a positional prefix and "
+            "not the whole answer. Narrow the query (smaller window/region, more "
+            "specific resource) or raise `limit`."
+        )
 
     # ------------------------------------------------------------------ credible sets
 
@@ -823,9 +834,8 @@ class GeneticsClient:
         `max_rows`:
 
           rows  — db-api caps a sandbox execution at 25,000 returned rows regardless of
-                  `max_rows`, and reports the cut, which becomes a GeneticsError. (The
-                  error text names no number, so there is nothing in it to tell you which
-                  ceiling you hit — assume 25,000.)
+                  `max_rows`, and reports both the cut and the cap it applied, so the
+                  GeneticsError names the ceiling you actually hit.
           bytes — 50 GB scanned per query and 200 GB across one execution; over either is a
                   GeneticsError too, not a short result.
 

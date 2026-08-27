@@ -430,6 +430,14 @@ class ChatHistoryDB(object, metaclass=Singleton):
             # chat_turn_metrics carries no foreign key (see _init_db), so the cascade that
             # clears chat_messages and conversation_analysis does not reach it.
             #
+            # The first clause is scoped by user_id as well as session_id: session_id is
+            # client-supplied, so before record_turn_metrics started rejecting another
+            # user's session id another user could have written a row carrying this one,
+            # and deleting their row here would be silent loss of somebody else's data.
+            # Rows with a NULL user_id are still taken: they are either an unauthenticated
+            # deployment's (no ownership exists there) or predate the user_id column, and
+            # in both cases nothing else will ever remove them.
+            #
             # The second clause covers this user's rows that carry neither id. Every
             # conversation's first turn streams before the browser has created the session
             # row, and the browser does not send message_id yet, so those rows can never be
@@ -443,10 +451,10 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 cursor.execute(
                     """
                     DELETE FROM chat_turn_metrics
-                    WHERE session_id = ?
+                    WHERE (session_id = ? AND (user_id IS ? OR user_id IS NULL))
                        OR (user_id = ? AND session_id IS NULL AND message_id IS NULL)
                     """,
-                    (session_id, user_id),
+                    (session_id, user_id, user_id),
                 )
             conn.commit()
         except BaseException:
@@ -1025,16 +1033,41 @@ class ChatHistoryDB(object, metaclass=Singleton):
         message_id and have their own turn's numbers overwrite that user's row, zeroing
         its cost and reassigning its session. The DO UPDATE's WHERE makes the conflicting
         write a no-op instead — nothing is inserted and nothing is overwritten. `IS` and
-        not `=` so that the NULL user_id of an unauthenticated deployment still matches
-        itself rather than failing every re-record.
+        not `=` so that a NULL user_id still matches itself: `NULL = NULL` is NULL, which
+        would turn every re-record of a row carrying no user — the rows predating the
+        user_id column, or any in-process caller that passes None — into a silent no-op.
 
-        Returns the row id, or None when the write was rejected as another user's row.
+        session_id is client-supplied on the same footing and gets the same treatment: the
+        INSERT is conditional on the id not naming a chat_sessions row owned by somebody
+        else, so one user cannot tag their turn's cost onto another user's conversation.
+        A session id that names NO chat_sessions row is still accepted, and the reason is
+        what the guard is FOR, not any client's timing: an id nobody owns violates nobody's
+        ownership, while requiring a known row would silently drop the cost of every turn
+        whose session row is absent at write time — session creation failed, or the
+        conversation was deleted while the turn was still streaming — and bias every figure
+        derived from this table. It is no longer true, and must not be re-derived from, the
+        reason this once gave: since genetics-results-suite-vda the browser resolves the
+        session BEFORE the request (LLMChat.tsx), because session_id became the `sid` claim
+        of the per-execution sandbox credential. Do not tighten this to require a known
+        session on the strength of that obsolete premise.
+
+        The check is skipped when user_id is NULL, which nothing in the service can reach:
+        chat_api's /chat/v1/chat is the only caller of stream_chat, it is not @is_public,
+        and its `user` comes from Depends(auth_required) — which returns "anonymous", not
+        None, when auth is disabled. NULL is therefore an in-process-caller-only state.
+
+        Returns the row id, or None when the write was rejected as another user's row or
+        another user's session.
         """
         row_id = str(uuid.uuid4())
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
         try:
+            # user_id=None opts this call out of the session-ownership guard: the NOT
+            # EXISTS below is gated on `? IS NOT NULL`. Nothing reachable from the API can
+            # do that (see the docstring), but an in-process caller that passes None would
+            # disable the guard for itself silently, and no test would fail.
             cursor.execute(
                 """
                 INSERT INTO chat_turn_metrics (
@@ -1042,7 +1075,11 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
                     cost_usd, wall_ms, tool_profile, model
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM chat_sessions
+                    WHERE id = ? AND ? IS NOT NULL AND user_id IS NOT ?
+                )
                 ON CONFLICT(message_id) WHERE message_id IS NOT NULL DO UPDATE SET
                     session_id = excluded.session_id,
                     iterations = excluded.iterations,
@@ -1061,6 +1098,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     row_id, session_id, message_id, user_id, iterations, tool_call_count,
                     input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
                     cost_usd, wall_ms, tool_profile, model,
+                    session_id, user_id, user_id,
                 ),
             )
             written = cursor.rowcount > 0
@@ -1069,10 +1107,21 @@ class ChatHistoryDB(object, metaclass=Singleton):
             conn.rollback()
             raise
         if not written:
-            logger.warning(
-                f"Turn metrics rejected: message_id={message_id} is already recorded "
-                f"for a different user than {user_id}"
-            )
+            # Both guards land here with rowcount 0 and SQLite cannot say which fired, but
+            # the arguments narrow it without asking the database: a NULL message_id cannot
+            # trip the upsert guard (its ON CONFLICT is scoped by the partial index `WHERE
+            # message_id IS NOT NULL`), and a NULL user_id cannot trip the session guard.
+            if message_id is None:
+                cause = f"session_id={session_id} belongs to a different user"
+            elif user_id is None:
+                cause = f"message_id={message_id} is already recorded for a different user"
+            else:
+                cause = (
+                    f"either message_id={message_id} is already recorded for a different "
+                    f"user or session_id={session_id} belongs to a different user — both "
+                    f"guards were eligible for this write"
+                )
+            logger.warning(f"Turn metrics rejected for user {user_id}: {cause}")
             return None
         return row_id
 

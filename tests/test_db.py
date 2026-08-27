@@ -1995,6 +1995,95 @@ class TestChatTurnMetrics:
         assert chat_history_db.delete_session(session.id, "someone@else.com") is False
         assert len(chat_history_db.get_turn_metrics(session.id)) == 1
 
+    def test_cannot_record_into_another_users_session(self, chat_history_db):
+        """session_id is client-supplied. Tagging a turn with someone else's session id
+        used to be accepted, poisoning that session's cost attribution."""
+        session = chat_history_db.create_session(USER)
+
+        assert (
+            self._record(
+                chat_history_db,
+                session_id=session.id,
+                message_id="attacker-msg",
+                user_id="attacker@example.com",
+                cost_usd=99.0,
+            )
+            is None
+        )
+
+        assert chat_history_db.get_turn_metrics(session.id) == []
+
+    def test_records_into_own_session(self, chat_history_db):
+        """The session guard must not break the normal path."""
+        session = chat_history_db.create_session(USER)
+        assert (
+            self._record(chat_history_db, session_id=session.id, user_id=USER) is not None
+        )
+        assert len(chat_history_db.get_turn_metrics(session.id)) == 1
+
+    def test_unauthenticated_deployment_records_into_an_existing_session(
+        self, chat_history_db
+    ):
+        """A NULL user_id has no ownership to check against, so the session guard is
+        skipped and the row is recorded. NULL is not what an auth-disabled deployment
+        writes (that is "anonymous") — it is only reachable from an in-process caller."""
+        session = chat_history_db.create_session("whoever-this-deployment-calls-people")
+        assert (
+            self._record(chat_history_db, session_id=session.id, user_id=None) is not None
+        )
+        assert len(chat_history_db.get_turn_metrics(session.id)) == 1
+
+    def test_delete_session_keeps_another_users_metrics_row(self, chat_history_db):
+        """Rows written before the session guard existed can still carry someone else's
+        session id. Deleting that session must not delete their row: the delete is
+        ownership-gated on chat_sessions, but the metrics rows themselves were not."""
+        session = chat_history_db.create_session(USER)
+        self._record(chat_history_db, session_id=session.id, message_id="mine", user_id=USER)
+        # written directly: record_turn_metrics now refuses this, but a deployed database
+        # may already hold such a row
+        chat_history_db._conn.execute(
+            """
+            INSERT INTO chat_turn_metrics (
+                id, session_id, message_id, user_id, iterations, tool_call_count,
+                input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                cost_usd, wall_ms
+            ) VALUES ('legacy', ?, 'theirs', 'other@example.com', 1, 0, 1, 1, 0, 0, 5.0, 10)
+            """,
+            (session.id,),
+        )
+        chat_history_db._conn.commit()
+
+        assert chat_history_db.delete_session(session.id, USER) is True
+
+        remaining = chat_history_db._conn.execute(
+            "SELECT message_id, user_id FROM chat_turn_metrics"
+        ).fetchall()
+        assert [(r["message_id"], r["user_id"]) for r in remaining] == [
+            ("theirs", "other@example.com")
+        ]
+
+    def test_delete_session_still_removes_rows_predating_the_user_id_column(
+        self, chat_history_db
+    ):
+        """Rows written before user_id existed carry NULL and belong to nobody in
+        particular; leaving them behind would outlive 'delete my conversation'."""
+        session = chat_history_db.create_session(USER)
+        chat_history_db._conn.execute(
+            """
+            INSERT INTO chat_turn_metrics (
+                id, session_id, message_id, user_id, iterations, tool_call_count,
+                input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                cost_usd, wall_ms
+            ) VALUES ('legacy', ?, 'old', NULL, 1, 0, 1, 1, 0, 0, 5.0, 10)
+            """,
+            (session.id,),
+        )
+        chat_history_db._conn.commit()
+
+        chat_history_db.delete_session(session.id, USER)
+
+        assert chat_history_db.get_turn_metrics(session.id) == []
+
     def test_failed_commit_leaves_nothing_pending(self, chat_history_db):
         with failing_commits(chat_history_db):
             with pytest.raises(sqlite3.OperationalError):

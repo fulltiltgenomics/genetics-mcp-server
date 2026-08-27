@@ -396,6 +396,76 @@ class TestChatEndpoint:
         assert len(thinking_events) == 1
         assert thinking_events[0] == {"type": "thinking"}
 
+    def test_a_default_request_asks_for_no_reasoning_text(self, test_client):
+        """The UI path must be untouched by --capture-thinking: a request that does not ask
+        for reasoning must not get it, and must not even request it of the service."""
+        seen = {}
+
+        async def mock_stream(**kwargs):
+            seen.update(kwargs)
+            yield StreamChunk(type="thinking")
+            yield StreamChunk(
+                type="thinking_summary",
+                content=json.dumps({"iteration": 1, "text": "should never be forwarded"}),
+            )
+            yield StreamChunk(type="done", message_content=[{"type": "text", "text": "a"}])
+
+        with patch("genetics_mcp_server.chat_api.get_llm_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                },
+            )
+
+        assert response.status_code == 200
+        # what keeps the UI silent is the flag it never sets; the service is mocked here, so
+        # it emits the chunk anyway and the forwarding branch is covered by the next test
+        assert seen["capture_thinking"] is False, "the UI must not opt in by default"
+
+    def test_capture_thinking_forwards_the_summary_with_its_iteration(self, test_client):
+        async def mock_stream(**kwargs):
+            assert kwargs["capture_thinking"] is True
+            yield StreamChunk(
+                type="thinking_summary",
+                content=json.dumps({"iteration": 2, "text": "check the burden table first"}),
+            )
+            yield StreamChunk(type="done", message_content=[{"type": "text", "text": "a"}])
+
+        with patch("genetics_mcp_server.chat_api.get_llm_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+            mock_service.stream_chat = mock_stream
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "provider": "anthropic",
+                    "enable_tools": False,
+                    "capture_thinking": True,
+                },
+            )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line[len("data:"):].strip())
+            for line in response.text.splitlines()
+            if line.startswith("data:") and line[len("data:"):].strip()
+        ]
+        summaries = [e for e in events if e.get("type") == "thinking_summary"]
+        assert summaries == [
+            {"type": "thinking_summary", "iteration": 2, "text": "check the burden table first"}
+        ]
+
 
 class TestChatEndpointProviders:
     """Tests for chat endpoint provider configuration."""
@@ -461,13 +531,7 @@ class TestChatEndpointProviders:
         ) + verbosity_prompt(None)
         assert injected not in service.kwargs["system_prompt"]
 
-    def test_system_prompt_follows_the_requested_tool_profile(self, test_client):
-        """The prompt is assembled from the tool list the request will actually get.
-
-        genetics-results-suite-4h6.69: before this, the endpoint built the prompt with no
-        reference to the profile, so the `code` arm was told to prefer API tools it had
-        not been given — which is exactly what the 4h6.23 A/B measures.
-        """
+    def _code_arm_prompt(self, test_client):
         from genetics_mcp_server import chat_api
 
         service = _CapturingService()
@@ -479,12 +543,49 @@ class TestChatEndpointProviders:
                     "tool_profile": "code",
                 },
             )
-
         assert response.status_code == 200
-        prompt = service.kwargs["system_prompt"]
+        return service.kwargs["system_prompt"]
+
+    def test_system_prompt_follows_the_requested_tool_profile(self, test_client, monkeypatch):
+        """The prompt is assembled from the tool list the request will actually get.
+
+        genetics-results-suite-4h6.69: before this, the endpoint built the prompt with no
+        reference to the profile, so the `code` arm was told to prefer API tools it had
+        not been given — which is exactly what the 4h6.23 A/B measures.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+
+        monkeypatch.setenv("SANDBOX_ENABLED", "true")
+        settings_module.get_settings.cache_clear()
+        try:
+            prompt = self._code_arm_prompt(test_client)
+        finally:
+            settings_module.get_settings.cache_clear()
+
         assert "run_analysis" in prompt
         assert "get_credible_sets_by_gene" not in prompt
         assert "Prefer the dedicated API tools" not in prompt
+
+    def test_the_sandbox_flag_reaches_the_prompt_this_endpoint_sends(
+        self, test_client, monkeypatch
+    ):
+        """genetics-results-suite-4h6.56 end to end, on the route rather than in a unit.
+
+        With SANDBOX_ENABLED false the tool is withheld, and because the prompt is built
+        from the resolved list the steering goes with it — no prompt edit, no second place
+        to remember. This is the assertion that would catch a future prompt that hard-codes
+        run_analysis guidance again.
+        """
+        from genetics_mcp_server.config import settings as settings_module
+
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+        settings_module.get_settings.cache_clear()
+        try:
+            prompt = self._code_arm_prompt(test_client)
+        finally:
+            settings_module.get_settings.cache_clear()
+
+        assert "run_analysis" not in prompt
 
     def test_chat_with_tool_profile(self, test_client):
         """Test providing tool_profile parameter."""
@@ -841,14 +942,18 @@ class _CapturingService:
         self.subagent_service = object()
         self.kwargs = None
 
-    def resolve_local_tool_names(self, tool_profile=None, enable_tools=True):
+    def resolve_local_tools(
+        self, tool_profile=None, enable_tools=True, custom_tool_descriptions=None
+    ):
         """The real resolution, not a stub: the endpoint assembles the system prompt from
         it (genetics-results-suite-4h6.69), so a stub here would stop these tests from
         seeing the prompt the endpoint actually sends."""
         from genetics_mcp_server.llm_service import LLMService
 
         self._disabled_tools = lambda: LLMService._disabled_tools(self)
-        return LLMService.resolve_local_tool_names(self, tool_profile, enable_tools)
+        return LLMService.resolve_local_tools(
+            self, tool_profile, enable_tools, custom_tool_descriptions
+        )
 
     def stream_chat(self, **kwargs):
         self.kwargs = kwargs

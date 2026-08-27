@@ -31,10 +31,45 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class _Block:
-    """One fragment of the system prompt, with the conditions for emitting it.
+    r"""One fragment of the system prompt, with the conditions for emitting it.
 
     `text` owns its surrounding newlines so that concatenating the emitted blocks
     reproduces the document structure with no re-joining.
+
+    Three rules for writing the text, none of which the gate can enforce for you:
+
+    1. NAME TOOLS EXACTLY. The gate matches `(?<!\w)NAME\b` (see `tools_named_in`), so a
+       plural or suffixed mention — `get_hla_by_alleles` where the tool is
+       `get_hla_by_allele` — is not seen as a mention at all, and the block is then
+       emitted on surfaces that do not have the tool. No test catches that:
+       tests/test_system_prompt.py's scan is independent of the gate on the ALGORITHM
+       (tokenise-then-intersect vs per-name regex) but shares its NORMALISATION, so the
+       two agree with each other while both being wrong. There is no live instance today
+       (genetics-results-suite-4h6.78); keep it that way by naming tools verbatim and
+       rephrasing the sentence around the exact name.
+
+    2. A PROHIBITION GATES POSITIVELY. `_assemble` asks only WHICH names appear in the
+       text, never with what polarity, so a block written to warn AGAINST a tool requires
+       that tool to be available. Remove the tool from a surface and the warning
+       disappears — along with everything else that block carries. The
+       genetics-results-suite-4h6.17/.69 cycle fixed the live instance (the HLA block,
+       where `get_summary_stats` appeared only inside a negation); the property remains.
+       If a rule has to outlive the tool it warns about, put the warning in its own block.
+
+    3. GATE ON WHAT A RULE NEEDS, NOT ON WHAT IT IS ABOUT. Science and grounding belong in
+       blocks that name no tool; only the "which tool" clause is gated. The line between
+       the two is whether the rule can be OBEYED without rows:
+       - An obligation that attaches when the model PRESENTS data holds on every surface,
+         because a surface with no data path can still present data it retrieved from a
+         document. So the pseudo-credible-set labelling duty ("not statistically
+         fine-mapped", "always tell the user explicitly") and the construction facts
+         needed to read such a result (the r² membership criteria, the PIP caution) are
+         ungated, and reach `rag`.
+       - A rule that can only be carried out by FETCHING rows — membership is whatever
+         `credible_sets_v` returns, re-query rather than answer from memory — is gated on
+         having a path to those rows: on a surface without one it names an action the
+         model cannot take, and "verify it" with nothing to verify against is worse than
+         silence (genetics-results-suite-4h6.79).
     """
 
     text: str
@@ -55,6 +90,21 @@ class _Block:
 
 def _fs(*names: str) -> frozenset[str]:
     return frozenset(names)
+
+
+# Tools whose input_schema actually carries `summarize`. The gate matches TOOL NAMES, so
+# advice keyed on a PARAMETER has to name the tools that have it, or it is emitted on
+# surfaces where the parameter does not exist (genetics-results-suite-4h6.75). Spelled out
+# rather than derived because importing tools.definitions at module scope would make
+# `config` depend on `tools` (see known_tool_names); tests/test_system_prompt.py checks
+# this set against the real schemas so it cannot rot silently.
+_SUMMARIZE_PARAM_TOOLS = _fs(
+    "get_credible_sets_by_gene",
+    "get_credible_sets_by_phenotype",
+    "get_credible_sets_by_qtl_gene",
+    "get_credible_sets_by_region",
+    "get_credible_sets_by_variant",
+)
 
 
 _PROMPT_BLOCKS: tuple[_Block, ...] = (
@@ -108,7 +158,30 @@ Now, looking only at the extracted data and literature above, provide your analy
     _Block(
         "- **get_gene_based_results returns only genebass p < 1e-4 rows, so a gene missing from it is not a gene without a burden result.** To say a gene was tested and came out null in a given trait, use get_gene_based_results_by_phenotype (unfiltered, one trait) or query gene_burden_results_v in the database (unfiltered, every gene x annotation x trait)\n"
     ),
-    _Block("""- **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types or resources — is what got cut, and you cannot see what is missing. Never answer a counting question ("how many X"), an inventory question ("which cell types / datasets / traits"), or an absence question ("is there any caQTL data for this gene") from a truncated result, and never state that something is not in the data because it was not in the visible part. Re-run the tool with narrower arguments (`data_types`, `resource`) or with `summarize=true` until the result is complete, or query the database for the count directly. If you report anything at all from a truncated result, say explicitly that it is partial
+    _Block("""- **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types or resources — is what got cut, and you cannot see what is missing. Never answer a counting question ("how many X"), an inventory question ("which cell types / datasets / traits"), or an absence question ("is there any caQTL data for this gene") from a truncated result, and never state that something is not in the data because it was not in the visible part."""),
+    # the remedy is keyed on a PARAMETER and on a database, neither of which the name gate
+    # can see, so as one sentence it was emitted on surfaces with no `summarize` and no
+    # database at all (genetics-results-suite-4h6.75). Each clause now carries the gate for
+    # the capability it names; the generic "narrow the request" fallback is true everywhere.
+    _Block(
+        " Re-run the tool with narrower arguments (`data_types`, `resource`) or with `summarize=true` until the result is complete.",
+        requires_any=_SUMMARIZE_PARAM_TOOLS,
+    ),
+    _Block(
+        " Narrow the request until the result is complete.",
+        excludes=_SUMMARIZE_PARAM_TOOLS,
+    ),
+    _Block(
+        " Query the database for the count directly rather than inferring it from the prefix.",
+        requires_any=_fs("query_database"),
+    ),
+    _Block(
+        " Count the rows in a script with `genetics.sql(...)` rather than inferring the count from the prefix.",
+        requires_any=_fs("run_analysis"),
+        excludes=_fs("query_database"),
+    ),
+    _Block("""\
+ If you report anything at all from a truncated result, say explicitly that it is partial
 - **Never present output you have not received yet.** Do not write a table, count, or effect estimate with empty cells or placeholders such as `[from query]` or `[to confirm]`, and do not end a turn by announcing a query you have not run. Announcing a call is not making one: if answering needs data, call the tool in the same turn and write the table only from the result that came back. If you cannot get the data, say what is missing instead of laying out the shape of an answer you do not have
 - When looking for something and it is not found, say so explicitly
 - When looking for a phenotype and many are found, mention all phenotype codes found, and prefer the FinnGen phenotype with the largest number of cases, or largest sample size if the number of cases is not available
@@ -223,8 +296,27 @@ For anything about the protein itself — domains, active/binding/metal sites, c
     # the products-vs-data_type distinction is a property of the data, not of any tool, so
     # it is stated without naming one; only the "go and call it" sentence is gated
     _Block("""
-When presenting data availability, always check each dataset's `products` field — it shows which data products (credible_sets, summary_stats, colocalization) are actually available. A dataset's `data_type` (e.g. pQTL) describes what the dataset *is*, but `products` determines what you can actually *query*. For example, a pQTL dataset with only `colocalization` in its products does not have QTL credible sets or summary stats available — only colocalization results. Make this distinction clear to the user. When listing datasets, always mention which products each dataset supports.
-
+When presenting data availability, always check each dataset's `products` field — it shows which data products (credible_sets, summary_stats, colocalization) are actually available. When listing datasets, always mention which products each dataset supports.
+""",
+        # the imperative presupposes a route to the field. Ungated it instructed surfaces
+        # with no catalog call at all to check a field they cannot read
+        # (genetics-results-suite-4h6.75), but `list_datasets` is NOT the only route:
+        # `genetics.datasets()` in the SDK delegates to the same executor method, which
+        # GETs the same `/v1/datasets` endpoint, and that response carries `products` per
+        # dataset (results-api app/routers/datasets.py). So `run_analysis` earns the
+        # imperative too, with the block below naming the call. The distinction itself is
+        # knowledge and stays below, on every surface.
+        requires_any=_fs("list_datasets", "run_analysis"),
+    ),
+    _Block(
+        "The catalog comes from `genetics.datasets(resource=..., include_stats=True)` inside a script on this surface — its payload carries each dataset's `products`.\n",
+        excludes=_fs("list_datasets"),
+        requires_any=_fs("run_analysis"),
+    ),
+    _Block("""
+A dataset's `data_type` (e.g. pQTL) describes what the dataset *is*, but its `products` field determines what you can actually *query*. For example, a pQTL dataset with only `colocalization` in its products does not have QTL credible sets or summary stats available — only colocalization results. Make this distinction clear to the user.
+"""),
+    _Block("""
 **When reporting aggregate counts or summaries** (e.g., number of colocalized trait pairs, total associations, dataset coverage), always state which datasets/resources are included in the result. If the user might expect a data source to be present but it is not (e.g., Open Targets does not contribute colocalization data), mention that explicitly.
 
 **When the user asks about the sample size, case/control counts, or provenance of a SPECIFIC result they are referring to** (a credible set, association, or row from an earlier step or an external source), first determine which dataset/resource that exact result came from — via its `dataset_id`/`resource`, or by re-querying it — and report the sample size for THAT dataset. Do not quote the sample size of whichever dataset is most convenient or the one you happen to have open; a result the user cites may come from a different dataset than the one you last queried. If you cannot establish which dataset the result is from, say so rather than attaching a sample size that may not apply.
@@ -268,6 +360,22 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
     # the same sentences gated it away from exactly the SQL surfaces. Only the authoritative
     # source is per-surface, so only that clause is split out; the rules themselves are
     # written once and gated on having any credible-set path at all.
+    #
+    # THE "When in doubt, verify" SENTENCE BELOW HAS NO SQL VARIANT ON PURPOSE
+    # (genetics-results-suite-4h6.80). It names `get_credible_set_by_id`, so the gate keeps
+    # it off `bigquery`, `code` and `rag` — and that is the intended shape, not an oversight
+    # to be "completed". It only restates the membership rule directly above it, which DOES
+    # have a SQL variant and IS emitted on both SQL surfaces (verified by rendering the
+    # profiles); a SQL-worded copy would be the third statement of one rule on those
+    # surfaces, since the re-query block four `_Block`s later — the r² sanity-check block
+    # sits in between — already tells them to derive membership from a fresh `COUNT` over
+    # `credible_sets_v`.
+    #
+    # THE CONDITION UNDER WHICH THAT STOPS BEING TRUE: the redundancy is a content
+    # judgement, not a structural guarantee. If the membership block above is ever reworded
+    # so it no longer carries "verify before calling anything a member", the SQL surfaces
+    # lose that instruction with nothing to catch it. Reword that block and you must revisit
+    # this one.
     _Block(
         "\n**Membership is NOT the same as LD.** A variant is a member of a credible set ONLY if it is actually returned as a member by `get_credible_set_by_id` (or appears in the `credible_sets_v` rows for that `cs_id`)."
     ),
@@ -330,6 +438,53 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
     _Block(
         "\nThose per-variant annotations come from `get_variant_annotations` (FinnGen), `get_myvariant_annotations` (clinical/functional), or the gnomAD MCP tools instead.\n",
         requires_any=_fs("query_database", "run_analysis"),
+    ),
+    # the remedy above names the two annotation tools, so the TEXT gate drops it on every
+    # surface without them while the prohibition it answers survives — measured on
+    # `bigquery` and on `code` (genetics-results-suite-4h6.76). The four variants below
+    # carry the route each of those surfaces actually has, and say there is none only
+    # where that is true.
+    #
+    # `get_variant_protein_effect` is what splits them. It returns the amino-acid change
+    # for a coding SNV together with its curated ClinVar significance, population
+    # frequency and rsID — i.e. part of exactly what the prohibition above forbids
+    # querying the database for — and it is present on `bigquery` (and `rag`) but not on
+    # `code`. Naming it in the two bigquery-facing variants makes them SELF-GATING under
+    # the text rule, which is the precondition they want; before that they told
+    # `bigquery` to refuse a coding-SNV annotation the SAME prompt documents how to fetch
+    # (genetics-results-suite-4h6.76 again, the second half).
+    #
+    # All of this reasons about LOCAL tools only: the prompt is assembled from the local
+    # tool list, so an always-on external MCP server (gnomAD, Open Targets — attached in
+    # llm_service.py for every profile except `rag` and the allow-list ones) is a further
+    # annotation route that nothing here accounts for, and whether one is configured is
+    # not visible from this repo.
+    _Block(
+        "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID. Beyond those two — non-coding variants, pathogenicity scores, multi-population frequencies — say what is missing rather than approximating it from the columns above.\n",
+        requires_any=_fs("run_analysis"),
+        excludes=_fs("get_variant_annotations", "get_myvariant_annotations"),
+    ),
+    _Block(
+        "\nThose per-variant annotations are not in the database. Fetch them in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` returns consequence, allele frequency and gene for a single variant, a batch, a whole gene or a region. What it does not cover — clinical significance, pathogenicity scores, multi-population frequencies — is not in the database either, so say what is missing rather than approximating it from the columns above.\n",
+        requires_any=_fs("run_analysis"),
+        excludes=_fs(
+            "get_variant_annotations", "get_myvariant_annotations", "get_variant_protein_effect"
+        ),
+    ),
+    _Block(
+        "\nThe database is not an alternative route to them. For a coding SNV, `get_variant_protein_effect` returns the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID — use it rather than refusing. For anything it does not cover — non-coding variants, pathogenicity scores, multi-population frequencies — say that it is not available here rather than approximating it from the columns above.\n",
+        requires_any=_fs("query_database"),
+        excludes=_fs("get_variant_annotations", "get_myvariant_annotations", "run_analysis"),
+    ),
+    _Block(
+        "\nThe database is not an alternative route to them, and there is no variant-annotation tool on this surface, so if an answer needs a variant's consequence, allele frequency, rsID or pathogenicity, say that it is not available here rather than approximating it from the columns above.\n",
+        requires_any=_fs("query_database"),
+        excludes=_fs(
+            "get_variant_annotations",
+            "get_myvariant_annotations",
+            "run_analysis",
+            "get_variant_protein_effect",
+        ),
     ),
     _Block("""
 When querying data with few datasets per resource, include a per-dataset breakdown in the results (e.g., `GROUP BY dataset`).

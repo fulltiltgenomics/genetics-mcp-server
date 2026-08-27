@@ -280,6 +280,23 @@ class TurnRecord:
     user_question: str | None = None
     final_answer: str | None = None
     final_answer_dropped_chars: int = 0
+    # ...and the discarded text ITSELF, with the call it followed, so a transcript can put it
+    # back where the model wrote it. Same boundary as the count above (one definition, in
+    # `pairwise_judge.dropped_prose_blocks`), and kept for the READER only: the judge is
+    # still shown `final_answer` alone, since this half names tools and scripts and would
+    # identify the arm on sight. Always captured — it is the model's own visible output, it
+    # is small next to the tool arguments already in the report, and its absence made the
+    # transcript claim a fragment was the whole reply.
+    final_answer_dropped_prose: list[dict[str, Any]] = field(default_factory=list)
+
+    # one entry per iteration that reasoned, {"iteration", "text"}, and EMPTY unless the run
+    # asked for it with --capture-thinking. Populated from the `thinking_summary` chunks,
+    # which the server emits only on request: the text exists nowhere else, since llm_service
+    # keeps thinking blocks out of `message_content` and the ordinary `thinking` chunk is a
+    # contentless keepalive. It is the model's SUMMARIZED reasoning — no model exposes the
+    # raw chain of thought — and it is never shown to the judge, which would see tool and
+    # script names in it and stop being blind.
+    thinking_detail: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -372,6 +389,52 @@ def extract_tool_calls(message_content: list[dict[str, Any]] | None) -> list[dic
 def count_tool_calls(message_content: list[dict[str, Any]] | None) -> int:
     """Count real tool_use blocks. Defined via the extractor so the two cannot disagree."""
     return len(extract_tool_calls(message_content))
+
+
+def attach_call_metadata(
+    calls: list[dict[str, Any]],
+    call_iteration: dict[str, int],
+    script_by_call: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Join the STREAM's per-call metadata onto calls extracted from the `done` chunk.
+
+    Two things the done chunk structurally cannot answer, and one it must keep answering:
+
+      * WHICH ITERATION A CALL BELONGS TO. `message_content` is every iteration's blocks
+        flattened into one list with no boundary between them, so a reader cannot tell six
+        calls in one parallel iteration from six iterations of one call each — which is the
+        whole difference between a wide arm and a slow one. llm_service emits its `tool_use`
+        chunks after the iteration's `usage` chunk and before any of that iteration's tools
+        run, so the count of usage chunks seen at that moment IS the iteration.
+      * HOW LONG A `run_analysis` CALL TOOK. Its `script_result` chunk carries the sandbox's
+        own wall clock keyed by `tool_use_id`. No other tool reports a duration on the wire.
+
+    ARGUMENTS ARE NOT TAKEN FROM THE STREAM, only correlated by id. llm_service rewrites the
+    copy it streams before emitting it — it substitutes `search_scientific_literature`'s
+    backend and strips `run_analysis`'s model-invented `user`/`session_id` — so the streamed
+    input is what the SERVER ran, not what the MODEL asked for, and the second is what a
+    losing case needs explaining.
+
+    Absent stays absent. Against a server that emits no `tool_use` chunks the key is simply
+    missing rather than guessed, and benchmark_scorecard says the report predates it instead
+    of printing an iteration nobody measured.
+    """
+    for call in calls:
+        call_id = call.get("id")
+        if not isinstance(call_id, str):
+            continue
+        if call_id in call_iteration:
+            call["iteration"] = call_iteration[call_id]
+        script = script_by_call.get(call_id)
+        if script is None:
+            continue
+        # the SCRIPT's own wall clock inside the sandbox (_script_result_payload), which is
+        # NOT the iteration's tool phase: that also covers dispatch, the other tools of the
+        # same iteration running alongside it, and rendering the result.
+        call["script_duration_ms"] = script.get("duration_ms")
+        call["script_status"] = script.get("status")
+        call["script_ok"] = script.get("ok")
+    return calls
 
 
 def _opt_int(data: dict[str, Any], key: str) -> int | None:
@@ -578,6 +641,7 @@ async def replay_turn(
     model: str | None,
     provider: str | None,
     timeout: float,
+    capture_thinking: bool = False,
 ) -> tuple[TurnRecord, list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Send one turn and read its metrics off the stream.
 
@@ -588,7 +652,11 @@ async def replay_turn(
     # imported here, not at module scope: pairwise_judge imports `matched_pairs` from this
     # module (the pairing rule has one definition), so a module-level import back would be a
     # cycle. Same lazy-import shape analyze_conversations uses for its own heavy deps.
-    from genetics_mcp_server.scripts.pairwise_judge import final_answer_split, user_question_text
+    from genetics_mcp_server.scripts.pairwise_judge import (
+        dropped_prose_blocks,
+        final_answer_split,
+        user_question_text,
+    )
 
     record = TurnRecord(
         case_id=case_id,
@@ -610,6 +678,10 @@ async def replay_turn(
         "verbosity": options.get("verbosity"),
         "instruction_set_id": options.get("instruction_set_id"),
         "literature_backend": options.get("literature_backend"),
+        # a run-level choice, not a per-turn option: it changes what the stream carries, not
+        # what the model is asked. A server that predates the field ignores it and the run
+        # simply records no reasoning, which the scorecard then says outright.
+        "capture_thinking": capture_thinking,
     }
     if model:
         body["model"] = model
@@ -626,6 +698,9 @@ async def replay_turn(
     # the outcome categories seen since the last usage chunk, i.e. within the current
     # iteration. Non-empty at the next usage chunk means that roundtrip was spent on them.
     pending_causes: set[str] = set()
+    # per-call metadata that only exists in the STREAM's ordering; see attach_call_metadata
+    call_iteration: dict[str, int] = {}
+    script_by_call: dict[str, dict[str, Any]] = {}
     message_content: list[dict[str, Any]] | None = None
     tool_results: list[dict[str, Any]] = []
     started = time.perf_counter()
@@ -701,8 +776,32 @@ async def replay_turn(
                             )
                             retry_loops_by_cause[cause] = retry_loops_by_cause.get(cause, 0) + 1
                             pending_causes.clear()
+                    elif dtype == "tool_use":
+                        # emitted after this iteration's usage chunk and before any of its
+                        # tools run, so the iteration in force is the one that call belongs
+                        # to. Read off the usage chunk rather than counted, so a server that
+                        # renumbers iterations stays authoritative over the harness.
+                        tool_use_id = data.get("id")
+                        if isinstance(tool_use_id, str) and usages:
+                            call_iteration[tool_use_id] = usages[-1].iteration
+                    elif dtype == "thinking_summary":
+                        # emitted per iteration as its blocks are collected, i.e. after that
+                        # iteration's usage chunk, so the server's own `iteration` is
+                        # authoritative and the usage count is only the fallback
+                        text = data.get("text")
+                        if isinstance(text, str) and text:
+                            record.thinking_detail.append(
+                                {
+                                    "iteration": data.get("iteration")
+                                    or (usages[-1].iteration if usages else None),
+                                    "text": text,
+                                }
+                            )
                     elif dtype == SCRIPT_RESULT_CHUNK_TYPE:
                         saw_script_chunk = True
+                        script_tool_use_id = data.get("tool_use_id")
+                        if isinstance(script_tool_use_id, str):
+                            script_by_call[script_tool_use_id] = data
                         category, shape = _script_outcome(data)
                         script_categories[category] = script_categories.get(category, 0) + 1
                         script_outcomes[shape] = script_outcomes.get(shape, 0) + 1
@@ -832,11 +931,14 @@ async def replay_turn(
         )
 
     if record.status == "ok":
-        record.tool_calls_detail = extract_tool_calls(message_content)
+        record.tool_calls_detail = attach_call_metadata(
+            extract_tool_calls(message_content), call_iteration, script_by_call
+        )
         record.tool_calls = len(record.tool_calls_detail)
         record.final_answer, record.final_answer_dropped_chars = final_answer_split(
             message_content
         )
+        record.final_answer_dropped_prose = dropped_prose_blocks(message_content)
     else:
         # the flag is only meaningful for a turn that finished; an aborted one never got
         # far enough for the absence of the marker to mean anything
@@ -876,6 +978,7 @@ async def replay_case_arm(
     provider: str | None,
     timeout: float,
     max_turns: int | None,
+    capture_thinking: bool = False,
 ) -> list[TurnRecord]:
     """Replay one case's whole user-turn sequence under one arm."""
     case_id = str(case.get("session_id") or case.get("id") or "unknown")
@@ -918,6 +1021,7 @@ async def replay_case_arm(
             model=model,
             provider=provider,
             timeout=timeout,
+            capture_thinking=capture_thinking,
         )
         records.append(record)
         if message_content is None:
@@ -951,6 +1055,7 @@ async def replay_case(
     provider: str | None,
     timeout: float,
     max_turns: int | None,
+    capture_thinking: bool = False,
 ) -> CaseResult:
     """Run both arms of one case back to back, in an alternating order."""
     order = arm_order_for_case(arms, case_index)
@@ -972,6 +1077,7 @@ async def replay_case(
                 provider=provider,
                 timeout=timeout,
                 max_turns=max_turns,
+                capture_thinking=capture_thinking,
             )
         )
     return result
@@ -1555,6 +1661,7 @@ async def run_benchmark(
     max_turns: int | None,
     auth_token: str | None,
     provider: str | None = None,
+    capture_thinking: bool = False,
 ) -> dict[str, Any]:
     cases = load_cases(dataset, limit)
     run_id = uuid.uuid4().hex[:8]
@@ -1578,6 +1685,7 @@ async def run_benchmark(
                     provider=provider,
                     timeout=timeout,
                     max_turns=max_turns,
+                    capture_thinking=capture_thinking,
                 )
 
         results = await asyncio.gather(
@@ -1630,6 +1738,7 @@ async def run_benchmark(
             "max_turns": max_turns,
             "timeout_s": timeout,
             "secret": True,
+            "capture_thinking": capture_thinking,
             # what the SERVER said each arm resolves to, asked before the run rather than
             # re-derived afterwards from a tree that may have moved
             "arm_tools": arm_tools,
@@ -1677,6 +1786,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=900.0,
         help="per-turn wall-clock deadline, seconds (not a per-read timeout: SSE "
         "keepalives would reset that indefinitely)",
+    )
+    parser.add_argument(
+        "--capture-thinking",
+        action="store_true",
+        help="ask the server to stream each iteration's summarized reasoning and record it "
+        "per turn, so benchmark_scorecard --markdown can show the thinking behind each "
+        "tool call. Off by default: it multiplies the report's size and is not needed for "
+        "any metric — thinking tokens are already inside output_tokens either way",
     )
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")
     parser.add_argument("--dry-run", action="store_true", help="resolve the plan, issue no requests")
@@ -1763,6 +1880,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=args.max_turns,
                 auth_token=os.environ.get("REPLAY_AUTH_TOKEN"),
                 provider=args.provider,
+                capture_thinking=args.capture_thinking,
             )
         )
     except RateLimitedError as exc:

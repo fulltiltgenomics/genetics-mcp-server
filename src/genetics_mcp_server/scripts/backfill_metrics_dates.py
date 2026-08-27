@@ -27,8 +27,12 @@ from pathlib import Path
 
 
 def load_session_dates(db_path: str) -> dict[str, str]:
-    """Map session_id -> created_at (session start) from chat_sessions."""
-    conn = sqlite3.connect(db_path)
+    """Map session_id -> created_at (session start) from chat_sessions.
+
+    Read-only: the backfill writes to metrics.json, never to the chat DB, so this
+    needs no write-capable handle on the live database (genetics-results-suite-402).
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute("SELECT id, created_at FROM chat_sessions").fetchall()
     finally:
