@@ -1242,9 +1242,31 @@ per turn underivable.
   reassigned, no error and no log. The row therefore carries the authenticated user, and the
   `DO UPDATE` ends in `WHERE chat_turn_metrics.user_id IS excluded.user_id`. A conflicting write
   from a different user **inserts nothing, overwrites nothing, and logs a warning**;
-  `record_turn_metrics` returns `None` rather than a row id. `IS` and not `=` so a deployment
-  with auth disabled, writing NULL `user_id`, can still re-record its own rows. `user_id` is also
-  what makes per-user cost analysis possible at all.
+  `record_turn_metrics` returns `None` rather than a row id. `IS` and not `=` so a NULL `user_id`
+  still matches itself — `NULL = NULL` is NULL, which would turn every re-record of a row that
+  carries no user (rows predating the `user_id` column, or an in-process caller passing `None`)
+  into a silent no-op. Note that a deployment with auth disabled does **not** write NULL: it
+  writes `"anonymous"` (`auth_required` returns `user or "anonymous"`). `user_id` is also what
+  makes per-user cost analysis possible at all.
+- **`session_id` is checked against `chat_sessions` on write.** It is client-supplied on the same
+  footing as `message_id`, so it used to be possible to tag a turn's cost onto another user's
+  conversation. The INSERT is now conditional on the id not naming a `chat_sessions` row owned by
+  somebody else; the write is refused exactly as an ownership-failing upsert is — nothing
+  inserted, a warning logged (naming which of the two guards fired, where the arguments make that
+  decidable). A `session_id` naming **no** row is still accepted, because the guard is about
+  ownership and an id nobody owns violates nobody's — requiring a known row would instead drop the
+  cost of every turn whose session row is absent at write time (creation failed, or the
+  conversation was deleted mid-stream). It is **not** accepted because "the first turn streams
+  before the session exists": since `genetics-results-suite-vda` the browser resolves the session
+  *before* the request, `session_id` having become the `sid` claim of the sandbox credential. The
+  check is skipped entirely when `user_id` is NULL, which no request can reach — `/chat/v1/chat`
+  is `stream_chat`'s only caller, it is not `@is_public`, and its `user` comes from
+  `Depends(auth_required)`, which returns `"anonymous"` and never `None`. Only a future in-process
+  caller passing `user_id=None` could disable the session guard for itself, and no test would
+  catch it (noted at the site). `delete_session`'s metrics DELETE is scoped the same way — `session_id = ? AND
+  (user_id IS ? OR user_id IS NULL)` — so a row another user wrote under this session id before
+  the write check existed survives a delete of the session, while rows predating the `user_id`
+  column, which carry NULL and would otherwise never be reachable, are still removed.
 - **Turn-1 rows are orphaned.** The browser does not send `message_id` today and creates the
   session only after the first exchange, so *every* conversation's opening turn is written with
   both ids NULL. Consequences, until the browser change lands (tracked in the browser repo):
