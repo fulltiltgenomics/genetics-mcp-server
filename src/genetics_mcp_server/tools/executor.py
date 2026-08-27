@@ -712,7 +712,15 @@ class ToolExecutor:
 
     @cached_property
     def public_url(self) -> str:
-        """Public URL for download links shown to users."""
+        """Public URL for download links shown to users.
+
+        Its default is base_url and both are non-data descriptors, so an
+        `executor.base_url = X` override reaches here only if it happens BEFORE
+        public_url is first read; afterwards public_url has cached the pre-override
+        value. Nothing assigns any of these three URLs today — the first fixture that
+        does (pointing an executor at a stub server, say) must assign base_url first, or
+        assign public_url explicitly as well.
+        """
         return self._public_api_url_arg or _endpoint_env(
             "GENETICS_PUBLIC_API_URL", self.base_url
         )
@@ -735,6 +743,17 @@ class ToolExecutor:
         per-instance lock in 3.12: two threads racing the first access would each build a
         client, and only the winner's connection pool is the one close() ever sees. The
         service holds one shared executor across threads (mcp_server.py).
+
+        Three sharp edges nothing triggers today, each with its own trigger condition.
+        `del executor.client` raises: there is no deleter, where the cached_property this
+        replaced allowed it once cached — anything that starts resetting an executor
+        between reuses needs `@client.deleter` popping __dict__ first. `hasattr(executor,
+        "client")` is always True *and* builds a live client as a side effect, so it can
+        never answer "was one ever made?"; close() reads __dict__ rather than the
+        attribute for exactly that reason. And `_client_lock` is set only by __init__, so
+        the first client access on an instance built around it — `object.__new__`,
+        `Mock(spec=ToolExecutor)`, a subclass skipping `super().__init__()` — raises
+        AttributeError rather than building anything.
         """
         client = self.__dict__.get("client")
         if client is None:
@@ -1730,6 +1749,11 @@ class ToolExecutor:
             gene_lit = quote_literal(gene, name="gene")
             window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
             limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+            # Re-parsing the SQL token is safe only while the floor stays >= 0: sql_int
+            # parenthesises negatives, and int("(-5)") raises a plain ValueError that the
+            # `except SqlValueError` below does not catch, so the tool would raise instead
+            # of returning an error dict. Four sibling tools repeat this exact pair
+            # (get_open_chromatin/variant_effect/mpra/mpra_pip_concordance_by_gene).
             limit = int(limit_sql)
             dataset_filter = ""
             if resources:
