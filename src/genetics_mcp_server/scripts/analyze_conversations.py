@@ -52,8 +52,12 @@ ANALYZER_VERSION = 1
 # ---------------------------------------------------------------------------
 
 def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Load chat_sessions and chat_messages into polars DataFrames."""
-    conn = sqlite3.connect(db_path)
+    """Load chat_sessions and chat_messages into polars DataFrames.
+
+    Read-only: this runs nightly against the live chat_history.db on a shared RWO PVC
+    while chat-backend is serving it, and nothing here writes (genetics-results-suite-4zd).
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         cursor = conn.execute("SELECT * FROM chat_sessions")
         cols = [desc[0] for desc in cursor.description]
