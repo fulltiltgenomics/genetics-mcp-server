@@ -68,6 +68,46 @@ class TestToolsEndpoint:
         assert "name" in tool
         assert "description" in tool
 
+    def test_resolved_matches_what_a_request_would_get(self, test_client):
+        """resolved=true answers with the tools the model is actually handed.
+
+        The point of the flag: the bare catalogue is neither filtered by profile nor by
+        `disabled_tools`, so a panel built on it would show a user tools the assistant does
+        not have. Pinning it to `describe_available_tools` — the same resolution the chat
+        request runs — is what makes the panel honest, so that is what is asserted here
+        rather than any particular count.
+        """
+        from genetics_mcp_server.llm_service import get_llm_service
+
+        response = test_client.get("/chat/v1/tools", params={"resolved": "true"})
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [t["name"] for t in data] == [
+            t["name"] for t in get_llm_service().describe_available_tools(None, True)
+        ]
+        assert all(t["description"] for t in data)
+        assert {t["source"] for t in data} <= {"local", "external", "rag"}
+
+    def test_resolved_narrows_with_the_profile(self, test_client):
+        """A narrower profile means a shorter list — the panel is per-conversation."""
+        everything = test_client.get("/chat/v1/tools", params={"resolved": "true"}).json()
+        rag = test_client.get(
+            "/chat/v1/tools", params={"resolved": "true", "tool_profile": "rag"}
+        ).json()
+
+        assert len(rag) < len(everything)
+        assert {t["category"] for t in rag} == {"general"}
+
+    def test_resolved_with_tools_off_is_empty(self, test_client):
+        """enable_tools=false is the one case where the assistant really has no tools."""
+        response = test_client.get(
+            "/chat/v1/tools", params={"resolved": "true", "enable_tools": "false"}
+        )
+
+        assert response.status_code == 200
+        assert response.json() == []
+
 
 class TestHealthEndpoint:
     """Tests for /healthz endpoint."""

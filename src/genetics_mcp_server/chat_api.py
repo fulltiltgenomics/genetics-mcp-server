@@ -420,9 +420,33 @@ async def chat_status(
 
 
 @app.get("/chat/v1/tools")
-async def list_tools(user: str | None = Depends(auth_required)) -> list[dict[str, Any]]:
-    """List available MCP tools with their descriptions and parameters."""
-    return TOOL_DEFINITIONS
+async def list_tools(
+    resolved: bool = False,
+    tool_profile: str | None = None,
+    enable_tools: bool = True,
+    user: str | None = Depends(auth_required),
+) -> list[dict[str, Any]]:
+    """List MCP tools with their descriptions.
+
+    Two questions, and the default answers the older one. Bare, this returns
+    `TOOL_DEFINITIONS` verbatim — the raw catalogue, with the full `parameters` of each
+    tool, but no profile filter, no `disabled_tools`, and neither the BigQuery nor the
+    subagent definition list. That is the wrong list to show a user: it names two tools the
+    server currently refuses to advertise and omits `query_database`, and it is the same
+    list whichever profile the conversation is on.
+
+    `resolved=true` answers the question the browser's tools panel actually asks — what
+    *this* conversation's assistant can do — by going through `describe_available_tools`,
+    which resolves the local surface and the proxied ones exactly as a chat request does.
+    It carries `category` and `source` per tool instead of `parameters`: the panel groups
+    by them, and the schemas are for the model, not the reader.
+
+    Both shapes are a list of tool objects, so a caller that ignores the new fields is
+    unaffected.
+    """
+    if not resolved:
+        return TOOL_DEFINITIONS
+    return get_llm_service().describe_available_tools(tool_profile, enable_tools)
 
 
 @app.get("/chat/v1/tools/resolved")

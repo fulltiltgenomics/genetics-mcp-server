@@ -1888,6 +1888,30 @@ def _warn_unknown_profile(tool_profile: str) -> None:
     )
 
 
+def all_local_tool_definitions() -> list[dict[str, Any]]:
+    """Every locally-defined tool, before any profile or disabled filter.
+
+    The three lists are one surface everywhere they are used together; naming that here
+    keeps `get_anthropic_tools` and `tool_category` filtering and labelling the same set.
+    """
+    return list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS) + list(SUBAGENT_TOOL_DEFINITIONS)
+
+
+_LOCAL_TOOL_CATEGORIES: dict[str, str] = {
+    t["name"]: t["category"] for t in all_local_tool_definitions()
+}
+
+
+def tool_category(name: str) -> str | None:
+    """The category a local tool is filtered by, or None for a name defined nowhere local.
+
+    `get_anthropic_tools` drops `category` on the way to Anthropic's format, which has no
+    field for it; a caller that has to label a resolved tool (the tools panel groups by it)
+    reads it back through here rather than re-deriving the profile filter.
+    """
+    return _LOCAL_TOOL_CATEGORIES.get(name)
+
+
 def get_anthropic_tools(
     custom_descriptions: dict[str, str] | None = None,
     tool_profile: str | None = None,
@@ -1914,7 +1938,7 @@ def get_anthropic_tools(
     """
     anthropic_tools = []
 
-    all_tools = list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS) + list(SUBAGENT_TOOL_DEFINITIONS)
+    all_tools = list(all_local_tool_definitions())
 
     if disabled_tools:
         all_tools = [t for t in all_tools if t["name"] not in disabled_tools]
