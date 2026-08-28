@@ -196,7 +196,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 llm_disposition TEXT,
                 topic TEXT,
                 complexity INTEGER,
-                metrics_json TEXT
+                metrics_json TEXT,
+                topic_model TEXT,
+                quality_model TEXT
             )
         """)
 
@@ -204,6 +206,26 @@ class ChatHistoryDB(object, metaclass=Singleton):
             CREATE INDEX IF NOT EXISTS idx_conversation_analysis_analyzed_at
             ON conversation_analysis(analyzed_at)
         """)
+
+        # migrations: add columns to conversation_analysis if they don't exist.
+        # The CREATE above is a no-op on the long-lived production DB file, so a
+        # column added only there would never appear and every INSERT naming it
+        # would raise OperationalError (genetics-results-suite-9wv). Rows written
+        # before this keep NULL models: which judge produced them is not recoverable.
+        #
+        # LATENT (same shape as the five migration blocks above, deliberately not
+        # fixed here): the PRAGMA read and the ALTER are not atomic. Two processes
+        # that both read table_info before either ALTER commits leave the loser
+        # raising OperationalError: duplicate column name, which propagates out of
+        # _init_db/__init__ — a backend pod fails to start, or the CronJob dies. The
+        # window is the single deploy that first adds a column and it self-heals on
+        # restart, so no locking is added.
+        cursor.execute("PRAGMA table_info(conversation_analysis)")
+        analysis_columns = {row[1] for row in cursor.fetchall()}
+        if "topic_model" not in analysis_columns:
+            cursor.execute("ALTER TABLE conversation_analysis ADD COLUMN topic_model TEXT")
+        if "quality_model" not in analysis_columns:
+            cursor.execute("ALTER TABLE conversation_analysis ADD COLUMN quality_model TEXT")
 
         # issue categories normalized to one row each so filtering and the
         # issue-mix plot are plain SQL GROUP BY rather than JSON parsing
@@ -1149,13 +1171,21 @@ class ChatHistoryDB(object, metaclass=Singleton):
         analyzer_version: int,
         source_updated_at: str | datetime | None,
         message_count: int,
+        topic_model: str | None = None,
+        quality_model: str | None = None,
     ) -> None:
         """Persist analysis for one session: one conversation_analysis row plus
         its conversation_issue rows, replacing any prior rows for the session.
 
         ``metrics`` is a ConversationMetrics instance or a dict with the same
-        fields. The whole write is a single short transaction so it does not
-        block live chat writers (no LLM calls or loops happen under the lock).
+        fields. ``topic_model``/``quality_model`` name the judge models that
+        produced this row, so an aggregate over the quality columns can GROUP BY
+        them instead of silently mixing judges. Pass a model only for a field this
+        call actually recomputed; ``None`` (the default) leaves whatever the row
+        already holds, so a row keeps the model recorded when it was last really
+        judged. A NULL that survives means "judged before the columns existed".
+        The whole write is a single short transaction so it does not block live
+        chat writers (no LLM calls or loops happen under the lock).
         """
         m = metrics if isinstance(metrics, dict) else vars(metrics)
 
@@ -1178,9 +1208,10 @@ class ChatHistoryDB(object, metaclass=Singleton):
             INSERT INTO conversation_analysis (
                 session_id, analyzed_at, analyzer_version, source_updated_at,
                 message_count, user_rating, llm_quality_score, success_label,
-                llm_disposition, topic, complexity, metrics_json
+                llm_disposition, topic, complexity, metrics_json,
+                topic_model, quality_model
             )
-            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 analyzed_at = CURRENT_TIMESTAMP,
                 analyzer_version = excluded.analyzer_version,
@@ -1192,7 +1223,14 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 llm_disposition = excluded.llm_disposition,
                 topic = excluded.topic,
                 complexity = excluded.complexity,
-                metrics_json = excluded.metrics_json
+                metrics_json = excluded.metrics_json,
+                -- COALESCE, not plain assignment: a re-upsert that did NOT recompute
+                -- the field passes NULL, and must leave the model recorded when the
+                -- row was last actually judged. Overwriting would let the nightly
+                -- run restamp every replayed-from-cache row with today's model and
+                -- destroy the mix this column exists to expose.
+                topic_model = COALESCE(excluded.topic_model, topic_model),
+                quality_model = COALESCE(excluded.quality_model, quality_model)
                 """,
                 (
                     session_id,
@@ -1206,6 +1244,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     m.get("topic"),
                     m.get("complexity"),
                     metrics_json,
+                    topic_model,
+                    quality_model,
                 ),
             )
 

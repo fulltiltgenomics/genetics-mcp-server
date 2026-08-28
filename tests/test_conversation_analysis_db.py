@@ -250,3 +250,139 @@ class TestPlotLoadFromDbDelegates:
         assert series["meta"]["empty"] is False
         assert series["meta"]["total"] == 1
         assert series["meta"]["scored"] == 1
+
+
+class TestJudgeModelColumns:
+    """topic_model / quality_model: the migration onto a long-lived production file,
+    and the COALESCE that keeps a cached re-upsert from erasing recorded provenance
+    (genetics-results-suite-9wv)."""
+
+    OLD_SCHEMA = """
+        CREATE TABLE conversation_analysis (
+            session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+            analyzed_at TIMESTAMP,
+            analyzer_version INTEGER,
+            source_updated_at TIMESTAMP,
+            message_count INTEGER,
+            user_rating INTEGER,
+            llm_quality_score INTEGER,
+            success_label TEXT,
+            llm_disposition TEXT,
+            topic TEXT,
+            complexity INTEGER,
+            metrics_json TEXT
+        )
+    """
+
+    @staticmethod
+    def _columns(db):
+        cursor = db._conn.cursor()
+        cursor.execute("PRAGMA table_info(conversation_analysis)")
+        return [row[1] for row in cursor.fetchall()]
+
+    def test_migrates_old_schema_and_is_idempotent(self, tmp_path):
+        """A production file whose conversation_analysis predates the two columns must
+        gain them on open (CREATE TABLE IF NOT EXISTS is a no-op there), and a second
+        open must not attempt the ALTERs again."""
+        import sqlite3
+
+        from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+
+        db_path = str(tmp_path / "old_schema.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(self.OLD_SCHEMA)
+        conn.execute(
+            "INSERT INTO conversation_analysis (session_id, analyzer_version, topic) "
+            "VALUES ('legacy', 1, 'gene_lookup')"
+        )
+        conn.commit()
+        conn.close()
+
+        dbs = []
+        try:
+            for _ in range(2):
+                if ChatHistoryDB in Singleton._instances:
+                    del Singleton._instances[ChatHistoryDB]
+                db = ChatHistoryDB(db_path)
+                dbs.append(db)
+                cols = self._columns(db)
+                assert "topic_model" in cols
+                assert "quality_model" in cols
+                # exactly one of each: a second ALTER would have raised, and a
+                # duplicate column is impossible in SQLite anyway
+                assert cols.count("topic_model") == 1
+                assert cols.count("quality_model") == 1
+
+            # the pre-existing row survives the migration with NULL models: which
+            # judge produced it is not recoverable, and NULL says so honestly
+            cursor = dbs[-1]._conn.cursor()
+            cursor.execute(
+                "SELECT topic, topic_model, quality_model FROM conversation_analysis "
+                "WHERE session_id = 'legacy'"
+            )
+            row = cursor.fetchone()
+            assert row["topic"] == "gene_lookup"
+            assert row["topic_model"] is None
+            assert row["quality_model"] is None
+        finally:
+            if ChatHistoryDB in Singleton._instances:
+                del Singleton._instances[ChatHistoryDB]
+            for db in dbs:
+                for c in db._connections.values():
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
+                db._connections.clear()
+
+    def test_models_round_trip(self, chat_history_db):
+        session = chat_history_db.create_session("user@example.com")
+        chat_history_db.upsert_analysis(
+            FakeMetrics(session_id=session.id),
+            analyzer_version=1, source_updated_at=None, message_count=2,
+            topic_model="claude-sonnet-4-6", quality_model="claude-opus-4-8",
+        )
+        row = chat_history_db.get_analysis_map()[session.id]
+        assert row["topic_model"] == "claude-sonnet-4-6"
+        assert row["quality_model"] == "claude-opus-4-8"
+
+    def test_defaults_stay_null(self, chat_history_db):
+        """A caller that never passes the kwargs leaves the models NULL, not ''."""
+        session = chat_history_db.create_session("user@example.com")
+        chat_history_db.upsert_analysis(
+            FakeMetrics(session_id=session.id),
+            analyzer_version=1, source_updated_at=None, message_count=2,
+        )
+        row = chat_history_db.get_analysis_map()[session.id]
+        assert row["topic_model"] is None
+        assert row["quality_model"] is None
+
+    def test_cached_reupsert_preserves_recorded_models(self, chat_history_db):
+        """The COALESCE: a re-upsert that recomputed nothing passes None and must
+        NOT null out (or restamp) the models recorded when the row was judged."""
+        session = chat_history_db.create_session("user@example.com")
+        chat_history_db.upsert_analysis(
+            FakeMetrics(session_id=session.id, llm_quality_score=4),
+            analyzer_version=1, source_updated_at=None, message_count=2,
+            topic_model="claude-sonnet-4-6", quality_model="claude-opus-4-8",
+        )
+        # replayed from cache on a later run: no LLM ran, so both models are None
+        chat_history_db.upsert_analysis(
+            FakeMetrics(session_id=session.id, llm_quality_score=4),
+            analyzer_version=1, source_updated_at=None, message_count=3,
+        )
+        row = chat_history_db.get_analysis_map()[session.id]
+        assert row["message_count"] == 3  # the rest of the row still updates
+        assert row["topic_model"] == "claude-sonnet-4-6"
+        assert row["quality_model"] == "claude-opus-4-8"
+
+        # a half-recompute (quality re-judged, topic replayed) updates only quality
+        chat_history_db.upsert_analysis(
+            FakeMetrics(session_id=session.id, llm_quality_score=5),
+            analyzer_version=1, source_updated_at=None, message_count=3,
+            quality_model="claude-opus-5",
+        )
+        row = chat_history_db.get_analysis_map()[session.id]
+        assert row["topic_model"] == "claude-sonnet-4-6"
+        assert row["quality_model"] == "claude-opus-5"

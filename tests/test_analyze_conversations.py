@@ -1524,3 +1524,78 @@ class TestResolveLlmConfigDb:
         from genetics_mcp_server.scripts.analyze_conversations import resolve_llm_config_db
 
         assert resolve_llm_config_db("chat_history.db", None) == "llm_config.db"
+
+
+def _judge_models(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return {
+            sid: (tm, qm)
+            for sid, tm, qm in conn.execute(
+                "SELECT session_id, topic_model, quality_model FROM conversation_analysis"
+            )
+        }
+    finally:
+        conn.close()
+
+
+class TestJudgeModelProvenance:
+    """The nightly CronJob passes no date bounds, so every session is 'in range' and
+    gets re-upserted whether or not it was re-judged. A session replayed from cache
+    must therefore NOT be stamped with the current run's model, or one night would
+    relabel the whole history with one judge and destroy the mix these columns exist
+    to expose (genetics-results-suite-9wv)."""
+
+    @pytest.mark.asyncio
+    async def test_run_records_the_models_it_actually_used(self, sample_db):
+        await _run_main(sample_db, ["--topic-model", "model-a", "--quality-model", "model-a"])
+        models = _judge_models(sample_db)
+        assert len(models) == 3
+        assert all(v == ("model-a", "model-a") for v in models.values())
+
+    @pytest.mark.asyncio
+    async def test_cached_session_is_not_restamped_with_this_runs_model(self, sample_db):
+        await _run_main(sample_db, ["--topic-model", "model-a", "--quality-model", "model-a"])
+
+        # continue s1 so it — and only it — is stale on the next run
+        conn = sqlite3.connect(sample_db)
+        try:
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = '2099-01-01 00:00:00' WHERE id = 's1'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        tm, qm = await _run_main(
+            sample_db, ["--topic-model", "model-b", "--quality-model", "model-b"]
+        )
+        assert tm.call_count == 1 and qm.call_count == 1  # only s1 hit the LLM
+
+        models = _judge_models(sample_db)
+        # the re-judged session carries the new judge...
+        assert models["s1"] == ("model-b", "model-b")
+        # ...and the two replayed from cache keep the judge that really scored them
+        assert models["s2"] == ("model-a", "model-a")
+        assert models["s3"] == ("model-a", "model-a")
+
+    @pytest.mark.asyncio
+    async def test_refresh_quality_stamps_only_the_quality_model(self, sample_db):
+        await _run_main(sample_db, ["--topic-model", "model-a", "--quality-model", "model-a"])
+        await _run_main(
+            sample_db,
+            ["--refresh-quality", "--topic-model", "model-b", "--quality-model", "model-b"],
+        )
+        models = _judge_models(sample_db)
+        # topics were replayed from cache, quality was genuinely re-judged
+        assert all(v == ("model-a", "model-b") for v in models.values())
+
+    @pytest.mark.asyncio
+    async def test_no_llm_records_no_models(self, sample_db):
+        tm, qm = await _run_main(sample_db, ["--no-llm"])
+        assert tm.call_count == 0 and qm.call_count == 0
+        models = _judge_models(sample_db)
+        assert len(models) == 3
+        # keyword categorization ran no model at all, so the arg defaults must not
+        # be recorded as if a judge had produced these rows
+        assert all(v == (None, None) for v in models.values())

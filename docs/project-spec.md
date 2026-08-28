@@ -2422,6 +2422,22 @@ read this DB.
   its row's `analyzer_version` equals the module-level `ANALYZER_VERSION` (bumping
   that constant invalidates every cached analysis). `source_updated_at` is stored as
   the raw `chat_sessions.updated_at` string so staleness comparisons stay consistent.
+  Each row also records the two judge models that produced it (`topic_model`,
+  `quality_model`, from `--topic-model` / `--quality-model`) as plain TEXT columns, so
+  an aggregate over the quality columns can `GROUP BY` them and see whether it is mixing
+  judges. A model is written **only for a field the run actually recomputed**: a session
+  replayed from the cache (and `--no-llm`, and a session the judge skipped) passes
+  `None`, and the upsert `COALESCE`s it, so the row keeps the model it already had. A
+  retained model therefore names the last run that recorded one for that field, which is
+  not necessarily the run that produced the value now stored: `--no-llm` still recomputes
+  and overwrites the topic by keyword, and `--force` / `--refresh-quality` can null a
+  score on a judge API error, in both cases leaving the older model in place. That is
+  inherent — `COALESCE` cannot express "clear this". Without that the nightly job — which has no date bounds, so every
+  session is in range — would restamp every pre-existing row with the current run's
+  model and erase the very mix these columns exist to expose. They are recorded only —
+  the model is deliberately **not** part of the staleness predicate, so changing it does
+  not trigger an unattended full re-judge. A NULL model means the row was judged before
+  the columns existed; which model produced it is not recoverable.
 - **Staleness-based selection**: the nightly run does minimal LLM work by asking the DB
   (`get_stale_or_missing_session_ids`) which in-range sessions actually need (re)analysis —
   ones with no row, a continued conversation (`chat_sessions.updated_at` advanced past
