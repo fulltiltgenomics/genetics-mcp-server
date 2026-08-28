@@ -183,6 +183,18 @@ def _email_allowed(email: str) -> bool:
     with the same value — without this it would match no domain at all and lock out every user
     of a deployment whose operator set `oauth_email_domain = "*"` deliberately.
 
+    A domain written with a LEADING DOT matches subdomains and NOT the bare domain, which is
+    what oauth2-proxy v7.14.3 does in `isEmailValidWithDomains` (validator.go): it accepts on
+    `HasSuffix(email, "@"+domain)`, and separately on `HasPrefix(domain, ".") &&
+    HasSuffix(atoms[len(atoms)-1], domain)` where `atoms[len-1]` is the part after the last
+    `@`. So `.example.com` admits `user@sub.example.com` and refuses `user@example.com` —
+    "@.example.com" is not a suffix of any real address. Without this branch a deployment
+    setting `oauth_email_domain = ".example.com"` would get a session at the gateway and a 401
+    from both backends: a logged-in UI in which every call fails
+    (genetics-results-suite-zl2). The suffix is tested against the domain part only, never
+    against the whole address, so `.example.com` cannot match `notexample.com`. This must stay
+    byte-for-byte equivalent in behaviour to results-api's `_email_allowed`.
+
     Fails OPEN when the deployment configured no allow-list at all. `allowed_email_domains`
     defaults to `finngen.fi`, so an unconfigured chat-backend would otherwise silently refuse
     every user of any other deployment — a total lockout, worse than the bug this file closes.
@@ -203,8 +215,25 @@ def _email_allowed(email: str) -> bool:
     if "*" in domains:
         return True
     email = email.strip().lower()
+    # LATENT, fail-closed: with no "@" this yields "" where oauth2-proxy's atoms[len-1] yields
+    # the WHOLE string, so `--email-domain=.com` admits the malformed identity "example.com" at
+    # the gateway and 401s it here — the same gateway-admits/backend-refuses divergence as
+    # genetics-results-suite-zl2, one step further out. Unreachable unless an IdP emits an
+    # address with no "@", and it errs toward refusing. The exact-match fix, if ever wanted, is
+    # `domain = email.rsplit("@", 1)[-1]` unconditionally; deliberately not applied.
     domain = email.split("@")[-1] if "@" in email else ""
-    return email in {e.strip().lower() for e in settings.allowed_emails} or domain in domains
+    if email in {e.strip().lower() for e in settings.allowed_emails} or domain in domains:
+        return True
+    # oauth2-proxy v7.14.3 accepts "*.example.com" as an exact synonym for ".example.com":
+    # `HasPrefix(domain, "*.") && HasSuffix(atoms[len-1], domain[1:])` strips the star and runs
+    # the same suffix test on the same string, so the two spellings must decide alike here too.
+    # A bare "*" is allow-all and is matched by equality above, which a "*."-prefixed entry can
+    # never satisfy — so this branch cannot widen one into allow-all.
+    return any(
+        (d.startswith(".") and domain.endswith(d))
+        or (d.startswith("*.") and domain.endswith(d[1:]))
+        for d in domains
+    )
 
 
 def get_authenticated_user(request: Request) -> str | None:
