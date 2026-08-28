@@ -228,7 +228,10 @@ class TestChatEndpoint:
         assert "text/event-stream" in content_type or response.status_code == 400
 
     def test_chat_invalid_provider(self, test_client):
-        """Test error handling for invalid provider."""
+        """An unrecognised provider is refused with a real 4xx before the SSE stream
+        opens, byte-distinguishable from a genuine server fault (a 200 SSE error event
+        would look identical to one apart from prose) -- not silently accepted or
+        downgraded (genetics-results-suite-c4s item 5)."""
         response = test_client.post(
             "/chat/v1/chat",
             json={
@@ -237,8 +240,50 @@ class TestChatEndpoint:
             },
         )
 
-        # should either reject the provider or fall back
-        assert response.status_code in [200, 400, 422]
+        assert response.status_code == 400
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+        assert "invalid_provider" in response.json()["detail"]
+
+    def test_chat_rejects_openai_provider_before_streaming(self, test_client):
+        """OpenAI support is dropped for now: refused at the boundary with a real 4xx,
+        not served and not silently downgraded, regardless of whether OPENAI_API_KEY is
+        configured in this environment."""
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [{"role": "user", "content": "Hello"}],
+                "provider": "openai",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "OpenAI" in response.json()["detail"]
+
+    def test_chat_rejects_non_claude_model_before_streaming(self, test_client):
+        """A client-supplied model outside the Claude family is refused before the SSE
+        stream opens (a 4xx is structurally impossible once EventSourceResponse has
+        committed status 200), not passed through to the provider SDK.
+
+        anthropic_client is mocked available so this exercises the model check itself
+        rather than the earlier 'Anthropic provider not available' guard (this test
+        environment has no ANTHROPIC_API_KEY configured).
+        """
+        with patch("genetics_mcp_server.chat_api.get_llm_service") as mock_get_service:
+            mock_service = mock_get_service.return_value
+            mock_service.anthropic_client = True
+            mock_service.openai_client = None
+
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "model": "gpt-4o",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+        assert "Claude" in response.json()["detail"]
 
     def test_chat_rejects_too_long_message(self, test_client):
         """Typed text over the limit is rejected with 413."""
@@ -1406,3 +1451,49 @@ class TestRequestSizeLimits:
             {"type": "image", "source": {"type": "base64", "data": "A" * 5_000_000}},
         ]
         assert chat_api._message_text_len(content) == len("look")
+
+
+class TestClassifyErrorSubclasses:
+    """`_classify_error` used to compare exception class names by exact string, so a
+    subclass like `anthropic.NotFoundError` (raised for an unrecognised model id) fell
+    through to the generic 'internal server error' message and misreported a caller
+    mistake as a server bug (genetics-results-suite-c4s).
+
+    An unrecognised `provider` string used to reach this function too, via a plain
+    `ValueError` raised in llm_service.py, and was given the same treatment. That is no
+    longer needed: an unsupported provider is now rejected by a 4xx guard in stream_chat
+    before the stream opens (genetics-results-suite-c4s item 5), so llm_service.py's
+    `ValueError("Unsupported provider: ...")` is unreachable from the API, and
+    `_classify_error` no longer special-cases `ValueError` — a genuine `ValueError`
+    subclass elsewhere in the streaming pipeline (e.g. `json.JSONDecodeError`,
+    `UnicodeDecodeError`) is a real internal fault, not a caller mistake."""
+
+    def test_not_found_error_is_not_reported_as_internal(self):
+        import anthropic
+        import httpx
+
+        from genetics_mcp_server import chat_api
+
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        resp = httpx.Response(404, request=req)
+        err = anthropic.NotFoundError(
+            "not found", response=resp, body={"error": {"type": "not_found_error"}}
+        )
+
+        message = chat_api._classify_error(err)
+
+        assert "internal server error" not in message.lower()
+
+    def test_json_decode_error_is_reported_as_internal(self):
+        """A real parse fault (ValueError subclass) must not be misreported as a caller
+        mistake now that the provider ValueError special-case is gone."""
+        import json
+
+        from genetics_mcp_server import chat_api
+
+        try:
+            json.loads("not json")
+        except json.JSONDecodeError as err:
+            message = chat_api._classify_error(err)
+
+        assert "internal server error" in message.lower()

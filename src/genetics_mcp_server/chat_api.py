@@ -85,7 +85,14 @@ def _classify_error(e: Exception) -> str:
         return "Invalid request sent to LLM service."
     if name == "InternalServerError" or err_type in ("api_error", "internal_server_error"):
         return "Claude had a temporary upstream error. Please try again."
-    if name == "APIStatusError":
+    # isinstance, not a name check: unlike the branches above (which match one exact
+    # exception type each), this is the catch-all for the whole APIStatusError family, and
+    # a name == "APIStatusError" string compare only matched the base class itself, letting
+    # subclasses like NotFoundError (e.g. an unrecognised model id) fall through to the
+    # generic "internal server error" below and misreport a caller mistake as a server bug.
+    from anthropic import APIStatusError
+
+    if isinstance(e, APIStatusError):
         status = getattr(e, "status_code", None)
         if status and status >= 500:
             return "Claude had a temporary upstream error. Please try again."
@@ -597,10 +604,36 @@ async def stream_chat(
             status_code=400,
             detail="Anthropic provider not available. Check ANTHROPIC_API_KEY.",
         )
-    if provider == "openai" and not service.openai_client:
+    # OpenAI support is dropped for now: refused at the boundary rather than removed, so
+    # the _stream_openai path and OPENAI_API_KEY stay in place for a future reinstatement.
+    # Unconditional on provider alone (not gated on service.openai_client), so the caller
+    # gets the same clear rejection regardless of whether OPENAI_API_KEY happens to be set.
+    if provider == "openai":
         raise HTTPException(
             status_code=400,
-            detail="OpenAI provider not available. Check OPENAI_API_KEY.",
+            detail="OpenAI provider is not currently supported. Only Claude models are available.",
+        )
+
+    # any provider string other than "anthropic" (or "openai", rejected above with its own
+    # message) is unrecognised. Without this, e.g. provider="foo" fell through both checks
+    # above, ran the full stream, and only hit llm_service.py's `raise ValueError` once
+    # EventSourceResponse had already committed HTTP 200 — a caller mistake reported
+    # byte-identical to a genuine server fault (see _classify_error).
+    if provider != "anthropic":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported provider: {provider}. Only 'anthropic' is available.",
+        )
+
+    # only Claude models are supported; everything past this point runs inside
+    # EventSourceResponse, which has already committed HTTP 200 by the time an error is
+    # known there, so a 4xx for a bad model choice must happen here, before the stream
+    # opens (see _classify_error's NotFoundError handling for what happens if a model
+    # string passes this check but the provider SDK still doesn't recognise it).
+    if request.model is not None and not request.model.startswith("claude-"):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported model. Only Claude models are available.",
         )
 
     # convert messages to dicts

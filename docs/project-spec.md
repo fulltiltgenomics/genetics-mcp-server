@@ -1544,9 +1544,13 @@ raw id rather than failing the run.
   two blocks: the split exists to give each half its own prompt-cache breakpoint, which that path
   has no equivalent for. Order matches Anthropic's — the envelope follows the server prompt. It
   previously dropped `user_instructions` outright with no log line, so a user with a set selected
-  saw it applied in the UI while the model never received it; `provider` is client-selectable and
-  `OPENAI_API_KEY` is wired into the pod, so that was reachable rather than theoretical
-  (`genetics-results-suite-b3v`).
+  saw it applied in the UI while the model never received it; `provider` was client-selectable and
+  `OPENAI_API_KEY` was wired into the pod, so that was reachable rather than theoretical
+  (`genetics-results-suite-b3v`). `stream_chat` now rejects `provider="openai"` with a 400 before
+  the stream opens (`genetics-results-suite-c4s` item 2). `OPENAI_API_KEY` is still wired into the
+  pod and this branch is still present in `llm_service.py`, kept for a possible future
+  reinstatement; what changed is that a request naming `openai` is now refused at the boundary
+  before it can reach this code.
 
 ## Architecture
 
