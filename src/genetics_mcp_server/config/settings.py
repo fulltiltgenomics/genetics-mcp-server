@@ -155,6 +155,22 @@ class Settings:
         ).lower() in ("1", "true", "yes")
     )
 
+    # NOT one of the "optional tools" above: literature search is part of the shipped
+    # surface, so this defaults TRUE and exists only to take it back out. The case it was
+    # added for is the benchmark, where an external API's key, latency and spend otherwise
+    # ride along in every arm and neither arm is measuring them.
+    #
+    # Turning it off is safe for the prompt because the gate in config/defaults.py keys on
+    # the tool NAMES a block mentions: with search_scientific_literature out of
+    # `disabled_tools`' complement, ~1.9 KB of citation and backend-naming instructions
+    # drop out with it. That is what stops this repeating the run_analysis failure, where
+    # the tool went away and the prompt kept telling the model to use it.
+    enable_literature_search: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_LITERATURE_SEARCH", "true"
+        ).lower() in ("1", "true", "yes")
+    )
+
     # myvariant.info API
     myvariant_api_url: str = field(
         default_factory=lambda: os.environ.get(
@@ -381,6 +397,8 @@ class Settings:
             disabled.add("get_phenotype_report")
         if not self.enable_subagents:
             disabled.add("launch_subagents")
+        if not self.enable_literature_search:
+            disabled.add("search_scientific_literature")
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a
             # sandbox rather than broken by it, and neither is a tool the prompt prefers
