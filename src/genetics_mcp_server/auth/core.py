@@ -174,8 +174,16 @@ def is_internal_caller(request: Request) -> bool:
     return hmac.compare_digest(auth_header[7:].encode("latin-1"), expected)
 
 
-def _email_allowed(email: str) -> bool:
-    """True when the address is covered by ALLOWED_EMAILS or ALLOWED_EMAIL_DOMAINS.
+def _matches_allow_list(email: str, settings) -> bool:
+    """True when the address matches ALLOWED_EMAILS/ALLOWED_EMAIL_DOMAINS, as oauth2-proxy would.
+
+    The MATCHING half of the allow-list, and only that: it answers "does this address match the
+    configured lists", never "did this deployment configure any". Split out of `_email_allowed`
+    (genetics-results-suite-ol7) so that paths where the allow-list is the ONLY authorization can
+    reuse the matching WITHOUT inheriting the fail-open below. mcp_server's bearer and Keycloak
+    paths are exactly those: they carry no trusted-proxy marker, so returning True there when
+    nothing is configured would admit any Google-verified account rather than being defence in
+    depth. Call this one from an unmarked path; call `_email_allowed` from a marked one.
 
     Compared case-insensitively on both sides: oauth2-proxy lower-cases the address before its
     own domain check, so `User@FinnGen.fi` gets a session there and must not be rejected here.
@@ -192,25 +200,12 @@ def _email_allowed(email: str) -> bool:
     setting `oauth_email_domain = ".example.com"` would get a session at the gateway and a 401
     from both backends: a logged-in UI in which every call fails
     (genetics-results-suite-zl2). The suffix is tested against the domain part only, never
-    against the whole address, so `.example.com` cannot match `notexample.com`. This must stay
-    byte-for-byte equivalent in behaviour to results-api's `_email_allowed`.
+    against the whole address, so `.example.com` cannot match `notexample.com`.
 
-    Fails OPEN when the deployment configured no allow-list at all. `allowed_email_domains`
-    defaults to `finngen.fi`, so an unconfigured chat-backend would otherwise silently refuse
-    every user of any other deployment — a total lockout, worse than the bug this file closes.
-    The marker check above is the security-critical half and still applies; the allow-list is
-    defence in depth against a compromised holder of INTERNAL_API_SECRET asserting an identity
-    oauth2-proxy would never have issued.
+    THIS function is the parity target, not `_email_allowed`: results-api's `_email_allowed`
+    (app/core/auth.py) is pure matching with no `allow_list_configured` preamble, so it is this
+    body that must stay byte-for-byte equivalent to it in behaviour.
     """
-    from genetics_mcp_server.config import get_settings
-
-    settings = get_settings()
-    if not settings.allow_list_configured:
-        logger.warning(
-            "no ALLOWED_EMAILS/ALLOWED_EMAIL_DOMAINS configured: accepting any identity the "
-            "trusted proxy asserts"
-        )
-        return True
     domains = {d.strip().lower() for d in settings.allowed_email_domains}
     if "*" in domains:
         return True
@@ -234,6 +229,33 @@ def _email_allowed(email: str) -> bool:
         or (d.startswith("*.") and domain.endswith(d[1:]))
         for d in domains
     )
+
+
+def _email_allowed(email: str) -> bool:
+    """True when the address is covered by ALLOWED_EMAILS or ALLOWED_EMAIL_DOMAINS.
+
+    The matching itself lives in `_matches_allow_list` above, which documents the oauth2-proxy
+    semantics it reproduces; this adds the fail-open preamble and the settings lookup.
+
+    Fails OPEN when the deployment configured no allow-list at all. `allowed_email_domains`
+    defaults to `finngen.fi`, so an unconfigured chat-backend would otherwise silently refuse
+    every user of any other deployment — a total lockout, worse than the bug this file closes.
+    The marker check is the security-critical half and still applies; the allow-list is
+    defence in depth against a compromised holder of INTERNAL_API_SECRET asserting an identity
+    oauth2-proxy would never have issued. That reasoning is what makes the fail-open safe, and
+    it does NOT travel: it is load-bearing on `get_authenticated_user`, which calls
+    `is_internal_caller` first, and absent anywhere the allow-list stands alone.
+    """
+    from genetics_mcp_server.config import get_settings
+
+    settings = get_settings()
+    if not settings.allow_list_configured:
+        logger.warning(
+            "no ALLOWED_EMAILS/ALLOWED_EMAIL_DOMAINS configured: accepting any identity the "
+            "trusted proxy asserts"
+        )
+        return True
+    return _matches_allow_list(email, settings)
 
 
 def get_authenticated_user(request: Request) -> str | None:

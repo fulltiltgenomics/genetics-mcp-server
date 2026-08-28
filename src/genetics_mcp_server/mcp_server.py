@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import TransportSecuritySettings
 
+from genetics_mcp_server.auth.core import _matches_allow_list
 from genetics_mcp_server.config.settings import get_settings, require_internal_api_secret
 from genetics_mcp_server.tools.definitions import register_mcp_tools
 from genetics_mcp_server.tools.executor import ToolExecutor
@@ -170,12 +171,6 @@ def _get_jwks_client(jwks_uri: str):
     return client
 
 
-def _email_allowed(email: str, settings) -> bool:
-    """Shared allow-list check used by every JWT bearer path."""
-    domain = email.split("@")[-1] if "@" in email else ""
-    return email in settings.allowed_emails or domain in settings.allowed_email_domains
-
-
 def _audience_allowed(payload: dict, settings) -> bool:
     """Check a verified Google Identity Token was actually addressed to this service.
 
@@ -238,7 +233,10 @@ def _validate_keycloak_token(token: str, settings) -> bool:
     if not email:
         logger.warning("Keycloak token does not contain an email")
         return False
-    if not _email_allowed(email, settings):
+    # _matches_allow_list, NOT auth.core's _email_allowed: this path carries no trusted-proxy
+    # marker, so the allow-list is the only authorization here and must stay fail-CLOSED when
+    # the deployment configured none (genetics-results-suite-ol7).
+    if not _matches_allow_list(email, settings):
         logger.warning("Keycloak email not allowed: %s", email)
         return False
     logger.info("authenticated Keycloak user: %s", email)
@@ -342,7 +340,8 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             if not email:
                 logger.warning("Token does not contain email")
                 return False
-            if not _email_allowed(email, settings):
+            # see the note on the Keycloak path: fail-CLOSED matching, no fail-open preamble
+            if not _matches_allow_list(email, settings):
                 logger.warning("Email domain not allowed: %s", email)
                 return False
             logger.info("authenticated JWT user: %s", email)
