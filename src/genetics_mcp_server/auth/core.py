@@ -174,7 +174,7 @@ def is_internal_caller(request: Request) -> bool:
     return hmac.compare_digest(auth_header[7:].encode("latin-1"), expected)
 
 
-def _matches_allow_list(email: str, settings) -> bool:
+def _matches_allow_list(email: str, settings, *, allow_wildcard: bool = True) -> bool:
     """True when the address matches ALLOWED_EMAILS/ALLOWED_EMAIL_DOMAINS, as oauth2-proxy would.
 
     The MATCHING half of the allow-list, and only that: it answers "does this address match the
@@ -187,7 +187,7 @@ def _matches_allow_list(email: str, settings) -> bool:
 
     Compared case-insensitively on both sides: oauth2-proxy lower-cases the address before its
     own domain check, so `User@FinnGen.fi` gets a session there and must not be rejected here.
-    A literal `*` in ALLOWED_EMAIL_DOMAINS means "any domain", matching what oauth2-proxy does
+    A literal `*` in ALLOWED_EMAIL_DOMAINS means "any domain" BY DEFAULT, matching what oauth2-proxy does
     with the same value — without this it would match no domain at all and lock out every user
     of a deployment whose operator set `oauth_email_domain = "*"` deliberately.
 
@@ -202,13 +202,45 @@ def _matches_allow_list(email: str, settings) -> bool:
     (genetics-results-suite-zl2). The suffix is tested against the domain part only, never
     against the whole address, so `.example.com` cannot match `notexample.com`.
 
+    `allow_wildcard=False` refuses the bare `*` and changes NOTHING else — every other form
+    stays at full parity, `*.example.com` included, because that is a different value. This is
+    the suite's one deliberate divergence from oauth2-proxy (genetics-results-suite-g8i), and
+    it is deliberate for a reason that does not generalise: parity on the matching FORMS
+    (case-folding, exact address, exact domain, leading dot, `*.`) is right because those
+    describe which humans the gateway admits, but `*` means "any domain behind the gateway"
+    and no gateway fronts the callers that pass False. The Google id_token path has none at
+    all; the Keycloak path's realm gate is fed from the same `${OAUTH_EMAIL_DOMAIN}`
+    (keycloak/realm-genetics.json.template binds it to the realm attribute
+    `allowedEmailDomains`) and itself refuses a bare `*` —
+    keycloak/email-allowlist-authenticator/email-allowlist.js tests
+    `email.endsWith("@" + d)`, which nothing satisfies for `*`, so brokered login is denied
+    before an account exists. Refusing `*` here AGREES with that gate rather than
+    contradicting it; honouring it would admit only the realm accounts that gate never
+    vetted, i.e. pre-existing and admin-created ones.
+    k8s/configs/bearer-auth-allowed.yaml feeds ALLOWED_EMAIL_DOMAINS from
+    `${OAUTH_EMAIL_DOMAIN}`, the SAME terraform variable oauth2-proxy is configured from, so
+    an operator writing `*` with the gateway in mind would otherwise turn the unproxied Google
+    id_token path into allow-all for any Google-verified address. `_audience_allowed` does not
+    save it: inert without GOOGLE_TOKEN_AUDIENCE, and the public gcloud client id when set.
+    The default is True so the proxied, marker-gated `_email_allowed` path is untouched; the
+    opt-out is spelled out at each call site rather than defaulted, so a new caller inherits
+    oauth2-proxy parity and has to say when it is not behind the proxy.
+
     THIS function is the parity target, not `_email_allowed`: results-api's `_email_allowed`
     (app/core/auth.py) is pure matching with no `allow_list_configured` preamble, so it is this
-    body that must stay byte-for-byte equivalent to it in behaviour.
+    body that must stay byte-for-byte equivalent to it in behaviour, in BOTH modes: results-api
+    carries the same `allow_wildcard` keyword with the same default, and passes False at its own
+    unmarked Google id_token path (genetics-results-suite-g8i).
     """
     domains = {d.strip().lower() for d in settings.allowed_email_domains}
     if "*" in domains:
-        return True
+        if allow_wildcard:
+            return True
+        # drop the star rather than fall through with it: the two suffix branches below ignore
+        # a bare "*" anyway, but `domain in domains` would otherwise still admit the malformed
+        # address "a@*". Only this one entry is removed, so a list of `*, .example.com` keeps
+        # matching subdomains.
+        domains.discard("*")
     email = email.strip().lower()
     # LATENT, fail-closed: with no "@" this yields "" where oauth2-proxy's atoms[len-1] yields
     # the WHOLE string, so `--email-domain=.com` admits the malformed identity "example.com" at
@@ -222,8 +254,9 @@ def _matches_allow_list(email: str, settings) -> bool:
     # oauth2-proxy v7.14.3 accepts "*.example.com" as an exact synonym for ".example.com":
     # `HasPrefix(domain, "*.") && HasSuffix(atoms[len-1], domain[1:])` strips the star and runs
     # the same suffix test on the same string, so the two spellings must decide alike here too.
-    # A bare "*" is allow-all and is matched by equality above, which a "*."-prefixed entry can
-    # never satisfy — so this branch cannot widen one into allow-all.
+    # A bare "*" is handled by equality above (allow-all, or discarded under
+    # allow_wildcard=False), and a "*."-prefixed entry can never equal it — so this branch
+    # cannot widen one into allow-all, in either mode.
     return any(
         (d.startswith(".") and domain.endswith(d))
         or (d.startswith("*.") and domain.endswith(d[1:]))
