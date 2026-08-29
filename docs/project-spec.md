@@ -1107,9 +1107,8 @@ iteration (`genetics-results-suite-6uk`). The two backends get there differently
 `_columns_meta` returns a **dict to splice with `**`** and is gated on
 `ToolExecutor(expose_columns=True)`, which only `GeneticsClient` passes: a tool result dict
 *is* the MCP tool payload and the chat backend's model input, and this epic freezes both, so
-with the flag off — or on an endpoint that does not advertise (search, gene annotations,
-gene groups, rsID lookup, LD, gene-disease, gene-based/gene-burden results) — the dict is byte-identical
-to before. An **injected** executor keeps whatever it was built with, so an empty
+with the flag off — or on an endpoint that does not advertise (`/v1/rsid/variants`; LD is a
+different service) — the dict is byte-identical to before. An **injected** executor keeps whatever it was built with, so an empty
 results-api result through the running service's shared executor falls back to a bare frame
 rather than silently changing that service's tool output.
 
@@ -1119,9 +1118,32 @@ dicts. `_frame()` consults `column_names` only when the result is empty — rout
 non-empty results-api result through the positional constructor would give up
 `pl.from_dicts`' `strict=False` fallback for the mixed-type columns upstream does produce.
 
-Not covered: results-api endpoints outside the `range_response` family (search, gene
-annotations, gene groups, rsID, LD, gene–disease) compute their JSON instead of streaming a
-TSV, so they have no header to advertise and degrade to today's bare `pl.DataFrame()`.
+The results-api endpoints outside the `range_response` family compute their JSON, so they
+have no file header to read and **declare** their columns instead
+(`genetics-results-suite-8a1`, in results-api; the declaration is refused there when it
+disagrees with a returned row). From this side they are indistinguishable — the same
+`X-Columns` header lifted by the same `_columns_meta` — so the executor change was one
+splice per call: `search_phenotypes`, `search_genes`, `get_genes_in_region`,
+`get_nearest_genes`, `get_gene_group_members`, `get_gene_based_results_by_phenotype`,
+`get_credible_set_leads_by_phenotype`, and `get_gene_disease_associations` on **both** its
+200 and its 404 branch (that endpoint expresses "no associations" as a 404 this executor
+already reads as an empty result). `get_credible_sets_by_phenotype` and
+`get_exome_results_by_phenotype` already spliced it and were simply never being sent one.
+
+`get_gene_based_results` is the exception: it requests TSV, so its schema is the header line
+`csv.DictReader` has already consumed and `tabix -h` prints even for a locus with no hits.
+`_columns_meta_from(reader.fieldnames)` lifts it, gated on the same `expose_columns` flag.
+
+Still not covered, re-derived from results-api's routers rather than assumed:
+`lookup_variants_by_rsid` (`/v1/rsid/variants`) and the LD calls, which go to the FinnGen LD
+server. `normalize_gene_symbols` is unaffected — the SDK builds that frame with an explicit
+`columns=`.
+
+`tests/test_sdk_empty_result_schema.py` used a fake transport that attached `X-Columns` to
+every response, which meant it asserted coverage it could not observe: three
+`json_phenotype`-backed branches sat in its parametrize as covered while results-api sent
+them no header. The transport now advertises only for paths in `_ADVERTISING_PATHS`,
+re-derived from that repo, so an endpoint that does not advertise fails this suite.
 
 ### URL path segments
 

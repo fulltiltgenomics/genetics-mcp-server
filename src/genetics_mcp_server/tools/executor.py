@@ -703,6 +703,12 @@ class ToolExecutor:
         raw = resp.headers.get("X-Columns")
         return {"column_names": raw.split(",")} if raw else {}
 
+    def _columns_meta_from(self, names: list[str] | None) -> dict[str, list[str]]:
+        """Same, for a TSV response whose column names were read from its header line."""
+        if not self._expose_columns or not names:
+            return {}
+        return {"column_names": list(names)}
+
     @cached_property
     def base_url(self) -> str:
         """The internal results-api endpoint, resolved on first use (see _endpoint_env)."""
@@ -1260,7 +1266,7 @@ class ToolExecutor:
             },
         )
         if resp.status_code == 200:
-            return {"success": True, "results": resp.json()}
+            return {"success": True, **self._columns_meta(resp), "results": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def search_genes(self, query: str, limit: int = 10) -> dict[str, Any]:
@@ -1271,7 +1277,7 @@ class ToolExecutor:
             params={"q": normalized_query, "types": "genes", "limit": limit, "format": "json"},
         )
         if resp.status_code == 200:
-            return {"success": True, "results": resp.json()}
+            return {"success": True, **self._columns_meta(resp), "results": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def lookup_variants_by_rsid(self, rsids: str) -> dict[str, Any]:
@@ -1545,6 +1551,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "phenotype": phenotype,
                     "resource": resource,
                     "count": len(results),
@@ -2288,13 +2295,18 @@ class ToolExecutor:
         )
         if resp.status_code == 200:
             results = resp.json()
-            result: dict[str, Any] = {"success": True, "gene": gene, "results": results}
+            result: dict[str, Any] = {
+                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
+            }
             if results:
                 result["_download_data"] = {"results": results, "filename": f"{gene}_disease_associations.tsv"}
             return result
         elif resp.status_code == 404:
+            # this endpoint expresses "no associations" as a 404, so the schema it
+            # advertises rides on the 404 too (genetics-results-suite-8a1)
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "gene": gene,
                 "results": [],
                 "message": "No Mendelian disease associations found",
@@ -2412,6 +2424,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
                     "count": len(results),
@@ -2441,8 +2454,12 @@ class ToolExecutor:
         if resp.status_code == 200:
             reader = csv.DictReader(io.StringIO(resp.text), delimiter="\t")
             results = list(reader)
+            # this one returns TSV, so its schema is the header line the reader already
+            # consumed — `tabix -h` prints it even when no row matched the gene's locus,
+            # and it was being dropped on the floor (genetics-results-suite-8a1)
             result: dict[str, Any] = {
                 "success": True,
+                **self._columns_meta_from(reader.fieldnames),
                 "gene": gene,
                 "count": len(results),
                 "results": results,
@@ -3592,6 +3609,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "variant": variant,
                     "genes": results,
                 }
@@ -3627,6 +3645,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "region": f"{chr}:{start}-{end}",
                     "genes": results,
                 }
@@ -3668,6 +3687,7 @@ class ToolExecutor:
                 count = data.get("count", 0)
                 result: dict[str, Any] = {
                     "success": True,
+                    **self._columns_meta(resp),
                     "group_id": data.get("group_id"),
                     "group_name": data.get("group_name"),
                     "exclude_olfactory": data.get("exclude_olfactory", exclude_olfactory),
