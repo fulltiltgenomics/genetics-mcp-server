@@ -39,6 +39,14 @@ UPSTREAM_UNREACHABLE_MSG = (
 # from a real upstream 503
 _UNREACHABLE_HEADER = "x-fg-upstream-unreachable"
 
+# MouseMine fails by accepting the connection and then never answering, so it needs its
+# own message: _ResilientAsyncClient only rewrites connect-level failures, and a read
+# timeout is not "the genetics data service is down" — every other tool still works
+MOUSEMINE_UNAVAILABLE_MSG = (
+    "MGI (MouseMine) did not respond in time. The service is intermittently "
+    "unresponsive — please try again later."
+)
+
 # variant classifications for counting coding and loss-of-function variants
 CODING_VARIANTS = {
     "missense_variant",
@@ -3121,6 +3129,10 @@ class ToolExecutor:
     # Templates would be friendlier but pin us to JAX-named templates that
     # change over releases. Inline PathQuery XML keeps this self-contained.
     _MOUSEMINE_URL = "https://www.mousemine.org/mousemine/service/query/results"
+    # MouseMine is a public best-effort instance and is regularly slow; cap the wait so a
+    # hung upstream can't hold an MCP tool call open. Each _mgi_* helper issues one query,
+    # so this is also the worst case for the whole search_mgi call.
+    _MOUSEMINE_TIMEOUT = 20.0
     _MGI_MARKER_URL = "https://www.informatics.jax.org/marker"
     _MGI_ALLELE_URL = "https://www.informatics.jax.org/allele"
 
@@ -3183,9 +3195,19 @@ class ToolExecutor:
             "format": "json",
             "size": str(size),
         }
-        resp = await self.external_client.get(
-            self._MOUSEMINE_URL, params=params, timeout=20.0
-        )
+        try:
+            resp = await self.external_client.get(
+                self._MOUSEMINE_URL, params=params, timeout=self._MOUSEMINE_TIMEOUT
+            )
+        except httpx.TimeoutException:
+            # the connection succeeds and the read then hangs, so _ResilientAsyncClient's
+            # ConnectError path never fires. Without this the timeout reaches search_mgi's
+            # generic handler and a routine upstream outage is reported to the user as an
+            # internal error and to the log as a traceback.
+            logger.warning(
+                "MouseMine did not respond within %ss", self._MOUSEMINE_TIMEOUT
+            )
+            return {"_error": MOUSEMINE_UNAVAILABLE_MSG}
         if resp.status_code != 200:
             # truncate body to keep error messages bounded
             body = (resp.text or "")[:200]
