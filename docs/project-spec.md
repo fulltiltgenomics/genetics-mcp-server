@@ -607,7 +607,9 @@ That covers one of the two drift directions. The other is a profile added HERE t
 
 Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"` and the explicit-allow-list profiles — a `code` profile that named seven tools would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
 
-`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default is still `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. `nocode` is its comparator arm rather than a user-facing choice — the pre-code-execution surface, added by `genetics-results-suite-4h6.78`/`.79` so an A/B has an honest baseline that `null` cannot provide (`null` contains `run_analysis`); the browser's Tools control does not list it as an option, though a user whose stored setting is already `nocode` now keeps it (see the drift note above). See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
+`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default remains `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. `nocode` is its comparator arm rather than a user-facing choice — the pre-code-execution surface, added by `genetics-results-suite-4h6.78`/`.79` so an A/B has an honest baseline that `null` cannot provide (`null` contains `run_analysis`); the browser's Tools control does not list it as an option, though a user whose stored setting is already `nocode` now keeps it (see the drift note above). See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
+
+**Shipping dark is now the settled outcome, not a pending one.** The paired A/B that was to decide whether `code` became the default — `genetics-results-suite-4h6.23` — was **descoped on 2026-08-30** by user decision: initial benchmarking was done manually and further benchmarking moves outside that epic. Its kill criterion was *"if the code arm does not beat the baseline on cost AND does not regress quality, keep it behind the profile rather than defaulting it on"*, whose conservative branch is the status quo — so the benchmark's absence **accepts** the documented default rather than leaving it open: **code execution stays opt-in; `null` stays the default profile.** The arms were never measured against each other, so nothing here says the code arm lost; the decision was not taken on numbers. No 4h6.23 figure exists, and no doc should be read as quoting one.
 
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
@@ -646,9 +648,11 @@ What the SDK's omission costs is the affordance, not the data: neither the SDK n
 stubs name that route, so a model would have to invent the request rather than call something
 put in front of it. That is a discoverability and convenience asymmetry, not an availability
 one, and inventing the call is not the intended way to use the sandbox.
-`genetics-results-suite-4h6.23` should still exclude or explicitly book questions that lean on
+Any A/B over these arms should still exclude or explicitly book questions that lean on
 either tool — but for those two different reasons, and without scoring the code-execution arm
-down as though both were unreachable. The egress allow-list and the credential's scope are
+down as though both were unreachable. That instruction was written for
+`genetics-results-suite-4h6.23`, which was descoped on 2026-08-30 without running; it now applies
+to whatever manual benchmarking is done instead. The egress allow-list and the credential's scope are
 specified and maintained in `genetics-results-suite` `docs/code-execution-security.md`; treat
 that document as the authority for both rather than the summary here, which will age.
 
@@ -2841,8 +2845,8 @@ and assistant prose written before a turn's last tool call was discarded at capt
 
 ## Paired Quality Judging
 
-`scripts/pairwise_judge.py` answers the half of `genetics-results-suite-4h6.23`'s kill
-criterion the benchmark's own metrics cannot: "must not **regress** quality". It is
+`scripts/pairwise_judge.py` answers the half of the descoped `genetics-results-suite-4h6.23`'s
+kill criterion the benchmark's own metrics cannot: "must not **regress** quality". It is
 **off by default** (`--judge` on the benchmark, or
 `python -m genetics_mcp_server.scripts.pairwise_judge --report <file>` over a report
 already written) — a run produces cost and latency numbers with no judge call at all.
