@@ -2259,6 +2259,9 @@ class ToolExecutor:
         try:
             gene = normalize_literal(gene, name="gene")
             gene_lit = quote_literal(gene, name="gene")
+            # unlike the HLA site above, nothing reads `resource` after this — the payload comes
+            # from _bq_gene_payload(gene, ...) and only `resource_lit` reaches the SQL, and
+            # quote_literal normalizes internally — so the rebind is uniformity, not effect.
             resource = normalize_literal(resource, name="resource")
             resource_lit = quote_literal(resource, name="resource")
             window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
@@ -6212,8 +6215,8 @@ class ToolExecutor:
             # and a service marker names nobody to attribute or revoke.
             #
             # At the dispatch and not at the route because THIS is the narrow waist every
-            # sandbox execution passes through — the streaming and non-streaming chat paths,
-            # subagent dispatch and any future caller — and because it sits immediately
+            # sandbox execution passes through — the streaming chat path, subagent dispatch
+            # and any future caller — and because it sits immediately
             # before mint_execution_tokens, so no credential can be minted for a subject
             # that was refused. A route-level check would guard only the routes someone
             # remembered to decorate and would also refuse chat itself, which the marker

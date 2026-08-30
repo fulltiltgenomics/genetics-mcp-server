@@ -1823,12 +1823,22 @@ TOOL_PROFILES: dict[str, set[str]] = {
     # strips it again whenever the subagent service did not initialize — both BEFORE the
     # profile filter, on every arm.
     #
-    # So the equivalence holds through a runtime flag, not through the category. MEASURED
-    # as a live request resolves them, with disabled_tools applied: all=65, nocode=62, and
-    # `all - nocode` is exactly {run_analysis, list_capabilities, read_artifact}.
-    # RE-MEASURE rather than trusting this line if enable_subagents is ever turned on, or if
-    # a non-code tool is filed under `orchestration` — either one silently widens the gap
-    # between the arms into something the A/B was not meant to measure.
+    # So the equivalence holds through TWO runtime flags, not through the category, and the
+    # sizes are deliberately not written down here — they move with the flags and with every
+    # tool added, which is exactly the kind of number that rots in a comment. Re-derive with
+    # disabled_tools applied (the `all` arm is tool_profile=None, not a profile named "all"):
+    #
+    #   get_anthropic_tools(None, tool_profile=None,     disabled_tools=settings.disabled_tools)
+    #   get_anthropic_tools(None, tool_profile="nocode", disabled_tools=settings.disabled_tools)
+    #
+    # Under the shipped chat-backend config — SANDBOX_ENABLED=true (k8s/deployments/
+    # chat-backend.yaml) and ENABLE_SUBAGENTS unset, i.e. false — `all - nocode` is exactly
+    # {run_analysis, list_capabilities, read_artifact}, which is the equivalence this profile
+    # relies on. It holds under NEITHER flag alone: with SANDBOX_ENABLED=false the gap loses
+    # run_analysis, and with enable_subagents turned on it gains launch_subagents.
+    # RE-DERIVE rather than trusting this line if enable_subagents is ever turned on, if the
+    # sandbox is disabled, or if a non-code tool is filed under `orchestration` — each one
+    # changes the gap between the arms into something the A/B was not meant to measure.
     #
     # No prompt work is needed to go with it. Since genetics-results-suite-4h6.69 the system
     # prompt is assembled from the tool list in force, so this profile also loses the

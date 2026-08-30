@@ -15,7 +15,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 ## Key Features
 
 - **Standalone MCP Server**: Connects to Claude Desktop, Cursor, or any MCP client via stdio, SSE or streamable HTTP
-- **LLM Chat API**: FastAPI service with streaming responses, supporting Anthropic and OpenAI providers
+- **LLM Chat API**: FastAPI service with streaming responses. Anthropic is the only selectable provider: since `genetics-results-suite-c4s`, `stream_chat` refuses `provider="openai"`, any other non-`anthropic` provider, and any model not starting with `claude-` with a 400 before the stream opens. The `_stream_openai` code path and `OPENAI_API_KEY` stay wired for a future reinstatement
 - **Genetics data tools**: Comprehensive access to GWAS, QTL, colocalization, expression, Mendelian disease data, LD, protein annotation, regulatory/functional genomics (open-chromatin atlases, allele-specific methylation, predicted variant effects, MPRA reporter activity), visualizations, and BigQuery for advanced queries
 - **Literature and web search**: Integration with Europe PMC, Perplexity, Tavily, and DuckDuckGo
 - **External MCP server proxying**: Aggregate tools from remote MCP servers (e.g., gnomAD, Open Targets Platform)
@@ -387,9 +387,9 @@ closes mcp-server → sandbox, but mcp-server holds `INTERNAL_API_SECRET` and is
 chat-backend:8000, and a valid marker with no identity header resolves to exactly that one
 service string (`genetics-results-suite-th2`) — so mcp-server → chat-backend → sandbox was
 open. The check sits at the **tool dispatch**, not on the HTTP route, because that is the
-narrow waist every execution passes (streaming chat, non-streaming chat, subagent
-dispatch, anything added later) and because it sits immediately before
-`mint_execution_tokens`, so no credential can be minted for a subject that was refused. A
+narrow waist every execution passes (streaming chat, subagent dispatch, anything added
+later) and because it sits immediately before `mint_execution_tokens`, so no credential
+can be minted for a subject that was refused. A
 route-level check would guard only the routes someone remembered to decorate, and would
 also refuse plain chat, which the marker identity may legitimately use.
 
@@ -1242,8 +1242,10 @@ conversation restores its options without changing what the next new chat starts
 
 One row per **completed** assistant turn, written by `_stream_anthropic` in the same block that
 logs the `Chat complete:` line, so the log line and the row can never disagree. **The Anthropic
-path only** — `_stream_openai` records nothing, so any aggregate over this table under-counts a
-deployment that also serves OpenAI. It holds
+path only** — `_stream_openai` records nothing, so any aggregate over this table would under-count a
+deployment that also served OpenAI. Since `genetics-results-suite-c4s` refuses
+`provider="openai"` at the request boundary, no such deployment can exist and the gap is
+latent rather than live. It holds
 `iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
 `cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model` and `created_at`. Before it,
 these numbers existed only in Cloud Logging and had to be recovered from the BigQuery log sink;
@@ -1381,7 +1383,9 @@ is emitted only if every tool name appearing in its text is in `tool_names`, wit
 the **Anthropic** path the prompt cannot describe a tool the model was not given. It does not
 hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor `tool_profile`
 and never sets `tools`, so that provider receives the prompt assembled for the full local set
-while getting no tools at all — pre-existing, and unchanged by 4h6.69. Consequences on the
+while getting no tools at all — pre-existing, and unchanged by 4h6.69, but unreachable since
+`genetics-results-suite-c4s` 400s `provider="openai"` before the stream opens; the mismatch is
+still described because the code path is still there. Consequences on the
 Anthropic path: the "Subagent Orchestration" section and the "variant_list_analysis skill"
 reference disappear with `ENABLE_SUBAGENTS=false`, "Phenotype Reports" with
 `ENABLE_PHENOTYPE_REPORT=false`, and every per-tool routing section under `tool_profile="code"`.
@@ -1449,10 +1453,11 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` pins three properties across the
-`None`/`api`/`bigquery`/`rag`/`code`/`nocode` profiles (`nocode`, the `code` arm's
-comparator, was added to `PROFILES` by `genetics-results-suite-4h6.78`/`.79`), the first
-and the heading-body half of the third with `ENABLE_SUBAGENTS` both true and false:
+`tests/test_system_prompt.py` holds **ten** test classes, **seven** of them parametrised
+over the `None`/`api`/`bigquery`/`rag`/`code`/`nocode` profiles (`nocode`, the `code` arm's
+comparator, was added to `PROFILES` by `genetics-results-suite-4h6.78`/`.79`). Three of
+those seven pin the core property families — the first, and the heading-body half of the
+third, with `ENABLE_SUBAGENTS` both true and false:
 **absence** (every tool name in the emitted prompt is in the resolved list, tokenising
 independently of the gate's own matcher — independently on the algorithm, not on the
 normalisation: neither sees a plural or suffixed name, so `_Block`'s docstring tells prompt
@@ -1462,7 +1467,7 @@ authors to name tools verbatim), **presence**
 under a different heading than it has in the unfiltered text, no heading is emitted empty). It
 also asserts the `run_analysis` bullet is byte-identical across every arm that carries it, which
 is what makes the `code`-vs-baseline A/B a comparison of tools rather than of wording.
-A fourth property is deliberately NOT parametrised over the six profiles, because that is what
+A further property is deliberately NOT parametrised over the six profiles, because that is what
 missed the defect it guards: `TestEverySurfaceWithADataPathIsRouted` drives ~80 tool sets off the
 full list — every single-tool removal plus flag-shaped family removals and their pairs — and
 asserts each surface reaching data through `get_credible_sets_by_gene`, `query_database` or
@@ -1642,7 +1647,7 @@ src/genetics_mcp_server/
 ### Data flow
 
 1. **MCP Server mode**: Client → FastMCP → ToolExecutor → Genetics API
-2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
+2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic → ToolExecutor → Genetics API (the `_stream_openai` branch is still in the code but refused at the request boundary since `genetics-results-suite-c4s`)
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
 4. **SDK mode**: script → `genetics_mcp_server.sdk` → GeneticsClient → ToolExecutor → Genetics API / BigQuery. Same executor, different entry point: no tool schema, no context row cap, polars frames instead of result envelopes.
 
@@ -1833,7 +1838,9 @@ agree with each other while both understate what was billed:
   attempts are billed and invisible.
 - **The OpenAI path emits no `usage` chunk at all.** `_stream_openai()` yields text and
   `done` only, so this whole section is Anthropic-path-only. `replay_benchmark.py`
-  handles that case with a `no_usage_chunks` status rather than a zero.
+  handles that case with a `no_usage_chunks` status rather than a zero. Since
+  `genetics-results-suite-c4s` refuses `provider="openai"` with a 400 before the stream
+  opens, no request reaches that path and the status now covers other causes.
 - **The stream carries no model name.** `estimate_cost()` falls back to Sonnet pricing
   for anything unrecognised (`has_pricing()` exists so callers can refuse instead), so
   the consumer must learn the model out-of-band and pass it in.
@@ -1961,7 +1968,7 @@ All configuration is via environment variables (`.env` file supported):
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude | - |
-| `OPENAI_API_KEY` | OpenAI API key | - |
+| `OPENAI_API_KEY` | OpenAI API key. Still read and still plumbed through, but unreachable: `stream_chat` refuses `provider="openai"` with a 400 since `genetics-results-suite-c4s` | - |
 | `DEFAULT_MODEL` | Default chat model | `claude-opus-5` |
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
@@ -2649,10 +2656,13 @@ harness issues two arms per case. `--base-url` therefore defaults to
   not `ok`.** Iterations, tokens and cost are all unmeasurable for it, so counting
   its (necessarily zero) `tool_use` blocks would push a fake `0` into the tool-call
   distribution while contributing nothing to any other, diverging the two samples'
-  `n` and dragging the tool-call median down. This is not hypothetical: the OpenAI
-  path in `llm_service` yields one synthetic text block with no usage chunk and no
-  tool_use blocks, so a deployment whose `default_provider` is OpenAI would report
-  `tool_calls=0` for every turn. `--provider` pins the provider on the request and is
+  `n` and dragging the tool-call median down. This was reachable before
+  `genetics-results-suite-c4s`: the OpenAI path in `llm_service` yields one synthetic
+  text block with no usage chunk and no tool_use blocks, so a deployment whose
+  `default_provider` was OpenAI reported `tool_calls=0` for every turn. `c4s` now
+  refuses `provider="openai"` with a 400 before the stream opens, and the benchmark
+  drives that same HTTP endpoint, so the status survives for other no-usage causes
+  rather than for this one. `--provider` pins the provider on the request and is
   recorded in the report config. The history stays intact, so the rest of the case
   still runs; it is the status, not an abort, that keeps the turn out of the
   comparison.

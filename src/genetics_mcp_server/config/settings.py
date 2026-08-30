@@ -78,8 +78,8 @@ class Settings:
     # same env var name db-api and results-api already gate their token verification on, so
     # one value describes the sandbox's existence across the three services that care.
     #
-    # While it is false `run_analysis` is absent from `disabled_tools`' complement, so no
-    # resolved tool list contains it (genetics-results-suite-4h6.56). Shipping it enabled
+    # While it is false, `disabled_tools` CONTAINS `run_analysis`, so no resolved tool
+    # list contains it (genetics-results-suite-4h6.56). Shipping it enabled
     # ahead of the sandbox is the expensive failure, not the safe one: the system prompt
     # tells the model to PREFER it, and an unreachable sandbox classifies as
     # SandboxUnavailable with retryable: True, so every chat turn is steered into a tool
