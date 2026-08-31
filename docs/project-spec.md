@@ -997,8 +997,8 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 - **The import closure is pinned, because the sandbox image ships exactly it.** That image
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
-  is eleven modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,definitions,executor,phewas_categories,sql_safety,uniprot}`.
+  is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
+  `tools/{__init__,executor,phewas_categories,sql_safety,uniprot}`.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` now imports `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
@@ -1012,6 +1012,19 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   because 3.12 dropped that descriptor's lock and the service shares one executor across
   threads, so a race would leak the loser's connection pool past `close()`. Assigning over
   any of them in a test still works.
+- **`tools/__init__.py` re-exports `definitions` lazily, and that is load-bearing**
+  (`genetics-results-suite-6bv`). `sdk/client.py` imports `tools.executor`, which runs the
+  `tools` package `__init__`, so an eager `from genetics_mcp_server.tools.definitions import
+  TOOL_DEFINITIONS, ...` there put `definitions.py` in the closure even though `executor.py`
+  never imports it. `4h6.70` then added `from pydantic import Field` to `definitions.py` for
+  the `minimum`/`maximum`/`pattern` keywords, and the sandbox image — which pins numpy, scipy,
+  polars, matplotlib and httpx and nothing else — could no longer `import
+  genetics_mcp_server.sdk`. Every `__all__` entry except `ToolExecutor` — that is the rule
+  `_LAZY_FROM_DEFINITIONS` encodes, seven names as of this writing — now resolves through a
+  module `__getattr__`, so `from genetics_mcp_server.tools import TOOL_DEFINITIONS` and
+  `tools.get_anthropic_tools` behave exactly as before for chat_api, llm_service, subagent and
+  routers/llm_config, while the SDK path never imports the module. Dropping it also stops the
+  sandbox shipping the full catalogue of every tool the suite exposes.
 - **The endpoint reads must stay behind the settings resolution.** `config/settings.py` calls
   `load_dotenv()` at module scope, so the `GENETICS_API_URL` / `GENETICS_PUBLIC_API_URL` /
   `BIGQUERY_API_URL` reads only see a `.env` file once that module has been imported. They go
@@ -1020,7 +1033,11 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   service) on the hard-coded default URL while still attaching a `.env`-supplied secret to it,
   and would silently disable the BigQuery tools. `test_sdk_import_closure.py` pins this.
 - `test_sdk_import_closure.py` measures the closure in a fresh interpreter and asserts
-  equality, and asserts the SDK imports with `dotenv` unavailable. Every probe forces `src/`
+  equality, and asserts the SDK imports when **every** distribution outside the transitive
+  requirement closure of the sandbox's five pinned ones is unavailable — a `sys.meta_path`
+  finder that raises `ModuleNotFoundError` for their top-level modules. That generalises what
+  was a single `dotenv` stub: a per-offender test only ever covers the offender already fixed,
+  which is why `l41`'s guard did not catch `6bv`'s pydantic. Every probe forces `src/`
   onto the subprocess `PYTHONPATH` and asserts `genetics_mcp_server.__file__` resolves under
   it, so an editable install pointing at another checkout cannot make it measure the wrong
   tree. Widening the closure means widening `SDK_ALLOWLIST` in
