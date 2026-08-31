@@ -3008,7 +3008,7 @@ already written) — a run produces cost and latency numbers with no judge call 
 ## Development Workflow
 
 - **Issue tracking**: beads (`bd`) tracks epics and tasks in `.beads/`, synced with git
-- **Feature planning**: new features go through architecture exploration (`.claude/agents/architecture-explorer.md`) which proposes 3 alternatives, then the selected approach is broken into ultrafocused subtasks in beads
+- **Feature planning**: new features go through architecture exploration (`~/.claude/agents/architecture-explorer.md` — a user-level agent, not checked into any repo) which proposes 3 alternatives, then the selected approach is broken into ultrafocused subtasks in beads
 - **Task execution**: work through subtasks via `bd ready`, updating status as you go
 
 ## Documentation
