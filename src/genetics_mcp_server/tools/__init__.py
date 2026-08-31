@@ -34,6 +34,23 @@ __all__ = [
 # made for config/settings.py. Every service caller (`from genetics_mcp_server.tools import
 # TOOL_DEFINITIONS`, `tools.get_anthropic_tools`) is unaffected: `from X import Y` and attribute
 # access both fall through to this hook.
+# IN THE SANDBOX THIS HOOK IS INERT, and deliberately left that way
+# (genetics-results-suite-tbg). `prune_venv.py` deletes definitions.py from the image — which
+# is the point of the cut above — so `from genetics_mcp_server.tools import TOOL_DEFINITIONS`
+# inside the sandbox raises `ImportError: cannot import name 'definitions' from
+# 'genetics_mcp_server.tools'`. That was CREATED by 6bv: before it, the eager re-export made
+# the same call fail at import of this package instead, and further upstream.
+#
+# No guard here, and that is a decision rather than an omission. The ImportError already
+# names the missing module and the file it was looked for in, so it is accurate; there is no
+# result shape to return in its place, unlike the executor methods tbg guarded; and the
+# alternatives are all worse — re-raising changes nothing, raising AttributeError would make
+# `hasattr` answer False and hide the absence entirely, and a sentinel would let a caller act
+# on a tool catalogue that does not exist. The defect was never this exception, it was
+# `ToolExecutor._analysis_hint` telling the model to consult list_capabilities about it;
+# `executor._SANDBOX_PRUNED_MODULES` lists this module so the hint answers accurately, and
+# `_absent_capability_named` matches this ImportError's shape as well as ModuleNotFoundError's.
+#
 # LATENT: this derives "lazy from definitions" as "everything in __all__ that is not
 # ToolExecutor", which holds only because every other entry today does live in `definitions`.
 # An __all__ entry added from a DIFFERENT submodule would be routed to

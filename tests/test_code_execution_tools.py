@@ -1116,10 +1116,25 @@ class TestRunAnalysisFailsClosed:
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(ToolExecutor.run_analysis)))
         tries = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
-        assert len(tries) == 1
+        # genetics-results-suite-tbg added a second try: the guard around the deferred
+        # imports of the modules the sandbox image prunes. It is separated by SHAPE rather
+        # than by position — a try whose body is nothing but imports cannot swallow a
+        # dispatch failure — so this test keeps pinning the request handler and a future
+        # guard of the same shape does not weaken it.
+        import_guards = [
+            node
+            for node in tries
+            if node.body and all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in node.body)
+        ]
+        for guard in import_guards:
+            assert [ast.unparse(h.type) for h in guard.handlers] == ["ModuleNotFoundError"], (
+                "an import guard may catch nothing broader than the missing module"
+            )
+        request_tries = [node for node in tries if node not in import_guards]
+        assert len(request_tries) == 1
         caught = [
             ast.unparse(handler.type) if handler.type else "BARE"
-            for handler in tries[0].handlers
+            for handler in request_tries[0].handlers
         ]
         assert "Exception" not in caught and "BARE" not in caught
         assert caught[0] == "SandboxTokenUnavailable", (
@@ -1495,7 +1510,15 @@ class TestRunAnalysisRequiresARealUser:
             for i, node in enumerate(body)
             if isinstance(node, ast.If) and "SERVICE_IDENTITY" in ast.unparse(node.test)
         )
-        try_index = next(i for i, node in enumerate(body) if isinstance(node, ast.Try))
+        # the deferred-import guard (genetics-results-suite-tbg) is also a Try and sits
+        # above the identity check by necessity — it is what binds SERVICE_IDENTITY. It
+        # mints nothing, so it is not the block this test is about; skip import-only trys.
+        try_index = next(
+            i
+            for i, node in enumerate(body)
+            if isinstance(node, ast.Try)
+            and not all(isinstance(n, (ast.Import, ast.ImportFrom)) for n in node.body)
+        )
         assert guard_index < try_index
 
 
