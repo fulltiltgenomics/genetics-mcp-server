@@ -15,7 +15,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 ## Key Features
 
 - **Standalone MCP Server**: Connects to Claude Desktop, Cursor, or any MCP client via stdio, SSE or streamable HTTP
-- **LLM Chat API**: FastAPI service with streaming responses, supporting Anthropic and OpenAI providers
+- **LLM Chat API**: FastAPI service with streaming responses. Anthropic is the only selectable provider: since `genetics-results-suite-c4s`, `stream_chat` refuses `provider="openai"`, any other non-`anthropic` provider, and any model not starting with `claude-` with a 400 before the stream opens. The `_stream_openai` code path and `OPENAI_API_KEY` stay wired for a future reinstatement
 - **Genetics data tools**: Comprehensive access to GWAS, QTL, colocalization, expression, Mendelian disease data, LD, protein annotation, regulatory/functional genomics (open-chromatin atlases, allele-specific methylation, predicted variant effects, MPRA reporter activity), visualizations, and BigQuery for advanced queries
 - **Literature and web search**: Integration with Europe PMC, Perplexity, Tavily, and DuckDuckGo
 - **External MCP server proxying**: Aggregate tools from remote MCP servers (e.g., gnomAD, Open Targets Platform)
@@ -387,9 +387,9 @@ closes mcp-server → sandbox, but mcp-server holds `INTERNAL_API_SECRET` and is
 chat-backend:8000, and a valid marker with no identity header resolves to exactly that one
 service string (`genetics-results-suite-th2`) — so mcp-server → chat-backend → sandbox was
 open. The check sits at the **tool dispatch**, not on the HTTP route, because that is the
-narrow waist every execution passes (streaming chat, non-streaming chat, subagent
-dispatch, anything added later) and because it sits immediately before
-`mint_execution_tokens`, so no credential can be minted for a subject that was refused. A
+narrow waist every execution passes (streaming chat, subagent dispatch, anything added
+later) and because it sits immediately before `mint_execution_tokens`, so no credential
+can be minted for a subject that was refused. A
 route-level check would guard only the routes someone remembered to decorate, and would
 also refuse plain chat, which the marker identity may legitimately use.
 
@@ -603,9 +603,13 @@ The fallback row is deliberate — the value is read back from `chat_messages` r
 
 That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, and `null` is the top row of this table — no filtering at all — so a user whose stored `chat_tool_profile` is a server-only name silently gets the FULL surface instead of the narrower one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Adding or renaming a profile here still requires editing that file: `tests/test_unknown_profile_warning.py::test_the_profile_key_set_is_pinned_against_the_browsers_copy` pins `TOOL_PROFILES | TOOL_PROFILE_TOOLS` against a literal so the decision is deliberate, mirroring the browser's own pin in `useChatOptions.test.ts`.
 
+`GET /chat/v1/tools?resolved=true[&tool_profile=<value>][&enable_tools=false]` answers this table for a caller: a list of `{name, description, category, source}`, where `source` is `local`, `external` or `rag` and `category` is null for the two proxied sources. Bare (`resolved` omitted) the endpoint keeps its older answer — `TOOL_DEFINITIONS` verbatim, with each tool's full `parameters`, but no profile filter, no `disabled_tools`, and neither the BigQuery nor the subagent list — which is the raw catalogue, not a surface anyone is ever handed. The browser's Tools panel (`genetics-results-browser/src/features/chat/ToolsDialog.tsx`) shows a user what the assistant on screen can do, so it asks with `resolved=true` and the conversation's own profile. Both halves resolve through the same functions a chat request does — `LLMService.resolve_local_tools` and `resolve_proxied_tools`, the latter extracted from `stream_chat` for exactly this reason — so the panel cannot name a tool the model was not given, or miss one it was.
+
 Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"` and the explicit-allow-list profiles — a `code` profile that named seven tools would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
 
-`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default is still `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. `nocode` is its comparator arm rather than a user-facing choice — the pre-code-execution surface, added by `genetics-results-suite-4h6.78`/`.79` so an A/B has an honest baseline that `null` cannot provide (`null` contains `run_analysis`); the browser's Tools control does not list it as an option, though a user whose stored setting is already `nocode` now keeps it (see the drift note above). See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
+`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default remains `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. `nocode` is its comparator arm rather than a user-facing choice — the pre-code-execution surface, added by `genetics-results-suite-4h6.78`/`.79` so an A/B has an honest baseline that `null` cannot provide (`null` contains `run_analysis`); the browser's Tools control does not list it as an option, though a user whose stored setting is already `nocode` now keeps it (see the drift note above). See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
+
+**Shipping dark is now the settled outcome, not a pending one.** The paired A/B that was to decide whether `code` became the default — `genetics-results-suite-4h6.23` — was **descoped on 2026-08-30** by user decision: initial benchmarking was done manually and further benchmarking moves outside that epic. Its kill criterion was *"if the code arm does not beat the baseline on cost AND does not regress quality, keep it behind the profile rather than defaulting it on"*, whose conservative branch is the status quo — so the benchmark's absence **accepts** the documented default rather than leaving it open: **code execution stays opt-in; `null` stays the default profile.** The arms were never measured against each other, so nothing here says the code arm lost; the decision was not taken on numbers. No 4h6.23 figure exists, and no doc should be read as quoting one.
 
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
@@ -644,9 +648,11 @@ What the SDK's omission costs is the affordance, not the data: neither the SDK n
 stubs name that route, so a model would have to invent the request rather than call something
 put in front of it. That is a discoverability and convenience asymmetry, not an availability
 one, and inventing the call is not the intended way to use the sandbox.
-`genetics-results-suite-4h6.23` should still exclude or explicitly book questions that lean on
+Any A/B over these arms should still exclude or explicitly book questions that lean on
 either tool — but for those two different reasons, and without scoring the code-execution arm
-down as though both were unreachable. The egress allow-list and the credential's scope are
+down as though both were unreachable. That instruction was written for
+`genetics-results-suite-4h6.23`, which was descoped on 2026-08-30 without running; it now applies
+to whatever manual benchmarking is done instead. The egress allow-list and the credential's scope are
 specified and maintained in `genetics-results-suite` `docs/code-execution-security.md`; treat
 that document as the authority for both rather than the summary here, which will age.
 
@@ -991,8 +997,8 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 - **The import closure is pinned, because the sandbox image ships exactly it.** That image
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
-  is eleven modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,definitions,executor,phewas_categories,sql_safety,uniprot}`.
+  is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
+  `tools/{__init__,executor,phewas_categories,sql_safety,uniprot}`.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` now imports `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
@@ -1006,6 +1012,19 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   because 3.12 dropped that descriptor's lock and the service shares one executor across
   threads, so a race would leak the loser's connection pool past `close()`. Assigning over
   any of them in a test still works.
+- **`tools/__init__.py` re-exports `definitions` lazily, and that is load-bearing**
+  (`genetics-results-suite-6bv`). `sdk/client.py` imports `tools.executor`, which runs the
+  `tools` package `__init__`, so an eager `from genetics_mcp_server.tools.definitions import
+  TOOL_DEFINITIONS, ...` there put `definitions.py` in the closure even though `executor.py`
+  never imports it. `4h6.70` then added `from pydantic import Field` to `definitions.py` for
+  the `minimum`/`maximum`/`pattern` keywords, and the sandbox image — which pins numpy, scipy,
+  polars, matplotlib and httpx and nothing else — could no longer `import
+  genetics_mcp_server.sdk`. Every `__all__` entry except `ToolExecutor` — that is the rule
+  `_LAZY_FROM_DEFINITIONS` encodes, seven names as of this writing — now resolves through a
+  module `__getattr__`, so `from genetics_mcp_server.tools import TOOL_DEFINITIONS` and
+  `tools.get_anthropic_tools` behave exactly as before for chat_api, llm_service, subagent and
+  routers/llm_config, while the SDK path never imports the module. Dropping it also stops the
+  sandbox shipping the full catalogue of every tool the suite exposes.
 - **The endpoint reads must stay behind the settings resolution.** `config/settings.py` calls
   `load_dotenv()` at module scope, so the `GENETICS_API_URL` / `GENETICS_PUBLIC_API_URL` /
   `BIGQUERY_API_URL` reads only see a `.env` file once that module has been imported. They go
@@ -1014,7 +1033,11 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   service) on the hard-coded default URL while still attaching a `.env`-supplied secret to it,
   and would silently disable the BigQuery tools. `test_sdk_import_closure.py` pins this.
 - `test_sdk_import_closure.py` measures the closure in a fresh interpreter and asserts
-  equality, and asserts the SDK imports with `dotenv` unavailable. Every probe forces `src/`
+  equality, and asserts the SDK imports when **every** distribution outside the transitive
+  requirement closure of the sandbox's five pinned ones is unavailable — a `sys.meta_path`
+  finder that raises `ModuleNotFoundError` for their top-level modules. That generalises what
+  was a single `dotenv` stub: a per-offender test only ever covers the offender already fixed,
+  which is why `l41`'s guard did not catch `6bv`'s pydantic. Every probe forces `src/`
   onto the subprocess `PYTHONPATH` and asserts `genetics_mcp_server.__file__` resolves under
   it, so an editable install pointing at another checkout cannot make it measure the wrong
   tree. Widening the closure means widening `SDK_ALLOWLIST` in
@@ -1105,9 +1128,8 @@ iteration (`genetics-results-suite-6uk`). The two backends get there differently
 `_columns_meta` returns a **dict to splice with `**`** and is gated on
 `ToolExecutor(expose_columns=True)`, which only `GeneticsClient` passes: a tool result dict
 *is* the MCP tool payload and the chat backend's model input, and this epic freezes both, so
-with the flag off — or on an endpoint that does not advertise (search, gene annotations,
-gene groups, rsID lookup, LD, gene-disease, gene-based/gene-burden results) — the dict is byte-identical
-to before. An **injected** executor keeps whatever it was built with, so an empty
+with the flag off — or on an endpoint that does not advertise (`/v1/rsid/variants`; LD is a
+different service) — the dict is byte-identical to before. An **injected** executor keeps whatever it was built with, so an empty
 results-api result through the running service's shared executor falls back to a bare frame
 rather than silently changing that service's tool output.
 
@@ -1117,9 +1139,32 @@ dicts. `_frame()` consults `column_names` only when the result is empty — rout
 non-empty results-api result through the positional constructor would give up
 `pl.from_dicts`' `strict=False` fallback for the mixed-type columns upstream does produce.
 
-Not covered: results-api endpoints outside the `range_response` family (search, gene
-annotations, gene groups, rsID, LD, gene–disease) compute their JSON instead of streaming a
-TSV, so they have no header to advertise and degrade to today's bare `pl.DataFrame()`.
+The results-api endpoints outside the `range_response` family compute their JSON, so they
+have no file header to read and **declare** their columns instead
+(`genetics-results-suite-8a1`, in results-api; the declaration is refused there when it
+disagrees with a returned row). From this side they are indistinguishable — the same
+`X-Columns` header lifted by the same `_columns_meta` — so the executor change was one
+splice per call: `search_phenotypes`, `search_genes`, `get_genes_in_region`,
+`get_nearest_genes`, `get_gene_group_members`, `get_gene_based_results_by_phenotype`,
+`get_credible_set_leads_by_phenotype`, and `get_gene_disease_associations` on **both** its
+200 and its 404 branch (that endpoint expresses "no associations" as a 404 this executor
+already reads as an empty result). `get_credible_sets_by_phenotype` and
+`get_exome_results_by_phenotype` already spliced it and were simply never being sent one.
+
+`get_gene_based_results` is the exception: it requests TSV, so its schema is the header line
+`csv.DictReader` has already consumed and `tabix -h` prints even for a locus with no hits.
+`_columns_meta_from(reader.fieldnames)` lifts it, gated on the same `expose_columns` flag.
+
+Still not covered, re-derived from results-api's routers rather than assumed:
+`lookup_variants_by_rsid` (`/v1/rsid/variants`) and the LD calls, which go to the FinnGen LD
+server. `normalize_gene_symbols` is unaffected — the SDK builds that frame with an explicit
+`columns=`.
+
+`tests/test_sdk_empty_result_schema.py` used a fake transport that attached `X-Columns` to
+every response, which meant it asserted coverage it could not observe: three
+`json_phenotype`-backed branches sat in its parametrize as covered while results-api sent
+them no header. The transport now advertises only for paths in `_ADVERTISING_PATHS`,
+re-derived from that repo, so an endpoint that does not advertise fails this suite.
 
 ### URL path segments
 
@@ -1218,8 +1263,10 @@ conversation restores its options without changing what the next new chat starts
 
 One row per **completed** assistant turn, written by `_stream_anthropic` in the same block that
 logs the `Chat complete:` line, so the log line and the row can never disagree. **The Anthropic
-path only** — `_stream_openai` records nothing, so any aggregate over this table under-counts a
-deployment that also serves OpenAI. It holds
+path only** — `_stream_openai` records nothing, so any aggregate over this table would under-count a
+deployment that also served OpenAI. Since `genetics-results-suite-c4s` refuses
+`provider="openai"` at the request boundary, no such deployment can exist and the gap is
+latent rather than live. It holds
 `iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
 `cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model` and `created_at`. Before it,
 these numbers existed only in Cloud Logging and had to be recovered from the BigQuery log sink;
@@ -1357,7 +1404,9 @@ is emitted only if every tool name appearing in its text is in `tool_names`, wit
 the **Anthropic** path the prompt cannot describe a tool the model was not given. It does not
 hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor `tool_profile`
 and never sets `tools`, so that provider receives the prompt assembled for the full local set
-while getting no tools at all — pre-existing, and unchanged by 4h6.69. Consequences on the
+while getting no tools at all — pre-existing, and unchanged by 4h6.69, but unreachable since
+`genetics-results-suite-c4s` 400s `provider="openai"` before the stream opens; the mismatch is
+still described because the code path is still there. Consequences on the
 Anthropic path: the "Subagent Orchestration" section and the "variant_list_analysis skill"
 reference disappear with `ENABLE_SUBAGENTS=false`, "Phenotype Reports" with
 `ENABLE_PHENOTYPE_REPORT=false`, and every per-tool routing section under `tool_profile="code"`.
@@ -1425,10 +1474,11 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` pins three properties across the
-`None`/`api`/`bigquery`/`rag`/`code`/`nocode` profiles (`nocode`, the `code` arm's
-comparator, was added to `PROFILES` by `genetics-results-suite-4h6.78`/`.79`), the first
-and the heading-body half of the third with `ENABLE_SUBAGENTS` both true and false:
+`tests/test_system_prompt.py` holds **ten** test classes, **seven** of them parametrised
+over the `None`/`api`/`bigquery`/`rag`/`code`/`nocode` profiles (`nocode`, the `code` arm's
+comparator, was added to `PROFILES` by `genetics-results-suite-4h6.78`/`.79`). Three of
+those seven pin the core property families — the first, and the heading-body half of the
+third, with `ENABLE_SUBAGENTS` both true and false:
 **absence** (every tool name in the emitted prompt is in the resolved list, tokenising
 independently of the gate's own matcher — independently on the algorithm, not on the
 normalisation: neither sees a plural or suffixed name, so `_Block`'s docstring tells prompt
@@ -1438,7 +1488,7 @@ authors to name tools verbatim), **presence**
 under a different heading than it has in the unfiltered text, no heading is emitted empty). It
 also asserts the `run_analysis` bullet is byte-identical across every arm that carries it, which
 is what makes the `code`-vs-baseline A/B a comparison of tools rather than of wording.
-A fourth property is deliberately NOT parametrised over the six profiles, because that is what
+A further property is deliberately NOT parametrised over the six profiles, because that is what
 missed the defect it guards: `TestEverySurfaceWithADataPathIsRouted` drives ~80 tool sets off the
 full list — every single-tool removal plus flag-shaped family removals and their pairs — and
 asserts each surface reaching data through `get_credible_sets_by_gene`, `query_database` or
@@ -1542,9 +1592,13 @@ raw id rather than failing the run.
   two blocks: the split exists to give each half its own prompt-cache breakpoint, which that path
   has no equivalent for. Order matches Anthropic's — the envelope follows the server prompt. It
   previously dropped `user_instructions` outright with no log line, so a user with a set selected
-  saw it applied in the UI while the model never received it; `provider` is client-selectable and
-  `OPENAI_API_KEY` is wired into the pod, so that was reachable rather than theoretical
-  (`genetics-results-suite-b3v`).
+  saw it applied in the UI while the model never received it; `provider` was client-selectable and
+  `OPENAI_API_KEY` was wired into the pod, so that was reachable rather than theoretical
+  (`genetics-results-suite-b3v`). `stream_chat` now rejects `provider="openai"` with a 400 before
+  the stream opens (`genetics-results-suite-c4s` item 2). `OPENAI_API_KEY` is still wired into the
+  pod and this branch is still present in `llm_service.py`, kept for a possible future
+  reinstatement; what changed is that a request naming `openai` is now refused at the boundary
+  before it can reach this code.
 
 ## Architecture
 
@@ -1614,7 +1668,7 @@ src/genetics_mcp_server/
 ### Data flow
 
 1. **MCP Server mode**: Client → FastMCP → ToolExecutor → Genetics API
-2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic/OpenAI → ToolExecutor → Genetics API
+2. **Chat API mode**: HTTP → FastAPI → LLMService → Anthropic → ToolExecutor → Genetics API (the `_stream_openai` branch is still in the code but refused at the request boundary since `genetics-results-suite-c4s`)
 3. **Subagent mode**: Main Agent → `launch_subagents` tool → SubagentService → parallel Claude API calls → ToolExecutor/External Tools → results aggregated back to main agent
 4. **SDK mode**: script → `genetics_mcp_server.sdk` → GeneticsClient → ToolExecutor → Genetics API / BigQuery. Same executor, different entry point: no tool schema, no context row cap, polars frames instead of result envelopes.
 
@@ -1805,7 +1859,9 @@ agree with each other while both understate what was billed:
   attempts are billed and invisible.
 - **The OpenAI path emits no `usage` chunk at all.** `_stream_openai()` yields text and
   `done` only, so this whole section is Anthropic-path-only. `replay_benchmark.py`
-  handles that case with a `no_usage_chunks` status rather than a zero.
+  handles that case with a `no_usage_chunks` status rather than a zero. Since
+  `genetics-results-suite-c4s` refuses `provider="openai"` with a 400 before the stream
+  opens, no request reaches that path and the status now covers other causes.
 - **The stream carries no model name.** `estimate_cost()` falls back to Sonnet pricing
   for anything unrecognised (`has_pricing()` exists so callers can refuse instead), so
   the consumer must learn the model out-of-band and pass it in.
@@ -1933,7 +1989,7 @@ All configuration is via environment variables (`.env` file supported):
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude | - |
-| `OPENAI_API_KEY` | OpenAI API key | - |
+| `OPENAI_API_KEY` | OpenAI API key. Still read and still plumbed through, but unreachable: `stream_chat` refuses `provider="openai"` with a 400 since `genetics-results-suite-c4s` | - |
 | `DEFAULT_MODEL` | Default chat model | `claude-opus-5` |
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
@@ -2096,7 +2152,7 @@ so no cross-origin request is made.
 | `API_TOKEN_TTL_DAYS` | Days of inactivity after which a per-user API token expires; every use pushes the deadline out again. `0` disables expiry. Does not apply to `MCP_API_KEY` (default `90`) |
 | `GOOGLE_TOKEN_AUDIENCE` | Comma-separated OAuth client ids a Google Identity Token's `aud` must be one of. Unset means the audience is not checked at all. The deployed value is the gcloud CLI's *public* client id, so it buys cross-OAuth-client replay protection only — not identity, and not replay by another service documenting the same gcloud flow (see branch 3 below) |
 | `ALLOWED_EMAILS` | Comma-separated email allow-list shared by all JWT bearer paths (Google Identity Token and Keycloak) |
-| `ALLOWED_EMAIL_DOMAINS` | Comma-separated email-domain allow-list shared by all JWT bearer paths (default: `finngen.fi`) |
+| `ALLOWED_EMAIL_DOMAINS` | Comma-separated email-domain allow-list shared by all JWT bearer paths (default: `finngen.fi`). A literal `*` is allow-all on the proxied identity-header path only; the two JWT bearer paths **refuse** it and log a `WARNING` at startup on a remote transport (`genetics-results-suite-g8i`) |
 | `OAUTH_ISSUER` | Keycloak realm issuer URL; enables the OAuth resource-server bearer path when set together with `OAUTH_RESOURCE_URL` |
 | `OAUTH_RESOURCE_URL` | Expected `aud` claim (this server's canonical URL) for Keycloak access tokens |
 | `OAUTH_JWKS_URI` | Override for the JWKS endpoint; defaults to `<OAUTH_ISSUER>/protocol/openid-connect/certs` |
@@ -2106,7 +2162,7 @@ Tokens are supplied as an `Authorization: Bearer XXX` header. A `?token=XXX` que
 The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes each presented token through four branches in order, mirroring the results-api implementation:
 
 1. **`MCP_API_KEY` shared secret** — constant-time compare against each configured value, on the UTF-8 **bytes** of both sides. `hmac.compare_digest` raises `TypeError` when handed a `str` containing non-ASCII, and `api_keys` is non-empty whenever this wrapper is installed, so every non-ASCII bearer reached at least one comparison — and since this is raw ASGI middleware with no exception handler above it, that surfaced as a **500 rather than a 401** (`genetics-results-suite-zyi`; the fourth instance of this bug in the suite, after results-api, chat-backend's `api_tokens.py` and db-api — `auth/core.py` here was converted to bytes by `genetics-results-suite-th2` but this call site was missed). The raw `authorization` header bytes are also decoded inside a `try`: an `Authorization` value that is not valid UTF-8 raised `UnicodeDecodeError` on the same path, and is now treated as an absent credential, i.e. a 401. The `?token=` fallback below carried the same defect a third time — `scope["query_string"].decode()`, unguarded, a `UnicodeDecodeError` straight out of raw ASGI — and is now caught the same way, an undecodable query string finding no token and falling through to the 401 (`genetics-results-suite-tzi`). All three are pinned in `tests/test_mcp_server.py`, which builds the ASGI scope with raw bytes because httpx refuses to encode a non-ASCII header value or query string and would otherwise fail in the client rather than the server. This gate keeps **UTF-8 on both sides** deliberately, unlike `auth/core.py` below, and no starlette is involved: it decodes the raw ASGI header bytes itself, with UTF-8, so re-encoding with UTF-8 reproduces the wire bytes exactly and anything undecodable is already a 401 before the comparison. Note what switching it would and would not do — switching only the encode would raise `UnicodeEncodeError`, i.e. the 500 this whole line exists to prevent, and switching the decode and the encode together would not change *which* tokens are accepted (the expected side is valid UTF-8 by construction), only where an undecodable value is rejected.
-2. **Keycloak OAuth access token (JWT)** — only attempted when `OAUTH_ISSUER` and `OAUTH_RESOURCE_URL` are both set (`settings.oauth_enabled`). If the token contains `.` it is verified with PyJWT against Keycloak's JWKS (fetched and cached via a per-URI singleton `jwt.PyJWKClient`): RS256 signature, `iss == OAUTH_ISSUER`, `aud` includes `OAUTH_RESOURCE_URL` (string or list), and `exp` not expired. The email is taken from the `email` claim (falling back to `preferred_username` only when it is itself an email) and checked against the same `ALLOWED_EMAILS` / `ALLOWED_EMAIL_DOMAINS` allow-list. Any failure (wrong iss/aud/signature, expired, or a JWKS network error) is non-fatal and **falls through** to branch 3 rather than 500-ing.
+2. **Keycloak OAuth access token (JWT)** — only attempted when `OAUTH_ISSUER` and `OAUTH_RESOURCE_URL` are both set (`settings.oauth_enabled`). If the token contains `.` it is verified with PyJWT against Keycloak's JWKS (fetched and cached via a per-URI singleton `jwt.PyJWKClient`): RS256 signature, `iss == OAUTH_ISSUER`, `aud` includes `OAUTH_RESOURCE_URL` (string or list), and `exp` not expired. The email is taken from the `email` claim (falling back to `preferred_username` only when it is itself an email) and checked against the same `ALLOWED_EMAILS` / `ALLOWED_EMAIL_DOMAINS` allow-list. The check is `auth/core.py:_matches_allow_list(email, settings, allow_wildcard=False)`, which reproduces oauth2-proxy v7.14.3's matching (case-insensitive, exact address, exact domain, and the `.example.com` / `*.example.com` subdomain forms) with exactly one deliberate divergence: a **literal `*` is refused** on both JWT branches. `*` means "any domain the gateway admits", and the ConfigMap below feeds this value from the same terraform `${OAUTH_EMAIL_DOMAIN}` oauth2-proxy reads — but no gateway sits in front of these two paths for that scope to be relative to, so honouring it would admit any Google-verified or realm-issued account (`genetics-results-suite-g8i`). `*.example.com` is a different value and keeps working. The opt-out is spelled out at both call sites; `allow_wildcard` defaults to `True`, so the proxied path is unaffected. Both JWT branches call *that* rather than `auth/core.py:_email_allowed`, deliberately: `_email_allowed` adds the fail-open preamble described below, which is safe only where a trusted-proxy marker has already run. These branches have no marker — the allow-list is their only authorization — so an unconfigured deployment must refuse here rather than admit every Google-verified account (`genetics-results-suite-ol7`). Any failure (wrong iss/aud/signature, expired, or a JWKS network error) is non-fatal and **falls through** to branch 3 rather than 500-ing.
 3. **Google Identity Token (JWT)** — if the token contains `.` it is validated via `google.oauth2.id_token.verify_oauth2_token` using a lazily-initialized singleton `google.auth.transport.requests.Request` (for JWKS caching). The payload must have `email_verified == True`; the email must satisfy the same allow-list (otherwise 401/403). Identity is set to the verified email. `verify_oauth2_token` **skips the `aud` claim when no audience is passed**, so `_audience_allowed` additionally requires `aud ∈ GOOGLE_TOKEN_AUDIENCE` — without it a token minted for a different OAuth client would be accepted as long as its email is allow-listed. The check is inert (with a warning logged per token) while `GOOGLE_TOKEN_AUDIENCE` is unset; the deployment sets it to the gcloud CLI's **public** client id, which is what `gcloud auth print-identity-token` issues — for *everyone*, so what the check is worth is **cross-OAuth-client** replay protection and not identity: it rejects a token addressed to a different client id (ADC's `764086051850-…`, a project-owned client), but *not* one the same user handed to another homegrown service that documents this same `gcloud auth print-identity-token` flow, because that token carries the identical `aud`. The email allow-list carries the whole of the authorization. **This branch is deprecated (still supported, and not being switched off without notice): branch 4 is the recommended programmatic credential.** A project-owned audience was considered and rejected — `gcloud auth print-identity-token` on user credentials cannot request a custom audience, so it would 401 every human caller. Full decision record: `genetics-results-suite/docs/project-spec.md`, "Programmatic credentials: why the per-user API key, not the Google id_token".
 4. **Per-user API token** — the recommended programmatic credential, and the one users are pointed at. Fall back to validating against the local LLM config DB (SHA-256 hashed) or via the chat-backend `/v1/tokens/validate` endpoint. Users create tokens from the browser's "MCP and API keys" dialog, i.e. the chat API (`POST /chat/v1/tokens`). That endpoint is `Depends(auth_required)`, which needs the internal-secret marker plus an allow-listed oauth2-proxy identity header, so **no bearer token can mint a token** — a headless caller (CI, service account) needs a human to sign in once and create its key, after which the key works headlessly. Unlike a Google id_token this deployment issues it, can revoke it per user, and ages it out on 90-day idleness.
 
@@ -2114,7 +2170,7 @@ The bearer auth middleware (`_wrap_with_bearer_auth` in `mcp_server.py`) routes 
 
 Note that neither the shared `MCP_API_KEY` path nor this per-user path logs anything on success, so **mcp-server logs cannot attribute usage to a user for either** — only the Google-JWT and Keycloak branches emit an `authenticated … user: <email>` line. `user_api_tokens.last_used_at` is the only per-user record of API-token usage — and only when it can be written: the update is swallowed on failure (see above), so under a locked or full database the request is still authenticated and the sole trace is the `could not record use of API token id=…` WARNING, which names the token id but not the user.
 
-In deployment, `ALLOWED_EMAILS` and `ALLOWED_EMAIL_DOMAINS` are sourced from the shared `bearer-auth-allowed` Kubernetes ConfigMap (defined in `genetics-results-suite/k8s/configs/`), which is also consumed by results-api so both services share an identical allow-list.
+In deployment, `ALLOWED_EMAILS` and `ALLOWED_EMAIL_DOMAINS` are sourced from the shared `bearer-auth-allowed` Kubernetes ConfigMap (defined in `genetics-results-suite/k8s/configs/`), which is also consumed by results-api so both services share an identical allow-list, and interpret it identically. That includes the `*` divergence: results-api's `app/core/auth.py:_email_allowed` took the same `allow_wildcard` keyword with the same parity-preserving default, and passes `allow_wildcard=False` at its own unmarked Google id_token path (`genetics-results-suite-g8i`). `*` is refused on every unproxied bearer path in the suite and honoured on every marker-gated proxied one, in both services.
 
 ### Admin page
 
@@ -2238,6 +2294,7 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `EXTERNAL_MCP_EXCLUDE_TOOLS` | Tool names to exclude from proxying |
 | `ENABLE_CREDIBLE_SETS_STATS` | Enable `get_credible_sets_stats` tool (default `false`) |
 | `ENABLE_PHENOTYPE_REPORT` | Enable `get_phenotype_report` tool (default `false`) |
+| `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
 
@@ -2422,6 +2479,22 @@ read this DB.
   its row's `analyzer_version` equals the module-level `ANALYZER_VERSION` (bumping
   that constant invalidates every cached analysis). `source_updated_at` is stored as
   the raw `chat_sessions.updated_at` string so staleness comparisons stay consistent.
+  Each row also records the two judge models that produced it (`topic_model`,
+  `quality_model`, from `--topic-model` / `--quality-model`) as plain TEXT columns, so
+  an aggregate over the quality columns can `GROUP BY` them and see whether it is mixing
+  judges. A model is written **only for a field the run actually recomputed**: a session
+  replayed from the cache (and `--no-llm`, and a session the judge skipped) passes
+  `None`, and the upsert `COALESCE`s it, so the row keeps the model it already had. A
+  retained model therefore names the last run that recorded one for that field, which is
+  not necessarily the run that produced the value now stored: `--no-llm` still recomputes
+  and overwrites the topic by keyword, and `--force` / `--refresh-quality` can null a
+  score on a judge API error, in both cases leaving the older model in place. That is
+  inherent — `COALESCE` cannot express "clear this". Without that the nightly job — which has no date bounds, so every
+  session is in range — would restamp every pre-existing row with the current run's
+  model and erase the very mix these columns exist to expose. They are recorded only —
+  the model is deliberately **not** part of the staleness predicate, so changing it does
+  not trigger an unattended full re-judge. A NULL model means the row was judged before
+  the columns existed; which model produced it is not recoverable.
 - **Staleness-based selection**: the nightly run does minimal LLM work by asking the DB
   (`get_stale_or_missing_session_ids`) which in-range sessions actually need (re)analysis —
   ones with no row, a continued conversation (`chat_sessions.updated_at` advanced past
@@ -2604,10 +2677,13 @@ harness issues two arms per case. `--base-url` therefore defaults to
   not `ok`.** Iterations, tokens and cost are all unmeasurable for it, so counting
   its (necessarily zero) `tool_use` blocks would push a fake `0` into the tool-call
   distribution while contributing nothing to any other, diverging the two samples'
-  `n` and dragging the tool-call median down. This is not hypothetical: the OpenAI
-  path in `llm_service` yields one synthetic text block with no usage chunk and no
-  tool_use blocks, so a deployment whose `default_provider` is OpenAI would report
-  `tool_calls=0` for every turn. `--provider` pins the provider on the request and is
+  `n` and dragging the tool-call median down. This was reachable before
+  `genetics-results-suite-c4s`: the OpenAI path in `llm_service` yields one synthetic
+  text block with no usage chunk and no tool_use blocks, so a deployment whose
+  `default_provider` was OpenAI reported `tool_calls=0` for every turn. `c4s` now
+  refuses `provider="openai"` with a 400 before the stream opens, and the benchmark
+  drives that same HTTP endpoint, so the status survives for other no-usage causes
+  rather than for this one. `--provider` pins the provider on the request and is
   recorded in the report config. The history stays intact, so the rest of the case
   still runs; it is the status, not an abort, that keeps the turn out of the
   comparison.
@@ -2786,8 +2862,8 @@ and assistant prose written before a turn's last tool call was discarded at capt
 
 ## Paired Quality Judging
 
-`scripts/pairwise_judge.py` answers the half of `genetics-results-suite-4h6.23`'s kill
-criterion the benchmark's own metrics cannot: "must not **regress** quality". It is
+`scripts/pairwise_judge.py` answers the half of the descoped `genetics-results-suite-4h6.23`'s
+kill criterion the benchmark's own metrics cannot: "must not **regress** quality". It is
 **off by default** (`--judge` on the benchmark, or
 `python -m genetics_mcp_server.scripts.pairwise_judge --report <file>` over a report
 already written) — a run produces cost and latency numbers with no judge call at all.
@@ -2932,7 +3008,7 @@ already written) — a run produces cost and latency numbers with no judge call 
 ## Development Workflow
 
 - **Issue tracking**: beads (`bd`) tracks epics and tasks in `.beads/`, synced with git
-- **Feature planning**: new features go through architecture exploration (`.claude/agents/architecture-explorer.md`) which proposes 3 alternatives, then the selected approach is broken into ultrafocused subtasks in beads
+- **Feature planning**: new features go through architecture exploration (`~/.claude/agents/architecture-explorer.md` — a user-level agent, not checked into any repo) which proposes 3 alternatives, then the selected approach is broken into ultrafocused subtasks in beads
 - **Task execution**: work through subtasks via `bd ready`, updating status as you go
 
 ## Documentation

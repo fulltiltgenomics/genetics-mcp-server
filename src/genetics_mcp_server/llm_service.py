@@ -36,6 +36,7 @@ from genetics_mcp_server.mcp_proxy import (
 )
 from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import TOOL_PROFILE_TOOLS, ToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools.definitions import tool_category
 from genetics_mcp_server.tools.executor import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
@@ -581,6 +582,31 @@ def _script_result_payload(
     }
 
 
+def resolve_proxied_tools(
+    tool_profile: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The proxied surfaces a request with this profile is handed: (external, RAG).
+
+    Always-on external tools (gnomAD, Open Targets) are excluded in the RAG profile, and in
+    any explicit-allow-list profile: those name their surface exactly, so re-adding ~20
+    proxied tools would defeat the surface they exist to measure. RAG tools are included
+    only when the profile is None (all) or "rag".
+
+    Extracted for the same reason `resolve_local_tools` exists: `/chat/v1/tools?resolved=true`
+    has to answer with the tools this rule would actually hand the model, and a second copy
+    of the rule beside the panel that shows them is a copy that drifts.
+    """
+    external_tools: list[dict[str, Any]] = []
+    if tool_profile != "rag" and tool_profile not in TOOL_PROFILE_TOOLS:
+        external_tools = get_external_anthropic_tools()
+
+    rag_tools: list[dict[str, Any]] = []
+    if tool_profile is None or tool_profile == "rag":
+        rag_tools = get_rag_anthropic_tools()
+
+    return external_tools, rag_tools
+
+
 @dataclass(frozen=True)
 class ResolvedLocalTools:
     """One request's local tool definitions, with the names projected off them.
@@ -691,6 +717,52 @@ class LLMService:
                 disabled_tools=self._disabled_tools(),
             )
         )
+
+    def describe_available_tools(
+        self, tool_profile: str | None = None, enable_tools: bool = True
+    ) -> list[dict[str, Any]]:
+        """Every tool such a request would be handed, with its description.
+
+        `resolve_local_tool_names` answers the same question for the local surface and
+        answers it in names only, which is all the drift check it was written for needs.
+        This is for the browser's tools panel, which has to show a user what the assistant
+        can actually do: that means descriptions, and it means the proxied tools too — a
+        list that stopped at the local surface would omit the gnomAD and Open Targets tools
+        entirely and leave the panel claiming the assistant cannot reach them.
+
+        Both halves go through the same resolution the request itself uses
+        (`resolve_local_tools`, `resolve_proxied_tools`), so the panel cannot list a tool
+        the model is not given, or miss one it is. `source` distinguishes them because only
+        the local half has a category to group by — proxied tools carry the remote server's
+        own name and description and are not part of any profile category.
+        """
+        local = self.resolve_local_tools(tool_profile, enable_tools)
+        tools: list[dict[str, Any]] = [
+            {
+                "name": t["name"],
+                "description": t["description"],
+                "category": tool_category(t["name"]),
+                "source": "local",
+            }
+            for t in local.definitions
+        ]
+
+        # mirrors stream_chat, which reaches the proxied surfaces only inside the same gate
+        if not (enable_tools and get_settings().mcp_enabled):
+            return tools
+
+        external_tools, rag_tools = resolve_proxied_tools(tool_profile)
+        for source, definitions in (("external", external_tools), ("rag", rag_tools)):
+            tools.extend(
+                {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "category": None,
+                    "source": source,
+                }
+                for t in definitions
+            )
+        return tools
 
     def resolve_local_tool_names(
         self, tool_profile: str | None = None, enable_tools: bool = True
@@ -956,19 +1028,9 @@ class LLMService:
             tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
 
-            # always-on external tools (gnomAD, Open Targets) excluded in RAG profile, and
-            # in any explicit-allow-list profile: those name their surface exactly, so
-            # re-adding ~20 proxied tools would defeat the surface they exist to measure
-            external_tools = []
-            if tool_profile != "rag" and tool_profile not in TOOL_PROFILE_TOOLS:
-                external_tools = get_external_anthropic_tools()
-                tool_definitions.extend(external_tools)
-
-            # RAG tools only included when profile is None (all) or "rag"
-            rag_tools = []
-            if tool_profile is None or tool_profile == "rag":
-                rag_tools = get_rag_anthropic_tools()
-                tool_definitions.extend(rag_tools)
+            external_tools, rag_tools = resolve_proxied_tools(tool_profile)
+            tool_definitions.extend(external_tools)
+            tool_definitions.extend(rag_tools)
 
             # mark last tool for prompt caching so tool definitions are cached
             if tool_definitions:

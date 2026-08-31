@@ -285,6 +285,85 @@ class TestAllowList:
             assert core.get_authenticated_user(unmarked) is None
 
 
+class TestLeadingDotDomain:
+    """oauth2-proxy's `--email-domain=.example.com` form (genetics-results-suite-zl2).
+
+    v7.14.3 `isEmailValidWithDomains` (validator.go) accepts on
+    `HasSuffix(email, "@"+domain)`, and separately on
+    `HasPrefix(domain, ".") && HasSuffix(atoms[len(atoms)-1], domain)` where `atoms[len-1]` is
+    the part after the last `@`. Subdomains match; the bare domain does not, because
+    "@.example.com" is a suffix of no real address. Before this, such a deployment got a
+    session at the gateway and a 401 from both backends. These assertions are duplicated in
+    results-api's tests/test_auth_header_trust.py — the two implementations must not drift.
+    """
+
+    @staticmethod
+    def _allowed(email: str, domains: str) -> bool:
+        with settings_env(
+            REQUIRE_AUTH="true",
+            INTERNAL_API_SECRET=INTERNAL_SECRET,
+            ALLOWED_EMAIL_DOMAINS=domains,
+            ALLOWED_EMAILS="guest@example.org",
+        ):
+            return core._email_allowed(email)
+
+    def test_subdomain_matches(self):
+        assert self._allowed("user@sub.example.com", ".example.com") is True
+        assert self._allowed("user@deep.sub.example.com", ".example.com") is True
+
+    def test_bare_domain_does_not_match(self):
+        """The half that is easy to get backwards: oauth2-proxy refuses this one."""
+        assert self._allowed("user@example.com", ".example.com") is False
+
+    def test_near_miss_is_refused(self):
+        """A suffix test against the whole address, or one forgetting the dot, admits these."""
+        assert self._allowed("user@notexample.com", ".example.com") is False
+        assert self._allowed("user@evilexample.com", "example.com") is False
+        assert self._allowed("user@other.example", ".example.com") is False
+
+    def test_exact_and_star_forms_are_unchanged(self):
+        assert self._allowed("user@example.com", "example.com") is True
+        assert self._allowed("user@sub.example.com", "example.com") is False
+        assert self._allowed("anyone@anywhere.example", "*") is True
+        assert self._allowed("Guest@Example.ORG", "example.com") is True
+
+    def test_star_dot_form_is_a_synonym_for_the_leading_dot_form(self):
+        """v7.14.3 strips the star (`domain[1:]`) and runs the leading-dot suffix test, so
+        `*.example.com` and `.example.com` decide identically — and neither is allow-all."""
+        assert self._allowed("user@sub.example.com", "*.example.com") is True
+        assert self._allowed("user@deep.sub.example.com", "*.example.com") is True
+        assert self._allowed("user@example.com", "*.example.com") is False
+        assert self._allowed("user@notexample.com", "*.example.com") is False
+        # the over-admission this code has never made: a "*."-prefixed entry is not allow-all
+        assert self._allowed("anyone@anywhere.example", "*.example.com") is False
+        # while a bare "*" still is
+        assert self._allowed("anyone@anywhere.example", "*") is True
+
+    def test_domain_is_taken_from_the_last_at_sign(self):
+        """Go's `atoms[len(atoms)-1]` is the part after the LAST "@"; str.split("@")[-1]
+        agrees, including when there is no local part at all."""
+        assert self._allowed("a@b@example.com", "example.com") is True
+        assert self._allowed("a@b@sub.example.com", ".example.com") is True
+        assert self._allowed("a@b@example.com", ".example.com") is False
+        assert self._allowed("@sub.example.com", ".example.com") is True
+
+    def test_degenerate_dot_entries_reduce_to_a_trailing_dot_test(self):
+        """A configured "." or "*." reduces to HasSuffix(domain_part, "."), which no ordinary
+        address satisfies. Pinning what oauth2-proxy does with the value, not endorsing it."""
+        assert self._allowed("user@example.com", ".") is False
+        assert self._allowed("user@example.com", "*.") is False
+        assert self._allowed("user@example.com.", ".") is True
+        assert self._allowed("user@example.com.", "*.") is True
+
+    def test_address_without_an_at_sign_is_refused(self):
+        """The one known divergence, recorded in the comment at core.py's `domain = ...` line:
+        oauth2-proxy's last atom is the whole string, so `.com` would admit this at the
+        gateway. Here the domain part is "" and it is refused — fail-closed, and unreachable
+        unless an IdP emits an address with no "@"."""
+        assert self._allowed("example.com", ".com") is False
+        assert self._allowed("example.com", "com") is False
+
+
 # ---------------------------------------------------------------------------
 # ordered rollout: auth-gateway (sending side) ships before chat-backend
 # ---------------------------------------------------------------------------

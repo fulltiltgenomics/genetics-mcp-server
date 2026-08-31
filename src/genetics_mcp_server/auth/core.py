@@ -174,21 +174,110 @@ def is_internal_caller(request: Request) -> bool:
     return hmac.compare_digest(auth_header[7:].encode("latin-1"), expected)
 
 
-def _email_allowed(email: str) -> bool:
-    """True when the address is covered by ALLOWED_EMAILS or ALLOWED_EMAIL_DOMAINS.
+def _matches_allow_list(email: str, settings, *, allow_wildcard: bool = True) -> bool:
+    """True when the address matches ALLOWED_EMAILS/ALLOWED_EMAIL_DOMAINS, as oauth2-proxy would.
+
+    The MATCHING half of the allow-list, and only that: it answers "does this address match the
+    configured lists", never "did this deployment configure any". Split out of `_email_allowed`
+    (genetics-results-suite-ol7) so that paths where the allow-list is the ONLY authorization can
+    reuse the matching WITHOUT inheriting the fail-open below. mcp_server's bearer and Keycloak
+    paths are exactly those: they carry no trusted-proxy marker, so returning True there when
+    nothing is configured would admit any Google-verified account rather than being defence in
+    depth. Call this one from an unmarked path; call `_email_allowed` from a marked one.
 
     Compared case-insensitively on both sides: oauth2-proxy lower-cases the address before its
     own domain check, so `User@FinnGen.fi` gets a session there and must not be rejected here.
-    A literal `*` in ALLOWED_EMAIL_DOMAINS means "any domain", matching what oauth2-proxy does
+    A literal `*` in ALLOWED_EMAIL_DOMAINS means "any domain" BY DEFAULT, matching what oauth2-proxy does
     with the same value — without this it would match no domain at all and lock out every user
     of a deployment whose operator set `oauth_email_domain = "*"` deliberately.
+
+    A domain written with a LEADING DOT matches subdomains and NOT the bare domain, which is
+    what oauth2-proxy v7.14.3 does in `isEmailValidWithDomains` (validator.go): it accepts on
+    `HasSuffix(email, "@"+domain)`, and separately on `HasPrefix(domain, ".") &&
+    HasSuffix(atoms[len(atoms)-1], domain)` where `atoms[len-1]` is the part after the last
+    `@`. So `.example.com` admits `user@sub.example.com` and refuses `user@example.com` —
+    "@.example.com" is not a suffix of any real address. Without this branch a deployment
+    setting `oauth_email_domain = ".example.com"` would get a session at the gateway and a 401
+    from both backends: a logged-in UI in which every call fails
+    (genetics-results-suite-zl2). The suffix is tested against the domain part only, never
+    against the whole address, so `.example.com` cannot match `notexample.com`.
+
+    `allow_wildcard=False` refuses the bare `*` and changes NOTHING else — every other form
+    stays at full parity, `*.example.com` included, because that is a different value. This is
+    the suite's one deliberate divergence from oauth2-proxy (genetics-results-suite-g8i), and
+    it is deliberate for a reason that does not generalise: parity on the matching FORMS
+    (case-folding, exact address, exact domain, leading dot, `*.`) is right because those
+    describe which humans the gateway admits, but `*` means "any domain behind the gateway"
+    and no gateway fronts the callers that pass False. The Google id_token path has none at
+    all; the Keycloak path's realm gate is fed from the same `${OAUTH_EMAIL_DOMAIN}`
+    (keycloak/realm-genetics.json.template binds it to the realm attribute
+    `allowedEmailDomains`) and itself refuses a bare `*` —
+    keycloak/email-allowlist-authenticator/email-allowlist.js tests
+    `email.endsWith("@" + d)`, which nothing satisfies for `*`, so brokered login is denied
+    before an account exists. Refusing `*` here AGREES with that gate rather than
+    contradicting it; honouring it would admit only the realm accounts that gate never
+    vetted, i.e. pre-existing and admin-created ones.
+    k8s/configs/bearer-auth-allowed.yaml feeds ALLOWED_EMAIL_DOMAINS from
+    `${OAUTH_EMAIL_DOMAIN}`, the SAME terraform variable oauth2-proxy is configured from, so
+    an operator writing `*` with the gateway in mind would otherwise turn the unproxied Google
+    id_token path into allow-all for any Google-verified address. `_audience_allowed` does not
+    save it: inert without GOOGLE_TOKEN_AUDIENCE, and the public gcloud client id when set.
+    The default is True so the proxied, marker-gated `_email_allowed` path is untouched; the
+    opt-out is spelled out at each call site rather than defaulted, so a new caller inherits
+    oauth2-proxy parity and has to say when it is not behind the proxy.
+
+    THIS function is the parity target, not `_email_allowed`: results-api's `_email_allowed`
+    (app/core/auth.py) is pure matching with no `allow_list_configured` preamble, so it is this
+    body that must stay byte-for-byte equivalent to it in behaviour, in BOTH modes: results-api
+    carries the same `allow_wildcard` keyword with the same default, and passes False at its own
+    unmarked Google id_token path (genetics-results-suite-g8i).
+    """
+    domains = {d.strip().lower() for d in settings.allowed_email_domains}
+    if "*" in domains:
+        if allow_wildcard:
+            return True
+        # drop the star rather than fall through with it: the two suffix branches below ignore
+        # a bare "*" anyway, but `domain in domains` would otherwise still admit the malformed
+        # address "a@*". Only this one entry is removed, so a list of `*, .example.com` keeps
+        # matching subdomains.
+        domains.discard("*")
+    email = email.strip().lower()
+    # LATENT, fail-closed: with no "@" this yields "" where oauth2-proxy's atoms[len-1] yields
+    # the WHOLE string, so `--email-domain=.com` admits the malformed identity "example.com" at
+    # the gateway and 401s it here — the same gateway-admits/backend-refuses divergence as
+    # genetics-results-suite-zl2, one step further out. Unreachable unless an IdP emits an
+    # address with no "@", and it errs toward refusing. The exact-match fix, if ever wanted, is
+    # `domain = email.rsplit("@", 1)[-1]` unconditionally; deliberately not applied.
+    domain = email.split("@")[-1] if "@" in email else ""
+    if email in {e.strip().lower() for e in settings.allowed_emails} or domain in domains:
+        return True
+    # oauth2-proxy v7.14.3 accepts "*.example.com" as an exact synonym for ".example.com":
+    # `HasPrefix(domain, "*.") && HasSuffix(atoms[len-1], domain[1:])` strips the star and runs
+    # the same suffix test on the same string, so the two spellings must decide alike here too.
+    # A bare "*" is handled by equality above (allow-all, or discarded under
+    # allow_wildcard=False), and a "*."-prefixed entry can never equal it — so this branch
+    # cannot widen one into allow-all, in either mode.
+    return any(
+        (d.startswith(".") and domain.endswith(d))
+        or (d.startswith("*.") and domain.endswith(d[1:]))
+        for d in domains
+    )
+
+
+def _email_allowed(email: str) -> bool:
+    """True when the address is covered by ALLOWED_EMAILS or ALLOWED_EMAIL_DOMAINS.
+
+    The matching itself lives in `_matches_allow_list` above, which documents the oauth2-proxy
+    semantics it reproduces; this adds the fail-open preamble and the settings lookup.
 
     Fails OPEN when the deployment configured no allow-list at all. `allowed_email_domains`
     defaults to `finngen.fi`, so an unconfigured chat-backend would otherwise silently refuse
     every user of any other deployment — a total lockout, worse than the bug this file closes.
-    The marker check above is the security-critical half and still applies; the allow-list is
+    The marker check is the security-critical half and still applies; the allow-list is
     defence in depth against a compromised holder of INTERNAL_API_SECRET asserting an identity
-    oauth2-proxy would never have issued.
+    oauth2-proxy would never have issued. That reasoning is what makes the fail-open safe, and
+    it does NOT travel: it is load-bearing on `get_authenticated_user`, which calls
+    `is_internal_caller` first, and absent anywhere the allow-list stands alone.
     """
     from genetics_mcp_server.config import get_settings
 
@@ -199,12 +288,7 @@ def _email_allowed(email: str) -> bool:
             "trusted proxy asserts"
         )
         return True
-    domains = {d.strip().lower() for d in settings.allowed_email_domains}
-    if "*" in domains:
-        return True
-    email = email.strip().lower()
-    domain = email.split("@")[-1] if "@" in email else ""
-    return email in {e.strip().lower() for e in settings.allowed_emails} or domain in domains
+    return _matches_allow_list(email, settings)
 
 
 def get_authenticated_user(request: Request) -> str | None:

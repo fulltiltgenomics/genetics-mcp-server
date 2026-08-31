@@ -26,7 +26,7 @@ All environment variables are optional but needed for each type of functionality
 | `BIGQUERY_API_URL` | Base URL for [genetics-results-db](https://github.com/fulltiltgenomics/genetics-results-db) server | - |
 | `INTERNAL_API_SECRET` | Shared secret sent as a bearer token on every call to `GENETICS_API_URL` and `BIGQUERY_API_URL`. Optional only for a local run against services that require no internal auth — the remote-transport MCP server and the chat API with `REQUIRE_AUTH=true` refuse to start without it, rather than making anonymous calls | - |
 | `ANTHROPIC_API_KEY` | Anthropic API key (for chat) | - |
-| `OPENAI_API_KEY` | OpenAI API key (for chat) | - |
+| `OPENAI_API_KEY` | OpenAI API key. Still read and plumbed through, but no request can reach the OpenAI path: the chat API refuses `provider="openai"` (and any model not starting with `claude-`) with a 400 before the stream opens, since `genetics-results-suite-c4s` | - |
 | `PERPLEXITY_API_KEY` | Perplexity API key (for literature search, the default backend) | - |
 | `TAVILY_API_KEY` | Tavily API key (for web search) | - |
 | `MCP_API_KEY` | Comma-separated bearer tokens; required to start the MCP server on a remote transport | - |

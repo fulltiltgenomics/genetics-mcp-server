@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import TransportSecuritySettings
 
+from genetics_mcp_server.auth.core import _matches_allow_list
 from genetics_mcp_server.config.settings import get_settings, require_internal_api_secret
 from genetics_mcp_server.tools.definitions import register_mcp_tools
 from genetics_mcp_server.tools.executor import ToolExecutor
@@ -170,12 +171,6 @@ def _get_jwks_client(jwks_uri: str):
     return client
 
 
-def _email_allowed(email: str, settings) -> bool:
-    """Shared allow-list check used by every JWT bearer path."""
-    domain = email.split("@")[-1] if "@" in email else ""
-    return email in settings.allowed_emails or domain in settings.allowed_email_domains
-
-
 def _audience_allowed(payload: dict, settings) -> bool:
     """Check a verified Google Identity Token was actually addressed to this service.
 
@@ -238,7 +233,23 @@ def _validate_keycloak_token(token: str, settings) -> bool:
     if not email:
         logger.warning("Keycloak token does not contain an email")
         return False
-    if not _email_allowed(email, settings):
+    # _matches_allow_list, NOT auth.core's _email_allowed: this path carries no trusted-proxy
+    # marker, so the allow-list is the only authorization here and must stay fail-CLOSED when
+    # the deployment configured none (genetics-results-suite-ol7).
+    #
+    # allow_wildcard=False is the deliberate, user-approved divergence from oauth2-proxy
+    # (genetics-results-suite-g8i) and applies to the bare "*" ONLY — every other form,
+    # "*.example.com" included, stays at full parity. ALLOWED_EMAIL_DOMAINS comes from the
+    # same terraform ${OAUTH_EMAIL_DOMAIN} oauth2-proxy reads, and there "*" sensibly means
+    # "any domain the gateway admits"; no oauth2-proxy fronts this path for that scope to be
+    # relative to. The one gate that IS fed from the same variable agrees with refusing it:
+    # keycloak/realm-genetics.json.template binds the realm attribute allowedEmailDomains to
+    # ${OAUTH_EMAIL_DOMAIN}, and keycloak/email-allowlist-authenticator/email-allowlist.js
+    # tests `email.endsWith("@" + d)` at first-broker-login, which a bare "*" satisfies for
+    # nobody — Keycloak already refuses "*" and creates no account. So honouring it here
+    # would contradict that gate and admit exactly the realm accounts it never vetted:
+    # pre-existing and admin-created ones.
+    if not _matches_allow_list(email, settings, allow_wildcard=False):
         logger.warning("Keycloak email not allowed: %s", email)
         return False
     logger.info("authenticated Keycloak user: %s", email)
@@ -342,7 +353,12 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             if not email:
                 logger.warning("Token does not contain email")
                 return False
-            if not _email_allowed(email, settings):
+            # see the notes on the Keycloak path: fail-CLOSED matching, no fail-open preamble,
+            # and allow_wildcard=False so a "*" meant for the gateway does not make this
+            # ungated path admit every Google-verified address (genetics-results-suite-g8i).
+            # _audience_allowed above is no backstop: inert without GOOGLE_TOKEN_AUDIENCE, and
+            # the *public* gcloud client id when set.
+            if not _matches_allow_list(email, settings, allow_wildcard=False):
                 logger.warning("Email domain not allowed: %s", email)
                 return False
             logger.info("authenticated JWT user: %s", email)
@@ -469,6 +485,31 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
     return auth_middleware
 
 
+def _warn_if_wildcard_allow_list(settings) -> None:
+    """Warn once at startup when ALLOWED_EMAIL_DOMAINS is `*` on a remote transport.
+
+    Called only from the remote-transport branch of `main()`, because that is the only shape
+    in which the bearer and Keycloak paths are reachable, and once per process rather than per
+    request. The operator's intent is genuinely not met on those two paths
+    (genetics-results-suite-g8i) and silence about that is the whole problem repeating — the
+    `*` reaches this process from the same terraform variable oauth2-proxy is configured from,
+    so an operator can set it without ever thinking about this server.
+    """
+    if any(d.strip() == "*" for d in settings.allowed_email_domains):
+        logger.warning(
+            "ALLOWED_EMAIL_DOMAINS contains a literal '*'. oauth2-proxy honours it as "
+            "allow-all, and so does the proxied identity-header path, because the gateway "
+            "has already decided who gets in. The bearer (Google id_token) and Keycloak "
+            "paths REFUSE it: no gateway sits in front of them, so allow-all there would "
+            "admit any Google-verified account — and, on the Keycloak path, any "
+            "pre-existing or admin-created realm account, since Keycloak's own "
+            "first-broker-login allow-list is fed the same '*' and matches nobody with it, "
+            "blocking new brokered logins outright. Those callers must be "
+            "covered by an explicit domain or address in ALLOWED_EMAIL_DOMAINS / "
+            "ALLOWED_EMAILS, or they will get 401s."
+        )
+
+
 def main():
     """Main entry point for the MCP server."""
     parser = argparse.ArgumentParser(
@@ -517,6 +558,7 @@ def main():
         # with no Authorization header (genetics-results-suite-618), which results-api now
         # answers 401 — a misconfiguration that would present as a far-end auth failure.
         require_internal_api_secret("the MCP server")
+        _warn_if_wildcard_allow_list(get_settings())
         api_keys = [k.strip() for k in api_key_env.split(",") if k.strip()]
         app = _wrap_with_bearer_auth(app, api_keys)
         logger.info(f"Bearer token authentication enabled ({len(api_keys)} key(s))")

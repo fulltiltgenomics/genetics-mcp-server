@@ -78,8 +78,8 @@ class Settings:
     # same env var name db-api and results-api already gate their token verification on, so
     # one value describes the sandbox's existence across the three services that care.
     #
-    # While it is false `run_analysis` is absent from `disabled_tools`' complement, so no
-    # resolved tool list contains it (genetics-results-suite-4h6.56). Shipping it enabled
+    # While it is false, `disabled_tools` CONTAINS `run_analysis`, so no resolved tool
+    # list contains it (genetics-results-suite-4h6.56). Shipping it enabled
     # ahead of the sandbox is the expensive failure, not the safe one: the system prompt
     # tells the model to PREFER it, and an unreachable sandbox classifies as
     # SandboxUnavailable with retryable: True, so every chat turn is steered into a tool
@@ -152,6 +152,22 @@ class Settings:
     enable_phenotype_report: bool = field(
         default_factory=lambda: os.environ.get(
             "ENABLE_PHENOTYPE_REPORT", "false"
+        ).lower() in ("1", "true", "yes")
+    )
+
+    # NOT one of the "optional tools" above: literature search is part of the shipped
+    # surface, so this defaults TRUE and exists only to take it back out. The case it was
+    # added for is the benchmark, where an external API's key, latency and spend otherwise
+    # ride along in every arm and neither arm is measuring them.
+    #
+    # Turning it off is safe for the prompt because the gate in config/defaults.py keys on
+    # the tool NAMES a block mentions: with search_scientific_literature out of
+    # `disabled_tools`' complement, ~1.9 KB of citation and backend-naming instructions
+    # drop out with it. That is what stops this repeating the run_analysis failure, where
+    # the tool went away and the prompt kept telling the model to use it.
+    enable_literature_search: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ENABLE_LITERATURE_SEARCH", "true"
         ).lower() in ("1", "true", "yes")
     )
 
@@ -381,6 +397,8 @@ class Settings:
             disabled.add("get_phenotype_report")
         if not self.enable_subagents:
             disabled.add("launch_subagents")
+        if not self.enable_literature_search:
+            disabled.add("search_scientific_literature")
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a
             # sandbox rather than broken by it, and neither is a tool the prompt prefers

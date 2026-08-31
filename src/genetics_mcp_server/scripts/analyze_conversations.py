@@ -2132,6 +2132,19 @@ async def main():
         cached_topics_db = {}
         cached_quality_db = {}
 
+    # provenance snapshot for the two model columns (genetics-results-suite-9wv).
+    # Taken here, after every mutation of the cached maps above (stale eviction and
+    # --force), so the keys are exactly the sessions this run will replay from cache
+    # without an LLM call. Those must NOT be stamped with this run's model: the
+    # nightly job has no date bounds, so the whole DB is "in range" and every
+    # pre-existing row would otherwise be relabelled with today's judge.
+    replayed_topic_ids = set(cached_topics_db)
+    replayed_quality_ids = set(cached_quality_db)
+    # None unless an LLM actually classified topics this run (--no-llm uses keywords)
+    topic_model_used: str | None = None
+    # filled in by the quality pass with the sessions the judge really scored
+    judged_quality_ids: set[str] = set()
+
     # tracks real API cost from token usage; only reflects this run's live calls
     # (cached topic/quality results incur no new cost)
     cost_tracker = CostTracker()
@@ -2160,6 +2173,7 @@ async def main():
             )
             cached_topics.update(new_topics)
         topics = cached_topics
+        topic_model_used = args.topic_model
 
     topic_dist = Counter(v["topic"] for v in topics.values())
     logger.info(f"  Topics: {dict(topic_dist.most_common())}")
@@ -2189,6 +2203,10 @@ async def main():
             cached_quality.update(new_assessments)
         else:
             logger.info("  All quality assessments cached, skipping LLM calls")
+
+        # only sessions the judge actually returned a verdict for this run; ones it
+        # skipped (below, labelled 'unknown') produced no judgment and so no model
+        judged_quality_ids = set(cached_quality) - replayed_quality_ids
 
         apply_quality_assessments(all_metrics, cached_quality)
         logger.info(f"  {len(cached_quality)} conversations evaluated")
@@ -2247,6 +2265,24 @@ async def main():
             ANALYZER_VERSION,
             source_updated_at=updated_at_by_session.get(m.session_id),
             message_count=m.total_messages,
+            # Narrow, one-time false attribution, deliberately left as-is: a session
+            # with no user message (created via POST /sessions and abandoned, or
+            # assistant rows only) never reaches session_first_msgs, so no model ever
+            # classified it — it takes the hardcoded "general_genetics" default in
+            # compute_all_metrics — yet on its first analysis it is not in
+            # replayed_topic_ids, so this stamps topic_model_used anyway (likewise
+            # under --force). Milder sibling: when a categorize_with_llm batch fails,
+            # the helper substitutes keyword topics but the row still gets the
+            # configured model. Both are one-time per row (afterwards the row is
+            # non-stale and passes None) and neither disturbs the provenance mix of
+            # genuinely judged rows. Tightening would mean an
+            # `m.session_id in topics` guard here.
+            topic_model=(
+                None if m.session_id in replayed_topic_ids else topic_model_used
+            ),
+            quality_model=(
+                args.quality_model if m.session_id in judged_quality_ids else None
+            ),
         )
     logger.info(f"  Persisted {len(all_metrics)} analyses to the DB cache")
 

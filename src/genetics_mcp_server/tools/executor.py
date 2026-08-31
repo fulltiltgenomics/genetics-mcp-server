@@ -103,6 +103,90 @@ def _resolve_settings() -> "Settings | _PrunedInstallSettings":
     return get_settings()
 
 
+# Modules the sandbox image deliberately does not contain but that code inside the SDK's
+# import closure still reaches at CALL time: `ddgs` is absent from
+# sandbox/requirements.txt, and the genetics_mcp_server ones are outside
+# sandbox/prune_venv.py's SDK_ALLOWLIST, so the build deletes them from the image. Every
+# import of them is DEFERRED, which is why nothing catches them earlier — the build's
+# `import genetics_mcp_server.sdk` check never executes a function body — and every one is
+# reachable from a sandboxed script, because sdk/client.py holds a ToolExecutor and
+# `genetics.get_client()._executor` is one attribute access from a documented entry point.
+#
+# Not all of them are imported by THIS file: `tools.definitions` is reached through
+# `tools/__init__.py`'s lazy `__getattr__`, so it has no site here to guard — it is listed
+# because `_absent_capability_named` below is the inventory the hint reads, and a script
+# that touches `from genetics_mcp_server.tools import TOOL_DEFINITIONS` deserves the same
+# accurate answer as one that calls `web_search`. Re-derive this set with an AST walk over
+# the closure's function-level imports; do not trust the list.
+#
+# Naming a module here does NOT make its capability work; it makes the absence legible.
+# Widening the image instead was considered and rejected (genetics-results-suite-tbg): the
+# sandbox NetworkPolicy grants no DNS, so ddgs would stall the glibc resolver rather than
+# fail fast, and shipping sandbox_client would hand a prompt-injected script a
+# confused-deputy surface with no egress rule to use it.
+_SANDBOX_PRUNED_MODULES = (
+    "ddgs",
+    "genetics_mcp_server.auth",
+    "genetics_mcp_server.auth.core",
+    "genetics_mcp_server.sandbox_client",
+    "genetics_mcp_server.sandbox_token",
+    "genetics_mcp_server.tools.definitions",
+)
+
+# stamped on every result the guards below return. Deliberately NOT SandboxNotConfigured:
+# that is an operator fault on a server that HAS the code and lacks an address, which an
+# operator can fix. This is the code not being in the image at all.
+CAPABILITY_UNAVAILABLE = "CapabilityUnavailable"
+
+
+def _pruned_module(exc: ModuleNotFoundError, *names: str) -> str | None:
+    """The name among `names` that `exc` reports missing, or None if the fault is elsewhere.
+
+    The same discrimination `_resolve_settings` makes, for the same reason: a
+    ModuleNotFoundError raised from DEEPER INSIDE a module that IS installed — a missing
+    third-party dependency of it, today or tomorrow — is a broken install, and swallowing
+    it as a pruned sandbox would hide a real fault outside the sandbox.
+    """
+    return exc.name if exc.name in names else None
+
+
+def _capability_absent_message(capability: str, module: str) -> str:
+    return (
+        f"{capability} is not available in this environment: `{module}` is not installed "
+        "here. The sandbox image ships only the SDK's import closure and excludes this "
+        "module by design, so no rewrite of the script can reach the capability."
+    )
+
+
+def _absent_capability_named(message: Any) -> str | None:
+    """The pruned module a supervisor-reported error message names, if any.
+
+    The supervisor forwards the child's exception as text, so `exc.name` does not survive
+    the hop and the name has to be read back out of the message. Matched with the quotes
+    CPython writes, so `genetics_mcp_server.auth` does not match a report about
+    `genetics_mcp_server.auth.core`.
+
+    TWO MESSAGE SHAPES, and the second is not optional. A plain `import a.b.c` of a pruned
+    module reports `No module named 'a.b.c'`. But `from a.b import c` where `c` was pruned
+    reports an **ImportError** — `cannot import name 'c' from 'a.b'` — which contains the
+    package and the attribute but NEVER the dotted path, so a search for the full name
+    misses it entirely. That is the shape `tools/__init__.py`'s lazy `__getattr__` produces
+    in the image, verified in the deployed sandbox pod, and ImportError is itself in
+    `_SDK_MISUSE_ERROR_TYPES` — so without this branch the one instance reached through a
+    package attribute would collect exactly the misleading hint this function exists to
+    prevent.
+    """
+    if not isinstance(message, str):
+        return None
+    for name in _SANDBOX_PRUNED_MODULES:
+        if "No module named" in message and f"'{name}'" in message:
+            return name
+        package, _, attribute = name.rpartition(".")
+        if package and f"cannot import name '{attribute}' from '{package}'" in message:
+            return name
+    return None
+
+
 def _endpoint_env(name: str, default: str | None = None) -> str | None:
     """An endpoint URL from the environment, read only after settings has had its chance.
 
@@ -703,6 +787,12 @@ class ToolExecutor:
         raw = resp.headers.get("X-Columns")
         return {"column_names": raw.split(",")} if raw else {}
 
+    def _columns_meta_from(self, names: list[str] | None) -> dict[str, list[str]]:
+        """Same, for a TSV response whose column names were read from its header line."""
+        if not self._expose_columns or not names:
+            return {}
+        return {"column_names": list(names)}
+
     @cached_property
     def base_url(self) -> str:
         """The internal results-api endpoint, resolved on first use (see _endpoint_env)."""
@@ -1260,7 +1350,7 @@ class ToolExecutor:
             },
         )
         if resp.status_code == 200:
-            return {"success": True, "results": resp.json()}
+            return {"success": True, **self._columns_meta(resp), "results": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def search_genes(self, query: str, limit: int = 10) -> dict[str, Any]:
@@ -1271,7 +1361,7 @@ class ToolExecutor:
             params={"q": normalized_query, "types": "genes", "limit": limit, "format": "json"},
         )
         if resp.status_code == 200:
-            return {"success": True, "results": resp.json()}
+            return {"success": True, **self._columns_meta(resp), "results": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def lookup_variants_by_rsid(self, rsids: str) -> dict[str, Any]:
@@ -1545,6 +1635,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "phenotype": phenotype,
                     "resource": resource,
                     "count": len(results),
@@ -2252,6 +2343,9 @@ class ToolExecutor:
         try:
             gene = normalize_literal(gene, name="gene")
             gene_lit = quote_literal(gene, name="gene")
+            # unlike the HLA site above, nothing reads `resource` after this — the payload comes
+            # from _bq_gene_payload(gene, ...) and only `resource_lit` reaches the SQL, and
+            # quote_literal normalizes internally — so the rebind is uniformity, not effect.
             resource = normalize_literal(resource, name="resource")
             resource_lit = quote_literal(resource, name="resource")
             window_sql = sql_int(window, name="window", minimum=0, maximum=self._MAX_SQL_WINDOW)
@@ -2288,13 +2382,18 @@ class ToolExecutor:
         )
         if resp.status_code == 200:
             results = resp.json()
-            result: dict[str, Any] = {"success": True, "gene": gene, "results": results}
+            result: dict[str, Any] = {
+                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
+            }
             if results:
                 result["_download_data"] = {"results": results, "filename": f"{gene}_disease_associations.tsv"}
             return result
         elif resp.status_code == 404:
+            # this endpoint expresses "no associations" as a 404, so the schema it
+            # advertises rides on the 404 too (genetics-results-suite-8a1)
             return {
                 "success": True,
+                **self._columns_meta(resp),
                 "gene": gene,
                 "results": [],
                 "message": "No Mendelian disease associations found",
@@ -2412,6 +2511,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
                     "count": len(results),
@@ -2441,8 +2541,12 @@ class ToolExecutor:
         if resp.status_code == 200:
             reader = csv.DictReader(io.StringIO(resp.text), delimiter="\t")
             results = list(reader)
+            # this one returns TSV, so its schema is the header line the reader already
+            # consumed — `tabix -h` prints it even when no row matched the gene's locus,
+            # and it was being dropped on the floor (genetics-results-suite-8a1)
             result: dict[str, Any] = {
                 "success": True,
+                **self._columns_meta_from(reader.fieldnames),
                 "gene": gene,
                 "count": len(results),
                 "results": results,
@@ -3592,6 +3696,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "variant": variant,
                     "genes": results,
                 }
@@ -3627,6 +3732,7 @@ class ToolExecutor:
                 results = resp.json()
                 return {
                     "success": True,
+                    **self._columns_meta(resp),
                     "region": f"{chr}:{start}-{end}",
                     "genes": results,
                 }
@@ -3668,6 +3774,7 @@ class ToolExecutor:
                 count = data.get("count", 0)
                 result: dict[str, Any] = {
                     "success": True,
+                    **self._columns_meta(resp),
                     "group_id": data.get("group_id"),
                     "group_name": data.get("group_name"),
                     "exclude_olfactory": data.get("exclude_olfactory", exclude_olfactory),
@@ -5455,7 +5562,19 @@ class ToolExecutor:
         """Search using DuckDuckGo (free fallback)."""
         import asyncio
 
-        from ddgs import DDGS
+        try:
+            from ddgs import DDGS
+        except ModuleNotFoundError as exc:
+            if not _pruned_module(exc, "ddgs"):
+                raise
+            logger.error("web search is unavailable: ddgs is not installed in this image")
+            return {
+                "success": False,
+                "query": query,
+                "source": "duckduckgo",
+                "error": _capability_absent_message("Web search", "ddgs"),
+                "error_type": CAPABILITY_UNAVAILABLE,
+            }
 
         def sync_search():
             return DDGS().text(query, max_results=max_results)
@@ -5964,10 +6083,17 @@ class ToolExecutor:
         faults. There is no total budget above this tool, unlike `run_analysis`'s 300s
         `wait_for`, so a retryable answer here is retried on the model's judgement alone.
         """
-        from genetics_mcp_server.sandbox_client import (
-            ERROR_BAD_EXECUTION_ID,
-            ERROR_MALFORMED_RESPONSE,
-        )
+        try:
+            from genetics_mcp_server.sandbox_client import (
+                ERROR_BAD_EXECUTION_ID,
+                ERROR_MALFORMED_RESPONSE,
+            )
+        except ModuleNotFoundError as exc:
+            if not _pruned_module(exc, "genetics_mcp_server.sandbox_client"):
+                raise
+            return self._capability_unavailable_error(
+                "Artifact reading", "genetics_mcp_server.sandbox_client"
+            )
 
         status = getattr(result, "status_code", None)
         error_type = getattr(result, "error_type", None)
@@ -6073,7 +6199,18 @@ class ToolExecutor:
         imported by the standalone MCP server, and the sandbox client has no business in
         that import graph. Tests replace this by assigning to the attribute.
         """
-        from genetics_mcp_server.sandbox_client import SandboxClient
+        try:
+            from genetics_mcp_server.sandbox_client import SandboxClient
+        except ModuleNotFoundError as exc:
+            if not _pruned_module(exc, "genetics_mcp_server.sandbox_client"):
+                raise
+            # RAISED, not shaped: this is a property whose contract is "the transport".
+            # Every entry point resolves it through `_sandbox_or_operator_error`, which
+            # guards the same import and answers with a shaped error first, so the only
+            # way here is a direct attribute access that has nothing to return.
+            raise RuntimeError(
+                _capability_absent_message("Code execution", "genetics_mcp_server.sandbox_client")
+            ) from exc
 
         return SandboxClient()
 
@@ -6093,7 +6230,14 @@ class ToolExecutor:
         nothing in the request flow escapes the family clause, but the family's fallback
         reports `retryable: True`, and no second ask can supply a missing address.
         """
-        from genetics_mcp_server.sandbox_client import SandboxNotConfigured
+        try:
+            from genetics_mcp_server.sandbox_client import SandboxNotConfigured
+        except ModuleNotFoundError as exc:
+            if not _pruned_module(exc, "genetics_mcp_server.sandbox_client"):
+                raise
+            return None, self._capability_unavailable_error(
+                "Code execution", "genetics_mcp_server.sandbox_client"
+            )
 
         try:
             return self._sandbox, None
@@ -6147,16 +6291,31 @@ class ToolExecutor:
         # auth.core is deferred for the same reason the sandbox imports are: it pulls
         # FastAPI in, and this module is imported by the standalone MCP server, whose
         # import graph has no business with either
-        from genetics_mcp_server.auth.core import SERVICE_IDENTITY
-        from genetics_mcp_server.sandbox_client import (
-            MAX_TIMEOUT_S,
-            SandboxBusy,
-            SandboxDeadlineExceeded,
-            SandboxError,
-            SandboxRejected,
-            SandboxUnavailable,
-        )
-        from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
+        try:
+            from genetics_mcp_server.auth.core import SERVICE_IDENTITY
+            from genetics_mcp_server.sandbox_client import (
+                MAX_TIMEOUT_S,
+                SandboxBusy,
+                SandboxDeadlineExceeded,
+                SandboxError,
+                SandboxRejected,
+                SandboxUnavailable,
+            )
+            from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
+        except ModuleNotFoundError as exc:
+            missing = _pruned_module(
+                exc,
+                "genetics_mcp_server.auth",
+                "genetics_mcp_server.auth.core",
+                "genetics_mcp_server.sandbox_client",
+                "genetics_mcp_server.sandbox_token",
+            )
+            if not missing:
+                raise
+            # a script calling run_analysis from INSIDE the sandbox: nesting an execution
+            # is not a capability the image carries, and the model must be able to tell
+            # that from "the sandbox is down", which is retryable and this is not
+            return self._capability_unavailable_error("Code execution", missing)
 
         if not isinstance(code, str) or not code.strip():
             # error_type is not decoration: without it this shape reaches the `script_result`
@@ -6192,8 +6351,8 @@ class ToolExecutor:
             # and a service marker names nobody to attribute or revoke.
             #
             # At the dispatch and not at the route because THIS is the narrow waist every
-            # sandbox execution passes through — the streaming and non-streaming chat paths,
-            # subagent dispatch and any future caller — and because it sits immediately
+            # sandbox execution passes through — the streaming chat path, subagent dispatch
+            # and any future caller — and because it sits immediately
             # before mint_execution_tokens, so no credential can be minted for a subject
             # that was refused. A route-level check would guard only the routes someone
             # remembered to decorate and would also refuse chat itself, which the marker
@@ -6420,7 +6579,21 @@ class ToolExecutor:
         if not isinstance(entries, list):
             return []
 
-        from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
+        try:
+            from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
+        except ModuleNotFoundError as exc:
+            if not _pruned_module(exc, "genetics_mcp_server.sandbox_client"):
+                raise
+            # structurally unreachable: this runs only on a result `run_analysis` produced,
+            # and that method guards the same import and returns before any result exists.
+            # Logged rather than raised or shaped because the caller has a SUCCESSFUL
+            # analysis in hand, and losing it over the image plot would be the worse
+            # failure; the empty list is not silent, it is this line.
+            logger.error(
+                "cannot fetch analysis images: genetics_mcp_server.sandbox_client is not "
+                "installed in this image"
+            )
+            return []
 
         wanted = []
         for entry in entries:
@@ -6448,6 +6621,23 @@ class ToolExecutor:
             if fetched:
                 images.append(fetched)
         return images
+
+    @staticmethod
+    def _capability_unavailable_error(capability: str, module: str) -> dict[str, Any]:
+        """The shaped failure for a capability whose code this image does not contain.
+
+        Distinct from `_sandbox_operator_error` on purpose. That one says an operator has
+        not configured a thing the process could otherwise do; this says the process is a
+        pruned sandbox install and the code is simply not present. Both are non-retryable,
+        but only one of them is something an operator can act on.
+        """
+        logger.error("%s is unavailable: %s is not installed in this image", capability, module)
+        return {
+            "success": False,
+            "error": _capability_absent_message(capability, module),
+            "error_type": CAPABILITY_UNAVAILABLE,
+            "retryable": False,
+        }
 
     @staticmethod
     def _sandbox_operator_error(message: str) -> dict[str, Any]:
@@ -6598,7 +6788,7 @@ class ToolExecutor:
         if isinstance(limit, str) and limit:
             fields["limit_exceeded"] = limit
 
-        hint = self._analysis_hint(status_text, error_type, limit)
+        hint = self._analysis_hint(status_text, error_type, limit, message)
         if hint:
             fields["hint"] = hint
         # a script that ran and failed is repairable by rewriting it, which is the model's
@@ -6608,7 +6798,9 @@ class ToolExecutor:
         return fields
 
     @staticmethod
-    def _analysis_hint(status_text: str, error_type: str | None, limit: Any) -> str | None:
+    def _analysis_hint(
+        status_text: str, error_type: str | None, limit: Any, message: Any = None
+    ) -> str | None:
         if status_text == "timeout":
             return (
                 "The wall clock fired. Narrow the query or process fewer rows; raising "
@@ -6632,6 +6824,24 @@ class ToolExecutor:
                 f"A sandbox limit fired ({limit_name or 'unknown'}). Do less work per run.",
             )
         if error_type in ToolExecutor._SDK_MISUSE_ERROR_TYPES:
+            # a ModuleNotFoundError naming one of the modules the image prunes is NOT the
+            # script calling the SDK wrong, and sending the model to list_capabilities for
+            # it is actively misleading: none of them appear there, so the list it is told
+            # to consult cannot explain the failure it just saw.
+            #
+            # Not made dead by the guards above, which run in the CHILD. This runs in
+            # chat-backend, whose image ships independently of the sandbox image, so it
+            # still sees raw reports from an older sandbox; and a script that imports one
+            # of these modules DIRECTLY, rather than through a guarded executor method,
+            # raises here no matter how new the image is.
+            absent = _absent_capability_named(message)
+            if absent:
+                return (
+                    f"`{absent}` is not installed in the sandbox image, so this capability "
+                    "is absent from the environment rather than being called wrongly. It "
+                    "will not appear in list_capabilities and no rewrite reaches it — use "
+                    "the SDK functions list_capabilities does report."
+                )
             return (
                 "This looks like the SDK being called differently from how it is defined. "
                 "Call list_capabilities for the exact signatures before rewriting."

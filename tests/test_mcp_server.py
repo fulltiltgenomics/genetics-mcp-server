@@ -822,6 +822,141 @@ class TestBearerAuthJWT:
         assert any(m.get("status") == 401 for m in messages)
 
 
+    # --- oauth2-proxy allow-list parity (genetics-results-suite-ol7) --------------------
+    # This path used to carry a private _email_allowed copy that had drifted from
+    # oauth2-proxy v7.14.3's isEmailValidWithDomains. Anything the gateway admits and this
+    # refuses is a user who gets a session and then a 401 from every call.
+
+    def _run_jwt(self, monkeypatch, email, settings):
+        app, call_log = self._build_app(
+            monkeypatch,
+            verify_result={"email": email, "email_verified": True},
+            settings=settings,
+        )
+        scope = self._make_scope(headers=self._bearer_header(self.JWT_TOKEN))
+        return call_log, self._collect_response(app, scope)
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_email_accepted(self, monkeypatch):
+        """`User@FinnGen.fi` must pass — oauth2-proxy lower-cases before its domain check.
+
+        The live defect the private copy caused: it compared the raw `FinnGen.fi` against a
+        lower-cased allow-list, so this address got a gateway session and a 401 here.
+        """
+        call_log, coro = self._run_jwt(
+            monkeypatch, "User@FinnGen.fi", _StubSettings(allowed_email_domains={"finngen.fi"})
+        )
+        messages = await coro
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_wildcard_domain_is_refused(self, monkeypatch):
+        """A literal `*` is the ONE form this path deliberately does not honour.
+
+        genetics-results-suite-g8i. oauth2-proxy reads the same terraform
+        `${OAUTH_EMAIL_DOMAIN}` and honours `*` as "any domain the gateway admits"; nothing
+        proxies this path, so honouring it here would admit every Google-verified address.
+        ol7 asserted the opposite here, on parity grounds, and that is the behaviour this
+        replaces.
+        """
+        call_log, coro = self._run_jwt(
+            monkeypatch, "anyone@whatever.io", _StubSettings(allowed_email_domains={"*"})
+        )
+        messages = await coro
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_wildcard_does_not_suppress_the_star_dot_form(self, monkeypatch):
+        """`*` and `*.example.com` are different values: refusing the first must not touch
+        the second, even when both are configured together."""
+        settings = _StubSettings(allowed_email_domains={"*", "*.example.com"})
+        call_log, coro = self._run_jwt(monkeypatch, "user@sub.example.com", settings)
+        messages = await coro
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_wildcard_alongside_a_real_domain_still_refuses_strangers(self, monkeypatch):
+        """Dropping `*` from the set must not turn the remaining entries into allow-all."""
+        settings = _StubSettings(allowed_email_domains={"*", "finngen.fi"})
+        call_log, coro = self._run_jwt(monkeypatch, "eve@evil.com", settings)
+        messages = await coro
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_leading_dot_domain_matches_subdomain(self, monkeypatch):
+        """`.example.com` admits a subdomain address."""
+        call_log, coro = self._run_jwt(
+            monkeypatch,
+            "user@sub.example.com",
+            _StubSettings(allowed_email_domains={".example.com"}),
+        )
+        messages = await coro
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_leading_dot_domain_refuses_bare_domain(self, monkeypatch):
+        """`.example.com` refuses the bare domain, exactly as oauth2-proxy does."""
+        call_log, coro = self._run_jwt(
+            monkeypatch,
+            "user@example.com",
+            _StubSettings(allowed_email_domains={".example.com"}),
+        )
+        messages = await coro
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_star_dot_domain_matches_subdomain(self, monkeypatch):
+        """`*.example.com` is an exact synonym for `.example.com` in oauth2-proxy v7.14.3."""
+        call_log, coro = self._run_jwt(
+            monkeypatch,
+            "user@sub.example.com",
+            _StubSettings(allowed_email_domains={"*.example.com"}),
+        )
+        messages = await coro
+        assert len(call_log) == 1
+        assert not any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_near_miss_domain_rejected(self, monkeypatch):
+        """`evilexample.com` must not be admitted by `.example.com`: the suffix test runs on
+        the domain part only, so it can never match a domain that merely ends in the string."""
+        call_log, coro = self._run_jwt(
+            monkeypatch,
+            "eve@evilexample.com",
+            _StubSettings(allowed_email_domains={".example.com", "example.com"}),
+        )
+        messages = await coro
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_allow_list_still_refuses(self, monkeypatch):
+        """With NO allow-list configured the bearer path must still REFUSE a stranger.
+
+        Regression guard for genetics-results-suite-ol7. `auth.core._email_allowed` fails OPEN
+        when `allow_list_configured` is False, and that is safe THERE only because
+        `get_authenticated_user` checks the trusted-proxy marker first. This path has no
+        marker — the allow-list is the only authorization — so delegating to `_email_allowed`
+        here would admit any Google-verified account on an unconfigured deployment. Both
+        get_settings handles are patched to the unconfigured stub, so such a delegation would
+        take the fail-open branch and turn this assertion red rather than failing open in
+        production.
+        """
+        settings = _StubSettings(allowed_email_domains={"finngen.fi"})
+        settings.allow_list_configured = False
+        monkeypatch.setattr("genetics_mcp_server.config.get_settings", lambda: settings)
+        call_log, coro = self._run_jwt(monkeypatch, "attacker@gmail.com", settings)
+        messages = await coro
+        assert len(call_log) == 0
+        assert any(m.get("status") == 401 for m in messages)
+
+
 class _KeycloakSettings:
     """Stub Settings for the Keycloak (OAuth resource-server) branch."""
 
@@ -975,6 +1110,66 @@ class TestBearerAuthKeycloak:
         monkeypatch.setattr("genetics_mcp_server.mcp_server._get_jwks_client", _boom)
         settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
         assert _validate_keycloak_token(self._make_token(), settings) is False
+
+    # --- oauth2-proxy allow-list parity, Keycloak path (genetics-results-suite-ol7) ----
+
+    def _kc_allowed(self, email, settings):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        return _validate_keycloak_token(self._make_token(email=email), settings)
+
+    def test_mixed_case_email_accepted(self):
+        """`User@FinnGen.fi` must validate — the live defect of the deleted private copy."""
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        assert self._kc_allowed("User@FinnGen.fi", settings) is True
+
+    def test_wildcard_domain_is_refused(self):
+        """Same deliberate divergence as the bearer path (genetics-results-suite-g8i): a
+        Keycloak-issued token proves realm authentication, not that the deployment meant to
+        admit every realm account, and no gateway stands in front of this path."""
+        settings = _KeycloakSettings(allowed_email_domains={"*"})
+        assert self._kc_allowed("anyone@whatever.io", settings) is False
+
+    def test_wildcard_does_not_suppress_the_star_dot_form(self):
+        settings = _KeycloakSettings(allowed_email_domains={"*", "*.example.com"})
+        assert self._kc_allowed("user@sub.example.com", settings) is True
+        assert self._kc_allowed("anyone@whatever.io", settings) is False
+
+    def test_wildcard_alongside_a_real_domain_still_refuses_strangers(self):
+        settings = _KeycloakSettings(allowed_email_domains={"*", "finngen.fi"})
+        assert self._kc_allowed("alice@finngen.fi", settings) is True
+        assert self._kc_allowed("eve@evil.com", settings) is False
+
+    def test_leading_dot_domain_matches_subdomain(self):
+        settings = _KeycloakSettings(allowed_email_domains={".example.com"})
+        assert self._kc_allowed("user@sub.example.com", settings) is True
+        assert self._kc_allowed("user@example.com", settings) is False
+
+    def test_star_dot_domain_matches_subdomain(self):
+        settings = _KeycloakSettings(allowed_email_domains={"*.example.com"})
+        assert self._kc_allowed("user@sub.example.com", settings) is True
+
+    def test_near_miss_domain_rejected(self):
+        settings = _KeycloakSettings(allowed_email_domains={".example.com", "example.com"})
+        assert self._kc_allowed("eve@evilexample.com", settings) is False
+
+    def test_non_matching_domain_rejected(self):
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        assert self._kc_allowed("eve@evil.com", settings) is False
+
+    def test_unconfigured_allow_list_still_refuses(self, monkeypatch):
+        """No allow-list configured must still REFUSE on the Keycloak path.
+
+        Same guard as the bearer path's test of this name: a Keycloak-issued token proves the
+        holder authenticated to the realm, not that the deployment allow-listed them, and this
+        path has no trusted-proxy marker to lean on. Delegating to `auth.core._email_allowed`
+        would fail open here; both get_settings handles are patched so that would show up as a
+        failure of this test.
+        """
+        settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
+        settings.allow_list_configured = False
+        monkeypatch.setattr("genetics_mcp_server.config.get_settings", lambda: settings)
+        assert self._kc_allowed("attacker@gmail.com", settings) is False
 
     @pytest.mark.asyncio
     async def test_valid_keycloak_token_via_middleware(self, monkeypatch):
@@ -1180,3 +1375,133 @@ class TestOAuthMetadataDiscovery:
         assert len(call_log) == 0
         assert any(m.get("status") == 401 for m in messages)
         assert self._www_authenticate(messages) is None
+
+
+class TestWildcardAllowListDivergence:
+    """The `*` divergence, from the other two directions (genetics-results-suite-g8i).
+
+    The two JWT branches refuse a literal `*`; this covers what must NOT have changed with it
+    — the proxied path's allow-all — and the startup warning that tells the operator the two
+    halves disagree, since both are configured from the same terraform variable.
+    """
+
+    def _core_settings(self, domains, emails=()):
+        settings = _StubSettings(allowed_emails=emails, allowed_email_domains=domains)
+        settings.allow_list_configured = True
+        return settings
+
+    def test_email_allowed_still_treats_wildcard_as_allow_all(self, monkeypatch):
+        """The proxied, marker-gated path is untouched: `*` still admits any domain there.
+
+        `_matches_allow_list`'s new `allow_wildcard` defaults to True precisely so this stays
+        true; a default flipped to False would show up here rather than in production as a
+        total lockout of a deployment that set `oauth_email_domain = "*"` on purpose.
+        """
+        from genetics_mcp_server.auth.core import _email_allowed
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.config.get_settings",
+            lambda: self._core_settings({"*"}),
+        )
+        assert _email_allowed("anyone@whatever.io") is True
+
+    def test_matcher_default_honours_wildcard(self):
+        """Same claim one layer down, without the fail-open preamble in the way."""
+        from genetics_mcp_server.auth.core import _matches_allow_list
+
+        assert _matches_allow_list("anyone@whatever.io", self._core_settings({"*"})) is True
+
+    def test_matcher_opt_out_refuses_wildcard_only(self):
+        from genetics_mcp_server.auth.core import _matches_allow_list
+
+        star_only = self._core_settings({"*"})
+        assert _matches_allow_list("anyone@whatever.io", star_only, allow_wildcard=False) is False
+
+        # every other form is untouched by the opt-out
+        for domains, email in (
+            ({"finngen.fi"}, "User@FinnGen.fi"),
+            ({".example.com"}, "user@sub.example.com"),
+            ({"*.example.com"}, "user@sub.example.com"),
+            ({"*", "*.example.com"}, "user@sub.example.com"),
+        ):
+            assert (
+                _matches_allow_list(email, self._core_settings(domains), allow_wildcard=False)
+                is True
+            ), (domains, email)
+
+        exact = self._core_settings(set(), emails={"Alice@FinnGen.fi"})
+        assert _matches_allow_list("alice@finngen.fi", exact, allow_wildcard=False) is True
+
+        # and the star must not become a matchable domain in its own right
+        assert _matches_allow_list("a@*", star_only, allow_wildcard=False) is False
+
+    def test_the_opt_out_does_not_mutate_the_settings(self):
+        """`domains.discard("*")` is the only mutation this change introduced, and it must stay
+        on the per-call set comprehension: a refusal that ate the star out of the settings
+        would silently turn the proxied path into a lockout for the rest of the process."""
+        from genetics_mcp_server.auth.core import _matches_allow_list
+
+        settings = self._core_settings({"*"})
+        assert _matches_allow_list("anyone@whatever.io", settings, allow_wildcard=False) is False
+        assert _matches_allow_list("anyone@whatever.io", settings) is True
+        assert set(settings.allowed_email_domains) == {"*"}
+
+    # --- the startup warning -----------------------------------------------------------
+
+    def _run_main(self, monkeypatch, transport, domains):
+        import sys as _sys
+
+        import uvicorn
+
+        from genetics_mcp_server import mcp_server
+
+        monkeypatch.setattr(_sys, "argv", ["mcp-server", "--transport", transport])
+        monkeypatch.setattr(
+            mcp_server, "get_settings", lambda: self._core_settings(domains)
+        )
+        monkeypatch.setattr(mcp_server, "require_internal_api_secret", lambda _label: None)
+        monkeypatch.setattr(mcp_server, "_wrap_with_bearer_auth", lambda app, keys: app)
+        monkeypatch.setattr(mcp_server.mcp, "run", lambda: None)
+        monkeypatch.setattr(mcp_server.mcp, "sse_app", lambda: object())
+        monkeypatch.setattr(mcp_server.mcp, "streamable_http_app", lambda: object())
+        monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+        monkeypatch.setenv("MCP_API_KEY", "some-key")
+        mcp_server.main()
+
+    @staticmethod
+    def _wildcard_warnings(caplog):
+        return [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and "ALLOWED_EMAIL_DOMAINS contains a literal" in r.message
+        ]
+
+    @pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+    def test_warns_on_remote_transport_with_wildcard(self, monkeypatch, caplog, transport):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="genetics_mcp_server.mcp_server"):
+            self._run_main(monkeypatch, transport, {"*"})
+
+        warnings = self._wildcard_warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0].message
+        # the operator has to learn WHICH paths disagree and why, or the warning just says
+        # "something is wrong" and gets ignored
+        assert "Keycloak" in message and "REFUSE" in message
+
+    def test_no_warning_on_remote_transport_without_wildcard(self, monkeypatch, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="genetics_mcp_server.mcp_server"):
+            self._run_main(monkeypatch, "streamable-http", {"finngen.fi", "*.example.com"})
+
+        assert self._wildcard_warnings(caplog) == []
+
+    def test_no_warning_on_stdio_even_with_wildcard(self, monkeypatch, caplog):
+        """stdio takes no bearer or Keycloak token, so there is nothing to warn about."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="genetics_mcp_server.mcp_server"):
+            self._run_main(monkeypatch, "stdio", {"*"})
+
+        assert self._wildcard_warnings(caplog) == []

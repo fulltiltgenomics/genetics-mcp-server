@@ -56,7 +56,6 @@ SDK_IMPORT_CLOSURE = frozenset(
         "genetics_mcp_server.sdk.client",
         "genetics_mcp_server.sdk.errors",
         "genetics_mcp_server.tools",
-        "genetics_mcp_server.tools.definitions",
         "genetics_mcp_server.tools.executor",
         "genetics_mcp_server.tools.phewas_categories",
         "genetics_mcp_server.tools.sql_safety",
@@ -93,6 +92,9 @@ def test_the_closure_is_exactly_the_pinned_set():
     [
         # names every internal env var (genetics-results-suite-l41)
         "genetics_mcp_server.config.settings",
+        # `from pydantic import Field` at module level, and the complete map of every tool
+        # the suite exposes — cut out of the closure by genetics-results-suite-6bv
+        "genetics_mcp_server.tools.definitions",
         # the identity model of every service in the suite, including the
         # X-Goog-Authenticated-User-Email trust rules
         "genetics_mcp_server.auth.core",
@@ -105,16 +107,105 @@ def test_named_modules_stay_out(module):
     assert module not in _measured_closure()
 
 
-def test_importing_the_sdk_does_not_need_dotenv():
-    """`config.settings` calls load_dotenv() at module scope, so while it was in the
-    closure the sandbox image had to pin python-dotenv purely to make `import
-    genetics_mcp_server.sdk` succeed. Nothing in the closure should need it now."""
-    probe = _ORIGIN_GUARD + (
-        "import sys; sys.modules['dotenv'] = None; "
-        "import genetics_mcp_server.sdk"  # a real import of dotenv would raise here
+# The distributions genetics-results-suite/sandbox/requirements.txt pins. pip installs those
+# WITH their dependencies; the SDK wheel then goes in --no-deps (docs/code-execution-security.md,
+# "Deviation 2"), so this list plus its transitive requirements is the entire third-party surface
+# the sandbox interpreter has. Changing it means changing that file, and vice versa.
+SANDBOX_PINNED_DISTRIBUTIONS = ("numpy", "scipy", "polars", "matplotlib", "httpx")
+
+_BLOCKED_IMPORT_PROBE = """
+import importlib.metadata as _md, json, sys
+
+# The walk skips a requirement only when its marker mentions `extra`; EVERY other environment
+# marker is ignored, so the requirement joins the allowed set whether or not pip would install
+# it in the image. That is the one direction in which this guard is LAXER than the image, and
+# it is the dangerous direction: `anyio` requires `exceptiongroup>=1.0.2; python_version <
+# "3.11"`, the sandbox is Python 3.11 so pip does NOT install it there, yet `exceptiongroup`
+# lands in `_dists` here — a closure module importing it would pass this test and fail the
+# image build. `typing_extensions` (`; python_version < "3.13"`) has the same shape and is
+# safe only by coincidence. The fix is to evaluate markers against the sandbox's Python
+# version, or to walk a resolved lock for that image instead of this venv's dev metadata;
+# filed separately, deliberately not done here.
+#
+# Every other divergence runs the other way — over-strict, which fails loudly rather than
+# silently. `importlib.metadata.requires("anyio")` on this release does not declare `sniffio`
+# at all, so `sniffio` stays blocked; that is CORRECT (the image installs it only as httpx's
+# own dependency, and blocking it merely makes the probe stricter than the image). Measured:
+# `import anyio` and a full `httpx.AsyncClient` request both succeed with it blocked.
+_dists, _stack = set(), list({pinned!r})
+while _stack:                                    # transitive requirements, extras excluded,
+    _d = _stack.pop()                            # the way `pip install -r` resolves them
+    _key = _d.lower().replace("-", "_")
+    if _key in _dists:
+        continue
+    _dists.add(_key)
+    try:
+        _reqs = _md.requires(_d) or []
+    except _md.PackageNotFoundError:
+        continue
+    for _r in _reqs:
+        _name, _, _marker = _r.partition(";")
+        if "extra" in _marker:
+            continue
+        _n = _name.split("[")[0].split("(")[0].strip()
+        for _sep in ">=<!~ ":
+            _n = _n.split(_sep)[0]
+        if _n:
+            _stack.append(_n)
+
+# every other top-level module this venv installed: pydantic, dotenv, mcp, anthropic, fastapi,
+# google.*, jwt ... Blocking by installed-distribution rather than by an allow-list of names
+# leaves the standard library and the interpreter's own private modules untouched.
+_blocked = {{
+    _mod
+    for _mod, _owners in _md.packages_distributions().items()
+    if not any(_o.lower().replace("-", "_") in _dists for _o in _owners)
+}} - {{"genetics_mcp_server"}}
+_hit = set()
+
+
+class _AbsentFromTheSandboxImage:
+    def find_spec(self, fullname, path=None, target=None):
+        top = fullname.split(".")[0]
+        if top not in _blocked:
+            return None
+        _hit.add(top)
+        raise ModuleNotFoundError("absent from the sandbox image: " + fullname, name=fullname)
+
+
+sys.meta_path.insert(0, _AbsentFromTheSandboxImage())
+import genetics_mcp_server.sdk  # noqa: F401
+print(json.dumps({{"blocked": sorted(_blocked), "attempted": sorted(_hit)}}))
+"""
+
+
+def test_the_sdk_imports_with_every_unpinned_third_party_module_blocked():
+    """The generalised form of the guard, and the point of it.
+
+    Two separate offenders have widened the closure by one module-level import into a package
+    the sandbox does not have: `config.settings` -> `dotenv` (genetics-results-suite-l41), then
+    `tools/definitions.py` -> `pydantic` (genetics-results-suite-6bv). A per-offender test
+    ("the SDK does not need dotenv") only ever catches the one already fixed, so this asserts
+    the property instead: the SDK imports when EVERY distribution outside
+    SANDBOX_PINNED_DISTRIBUTIONS' dependency closure is unavailable. The third offender fails
+    here, in the commit that introduces it, rather than in another repo's image build.
+
+    A module the SDK reaches for and does not get is not automatically a failure — httpx's CLI
+    entry point is a real `try: ... except ImportError` and is expected to be denied — which is
+    exactly why this asserts on the import succeeding rather than on nothing being attempted.
+    """
+    result = _run_probe(_ORIGIN_GUARD + _BLOCKED_IMPORT_PROBE.format(pinned=list(SANDBOX_PINNED_DISTRIBUTIONS)))
+    assert result.returncode == 0, (
+        "importing the SDK reached a package the sandbox image does not install; "
+        "either defer that import out of the closure or widen sandbox/requirements.txt "
+        f"deliberately:\n{result.stderr}"
     )
-    result = _run_probe(probe)
-    assert result.returncode == 0, result.stderr
+    measured = json.loads(result.stdout.strip().splitlines()[-1])
+    # the guard is only meaningful if it is actually blocking; both known offenders must be in
+    # the blocked set, or a future `pip install pydantic` into the dev venv could quietly
+    # neuter this test
+    for offender in ("dotenv", "pydantic"):
+        assert offender in measured["blocked"], measured["blocked"]
 
 
 def test_the_executor_can_be_built_and_used_without_config_settings(tmp_path):
