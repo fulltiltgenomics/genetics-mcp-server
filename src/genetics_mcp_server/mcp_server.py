@@ -25,7 +25,7 @@ from mcp.server.sse import TransportSecuritySettings
 from genetics_mcp_server.auth.core import _matches_allow_list
 from genetics_mcp_server.config.settings import get_settings, require_internal_api_secret
 from genetics_mcp_server.tools.definitions import register_mcp_tools
-from genetics_mcp_server.tools.executor import ToolExecutor
+from genetics_mcp_server.tools.orchestration import ServerToolExecutor
 
 # load environment variables
 load_dotenv()
@@ -77,7 +77,7 @@ else:
 
 # create executor and register tools
 api_url = os.environ.get("GENETICS_API_URL", "http://0.0.0.0:2000/api")
-executor = ToolExecutor(api_base_url=api_url)
+executor = ServerToolExecutor(api_base_url=api_url)
 
 _settings = get_settings()
 # literature search is only available via the chat backend (uses Perplexity API);

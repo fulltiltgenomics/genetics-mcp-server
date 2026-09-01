@@ -14,9 +14,11 @@ if TYPE_CHECKING:
         get_anthropic_tools,
         register_mcp_tools,
     )
+    from genetics_mcp_server.tools.orchestration import ServerToolExecutor
 
 __all__ = [
     "ToolExecutor",
+    "ServerToolExecutor",
     "TOOL_DEFINITIONS",
     "BIGQUERY_TOOL_DEFINITIONS",
     "SUBAGENT_TOOL_DEFINITIONS",
@@ -47,19 +49,40 @@ __all__ = [
 # alternatives are all worse — re-raising changes nothing, raising AttributeError would make
 # `hasattr` answer False and hide the absence entirely, and a sentinel would let a caller act
 # on a tool catalogue that does not exist. The defect was never this exception, it was
-# `ToolExecutor._analysis_hint` telling the model to consult list_capabilities about it;
-# `executor._SANDBOX_PRUNED_MODULES` lists this module so the hint answers accurately, and
+# `ServerToolExecutor._analysis_hint` telling the model to consult list_capabilities about it;
+# `orchestration._SANDBOX_PRUNED_MODULES` lists this module so the hint answers accurately, and
 # `_absent_capability_named` matches this ImportError's shape as well as ModuleNotFoundError's.
 #
-# LATENT: this derives "lazy from definitions" as "everything in __all__ that is not
-# ToolExecutor", which holds only because every other entry today does live in `definitions`.
-# An __all__ entry added from a DIFFERENT submodule would be routed to
-# `getattr(definitions, name)` and raise an AttributeError naming the wrong module. If that
-# happens, list the definitions names explicitly instead of subtracting from __all__.
-_LAZY_FROM_DEFINITIONS = frozenset(__all__) - {"ToolExecutor"}
+# `ServerToolExecutor` is lazy for the same reason and cuts the same way: it subclasses
+# `executor.ToolExecutor` with the half that reaches the sandbox transport, DuckDuckGo and
+# the auth model, none of which the image contains. Importing this package must not pull
+# that module in, because importing `tools.executor` imports this package. In the sandbox
+# this branch raises a plain `ModuleNotFoundError` naming `tools.orchestration` rather than
+# the ImportError shape above, and `orchestration._SANDBOX_PRUNED_MODULES` lists it too, so
+# the hint answers accurately for either.
+#
+# Listed rather than derived by subtracting from `__all__`: that subtraction routed every
+# name it did not recognise to `definitions`, so a name from a third submodule would have
+# raised an AttributeError naming the wrong file.
+_LAZY_FROM_DEFINITIONS = frozenset(
+    {
+        "BIGQUERY_TOOL_DEFINITIONS",
+        "SUBAGENT_TOOL_DEFINITIONS",
+        "TOOL_DEFINITIONS",
+        "TOOL_PROFILES",
+        "TOOL_PROFILE_TOOLS",
+        "get_anthropic_tools",
+        "register_mcp_tools",
+    }
+)
 
 
 def __getattr__(name: str) -> Any:
+    if name == "ServerToolExecutor":
+        from genetics_mcp_server.tools.orchestration import ServerToolExecutor
+
+        globals()[name] = ServerToolExecutor
+        return ServerToolExecutor
     if name in _LAZY_FROM_DEFINITIONS:
         from genetics_mcp_server.tools import definitions
 

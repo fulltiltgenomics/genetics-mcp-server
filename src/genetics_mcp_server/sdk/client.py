@@ -165,11 +165,15 @@ class GeneticsClient:
         # of the curated SDK surface" so that neither a reader nor a model treats it as a
         # recommended entry point — it does NOT make it unreachable, and nothing here
         # should ever be cited as though it did. `_executor` is one attribute access away
-        # from every unwrapped tool method on the same authenticated client, and a script
-        # needs no client at all to get one: `tools/executor.py` is on the SDK_ALLOWLIST in
+        # from every unwrapped tool method THE SHIPPED EXECUTOR HAS, and a script needs no
+        # client at all to get one: `tools/executor.py` is on the SDK_ALLOWLIST in
         # genetics-results-suite `sandbox/prune_venv.py` (it must ship because this module
         # imports ToolExecutor directly), so sandboxed code can just
         # `from genetics_mcp_server.tools.executor import ToolExecutor` and build its own.
+        # What it is NOT one attribute access away from is `tools/orchestration.py` — the
+        # sandbox gateway, artifact reads and web search — which is a different statement:
+        # that code is absent from the image because it cannot run there and the SDK does
+        # not need it, not because anything is being withheld from a script.
         # `tools/uniprot.py` is on that same allow-list — a third-party HTTP client ships
         # into the image — so "the third-party tools are unreachable" rests ENTIRELY on
         # egress, with no second layer pruning them out.

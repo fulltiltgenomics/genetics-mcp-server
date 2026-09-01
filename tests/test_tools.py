@@ -5,7 +5,7 @@ Run with: pytest -m integration
 
 import pytest
 
-from genetics_mcp_server.tools import ToolExecutor
+from genetics_mcp_server.tools import ServerToolExecutor, ToolExecutor
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
     SUBAGENT_TOOL_DEFINITIONS,
@@ -412,7 +412,7 @@ class TestLiteratureSearch:
     @pytest.fixture(autouse=True)
     async def setup_executor(self):
         """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
+        self.executor = ServerToolExecutor()
         yield
         await self.executor.close()
 
@@ -484,7 +484,7 @@ class TestLiteratureSearchPerplexity:
     @pytest.fixture(autouse=True)
     async def setup_executor(self):
         """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
+        self.executor = ServerToolExecutor()
         yield
         await self.executor.close()
 

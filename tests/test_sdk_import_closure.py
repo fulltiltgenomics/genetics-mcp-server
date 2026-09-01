@@ -98,6 +98,10 @@ def test_the_closure_is_exactly_the_pinned_set():
         # the identity model of every service in the suite, including the
         # X-Goog-Authenticated-User-Email trust rules
         "genetics_mcp_server.auth.core",
+        # the run_analysis gateway, its identity refusal and the artifact authorization
+        # model. It subclasses the executor rather than being mixed into it precisely so
+        # that the shipped half never names it; this is what asserts that stayed true.
+        "genetics_mcp_server.tools.orchestration",
         "genetics_mcp_server.chat_api",
         "genetics_mcp_server.mcp_server",
         "genetics_mcp_server.llm_service",

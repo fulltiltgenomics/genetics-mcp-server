@@ -39,6 +39,10 @@ check '^src/genetics_mcp_server/tools/executor\.py$' \
     '^docs/(project-spec|variant-list-analysis)\.md$' \
     'tools/executor.py -> docs/project-spec.md (tool execution, truncation, downloads); docs/variant-list-analysis.md when analyze_variant_list changes'
 
+check '^src/genetics_mcp_server/tools/orchestration\.py$' \
+    '^docs/project-spec\.md$' \
+    'tools/orchestration.py -> docs/project-spec.md (the code-execution tool layer: the run_analysis gateway and its identity refusal, artifact scoping, literature and web search) — and the suite repo owns what the sandbox image ships'
+
 check '^src/genetics_mcp_server/routers/' '^docs/project-spec\.md$' \
     'routers/ -> docs/project-spec.md (admin endpoint list, API token endpoints, admin access rules)'
 

@@ -256,9 +256,9 @@ class _TTLCache:
         self._entries.clear()
 
 
-# module level, not per UniProtClient: a client is built from a ToolExecutor, and
-# ToolExecutor is instantiated independently by LLMService, by the standalone MCP server
-# and by the analyze_variants CLI, so a per-instance cache would be per-executor.
+# module level, not per UniProtClient: a client is built from a ToolExecutor, and one is
+# instantiated independently by LLMService, by the standalone MCP server, by the
+# analyze_variants CLI and by the SDK, so a per-instance cache would be per-executor.
 # Subagents do share the main agent's executor today (LLMService hands its own to
 # SubagentService), but nothing in that API requires it, and a per-instance cache would
 # silently stop being shared the moment any caller builds its own executor.

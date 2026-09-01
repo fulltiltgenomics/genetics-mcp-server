@@ -331,7 +331,7 @@ truncation survived the move: it bounds the model's context, which no transport 
 
 **The name is resolved server-side against the authenticated USER AND session, and nothing
 else is addressable.** `run_analysis` records each completed execution's manifest in
-`_ArtifactManifests` (`tools/executor.py`) under the key **`(sub, sid)`**;
+`_ArtifactManifests` (`tools/orchestration.py`) under the key **`(sub, sid)`**;
 `llm_service._execute_tool` injects that pair into `read_artifact` exactly as it injects the
 identity into `run_analysis`, stripping any same-named key the model emitted, and the declared
 schema still has exactly one parameter, `name`. **The user term is what makes the key an
@@ -447,7 +447,7 @@ markers for every turn predating the change; `_TOOL_USE_MARKER_RE` matches both 
 the client-written `[TOOLUSE:<base64>]` marker that replaced them, so neither shape reaches
 the model on replay.
 
-**The turn budget is this layer's, not the transport's** (`ToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
+**The turn budget is this layer's, not the transport's** (`ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
 300 s, applied with `asyncio.wait_for`). `sandbox_client` bounds each *attempt* correctly
 and deliberately offers no total, because its per-attempt read deadline is derived from the
 supervisor's own worst-case hold time (120 s queued + `timeout_s` + 15 s margin). The
@@ -477,7 +477,7 @@ pins both the behaviour and — by parsing the handler's AST — the clause orde
 `_sandbox` is a `cached_property` whose constructor raises when `SANDBOX_URL` is unset, so
 "nothing is configured" would otherwise surface as a bare exception at any attribute access
 — and `read_artifact` touches it in no `try` of its own. Both entry points resolve through
-`ToolExecutor._sandbox_or_operator_error`, which returns the same `SandboxNotConfigured` /
+`ServerToolExecutor._sandbox_or_operator_error`, which returns the same `SandboxNotConfigured` /
 `retryable: False` shape either way, so a new caller fails in the house style without having
 to remember a handler and there is no clause ordering to get wrong.
 
@@ -733,11 +733,16 @@ scores and tier flags are in no view a script can query, so a script cannot writ
 itself — it can only fetch the document results-api serves.
 
 **"Not in the SDK" does not mean "not reachable", and this list is not an enforcement boundary.**
-`GeneticsClient` keeps the full `ToolExecutor` on `._executor` — and reaching it needs no client
+`GeneticsClient` keeps a `ToolExecutor` on `._executor` — and reaching it needs no client
 at all: `tools/executor.py` is on `sandbox/prune_venv.py`'s `SDK_ALLOWLIST` (it ships because
 `sdk/client.py` imports `ToolExecutor` directly), so a sandboxed script can simply
 `from genetics_mcp_server.tools.executor import ToolExecutor` and construct its own. httpx ships
-too, as the SDK's own transport. The leading underscore is **curation, not enforcement**: it marks
+too, as the SDK's own transport. What `._executor` is **not** is the orchestration half —
+`run_analysis`, `read_artifact`, web and literature search — which is `ServerToolExecutor` in
+`tools/orchestration.py`, the class the servers construct and the SDK never imports, in any
+environment. That absence is a disclosure decision, not a control: the sandbox cannot run code
+needing `ddgs`, `sandbox_client`, `auth.core` and `sandbox_token`, none of which it has.
+The leading underscore is **curation, not enforcement**: it marks
 the executor as outside the curated surface so that a reader or a model does not treat it as a
 recommended entry point, and it should never be cited as a control. The containment boundary, **as
 specified**, is the sandbox's deny-by-default **network egress allow-list** (db-api and results-api
@@ -916,6 +921,7 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   - **`_executor` calls are NOT audited.** `genetics.get_client()._executor.<method>()`
     returns the same data and emits nothing, and `tools/executor.py` ships in the sandbox
     image, so a script can build its own executor in one import (`genetics-results-suite-4h6.33`).
+    Every data-access method is on that class; only the orchestration half is elsewhere.
     The underscore is curation, not enforcement. Closing this means instrumenting
     `ToolExecutor` itself, which is a much larger change: every MCP tool call goes through
     those same methods, so it would need chat-backend's existing `Executing tool:` line
@@ -1019,12 +1025,16 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   never imports it. `4h6.70` then added `from pydantic import Field` to `definitions.py` for
   the `minimum`/`maximum`/`pattern` keywords, and the sandbox image — which pins numpy, scipy,
   polars, matplotlib and httpx and nothing else — could no longer `import
-  genetics_mcp_server.sdk`. Every `__all__` entry except `ToolExecutor` — that is the rule
-  `_LAZY_FROM_DEFINITIONS` encodes, seven names as of this writing — now resolves through a
-  module `__getattr__`, so `from genetics_mcp_server.tools import TOOL_DEFINITIONS` and
-  `tools.get_anthropic_tools` behave exactly as before for chat_api, llm_service, subagent and
-  routers/llm_config, while the SDK path never imports the module. Dropping it also stops the
-  sandbox shipping the full catalogue of every tool the suite exposes.
+  genetics_mcp_server.sdk`. The `definitions` entries of `__all__` — the set
+  `_LAZY_FROM_DEFINITIONS` names — now resolve through a module `__getattr__`, so
+  `from genetics_mcp_server.tools import TOOL_DEFINITIONS` and `tools.get_anthropic_tools`
+  behave exactly as before for chat_api, llm_service, subagent and routers/llm_config, while
+  the SDK path never imports the module. Dropping it also stops the sandbox shipping the full
+  catalogue of every tool the suite exposes. `ServerToolExecutor` resolves through the same
+  hook, from `tools/orchestration.py`, for the same reason. Both sets are listed explicitly
+  rather than derived by subtracting from `__all__`: that subtraction routed every name it did
+  not recognise to `definitions`, so a name from a third submodule would have raised an
+  `AttributeError` naming the wrong file.
 - **The endpoint reads must stay behind the settings resolution.** `config/settings.py` calls
   `load_dotenv()` at module scope, so the `GENETICS_API_URL` / `GENETICS_PUBLIC_API_URL` /
   `BIGQUERY_API_URL` reads only see a `.env` file once that module has been imported. They go
@@ -1625,7 +1635,8 @@ src/genetics_mcp_server/
 ├── tools/
 │   ├── __init__.py
 │   ├── definitions.py   # tool definitions (shared)
-│   ├── executor.py      # tool execution via HTTP
+│   ├── executor.py      # tool execution via HTTP; the half the sandbox image ships
+│   ├── orchestration.py # ServerToolExecutor: run_analysis, read_artifact, web/literature search
 │   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
 │   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
 │   └── phewas_categories.py  # PheWAS plot category mappings
@@ -1707,7 +1718,7 @@ literal at a call site.
   branched on, anything else is carried through as an opaque label.
 - **No total deadline, deliberately.** Each attempt is bounded; the sum is not (~585 s worst
   case). The cap belongs to whoever owns the chat turn, and that is `run_analysis` — see
-  `ToolExecutor._RUN_ANALYSIS_DEADLINE_S` under Code execution tools. Its only caller is that
+  `ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S` under Code execution tools. Its only caller is that
   handler.
 
 ### Turn termination and truncation

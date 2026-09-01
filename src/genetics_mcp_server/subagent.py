@@ -33,7 +33,7 @@ from genetics_mcp_server.skills.sandbox_tools import (
     list_directory,
     read_file,
 )
-from genetics_mcp_server.tools import ToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools import ServerToolExecutor, get_anthropic_tools
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ class SubagentResult:
 class SubagentService:
     """Service for running parallel subagents with specialized skills."""
 
-    def __init__(self, anthropic_client: Any, executor: ToolExecutor):
+    def __init__(self, anthropic_client: Any, executor: ServerToolExecutor):
         self._client = anthropic_client
         self._executor = executor
 

@@ -1267,9 +1267,9 @@ def test_the_harness_reads_the_chunk_the_chat_backend_actually_emits():
         _script_outcome,
         _script_ran,
     )
-    from genetics_mcp_server.tools import ToolExecutor
+    from genetics_mcp_server.tools import ServerToolExecutor
 
-    render = ToolExecutor()._render_analysis
+    render = ServerToolExecutor()._render_analysis
     ok = _script_result_payload(1, render({"status": "ok", "duration_ms": 5}))
     failed = _script_result_payload(
         1, render({"status": "error", "error": {"type": "ValueError", "message": "x"}})
@@ -1303,9 +1303,9 @@ async def test_the_model_caused_non_run_shapes_the_real_executor_emits_are_not_i
         OUTCOME_MODEL_REJECTED,
         _script_outcome,
     )
-    from genetics_mcp_server.tools import ToolExecutor
+    from genetics_mcp_server.tools import ServerToolExecutor
 
-    executor = ToolExecutor()
+    executor = ServerToolExecutor()
     # a transport that would fail the test if it were ever reached: neither shape below is
     # allowed to leave this process, which is exactly why the sandbox cannot be blamed
     executor._sandbox = SandboxClient(

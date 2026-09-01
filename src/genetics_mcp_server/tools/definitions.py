@@ -13,7 +13,7 @@ from pydantic import Field
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
-    from genetics_mcp_server.tools.executor import ToolExecutor
+    from genetics_mcp_server.tools.orchestration import ServerToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -2012,7 +2012,7 @@ def get_anthropic_tools(
 
 def register_mcp_tools(
     mcp: "FastMCP",
-    executor: "ToolExecutor",
+    executor: "ServerToolExecutor",
     disabled_tools: set[str] | None = None,
 ) -> None:
     """
@@ -2020,7 +2020,7 @@ def register_mcp_tools(
 
     Args:
         mcp: FastMCP server instance
-        executor: ToolExecutor instance for making API calls
+        executor: ServerToolExecutor instance for making API calls
         disabled_tools: Optional set of tool names to skip registration.
 
     BOUNDS ON THIS SURFACE ARE NOT THE SAME DECISION AS ON THE ANTHROPIC ONE
