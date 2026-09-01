@@ -1164,10 +1164,10 @@ class LLMService:
                 # `input_tokens` here is the whole context, NOT the billed uncached input
                 # — it is what the browser's context meter renders against context_window,
                 # so its meaning is fixed. `cache_read` and `cache_create` are the two
-                # cached components of it, reported separately because they differ by more
-                # than 12x in price: billed uncached input is
-                # `input_tokens - cache_read - cache_create`, which is exactly the
-                # per-iteration increment of `total_input_tokens`. A consumer with no
+                # cached components of it, reported separately because a cache write is
+                # priced far above a cache read (`_PRICING` in cost.py): billed uncached
+                # input is `input_tokens - cache_read - cache_create`, which is exactly
+                # the per-iteration increment of `total_input_tokens`. A consumer with no
                 # database row (secret chat writes none) needs all three to price a turn.
                 #
                 # The two timing fields are deliberately named for their epoch, because

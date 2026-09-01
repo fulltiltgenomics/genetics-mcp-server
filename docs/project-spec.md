@@ -229,8 +229,11 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 
 ### Code execution tools
 
-Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
-not deployed, so `read_artifact` has nothing to reach in any running service — and
+Tool halves of the sandbox design (`genetics-results-suite-4h6`). **Whether a sandbox is
+running is a per-deployment fact and must be read off the cluster, not off this document** —
+`kubectl -n genetics get deploy sandbox`; one has been serving on daly-staging since
+2026-08-26. Where none is deployed `read_artifact` has nothing to reach in any running
+service — and
 **`run_analysis` is withheld entirely until `SANDBOX_ENABLED` is true**
 (`genetics-results-suite-4h6.56`). The flag is a deployment fact, not a preference: with
 no sandbox at `SANDBOX_URL` the transport fails as `SandboxUnavailable` with
@@ -744,11 +747,13 @@ environment. That absence is a disclosure decision, not a control: the sandbox c
 needing `ddgs`, `sandbox_client`, `auth.core` and `sandbox_token`, none of which it has.
 The leading underscore is **curation, not enforcement**: it marks
 the executor as outside the curated surface so that a reader or a model does not treat it as a
-recommended entry point, and it should never be cited as a control. The containment boundary, **as
-specified**, is the sandbox's deny-by-default **network egress allow-list** (db-api and results-api
-only) in `genetics-results-suite` `docs/code-execution-security.md` — specified rather than live:
-the sandbox is not deployed, and that policy stays decoration until `genetics-results-suite-4h6.7`
-ships a Deployment carrying the labels it selects.
+recommended entry point, and it should never be cited as a control. The containment boundary is
+the sandbox's deny-by-default **network egress allow-list** (db-api and results-api only) in
+`genetics-results-suite` `docs/code-execution-security.md`. `k8s/deployments/sandbox.yaml` carries
+the labels that policy selects, so the policy binds wherever that Deployment is applied — on
+daly-staging it is, and the applied policy was verified byte-equivalent to the committed manifest
+on 2026-08-31. Where no sandbox is deployed the policy selects nothing, which is a fact about that
+deployment and not about the policy.
 
 Reachability therefore divides this list along a different axis than the one that put tools on
 it. The third-party tools **are** genuinely unreachable from a sandboxed script — but for the
@@ -1828,8 +1833,8 @@ name says `total_`:
   meaning is deliberately frozen (`genetics-results-suite-n3p`)
 - `cache_read` — the part of `input_tokens` served from the prompt cache
 - `cache_create` — the part of `input_tokens` written into the prompt cache. Kept apart
-  from `cache_read` because the two differ by more than 12x in price, so folding them
-  together makes an exact cost underivable
+  from `cache_read` because a cache write is priced far above a cache read (see
+  `_PRICING` in `cost.py`), so folding them together makes an exact cost underivable
 - `output_tokens` — output tokens generated in this call
 - `total_input_tokens` — cumulative **billed uncached** input across all iterations so
   far, i.e. the running sum of `input_tokens - cache_read - cache_create`
@@ -2625,8 +2630,8 @@ harness issues two arms per case. `--base-url` therefore defaults to
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
   derived as `sum(per-iteration input_tokens) - total_input_tokens`.
 - **Cost is exact when the stream carries the cache split, and an interval when it
-  does not — and the report says which.** Cache reads and cache creations differ by
-  more than 12x in price, so the sum alone can only be bracketed. Since
+  does not — and the report says which.** Cache reads and cache creations are priced
+  far apart, so the sum alone can only be bracketed. Since
   `genetics-results-suite-n3p` the `usage` payload reports `cache_read` and
   `cache_create` separately, and the harness prices the three token classes
   separately into `cost_usd` (`cost_basis: "exact"`). `cost_usd_min` / `cost_usd_max`

@@ -162,7 +162,7 @@ class IterationUsage:
     context_window: int
     context_percent: float
 
-    # the two cached components of input_tokens, priced >12x apart. Present since
+    # the two cached components of input_tokens, priced far apart. Present since
     # genetics-results-suite-n3p; None when the server predates it or the provider path
     # does not report them, which is what forces the turn back onto the cost interval.
     cache_read: int | None = None
@@ -507,12 +507,12 @@ def _cost_bounds(
 ) -> tuple[float | None, float | None]:
     """Bound the turn's USD cost when the cache split is NOT available.
 
-    Cache reads and cache creations differ by more than 12x in price, so a stream that
-    reports only their sum can only be bracketed: everything-cache-read is the floor,
-    everything-cache-creation the ceiling. In steady state the truth sits near the floor,
-    but the harness does not pretend to know that. `_exact_cost` supersedes this whenever
-    the usage chunks carry the split; the bracket is still computed, both as the fallback
-    and as a sanity range the exact figure must sit inside.
+    Cache reads and cache creations are priced far apart (`_PRICING` in cost.py), so a
+    stream that reports only their sum can only be bracketed: everything-cache-read is the
+    floor, everything-cache-creation the ceiling. In steady state the truth sits near the
+    floor, but the harness does not pretend to know that. `_exact_cost` supersedes this
+    whenever the usage chunks carry the split; the bracket is still computed, both as the
+    fallback and as a sanity range the exact figure must sit inside.
     """
     if not model:
         return None, None
@@ -1620,7 +1620,7 @@ def format_summary(report: dict[str, Any]) -> str:
             "carried no cache_read/cache_create split (an older server, or a provider path "
             "that does not report it). Those turns have only the interval cost_usd_min .. "
             "cost_usd_max: the min prices every cached token as a cache read and the max as "
-            "a cache creation, and those two differ >12x in price. The BRACKET is narrower "
+            "a cache creation, and those two are priced far apart. The BRACKET is narrower "
             "than that — output tokens and uncached input are in both endpoints — but it is "
             "wide enough to matter. They are NOT in the cost_usd distribution — do not read "
             "a mixed run's cost_usd as covering every turn."
