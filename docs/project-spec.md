@@ -1043,15 +1043,42 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   service) on the hard-coded default URL while still attaching a `.env`-supplied secret to it,
   and would silently disable the BigQuery tools. `test_sdk_import_closure.py` pins this.
 - `test_sdk_import_closure.py` measures the closure in a fresh interpreter and asserts
-  equality, and asserts the SDK imports when **every** distribution outside the transitive
-  requirement closure of the sandbox's five pinned ones is unavailable — a `sys.meta_path`
-  finder that raises `ModuleNotFoundError` for their top-level modules. That generalises what
-  was a single `dotenv` stub: a per-offender test only ever covers the offender already fixed,
-  which is why `l41`'s guard did not catch `6bv`'s pydantic. Every probe forces `src/`
-  onto the subprocess `PYTHONPATH` and asserts `genetics_mcp_server.__file__` resolves under
-  it, so an editable install pointing at another checkout cannot make it measure the wrong
-  tree. Widening the closure means widening `SDK_ALLOWLIST` in
-  `genetics-results-suite/sandbox/prune_venv.py` in the same change, or the image build fails.
+  equality, and then asserts the third-party surface twice over — once at runtime and once
+  statically, because neither shape can see the other. At runtime a `sys.meta_path` finder
+  makes every module outside the image's surface unavailable **to a shipped file**, and the SDK
+  still has to import. Statically, `ast` reads every file the closure ships and refuses any
+  import of a top-level name outside the standard library, the sandbox's five pins and the
+  package itself, **at any nesting depth** — so a function-level import, one under
+  `try`/`except ImportError`, one under `if TYPE_CHECKING` and one inside a module
+  `__getattr__` are all caught. The static half is the one that matters here: deferring an
+  import is this codebase's house style for adding capability, and a deferred import runs at
+  call time, so `import genetics_mcp_server.sdk` proves nothing about it and the
+  `ModuleNotFoundError` lands inside a container with no shell and no package manager instead.
+  Together they generalise what was a single `dotenv` stub: a per-offender test only ever
+  covers the offender already fixed, which is why `l41`'s guard did not catch `6bv`'s pydantic.
+- **The guard's verdict is a property of the commit, not of the developer's venv.** The allowed
+  module names are written down beside the pins, and the finder allows by that list rather than
+  blocking "every other installed distribution". Reading installed metadata instead did three
+  things at once: a pin absent locally (scipy) dropped silently out of the allowed set, so its
+  dependencies were over-blocked on some machines and not others; `.pth`-installed modules such
+  as `_virtualenv` belonged to no distribution and were therefore never blocked at all; and
+  every environment marker that did not mention `extra` was ignored, which admitted
+  `exceptiongroup` — a requirement `anyio` declares only below Python 3.11 — into a set
+  describing a 3.11 image, the one direction in which the guard was ever laxer than the image.
+  Nothing walks requirement metadata now, so there are no markers left to evaluate. The finder
+  is proved live by driving it from a synthetic frame carrying a shipped file's name, rather
+  than by asserting some dev-only distribution is blocked: that older self-check coupled a
+  security guard to `dotenv` and `pydantic` being installed, and so failed in a venv built from
+  the sandbox's own requirements — the environment closest to the thing under test. What is
+  left to the image build is the standard library's own version boundary: names are matched
+  against this interpreter's `sys.stdlib_module_names`, and
+  `genetics-results-suite/sandbox/build-checks.py` runs the same static scan inside the
+  builder, on 3.11, against the modules pip actually resolved.
+- Every probe forces `src/` onto the subprocess `PYTHONPATH` and asserts
+  `genetics_mcp_server.__file__` resolves under it, so an editable install pointing at another
+  checkout cannot make it measure the wrong tree. Widening the closure means widening
+  `SDK_ALLOWLIST` in `genetics-results-suite/sandbox/prune_venv.py` in the same change, or the
+  image build fails.
 
 ### SQL safety at the SDK boundary
 

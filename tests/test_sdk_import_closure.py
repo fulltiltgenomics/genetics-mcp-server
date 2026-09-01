@@ -14,8 +14,13 @@ This test is the one that fails in this repo, in the commit that widens it.
 
 Measured the way that allow-list was: import the package and enumerate `sys.modules`, in
 a fresh interpreter so nothing another test imported can be mistaken for a dependency.
+
+Importing is only half of it. The image ships source, and source that runs at CALL time is
+invisible to anything that imports the package and looks at what loaded — so the shipped
+files are also read with `ast`, which is the only half that can see a deferred import.
 """
 
+import ast
 import json
 import os
 import subprocess
@@ -117,99 +122,251 @@ def test_named_modules_stay_out(module):
 # the sandbox interpreter has. Changing it means changing that file, and vice versa.
 SANDBOX_PINNED_DISTRIBUTIONS = ("numpy", "scipy", "polars", "matplotlib", "httpx")
 
-_BLOCKED_IMPORT_PROBE = """
-import importlib.metadata as _md, json, sys
-
-# The walk skips a requirement only when its marker mentions `extra`; EVERY other environment
-# marker is ignored, so the requirement joins the allowed set whether or not pip would install
-# it in the image. That is the one direction in which this guard is LAXER than the image, and
-# it is the dangerous direction: `anyio` requires `exceptiongroup>=1.0.2; python_version <
-# "3.11"`, the sandbox is Python 3.11 so pip does NOT install it there, yet `exceptiongroup`
-# lands in `_dists` here — a closure module importing it would pass this test and fail the
-# image build. `typing_extensions` (`; python_version < "3.13"`) has the same shape and is
-# safe only by coincidence. The fix is to evaluate markers against the sandbox's Python
-# version, or to walk a resolved lock for that image instead of this venv's dev metadata;
-# filed separately, deliberately not done here.
+# The top-level module names those pins provide, and the only third-party names a shipped source
+# file may name. Written down rather than read out of installed metadata, because metadata makes
+# the verdict a function of THIS venv rather than of the image: a pin that is not installed here
+# (scipy is not) drops out of the set silently, and two developers get different answers from the
+# same commit. Written down, the answer is the same everywhere and the test below is what stops
+# it rotting.
 #
-# Every other divergence runs the other way — over-strict, which fails loudly rather than
-# silently. `importlib.metadata.requires("anyio")` on this release does not declare `sniffio`
-# at all, so `sniffio` stays blocked; that is CORRECT (the image installs it only as httpx's
-# own dependency, and blocking it merely makes the probe stricter than the image). Measured:
-# `import anyio` and a full `httpx.AsyncClient` request both succeed with it blocked.
-_dists, _stack = set(), list({pinned!r})
-while _stack:                                    # transitive requirements, extras excluded,
-    _d = _stack.pop()                            # the way `pip install -r` resolves them
-    _key = _d.lower().replace("-", "_")
-    if _key in _dists:
-        continue
-    _dists.add(_key)
-    try:
-        _reqs = _md.requires(_d) or []
-    except _md.PackageNotFoundError:
-        continue
-    for _r in _reqs:
-        _name, _, _marker = _r.partition(";")
-        if "extra" in _marker:
-            continue
-        _n = _name.split("[")[0].split("(")[0].strip()
-        for _sep in ">=<!~ ":
-            _n = _n.split(_sep)[0]
-        if _n:
-            _stack.append(_n)
+# Deliberately narrower than the image, which also holds everything pip pulls in behind those
+# pins — anyio, certifi, contourpy, six and the rest. Those are legitimately importable there,
+# but a shipped file reaching past the declared pins into httpx's or matplotlib's private
+# dependency set is a widening that should be argued for; refusing it here fails loudly, which
+# is the safe direction.
+SANDBOX_MODULE_NAMES = frozenset(
+    {"numpy", "scipy", "polars", "matplotlib", "mpl_toolkits", "pylab", "httpx"}
+)
 
-# every other top-level module this venv installed: pydantic, dotenv, mcp, anthropic, fastapi,
-# google.*, jwt ... Blocking by installed-distribution rather than by an allow-list of names
-# leaves the standard library and the interpreter's own private modules untouched.
-_blocked = {{
-    _mod
-    for _mod, _owners in _md.packages_distributions().items()
-    if not any(_o.lower().replace("-", "_") in _dists for _o in _owners)
-}} - {{"genetics_mcp_server"}}
+
+def test_the_pinned_module_names_still_match_the_pinned_distributions():
+    """SANDBOX_MODULE_NAMES is written down, so something has to notice it going stale.
+
+    Only the pins that happen to be installed here can be checked, and that is the point of
+    writing the set down in the first place: this narrows as the venv narrows instead of
+    changing the verdict of the guards that use it.
+    """
+    import importlib.metadata as md
+
+    pinned = {d.lower().replace("-", "_") for d in SANDBOX_PINNED_DISTRIBUTIONS}
+    owners_of = md.packages_distributions()
+    provided = {
+        module
+        for module, owners in owners_of.items()
+        if {o.lower().replace("-", "_") for o in owners} & pinned
+    }
+    assert provided <= SANDBOX_MODULE_NAMES, (
+        f"a pin provides a module the set does not list: {sorted(provided - SANDBOX_MODULE_NAMES)}"
+    )
+    for name in sorted(SANDBOX_MODULE_NAMES):
+        owners = {o.lower().replace("-", "_") for o in owners_of.get(name, ())}
+        assert not owners or owners & pinned, f"{name} comes from {sorted(owners)}, not a pin"
+
+
+# Installs a meta_path finder that answers for the image's module surface rather than for this
+# venv's. The obvious alternative — block every installed distribution outside the pins — is
+# rejected on two counts, and both are why this admits nothing by default:
+#
+#   * a top-level module `importlib.metadata.packages_distributions()` cannot attribute to any
+#     distribution falls outside a blocked set entirely and imports freely: `.pth`-installed
+#     modules such as `_virtualenv`, egg-link and develop installs, loose files dropped into
+#     site-packages;
+#   * deriving a blocked set means walking requirement metadata, which means evaluating
+#     environment markers or ignoring them. Ignoring them admits `exceptiongroup` — `anyio`
+#     requires it only below Python 3.11 and the image is 3.11 — which is the one direction in
+#     which a guard here can be LAXER than the image. Nothing walks metadata now.
+_IMAGE_MODULE_POLICY = """
+import os, sys
+
+_allowed = set(sys.stdlib_module_names) | set({allowed!r}) | {{"genetics_mcp_server"}}
 _hit = set()
+
+# the finder is process-global, so it must not answer for imports httpx or matplotlib make on
+# their own behalf: pip installs the pins WITH their dependencies, so those imports are honest
+# in the image. Attribute each import to the innermost frame outside the import machinery and
+# apply the policy only where that frame is a genetics_mcp_server source file.
+_MACHINERY = ("<frozen importlib", os.path.join(os.path.dirname(os.__file__), "importlib"))
 
 
 class _AbsentFromTheSandboxImage:
     def find_spec(self, fullname, path=None, target=None):
         top = fullname.split(".")[0]
-        if top not in _blocked:
+        if top in _allowed:
+            return None
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_code.co_filename.startswith(_MACHINERY):
+            frame = frame.f_back
+        if frame is None:
+            return None
+        if "genetics_mcp_server" not in frame.f_code.co_filename.replace(os.sep, "/").split("/"):
             return None
         _hit.add(top)
         raise ModuleNotFoundError("absent from the sandbox image: " + fullname, name=fullname)
 
 
 sys.meta_path.insert(0, _AbsentFromTheSandboxImage())
+"""
+
+# only the policy carries substitutions; the body below is a plain string so its own braces
+# stay its own
+_BLOCKED_IMPORT_PROBE_BODY = """
+import json
 import genetics_mcp_server.sdk  # noqa: F401
-print(json.dumps({{"blocked": sorted(_blocked), "attempted": sorted(_hit)}}))
+
+# The policy has to be shown to be live, and the shape of that proof is the point. Asserting
+# that some named dev-only distribution lands in a blocked set couples a security guard to
+# whatever the developer's venv holds, and fails hardest in a venv built from the sandbox's own
+# requirements plus the SDK — the environment CLOSEST to the thing under test. Drive the policy
+# directly instead: a frame carrying a shipped file's name, a module name that exists nowhere,
+# and the same answer in every environment.
+_pkg = os.path.dirname(genetics_mcp_server.__file__)
+
+
+def _canary(source, filename):
+    try:
+        exec(compile(source, filename, "exec"), {})
+    except ModuleNotFoundError as exc:
+        return str(exc)
+    return ""
+
+
+print(json.dumps({
+    "attempted": sorted(_hit),
+    "blocked_in_a_shipped_file": _canary(
+        "import __not_in_the_sandbox_image__", os.path.join(_pkg, "_canary.py")
+    ),
+    "allowed_in_a_shipped_file": _canary("import json", os.path.join(_pkg, "_canary.py")),
+    "unattributed": _canary(
+        "import __not_in_the_sandbox_image__",
+        os.path.join(os.path.dirname(_pkg), "_canary.py"),
+    ),
+}))
 """
 
 
-def test_the_sdk_imports_with_every_unpinned_third_party_module_blocked():
+def test_the_sdk_imports_with_every_module_the_image_lacks_blocked():
     """The generalised form of the guard, and the point of it.
 
     Two separate offenders have widened the closure by one module-level import into a package
     the sandbox does not have: `config.settings` -> `dotenv` (genetics-results-suite-l41), then
     `tools/definitions.py` -> `pydantic` (genetics-results-suite-6bv). A per-offender test
     ("the SDK does not need dotenv") only ever catches the one already fixed, so this asserts
-    the property instead: the SDK imports when EVERY distribution outside
-    SANDBOX_PINNED_DISTRIBUTIONS' dependency closure is unavailable. The third offender fails
-    here, in the commit that introduces it, rather than in another repo's image build.
+    the property instead: the SDK imports when every module outside the image's surface is
+    unavailable to a shipped file. The third offender fails here, in the commit that introduces
+    it, rather than in another repo's image build.
 
-    A module the SDK reaches for and does not get is not automatically a failure — httpx's CLI
-    entry point is a real `try: ... except ImportError` and is expected to be denied — which is
-    exactly why this asserts on the import succeeding rather than on nothing being attempted.
+    This sees only what runs during the import. A deferred import runs at call time and is
+    invisible to it by construction, which is what the static scan below is for.
     """
-    result = _run_probe(_ORIGIN_GUARD + _BLOCKED_IMPORT_PROBE.format(pinned=list(SANDBOX_PINNED_DISTRIBUTIONS)))
+    result = _run_probe(
+        _ORIGIN_GUARD
+        + _IMAGE_MODULE_POLICY.format(allowed=sorted(SANDBOX_MODULE_NAMES))
+        + _BLOCKED_IMPORT_PROBE_BODY
+    )
     assert result.returncode == 0, (
-        "importing the SDK reached a package the sandbox image does not install; "
+        "importing the SDK reached a module the sandbox image does not install; "
         "either defer that import out of the closure or widen sandbox/requirements.txt "
         f"deliberately:\n{result.stderr}"
     )
     measured = json.loads(result.stdout.strip().splitlines()[-1])
-    # the guard is only meaningful if it is actually blocking; both known offenders must be in
-    # the blocked set, or a future `pip install pydantic` into the dev venv could quietly
-    # neuter this test
-    for offender in ("dotenv", "pydantic"):
-        assert offender in measured["blocked"], measured["blocked"]
+    assert "absent from the sandbox image" in measured["blocked_in_a_shipped_file"], measured
+    assert measured["allowed_in_a_shipped_file"] == "", measured
+    assert "absent from the sandbox image" not in measured["unattributed"], measured
+
+
+_CLOSURE_FILES_PROBE = (
+    _ORIGIN_GUARD
+    + """
+import json, sys
+import genetics_mcp_server.sdk  # noqa: F401
+print(json.dumps({
+    m: getattr(sys.modules[m], "__file__", None)
+    for m in sys.modules
+    if m.split(".")[0] == "genetics_mcp_server"
+}))
+"""
+)
+
+
+def _shipped_sources() -> dict[str, str]:
+    """The files the sandbox image ships, measured rather than listed a second time.
+
+    prune_venv.py's SDK_ALLOWLIST is the same set expressed as paths; deriving these from the
+    live closure keeps this from becoming a third copy of it, and the equality test above is
+    what pins the set itself.
+    """
+    result = _run_probe(_CLOSURE_FILES_PROBE)
+    assert result.returncode == 0, result.stderr
+    files = json.loads(result.stdout.strip().splitlines()[-1])
+    assert all(files.values()), f"a closure module has no source file: {files}"
+    return files
+
+
+def _dynamic_import_target(node: ast.Call) -> str | None:
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+    if name not in ("__import__", "import_module") or not node.args:
+        return None
+    arg = node.args[0]
+    return arg.value if isinstance(arg, ast.Constant) and isinstance(arg.value, str) else None
+
+
+def _imported_top_level_names(source: str) -> list[tuple[str, int]]:
+    """Every top-level module name an import in `source` names, at ANY nesting depth.
+
+    `ast.walk` rather than a scan of the module body, because depth is the whole point: a
+    function-level import, one inside `try`/`except ImportError`, one under `if TYPE_CHECKING`
+    and one in a module `__getattr__` are all invisible to anything that imports the package
+    and looks at what loaded.
+
+    Relative imports are skipped — they resolve inside genetics_mcp_server by construction, and
+    what is inside the package is the closure test's question, not this one.
+    """
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            found += [(alias.name.split(".")[0], node.lineno) for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            found.append(((node.module or "").split(".")[0], node.lineno))
+        elif isinstance(node, ast.Call):
+            target = _dynamic_import_target(node)
+            if target:
+                found.append((target.split(".")[0], node.lineno))
+    return [(name, lineno) for name, lineno in found if name]
+
+
+def test_no_shipped_source_names_a_module_the_image_lacks():
+    """The deferred-import shape, which every runtime guard is blind to.
+
+    `import genetics_mcp_server.sdk` executes module bodies and nothing else, so a
+    `from ddgs import DDGS` inside a method passes every check this file makes and then raises
+    ModuleNotFoundError inside a container with no shell and no package manager — which has
+    shipped. Deferring an import is also this codebase's house style for adding capability, so
+    the blind spot sits precisely where new code lands.
+
+    `if TYPE_CHECKING` and `try/except ImportError` guards are held to the same rule, for the
+    reason the assertion below states; `typing.get_type_hints()` on the annotations would try
+    to resolve a TYPE_CHECKING import for real regardless of the guard.
+
+    Over-strictness is the hazard here rather than laxness — a false positive breaks the build
+    for everyone — so the allowed set is the union of the standard library, the pins, and the
+    package itself, and `__future__` and relative imports are inside it by construction.
+    """
+    allowed = set(sys.stdlib_module_names) | SANDBOX_MODULE_NAMES | {"genetics_mcp_server"}
+    offenders = []
+    for module, path in sorted(_shipped_sources().items()):
+        for name, lineno in _imported_top_level_names(Path(path).read_text()):
+            if name not in allowed:
+                offenders.append(f"{path}:{lineno} imports {name!r} ({module})")
+    assert not offenders, (
+        "the sandbox image ships these files, and they name modules it does not install. "
+        "Deferring the import does not help — it moves the failure from the build to a "
+        "call inside the sandbox — and neither does a `TYPE_CHECKING` or `try/except "
+        "ImportError` guard: the name is in the shipped source whether or not that line "
+        "runs. Move the code out of the SDK's import closure, or widen "
+        "genetics-results-suite/sandbox/requirements.txt deliberately:\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 def test_the_executor_can_be_built_and_used_without_config_settings(tmp_path):
