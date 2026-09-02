@@ -764,11 +764,15 @@ class GeneticsClient:
         r2_threshold: float | None = None,
         panel: str = "sisu42",
     ) -> pl.DataFrame:
-        """LD from the FinnGen LD server.
+        """LD from the FinnGen LD server, proxied rather than called directly.
 
         With `other`, one row for that pair; without it, every variant in LD above the
         threshold. Defaults differ per shape and match the tool layer (0.1 for a named
         pair, 0.6 for a neighbourhood scan).
+
+        The proxy is what makes this callable from a sandbox script at all: the LD server is
+        on the public internet and the sandbox has no DNS and no internet egress, so a direct
+        call resolves nothing. A script does not have to know or do anything about that.
         """
         if other is not None:
             _reject("ld(variant, other)", window=window)

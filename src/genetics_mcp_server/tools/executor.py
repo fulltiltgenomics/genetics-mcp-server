@@ -377,6 +377,24 @@ class _SandboxTokenAuth(httpx.Auth):
 _KEEP_DEFAULT_ROW_LIMIT = object()
 
 
+def _ld_error(resp: Any) -> str:
+    """One message for both LD call sites, distinguishing the proxy from the upstream.
+
+    results-api answers 502 when the LD server itself failed or was unreachable and 4xx when
+    the request was wrong, so the distinction a caller can act on — ask differently, or try
+    later — survives into the message rather than collapsing into one status number."""
+    if resp.status_code == 502:
+        return "the LD server is unavailable (results-api could not reach it)"
+    if resp.status_code == 422:
+        detail = ""
+        try:
+            detail = resp.json().get("detail", "")
+        except Exception:
+            pass
+        return f"LD request refused: {detail or 'invalid variant, window, threshold or panel'}"
+    return f"LD lookup failed: HTTP {resp.status_code}"
+
+
 def _seg(value: Any) -> str:
     """Percent-encode a caller-supplied value for use as a URL *path segment*.
 
@@ -2287,7 +2305,7 @@ class ToolExecutor:
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     # -------------------------------------------------------------------------
-    # LD Tools (FinnGen LD Server)
+    # LD Tools (the FinnGen LD server, reached through results-api's proxy)
     # -------------------------------------------------------------------------
 
     def _parse_variant(self, variant: str) -> tuple[str, int, str, str]:
@@ -2313,6 +2331,34 @@ class ToolExecutor:
         except ValueError:
             raise ValueError(f"Invalid position in variant: {variant}")
         return chr_str, pos, ref, alt
+
+    async def _ld_request(
+        self, variant: str, *, window: int, r2_threshold: float, panel: str
+    ):
+        """One LD call, through results-api rather than straight to the LD server.
+
+        The redirection is not stylistic. The LD server is on the public internet and the
+        sandbox has no DNS and no internet egress — the design of record in
+        genetics-results-suite `k8s/network-policies/sandbox-policy.yaml`, load-bearing
+        against exfiltration — so `genetics.ld(...)` in a run_analysis script resolved
+        nothing and every locuszoom came back uncoloured. results-api is reachable from the
+        sandbox and is not itself confined, so it makes the call the script cannot.
+
+        `self.client` and not `external_client`: this is now a results-api request like every
+        other, so it carries the same credential and is subject to the same per-execution
+        accounting a sandbox caller is already bound by. Nothing here reinterprets the answer
+        — results-api passes the upstream's own `ld` entries through, so the two call sites
+        below keep the parsing they always had.
+        """
+        return await self.client.get(
+            f"{self.base_url}/v1/ld/{_seg(variant)}",
+            params={
+                "window": window,
+                "r2_threshold": r2_threshold,
+                "panel": panel,
+            },
+            timeout=30.0,
+        )
 
     async def get_ld_between_variants(
         self,
@@ -2351,21 +2397,14 @@ class ToolExecutor:
             # window = 2 * distance + 1000000 (API bug workaround)
             window = 2 * distance + 1_000_000
 
-            resp = await self.external_client.get(
-                "https://api.finngen.fi/api/ld",
-                params={
-                    "variant": variant1,
-                    "window": window,
-                    "panel": panel,
-                    "r2_thresh": r2_threshold,
-                },
-                timeout=30.0,
+            resp = await self._ld_request(
+                variant1, window=window, r2_threshold=r2_threshold, panel=panel
             )
 
             if resp.status_code != 200:
                 return {
                     "success": False,
-                    "error": f"FinnGen LD API error: HTTP {resp.status_code}",
+                    "error": _ld_error(resp),
                 }
 
             data = resp.json()
@@ -2419,22 +2458,12 @@ class ToolExecutor:
             except ValueError as e:
                 return {"success": False, "error": str(e)}
 
-            resp = await self.external_client.get(
-                "https://api.finngen.fi/api/ld",
-                params={
-                    "variant": variant,
-                    "window": window,
-                    "panel": panel,
-                    "r2_thresh": r2_threshold,
-                },
-                timeout=30.0,
+            resp = await self._ld_request(
+                variant, window=window, r2_threshold=r2_threshold, panel=panel
             )
 
             if resp.status_code != 200:
-                return {
-                    "success": False,
-                    "error": f"FinnGen LD API error: HTTP {resp.status_code}",
-                }
+                return {"success": False, "error": _ld_error(resp)}
 
             data = resp.json()
             ld_results = data.get("ld", [])

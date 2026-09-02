@@ -223,13 +223,11 @@ def locuszoom(
     window, and LD is taken against it from the FinnGen LD server.
 
     Returns a dict describing what was drawn — path, lead, n_variants, region, and
-    `ld_joined`, which is False when the LD server returned nothing for the lead. IN THE
-    DEPLOYED SANDBOX IT IS ALWAYS FALSE: the LD server is on the public internet and the
-    sandbox has no DNS and no internet egress, by design, so `ld=True` costs one fast
-    resolver failure and the points come out grey. That case
-    is a plot with grey points rather than an error, because a locuszoom without LD is still
-    the right picture of the locus; check the flag rather than assuming the colours mean
-    something.
+    `ld_joined`, which is False when the LD server returned nothing for the lead — a plot
+    with grey points rather than an error, because a locuszoom without LD is still the right
+    picture of the locus. Check the flag rather than assuming the colours mean something:
+    the LD server is a third party, reached through a proxy, so an outage there costs the
+    colours and nothing else.
 
     Writes into the execution's artifacts directory by default, so the figure is returned to
     the user automatically. Pass `ax` to draw into an existing axis instead, in which case no

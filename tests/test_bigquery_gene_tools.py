@@ -157,6 +157,12 @@ _INJECTION_PAYLOADS = [
         ("get_variant_effect_by_variant", ("../..",), "/api/v1/variant_effect/variant/"),
         ("get_exome_results_by_gene", ("../v1/resources",), "/api/v1/exome_results_by_gene/"),
         ("get_gene_expression", ("a/b",), "/api/v1/expression_by_gene/"),
+        # LD stopped being an outbound call to the public internet and became a results-api
+        # path like the rest, so the caller-supplied variant is now a path segment on the
+        # credentialed client and is held to the same rule. The value has to survive
+        # _parse_variant to reach the request at all, so the hostile part is the CHROMOSOME:
+        # four colon-separated fields with an integer position is all that check enforces.
+        ("get_variants_in_ld", ("../..:1:A:G",), "/api/v1/ld/"),
     ],
 )
 async def test_url_path_segments_cannot_escape_their_endpoint(method, args, prefix):
