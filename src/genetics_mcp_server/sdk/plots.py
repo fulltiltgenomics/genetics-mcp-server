@@ -14,11 +14,12 @@ so a script can take the axes back and add to them, or call it for each of sever
 in one execution and lay the results out itself. Every function here takes `ax=` for that
 reason and returns what it drew rather than only a path.
 
-STYLE IS NOT SET HERE. The sandbox image applies the house matplotlib style to every figure
-through the rcParams the supervisor seeds (genetics-results-suite sandbox/gen_mplrc.py), so
-these functions inherit it like any other script would, and a change to the house style
-changes them with no edit. The one thing they DO set is the LD colour ramp, because those
-colours are semantic — a reader decodes r² from them — and must not follow a style's cycle.
+STYLE IS NOT SET HERE. These draw under whatever rcParams are in force — matplotlib's own
+defaults plus the render density the sandbox bakes (genetics-results-suite
+sandbox/gen_mplrc.py) — so a caller who prefers another style sets it and these follow. What
+they DO set is the LD colour ramp and the two marker shapes, because both are semantic: a
+reader decodes r² from the colours and consequence from the shapes, so neither may follow a
+style's prop_cycle.
 
 ADDING A PLOT. Write the function, export it in `__all__`, and give it a docstring whose first
 line reads as a description: `list_capabilities(module="plots")` and the generated
@@ -50,6 +51,41 @@ _LD_BINS: tuple[tuple[float, str, str], ...] = (
 )
 _LD_UNKNOWN = "#BBBBBB"
 _LEAD_COLOUR = "#7D26CD"
+
+# Shape carries consequence, colour carries LD: two channels, so a coding variant in high LD
+# reads as both at once. The lead follows the same rule as everything else — it is marked out
+# by size and colour, not by a third shape nothing else uses.
+_MARKER_CODING = "s"
+_MARKER_OTHER = "o"
+
+# VEP terms that place a variant in a coding sequence or change the protein. Deliberately NOT
+# including `splice_region_variant`: VEP assigns it up to 8 bp into an intron, so a square
+# there would claim a coding position the term does not establish. The two splice-site terms
+# ARE here — they abolish a site and are scored as loss of function.
+_CODING_CONSEQUENCES = frozenset({
+    "coding_sequence_variant",
+    "frameshift_variant",
+    "inframe_deletion",
+    "inframe_insertion",
+    "incomplete_terminal_codon_variant",
+    "missense_variant",
+    "protein_altering_variant",
+    "splice_acceptor_variant",
+    "splice_donor_variant",
+    "start_lost",
+    "start_retained_variant",
+    "stop_gained",
+    "stop_lost",
+    "stop_retained_variant",
+    "synonymous_variant",
+    "transcript_ablation",
+    "transcript_amplification",
+})
+
+# the significance line and its label are scaffolding, not data: grey keeps them behind the
+# points instead of competing with the LD ramp for the reader's attention
+_SIGNIFICANCE_GREY = "#888888"
+_WARNING_COLOUR = "#AA0000"
 
 # Asked of the LD server rather than 0.0. At r²≥0 it answers with every variant in the panel,
 # which costs twice: the informative points disappear into a navy cloud of r²≈0, and the answer
@@ -113,6 +149,64 @@ def _norm_variant_id(value: Any) -> str:
         return str(value).strip()
     chrom, pos, ref, alt = parts
     return _variant_id(chrom, pos, ref, alt)
+
+
+def _format_p(mlog10p: float | None) -> str:
+    """A p-value as a decimal string, taken apart from -log10(p) rather than computed.
+
+    `10 ** -400` is 0.0 in a float, so a p-value that far down cannot be computed and then
+    formatted — the lead of a strong locus would print as `0.0e+00`. Splitting the exponent
+    from the mantissa keeps the digits: -log10(p) = 400.5 renders 3.2e-401 with no arithmetic
+    that can underflow.
+    """
+    if mlog10p is None or not math.isfinite(mlog10p) or mlog10p <= 0:
+        return "1"
+    exponent = math.floor(mlog10p)
+    mantissa = 10 ** (1 - (mlog10p - exponent))
+    exponent += 1
+    if mantissa >= 10:  # an integral -log10(p), e.g. 13.0 -> 10.0e-14
+        mantissa /= 10
+        exponent -= 1
+    return f"{mantissa:.2f}e-{exponent}"
+
+
+def _lead_label(variant_id: str, row: dict[str, Any], mlog10p: float) -> str:
+    """What the annotation says: the id, then whichever of p, beta and AF the frame carries.
+
+    Built from what is present rather than from a fixed list, because `data=` may be any frame
+    a caller assembled and a KeyError there would lose the whole figure for a caption.
+    """
+    parts = [f"p={_format_p(mlog10p)}"]
+    beta = row.get("beta")
+    if beta is not None:
+        parts.append(f"beta={float(beta):.3g}")
+    af = row.get("af")
+    if af is not None:
+        parts.append(f"AF={float(af):.4g}")
+    return f"{variant_id}\n" + "  ".join(parts)
+
+
+def _coding_flags(frame: pl.DataFrame, region: str) -> tuple[list[bool], bool]:
+    """One flag per row: does this variant sit in a coding sequence.
+
+    The consequence is not in the summary statistics, so it is a second fetch. Failure is
+    tolerated the same way the LD fetch is — every point falls back to a circle and the figure
+    is still the right picture of the locus.
+    """
+    from genetics_mcp_server import sdk
+
+    try:
+        annotations = sdk.variant_annotation(region=region)
+    except Exception:
+        return [False] * frame.height, False
+    if annotations.is_empty() or not {"variant", "most_severe"} <= set(annotations.columns):
+        return [False] * frame.height, False
+    coding_ids = {
+        _norm_variant_id(row["variant"])
+        for row in annotations.iter_rows(named=True)
+        if row.get("most_severe") in _CODING_CONSEQUENCES
+    }
+    return [vid in coding_ids for vid in frame["_variant_id"]], True
 
 
 def _variant_pos(value: Any) -> int | None:
@@ -276,6 +370,7 @@ def locuszoom(
     ld: bool = True,
     ld_panel: str = "sisu42",
     genes: bool = True,
+    coding: bool = True,
     data: pl.DataFrame | None = None,
     path: str | None = None,
     title: str | None = None,
@@ -291,9 +386,16 @@ def locuszoom(
     centred with `flank` either side. `lead` defaults to the strongest association in the
     window, and LD is taken against it from the FinnGen LD server.
 
-    Grey means "no r² to show" — either the LD panel does not carry the variant or its r² is
-    below the floor these plots colour at. Only the correlated variants are coloured, so the
-    ramp reads at a glance instead of painting the whole cloud navy.
+    Colour is LD and shape is consequence, so a coding variant in high LD reads as both at
+    once: a square sits in a coding sequence or changes the protein, a circle does not, and
+    the lead takes whichever shape its own consequence gives it. Grey means "no r² to show" —
+    either the LD panel does not carry the variant or its r² is below the floor these plots
+    colour at. Only the correlated variants are coloured, so the ramp reads at a glance
+    instead of painting the whole cloud navy.
+
+    The gene track draws gene bodies only. The annotation this SDK can reach is GENCODE
+    gene-level — start, end, strand, biotype — with no transcript or exon structure, so there
+    are no exon boxes to draw.
 
     Returns a dict describing what was drawn: `path`, `lead`, `lead_mlog10p`, `region`,
     `phenotype`, `n_variants`, `n_genes`, plus two worth reading every time.
@@ -309,6 +411,9 @@ def locuszoom(
     window is too narrow for the locus — the signal has support the plot does not show — and
     the fix is to redraw with a larger `flank` or an explicit `region`. The figure carries
     the same warning so a reader who never sees this dict is not misled.
+
+    `coding_marked` is False when the consequence lookup did not answer, in which case every
+    point is a circle and shape means nothing; set `coding=False` to skip that fetch outright.
 
     `path` may be relative, in which case it is written inside the execution's artifacts
     directory and returned to the user automatically; that is also where the default goes.
@@ -360,14 +465,14 @@ def locuszoom(
         frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("_variant_id"))
 
     if lead is None:
-        top = frame.sort("_y", descending=True).row(0, named=True)
-        lead = top["_variant_id"] or f"{top.get('chr', chrom)}:{top['pos']}"
-        lead_pos, lead_y = top["pos"], top["_y"]
+        lead_row = frame.sort("_y", descending=True).row(0, named=True)
+        lead = lead_row["_variant_id"] or f"{lead_row.get('chr', chrom)}:{lead_row['pos']}"
     else:
         match = frame.filter(pl.col("_variant_id") == _norm_variant_id(lead))
         if match.is_empty():
             raise GeneticsUsageError(f"lead {lead!r} is not among the variants in {region}")
-        lead_pos, lead_y = match.row(0, named=True)["pos"], match.row(0, named=True)["_y"]
+        lead_row = match.row(0, named=True)
+    lead_pos, lead_y = lead_row["pos"], lead_row["_y"]
     lead_id = _norm_variant_id(lead)
 
     # the window the DATA covers. Computed here rather than at plotting time because the LD
@@ -397,6 +502,10 @@ def locuszoom(
     colours, r2_values, ld_joined = _ld_colours(frame, lead_id, ld_frame)
     frame = frame.with_columns(pl.Series("_r2", r2_values, dtype=pl.Float64))
 
+    coding_flags, coding_marked = (
+        _coding_flags(frame, region) if coding else ([False] * frame.height, False)
+    )
+
     own_figure = ax is None
     gene_frame = None
     if own_figure:
@@ -418,15 +527,35 @@ def locuszoom(
     else:
         figure, gene_ax = ax.get_figure(), None
 
-    ax.scatter(frame["pos"], frame["_y"], c=colours, s=9, linewidths=0.2,
-               edgecolors="#33333355", zorder=2)
-    ax.scatter([lead_pos], [lead_y], marker="D", s=34, c=_LEAD_COLOUR,
-               edgecolors="black", linewidths=0.4, zorder=3)
-    ax.annotate(lead_id, (lead_pos, lead_y), textcoords="offset points", xytext=(6, 4),
+    # one scatter per shape: matplotlib takes a single marker per call, and the shape is what
+    # separates a coding variant from the rest
+    positions, ys = list(frame["pos"]), list(frame["_y"])
+    for marker, wanted in ((_MARKER_OTHER, False), (_MARKER_CODING, True)):
+        rows = [i for i, is_coding in enumerate(coding_flags) if is_coding is wanted]
+        if not rows:
+            continue
+        ax.scatter([positions[i] for i in rows], [ys[i] for i in rows],
+                   c=[colours[i] for i in rows], marker=marker, s=9, linewidths=0.2,
+                   edgecolors="#33333355", zorder=2)
+
+    lead_index = next(
+        (i for i, vid in enumerate(frame["_variant_id"]) if vid == lead_id), None
+    )
+    lead_coding = bool(lead_index is not None and coding_flags[lead_index])
+    ax.scatter([lead_pos], [lead_y], marker=_MARKER_CODING if lead_coding else _MARKER_OTHER,
+               s=40, c=_LEAD_COLOUR, edgecolors="black", linewidths=0.4, zorder=3)
+    # below the point: above it, the label of a lead at the top of the panel runs into the
+    # axes frame, which is where the strongest association always sits
+    ax.annotate(_lead_label(lead_id, lead_row, lead_y), (lead_pos, lead_y),
+                textcoords="offset points", xytext=(0, -9), ha="center", va="top",
                 fontsize=6)
+    line_y = -math.log10(significance) if significance else 0.0
     if significance:
-        ax.axhline(-math.log10(significance), color="#AA0000", linewidth=0.6, linestyle="--",
-                   zorder=1)
+        ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
+        # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
+        ax.text(0.006, line_y, f"p={significance:g}".replace("e-0", "e-"),
+                transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6,
+                color=_SIGNIFICANCE_GREY)
 
     if outside:
         # on the figure and not only in the returned dict: the figure is what reaches the
@@ -441,7 +570,8 @@ def locuszoom(
             rf"{len(outside)} r$^2\geq${_LD_NOTABLE_R2:g} partner"
             f"{'' if len(outside) == 1 else 's'} outside window; "
             f"nearest {gap / 1000:.0f} kb out, r$^2$={nearest['r2']:.2f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=5, color="#AA0000",
+            transform=ax.transAxes, ha="right", va="top", fontsize=7,
+            color=_WARNING_COLOUR,
         )
 
     ax.set_ylabel(r"$-\log_{10}(p)$")
@@ -459,6 +589,12 @@ def locuszoom(
     # pinned before the gene track can widen it through sharex
     pad = max((span_hi - span_lo) * 0.02, 1)
     ax.set_xlim(span_lo - pad, span_hi + pad)
+
+    # headroom, so the corner notes have somewhere to sit: autoscaling leaves the strongest
+    # association at the top of the panel, which is exactly where the legend and the
+    # outside-window warning are drawn
+    y_top = max(float(frame["_y"].max()), line_y if significance else 0.0)
+    ax.set_ylim(top=y_top + max(y_top * (0.22 if outside else 0.08), 0.5))
 
     n_genes = 0
     if gene_ax is not None:
@@ -483,4 +619,5 @@ def locuszoom(
         "n_genes": n_genes,
         "ld_joined": ld_joined,
         "ld_partners_outside_window": outside,
+        "coding_marked": coding_marked,
     }

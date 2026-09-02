@@ -3,9 +3,10 @@
 Everything here passes `data=` and turns the LD and gene fetches off, so no test reaches a
 service: what is under test is the drawing and the decisions around it, not the client.
 
-What these CANNOT check is the house style — the rcParams come from a matplotlibrc the
-sandbox image bakes, so a figure drawn here is drawn under this venv's matplotlib defaults.
-That half is asserted where it is true, in genetics-results-suite/sandbox/build-checks.py.
+What these CANNOT check is the rcParams — render density comes from a matplotlibrc the sandbox
+image bakes, so a figure drawn here is drawn under this venv's matplotlib defaults. That half
+is asserted where it is true, in genetics-results-suite/sandbox/build-checks.py, which also
+asserts that no STYLE is baked in: scienceplots ships in the image but a script has to ask.
 """
 
 import math
@@ -377,3 +378,142 @@ def test_dir_of_the_sdk_package_lists_the_lazily_resolved_plots_module():
     sdk = importlib.reload(importlib.import_module("genetics_mcp_server.sdk"))
     assert "plots" in dir(sdk), "dir() hides the submodule until something touches it"
     assert not hasattr(sdk, "locuszoom"), "plots functions must not leak to the top level"
+
+
+@pytest.mark.parametrize(
+    "mlog10p,expected",
+    [
+        (12.6814, "2.08e-13"),   # 12:49272869:C:T for hearing loss, p=2.08257e-13
+        (17.1694, "6.77e-18"),   # the same variant for potassium, p=6.77018e-18
+        (0.282271, "5.22e-1"),   # p=0.52207
+        (13.0, "1.00e-13"),      # integral: 10.0e-14 must normalise
+        (400.5, "3.16e-401"),    # 10 ** -400.5 is 0.0 in a float; this is the whole point
+        (0.0, "1"),
+        (None, "1"),
+    ],
+)
+def test_the_p_value_is_taken_apart_from_mlog10p_rather_than_computed(mlog10p, expected):
+    assert plots._format_p(mlog10p) == expected
+
+
+def test_the_lead_label_carries_p_beta_and_af_and_skips_what_is_absent():
+    full = plots._lead_label("12:1:A:G", {"beta": 1.17569, "af": 0.00234211}, 12.6814)
+    assert full == "12:1:A:G\np=2.08e-13  beta=1.18  AF=0.002342"
+    # `data=` may be any frame a caller assembled; a missing column must not lose the figure
+    assert plots._lead_label("12:1:A:G", {}, 12.6814) == "12:1:A:G\np=2.08e-13"
+
+
+def test_coding_consequences_square_and_everything_else_circles(monkeypatch, tmp_path):
+    from genetics_mcp_server import sdk
+
+    frame = frame_of(n=6)
+    ids = [f"12:{49_500_000 + i * 1_000}:C:T" for i in range(6)]
+
+    def fake_annotation(**kwargs):
+        return pl.DataFrame(
+            {
+                "variant": ids,
+                # two coding, then terms that must NOT square: splice_region is up to 8bp
+                # into an intron, and UTR/intron/intergenic are not coding at all
+                "most_severe": [
+                    "missense_variant", "synonymous_variant", "splice_region_variant",
+                    "3_prime_UTR_variant", "intron_variant", "intergenic_variant",
+                ],
+            }
+        )
+
+    monkeypatch.setattr(sdk, "variant_annotation", fake_annotation)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    flags, marked = plots._coding_flags(
+        frame.with_columns(pl.Series("_variant_id", ids)), "12:1-2"
+    )
+    assert marked is True
+    assert flags == [True, True, False, False, False, False]
+
+
+def test_an_unavailable_consequence_lookup_leaves_every_point_a_circle(monkeypatch):
+    from genetics_mcp_server import sdk
+
+    def boom(**kwargs):
+        raise RuntimeError("db-api is down")
+
+    monkeypatch.setattr(sdk, "variant_annotation", boom)
+    frame = frame_of(n=4).with_columns(pl.Series("_variant_id", ["a", "b", "c", "d"]))
+    flags, marked = plots._coding_flags(frame, "12:1-2")
+    assert flags == [False] * 4
+    assert marked is False, "a failed lookup must not read as 'nothing here is coding'"
+
+
+def test_coding_false_skips_the_fetch_entirely(monkeypatch, tmp_path):
+    from genetics_mcp_server import sdk
+
+    def refuse(**kwargs):  # pragma: no cover - only runs on a regression
+        raise AssertionError("variant_annotation was fetched despite coding=False")
+
+    monkeypatch.setattr(sdk, "variant_annotation", refuse)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=False, coding=False,
+    )
+    assert result["coding_marked"] is False
+
+
+def test_the_lead_is_not_a_diamond_and_the_significance_line_is_grey(monkeypatch, tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(sdk, "variant_annotation", lambda **k: pl.DataFrame())
+    _figure, ax = plt.subplots()
+    plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=False, ax=ax,
+    )
+    # reference paths built by scatter itself: a MarkerStyle path is transformed on the way
+    # into a collection, so comparing against MarkerStyle("D").get_path() never matches and
+    # the assertion passes whatever is drawn
+    _ref_fig, ref_ax = plt.subplots()
+    reference = {}
+    for name in ("o", "s", "D"):
+        ref_ax.scatter([0], [0], marker=name)
+        reference[name] = ref_ax.collections[-1].get_paths()[0].vertices
+    plt.close(_ref_fig)
+
+    def shape_of(vertices):
+        for name, ref in reference.items():
+            if vertices.shape == ref.shape and (vertices == ref).all():
+                return name
+        return "?"
+
+    drawn = {shape_of(c.get_paths()[0].vertices) for c in ax.collections}
+    assert "D" not in drawn, "the lead is still drawn as a diamond"
+    assert drawn <= {"o", "s"}, f"unexpected marker shapes: {drawn}"
+
+    line = next(ln for ln in ax.lines if ln.get_linestyle() == "--")
+    assert line.get_color() == plots._SIGNIFICANCE_GREY
+    label = next(t for t in ax.texts if t.get_text().startswith("p="))
+    assert label.get_text() == "p=5e-8", "the padded exponent reached the figure"
+    assert label.get_color() == plots._SIGNIFICANCE_GREY
+    plt.close("all")
+
+
+def test_the_lead_annotation_sits_below_the_point(monkeypatch, tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(sdk, "variant_annotation", lambda **k: pl.DataFrame())
+    _figure, ax = plt.subplots()
+    plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=False, ax=ax,
+    )
+    note = next(t for t in ax.texts if "p=" in t.get_text() and "\n" in t.get_text())
+    assert note.get_verticalalignment() == "top"
+    assert note.xyann[1] < 0, "the label is offset upwards and will run into the axes frame"
+    plt.close("all")
