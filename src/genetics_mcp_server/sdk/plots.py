@@ -180,11 +180,14 @@ def _draw_genes(ax, genes: pl.DataFrame, start: int, end: int, max_rows: int = 4
                 continue
             row_ends.append(0)
         row_ends[row] = g_end
-        ax.plot([g_start, g_end], [-row, -row], linewidth=2.0, solid_capstyle="butt",
+        # clipped to the window: a gene overlapping the boundary is returned whole, and on a
+        # shared x axis its far end drags the association panel's limits out with it
+        left, right = max(g_start, start), min(g_end, end)
+        ax.plot([left, right], [-row, -row], linewidth=2.0, solid_capstyle="butt",
                 color="#4A4A4A")
         strand = (gene.get("gene_strand") or "").strip()
         label = f"{name}{'→' if strand == '+' else '←' if strand == '-' else ''}"
-        ax.text((g_start + g_end) / 2, -row + 0.22, label, ha="center", va="bottom",
+        ax.text((left + right) / 2, -row + 0.22, label, ha="center", va="bottom",
                 fontsize=5, color="#222222")
         drawn += 1
     ax.set_yticks([])
@@ -220,7 +223,10 @@ def locuszoom(
     window, and LD is taken against it from the FinnGen LD server.
 
     Returns a dict describing what was drawn — path, lead, n_variants, region, and
-    `ld_joined`, which is False when the LD server returned nothing for the lead. That case
+    `ld_joined`, which is False when the LD server returned nothing for the lead. IN THE
+    DEPLOYED SANDBOX IT IS ALWAYS FALSE: the LD server is on the public internet and the
+    sandbox has no DNS and no internet egress, by design, so `ld=True` costs one fast
+    resolver failure and the points come out grey. That case
     is a plot with grey points rather than an error, because a locuszoom without LD is still
     the right picture of the locus; check the flag rather than assuming the colours mean
     something.
@@ -339,10 +345,14 @@ def locuszoom(
         ax.legend(handles=handles, title=r"$r^2$", fontsize=5, title_fontsize=5,
                   loc="upper left", ncol=1)
 
+    # the window the DATA covers, pinned before the gene track can widen it through sharex
+    span_lo, span_hi = int(frame["pos"].min()), int(frame["pos"].max())
+    pad = max((span_hi - span_lo) * 0.02, 1)
+    ax.set_xlim(span_lo - pad, span_hi + pad)
+
     n_genes = 0
     if gene_ax is not None:
-        start, end = int(frame["pos"].min()), int(frame["pos"].max())
-        n_genes = _draw_genes(gene_ax, gene_frame, start, end)
+        n_genes = _draw_genes(gene_ax, gene_frame, span_lo, span_hi)
         gene_ax.set_xlabel(f"position on chromosome {frame['chr'][0] if 'chr' in frame.columns else ''}".rstrip())
     else:
         ax.set_xlabel("position")

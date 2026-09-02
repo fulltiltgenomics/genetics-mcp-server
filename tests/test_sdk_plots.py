@@ -197,3 +197,69 @@ def test_every_exported_plot_has_a_docstring_the_catalogue_can_render():
     for name in plots.__all__:
         function = getattr(plots, name)
         assert function.__doc__ and function.__doc__.strip(), f"{name} has no docstring"
+
+
+def test_a_gene_overlapping_the_boundary_does_not_widen_the_association_panel(
+    tmp_path, monkeypatch
+):
+    """Measured on staging before this was pinned: gene_annotations returns a gene WHOLE when
+    it merely overlaps the window, and on a shared x axis its far end dragged the limits out,
+    squeezing the association panel into a fraction of the figure."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    frame = frame_of()
+    overhanging = pl.DataFrame(
+        {
+            "gene_name": ["TUBA1C"],
+            "gene_start": [49_490_000],
+            # a long way past the last variant, the way a real gene overlapping the edge is
+            "gene_end": [52_000_000],
+            "gene_strand": ["+"],
+        }
+    )
+    monkeypatch.setattr(sdk, "gene_annotations", lambda **_kw: overhanging, raising=False)
+
+    drawn = {}
+    original = matplotlib.figure.Figure.savefig
+
+    def record(self, *args, **kwargs):
+        drawn["figure"] = self
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", record)
+
+    result = plots.locuszoom(
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame,
+        ld=False,
+        genes=True,
+        path=str(tmp_path / "lz.png"),
+    )
+    assert result["n_genes"] == 1
+    _lo, hi = drawn["figure"].axes[0].get_xlim()
+    assert hi < frame["pos"].max() + 10_000, (
+        f"the gene track widened the shared axis to {hi}"
+    )
+    plt.close("all")
+
+
+def test_the_x_axis_covers_the_data_and_not_much_more(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    _figure, ax = plt.subplots()
+    frame = frame_of()
+    plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame, ld=False, genes=False, ax=ax
+    )
+    lo, hi = ax.get_xlim()
+    span = frame["pos"].max() - frame["pos"].min()
+    assert lo == pytest.approx(frame["pos"].min() - span * 0.02)
+    assert hi == pytest.approx(frame["pos"].max() + span * 0.02)
+    plt.close("all")
