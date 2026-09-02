@@ -166,6 +166,26 @@ class TestListCapabilities:
         result = await executor.list_capabilities(module=module)
         assert "import genetics" in result["usage"]
 
+    @pytest.mark.parametrize("module", ["genetics", "client", "errors", "plots"])
+    async def test_every_module_response_shows_the_call_path_not_only_the_import(
+        self, executor, module
+    ):
+        """The import line alone reads as `genetics.<name>(...)` for every module, which is
+        right for one of the four. Measured: a session read `def locuszoom(...)` out of
+        module="plots", wrote `genetics.locuszoom(...)`, got an AttributeError and spent two
+        further executions finding `genetics.plots`."""
+        from genetics_mcp_server.tools.executor import _SDK_CALL_PREFIXES, _sdk_members
+
+        result = await executor.list_capabilities(module=module)
+        first = _sdk_members(module)[0][0]
+        assert f"{_SDK_CALL_PREFIXES[module]}{first}" in result["usage"]
+        # the example must name something the module really exports
+        assert first in result["signatures"]
+
+    async def test_the_plots_call_path_is_the_one_a_script_can_actually_write(self, executor):
+        result = await executor.list_capabilities(module="plots")
+        assert "genetics.plots.locuszoom" in result["usage"]
+
     async def test_index_summaries_do_not_come_from_module_docstrings(self, executor):
         from genetics_mcp_server import sdk
 

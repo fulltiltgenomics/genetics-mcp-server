@@ -5291,6 +5291,28 @@ _SDK_USAGE = (
     "genetics_mcp_server.sdk)"
 )
 
+# How a name in each module is actually written at a call site. The import line alone reads as
+# `genetics.<name>(...)` for every module — right for `genetics`, wrong for the other three,
+# and measured wrong: a session read `def locuszoom(...)` out of module="plots", called
+# `genetics.locuszoom(...)`, got an AttributeError, and spent two more executions finding
+# `genetics.plots`. The prefix is rendered against a real member name so the example cannot
+# name a function the module does not export.
+_SDK_CALL_PREFIXES = {
+    "genetics": "genetics.",
+    "client": "await genetics.get_client().",
+    "errors": "except genetics.",
+    "plots": "genetics.plots.",
+}
+
+
+def _sdk_usage(module: str | None) -> str:
+    if module is None:
+        return _SDK_USAGE
+    first = next((name for name, _obj in _sdk_members(module)), None)
+    if first is None:
+        return _SDK_USAGE
+    return f"{_SDK_USAGE}; call these as {_SDK_CALL_PREFIXES[module]}{first}"
+
 
 def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
     from genetics_mcp_server.sdk import client as sdk_client
@@ -5303,7 +5325,7 @@ def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
     if module is None:
         return {
             "success": True,
-            "usage": _SDK_USAGE,
+            "usage": _sdk_usage(None),
             "modules": [
                 {
                     "module": name,
@@ -5326,6 +5348,6 @@ def _sdk_capabilities(module: str | None = None) -> dict[str, Any]:
     return {
         "success": True,
         "module": module,
-        "usage": _SDK_USAGE,
+        "usage": _sdk_usage(module),
         "signatures": "\n\n".join(blocks),
     }

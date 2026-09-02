@@ -174,6 +174,17 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def __dir__() -> list[str]:
+    """`plots` is absent from the module dict until __getattr__ has resolved it once.
+
+    Without this, `dir(genetics)` — the obvious probe after a wrong guess at a name — reports
+    that the lazily-resolved submodule does not exist. Measured: a session that guessed
+    `genetics.locuszoom(...)`, got the AttributeError, ran `dir(genetics)` and was told
+    nothing, then spent a further execution discovering `from genetics import plots`.
+    """
+    return sorted(set(globals()) | set(__all__))
+
+
 __all__ = [
     *_FUNCTIONS,
     "GeneticsClient",

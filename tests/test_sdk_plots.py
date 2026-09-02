@@ -263,3 +263,117 @@ def test_the_x_axis_covers_the_data_and_not_much_more(tmp_path):
     assert lo == pytest.approx(frame["pos"].min() - span * 0.02)
     assert hi == pytest.approx(frame["pos"].max() + span * 0.02)
     plt.close("all")
+
+
+def test_a_relative_path_lands_in_the_artifacts_directory(tmp_path, monkeypatch):
+    """A relative name used to be written to the process cwd, which the sandbox does not
+    collect: the call succeeded, the figure was drawn, and nothing came back."""
+    artifacts, cwd = tmp_path / "artifacts", tmp_path / "cwd"
+    artifacts.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(artifacts))
+    monkeypatch.chdir(cwd)
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=False, path="hearing_loss.png",
+    )
+    assert result["path"] == str(artifacts / "hearing_loss.png")
+    assert (artifacts / "hearing_loss.png").exists()
+    assert not list(cwd.iterdir()), "the figure was written to the cwd and would be lost"
+
+
+def test_an_absolute_path_is_honoured_as_given(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
+    (tmp_path / "artifacts").mkdir()
+    target = tmp_path / "somewhere_else.png"
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=False, path=str(target),
+    )
+    assert result["path"] == str(target)
+    assert target.exists()
+    assert not list((tmp_path / "artifacts").iterdir())
+
+
+def test_ld_is_asked_for_over_more_than_the_plotted_span_and_above_a_floor(
+    monkeypatch, tmp_path
+):
+    """Both halves matter. r2>=0 makes the server answer with the whole panel, which buries
+    the colour and truncates positionally; a window equal to the plot cannot see a partner
+    just outside it."""
+    from genetics_mcp_server import sdk
+
+    seen = {}
+
+    def fake_ld(variant, *, window, r2_threshold, panel):
+        seen.update(variant=variant, window=window, r2_threshold=r2_threshold, panel=panel)
+        return pl.DataFrame({"variant": [], "r2": []}, schema={"variant": pl.Utf8, "r2": pl.Float64})
+
+    monkeypatch.setattr(sdk, "ld", fake_ld)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    frame = frame_of(n=25)  # 24 kb of positions
+    plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame, genes=False, ld=True,
+    )
+    span = int(frame["pos"].max()) - int(frame["pos"].min())
+    assert seen["r2_threshold"] == plots._LD_MIN_R2 > 0
+    assert seen["window"] >= plots._LD_SEARCH_SPAN_MULTIPLE * span
+    assert seen["panel"] == "sisu42"
+
+
+def test_a_correlated_partner_outside_the_window_is_reported_and_drawn(monkeypatch, tmp_path):
+    """The failure this exists for: a ±250 kb plot of 12:49272869:C:T excludes
+    12:49564549:G:A, which is r²=0.78 with the lead and more significant than it."""
+    from genetics_mcp_server import sdk
+
+    def fake_ld(variant, *, window, r2_threshold, panel):
+        return pl.DataFrame(
+            {
+                # inside the window, and one 64 kb past its right edge
+                "variant": ["12:49505000:A:G", "12:49564549:G:A", "12:49570000:T:C"],
+                "r2": [0.9, 0.78, 0.05],
+            }
+        )
+
+    monkeypatch.setattr(sdk, "ld", fake_ld)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), genes=False, ld=True,
+    )
+    outside = result["ld_partners_outside_window"]
+    # 0.05 is below the reporting floor, 0.9 is inside the plotted span
+    assert [p["variant"] for p in outside] == ["12:49564549:G:A"]
+    assert outside[0]["pos"] == 49_564_549
+    assert outside[0]["r2"] == pytest.approx(0.78)
+
+
+def test_nothing_outside_the_window_reports_an_empty_list_not_a_missing_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False, genes=False
+    )
+    assert result["ld_partners_outside_window"] == []
+
+
+def test_partners_outside_ranks_by_r2_and_ignores_what_it_cannot_place():
+    ld = pl.DataFrame(
+        {
+            "variant": ["12:100:A:G", "12:900:A:G", "12:950:A:G", "not-a-variant", "12:500:A:G"],
+            "r2": [0.3, 0.9, None, 0.99, 0.95],
+        }
+    )
+    found = plots._partners_outside(ld, 400, 600)
+    assert [p["r2"] for p in found] == [0.9, 0.3]
+    assert plots._partners_outside(None, 400, 600) == []
+
+
+def test_dir_of_the_sdk_package_lists_the_lazily_resolved_plots_module():
+    """`dir(genetics)` is the obvious probe after a wrong guess at a name, and a module
+    __getattr__ without a matching __dir__ answers that the submodule does not exist."""
+    import importlib
+    import sys
+
+    sys.modules.pop("genetics_mcp_server.sdk.plots", None)
+    sdk = importlib.reload(importlib.import_module("genetics_mcp_server.sdk"))
+    assert "plots" in dir(sdk), "dir() hides the submodule until something touches it"
+    assert not hasattr(sdk, "locuszoom"), "plots functions must not leak to the top level"

@@ -51,10 +51,45 @@ _LD_BINS: tuple[tuple[float, str, str], ...] = (
 _LD_UNKNOWN = "#BBBBBB"
 _LEAD_COLOUR = "#7D26CD"
 
+# Asked of the LD server rather than 0.0. At r²≥0 it answers with every variant in the panel,
+# which costs twice: the informative points disappear into a navy cloud of r²≈0, and the answer
+# is truncated positionally. Measured at 12:49272869:C:T — a ±250 kb request came back with
+# 3000 entries spanning 49,023,161–49,503,366 while the panel holds 3097 in that window, so the
+# right-hand edge of the plot went grey with nothing to say why. At this floor the same locus
+# returns 17 entries across ±500 kb: every point that carries colour, and no truncation.
+# A variant below it is grey — not measured-and-low, but "not among the ones worth colouring",
+# which is what grey already means for a variant the panel does not carry at all.
+_LD_MIN_R2 = 0.05
+
+# LD is asked for over this multiple of the plotted span so a correlated partner just outside
+# the window can be named rather than silently omitted. Measured at the same locus: the
+# strongest variant there (r²=0.78, and more significant than the lead) sits 292 kb away, so a
+# ±250 kb plot drops the one point showing the signal is not a singleton.
+_LD_SEARCH_SPAN_MULTIPLE = 2
+
+# r² at which a partner outside the window is worth reporting: the first bin above "< 0.2",
+# i.e. the first whose colour a reader would have noticed had it been in frame.
+_LD_NOTABLE_R2 = 0.2
+
 
 def _artifacts_dir() -> str:
     """Where a sandbox execution's files are collected. Outside the sandbox, the cwd."""
     return os.environ.get("SANDBOX_ARTIFACTS_DIR") or "."
+
+
+def _resolve_path(path: str | None) -> str:
+    """Where the figure is written. A relative name lands in the artifacts directory.
+
+    Not `path or <default>`: a relative `path=` used to be written to the process cwd, which
+    the sandbox does not collect, so a correct call drew the figure and returned nothing. The
+    caller's only clue was an empty artifact list, and the docstring promised the opposite.
+    An absolute path is honoured as given.
+    """
+    if path is None:
+        return os.path.join(_artifacts_dir(), "locuszoom.png")
+    if os.path.isabs(path):
+        return path
+    return os.path.join(_artifacts_dir(), path)
 
 
 def _norm_chrom(value: Any) -> str:
@@ -78,6 +113,40 @@ def _norm_variant_id(value: Any) -> str:
         return str(value).strip()
     chrom, pos, ref, alt = parts
     return _variant_id(chrom, pos, ref, alt)
+
+
+def _variant_pos(value: Any) -> int | None:
+    parts = str(value).split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _partners_outside(
+    ld_frame: pl.DataFrame | None, lo: int, hi: int
+) -> list[dict[str, Any]]:
+    """LD partners the plotted window excludes, strongest first.
+
+    A locuszoom is read as "this is the locus", so a correlated variant just past the edge is
+    not a missing detail — it is the difference between a lone signal and a supported one, and
+    the window is a default nobody chose per locus.
+    """
+    if ld_frame is None or ld_frame.is_empty() or "variant" not in ld_frame.columns:
+        return []
+    found = []
+    for row in ld_frame.iter_rows(named=True):
+        variant, r2 = row.get("variant"), row.get("r2")
+        if variant is None or r2 is None or float(r2) < _LD_NOTABLE_R2:
+            continue
+        pos = _variant_pos(variant)
+        if pos is None or lo <= pos <= hi:
+            continue
+        found.append({"variant": _norm_variant_id(variant), "pos": pos, "r2": float(r2)})
+    found.sort(key=lambda partner: partner["r2"], reverse=True)
+    return found
 
 
 def _region_from_variant(variant: str, flank: int) -> tuple[str, str]:
@@ -222,16 +291,29 @@ def locuszoom(
     centred with `flank` either side. `lead` defaults to the strongest association in the
     window, and LD is taken against it from the FinnGen LD server.
 
-    Returns a dict describing what was drawn — path, lead, n_variants, region, and
-    `ld_joined`, which is False when the LD server returned nothing for the lead — a plot
-    with grey points rather than an error, because a locuszoom without LD is still the right
-    picture of the locus. Check the flag rather than assuming the colours mean something:
-    the LD server is a third party, reached through a proxy, so an outage there costs the
-    colours and nothing else.
+    Grey means "no r² to show" — either the LD panel does not carry the variant or its r² is
+    below the floor these plots colour at. Only the correlated variants are coloured, so the
+    ramp reads at a glance instead of painting the whole cloud navy.
 
-    Writes into the execution's artifacts directory by default, so the figure is returned to
-    the user automatically. Pass `ax` to draw into an existing axis instead, in which case no
-    gene track is added and nothing is saved.
+    Returns a dict describing what was drawn: `path`, `lead`, `lead_mlog10p`, `region`,
+    `phenotype`, `n_variants`, `n_genes`, plus two worth reading every time.
+
+    `ld_joined` is False when the LD server returned nothing for the lead — a plot with grey
+    points rather than an error, because a locuszoom without LD is still the right picture of
+    the locus. Check it rather than assuming the colours mean something: the LD server is a
+    third party, reached through a proxy, so an outage there costs the colours and nothing
+    else.
+
+    `ld_partners_outside_window` lists the variants correlated with the lead that fall
+    outside the window, strongest first, as {variant, pos, r2}. It is non-empty when the
+    window is too narrow for the locus — the signal has support the plot does not show — and
+    the fix is to redraw with a larger `flank` or an explicit `region`. The figure carries
+    the same warning so a reader who never sees this dict is not misled.
+
+    `path` may be relative, in which case it is written inside the execution's artifacts
+    directory and returned to the user automatically; that is also where the default goes.
+    Pass `ax` to draw into an existing axis instead, in which case no gene track is added and
+    nothing is saved.
     """
     import matplotlib.pyplot as plt
 
@@ -288,15 +370,30 @@ def locuszoom(
         lead_pos, lead_y = match.row(0, named=True)["pos"], match.row(0, named=True)["_y"]
     lead_id = _norm_variant_id(lead)
 
+    # the window the DATA covers. Computed here rather than at plotting time because the LD
+    # request is sized from it: `flank` is meaningless when the caller gave region=, and the
+    # old `2 * flank` asked for the default width regardless of what was actually drawn.
+    span_lo, span_hi = int(frame["pos"].min()), int(frame["pos"].max())
+
     ld_frame = None
+    outside: list[dict[str, Any]] = []
     if ld:
         try:
-            ld_frame = sdk.ld(lead_id, window=max(2 * flank, 200_000), r2_threshold=0.0,
-                              panel=ld_panel)
+            ld_frame = sdk.ld(
+                lead_id,
+                # the server's `window` is the TOTAL span it centres on the lead, so this is
+                # _LD_SEARCH_SPAN_MULTIPLE times the plotted width — wide enough to cover the
+                # window from a lead anywhere inside it, and to see just past both edges
+                window=max(_LD_SEARCH_SPAN_MULTIPLE * max(span_hi - span_lo, 1), 200_000),
+                r2_threshold=_LD_MIN_R2,
+                panel=ld_panel,
+            )
         except Exception:
             # the LD server is a third party and its absence must not lose the figure; the
             # returned ld_joined=False is how a caller learns the colours mean nothing
             ld_frame = None
+        else:
+            outside = _partners_outside(ld_frame, span_lo, span_hi)
     colours, r2_values, ld_joined = _ld_colours(frame, lead_id, ld_frame)
     frame = frame.with_columns(pl.Series("_r2", r2_values, dtype=pl.Float64))
 
@@ -331,6 +428,22 @@ def locuszoom(
         ax.axhline(-math.log10(significance), color="#AA0000", linewidth=0.6, linestyle="--",
                    zorder=1)
 
+    if outside:
+        # on the figure and not only in the returned dict: the figure is what reaches the
+        # reader, and a plot that silently omits the locus's best-correlated variant is wrong
+        # in the one way a reader cannot detect
+        nearest = min(
+            outside, key=lambda p: min(abs(p["pos"] - span_lo), abs(p["pos"] - span_hi))
+        )
+        gap = min(abs(nearest["pos"] - span_lo), abs(nearest["pos"] - span_hi))
+        ax.text(
+            0.995, 0.99,
+            rf"{len(outside)} r$^2\geq${_LD_NOTABLE_R2:g} partner"
+            f"{'' if len(outside) == 1 else 's'} outside window; "
+            f"nearest {gap / 1000:.0f} kb out, r$^2$={nearest['r2']:.2f}",
+            transform=ax.transAxes, ha="right", va="top", fontsize=5, color="#AA0000",
+        )
+
     ax.set_ylabel(r"$-\log_{10}(p)$")
     ax.set_title(title if title is not None else f"{phenotype} — {region}")
     ax.margins(x=0.02)
@@ -343,8 +456,7 @@ def locuszoom(
         ax.legend(handles=handles, title=r"$r^2$", fontsize=5, title_fontsize=5,
                   loc="upper left", ncol=1)
 
-    # the window the DATA covers, pinned before the gene track can widen it through sharex
-    span_lo, span_hi = int(frame["pos"].min()), int(frame["pos"].max())
+    # pinned before the gene track can widen it through sharex
     pad = max((span_hi - span_lo) * 0.02, 1)
     ax.set_xlim(span_lo - pad, span_hi + pad)
 
@@ -357,7 +469,7 @@ def locuszoom(
 
     written = None
     if own_figure:
-        written = path or os.path.join(_artifacts_dir(), "locuszoom.png")
+        written = _resolve_path(path)
         figure.savefig(written)
         plt.close(figure)
 
@@ -370,4 +482,5 @@ def locuszoom(
         "n_variants": frame.height,
         "n_genes": n_genes,
         "ld_joined": ld_joined,
+        "ld_partners_outside_window": outside,
     }
