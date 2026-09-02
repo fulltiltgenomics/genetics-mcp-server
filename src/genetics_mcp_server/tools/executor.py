@@ -5156,7 +5156,7 @@ class ToolExecutor:
 # the modules a script sees, in the order the index reports them. They are the three the
 # sandbox stubs are generated from (sandbox/stubs/*.pyi), so the tool and the shipped
 # reference describe the same surface.
-_SDK_MODULES = ("genetics", "client", "errors")
+_SDK_MODULES = ("genetics", "client", "errors", "plots")
 
 # one-line labels written here rather than taken from each module's __doc__. The catalogue
 # renders per-function signatures and docstrings only: module docstrings describe the
@@ -5167,6 +5167,7 @@ _SDK_MODULE_SUMMARIES = {
     "genetics": "the sync functions a script calls; every one returns a polars DataFrame",
     "client": "the awaitable GeneticsClient form of the same functions",
     "errors": "what a script catches",
+    "plots": "ready-made standard figures; they draw, they do not fetch",
 }
 
 # `genetics` re-exports these beyond the data functions; the data functions themselves come
@@ -5230,6 +5231,13 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
             for n in names
             if hasattr(sdk_client.GeneticsClient, n)
         ]
+    if module == "plots":
+        # __all__ rather than a name list here: sdk/plots.py's own export list is what the
+        # generated stub reads too, so the catalogue and the stub cannot disagree about
+        # which plots exist
+        from genetics_mcp_server.sdk import plots as sdk_plots
+
+        return [(n, getattr(sdk_plots, n)) for n in sdk_plots.__all__]
     return [
         (n, obj)
         for n, obj in vars(sdk_errors).items()

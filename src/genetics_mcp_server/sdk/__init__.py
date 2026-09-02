@@ -153,6 +153,27 @@ for _name in _FUNCTIONS:
     globals()[_name] = _make_sync(_name)
 del _name
 
+def __getattr__(name: str):
+    """`genetics.plots` resolves on first use, and only then.
+
+    Deliberately lazy rather than an import at the top of this file: plots imports
+    matplotlib.pyplot, and this package is imported by chat-backend and mcp-server, where a
+    figure is never drawn. In the sandbox the cost is already paid — the supervisor prewarms
+    matplotlib before the first fork — so the laziness buys the servers an import they do not
+    need and costs a script nothing.
+    """
+    if name == "plots":
+        # import_module and NOT `from genetics_mcp_server.sdk import plots`: the `from` form
+        # asks this package for the attribute, which lands back here — measured, as a
+        # RecursionError at collection time the moment a test imported it that way.
+        import importlib
+
+        module = importlib.import_module("genetics_mcp_server.sdk.plots")
+        globals()["plots"] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     *_FUNCTIONS,
     "GeneticsClient",
@@ -162,4 +183,5 @@ __all__ = [
     "configure",
     "get_client",
     "parse_region",
+    "plots",
 ]

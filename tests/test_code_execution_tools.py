@@ -67,14 +67,14 @@ class TestToolDefinitions:
         assert tools["read_artifact"]["input_schema"]["required"] == ["name"]
         capabilities = tools["list_capabilities"]["input_schema"]
         assert capabilities["required"] == []
-        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors"]
+        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors", "plots"]
 
 
 class TestListCapabilities:
     async def test_index_lists_every_module(self, executor):
         result = await executor.list_capabilities()
         assert result["success"] is True
-        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors"]
+        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors", "plots"]
         assert all(m["summary"] for m in result["modules"])
 
     async def test_index_covers_the_whole_sdk_export_list(self, executor):
@@ -116,7 +116,7 @@ class TestListCapabilities:
 
     async def test_discloses_no_credentials(self, executor, monkeypatch):
         monkeypatch.setenv("INTERNAL_API_SECRET", "super-secret-value")
-        for module in (None, "genetics", "client", "errors"):
+        for module in (None, "genetics", "client", "errors", "plots"):
             result = await executor.list_capabilities(module=module)
             assert "super-secret-value" not in str(result)
 
@@ -146,14 +146,14 @@ class TestListCapabilities:
             "results-api",
             "genetics-results-suite-6uk",
         )
-        for module in (None, "genetics", "client", "errors"):
+        for module in (None, "genetics", "client", "errors", "plots"):
             result = await executor.list_capabilities(module=module)
             assert "doc" not in result
             rendered = str(result)
             for token in forbidden:
                 assert token not in rendered, f"{token!r} leaked for module {module!r}"
 
-    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors"])
+    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors", "plots"])
     async def test_every_response_says_how_to_import_the_sdk(self, executor, module):
         """genetics-results-suite-706: the catalogue is the only reachable place that can.
 

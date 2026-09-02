@@ -21,6 +21,7 @@ files are also read with `ast`, which is the only half that can see a deferred i
 """
 
 import ast
+import importlib
 import json
 import os
 import subprocess
@@ -288,17 +289,32 @@ print(json.dumps({
 )
 
 
+# Shipped by prune_venv.py's SDK_ALLOWLIST but NOT reachable from `import
+# genetics_mcp_server.sdk`, so the closure probe below cannot see them. sdk/plots.py is
+# resolved through sdk/__init__.py's module __getattr__ precisely so the servers never import
+# matplotlib, which means the measurement that keeps this file honest stops at its door — and
+# a deferred `import somethingelse` inside it would ship and fail inside the sandbox with
+# nothing here objecting. Listed rather than measured because there is nothing to measure: if
+# this list and SDK_ALLOWLIST disagree, the symptom is a shipped file nobody scans.
+SHIPPED_OUTSIDE_CLOSURE = ("genetics_mcp_server.sdk.plots",)
+
+
 def _shipped_sources() -> dict[str, str]:
     """The files the sandbox image ships, measured rather than listed a second time.
 
     prune_venv.py's SDK_ALLOWLIST is the same set expressed as paths; deriving these from the
     live closure keeps this from becoming a third copy of it, and the equality test above is
-    what pins the set itself.
+    what pins the set itself. SHIPPED_OUTSIDE_CLOSURE is the deliberate exception, and is the
+    only part of this that IS a second list.
     """
     result = _run_probe(_CLOSURE_FILES_PROBE)
     assert result.returncode == 0, result.stderr
     files = json.loads(result.stdout.strip().splitlines()[-1])
     assert all(files.values()), f"a closure module has no source file: {files}"
+    for name in SHIPPED_OUTSIDE_CLOSURE:
+        module = importlib.import_module(name)
+        assert module.__file__, f"{name} has no source file"
+        files[name] = module.__file__
     return files
 
 

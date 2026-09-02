@@ -1630,7 +1630,7 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "module": {
                 "type": "string",
                 "description": "SDK module to describe. Omit for the index.",
-                "enum": ["genetics", "client", "errors"],
+                "enum": ["genetics", "client", "errors", "plots"],
             },
         },
     },
@@ -1658,6 +1658,11 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "markdown image placeholder for it. Any OTHER artifact can be read back with "
             "read_artifact by name, for about 5 minutes after the run; printing what you need "
             "is still cheaper than reading a file back, so print anything small.\n\n"
+            "Standard figures are already written: `genetics.plots` has the conventional ones "
+            "— a locuszoom among them — so a request for one is a call, not a plot to compose "
+            "from scratch. list_capabilities(module=\"plots\") lists what is there. Every "
+            "figure is styled by the sandbox itself; a script neither needs nor should add a "
+            "style, and one that sets its own is overriding a deliberate default.\n\n"
             "Each run is independent: no variables, files or imports survive from one call to "
             "the next, so a follow-up script must redo the work it needs."
         ),
@@ -2633,7 +2638,7 @@ def register_mcp_tools(
 
         @mcp.tool()
         async def list_capabilities(module: str | None = None) -> dict:
-            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors') as signatures with docstrings. Omit module for the index."""
+            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors', 'plots') as signatures with docstrings. Omit module for the index."""
             return await executor.list_capabilities(module=module)
 
     # run_analysis has NO block here, deliberately, and the omission is the point.
