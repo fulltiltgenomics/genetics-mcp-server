@@ -550,3 +550,115 @@ def test_the_leads_gene_and_consequence_are_drawn_and_returned(monkeypatch, tmp_
     )
     assert result["lead_consequence"] == "missense_variant"
     assert result["lead_gene"] == "TUBA1C"
+
+
+# ----------------------------------------------------------------- the gene models
+
+
+def gene_axis():
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt.subplots()
+
+
+PCSK9 = {
+    "gene_name": ["PCSK9"],
+    "gene_start": [55_039_445],
+    "gene_end": [55_064_852],
+    "gene_strand": ["+"],
+    # first exon entirely 5' UTR, second exon translated in full, third partly
+    "exon_starts": [[55_039_445, 55_043_843, 55_052_000]],
+    "exon_ends": [[55_039_763, 55_044_063, 55_052_400]],
+    "cds_starts": [[None, 55_043_843, 55_052_000]],
+    "cds_ends": [[None, 55_044_063, 55_052_200]],
+}
+
+
+def test_exon_spans_pairs_each_exon_with_its_own_coding_bounds():
+    spans = plots._exon_spans({k: v[0] for k, v in PCSK9.items()})
+    assert spans == [
+        (55_039_445, 55_039_763, None, None),
+        (55_043_843, 55_044_063, 55_043_843, 55_044_063),
+        (55_052_000, 55_052_400, 55_052_000, 55_052_200),
+    ]
+
+
+@pytest.mark.parametrize(
+    "gene",
+    [
+        {},                                                    # a results-api with no exons
+        {"exon_starts": [], "exon_ends": []},                  # a release with no exon file
+        {"exon_starts": [1, 2], "exon_ends": [3]},             # lists that cannot be paired
+    ],
+)
+def test_a_gene_without_usable_exon_structure_draws_its_body_alone(gene):
+    """Three different upstreams arrive as the same thing here, and none may raise: the
+    track degrades to gene bodies, which is what it drew before exons existed."""
+    assert plots._exon_spans(gene) == []
+
+
+def test_a_coding_exon_is_drawn_thicker_than_its_utr_and_the_body_thinnest():
+    """Thickness IS the encoding — a reader tells UTR from coding sequence by nothing else."""
+    figure, ax = gene_axis()
+    drawn, exons = plots._draw_genes(ax, pl.DataFrame(PCSK9), 55_030_000, 55_070_000)
+
+    assert (drawn, exons) == (1, 3)
+    widths = sorted({line.get_linewidth() for line in ax.lines})
+    assert widths == [
+        plots._GENE_BODY_WIDTH,
+        plots._GENE_EXON_WIDTH,
+        plots._GENE_CDS_WIDTH,
+    ], "the three tiers of a gene model are not all present and distinct"
+
+    utr_only = [
+        line for line in ax.lines
+        if line.get_linewidth() == plots._GENE_CDS_WIDTH
+        and list(line.get_xdata())[0] == 55_039_445
+    ]
+    assert not utr_only, "an untranslated exon was given a coding bar"
+
+
+def test_an_exon_outside_the_window_is_clipped_away_rather_than_drawn():
+    """The API returns a gene whole, exons included, so a gene overhanging the window brings
+    exons that belong to no visible part of it."""
+    figure, ax = gene_axis()
+    plots._draw_genes(ax, pl.DataFrame(PCSK9), 55_030_000, 55_040_000)
+
+    for line in ax.lines:
+        xs = list(line.get_xdata())
+        assert max(xs) <= 55_040_000 and min(xs) >= 55_030_000
+
+
+def test_locuszoom_reports_how_many_exons_it_drew(tmp_path, monkeypatch):
+    """`n_exons` is what tells a caller whether the track has structure at all, the way
+    `ld_joined` tells them whether the colours mean anything."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    with_exons = pl.DataFrame(
+        {**PCSK9, "gene_start": [49_490_000], "gene_end": [49_530_000],
+         "exon_starts": [[49_500_000, 49_510_000]],
+         "exon_ends": [[49_500_400, 49_510_600]],
+         "cds_starts": [[None, 49_510_000]],
+         "cds_ends": [[None, 49_510_600]]}
+    )
+    monkeypatch.setattr(sdk, "gene_annotations", lambda **_kw: with_exons, raising=False)
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=True, path=str(tmp_path / "with.png"),
+    )
+    assert (result["n_genes"], result["n_exons"]) == (1, 2)
+
+    bodies_only = with_exons.drop(["exon_starts", "exon_ends", "cds_starts", "cds_ends"])
+    monkeypatch.setattr(sdk, "gene_annotations", lambda **_kw: bodies_only, raising=False)
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+        genes=True, path=str(tmp_path / "without.png"),
+    )
+    assert (result["n_genes"], result["n_exons"]) == (1, 0)
+    plt.close("all")

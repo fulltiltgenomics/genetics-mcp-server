@@ -331,14 +331,59 @@ def _ld_colours(frame: pl.DataFrame, lead_id: str, ld_frame: pl.DataFrame | None
     return colours, values, bool(r2_by_id)
 
 
-def _draw_genes(ax, genes: pl.DataFrame, start: int, end: int, max_rows: int = 4) -> int:
-    """Gene bodies on a small track, packed into non-overlapping rows. Returns rows used."""
+# A gene model reads by thickness: the body is a hairline, an exon is a bar, and the
+# translated part of that exon is thicker still. Widths are in points rather than data
+# units, so the bars keep their proportions whatever span the window covers.
+_GENE_BODY_WIDTH = 0.7
+_GENE_EXON_WIDTH = 2.6
+_GENE_CDS_WIDTH = 4.4
+_GENE_COLOUR = "#4A4A4A"
+
+
+def _exon_spans(gene: dict[str, Any]) -> list[tuple[Any, Any, Any, Any]]:
+    """(exon_start, exon_end, cds_start, cds_end) per exon, empty when there is no structure.
+
+    The API's four arrays are positional and equal length, so an exon's coding bounds sit at
+    the same index as the exon; a GENCODE release with no exon file returns all four empty,
+    and a results-api too old to serve them returns none of the columns at all. Both arrive
+    here as no exons, which draws the bare body rather than failing.
+    """
+    starts, ends = gene.get("exon_starts"), gene.get("exon_ends")
+    if not starts or not ends or len(starts) != len(ends):
+        return []
+    cds_starts = gene.get("cds_starts") or [None] * len(starts)
+    cds_ends = gene.get("cds_ends") or [None] * len(starts)
+    if len(cds_starts) != len(starts) or len(cds_ends) != len(starts):
+        cds_starts = cds_ends = [None] * len(starts)
+    return list(zip(starts, ends, cds_starts, cds_ends))
+
+
+def _bar(ax, lo, hi, row: int, width: float, start: int, end: int) -> None:
+    """One segment of a gene model, clipped to the window and skipped when outside it."""
+    if lo is None or hi is None:
+        return
+    lo, hi = max(lo, start), min(hi, end)
+    if lo > hi:
+        return
+    ax.plot([lo, hi], [-row, -row], linewidth=width, solid_capstyle="butt",
+            color=_GENE_COLOUR, zorder=2)
+
+
+def _draw_genes(
+    ax, genes: pl.DataFrame, start: int, end: int, max_rows: int = 4
+) -> tuple[int, int]:
+    """Gene models on a small track, packed into non-overlapping rows.
+
+    Returns (genes drawn, exons drawn). The second is 0 when the API served no exon
+    structure, which is what tells the caller the track is bodies only.
+    """
     if genes.is_empty() or "gene_start" not in genes.columns:
         ax.set_yticks([])
-        return 0
+        return 0, 0
     ordered = genes.sort("gene_start")
     row_ends: list[int] = []
     drawn = 0
+    exons_drawn = 0
     span = max(end - start, 1)
     for gene in ordered.iter_rows(named=True):
         g_start, g_end = gene.get("gene_start"), gene.get("gene_end")
@@ -359,8 +404,11 @@ def _draw_genes(ax, genes: pl.DataFrame, start: int, end: int, max_rows: int = 4
         # clipped to the window: a gene overlapping the boundary is returned whole, and on a
         # shared x axis its far end drags the association panel's limits out with it
         left, right = max(g_start, start), min(g_end, end)
-        ax.plot([left, right], [-row, -row], linewidth=2.0, solid_capstyle="butt",
-                color="#4A4A4A")
+        _bar(ax, left, right, row, _GENE_BODY_WIDTH, start, end)
+        for exon_start, exon_end, cds_start, cds_end in _exon_spans(gene):
+            _bar(ax, exon_start, exon_end, row, _GENE_EXON_WIDTH, start, end)
+            _bar(ax, cds_start, cds_end, row, _GENE_CDS_WIDTH, start, end)
+            exons_drawn += 1
         strand = (gene.get("gene_strand") or "").strip()
         label = f"{name}{'→' if strand == '+' else '←' if strand == '-' else ''}"
         ax.text((left + right) / 2, -row + 0.22, label, ha="center", va="bottom",
@@ -368,8 +416,7 @@ def _draw_genes(ax, genes: pl.DataFrame, start: int, end: int, max_rows: int = 4
         drawn += 1
     ax.set_yticks([])
     ax.set_ylim(-max(len(row_ends), 1) + 0.2, 0.9)
-    return drawn
-
+    return drawn, exons_drawn
 
 def locuszoom(
     *,
@@ -406,12 +453,15 @@ def locuszoom(
     colour at. Only the correlated variants are coloured, so the ramp reads at a glance
     instead of painting the whole cloud navy.
 
-    The gene track draws gene bodies only. The annotation this SDK can reach is GENCODE
-    gene-level — start, end, strand, biotype — with no transcript or exon structure, so there
-    are no exon boxes to draw.
+    The gene track draws a gene model per gene: a hairline over the whole gene body, a bar
+    per exon of its GENCODE Ensembl-canonical transcript, and a thicker bar over the part of
+    each exon that is translated, so an untranslated leading or trailing exon reads as such.
+    One transcript per gene, not all of them — a locus is legible with one model per gene and
+    unreadable with twenty. `n_exons` in the returned dict is 0 when the API served no exon
+    structure, in which case the track is gene bodies only.
 
     Returns a dict describing what was drawn: `path`, `lead`, `lead_mlog10p`, `region`,
-    `phenotype`, `n_variants`, `n_genes`, plus two worth reading every time.
+    `phenotype`, `n_variants`, `n_genes`, `n_exons`, plus two worth reading every time.
 
     `ld_joined` is False when the LD server returned nothing for the lead — a plot with grey
     points rather than an error, because a locuszoom without LD is still the right picture of
@@ -616,9 +666,9 @@ def locuszoom(
     y_top = max(float(frame["_y"].max()), line_y if significance else 0.0)
     ax.set_ylim(top=y_top + max(y_top * (0.22 if outside else 0.08), 0.5))
 
-    n_genes = 0
+    n_genes, n_exons = 0, 0
     if gene_ax is not None:
-        n_genes = _draw_genes(gene_ax, gene_frame, span_lo, span_hi)
+        n_genes, n_exons = _draw_genes(gene_ax, gene_frame, span_lo, span_hi)
         gene_ax.set_xlabel(f"position on chromosome {frame['chr'][0] if 'chr' in frame.columns else ''}".rstrip())
     else:
         ax.set_xlabel("position")
@@ -637,6 +687,7 @@ def locuszoom(
         "phenotype": phenotype,
         "n_variants": frame.height,
         "n_genes": n_genes,
+        "n_exons": n_exons,
         "ld_joined": ld_joined,
         "ld_partners_outside_window": outside,
         "coding_marked": coding_marked,
