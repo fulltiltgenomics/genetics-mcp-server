@@ -403,10 +403,22 @@ def test_the_lead_label_carries_p_beta_and_af_and_skips_what_is_absent():
     assert plots._lead_label("12:1:A:G", {}, 12.6814) == "12:1:A:G\np=2.08e-13"
 
 
+def test_the_lead_label_names_the_gene_and_the_consequence_when_annotated():
+    labelled = plots._lead_label(
+        "12:49272869:C:T", {"beta": 1.17569, "af": 0.00234211}, 12.6814,
+        "missense_variant", "TUBA1C",
+    )
+    assert labelled.splitlines()[0] == "12:49272869:C:T  TUBA1C missense_variant"
+    # an intergenic lead has a consequence and no gene; losing the consequence too would be
+    # dropping the more informative half
+    assert plots._lead_label("12:1:A:G", {}, 3.0, "intergenic_variant", None).splitlines()[0] \
+        == "12:1:A:G  intergenic_variant"
+    assert plots._lead_label("12:1:A:G", {}, 3.0, None, None).splitlines()[0] == "12:1:A:G"
+
+
 def test_coding_consequences_square_and_everything_else_circles(monkeypatch, tmp_path):
     from genetics_mcp_server import sdk
 
-    frame = frame_of(n=6)
     ids = [f"12:{49_500_000 + i * 1_000}:C:T" for i in range(6)]
 
     def fake_annotation(**kwargs):
@@ -424,11 +436,9 @@ def test_coding_consequences_square_and_everything_else_circles(monkeypatch, tmp
 
     monkeypatch.setattr(sdk, "variant_annotation", fake_annotation)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
-    flags, marked = plots._coding_flags(
-        frame.with_columns(pl.Series("_variant_id", ids)), "12:1-2"
-    )
-    assert marked is True
-    assert flags == [True, True, False, False, False, False]
+    found = plots._consequences("12:1-2")
+    coding = [found[vid][0] in plots._CODING_CONSEQUENCES for vid in ids]
+    assert coding == [True, True, False, False, False, False]
 
 
 def test_an_unavailable_consequence_lookup_leaves_every_point_a_circle(monkeypatch):
@@ -438,10 +448,9 @@ def test_an_unavailable_consequence_lookup_leaves_every_point_a_circle(monkeypat
         raise RuntimeError("db-api is down")
 
     monkeypatch.setattr(sdk, "variant_annotation", boom)
-    frame = frame_of(n=4).with_columns(pl.Series("_variant_id", ["a", "b", "c", "d"]))
-    flags, marked = plots._coding_flags(frame, "12:1-2")
-    assert flags == [False] * 4
-    assert marked is False, "a failed lookup must not read as 'nothing here is coding'"
+    assert plots._consequences("12:1-2") is None, (
+        "a failed lookup must be distinguishable from 'nothing here is coding'"
+    )
 
 
 def test_coding_false_skips_the_fetch_entirely(monkeypatch, tmp_path):
@@ -457,6 +466,7 @@ def test_coding_false_skips_the_fetch_entirely(monkeypatch, tmp_path):
         genes=False, coding=False,
     )
     assert result["coding_marked"] is False
+    assert result["lead_consequence"] is None and result["lead_gene"] is None
 
 
 def test_the_lead_is_not_a_diamond_and_the_significance_line_is_grey(monkeypatch, tmp_path):
@@ -517,3 +527,26 @@ def test_the_lead_annotation_sits_below_the_point(monkeypatch, tmp_path):
     assert note.get_verticalalignment() == "top"
     assert note.xyann[1] < 0, "the label is offset upwards and will run into the axes frame"
     plt.close("all")
+
+
+def test_the_leads_gene_and_consequence_are_drawn_and_returned(monkeypatch, tmp_path):
+    from genetics_mcp_server import sdk
+
+    lead = "12:49503000:C:T"
+    monkeypatch.setattr(
+        sdk, "variant_annotation",
+        lambda **k: pl.DataFrame(
+            {"variant": [lead], "most_severe": ["missense_variant"],
+             "gene_most_severe": ["TUBA1C"]}
+        ),
+    )
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    frame = sumstats([{
+        "chr": "12", "pos": 49_503_000, "ref": "C", "alt": "T",
+        "pval": 2.08257e-13, "mlog10p": 12.6814,
+    }])
+    result = plots.locuszoom(
+        phenotype="X", region="12:49400000-49600000", data=frame, ld=False, genes=False,
+    )
+    assert result["lead_consequence"] == "missense_variant"
+    assert result["lead_gene"] == "TUBA1C"

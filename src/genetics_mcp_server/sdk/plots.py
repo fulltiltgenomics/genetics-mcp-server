@@ -170,12 +170,23 @@ def _format_p(mlog10p: float | None) -> str:
     return f"{mantissa:.2f}e-{exponent}"
 
 
-def _lead_label(variant_id: str, row: dict[str, Any], mlog10p: float) -> str:
-    """What the annotation says: the id, then whichever of p, beta and AF the frame carries.
+def _lead_label(
+    variant_id: str,
+    row: dict[str, Any],
+    mlog10p: float,
+    consequence: str | None = None,
+    gene: str | None = None,
+) -> str:
+    """The id and its consequence, then whichever of p, beta and AF the frame carries.
 
     Built from what is present rather than from a fixed list, because `data=` may be any frame
-    a caller assembled and a KeyError there would lose the whole figure for a caption.
+    a caller assembled and a KeyError there would lose the whole figure for a caption. The VEP
+    term is written out rather than prettified: `missense_variant` is the value the annotation
+    holds and the one a follow-up query would filter on.
     """
+    head = variant_id
+    if consequence:
+        head = f"{variant_id}  {gene} {consequence}" if gene else f"{variant_id}  {consequence}"
     parts = [f"p={_format_p(mlog10p)}"]
     beta = row.get("beta")
     if beta is not None:
@@ -183,30 +194,32 @@ def _lead_label(variant_id: str, row: dict[str, Any], mlog10p: float) -> str:
     af = row.get("af")
     if af is not None:
         parts.append(f"AF={float(af):.4g}")
-    return f"{variant_id}\n" + "  ".join(parts)
+    return f"{head}\n" + "  ".join(parts)
 
 
-def _coding_flags(frame: pl.DataFrame, region: str) -> tuple[list[bool], bool]:
-    """One flag per row: does this variant sit in a coding sequence.
+def _consequences(region: str) -> dict[str, tuple[str | None, str | None]] | None:
+    """variant id -> (most_severe, gene_most_severe), or None when the lookup did not answer.
 
     The consequence is not in the summary statistics, so it is a second fetch. Failure is
-    tolerated the same way the LD fetch is — every point falls back to a circle and the figure
-    is still the right picture of the locus.
+    tolerated the same way the LD fetch is — the figure is still the right picture of the
+    locus without it. `None` and `{}` are deliberately different answers: an empty mapping is
+    a region with no annotation, `None` is a lookup that failed, and only the first may be
+    reported to the caller as "nothing here is coding".
     """
     from genetics_mcp_server import sdk
 
     try:
         annotations = sdk.variant_annotation(region=region)
     except Exception:
-        return [False] * frame.height, False
+        return None
     if annotations.is_empty() or not {"variant", "most_severe"} <= set(annotations.columns):
-        return [False] * frame.height, False
-    coding_ids = {
-        _norm_variant_id(row["variant"])
+        return None
+    return {
+        _norm_variant_id(row["variant"]): (
+            row.get("most_severe"), row.get("gene_most_severe")
+        )
         for row in annotations.iter_rows(named=True)
-        if row.get("most_severe") in _CODING_CONSEQUENCES
     }
-    return [vid in coding_ids for vid in frame["_variant_id"]], True
 
 
 def _variant_pos(value: Any) -> int | None:
@@ -414,6 +427,8 @@ def locuszoom(
 
     `coding_marked` is False when the consequence lookup did not answer, in which case every
     point is a circle and shape means nothing; set `coding=False` to skip that fetch outright.
+    The same lookup fills `lead_consequence` and `lead_gene`, which the lead's label also
+    carries, so the strongest variant names what it does and where before anyone asks.
 
     `path` may be relative, in which case it is written inside the execution's artifacts
     directory and returned to the user automatically; that is also where the default goes.
@@ -502,9 +517,13 @@ def locuszoom(
     colours, r2_values, ld_joined = _ld_colours(frame, lead_id, ld_frame)
     frame = frame.with_columns(pl.Series("_r2", r2_values, dtype=pl.Float64))
 
-    coding_flags, coding_marked = (
-        _coding_flags(frame, region) if coding else ([False] * frame.height, False)
-    )
+    consequences = _consequences(region) if coding else None
+    coding_marked = consequences is not None
+    coding_flags = [
+        consequences.get(vid, (None, None))[0] in _CODING_CONSEQUENCES if consequences else False
+        for vid in frame["_variant_id"]
+    ]
+    lead_consequence, lead_gene = (consequences or {}).get(lead_id, (None, None))
 
     own_figure = ax is None
     gene_frame = None
@@ -546,7 +565,8 @@ def locuszoom(
                s=40, c=_LEAD_COLOUR, edgecolors="black", linewidths=0.4, zorder=3)
     # below the point: above it, the label of a lead at the top of the panel runs into the
     # axes frame, which is where the strongest association always sits
-    ax.annotate(_lead_label(lead_id, lead_row, lead_y), (lead_pos, lead_y),
+    ax.annotate(_lead_label(lead_id, lead_row, lead_y, lead_consequence, lead_gene),
+                (lead_pos, lead_y),
                 textcoords="offset points", xytext=(0, -9), ha="center", va="top",
                 fontsize=6)
     line_y = -math.log10(significance) if significance else 0.0
@@ -620,4 +640,6 @@ def locuszoom(
         "ld_joined": ld_joined,
         "ld_partners_outside_window": outside,
         "coding_marked": coding_marked,
+        "lead_consequence": lead_consequence,
+        "lead_gene": lead_gene,
     }
