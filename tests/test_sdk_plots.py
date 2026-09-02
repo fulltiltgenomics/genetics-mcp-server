@@ -359,13 +359,26 @@ def test_nothing_outside_the_window_reports_an_empty_list_not_a_missing_key(tmp_
 def test_partners_outside_ranks_by_r2_and_ignores_what_it_cannot_place():
     ld = pl.DataFrame(
         {
-            "variant": ["12:100:A:G", "12:900:A:G", "12:950:A:G", "not-a-variant", "12:500:A:G"],
-            "r2": [0.3, 0.9, None, 0.99, 0.95],
+            "variant": ["12:100:A:G", "12:900:A:G", "12:950:A:G", "not-a-variant",
+                        "12:500:A:G", "12:80:A:G"],
+            "r2": [0.7, 0.9, None, 0.99, 0.95, 0.3],
         }
     )
     found = plots._partners_outside(ld, 400, 600)
-    assert [p["r2"] for p in found] == [0.9, 0.3]
+    assert [p["r2"] for p in found] == [0.9, 0.7]
     assert plots._partners_outside(None, 400, 600) == []
+
+
+def test_a_weakly_correlated_partner_outside_the_window_is_not_reported():
+    """The note asks the reader to redraw wider, so it fires only where that is worth doing.
+    A partner just over the floor is reported and one just under it is not, which is what
+    makes this a threshold rather than a preference."""
+    just_over = plots._LD_NOTABLE_R2
+    just_under = plots._LD_NOTABLE_R2 - 0.01
+    ld = pl.DataFrame(
+        {"variant": ["12:100:A:G", "12:900:A:G"], "r2": [just_under, just_over]}
+    )
+    assert [p["r2"] for p in plots._partners_outside(ld, 400, 600)] == [just_over]
 
 
 def test_dir_of_the_sdk_package_lists_the_lazily_resolved_plots_module():
@@ -398,9 +411,10 @@ def test_the_p_value_is_taken_apart_from_mlog10p_rather_than_computed(mlog10p, e
 
 def test_the_lead_label_carries_p_beta_and_af_and_skips_what_is_absent():
     full = plots._lead_label("12:1:A:G", {"beta": 1.17569, "af": 0.00234211}, 12.6814)
-    assert full == "12:1:A:G\np=2.08e-13  beta=1.18  AF=0.002342"
+    assert full == "12:1:A:G\np 2.08e-13  beta 1.18  AF 0.002342"
     # `data=` may be any frame a caller assembled; a missing column must not lose the figure
-    assert plots._lead_label("12:1:A:G", {}, 12.6814) == "12:1:A:G\np=2.08e-13"
+    assert plots._lead_label("12:1:A:G", {}, 12.6814) == "12:1:A:G\np 2.08e-13"
+    assert "=" not in full, "the caption reads as a caption, not as an assignment"
 
 
 def test_the_lead_label_names_the_gene_and_the_consequence_when_annotated():
@@ -408,11 +422,11 @@ def test_the_lead_label_names_the_gene_and_the_consequence_when_annotated():
         "12:49272869:C:T", {"beta": 1.17569, "af": 0.00234211}, 12.6814,
         "missense_variant", "TUBA1C",
     )
-    assert labelled.splitlines()[0] == "12:49272869:C:T  TUBA1C missense_variant"
+    assert labelled.splitlines()[0] == "12:49272869:C:T  TUBA1C missense"
     # an intergenic lead has a consequence and no gene; losing the consequence too would be
     # dropping the more informative half
     assert plots._lead_label("12:1:A:G", {}, 3.0, "intergenic_variant", None).splitlines()[0] \
-        == "12:1:A:G  intergenic_variant"
+        == "12:1:A:G  intergenic"
     assert plots._lead_label("12:1:A:G", {}, 3.0, None, None).splitlines()[0] == "12:1:A:G"
 
 
@@ -504,8 +518,8 @@ def test_the_lead_is_not_a_diamond_and_the_significance_line_is_grey(monkeypatch
 
     line = next(ln for ln in ax.lines if ln.get_linestyle() == "--")
     assert line.get_color() == plots._SIGNIFICANCE_GREY
-    label = next(t for t in ax.texts if t.get_text().startswith("p="))
-    assert label.get_text() == "p=5e-8", "the padded exponent reached the figure"
+    label = next(t for t in ax.texts if t.get_text().startswith("p "))
+    assert label.get_text() == "p 5e-8", "the padded exponent reached the figure"
     assert label.get_color() == plots._SIGNIFICANCE_GREY
     plt.close("all")
 
@@ -523,7 +537,7 @@ def test_the_lead_annotation_sits_below_the_point(monkeypatch, tmp_path):
         phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
         genes=False, ax=ax,
     )
-    note = next(t for t in ax.texts if "p=" in t.get_text() and "\n" in t.get_text())
+    note = next(t for t in ax.texts if "\np " in t.get_text())
     assert note.get_verticalalignment() == "top"
     assert note.xyann[1] < 0, "the label is offset upwards and will run into the axes frame"
     plt.close("all")
@@ -746,3 +760,181 @@ def test_an_ensg_named_gene_is_left_out_of_the_track_entirely():
 
     assert (drawn, exons) == (1, 1), "the ENSG-named gene was drawn"
     assert [t.get_text() for t in ax.texts] == ["TUBA1C→"]
+
+
+# ------------------------------------------------- the axes the reader actually reads
+
+
+GENE_IN_WINDOW = {
+    "gene_name": ["TUBA1C"],
+    "hgnc_symbol": ["TUBA1C"],
+    "gene_start": [49_500_000],
+    "gene_end": [49_520_000],
+    "gene_strand": ["+"],
+    "exon_starts": [[49_500_000, 49_510_000]],
+    "exon_ends": [[49_500_400, 49_510_600]],
+    "cds_starts": [[None, 49_510_000]],
+    "cds_ends": [[None, 49_510_600]],
+}
+
+
+def drawn_figure(monkeypatch, tmp_path, annotations=None, **over):
+    """A whole locuszoom, gene track included, with the figure kept for inspection.
+
+    `plt.close` frees the manager and leaves the Figure and its Axes intact, so capturing the
+    argument is enough — nothing has to stay open. Passing `ax=` instead, as the older tests
+    here do, is not an option: that path draws no gene track, which is half of what these
+    assert about.
+    """
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    captured = {}
+    real_close = plt.close
+
+    def capture(figure=None):
+        if hasattr(figure, "axes"):
+            captured["figure"] = figure
+        real_close(figure)
+
+    monkeypatch.setattr(plt, "close", capture)
+    frame = pl.DataFrame() if annotations is None else pl.DataFrame(annotations)
+    monkeypatch.setattr(sdk, "variant_annotation", lambda **k: frame)
+    monkeypatch.setattr(sdk, "gene_annotations", lambda **k: pl.DataFrame(GENE_IN_WINDOW))
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+
+    kwargs = {
+        "phenotype": "X", "region": "12:49400000-49600000", "data": frame_of(),
+        "ld": False, "genes": True,
+    }
+    kwargs.update(over)
+    result = plots.locuszoom(**kwargs)
+    ax, gene_ax = captured["figure"].axes
+    return result, ax, gene_ax
+
+
+def visible_tick_labels(axis) -> bool:
+    return any(tick.label1.get_visible() for tick in axis.xaxis.get_major_ticks())
+
+
+def test_the_position_scale_sits_on_the_association_panel_above_the_gene_track(
+    monkeypatch, tmp_path
+):
+    """sharex puts the tick labels on the bottom axis by default, which left the gene models
+    between the points and the scale they are read against."""
+    result, ax, gene_ax = drawn_figure(monkeypatch, tmp_path)
+    assert result["n_genes"] == 1
+    assert visible_tick_labels(ax), "the association panel carries no position scale"
+    assert not visible_tick_labels(gene_ax), "the scale is drawn twice, or under the genes"
+    assert ax.get_xlabel() == "position on chromosome 12"
+    assert gene_ax.get_xlabel() == ""
+
+
+def test_the_gene_track_is_a_strip_and_not_a_second_boxed_plot(monkeypatch, tmp_path):
+    _result, ax, gene_ax = drawn_figure(monkeypatch, tmp_path)
+    assert not any(spine.get_visible() for spine in gene_ax.spines.values())
+    assert list(gene_ax.get_yticks()) == []
+    # the association panel keeps its box; only the track loses one
+    assert any(spine.get_visible() for spine in ax.spines.values())
+
+
+def test_an_empty_gene_frame_still_leaves_the_track_unboxed():
+    """The early return is its own path, and a bare box with nothing in it is the worst of
+    both: it reads as a panel that failed rather than as a locus with no genes."""
+    _figure, ax = gene_axis()
+    assert plots._draw_genes(ax, pl.DataFrame(), 1, 100) == (0, 0)
+    assert not any(spine.get_visible() for spine in ax.spines.values())
+
+
+def test_the_legend_names_the_lead_and_the_panel_the_r2_came_from(monkeypatch, tmp_path):
+    """A bare "r²" does not say what to or from where, and both change between figures."""
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(
+        sdk, "ld",
+        lambda variant, **k: pl.DataFrame({"variant": ["12:49501000:C:T"], "r2": [0.9]}),
+    )
+    result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True, ld_panel="sisu99")
+    title = ax.get_legend().get_title().get_text()
+    assert result["lead"] in title
+    assert "sisu99" in title, "the panel is hard-coded rather than taken from the call"
+    assert "r^2" in title
+
+
+def test_the_type_and_the_rules_are_sized_for_the_figure_these_draw(monkeypatch, tmp_path):
+    """matplotlib's defaults are sized for a figure twice this wide; at 6.5 in a 12 pt title
+    and 0.8 pt spines crowd a panel whose own annotations are 5-7 pt."""
+    matplotlib = pytest.importorskip("matplotlib")
+
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path)
+    assert ax.title.get_fontsize() == plots._TITLE_SIZE
+    assert ax.xaxis.label.get_fontsize() == plots._LABEL_SIZE
+    assert ax.yaxis.label.get_fontsize() == plots._LABEL_SIZE
+    assert ax.get_xticklabels()[0].get_fontsize() == plots._TICK_SIZE
+    assert {spine.get_linewidth() for spine in ax.spines.values()} == {plots._AXIS_LINEWIDTH}
+
+    # the point is that they are smaller than what would be inherited, not the numbers
+    assert plots._TITLE_SIZE < matplotlib.rcParams["font.size"]
+    assert plots._AXIS_LINEWIDTH < matplotlib.rcParams["axes.linewidth"]
+
+
+@pytest.mark.parametrize(
+    "term,expected",
+    [
+        ("missense_variant", "missense"),
+        ("splice_acceptor_variant", "splice acceptor"),
+        ("5_prime_UTR_variant", "5 prime UTR"),
+        ("stop_gained", "stop gained"),
+        ("intergenic_variant", "intergenic"),
+        (None, None),
+        ("", ""),
+    ],
+)
+def test_a_consequence_reads_as_words_in_a_caption(term, expected):
+    assert plots._pretty_consequence(term) == expected
+
+
+def test_the_caption_shortens_the_term_and_the_returned_dict_keeps_it(monkeypatch, tmp_path):
+    """Two audiences: a reader wants `missense`, and a follow-up query filters on the VEP
+    term, which `missense` would not match."""
+    lead = "12:49503000:C:T"
+    frame = sumstats([{
+        "chr": "12", "pos": 49_503_000, "ref": "C", "alt": "T",
+        "pval": 2.08257e-13, "mlog10p": 12.6814,
+    }])
+    result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, data=frame,
+        annotations={"variant": [lead], "most_severe": ["missense_variant"],
+                     "gene_most_severe": ["TUBA1C"]},
+    )
+    assert result["lead_consequence"] == "missense_variant"
+    caption = next(t.get_text() for t in ax.texts if lead in t.get_text())
+    assert "TUBA1C missense" in caption
+    assert "missense_variant" not in caption
+
+
+def test_no_caption_on_the_figure_reads_as_an_assignment(monkeypatch, tmp_path):
+    """`p=5e-8`, `beta=1.18`, `r2=0.78` — a figure names a quantity and its value, and the
+    `=` is a habit from code that reads as one on a plot."""
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(
+        sdk, "ld",
+        # one partner past the right edge, so the outside-window note is drawn too
+        lambda variant, **k: pl.DataFrame(
+            {"variant": ["12:49501000:C:T", "12:49900000:G:A"], "r2": [0.9, 0.78]}
+        ),
+    )
+    _result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, ld=True,
+        annotations={"variant": ["12:49503000:C:T"], "most_severe": ["missense_variant"],
+                     "gene_most_severe": ["TUBA1C"]},
+    )
+    drawn = [t.get_text() for t in ax.texts]
+    assert any("kb out" in t for t in drawn), "the outside-window note was not drawn"
+    assert any(t.startswith("p ") for t in drawn), "the significance line lost its label"
+    for text in drawn:
+        assert "=" not in text, text

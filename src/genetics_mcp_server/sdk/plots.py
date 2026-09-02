@@ -14,12 +14,14 @@ so a script can take the axes back and add to them, or call it for each of sever
 in one execution and lay the results out itself. Every function here takes `ax=` for that
 reason and returns what it drew rather than only a path.
 
-STYLE IS NOT SET HERE. These draw under whatever rcParams are in force — matplotlib's own
-defaults plus the render density the sandbox bakes (genetics-results-suite
-sandbox/gen_mplrc.py) — so a caller who prefers another style sets it and these follow. What
-they DO set is the LD colour ramp and the two marker shapes, because both are semantic: a
-reader decodes r² from the colours and consequence from the shapes, so neither may follow a
-style's prop_cycle.
+STYLE IS MOSTLY NOT SET HERE. These draw under whatever rcParams are in force — matplotlib's
+own defaults plus the render density the sandbox bakes (genetics-results-suite
+sandbox/gen_mplrc.py) — so a caller who prefers another style sets it and these follow. Two
+things are set anyway. The LD colour ramp and the two marker shapes, because both are
+semantic: a reader decodes r² from the colours and consequence from the shapes, so neither
+may follow a style's prop_cycle. And the type sizes and rule widths, because matplotlib's
+defaults are sized for a figure twice as wide as the one these draw on and a caller who has
+set no style should not have to correct for that.
 
 ADDING A PLOT. Write the function, export it in `__all__`, and give it a docstring whose first
 line reads as a description: `list_capabilities(module="plots")` and the generated
@@ -87,6 +89,16 @@ _CODING_CONSEQUENCES = frozenset({
 _SIGNIFICANCE_GREY = "#888888"
 _WARNING_COLOUR = "#AA0000"
 
+# Type sizes and rule widths, in points on the 6.5 in figure these draw by default. Set here
+# rather than inherited: matplotlib's defaults are sized for a figure roughly twice this
+# wide, and at this one they crowd a panel whose own annotations are 5-7 pt. Everything else
+# still follows the caller's rcParams.
+_TITLE_SIZE = 6
+_LABEL_SIZE = 6
+_TICK_SIZE = 6
+_AXIS_LINEWIDTH = 0.5
+_TICK_LENGTH = 2.0
+
 # Asked of the LD server rather than 0.0. At r²≥0 it answers with every variant in the panel,
 # which costs twice: the informative points disappear into a navy cloud of r²≈0, and the answer
 # is truncated positionally. Measured at 12:49272869:C:T — a ±250 kb request came back with
@@ -103,9 +115,10 @@ _LD_MIN_R2 = 0.05
 # ±250 kb plot drops the one point showing the signal is not a singleton.
 _LD_SEARCH_SPAN_MULTIPLE = 2
 
-# r² at which a partner outside the window is worth reporting: the first bin above "< 0.2",
-# i.e. the first whose colour a reader would have noticed had it been in frame.
-_LD_NOTABLE_R2 = 0.2
+# r² at which a partner outside the window is worth reporting. The note asks the reader to
+# redraw at a wider window, so it sits where that is worth doing — a partner the ramp would
+# have shown as strongly correlated — rather than at every partner the search span reaches.
+_LD_NOTABLE_R2 = 0.6
 
 
 def _artifacts_dir() -> str:
@@ -170,6 +183,17 @@ def _format_p(mlog10p: float | None) -> str:
     return f"{mantissa:.2f}e-{exponent}"
 
 
+def _pretty_consequence(term: str | None) -> str | None:
+    """`missense_variant` -> `missense`: a VEP term as a caption writes it.
+
+    Display only. `lead_consequence` in the returned dict keeps the term verbatim, because
+    that is the value a follow-up query filters on and a shortened one would not match.
+    """
+    if not term:
+        return term
+    return str(term).removesuffix("_variant").replace("_", " ") or str(term)
+
+
 def _lead_label(
     variant_id: str,
     row: dict[str, Any],
@@ -180,20 +204,19 @@ def _lead_label(
     """The id and its consequence, then whichever of p, beta and AF the frame carries.
 
     Built from what is present rather than from a fixed list, because `data=` may be any frame
-    a caller assembled and a KeyError there would lose the whole figure for a caption. The VEP
-    term is written out rather than prettified: `missense_variant` is the value the annotation
-    holds and the one a follow-up query would filter on.
+    a caller assembled and a KeyError there would lose the whole figure for a caption.
     """
     head = variant_id
-    if consequence:
-        head = f"{variant_id}  {gene} {consequence}" if gene else f"{variant_id}  {consequence}"
-    parts = [f"p={_format_p(mlog10p)}"]
+    term = _pretty_consequence(consequence)
+    if term:
+        head = f"{variant_id}  {gene} {term}" if gene else f"{variant_id}  {term}"
+    parts = [f"p {_format_p(mlog10p)}"]
     beta = row.get("beta")
     if beta is not None:
-        parts.append(f"beta={float(beta):.3g}")
+        parts.append(f"beta {float(beta):.3g}")
     af = row.get("af")
     if af is not None:
-        parts.append(f"AF={float(af):.4g}")
+        parts.append(f"AF {float(af):.4g}")
     return f"{head}\n" + "  ".join(parts)
 
 
@@ -419,8 +442,13 @@ def _draw_genes(
     only by an ENSG are left out entirely, so the first can be short of the number of genes
     in the window.
     """
+    # no frame and no scale: the position axis is the association panel's, drawn directly
+    # above, and a box around the models reads as a second plot rather than as a strip of one
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(bottom=False, labelbottom=False)
+    ax.set_yticks([])
     if genes.is_empty() or "gene_start" not in genes.columns:
-        ax.set_yticks([])
         return 0, 0
     # sorted by what is actually drawn, so the row packing below sees the same spans the
     # reader does
@@ -456,7 +484,6 @@ def _draw_genes(
         ax.text((left + right) / 2, -row + 0.22, label, ha="center", va="bottom",
                 fontsize=5, color="#222222")
         drawn += 1
-    ax.set_yticks([])
     ax.set_ylim(-max(len(row_ends), 1) + 0.2, 0.9)
     return drawn, exons_drawn
 
@@ -666,7 +693,7 @@ def locuszoom(
     if significance:
         ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
         # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
-        ax.text(0.006, line_y, f"p={significance:g}".replace("e-0", "e-"),
+        ax.text(0.006, line_y, f"p {significance:g}".replace("e-0", "e-"),
                 transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6,
                 color=_SIGNIFICANCE_GREY)
 
@@ -682,13 +709,17 @@ def locuszoom(
             0.995, 0.99,
             rf"{len(outside)} r$^2\geq${_LD_NOTABLE_R2:g} partner"
             f"{'' if len(outside) == 1 else 's'} outside window; "
-            f"nearest {gap / 1000:.0f} kb out, r$^2$={nearest['r2']:.2f}",
+            f"nearest {gap / 1000:.0f} kb out, r$^2$ {nearest['r2']:.2f}",
             transform=ax.transAxes, ha="right", va="top", fontsize=7,
             color=_WARNING_COLOUR,
         )
 
-    ax.set_ylabel(r"$-\log_{10}(p)$")
-    ax.set_title(title if title is not None else f"{phenotype} — {region}")
+    ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=_LABEL_SIZE)
+    ax.set_title(title if title is not None else f"{phenotype} — {region}",
+                 fontsize=_TITLE_SIZE)
+    ax.tick_params(labelsize=_TICK_SIZE, width=_AXIS_LINEWIDTH, length=_TICK_LENGTH)
+    for spine in ax.spines.values():
+        spine.set_linewidth(_AXIS_LINEWIDTH)
     ax.margins(x=0.02)
     if ld_joined:
         handles = [
@@ -696,8 +727,11 @@ def locuszoom(
                        label=label)
             for _threshold, colour, label in _LD_BINS
         ]
-        ax.legend(handles=handles, title=r"$r^2$", fontsize=5, title_fontsize=5,
-                  loc="upper left", ncol=1)
+        # the panel is named, not just the quantity: r² is to the lead and from one LD panel,
+        # and a reader comparing two figures cannot tell either from a bare "r²". The panel
+        # is whatever the call asked for, so a different one relabels itself.
+        ax.legend(handles=handles, title=f"LD $r^2$ to {lead_id} ({ld_panel})",
+                  fontsize=5, title_fontsize=5, loc="upper left", ncol=1)
 
     # pinned before the gene track can widen it through sharex
     pad = max((span_hi - span_lo) * 0.02, 1)
@@ -712,9 +746,12 @@ def locuszoom(
     n_genes, n_exons = 0, 0
     if gene_ax is not None:
         n_genes, n_exons = _draw_genes(gene_ax, gene_frame, span_lo, span_hi)
-        gene_ax.set_xlabel(f"position on chromosome {frame['chr'][0] if 'chr' in frame.columns else ''}".rstrip())
-    else:
-        ax.set_xlabel("position")
+        # the scale belongs to the panel it is read against: sharex hides the upper axis's
+        # tick labels by default, which put the position axis under the gene track and the
+        # models between the points and their own scale
+        ax.tick_params(labelbottom=True)
+    chrom_label = frame["chr"][0] if "chr" in frame.columns else ""
+    ax.set_xlabel(f"position on chromosome {chrom_label}".rstrip(), fontsize=_LABEL_SIZE)
 
     written = None
     if own_figure:
