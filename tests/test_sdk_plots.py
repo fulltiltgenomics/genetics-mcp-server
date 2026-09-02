@@ -662,3 +662,87 @@ def test_locuszoom_reports_how_many_exons_it_drew(tmp_path, monkeypatch):
     )
     assert (result["n_genes"], result["n_exons"]) == (1, 0)
     plt.close("all")
+
+
+# ------------------------------------------------- what the model spans, and what is drawn
+
+
+TUBA1C = {
+    # the real v49 shape: an 86 kb gene record whose MANE transcript is the rightmost 9.5 kb
+    "gene_name": ["TUBA1C"],
+    "gene_start": [49_188_736],
+    "gene_end": [49_274_600],
+    "gene_strand": ["+"],
+    "exon_starts": [[49_265_082, 49_269_465, 49_269_828, 49_272_253]],
+    "exon_ends": [[49_265_184, 49_269_687, 49_269_976, 49_274_600]],
+    "cds_starts": [[49_265_182, 49_269_465, 49_269_828, 49_272_253]],
+    "cds_ends": [[49_265_184, 49_269_687, 49_269_976, 49_273_227]],
+}
+
+
+def body_line(ax):
+    """The hairline under one gene model — the only line drawn at the body width."""
+    lines = [ln for ln in ax.lines if ln.get_linewidth() == plots._GENE_BODY_WIDTH]
+    assert len(lines) == 1, f"expected one body line, got {len(lines)}"
+    return list(lines[0].get_xdata())
+
+
+def test_the_body_spans_the_transcript_and_not_the_gene_record():
+    """A GENCODE gene record spans every transcript it has, so drawing it puts the exons in
+    a corner of a long bare line and the gene reads as being somewhere it is not. TUBA1C's
+    record is 86 kb; the transcript actually drawn is 9.5 kb of it."""
+    figure, ax = gene_axis()
+    plots._draw_genes(ax, pl.DataFrame(TUBA1C), 49_150_000, 49_300_000)
+
+    assert body_line(ax) == [49_265_082, 49_274_600]
+    assert body_line(ax)[0] != TUBA1C["gene_start"][0], "the body still spans the gene record"
+
+
+def test_a_gene_with_no_exons_still_spans_its_record():
+    """There is nothing else to draw it from, and it is what the track did before exons."""
+    figure, ax = gene_axis()
+    bodies_only = pl.DataFrame(TUBA1C).drop(
+        ["exon_starts", "exon_ends", "cds_starts", "cds_ends"]
+    )
+    drawn, exons = plots._draw_genes(ax, bodies_only, 49_150_000, 49_300_000)
+
+    assert (drawn, exons) == (1, 0)
+    assert body_line(ax) == [49_188_736, 49_274_600]
+
+
+@pytest.mark.parametrize(
+    "gene,expected",
+    [
+        ({"gene_name": "ENSG00000258232", "hgnc_symbol": None}, None),
+        ({"gene_name": "ENSG00000258232", "hgnc_symbol": ""}, None),
+        # a handful of ENSG-named genes do carry an HGNC symbol, so it is consulted
+        ({"gene_name": "ENSG00000123456", "hgnc_symbol": "REALGENE"}, "REALGENE"),
+        ({"gene_name": "TUBA1C", "hgnc_symbol": "TUBA1C"}, "TUBA1C"),
+        ({"gene_name": "TUBA1C", "hgnc_symbol": None}, "TUBA1C"),
+    ],
+)
+def test_a_gene_named_only_by_an_ensg_has_no_label_to_draw(gene, expected):
+    assert plots._gene_label(gene) == expected
+
+
+def test_an_ensg_named_gene_is_left_out_of_the_track_entirely():
+    """Not drawn nameless: an ENSG is a row of characters nobody can look up, and the track
+    is already packing genes into four rows."""
+    figure, ax = gene_axis()
+    two = pl.DataFrame(
+        {
+            "gene_name": ["TUBA1C", "ENSG00000258232"],
+            "hgnc_symbol": ["TUBA1C", None],
+            "gene_start": [49_265_082, 49_265_156],
+            "gene_end": [49_274_600, 49_265_198],
+            "gene_strand": ["+", "-"],
+            "exon_starts": [[49_265_082], [49_265_156]],
+            "exon_ends": [[49_265_184], [49_265_198]],
+            "cds_starts": [[None], [None]],
+            "cds_ends": [[None], [None]],
+        }
+    )
+    drawn, exons = plots._draw_genes(ax, two, 49_150_000, 49_300_000)
+
+    assert (drawn, exons) == (1, 1), "the ENSG-named gene was drawn"
+    assert [t.get_text() for t in ax.texts] == ["TUBA1C→"]

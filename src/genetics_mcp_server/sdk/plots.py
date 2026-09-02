@@ -369,27 +369,70 @@ def _bar(ax, lo, hi, row: int, width: float, start: int, end: int) -> None:
             color=_GENE_COLOUR, zorder=2)
 
 
+def _gene_label(gene: dict[str, Any]) -> str | None:
+    """The symbol to draw, or None for a gene the track should leave out.
+
+    GENCODE names some protein-coding genes by their ENSG alone. An ENSG on a locus plot is
+    a row of characters nobody can look up, and it crowds a track that is already packing
+    genes into four rows, so those are dropped rather than drawn nameless. A few of them do
+    carry an HGNC symbol, which is why that is consulted rather than assumed absent.
+    """
+    for candidate in (gene.get("gene_name"), gene.get("hgnc_symbol")):
+        if candidate and not str(candidate).startswith("ENSG"):
+            return str(candidate)
+    return None
+
+
+def _drawable(gene: dict[str, Any]) -> tuple[str, int, int, list, str] | None:
+    """One gene reduced to what the track draws, or None if it cannot be drawn.
+
+    THE SPAN IS THE TRANSCRIPT'S, NOT THE GENE RECORD'S, and that is the whole point of this
+    function. The exons belong to one transcript while a GENCODE gene record spans every
+    transcript it has, and the two disagree badly: measured on v49, the canonical transcript
+    covers under a tenth of the gene record for 185 protein-coding genes and under a quarter
+    for 641 — TUBA1C's record runs 86 kb while its MANE transcript is 9.5 kb. Drawing the
+    record's span put four exons in the right-hand tenth of a long bare line, which reads as
+    exons in the wrong place. A gene with no exon structure has nothing but the record to
+    draw, so it keeps it.
+    """
+    name = _gene_label(gene)
+    if name is None:
+        return None
+    spans = _exon_spans(gene)
+    if spans:
+        g_start = min(exon_start for exon_start, _e, _cs, _ce in spans)
+        g_end = max(exon_end for _s, exon_end, _cs, _ce in spans)
+    else:
+        g_start, g_end = gene.get("gene_start"), gene.get("gene_end")
+    if g_start is None or g_end is None:
+        return None
+    return name, g_start, g_end, spans, (gene.get("gene_strand") or "").strip()
+
+
 def _draw_genes(
     ax, genes: pl.DataFrame, start: int, end: int, max_rows: int = 4
 ) -> tuple[int, int]:
     """Gene models on a small track, packed into non-overlapping rows.
 
     Returns (genes drawn, exons drawn). The second is 0 when the API served no exon
-    structure, which is what tells the caller the track is bodies only.
+    structure, which is what tells the caller the track is bodies only. Genes GENCODE names
+    only by an ENSG are left out entirely, so the first can be short of the number of genes
+    in the window.
     """
     if genes.is_empty() or "gene_start" not in genes.columns:
         ax.set_yticks([])
         return 0, 0
-    ordered = genes.sort("gene_start")
+    # sorted by what is actually drawn, so the row packing below sees the same spans the
+    # reader does
+    drawable = sorted(
+        (d for d in (_drawable(g) for g in genes.iter_rows(named=True)) if d),
+        key=lambda d: d[1],
+    )
     row_ends: list[int] = []
     drawn = 0
     exons_drawn = 0
     span = max(end - start, 1)
-    for gene in ordered.iter_rows(named=True):
-        g_start, g_end = gene.get("gene_start"), gene.get("gene_end")
-        name = gene.get("gene_name") or gene.get("hgnc_symbol") or ""
-        if g_start is None or g_end is None:
-            continue
+    for name, g_start, g_end, spans, strand in drawable:
         # pack: first row whose last gene ends before this one starts, with a gap for the label
         gap = span * 0.06
         for row, occupied_to in enumerate(row_ends):
@@ -405,11 +448,10 @@ def _draw_genes(
         # shared x axis its far end drags the association panel's limits out with it
         left, right = max(g_start, start), min(g_end, end)
         _bar(ax, left, right, row, _GENE_BODY_WIDTH, start, end)
-        for exon_start, exon_end, cds_start, cds_end in _exon_spans(gene):
+        for exon_start, exon_end, cds_start, cds_end in spans:
             _bar(ax, exon_start, exon_end, row, _GENE_EXON_WIDTH, start, end)
             _bar(ax, cds_start, cds_end, row, _GENE_CDS_WIDTH, start, end)
             exons_drawn += 1
-        strand = (gene.get("gene_strand") or "").strip()
         label = f"{name}{'→' if strand == '+' else '←' if strand == '-' else ''}"
         ax.text((left + right) / 2, -row + 0.22, label, ha="center", va="bottom",
                 fontsize=5, color="#222222")
@@ -453,12 +495,13 @@ def locuszoom(
     colour at. Only the correlated variants are coloured, so the ramp reads at a glance
     instead of painting the whole cloud navy.
 
-    The gene track draws a gene model per gene: a hairline over the whole gene body, a bar
-    per exon of its GENCODE Ensembl-canonical transcript, and a thicker bar over the part of
-    each exon that is translated, so an untranslated leading or trailing exon reads as such.
-    One transcript per gene, not all of them — a locus is legible with one model per gene and
-    unreadable with twenty. `n_exons` in the returned dict is 0 when the API served no exon
-    structure, in which case the track is gene bodies only.
+    The gene track draws one model per gene: a hairline over the transcript, a bar per exon
+    of it, and a thicker bar over the part of each exon that is translated, so an
+    untranslated leading or trailing exon reads as such. The transcript is GENCODE's
+    Ensembl-canonical one, and the hairline spans IT rather than the gene record, which can
+    be many times longer where a gene has transcripts the canonical one does not reach.
+    Genes GENCODE names only by an ENSG are left out. `n_exons` in the returned dict is 0
+    when the API served no exon structure, in which case the track is gene bodies only.
 
     Returns a dict describing what was drawn: `path`, `lead`, `lead_mlog10p`, `region`,
     `phenotype`, `n_variants`, `n_genes`, `n_exons`, plus two worth reading every time.
