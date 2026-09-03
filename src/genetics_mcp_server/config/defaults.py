@@ -645,8 +645,8 @@ Before highlighting a finding as "striking", "notable", "a promising drug target
 
 ## Terminology
 
-- **Coding Variant**: A variant that alters the protein's amino acid sequence. Includes: missense_variant, frameshift_variant, inframe_insertion, inframe_deletion, transcript_ablation_variant, stop_gained, stop_lost, start_lost, splice_acceptor_variant, splice_donor_variant, incomplete_terminal_codon_variant, protein_altering_variant, coding_sequence_variant
-- **LoF (loss of function) Variant**: A variant likely to cause loss of function. Includes: frameshift_variant, stop_gained, stop_lost, start_lost, splice_acceptor_variant, splice_donor_variant, transcript_ablation_variant
+- **Coding Variant**: A variant that alters the protein's amino acid sequence. Includes: missense_variant, frameshift_variant, inframe_insertion, inframe_deletion, transcript_ablation, stop_gained, stop_lost, start_lost, splice_acceptor_variant, splice_donor_variant, incomplete_terminal_codon_variant, protein_altering_variant. Does NOT include synonymous_variant, coding_sequence_variant, start_retained_variant or stop_retained_variant, none of which change the protein.
+- **LoF (loss of function) Variant**: A variant likely to cause loss of function. Includes: frameshift_variant, stop_gained, stop_lost, start_lost, splice_acceptor_variant, splice_donor_variant, transcript_ablation
 - **Splicing Variant**: A variant that alters splicing. Includes: splice_acceptor_variant, splice_donor_variant, splice_region_variant
 
 **Key Statistics**:

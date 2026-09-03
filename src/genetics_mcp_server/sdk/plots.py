@@ -60,12 +60,19 @@ _LEAD_COLOUR = "#7D26CD"
 _MARKER_CODING = "s"
 _MARKER_OTHER = "o"
 
-# VEP terms that place a variant in a coding sequence or change the protein. Deliberately NOT
-# including `splice_region_variant`: VEP assigns it up to 8 bp into an intron, so a square
-# there would claim a coding position the term does not establish. The two splice-site terms
-# ARE here — they abolish a site and are scored as loss of function.
+# VEP terms that change the protein a transcript codes for. This is the suite's shared
+# definition of "coding" and it is duplicated rather than shared because the other four copies
+# are in another repo or another language: genetics-results-api app/config/common.py
+# `coding_set`, genetics-results-browser src/utils/coding.ts and bff/coding.ts, and the chat
+# prompt's Terminology block in config/defaults.py. Changing one means changing all five.
+#
+# TWO DELIBERATE EXCLUSIONS, both of which look like omissions. `synonymous_variant` sits in a
+# coding sequence and leaves the protein identical, so a square would claim a protein effect
+# the term denies; the same reasoning drops `start_retained_variant` and `stop_retained_variant`.
+# `splice_region_variant` is excluded because VEP assigns it up to 8 bp into an intron, so a
+# square there would claim a coding position the term does not establish — the two splice-site
+# terms that abolish a site ARE here.
 _CODING_CONSEQUENCES = frozenset({
-    "coding_sequence_variant",
     "frameshift_variant",
     "inframe_deletion",
     "inframe_insertion",
@@ -75,13 +82,9 @@ _CODING_CONSEQUENCES = frozenset({
     "splice_acceptor_variant",
     "splice_donor_variant",
     "start_lost",
-    "start_retained_variant",
     "stop_gained",
     "stop_lost",
-    "stop_retained_variant",
-    "synonymous_variant",
     "transcript_ablation",
-    "transcript_amplification",
 })
 
 # the significance line and its label are scaffolding, not data: grey keeps them behind the
@@ -218,6 +221,83 @@ def _lead_label(
     if af is not None:
         parts.append(f"AF {float(af):.4g}")
     return f"{head}\n" + "  ".join(parts)
+
+
+# resolved once per process rather than per figure: a script that draws a panel per phenotype
+# would otherwise refetch the whole schema for each one, and labels do not change under a
+# running sandbox. A failed fetch is NOT cached — it falls back to the raw token for that call
+# and tries again on the next.
+_RESOURCE_LABELS: dict[str, str] | None = None
+
+
+def _resource_label(resource: str) -> str:
+    """The display name `configs/datasets.yaml` gives this resource, or the resource itself.
+
+    Taken from the live schema rather than a map here: a table of resource names in this file
+    is one more list to go stale the next time a resource is added.
+    """
+    global _RESOURCE_LABELS
+    from genetics_mcp_server import sdk
+
+    if _RESOURCE_LABELS is None:
+        try:
+            resources = sdk.schema().get("resources") or {}
+        except Exception:
+            return resource
+        _RESOURCE_LABELS = {
+            key: str(value.get("label") or key)
+            for key, value in resources.items()
+            if isinstance(value, dict)
+        }
+    return _RESOURCE_LABELS.get(resource, resource)
+
+
+def _phenotype_name(phenotype: str) -> str | None:
+    """The trait's human-readable name, or None when it cannot be resolved.
+
+    None and the code itself are the same answer here — both mean "nothing to add to the
+    title" — so an unresolved code degrades to the title this replaced rather than to a
+    caption saying `Unknown: H8_HL_IDIOP`, which is what the upstream returns for one.
+    """
+    from genetics_mcp_server import sdk
+
+    try:
+        frame = sdk.lookup_phenotype_names(phenotype)
+    except Exception:
+        return None
+    if frame.is_empty() or "name" not in frame.columns:
+        return None
+    name = frame["name"][0]
+    if not name or str(name).startswith("Unknown:") or str(name) == phenotype:
+        return None
+    return str(name)
+
+
+def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: str) -> str:
+    """`Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14) — 12:49022869-49522869`.
+
+    The code stays in the title even when the name resolves, because it is what a follow-up
+    query takes and the name is not. Release and resource are read off the frame rather than
+    off the arguments, so a caller who passed `data=` gets the label of the data they actually
+    plotted instead of this function's `resource` default.
+
+    Every part is optional and the title degrades one piece at a time: no name leaves the code
+    in front, no release leaves the resource alone, and neither leaves `CODE — region`.
+    """
+    def first(column: str) -> str | None:
+        if column not in frame.columns or frame.height == 0:
+            return None
+        value = frame[column][0]
+        return str(value) if value else None
+
+    name = _phenotype_name(phenotype)
+    source = " ".join(
+        part for part in (_resource_label(first("resource") or resource), first("version"))
+        if part
+    )
+    inside = ", ".join(part for part in (phenotype if name else None, source) if part)
+    head = name or phenotype
+    return f"{head} ({inside}) — {region}" if inside else f"{head} — {region}"
 
 
 def _consequences(region: str) -> dict[str, tuple[str | None, str | None]] | None:
@@ -515,6 +595,12 @@ def locuszoom(
     centred with `flank` either side. `lead` defaults to the strongest association in the
     window, and LD is taken against it from the FinnGen LD server.
 
+    THE DEFAULT WINDOW IS THE RIGHT ONE UNLESS THE QUESTION IS ABOUT THE WINDOW. `flank` is
+    250 kb either side, i.e. a 500 kb plot; pass `variant=` and leave it alone. Widening it as
+    a matter of course spreads the signal over a picture that is mostly empty, and a locus
+    that genuinely needs more says so — `ld_partners_outside_window` names the correlated
+    variants the window excluded, and that is the signal to redraw wider.
+
     Colour is LD and shape is consequence, so a coding variant in high LD reads as both at
     once: a square sits in a coding sequence or changes the protein, a circle does not, and
     the lead takes whichever shape its own consequence gives it. Grey means "no r² to show" —
@@ -715,8 +801,10 @@ def locuszoom(
         )
 
     ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=_LABEL_SIZE)
-    ax.set_title(title if title is not None else f"{phenotype} — {region}",
-                 fontsize=_TITLE_SIZE)
+    ax.set_title(
+        title if title is not None else _default_title(phenotype, region, frame, resource),
+        fontsize=_TITLE_SIZE,
+    )
     ax.tick_params(labelsize=_TICK_SIZE, width=_AXIS_LINEWIDTH, length=_TICK_LENGTH)
     for spine in ax.spines.values():
         spine.set_linewidth(_AXIS_LINEWIDTH)

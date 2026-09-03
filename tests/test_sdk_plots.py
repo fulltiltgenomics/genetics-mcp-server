@@ -439,8 +439,9 @@ def test_coding_consequences_square_and_everything_else_circles(monkeypatch, tmp
         return pl.DataFrame(
             {
                 "variant": ids,
-                # two coding, then terms that must NOT square: splice_region is up to 8bp
-                # into an intron, and UTR/intron/intergenic are not coding at all
+                # one coding, then terms that must NOT square. synonymous sits in a coding
+                # sequence and leaves the protein identical; splice_region is up to 8bp into
+                # an intron; UTR/intron/intergenic are not coding at all
                 "most_severe": [
                     "missense_variant", "synonymous_variant", "splice_region_variant",
                     "3_prime_UTR_variant", "intron_variant", "intergenic_variant",
@@ -452,7 +453,53 @@ def test_coding_consequences_square_and_everything_else_circles(monkeypatch, tmp
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     found = plots._consequences("12:1-2")
     coding = [found[vid][0] in plots._CODING_CONSEQUENCES for vid in ids]
-    assert coding == [True, True, False, False, False, False]
+    assert coding == [True, False, False, False, False, False]
+
+
+def test_the_coding_set_is_the_one_the_rest_of_the_suite_uses():
+    """Five copies of this list exist — here, results-api's `coding_set`, the chat prompt's
+    Terminology block, and the browser's two coding.ts files. They drifted four ways before
+    being reconciled, so this pins the membership rather than only the behaviour.
+
+    The terms written without a `_variant` suffix are written that way because that is the SO
+    name the annotation actually holds: `transcript_ablation` occurs in the data and
+    `transcript_ablation_variant` does not, so the suffixed spelling matched nothing.
+    """
+    assert plots._CODING_CONSEQUENCES == frozenset({
+        "frameshift_variant",
+        "inframe_deletion",
+        "inframe_insertion",
+        "incomplete_terminal_codon_variant",
+        "missense_variant",
+        "protein_altering_variant",
+        "splice_acceptor_variant",
+        "splice_donor_variant",
+        "start_lost",
+        "stop_gained",
+        "stop_lost",
+        "transcript_ablation",
+    })
+
+
+@pytest.mark.parametrize(
+    "term",
+    [
+        # in a coding sequence, protein unchanged — the reason all four are excluded
+        "synonymous_variant",
+        "coding_sequence_variant",
+        "start_retained_variant",
+        "stop_retained_variant",
+        # up to 8bp into an intron, so it establishes no coding position
+        "splice_region_variant",
+        # present in the data and not coding
+        "non_coding_transcript_exon_variant",
+        "3_prime_UTR_variant",
+        "5_prime_UTR_variant",
+        "mature_miRNA_variant",
+    ],
+)
+def test_terms_that_must_not_square(term):
+    assert term not in plots._CODING_CONSEQUENCES
 
 
 def test_an_unavailable_consequence_lookup_leaves_every_point_a_circle(monkeypatch):
@@ -938,3 +985,115 @@ def test_no_caption_on_the_figure_reads_as_an_assignment(monkeypatch, tmp_path):
     assert any(t.startswith("p ") for t in drawn), "the significance line lost its label"
     for text in drawn:
         assert "=" not in text, text
+
+
+# ------------------------------------------------------------------------- the title
+
+
+def title_env(monkeypatch, *, name="Sudden idiopathic hearing loss",
+              label="FinnGen", raises=None):
+    from genetics_mcp_server import sdk
+
+    plots._RESOURCE_LABELS = None  # the cache is process-wide; each case starts cold
+
+    def lookup(codes):
+        if raises == "name":
+            raise RuntimeError("trait_name_mapping is down")
+        return pl.DataFrame({"phenotype": [codes], "name": [name]})
+
+    def schema(*_a, **_k):
+        if raises == "schema":
+            raise RuntimeError("db-api is down")
+        return {"resources": {"finngen": {"label": label}}} if label else {"resources": {}}
+
+    monkeypatch.setattr(sdk, "lookup_phenotype_names", lookup)
+    monkeypatch.setattr(sdk, "schema", schema)
+
+
+def sumstats_with_version(version="R14", resource="finngen"):
+    frame = frame_of()
+    columns = []
+    if resource is not None:
+        columns.append(pl.lit(resource).alias("resource"))
+    if version is not None:
+        columns.append(pl.lit(version).alias("version"))
+    return frame.with_columns(columns) if columns else frame
+
+
+def test_the_title_names_the_trait_the_code_and_the_release(monkeypatch):
+    title_env(monkeypatch)
+    assert plots._default_title(
+        "H8_HL_IDIOP", "12:49022869-49522869", sumstats_with_version(), "finngen"
+    ) == "Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14) — 12:49022869-49522869"
+
+
+def test_the_release_and_resource_come_off_the_frame_not_the_argument(monkeypatch):
+    """A caller who passed `data=` gets the label of the data they actually plotted; the
+    `resource` argument was never used to fetch it."""
+    title_env(monkeypatch, label=None)
+    got = plots._default_title(
+        "X", "12:1-2", sumstats_with_version(version="R13", resource="ukbb"), "finngen"
+    )
+    assert "ukbb R13" in got and "finngen" not in got
+
+
+@pytest.mark.parametrize(
+    "kwargs,frame_kwargs,expected",
+    [
+        # the code stays in front when the name does not resolve
+        ({"name": None}, {}, "H8_HL_IDIOP (FinnGen R14) — 12:1-2"),
+        ({"name": "Unknown: H8_HL_IDIOP"}, {}, "H8_HL_IDIOP (FinnGen R14) — 12:1-2"),
+        # a frame with no release still names the resource
+        ({}, {"version": None},
+         "Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen) — 12:1-2"),
+        # both lookups down: the resource argument is all that is left, unlabelled
+        ({"raises": "name", "label": None}, {"version": None, "resource": None},
+         "H8_HL_IDIOP (finngen) — 12:1-2"),
+    ],
+)
+def test_the_title_degrades_one_piece_at_a_time(monkeypatch, kwargs, frame_kwargs, expected):
+    """Every part is a third-party lookup, and none of them may cost the figure."""
+    title_env(monkeypatch, **kwargs)
+    frame = sumstats_with_version(**{"version": "R14", "resource": "finngen", **frame_kwargs})
+    assert plots._default_title("H8_HL_IDIOP", "12:1-2", frame, "finngen") == expected
+
+
+def test_nothing_at_all_to_add_leaves_the_title_this_replaced(monkeypatch):
+    """The floor of the degradation, reached only when there is no resource to name either."""
+    title_env(monkeypatch, raises="name", label=None)
+    frame = sumstats_with_version(version=None, resource=None)
+    assert plots._default_title("H8_HL_IDIOP", "12:1-2", frame, "") == "H8_HL_IDIOP — 12:1-2"
+
+
+def test_a_failed_schema_fetch_is_not_cached(monkeypatch):
+    """Caching the failure would leave every later figure in the execution unlabelled for a
+    blip that lasted one call."""
+    title_env(monkeypatch, raises="schema")
+    assert plots._resource_label("finngen") == "finngen"
+    assert plots._RESOURCE_LABELS is None
+    title_env(monkeypatch)
+    assert plots._resource_label("finngen") == "FinnGen"
+
+
+def test_an_explicit_title_still_wins(monkeypatch, tmp_path):
+    title_env(monkeypatch)
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, title="mine")
+    assert ax.get_title() == "mine"
+
+
+def test_the_drawn_title_is_the_derived_one(monkeypatch, tmp_path):
+    title_env(monkeypatch)
+    _result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, phenotype="H8_HL_IDIOP", data=sumstats_with_version()
+    )
+    assert ax.get_title().startswith("Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14)")
+
+
+def test_the_default_window_is_250kb_either_side():
+    """The house default, and the one the plots are composed for. It is stated in the
+    docstring too, because that is what reaches a script's author."""
+    import inspect
+
+    assert inspect.signature(plots.locuszoom).parameters["flank"].default == 250_000
+    region, _chrom = plots._region_from_variant("12:49272869:C:T", 250_000)
+    assert region == "12:49022869-49522869"
