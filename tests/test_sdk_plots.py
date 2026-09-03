@@ -999,7 +999,8 @@ def title_env(monkeypatch, *, name="Sudden idiopathic hearing loss",
     def lookup(codes):
         if raises == "name":
             raise RuntimeError("trait_name_mapping is down")
-        return pl.DataFrame({"phenotype": [codes], "name": [name]})
+        codes = [codes] if isinstance(codes, str) else list(codes)
+        return pl.DataFrame({"phenotype": codes, "name": [name] * len(codes)})
 
     def schema(*_a, **_k):
         if raises == "schema":
@@ -1097,3 +1098,147 @@ def test_the_default_window_is_250kb_either_side():
     assert inspect.signature(plots.locuszoom).parameters["flank"].default == 250_000
     region, _chrom = plots._region_from_variant("12:49272869:C:T", 250_000)
     assert region == "12:49022869-49522869"
+
+
+# ---------------------------------------------------------------------------------- phewas
+
+
+def associations(rows):
+    """Credible-set rows as `credible_sets(variant=...)` returns them, GWAS and QTL alike."""
+    base = {
+        "resource": "finngen", "data_type": "GWAS", "trait": None, "mlog10p": None,
+        "most_severe": "missense_variant", "gene_most_severe": "APOE",
+    }
+    return pl.DataFrame([{**base, **row} for row in rows])
+
+
+def phewas_frame():
+    return associations([
+        {"trait": "I9_CHD", "mlog10p": 12.0},
+        {"trait": "T2D", "mlog10p": 9.5},
+        {"trait": "AD", "mlog10p": 300.0},
+        {"trait": "XYZ", "mlog10p": 3.0},
+        {"trait": "WEAK", "mlog10p": 1.0},
+        {"trait": "ENSG00000130203", "mlog10p": 40.0, "data_type": "eQTL"},
+    ])
+
+
+def named_phewas(monkeypatch, tmp_path, **over):
+    """A whole phewas drawn from `data=`, with the figure kept for inspection."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    def names(codes):
+        known = {"I9_CHD": "Coronary heart disease", "AD": "Alzheimer's disease",
+                 "T2D": "Type 2 diabetes"}
+        return pl.DataFrame({"phenotype": codes, "name": [known.get(c, f"Unknown: {c}") for c in codes]})
+
+    monkeypatch.setattr(sdk, "lookup_phenotype_names", names, raising=False)
+    # the display name comes from the live schema; the title under test is the shape, not it
+    monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    captured = {}
+    real_close = plt.close
+
+    def capture(figure=None):
+        if hasattr(figure, "axes"):
+            captured["figure"] = figure
+        real_close(figure)
+
+    monkeypatch.setattr(plt, "close", capture)
+    kwargs = {"variant": "19:44908684:T:C", "data": phewas_frame()}
+    kwargs.update(over)
+    result = plots.phewas(**kwargs)
+    return result, captured["figure"].axes[0]
+
+
+def test_phewas_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
+    result, _ax = named_phewas(monkeypatch, tmp_path)
+    assert result["path"] == str(tmp_path / "phewas.png")
+    assert (tmp_path / "phewas.png").stat().st_size > 0
+    assert result["variant"] == "19:44908684:T:C"
+    # the QTL row and the one below min_mlog10p are not associations on a phewas
+    assert result["n_associations"] == 4
+    assert result["n_significant"] == 3
+    assert result["strongest"] == "AD"
+    assert result["strongest_name"] == "Alzheimer's disease"
+    assert result["strongest_mlog10p"] == 300.0
+    assert result["variant_gene"] == "APOE"
+    assert result["variant_consequence"] == "missense_variant"
+
+
+def test_phewas_puts_other_last_and_names_the_categories_on_the_x_axis(monkeypatch, tmp_path):
+    result, ax = named_phewas(monkeypatch, tmp_path)
+    assert result["categories"][-1] == "Other"
+    assert result["categories"][:-1] == sorted(result["categories"][:-1])
+    assert [t.get_text() for t in ax.get_xticklabels()] == result["categories"]
+    assert not ax.get_legend(), "a phewas carries no legend box"
+
+
+def test_phewas_draws_the_significance_line_the_way_the_locuszoom_does(monkeypatch, tmp_path):
+    _result, ax = named_phewas(monkeypatch, tmp_path)
+    line = next(ln for ln in ax.lines if ln.get_linestyle() == "--")
+    assert line.get_color() == plots._SIGNIFICANCE_GREY
+    assert line.get_ydata()[0] == pytest.approx(-math.log10(5e-8))
+    label = next(t for t in ax.texts if t.get_text().startswith("p "))
+    assert label.get_text() == "p 5e-8"
+    assert label.get_color() == plots._SIGNIFICANCE_GREY
+
+
+def test_phewas_leaves_at_least_two_units_above_the_strongest_association(monkeypatch, tmp_path):
+    _result, ax = named_phewas(monkeypatch, tmp_path)
+    assert ax.get_ylim()[1] >= 300.0 + 2.0
+    # and the same when the strongest point sits below the line, so the line's own label fits
+    _result, ax = named_phewas(
+        monkeypatch, tmp_path, data=associations([{"trait": "T2D", "mlog10p": 3.0}])
+    )
+    assert ax.get_ylim()[1] >= -math.log10(5e-8) + 2.0
+    assert ax.get_ylim()[0] == 0.0
+
+
+def test_phewas_names_the_significant_associations_and_the_variant(monkeypatch, tmp_path):
+    _result, ax = named_phewas(monkeypatch, tmp_path)
+    drawn = {t.get_text() for t in ax.texts}
+    assert {"Alzheimer's disease", "Coronary heart disease", "Type 2 diabetes"} <= drawn
+    assert "XYZ" not in drawn, "an association below the line is not named"
+    assert ax.get_title() == "19:44908684:T:C  APOE missense — finngen"
+
+
+def test_phewas_with_nothing_above_the_floor_says_so():
+    with pytest.raises(GeneticsUsageError, match="nothing to plot"):
+        plots.phewas(
+            variant="19:44908684:T:C", data=associations([{"trait": "T2D", "mlog10p": 1.0}])
+        )
+
+
+def test_phewas_into_a_caller_supplied_axis_saves_nothing(monkeypatch, tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(sdk, "lookup_phenotype_names", lambda codes: pl.DataFrame(), raising=False)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    _figure, ax = plt.subplots()
+    result = plots.phewas(variant="19:44908684:T:C", data=phewas_frame(), ax=ax)
+    assert result["path"] is None
+    assert not list(tmp_path.iterdir())
+    # no names resolved: the labels fall back to the codes and the categoriser still places them
+    assert result["strongest_name"] == "AD"
+    plt.close("all")
+
+
+def test_phewas_names_a_phenotype_once_however_many_resources_carry_it(monkeypatch, tmp_path):
+    twice = associations([
+        {"trait": "AD", "mlog10p": 300.0, "resource": "finngen"},
+        {"trait": "AD", "mlog10p": 120.0, "resource": "ukbb"},
+        {"trait": "T2D", "mlog10p": 9.5},
+    ])
+    _result, ax = named_phewas(monkeypatch, tmp_path, data=twice)
+    names = [t.get_text() for t in ax.texts if not t.get_text().startswith("p ")]
+    assert names.count("Alzheimer's disease") == 1
+    assert sorted(names) == ["Alzheimer's disease", "Type 2 diabetes"]

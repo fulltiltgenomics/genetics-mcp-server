@@ -563,65 +563,6 @@ class TestCredibleSetStatsTools:
 
 
 @pytest.mark.integration
-class TestVisualizationTools:
-    """Tests for visualization tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
-    async def test_create_phewas_plot(self):
-        """Test creating a PheWAS plot for a variant."""
-        result = await self.executor.create_phewas_plot("19:44908684:T:C")
-
-        assert result["success"] is True
-        assert result["variant"] == "19:44908684:T:C"
-        assert "n_associations" in result
-        assert "n_significant" in result
-        assert "categories" in result
-        assert "image_base64" in result
-        assert result["image_format"] == "png"
-        # verify base64 is valid PNG (starts with PNG magic bytes when decoded)
-        import base64
-        decoded = base64.b64decode(result["image_base64"])
-        assert decoded[:8] == b"\x89PNG\r\n\x1a\n"
-
-    async def test_create_phewas_plot_with_resource(self):
-        """Test creating PheWAS plot filtered by resource."""
-        result = await self.executor.create_phewas_plot(
-            "19:44908684:T:C",
-            resource="finngen",
-        )
-
-        assert result["success"] is True
-        assert "image_base64" in result
-
-    async def test_create_phewas_plot_with_thresholds(self):
-        """Test creating PheWAS plot with custom thresholds."""
-        result = await self.executor.create_phewas_plot(
-            "19:44908684:T:C",
-            significance_threshold=5.0,
-            min_mlog10p=1.0,
-        )
-
-        assert result["success"] is True
-        assert "image_base64" in result
-
-    async def test_create_phewas_plot_no_associations(self):
-        """Test error when variant has no GWAS associations."""
-        result = await self.executor.create_phewas_plot(
-            "1:1:A:T",  # unlikely to have associations
-            min_mlog10p=100.0,  # very high threshold
-        )
-
-        assert result["success"] is False
-        assert "error" in result
-
-
-@pytest.mark.integration
 class TestSummaryStatsTools:
     """Tests for summary statistics tools."""
 
@@ -818,7 +759,6 @@ class TestVariantAnnotationTools:
 # Update them only alongside a deliberate, reviewed change to a tool's category.
 _PROFILE_NONE_NAMES = {
     "analyze_variant_list",
-    "create_phewas_plot",
     "get_asm_qtl_by_gene",
     "get_asm_qtl_by_variant",
     "get_colocalization",
@@ -889,7 +829,6 @@ _PROFILE_NONE_NAMES = {
 
 _PROFILE_API_NAMES = {
     "analyze_variant_list",
-    "create_phewas_plot",
     "get_asm_qtl_by_gene",
     "get_asm_qtl_by_variant",
     "get_colocalization",
@@ -957,7 +896,6 @@ _PROFILE_API_NAMES = {
 }
 
 _PROFILE_BIGQUERY_NAMES = {
-    "create_phewas_plot",
     "get_database_schema",
     "get_dataset_display_names",
     "get_gene_group_members",
@@ -985,7 +923,6 @@ _PROFILE_BIGQUERY_NAMES = {
 
 # also the resolved set for any unrecognised profile string, which degrades to general-only
 _PROFILE_RAG_NAMES = {
-    "create_phewas_plot",
     "get_dataset_display_names",
     "get_gene_group_members",
     "get_protein_annotations",

@@ -1,7 +1,7 @@
 """Unit tests for phenotype categorization."""
 
 
-from genetics_mcp_server.tools.phewas_categories import (
+from genetics_mcp_server.sdk.phewas_categories import (
     CATEGORY_COLORS,
     categorize_phenotype,
     get_category_color,

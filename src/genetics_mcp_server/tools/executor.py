@@ -10,9 +10,7 @@ than shipping it.
 """
 
 import asyncio
-import base64
 import inspect
-import io
 import json
 import logging
 import os
@@ -27,15 +25,7 @@ from urllib.parse import quote, urlencode
 from xml.sax.saxutils import quoteattr
 
 import httpx
-import matplotlib
 
-matplotlib.use("Agg")  # non-interactive backend for server use
-import matplotlib.pyplot as plt
-
-from genetics_mcp_server.tools.phewas_categories import (
-    categorize_phenotype,
-    get_category_color,
-)
 from genetics_mcp_server.tools.sql_safety import (
     SqlValueError,
     normalize_literal,
@@ -2805,188 +2795,6 @@ class ToolExecutor:
                 f"Error in get_summary_stats_by_region({region}): {e}\n{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
-
-    # -------------------------------------------------------------------------
-    # Visualization Tools
-    # -------------------------------------------------------------------------
-
-    async def create_phewas_plot(
-        self,
-        variant: str,
-        resource: str | None = None,
-        significance_threshold: float = 7.3,
-        min_mlog10p: float = 2.0,
-    ) -> dict[str, Any]:
-        """Create a PheWAS plot for a variant showing phenotype associations."""
-        try:
-            # fetch associations using existing method
-            data = await self.get_credible_sets_by_variant(
-                variant, resource=resource, summarize=False
-            )
-            if not data["success"]:
-                return data
-
-            # filter to GWAS associations above threshold
-            results = [
-                r for r in data["results"]
-                if r.get("data_type") == "GWAS"
-                and (r.get("mlog10p") or 0) >= min_mlog10p
-            ]
-
-            if not results:
-                return {
-                    "success": False,
-                    "error": f"No GWAS associations found for {variant} with -log10(p) >= {min_mlog10p}",
-                }
-
-            # get phenotype names for categorization
-            phenotype_codes = list(set(r.get("trait", "") for r in results if r.get("trait")))
-            names_data = await self.lookup_phenotype_names(phenotype_codes)
-            code_to_name = names_data.get("names", {}) if names_data.get("success") else {}
-
-            # categorize each phenotype
-            for r in results:
-                code = r.get("trait", "")
-                name = code_to_name.get(code, "")
-                r["category"] = categorize_phenotype(code, name)
-                r["phenotype_name"] = name if name and not name.startswith("Unknown:") else code
-
-            # sort by category, then by mlog10p within category
-            results.sort(key=lambda x: (x["category"], -(x.get("mlog10p") or 0)))
-
-            # generate matplotlib figure
-            fig = self._create_phewas_figure(results, variant, significance_threshold)
-
-            # encode as base64 PNG
-            buffer = io.BytesIO()
-            fig.savefig(buffer, format="png", dpi=100, bbox_inches="tight", facecolor="white")
-            buffer.seek(0)
-            base64_png = base64.b64encode(buffer.read()).decode("utf-8")
-            plt.close(fig)
-
-            # compute summary stats
-            n_significant = sum(1 for r in results if (r.get("mlog10p") or 0) >= significance_threshold)
-            categories_found = sorted(set(r["category"] for r in results))
-
-            return {
-                "success": True,
-                "variant": variant,
-                "n_associations": len(results),
-                "n_significant": n_significant,
-                "categories": categories_found,
-                "image_base64": base64_png,
-                "image_format": "png",
-            }
-
-        except Exception as e:
-            logger.error(f"Error in create_phewas_plot({variant}): {e}\n{traceback.format_exc()}")
-            return {"success": False, "error": INTERNAL_ERROR_MSG}
-
-    def _create_phewas_figure(
-        self,
-        results: list[dict],
-        variant: str,
-        significance_threshold: float,
-    ) -> plt.Figure:
-        """Create a matplotlib PheWAS figure."""
-        fig, ax = plt.subplots(figsize=(14, 6))
-
-        # assign x-positions - group by category
-        categories = []
-        x_positions = []
-        y_values = []
-        colors = []
-        labels = []
-
-        current_x = 0
-        last_category = None
-        category_ranges = {}  # track x-range for each category
-
-        for r in results:
-            category = r["category"]
-
-            # add gap between categories
-            if last_category is not None and category != last_category:
-                current_x += 2
-
-            if category not in category_ranges:
-                category_ranges[category] = {"start": current_x, "end": current_x}
-
-            x_positions.append(current_x)
-            y_values.append(r.get("mlog10p") or 0)
-            colors.append(get_category_color(category))
-            labels.append(r["phenotype_name"])
-            categories.append(category)
-
-            category_ranges[category]["end"] = current_x
-            last_category = category
-            current_x += 1
-
-        # scatter plot
-        ax.scatter(x_positions, y_values, c=colors, s=50, alpha=0.7, edgecolors="none")
-
-        # significance threshold line
-        ax.axhline(
-            y=significance_threshold,
-            color="red",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.7,
-            label="Genome-wide significance (p=5e-8)",
-        )
-
-        # category labels at bottom
-        for category, ranges in category_ranges.items():
-            mid_x = (ranges["start"] + ranges["end"]) / 2
-            ax.text(
-                mid_x,
-                -0.5,
-                category,
-                ha="center",
-                va="top",
-                fontsize=8,
-                rotation=45,
-                color=get_category_color(category),
-                fontweight="bold",
-            )
-
-        # annotate top significant hits
-        significant_results = [
-            (x, y, label) for x, y, label in zip(x_positions, y_values, labels)
-            if y >= significance_threshold
-        ]
-        # sort by y descending and take top 10
-        significant_results.sort(key=lambda t: -t[1])
-        for x, y, label in significant_results[:10]:
-            # truncate long labels
-            short_label = label[:30] + "..." if len(label) > 30 else label
-            ax.annotate(
-                short_label,
-                (x, y),
-                xytext=(5, 5),
-                textcoords="offset points",
-                fontsize=7,
-                alpha=0.8,
-            )
-
-        # formatting
-        ax.set_xlabel("Phenotype Category", fontsize=10)
-        ax.set_ylabel("-log10(p-value)", fontsize=10)
-        ax.set_title(f"PheWAS Plot for {variant}", fontsize=12, fontweight="bold")
-
-        ax.set_xlim(-1, current_x)
-        ax.set_ylim(bottom=0)
-        ax.set_xticks([])  # hide x-axis ticks since we're using category labels
-
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["bottom"].set_visible(False)
-
-        # legend for significance line
-        ax.legend(loc="upper right", fontsize=8)
-
-        plt.tight_layout()
-        return fig
 
     async def get_credible_sets_stats(
         self,

@@ -33,7 +33,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 ## Technical implementation considerations
 
 - polars should be used to process tabular data from the genetics API
-- matplotlib is used for generating scientific visualizations (PheWAS plots, etc.)
+- matplotlib is used only by `sdk/plots.py`, the standard figures a sandboxed script draws; the servers never import it
 - Asynchronous code execution using async/await with httpx for HTTP calls
 - The MCP server uses FastMCP from the mcp library for tool registration
 - Tool definitions are shared between MCP server and LLM service via a common module
@@ -125,8 +125,11 @@ Four evidence types that must not be conflated, because a user question about "r
 
 | Tool | Description |
 |------|-------------|
-| `create_phewas_plot` | Create a PheWAS plot showing phenotype associations for a variant (returns base64 PNG) |
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
+
+Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
+locuszoom and a phewas — as functions a `run_analysis` script calls, and the figure comes
+back as an artifact.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -585,7 +588,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
@@ -623,7 +626,7 @@ API-category tools one at a time. It wraps 40 of the 44; the four `api`-category
 **not** wrap are `get_phenotype_report`, `get_credible_sets_stats`, `analyze_variant_list` and
 `get_myvariant_annotations`. The "Deliberately **not** in the SDK" section below gives the
 reasoning, but it is written across categories — its list also names `general`-category tools
-such as `create_phewas_plot`, which was never one of the 44 — so it is not a substitute for
+such as `search_uniprot`, which was never one of the 44 — so it is not a substitute for
 the four named here.
 
 The four are excluded deliberately, but not for one shared reason, and the axis that separates
@@ -728,8 +731,8 @@ via the `X-Columns` response header results-api added for
 `genetics-results-suite-6uk` (see "Empty results keep their schema").
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
-cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
-`analyze_variant_list`, `get_credible_sets_stats`) and `get_phenotype_report`. The first group is
+cBioPortal, myvariant, UniProt), the presentation tools (`analyze_variant_list`,
+`get_credible_sets_stats`) and `get_phenotype_report`. The first group is
 not genetics-results data; the second is model-facing summarisation that a script writes for
 itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
 scores and tier flags are in no view a script can query, so a script cannot write the report for
@@ -1008,8 +1011,10 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 - **The import closure is pinned, because the sandbox image ships exactly it.** That image
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
-  is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,executor,phewas_categories,sql_safety,uniprot}`.
+  is nine modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
+  `tools/{__init__,executor,sql_safety,uniprot}`. `sdk/plots.py` and the
+  `sdk/phewas_categories.py` only it imports ship too but sit outside the closure, resolved
+  lazily so the servers never import matplotlib.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` now imports `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
@@ -1670,13 +1675,14 @@ src/genetics_mcp_server/
 │   ├── executor.py      # tool execution via HTTP; the half the sandbox image ships
 │   ├── orchestration.py # ServerToolExecutor: run_analysis, read_artifact, web/literature search
 │   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
-│   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
-│   └── phewas_categories.py  # PheWAS plot category mappings
+│   └── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
 ├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
 │   ├── __init__.py      # sync module-level functions, shared client lifecycle
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
-│   └── errors.py        # GeneticsError / GeneticsUsageError
+│   ├── errors.py        # GeneticsError / GeneticsUsageError
+│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas)
+│   └── phewas_categories.py  # the phewas's phenotype-category axis
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
@@ -2396,7 +2402,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
 | `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
 | `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
-| `test_phewas_categories.py` | PheWAS category mappings |
+| `test_phewas_categories.py` | The phewas plot's phenotype-category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint, and the regression guard for silent download failures: every malformed `_download_data` payload (including verbatim reproductions of the `bef` and `buc` positional-rows payloads, and a non-`str` `filename`) must raise `DownloadShapeError` out of `_convert_to_tsv`, must never return quietly from `_process_download_hints`, and must there yield `DOWNLOAD_SHAPE_NOTE` plus a `DOWNLOAD_SHAPE_DEFECT tool=…` ERROR line with a traceback *without* propagating; a `TypeError` from the store still propagates (pinning the narrow `except`); `ENOSPC`, an unwritable storage path and an unencodable upstream value each surface `DOWNLOAD_FAILED_NOTE` plus a `DOWNLOAD_FAILED tool=…` ERROR line |

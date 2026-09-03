@@ -1218,32 +1218,6 @@ Do NOT use this to look up a protein you can already name; resolving a gene symb
         },
     },
     {
-        "name": "create_phewas_plot",
-        "category": "general",
-        "description": "Create a PheWAS (Phenome-Wide Association Study) plot showing all phenotype associations for a variant. Returns a base64-encoded PNG image with phenotypes grouped by category on the X-axis and -log10(p-value) on the Y-axis.",
-        "parameters": {
-            "variant": {
-                "type": "string",
-                "description": "Variant ID (chr:pos:ref:alt, e.g., '19:44908684:T:C')",
-                "required": True,
-            },
-            "resource": {
-                "type": "string",
-                "description": "Data resource: 'finngen', 'ukbb', or omit for all sources",
-            },
-            "significance_threshold": {
-                "type": "number",
-                "description": "Show significance line at this -log10(p) value (default 7.3, genome-wide significance)",
-                "default": 7.3,
-            },
-            "min_mlog10p": {
-                "type": "number",
-                "description": "Only show associations with -log10(p) above this value (default 2.0)",
-                "default": 2.0,
-            },
-        },
-    },
-    {
         "name": "get_ld_between_variants",
         "category": "api",
         "description": "Get linkage disequilibrium (LD) statistics between two specific variants. Returns r2 and D' values from the FinnGen reference panel. Both variants must be on the same chromosome and within 5 Mb of each other.",
@@ -2521,18 +2495,6 @@ def register_mcp_tools(
             return await executor.search_uniprot(
                 query, keyword, organism_id, reviewed_only, fields, size, count_only
             )
-
-    @mcp.tool()
-    async def create_phewas_plot(
-        variant: str,
-        resource: str | None = None,
-        significance_threshold: float = 7.3,
-        min_mlog10p: float = 2.0,
-    ) -> dict:
-        """Create a PheWAS plot showing phenotype associations for a variant."""
-        return await executor.create_phewas_plot(
-            variant, resource, significance_threshold, min_mlog10p
-        )
 
     @mcp.tool()
     async def get_ld_between_variants(

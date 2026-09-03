@@ -2,6 +2,7 @@
 
     import genetics
     genetics.plots.locuszoom(phenotype="H8_HEARINGLOSS", variant="12:49578357:C:T")
+    genetics.plots.phewas(variant="19:44908684:T:C")
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
@@ -38,8 +39,9 @@ from typing import Any
 import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsUsageError
+from genetics_mcp_server.sdk.phewas_categories import categorize_phenotype, get_category_color
 
-__all__ = ["locuszoom"]
+__all__ = ["locuszoom", "phewas"]
 
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
@@ -129,7 +131,7 @@ def _artifacts_dir() -> str:
     return os.environ.get("SANDBOX_ARTIFACTS_DIR") or "."
 
 
-def _resolve_path(path: str | None) -> str:
+def _resolve_path(path: str | None, default: str) -> str:
     """Where the figure is written. A relative name lands in the artifacts directory.
 
     Not `path or <default>`: a relative `path=` used to be written to the process cwd, which
@@ -138,7 +140,7 @@ def _resolve_path(path: str | None) -> str:
     An absolute path is honoured as given.
     """
     if path is None:
-        return os.path.join(_artifacts_dir(), "locuszoom.png")
+        return os.path.join(_artifacts_dir(), default)
     if os.path.isabs(path):
         return path
     return os.path.join(_artifacts_dir(), path)
@@ -197,6 +199,14 @@ def _pretty_consequence(term: str | None) -> str | None:
     return str(term).removesuffix("_variant").replace("_", " ") or str(term)
 
 
+def _variant_head(variant_id: str, consequence: str | None, gene: str | None) -> str:
+    """`19:44908684:T:C  APOE missense`, or the bare id when nothing is annotated."""
+    term = _pretty_consequence(consequence)
+    if not term:
+        return variant_id
+    return f"{variant_id}  {gene} {term}" if gene else f"{variant_id}  {term}"
+
+
 def _lead_label(
     variant_id: str,
     row: dict[str, Any],
@@ -209,10 +219,7 @@ def _lead_label(
     Built from what is present rather than from a fixed list, because `data=` may be any frame
     a caller assembled and a KeyError there would lose the whole figure for a caption.
     """
-    head = variant_id
-    term = _pretty_consequence(consequence)
-    if term:
-        head = f"{variant_id}  {gene} {term}" if gene else f"{variant_id}  {term}"
+    head = _variant_head(variant_id, consequence, gene)
     parts = [f"p {_format_p(mlog10p)}"]
     beta = row.get("beta")
     if beta is not None:
@@ -252,25 +259,33 @@ def _resource_label(resource: str) -> str:
     return _RESOURCE_LABELS.get(resource, resource)
 
 
-def _phenotype_name(phenotype: str) -> str | None:
-    """The trait's human-readable name, or None when it cannot be resolved.
+def _phenotype_names(phenotypes: list[str]) -> dict[str, str]:
+    """code -> human-readable name, for the codes that resolve to one.
 
-    None and the code itself are the same answer here — both mean "nothing to add to the
-    title" — so an unresolved code degrades to the title this replaced rather than to a
-    caption saying `Unknown: H8_HL_IDIOP`, which is what the upstream returns for one.
+    A code that does not resolve is absent rather than mapped to the upstream's
+    `Unknown: H8_HL_IDIOP` placeholder or to itself, so every caller's fallback is the same
+    one: use the code. A failed lookup is an empty mapping for the same reason — a title or
+    a label without the name is still right, and the figure is what matters.
     """
     from genetics_mcp_server import sdk
 
+    if not phenotypes:
+        return {}
     try:
-        frame = sdk.lookup_phenotype_names(phenotype)
+        frame = sdk.lookup_phenotype_names(phenotypes)
     except Exception:
-        return None
-    if frame.is_empty() or "name" not in frame.columns:
-        return None
-    name = frame["name"][0]
-    if not name or str(name).startswith("Unknown:") or str(name) == phenotype:
-        return None
-    return str(name)
+        return {}
+    if frame.is_empty() or not {"phenotype", "name"} <= set(frame.columns):
+        return {}
+    names = {}
+    for code, name in zip(frame["phenotype"], frame["name"]):
+        if name and not str(name).startswith("Unknown:") and str(name) != code:
+            names[str(code)] = str(name)
+    return names
+
+
+def _phenotype_name(phenotype: str) -> str | None:
+    return _phenotype_names([phenotype]).get(phenotype)
 
 
 def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: str) -> str:
@@ -567,6 +582,33 @@ def _draw_genes(
     ax.set_ylim(-max(len(row_ends), 1) + 0.2, 0.9)
     return drawn, exons_drawn
 
+def _significance_line(ax, significance: float) -> float:
+    """The significance line and its label, drawn the same way on every plot; returns its y.
+
+    The label sits on the line rather than in a legend box: grey scaffolding named where it
+    is, so the figure carries no legend unless something else needs one. Returns 0.0 and
+    draws nothing when `significance` is falsy.
+    """
+    if not significance:
+        return 0.0
+    line_y = -math.log10(significance)
+    ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
+    # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
+    ax.text(0.006, line_y, f"p {significance:g}".replace("e-0", "e-"),
+            transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6,
+            color=_SIGNIFICANCE_GREY)
+    return line_y
+
+
+def _dress(ax, title: str) -> None:
+    """The y label, the title and the type sizes every one of these plots shares."""
+    ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=_LABEL_SIZE)
+    ax.set_title(title, fontsize=_TITLE_SIZE)
+    ax.tick_params(labelsize=_TICK_SIZE, width=_AXIS_LINEWIDTH, length=_TICK_LENGTH)
+    for spine in ax.spines.values():
+        spine.set_linewidth(_AXIS_LINEWIDTH)
+
+
 def locuszoom(
     *,
     phenotype: str,
@@ -775,13 +817,7 @@ def locuszoom(
                 (lead_pos, lead_y),
                 textcoords="offset points", xytext=(0, -9), ha="center", va="top",
                 fontsize=6)
-    line_y = -math.log10(significance) if significance else 0.0
-    if significance:
-        ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
-        # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
-        ax.text(0.006, line_y, f"p {significance:g}".replace("e-0", "e-"),
-                transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6,
-                color=_SIGNIFICANCE_GREY)
+    line_y = _significance_line(ax, significance)
 
     if outside:
         # on the figure and not only in the returned dict: the figure is what reaches the
@@ -800,14 +836,7 @@ def locuszoom(
             color=_WARNING_COLOUR,
         )
 
-    ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=_LABEL_SIZE)
-    ax.set_title(
-        title if title is not None else _default_title(phenotype, region, frame, resource),
-        fontsize=_TITLE_SIZE,
-    )
-    ax.tick_params(labelsize=_TICK_SIZE, width=_AXIS_LINEWIDTH, length=_TICK_LENGTH)
-    for spine in ax.spines.values():
-        spine.set_linewidth(_AXIS_LINEWIDTH)
+    _dress(ax, title if title is not None else _default_title(phenotype, region, frame, resource))
     ax.margins(x=0.02)
     if ld_joined:
         handles = [
@@ -843,7 +872,7 @@ def locuszoom(
 
     written = None
     if own_figure:
-        written = _resolve_path(path)
+        written = _resolve_path(path, "locuszoom.png")
         figure.savefig(written)
         plt.close(figure)
 
@@ -861,4 +890,208 @@ def locuszoom(
         "coding_marked": coding_marked,
         "lead_consequence": lead_consequence,
         "lead_gene": lead_gene,
+    }
+
+
+# One slot per association along x, and this many empty slots between one category and the
+# next: the gap is what makes the groups read as groups, since nothing else separates them.
+_PHEWAS_CATEGORY_GAP = 2
+
+# Room between the strongest association and the top of the panel, in -log10 p. A fixed
+# amount rather than a fraction alone, because the point labels are drawn upward and at a
+# modest -log10 p a fraction leaves nowhere for the top one to go.
+_PHEWAS_HEADROOM = 2.0
+
+# how many of the strongest significant associations are named on the figure, and at what
+# length: past this the labels overprint each other and none can be read
+_PHEWAS_LABELS = 10
+_PHEWAS_LABEL_CHARS = 30
+
+
+def _first(frame: pl.DataFrame, column: str) -> str | None:
+    """The first non-null value of a column the frame may not have."""
+    if column not in frame.columns:
+        return None
+    values = frame[column].drop_nulls()
+    return str(values[0]) if len(values) else None
+
+
+def _phewas_title(variant_id: str, frame: pl.DataFrame, resource: str | None) -> str:
+    """`19:44908684:T:C  APOE missense — FinnGen, UK Biobank`.
+
+    The consequence comes off the rows themselves: a credible-set row carries the variant's
+    `most_severe` and `gene_most_severe`, so unlike the locuszoom this needs no second
+    lookup. The resources are the ones the data actually came from, so a caller who passed
+    `data=` gets the label of what they plotted, and past three they are counted rather
+    than listed.
+    """
+    head = _variant_head(
+        variant_id, _first(frame, "most_severe"), _first(frame, "gene_most_severe")
+    )
+    if "resource" in frame.columns:
+        resources = sorted(set(str(r) for r in frame["resource"].drop_nulls()))
+    else:
+        resources = [resource] if resource else []
+    if len(resources) > 3:
+        source = f"{len(resources)} resources"
+    else:
+        source = ", ".join(_resource_label(r) for r in resources)
+    return f"{head} — {source}" if source else head
+
+
+def phewas(
+    *,
+    variant: str,
+    resource: str | None = None,
+    min_mlog10p: float = 2.0,
+    data: pl.DataFrame | None = None,
+    path: str | None = None,
+    title: str | None = None,
+    significance: float = 5e-8,
+    ax: Any = None,
+) -> dict[str, Any]:
+    """Phenome-wide association plot: -log10 p of every GWAS association of one variant.
+
+    The associations are the fine-mapped credible sets the variant belongs to, across every
+    resource unless `resource=` names one, kept where -log10(p) is at least `min_mlog10p`.
+    Each is one point, coloured by the category its phenotype falls into — an organ system
+    or disease area read off the phenotype's name, or its code when the name does not say —
+    and the categories are the x axis, `Other` last. The strongest associations above the
+    significance line are named on the figure, each phenotype once.
+
+    The title names the variant with its gene and consequence, taken from the rows
+    themselves, and the resources the associations came from.
+
+    Returns a dict describing what was drawn: `path`, `variant`, `n_associations`,
+    `n_significant`, `categories` in plotting order, `strongest` and `strongest_name` (the
+    phenotype code and name of the top association) with `strongest_mlog10p`, and
+    `variant_consequence` and `variant_gene` as the title shows them.
+
+    `path` may be relative, in which case it is written inside the execution's artifacts
+    directory and returned to the user automatically; that is also where the default goes.
+    Pass `ax` to draw into an existing axis instead, in which case nothing is saved. Pass
+    `data=` to plot a frame already in hand — credible-set rows, or any frame with a `trait`
+    column and `mlog10p` or `pval`.
+    """
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server import sdk
+
+    variant_id = _norm_variant_id(variant)
+    frame = data if data is not None else sdk.credible_sets(
+        variant=variant_id, resource=resource, data_types="GWAS"
+    )
+    if "trait" not in frame.columns:
+        raise GeneticsUsageError(
+            f"the associations have no 'trait' column, so there is nothing to place on the "
+            f"x axis; columns are {frame.columns}"
+        )
+    if "data_type" in frame.columns:
+        # a caller's `data=` may carry the QTL rows too; a phewas is the GWAS ones
+        frame = frame.filter(pl.col("data_type").cast(pl.Utf8).str.to_uppercase() == "GWAS")
+    if not frame.is_empty():
+        frame = frame.with_columns(_mlog10p(frame).alias("_y")).filter(
+            pl.col("_y") >= min_mlog10p
+        )
+    if frame.is_empty():
+        raise GeneticsUsageError(
+            f"no GWAS associations for {variant_id} at -log10(p) >= {min_mlog10p:g} "
+            f"(resource={resource!r}) — nothing to plot"
+        )
+
+    names = _phenotype_names(sorted({str(code) for code in frame["trait"]}))
+    frame = frame.with_columns(
+        pl.col("trait").cast(pl.Utf8).alias("_code"),
+    ).with_columns(
+        pl.col("_code").map_elements(
+            lambda code: names.get(code, code), return_dtype=pl.Utf8
+        ).alias("_name"),
+        pl.col("_code").map_elements(
+            lambda code: categorize_phenotype(code, names.get(code)), return_dtype=pl.Utf8
+        ).alias("_category"),
+    )
+    # `Other` is where the categoriser gave up, so it sits at the end rather than in the
+    # alphabet's middle; within a category the strongest association comes first
+    frame = frame.with_columns((pl.col("_category") == "Other").alias("_last")).sort(
+        ["_last", "_category", "_y"], descending=[False, False, True]
+    )
+    codes = list(frame["_code"])
+
+    categories: list[str] = []
+    spans: dict[str, list[int]] = {}
+    xs: list[int] = []
+    x = 0
+    for category in frame["_category"]:
+        if categories and category != categories[-1]:
+            x += _PHEWAS_CATEGORY_GAP
+        if category not in spans:
+            categories.append(category)
+            spans[category] = [x, x]
+        spans[category][1] = x
+        xs.append(x)
+        x += 1
+    ys = [float(y) for y in frame["_y"]]
+    labels = list(frame["_name"])
+
+    own_figure = ax is None
+    if own_figure:
+        figure, ax = plt.subplots(figsize=(6.5, 3.4), constrained_layout=True)
+    else:
+        figure = ax.get_figure()
+
+    ax.scatter(xs, ys, c=[get_category_color(c) for c in frame["_category"]],
+               marker=_MARKER_OTHER, s=9, linewidths=0.2, edgecolors="#33333355", zorder=2)
+    line_y = _significance_line(ax, significance)
+
+    # each phenotype is named once, at its strongest point: the same trait from two resources
+    # is two points a slot apart, and two copies of one label overprint into neither
+    named: list[int] = []
+    seen: set[str] = set()
+    for i in sorted(range(len(ys)), key=lambda i: ys[i], reverse=True):
+        if significance and ys[i] < line_y:
+            break
+        if codes[i] in seen:
+            continue
+        seen.add(codes[i])
+        named.append(i)
+        if len(named) == _PHEWAS_LABELS:
+            break
+    for i in named:
+        text = labels[i]
+        if len(text) > _PHEWAS_LABEL_CHARS:
+            text = text[:_PHEWAS_LABEL_CHARS] + "…"
+        ax.annotate(text, (xs[i], ys[i]), textcoords="offset points", xytext=(2, 2),
+                    ha="left", va="bottom", fontsize=5)
+
+    _dress(ax, title if title is not None else _phewas_title(variant_id, frame, resource))
+    # the categories ARE the x scale: one label under the middle of each group, and no tick
+    # marks, since a mark would point at one association among several. The labels stay in
+    # the text colour rather than the category's — the groups already separate them, and
+    # the ramp has a yellow that is unreadable on white.
+    ax.set_xticks([(lo + hi) / 2 for lo, hi in (spans[c] for c in categories)])
+    ax.set_xticklabels(categories, rotation=45, ha="right", rotation_mode="anchor")
+    ax.tick_params(axis="x", length=0)
+    ax.set_xlim(-1, x)
+    y_top = max(max(ys), line_y)
+    ax.set_ylim(0, y_top + max(_PHEWAS_HEADROOM, y_top * 0.08))
+
+    written = None
+    if own_figure:
+        written = _resolve_path(path, "phewas.png")
+        figure.savefig(written)
+        plt.close(figure)
+
+    strongest = max(range(len(ys)), key=lambda i: ys[i])
+    row = frame.row(strongest, named=True)
+    return {
+        "path": written,
+        "variant": variant_id,
+        "n_associations": frame.height,
+        "n_significant": sum(y >= line_y for y in ys) if significance else 0,
+        "categories": categories,
+        "strongest": row["_code"],
+        "strongest_name": row["_name"],
+        "strongest_mlog10p": ys[strongest],
+        "variant_consequence": _first(frame, "most_severe"),
+        "variant_gene": _first(frame, "gene_most_severe"),
     }
