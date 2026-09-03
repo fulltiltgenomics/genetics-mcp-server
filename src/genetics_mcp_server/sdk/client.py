@@ -24,6 +24,7 @@ import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import ToolExecutor
+from genetics_mcp_server.tools.sql_safety import SqlValueError, quote_literal, quote_literal_list
 
 # db-api's per-query row ceiling, mirrored from the tool layer. `limit` on the BigQuery
 # functions defaults to it rather than to the tool surface's 500: a script consumes rows
@@ -850,11 +851,56 @@ class GeneticsClient:
         So aggregate, filter or add the partition predicate in SQL rather than fetching
         every row and reducing in polars.
         """
+        return await self._query(query, max_rows=max_rows)
+
+    async def _query(self, query: str, *, max_rows: int = 100_000) -> pl.DataFrame:
+        # the executor and not self.sql(): every public method is audited, and a typed
+        # function that went through sql() would write two lines for one read
         result = self._payload(await self._executor.query_database(query, max_rows=max_rows))
         self._check_truncation(result)
         return _frame(result.get("rows") or [], columns=result.get("columns") or None)
 
     # ------------------------------------------------------------------ code -> name
+
+    async def phenotypes(
+        self,
+        *,
+        codes: str | list[str] | None = None,
+        dataset: str | list[str] | None = None,
+        resource: str | None = None,
+    ) -> pl.DataFrame:
+        """Trait metadata from `phenotypes_v`: name, trait type, source category, sample sizes.
+
+        `codes` are trait codes as the results views' `trait_original` column stores them
+        (`H8_HL_IDIOP`, not the display form in `trait`); `dataset` and `resource` narrow the
+        rows, and at least one of the three is needed. One row per (dataset, code), so a code
+        several datasets share comes back once per dataset — join on both.
+
+        `category` is the source's own grouping — a FinnGen ICD chapter, Kanta's
+        Quantitative/Binary, an Open Targets project id, a Genebass trait type — not one
+        harmonised across resources. Coverage is partial by design: QTL datasets and those
+        whose codes are already readable have no rows, so LEFT JOIN when the dataset is not
+        known in advance.
+        """
+        clauses = []
+        try:
+            if codes is not None:
+                code_list = [codes] if isinstance(codes, str) else list(codes)
+                clauses.append(f"trait_original IN ({quote_literal_list(code_list, name='codes')})")
+            if dataset is not None:
+                dataset_list = [dataset] if isinstance(dataset, str) else list(dataset)
+                clauses.append(f"dataset IN ({quote_literal_list(dataset_list, name='dataset')})")
+            if resource is not None:
+                clauses.append(f"resource = {quote_literal(resource, name='resource')}")
+        except SqlValueError as exc:
+            raise GeneticsUsageError(str(exc)) from None
+        if not clauses:
+            raise GeneticsUsageError("phenotypes() needs codes=, dataset= or resource=")
+        return await self._query(
+            "SELECT dataset, resource, version, trait_original, trait_name, trait_type, "
+            "category, n_samples, n_cases, n_controls, coloc_partner_only "
+            f"FROM phenotypes_v WHERE {' AND '.join(clauses)}"
+        )
 
     async def lookup_phenotype_names(self, codes: str | list[str]) -> pl.DataFrame:
         """Resolve trait codes ('I9_CHD') to their human-readable names.

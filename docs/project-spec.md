@@ -701,6 +701,7 @@ winner.
 | `ld(variant[, other])` | `get_variants_in_ld`, `get_ld_between_variants` |
 | `search(query=[, kind=]\|rsids=)` | `search_phenotypes`, `search_genes`, `lookup_variants_by_rsid` |
 | `lookup_phenotype_names(codes)` | `lookup_phenotype_names` |
+| `phenotypes(codes=\|dataset=\|resource=)` | — no tool: a typed query over `phenotypes_v` (name, trait type, the source's own `category`, sample sizes), keyed on `trait_original`; what `plots.phewas` groups by |
 | `get_dataset_display_names()` | `get_dataset_display_names` |
 | `normalize_gene_symbols(symbols)` | `normalize_gene_symbols` |
 | `sql(query)` | `query_database` |
@@ -1012,9 +1013,8 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
   is nine modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,executor,sql_safety,uniprot}`. `sdk/plots.py` and the
-  `sdk/phewas_categories.py` only it imports ship too but sit outside the closure, resolved
-  lazily so the servers never import matplotlib.
+  `tools/{__init__,executor,sql_safety,uniprot}`. `sdk/plots.py` ships too but sits outside
+  the closure, resolved lazily so the servers never import matplotlib.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` now imports `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
@@ -1681,8 +1681,7 @@ src/genetics_mcp_server/
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas)
-│   └── phewas_categories.py  # the phewas's phenotype-category axis
+│   └── plots.py         # genetics.plots: the standard figures (locuszoom, phewas)
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
@@ -2402,7 +2401,6 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
 | `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
 | `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
-| `test_phewas_categories.py` | The phewas plot's phenotype-category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint, and the regression guard for silent download failures: every malformed `_download_data` payload (including verbatim reproductions of the `bef` and `buc` positional-rows payloads, and a non-`str` `filename`) must raise `DownloadShapeError` out of `_convert_to_tsv`, must never return quietly from `_process_download_hints`, and must there yield `DOWNLOAD_SHAPE_NOTE` plus a `DOWNLOAD_SHAPE_DEFECT tool=…` ERROR line with a traceback *without* propagating; a `TypeError` from the store still propagates (pinning the narrow `except`); `ENOSPC`, an unwritable storage path and an unencodable upstream value each surface `DOWNLOAD_FAILED_NOTE` plus a `DOWNLOAD_FAILED tool=…` ERROR line |

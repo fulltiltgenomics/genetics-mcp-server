@@ -69,6 +69,7 @@ _FUNCTIONS = (
     "summary_stats",
     "ld",
     "search",
+    "phenotypes",
     "lookup_phenotype_names",
     "get_dataset_display_names",
     "normalize_gene_symbols",

@@ -32,14 +32,16 @@ a script's author to discover it.
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
+import re
+import textwrap
 from typing import Any
 
 import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsUsageError
-from genetics_mcp_server.sdk.phewas_categories import categorize_phenotype, get_category_color
 
 __all__ = ["locuszoom", "phewas"]
 
@@ -259,33 +261,25 @@ def _resource_label(resource: str) -> str:
     return _RESOURCE_LABELS.get(resource, resource)
 
 
-def _phenotype_names(phenotypes: list[str]) -> dict[str, str]:
-    """code -> human-readable name, for the codes that resolve to one.
+def _phenotype_name(phenotype: str) -> str | None:
+    """The trait's human-readable name, or None when it cannot be resolved.
 
-    A code that does not resolve is absent rather than mapped to the upstream's
-    `Unknown: H8_HL_IDIOP` placeholder or to itself, so every caller's fallback is the same
-    one: use the code. A failed lookup is an empty mapping for the same reason — a title or
-    a label without the name is still right, and the figure is what matters.
+    None and the code itself are the same answer here — both mean "nothing to add to the
+    title" — so an unresolved code degrades to the title this replaced rather than to a
+    caption saying `Unknown: H8_HL_IDIOP`, which is what the upstream returns for one.
     """
     from genetics_mcp_server import sdk
 
-    if not phenotypes:
-        return {}
     try:
-        frame = sdk.lookup_phenotype_names(phenotypes)
+        frame = sdk.lookup_phenotype_names(phenotype)
     except Exception:
-        return {}
-    if frame.is_empty() or not {"phenotype", "name"} <= set(frame.columns):
-        return {}
-    names = {}
-    for code, name in zip(frame["phenotype"], frame["name"]):
-        if name and not str(name).startswith("Unknown:") and str(name) != code:
-            names[str(code)] = str(name)
-    return names
-
-
-def _phenotype_name(phenotype: str) -> str | None:
-    return _phenotype_names([phenotype]).get(phenotype)
+        return None
+    if frame.is_empty() or "name" not in frame.columns:
+        return None
+    name = frame["name"][0]
+    if not name or str(name).startswith("Unknown:") or str(name) == phenotype:
+        return None
+    return str(name)
 
 
 def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: str) -> str:
@@ -907,6 +901,78 @@ _PHEWAS_HEADROOM = 2.0
 _PHEWAS_LABELS = 10
 _PHEWAS_LABEL_CHARS = 30
 
+# a FinnGen ICD chapter is `VIII Diseases of the ear and mastoid process (H8_)`: too long for
+# one line under a category that may hold a single point, so a tick label is wrapped to this
+# width and cut after this many lines
+_PHEWAS_TICK_WIDTH = 26
+_PHEWAS_TICK_LINES = 2
+
+# where a phenotype has no `phenotypes_v` row — a QTL trait, a dataset whose codes are
+# already readable, a lookup that failed — its point still needs a group
+_PHEWAS_UNCATEGORISED = "Other"
+
+_ROMAN = re.compile(r"^([IVXLC]+)\b")
+_ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+
+
+def _roman(numeral: str) -> int:
+    total = 0
+    for this, following in zip(numeral, numeral[1:] + " "):
+        value = _ROMAN_VALUES[this]
+        total += -value if _ROMAN_VALUES.get(following, 0) > value else value
+    return total
+
+
+def _category_order(category: str) -> tuple[int, int, str]:
+    """`Other` last; ICD chapters in chapter order; everything else alphabetically after.
+
+    The chapters are the one source grouping with an order of its own, and it is not the
+    alphabet's: sorted as strings, `IX Diseases of the circulatory system` lands between
+    `II Neoplasms` and `V Mental disorders`.
+    """
+    if category == _PHEWAS_UNCATEGORISED:
+        return (2, 0, "")
+    match = _ROMAN.match(category)
+    if match:
+        return (0, _roman(match.group(1)), category)
+    return (1, 0, category)
+
+
+def _tick_label(category: str) -> str:
+    lines = textwrap.wrap(category, _PHEWAS_TICK_WIDTH)
+    if len(lines) > _PHEWAS_TICK_LINES:
+        lines = lines[:_PHEWAS_TICK_LINES]
+        lines[-1] += "…"
+    return "\n".join(lines)
+
+
+def _phenotype_metadata(frame: pl.DataFrame) -> dict[tuple[str | None, str], tuple[str | None, str | None]]:
+    """(dataset, code) -> (name, category) from `phenotypes_v`, for the frame's traits.
+
+    The category is the source's own grouping — a FinnGen ICD chapter, an Open Targets
+    project id — rather than one harmonised here, so a phewas across resources groups each
+    resource's traits the way that resource does. Keyed on both dataset and code because a
+    code recurs across datasets with different names; a frame that carries no `dataset` is
+    matched on the code alone. A failed fetch is an empty mapping, tolerated the way the LD
+    and consequence lookups are: every point then falls into one group, and the figure is
+    still the right picture of the variant.
+    """
+    from genetics_mcp_server import sdk
+
+    codes = sorted({str(code) for code in frame["_code"]})
+    try:
+        rows = sdk.phenotypes(codes=codes)
+    except Exception:
+        return {}
+    if rows.is_empty() or not {"dataset", "trait_original"} <= set(rows.columns):
+        return {}
+    found: dict[tuple[str | None, str], tuple[str | None, str | None]] = {}
+    for row in rows.iter_rows(named=True):
+        key = (row["dataset"], row["trait_original"])
+        found[key] = (row.get("trait_name"), row.get("category"))
+        found.setdefault((None, row["trait_original"]), found[key])
+    return found
+
 
 def _first(frame: pl.DataFrame, column: str) -> str | None:
     """The first non-null value of a column the frame may not have."""
@@ -954,10 +1020,13 @@ def phewas(
 
     The associations are the fine-mapped credible sets the variant belongs to, across every
     resource unless `resource=` names one, kept where -log10(p) is at least `min_mlog10p`.
-    Each is one point, coloured by the category its phenotype falls into — an organ system
-    or disease area read off the phenotype's name, or its code when the name does not say —
-    and the categories are the x axis, `Other` last. The strongest associations above the
-    significance line are named on the figure, each phenotype once.
+    Each is one point, grouped along the x axis by the category `phenotypes_v` gives its
+    phenotype — the source's own grouping, so a FinnGen endpoint sits in its ICD chapter and
+    an Open Targets study under its project, and a phewas across resources groups each
+    resource's traits the way that resource does. ICD chapters keep chapter order; a
+    phenotype with no metadata row goes to `Other`, last. The strongest associations above
+    the significance line are named on the figure, each phenotype once, by the name
+    `phenotypes_v` carries or else by the `trait` column read as words.
 
     The title names the variant with its gene and consequence, taken from the rows
     themselves, and the resources the associations came from.
@@ -971,7 +1040,8 @@ def phewas(
     directory and returned to the user automatically; that is also where the default goes.
     Pass `ax` to draw into an existing axis instead, in which case nothing is saved. Pass
     `data=` to plot a frame already in hand — credible-set rows, or any frame with a `trait`
-    column and `mlog10p` or `pval`.
+    column and `mlog10p` or `pval`; `trait_original` and `dataset` are what the names and
+    categories are looked up by, and without them every point is `Other`.
     """
     import matplotlib.pyplot as plt
 
@@ -999,22 +1069,32 @@ def phewas(
             f"(resource={resource!r}) — nothing to plot"
         )
 
-    names = _phenotype_names(sorted({str(code) for code in frame["trait"]}))
+    # `trait_original` is the code the metadata is keyed on; `trait` is a display form of it
+    # (`Height,_inverse-rank_normalized` for `HEIGHT_IRN`) that resolves nothing, and is the
+    # label of last resort, read as words
+    code_column = "trait_original" if "trait_original" in frame.columns else "trait"
     frame = frame.with_columns(
-        pl.col("trait").cast(pl.Utf8).alias("_code"),
-    ).with_columns(
-        pl.col("_code").map_elements(
-            lambda code: names.get(code, code), return_dtype=pl.Utf8
-        ).alias("_name"),
-        pl.col("_code").map_elements(
-            lambda code: categorize_phenotype(code, names.get(code)), return_dtype=pl.Utf8
-        ).alias("_category"),
+        pl.col(code_column).cast(pl.Utf8).alias("_code"),
+        pl.col("trait").cast(pl.Utf8).str.replace_all("_", " ").alias("_display"),
     )
-    # `Other` is where the categoriser gave up, so it sits at the end rather than in the
-    # alphabet's middle; within a category the strongest association comes first
-    frame = frame.with_columns((pl.col("_category") == "Other").alias("_last")).sort(
-        ["_last", "_category", "_y"], descending=[False, False, True]
+    metadata = _phenotype_metadata(frame)
+    datasets = frame["dataset"] if "dataset" in frame.columns else [None] * frame.height
+    names, categories_of = [], []
+    for dataset, code, display in zip(datasets, frame["_code"], frame["_display"]):
+        name, category = metadata.get(
+            (dataset, code), metadata.get((None, code), (None, None))
+        )
+        names.append(name or display)
+        categories_of.append(category or _PHEWAS_UNCATEGORISED)
+    frame = frame.with_columns(
+        pl.Series("_name", names, dtype=pl.Utf8),
+        pl.Series("_category", categories_of, dtype=pl.Utf8),
     )
+    # within a category the strongest association comes first
+    order = {c: i for i, c in enumerate(sorted(set(categories_of), key=_category_order))}
+    frame = frame.with_columns(
+        pl.col("_category").replace_strict(order, return_dtype=pl.Int64).alias("_order")
+    ).sort(["_order", "_y"], descending=[False, True])
     codes = list(frame["_code"])
 
     categories: list[str] = []
@@ -1039,7 +1119,12 @@ def phewas(
     else:
         figure = ax.get_figure()
 
-    ax.scatter(xs, ys, c=[get_category_color(c) for c in frame["_category"]],
+    # colour separates neighbouring groups and encodes nothing a reader decodes, so unlike
+    # the LD ramp it follows whatever prop_cycle the caller's style set
+    palette = dict(zip(categories, itertools.cycle(
+        plt.rcParams["axes.prop_cycle"].by_key().get("color") or ["#333333"]
+    )))
+    ax.scatter(xs, ys, c=[palette[c] for c in frame["_category"]],
                marker=_MARKER_OTHER, s=9, linewidths=0.2, edgecolors="#33333355", zorder=2)
     line_y = _significance_line(ax, significance)
 
@@ -1065,11 +1150,10 @@ def phewas(
 
     _dress(ax, title if title is not None else _phewas_title(variant_id, frame, resource))
     # the categories ARE the x scale: one label under the middle of each group, and no tick
-    # marks, since a mark would point at one association among several. The labels stay in
-    # the text colour rather than the category's — the groups already separate them, and
-    # the ramp has a yellow that is unreadable on white.
+    # marks, since a mark would point at one association among several
     ax.set_xticks([(lo + hi) / 2 for lo, hi in (spans[c] for c in categories)])
-    ax.set_xticklabels(categories, rotation=45, ha="right", rotation_mode="anchor")
+    ax.set_xticklabels([_tick_label(c) for c in categories], rotation=45, ha="right",
+                       rotation_mode="anchor")
     ax.tick_params(axis="x", length=0)
     ax.set_xlim(-1, x)
     y_top = max(max(ys), line_y)

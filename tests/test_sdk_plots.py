@@ -999,8 +999,7 @@ def title_env(monkeypatch, *, name="Sudden idiopathic hearing loss",
     def lookup(codes):
         if raises == "name":
             raise RuntimeError("trait_name_mapping is down")
-        codes = [codes] if isinstance(codes, str) else list(codes)
-        return pl.DataFrame({"phenotype": codes, "name": [name] * len(codes)})
+        return pl.DataFrame({"phenotype": [codes], "name": [name]})
 
     def schema(*_a, **_k):
         if raises == "schema":
@@ -1106,21 +1105,52 @@ def test_the_default_window_is_250kb_either_side():
 def associations(rows):
     """Credible-set rows as `credible_sets(variant=...)` returns them, GWAS and QTL alike."""
     base = {
-        "resource": "finngen", "data_type": "GWAS", "trait": None, "mlog10p": None,
+        "resource": "finngen", "dataset": "FinnGen_R14", "data_type": "GWAS", "trait": None,
+        "trait_original": None, "mlog10p": None,
         "most_severe": "missense_variant", "gene_most_severe": "APOE",
     }
-    return pl.DataFrame([{**base, **row} for row in rows])
+    out = []
+    for row in rows:
+        merged = {**base, **row}
+        # results-api fills `trait` with a display form of the code; the code itself is
+        # `trait_original`, and a test that passes only one gets the other derived
+        merged.setdefault("trait_original", merged["trait"])
+        merged["trait"] = merged["trait"] or merged["trait_original"]
+        out.append(merged)
+    return pl.DataFrame(out)
+
+
+# what phenotypes_v holds for these codes: the ICD chapter, not an organ system
+PHENOTYPES_V = {
+    "I9_CHD": ("Coronary heart disease", "IX Diseases of the circulatory system (I9_)"),
+    "T2D": ("Type 2 diabetes", "IV Endocrine, nutritional and metabolic diseases (E4_)"),
+    "H8_HL_IDIOP": ("Sudden idiopathic hearing loss",
+                    "VIII Diseases of the ear and mastoid process (H8_)"),
+    "AD": ("Alzheimer's disease", "VI Diseases of the nervous system (G6_)"),
+}
 
 
 def phewas_frame():
     return associations([
-        {"trait": "I9_CHD", "mlog10p": 12.0},
-        {"trait": "T2D", "mlog10p": 9.5},
-        {"trait": "AD", "mlog10p": 300.0},
-        {"trait": "XYZ", "mlog10p": 3.0},
-        {"trait": "WEAK", "mlog10p": 1.0},
-        {"trait": "ENSG00000130203", "mlog10p": 40.0, "data_type": "eQTL"},
+        {"trait_original": "I9_CHD", "mlog10p": 12.0},
+        {"trait_original": "T2D", "mlog10p": 9.5},
+        {"trait_original": "AD", "mlog10p": 300.0},
+        {"trait_original": "H8_HL_IDIOP", "mlog10p": 8.0},
+        {"trait_original": "XYZ", "trait": "Some_odd_thing", "mlog10p": 3.0},
+        {"trait_original": "WEAK", "mlog10p": 1.0},
+        {"trait_original": "ENSG00000130203|ge", "trait": "APOE", "mlog10p": 40.0,
+         "data_type": "eQTL"},
     ])
+
+
+def fake_phenotypes(**kwargs):
+    codes = kwargs.get("codes") or []
+    rows = [
+        {"dataset": "FinnGen_R14", "resource": "finngen", "trait_original": code,
+         "trait_name": PHENOTYPES_V[code][0], "category": PHENOTYPES_V[code][1]}
+        for code in codes if code in PHENOTYPES_V
+    ]
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
 
 
 def named_phewas(monkeypatch, tmp_path, **over):
@@ -1131,12 +1161,7 @@ def named_phewas(monkeypatch, tmp_path, **over):
 
     from genetics_mcp_server import sdk
 
-    def names(codes):
-        known = {"I9_CHD": "Coronary heart disease", "AD": "Alzheimer's disease",
-                 "T2D": "Type 2 diabetes"}
-        return pl.DataFrame({"phenotype": codes, "name": [known.get(c, f"Unknown: {c}") for c in codes]})
-
-    monkeypatch.setattr(sdk, "lookup_phenotype_names", names, raising=False)
+    monkeypatch.setattr(sdk, "phenotypes", fake_phenotypes, raising=False)
     # the display name comes from the live schema; the title under test is the shape, not it
     monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
@@ -1161,8 +1186,8 @@ def test_phewas_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
     assert (tmp_path / "phewas.png").stat().st_size > 0
     assert result["variant"] == "19:44908684:T:C"
     # the QTL row and the one below min_mlog10p are not associations on a phewas
-    assert result["n_associations"] == 4
-    assert result["n_significant"] == 3
+    assert result["n_associations"] == 5
+    assert result["n_significant"] == 4
     assert result["strongest"] == "AD"
     assert result["strongest_name"] == "Alzheimer's disease"
     assert result["strongest_mlog10p"] == 300.0
@@ -1170,12 +1195,38 @@ def test_phewas_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
     assert result["variant_consequence"] == "missense_variant"
 
 
-def test_phewas_puts_other_last_and_names_the_categories_on_the_x_axis(monkeypatch, tmp_path):
+def test_phewas_groups_by_the_source_category_in_chapter_order_with_other_last(
+    monkeypatch, tmp_path
+):
     result, ax = named_phewas(monkeypatch, tmp_path)
-    assert result["categories"][-1] == "Other"
-    assert result["categories"][:-1] == sorted(result["categories"][:-1])
-    assert [t.get_text() for t in ax.get_xticklabels()] == result["categories"]
+    assert result["categories"] == [
+        "IV Endocrine, nutritional and metabolic diseases (E4_)",
+        "VI Diseases of the nervous system (G6_)",
+        "VIII Diseases of the ear and mastoid process (H8_)",
+        "IX Diseases of the circulatory system (I9_)",
+        "Other",
+    ]
+    assert len(ax.get_xticklabels()) == len(result["categories"])
     assert not ax.get_legend(), "a phewas carries no legend box"
+
+
+def test_a_long_chapter_name_is_wrapped_on_the_axis_not_truncated_to_nothing():
+    label = plots._tick_label("VIII Diseases of the ear and mastoid process (H8_)")
+    assert "\n" in label and label.count("\n") <= plots._PHEWAS_TICK_LINES - 1
+    assert plots._tick_label("Other") == "Other"
+
+
+@pytest.mark.parametrize(
+    "categories,expected",
+    [
+        (["V Mental", "IX Circ", "II Neoplasms", "I Infectious"],
+         ["I Infectious", "II Neoplasms", "V Mental", "IX Circ"]),
+        (["Other", "Quantitative", "Binary", "XI Digestive"],
+         ["XI Digestive", "Binary", "Quantitative", "Other"]),
+    ],
+)
+def test_category_order_is_chapter_order_then_alphabetical_then_other(categories, expected):
+    assert sorted(categories, key=plots._category_order) == expected
 
 
 def test_phewas_draws_the_significance_line_the_way_the_locuszoom_does(monkeypatch, tmp_path):
@@ -1193,7 +1244,7 @@ def test_phewas_leaves_at_least_two_units_above_the_strongest_association(monkey
     assert ax.get_ylim()[1] >= 300.0 + 2.0
     # and the same when the strongest point sits below the line, so the line's own label fits
     _result, ax = named_phewas(
-        monkeypatch, tmp_path, data=associations([{"trait": "T2D", "mlog10p": 3.0}])
+        monkeypatch, tmp_path, data=associations([{"trait_original": "T2D", "mlog10p": 3.0}])
     )
     assert ax.get_ylim()[1] >= -math.log10(5e-8) + 2.0
     assert ax.get_ylim()[0] == 0.0
@@ -1202,16 +1253,54 @@ def test_phewas_leaves_at_least_two_units_above_the_strongest_association(monkey
 def test_phewas_names_the_significant_associations_and_the_variant(monkeypatch, tmp_path):
     _result, ax = named_phewas(monkeypatch, tmp_path)
     drawn = {t.get_text() for t in ax.texts}
-    assert {"Alzheimer's disease", "Coronary heart disease", "Type 2 diabetes"} <= drawn
-    assert "XYZ" not in drawn, "an association below the line is not named"
+    assert {"Alzheimer's disease", "Coronary heart disease", "Type 2 diabetes",
+            "Sudden idiopathic hearing loss"} <= drawn
+    assert not any("odd" in t for t in drawn), "an association below the line is not named"
     assert ax.get_title() == "19:44908684:T:C  APOE missense — finngen"
+
+
+def test_phewas_looks_names_up_by_the_code_and_not_the_display_form(monkeypatch, tmp_path):
+    seen = {}
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return fake_phenotypes(**kwargs)
+
+    display_form = associations([
+        {"trait_original": "HEIGHT_IRN", "trait": "Height,_inverse-rank_normalized",
+         "mlog10p": 30.0},
+    ])
+    monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
+    result, ax = named_phewas(monkeypatch, tmp_path, data=display_form)
+    monkeypatch.setattr("genetics_mcp_server.sdk.phenotypes", spy, raising=False)
+    plots.phewas(variant="19:44908684:T:C", data=display_form, path=str(tmp_path / "x.png"))
+    assert seen["codes"] == ["HEIGHT_IRN"], "the lookup was keyed on the display form"
+    # no metadata row: the label is the display form read as words, the code stays verbatim
+    assert result["strongest"] == "HEIGHT_IRN"
+    assert result["strongest_name"] == "Height, inverse-rank normalized"
+    assert result["categories"] == ["Other"]
+    drawn = [t.get_text() for t in ax.texts if t.get_text().startswith("Height")]
+    assert drawn and "_" not in drawn[0]
 
 
 def test_phewas_with_nothing_above_the_floor_says_so():
     with pytest.raises(GeneticsUsageError, match="nothing to plot"):
         plots.phewas(
-            variant="19:44908684:T:C", data=associations([{"trait": "T2D", "mlog10p": 1.0}])
+            variant="19:44908684:T:C",
+            data=associations([{"trait_original": "T2D", "mlog10p": 1.0}]),
         )
+
+
+def test_phewas_survives_a_metadata_lookup_that_fails(monkeypatch, tmp_path):
+    def boom(**_kw):
+        raise RuntimeError("db-api is down")
+
+    monkeypatch.setattr("genetics_mcp_server.sdk.phenotypes", boom, raising=False)
+    monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = plots.phewas(variant="19:44908684:T:C", data=phewas_frame())
+    assert result["categories"] == ["Other"]
+    assert result["strongest_name"] == "AD"
 
 
 def test_phewas_into_a_caller_supplied_axis_saves_nothing(monkeypatch, tmp_path):
@@ -1221,22 +1310,20 @@ def test_phewas_into_a_caller_supplied_axis_saves_nothing(monkeypatch, tmp_path)
 
     from genetics_mcp_server import sdk
 
-    monkeypatch.setattr(sdk, "lookup_phenotype_names", lambda codes: pl.DataFrame(), raising=False)
+    monkeypatch.setattr(sdk, "phenotypes", fake_phenotypes, raising=False)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     _figure, ax = plt.subplots()
     result = plots.phewas(variant="19:44908684:T:C", data=phewas_frame(), ax=ax)
     assert result["path"] is None
     assert not list(tmp_path.iterdir())
-    # no names resolved: the labels fall back to the codes and the categoriser still places them
-    assert result["strongest_name"] == "AD"
     plt.close("all")
 
 
 def test_phewas_names_a_phenotype_once_however_many_resources_carry_it(monkeypatch, tmp_path):
     twice = associations([
-        {"trait": "AD", "mlog10p": 300.0, "resource": "finngen"},
-        {"trait": "AD", "mlog10p": 120.0, "resource": "ukbb"},
-        {"trait": "T2D", "mlog10p": 9.5},
+        {"trait_original": "AD", "mlog10p": 300.0, "resource": "finngen"},
+        {"trait_original": "AD", "mlog10p": 120.0, "resource": "ukbb", "dataset": "UKBB"},
+        {"trait_original": "T2D", "mlog10p": 9.5},
     ])
     _result, ax = named_phewas(monkeypatch, tmp_path, data=twice)
     names = [t.get_text() for t in ax.texts if not t.get_text().startswith("p ")]

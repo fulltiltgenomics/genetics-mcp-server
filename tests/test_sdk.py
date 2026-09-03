@@ -238,6 +238,31 @@ async def test_sql_with_no_rows_keeps_the_column_names():
     assert frame.height == 0
 
 
+async def test_phenotypes_builds_one_query_over_phenotypes_v_keyed_on_the_code():
+    client, executor = make_client(
+        {"success": True, "columns": ["dataset", "trait_original", "category"],
+         "rows": [["FinnGen_R14", "H8_HL_IDIOP", "VIII Diseases of the ear and mastoid process (H8_)"]]}
+    )
+    frame = await client.phenotypes(codes=["H8_HL_IDIOP", "T2D"], resource="finngen")
+    name, args, _kwargs = executor.last
+    assert name == "query_database"
+    assert "FROM phenotypes_v" in args[0]
+    assert "trait_original IN ('H8_HL_IDIOP', 'T2D')" in args[0]
+    assert "resource = 'finngen'" in args[0]
+    assert frame["category"][0].startswith("VIII")
+    # one executor call: a typed function must not also pass through the audited sql()
+    assert [c[0] for c in executor.calls] == ["query_database"]
+
+
+async def test_phenotypes_refuses_a_code_it_cannot_place_in_a_literal_and_an_empty_filter():
+    client, executor = make_client()
+    with pytest.raises(GeneticsUsageError):
+        await client.phenotypes(codes=["ENSG00000187608|ge"])
+    with pytest.raises(GeneticsUsageError):
+        await client.phenotypes()
+    assert executor.calls == []
+
+
 async def test_client_lifts_the_context_row_cap_only_on_executors_it_builds():
     """The 500-row inline cap exists to protect the model's context; a script filters rows
     itself and must not receive a positional prefix.
