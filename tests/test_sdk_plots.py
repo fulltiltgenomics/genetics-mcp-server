@@ -1153,7 +1153,7 @@ def fake_phenotypes(**kwargs):
     return pl.DataFrame(rows) if rows else pl.DataFrame()
 
 
-def named_phewas(monkeypatch, tmp_path, **over):
+def named_phewas(monkeypatch, tmp_path, phenotypes=fake_phenotypes, **over):
     """A whole phewas drawn from `data=`, with the figure kept for inspection."""
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
@@ -1161,7 +1161,7 @@ def named_phewas(monkeypatch, tmp_path, **over):
 
     from genetics_mcp_server import sdk
 
-    monkeypatch.setattr(sdk, "phenotypes", fake_phenotypes, raising=False)
+    monkeypatch.setattr(sdk, "phenotypes", phenotypes, raising=False)
     # the display name comes from the live schema; the title under test is the shape, not it
     monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
@@ -1199,14 +1199,14 @@ def test_phewas_groups_by_the_source_category_in_chapter_order_with_other_last(
     monkeypatch, tmp_path
 ):
     result, ax = named_phewas(monkeypatch, tmp_path)
-    assert result["categories"] == [
+    assert result["groups"] == [
         "IV Endocrine, nutritional and metabolic diseases (E4_)",
         "VI Diseases of the nervous system (G6_)",
         "VIII Diseases of the ear and mastoid process (H8_)",
         "IX Diseases of the circulatory system (I9_)",
         "Other",
     ]
-    assert len(ax.get_xticklabels()) == len(result["categories"])
+    assert len(ax.get_xticklabels()) == len(result["groups"])
     assert not ax.get_legend(), "a phewas carries no legend box"
 
 
@@ -1278,7 +1278,7 @@ def test_phewas_looks_names_up_by_the_code_and_not_the_display_form(monkeypatch,
     # no metadata row: the label is the display form read as words, the code stays verbatim
     assert result["strongest"] == "HEIGHT_IRN"
     assert result["strongest_name"] == "Height, inverse-rank normalized"
-    assert result["categories"] == ["Other"]
+    assert result["groups"] == ["Other"]
     drawn = [t.get_text() for t in ax.texts if t.get_text().startswith("Height")]
     assert drawn and "_" not in drawn[0]
 
@@ -1299,7 +1299,7 @@ def test_phewas_survives_a_metadata_lookup_that_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     result = plots.phewas(variant="19:44908684:T:C", data=phewas_frame())
-    assert result["categories"] == ["Other"]
+    assert result["groups"] == ["Other"]
     assert result["strongest_name"] == "AD"
 
 
@@ -1329,3 +1329,34 @@ def test_phewas_names_a_phenotype_once_however_many_resources_carry_it(monkeypat
     names = [t.get_text() for t in ax.texts if not t.get_text().startswith("p ")]
     assert names.count("Alzheimer's disease") == 1
     assert sorted(names) == ["Alzheimer's disease", "Type 2 diabetes"]
+
+
+def test_a_pleiotropic_variant_is_grouped_by_resource_rather_than_by_a_wall_of_chapters(
+    monkeypatch, tmp_path
+):
+    chapters = [f"{numeral} Chapter {i}" for i, numeral in enumerate(
+        ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"], 1
+    )]
+    rows, meta = [], {}
+    for i, chapter in enumerate(chapters):
+        code = f"CODE{i}"
+        resource = "finngen" if i % 2 else "open_targets"
+        rows.append({"trait_original": code, "mlog10p": 10.0 + i, "resource": resource,
+                     "dataset": "FinnGen_R14" if i % 2 else "Open_Targets_26.06"})
+        meta[code] = (f"Trait {i}", chapter)
+
+    def phenotypes(**kwargs):
+        return pl.DataFrame([
+            {"dataset": "FinnGen_R14" if int(c[4:]) % 2 else "Open_Targets_26.06",
+             "trait_original": c, "trait_name": meta[c][0], "category": meta[c][1]}
+            for c in kwargs["codes"]
+        ])
+
+    result, ax = named_phewas(monkeypatch, tmp_path, phenotypes, data=associations(rows))
+    assert result["grouped_by"] == "resource"
+    assert result["groups"] == ["finngen", "open_targets"]
+    assert [t.get_text() for t in ax.get_xticklabels()] == ["finngen", "open_targets"]
+    # one fewer category and the chapters come back
+    result, _ax = named_phewas(monkeypatch, tmp_path, phenotypes, data=associations(rows[:-1]))
+    assert result["grouped_by"] == "category"
+    assert len(result["groups"]) == 10

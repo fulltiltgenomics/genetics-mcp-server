@@ -911,6 +911,11 @@ _PHEWAS_TICK_LINES = 2
 # already readable, a lookup that failed — its point still needs a group
 _PHEWAS_UNCATEGORISED = "Other"
 
+# past this many categories the axis is a wall of chapter names under groups of one or two
+# points — measured on the APOE missense variant, where every ICD chapter and every Open
+# Targets project answers — so the plot falls back to grouping by resource
+_PHEWAS_MAX_CATEGORIES = 10
+
 _ROMAN = re.compile(r"^([IVXLC]+)\b")
 _ROMAN_VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
 
@@ -1024,15 +1029,18 @@ def phewas(
     phenotype — the source's own grouping, so a FinnGen endpoint sits in its ICD chapter and
     an Open Targets study under its project, and a phewas across resources groups each
     resource's traits the way that resource does. ICD chapters keep chapter order; a
-    phenotype with no metadata row goes to `Other`, last. The strongest associations above
-    the significance line are named on the figure, each phenotype once, by the name
-    `phenotypes_v` carries or else by the `trait` column read as words.
+    phenotype with no metadata row goes to `Other`, last. A variant that answers in more
+    than ten categories — a pleiotropic one, where the axis would be a wall of chapter
+    names over groups of a point or two — is grouped by resource instead. The strongest
+    associations above the significance line are named on the figure, each phenotype once,
+    by the name `phenotypes_v` carries or else by the `trait` column read as words.
 
     The title names the variant with its gene and consequence, taken from the rows
     themselves, and the resources the associations came from.
 
     Returns a dict describing what was drawn: `path`, `variant`, `n_associations`,
-    `n_significant`, `categories` in plotting order, `strongest` and `strongest_name` (the
+    `n_significant`, `grouped_by` ("category" or "resource") with the `groups` in plotting
+    order, `strongest` and `strongest_name` (the
     phenotype code and name of the top association) with `strongest_mlog10p`, and
     `variant_consequence` and `variant_gene` as the title shows them.
 
@@ -1086,11 +1094,18 @@ def phewas(
         )
         names.append(name or display)
         categories_of.append(category or _PHEWAS_UNCATEGORISED)
+    grouped_by = "category"
+    if len(set(categories_of)) > _PHEWAS_MAX_CATEGORIES:
+        grouped_by = "resource"
+        resources = frame["resource"] if "resource" in frame.columns else [None] * frame.height
+        categories_of = [
+            _resource_label(str(r)) if r else _PHEWAS_UNCATEGORISED for r in resources
+        ]
     frame = frame.with_columns(
         pl.Series("_name", names, dtype=pl.Utf8),
         pl.Series("_category", categories_of, dtype=pl.Utf8),
     )
-    # within a category the strongest association comes first
+    # within a group the strongest association comes first
     order = {c: i for i, c in enumerate(sorted(set(categories_of), key=_category_order))}
     frame = frame.with_columns(
         pl.col("_category").replace_strict(order, return_dtype=pl.Int64).alias("_order")
@@ -1172,7 +1187,8 @@ def phewas(
         "variant": variant_id,
         "n_associations": frame.height,
         "n_significant": sum(y >= line_y for y in ys) if significance else 0,
-        "categories": categories,
+        "grouped_by": grouped_by,
+        "groups": categories,
         "strongest": row["_code"],
         "strongest_name": row["_name"],
         "strongest_mlog10p": ys[strongest],
