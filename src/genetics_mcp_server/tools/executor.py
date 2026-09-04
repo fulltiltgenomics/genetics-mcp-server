@@ -4832,24 +4832,34 @@ class ToolExecutor:
     # unchanged apart from an optional download hint, so the resolution block it
     # carries — which protein was actually resolved — always reaches the agent.
 
-    # a search wider than this is a table, not an answer: the rows go to a TSV link
+    # a result wider than this is a table, not an answer: the rows go to a TSV link
     # instead of into the context
-    _UNIPROT_DOWNLOAD_THRESHOLD = 25
+    _DOWNLOAD_THRESHOLD = 25
 
     @staticmethod
-    def _uniprot_download_hint(
-        result: dict[str, Any], filename: str, min_rows: int = 1
+    def _download_hint(
+        result: dict[str, Any],
+        filename: str,
+        min_rows: int = 1,
+        key: str = "results",
+        rows: list[Any] | None = None,
     ) -> dict[str, Any]:
-        """Attach a _download_data hint for the row list in a UniProt tool result."""
+        """Attach a _download_data hint for a row list in a tool result.
+
+        `key` names the result field holding the rows; `rows` overrides it where the
+        downloadable table is wider than what the tool returned (a summary it trimmed).
+        The payload key stays "results" either way — llm_service accepts that shape or
+        the columnar one, and nothing else.
+        """
         if not isinstance(result, dict) or not result.get("success"):
             return result
-        rows = result.get("results")
+        table = result.get(key) if rows is None else rows
         if (
-            isinstance(rows, list)
-            and len(rows) >= min_rows
-            and all(isinstance(r, dict) for r in rows)
+            isinstance(table, list)
+            and len(table) >= min_rows
+            and all(isinstance(r, dict) for r in table)
         ):
-            result["_download_data"] = {"results": rows, "filename": filename}
+            result["_download_data"] = {"results": table, "filename": filename}
         return result
 
     async def get_protein_annotations(
@@ -4876,7 +4886,7 @@ class ToolExecutor:
             return {"success": False, "error": INTERNAL_ERROR_MSG}
         # a batch of accessions is a table (the 167-gene zymogen case); one protein is not
         if isinstance(query, list):
-            return self._uniprot_download_hint(result, "protein_annotations.tsv")
+            return self._download_hint(result, "protein_annotations.tsv")
         return result
 
     async def map_protein_variants(
@@ -4910,7 +4920,7 @@ class ToolExecutor:
                 f"{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
-        return self._uniprot_download_hint(result, "variant_protein_effect.tsv")
+        return self._download_hint(result, "variant_protein_effect.tsv")
 
     async def search_uniprot(
         self,
@@ -4939,8 +4949,94 @@ class ToolExecutor:
                 f"{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
-        return self._uniprot_download_hint(
-            result, "uniprot_search.tsv", min_rows=self._UNIPROT_DOWNLOAD_THRESHOLD
+        return self._download_hint(
+            result, "uniprot_search.tsv", min_rows=self._DOWNLOAD_THRESHOLD
+        )
+
+    # -------------------------------------------------------------------------
+    # ChEMBL
+    # -------------------------------------------------------------------------
+
+    # the logic lives in tools/chembl.py, for the same reason as the UniProt delegates
+    # above: llm_service dispatches with getattr(self.executor, tool_name), so a tool
+    # needs a method here, but nothing about it needs a ToolExecutor. Each returns the
+    # client's result unchanged apart from a download hint, so the resolution block —
+    # which target or which molecule the query was read as — always reaches the agent.
+
+    # a download filename is interpolated into a Content-Disposition header unescaped
+    # (chat_api.py), so it is built from an identifier ChEMBL resolved or from this
+    # constant — never from the agent-supplied query
+    _CHEMBL_FILENAME_FALLBACK = "chembl"
+
+    async def get_drug_targets_for_gene(
+        self,
+        query: str,
+        min_phase: float = 0,
+        include_indications: bool = False,
+        max_results: int = 25,
+    ) -> dict[str, Any]:
+        """Get the drugs and clinical candidates acting on a gene's ChEMBL target."""
+        try:
+            result = await self.chembl.get_drug_targets_for_gene(
+                query,
+                min_phase=min_phase,
+                include_indications=include_indications,
+                max_results=max_results,
+            )
+        except Exception as e:
+            logger.error(
+                f"Error in get_drug_targets_for_gene({query!r}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+        target_id = result.get("target_chembl_id") if isinstance(result, dict) else None
+        return self._download_hint(
+            result,
+            f"{target_id or self._CHEMBL_FILENAME_FALLBACK}_chembl_drugs.tsv",
+            min_rows=self._DOWNLOAD_THRESHOLD,
+            key="drugs",
+        )
+
+    async def get_drug_profile(self, query: str) -> dict[str, Any]:
+        """Get ChEMBL's profile for one drug: phase, ATC, mechanisms, indications."""
+        try:
+            result = await self.chembl.get_drug_profile(query)
+        except Exception as e:
+            logger.error(f"Error in get_drug_profile({query!r}): {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+        drug = result.get("drug") if isinstance(result, dict) else None
+        molecule_id = (drug or {}).get("molecule_chembl_id") or self._CHEMBL_FILENAME_FALLBACK
+        # the result keeps the best-evidenced indications only; the download gets them all
+        rows = result.pop("_all_indications", None) if isinstance(result, dict) else None
+        return self._download_hint(
+            result,
+            f"{molecule_id}_chembl_profile.tsv",
+            min_rows=self._DOWNLOAD_THRESHOLD,
+            key="indications",
+            rows=rows,
+        )
+
+    async def get_target_bioactivity(
+        self, query: str, pchembl_min: float = 6.0, max_results: int = 25
+    ) -> dict[str, Any]:
+        """Summarise the compounds with measured potency against a gene's target."""
+        try:
+            result = await self.chembl.get_target_bioactivity(
+                query, pchembl_min=pchembl_min, max_results=max_results
+            )
+        except Exception as e:
+            logger.error(
+                f"Error in get_target_bioactivity({query!r}): {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+        # the full per-molecule summary is the downloadable table; only the top slice is
+        # in the result, so it is popped rather than shown
+        rows = result.pop("_all_compounds", None) if isinstance(result, dict) else None
+        target_id = result.get("target_chembl_id") if isinstance(result, dict) else None
+        return self._download_hint(
+            result,
+            f"{target_id or self._CHEMBL_FILENAME_FALLBACK}_chembl_bioactivity.tsv",
+            min_rows=self._DOWNLOAD_THRESHOLD,
+            rows=rows,
         )
 
     # -------------------------------------------------------------------------

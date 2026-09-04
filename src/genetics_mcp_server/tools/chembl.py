@@ -1,9 +1,10 @@
 """Client for the ChEMBL REST API (drug mechanisms, indications, bioactivity).
 
-Transport only: URL building, the origin pin, the TTL cache, paging and error
-sentinels. Target resolution and the tool methods live elsewhere, the way
-tools/uniprot.py keeps its logic out of executor.py so it can be tested without a
-ToolExecutor.
+Transport (URL building, the origin pin, the TTL cache, paging, error sentinels),
+resolution and the tool methods all live here, the way tools/uniprot.py keeps its logic
+out of executor.py so it can be tested without a ToolExecutor; the executor holds only
+delegates. No method raises for a ChEMBL-side problem: a tool method returns a
+`success: False` dict naming the stage, everything below it returns an error sentinel.
 """
 
 import logging
@@ -33,12 +34,106 @@ _MAX_PAGES = 10
 # not be shared.
 _CACHE = _TTLCache()
 
-_CHEMBL_TARGET_RE = re.compile(r"^CHEMBL[0-9]+$")
+_CHEMBL_ID_RE = re.compile(r"^CHEMBL[0-9]+$")
 
 # a heteromer, a protein family and a cell line are all "targets" for the same accession,
 # and only this one is the protein itself; the rest are reported rather than dropped
 _SINGLE_PROTEIN = "SINGLE PROTEIN"
 _TARGET_FIELDS = ["target_chembl_id", "pref_name", "target_type"]
+_TARGET_DETAIL_FIELDS = [*_TARGET_FIELDS, "organism", "target_components"]
+_MECHANISM_FIELDS = ["molecule_chembl_id", "mechanism_of_action", "action_type", "max_phase"]
+_PROFILE_MECHANISM_FIELDS = [
+    "target_chembl_id",
+    "mechanism_of_action",
+    "action_type",
+    "max_phase",
+]
+_MOLECULE_FIELDS = [
+    "molecule_chembl_id",
+    "pref_name",
+    "max_phase",
+    "first_approval",
+    "withdrawn_flag",
+    "atc_classifications",
+    "molecule_type",
+]
+# only the name ladder needs the hierarchy, and it is a nested object: projecting it on
+# the mechanism -> molecule join would widen every row of that batch for nothing
+_CANDIDATE_FIELDS = [*_MOLECULE_FIELDS, "molecule_hierarchy"]
+_TOP_FIELDS = ["molecule_chembl_id", "pref_name", "max_phase"]
+_INDICATION_FIELDS = ["efo_id", "efo_term", "mesh_heading", "max_phase_for_ind"]
+_INDICATION_BATCH_FIELDS = ["molecule_chembl_id", *_INDICATION_FIELDS]
+_ACTIVITY_FIELDS = [
+    "molecule_chembl_id",
+    "standard_type",
+    "standard_relation",
+    "pchembl_value",
+    "assay_chembl_id",
+]
+
+# ChEMBL pages at 20 by default and allows up to 1000; asking for more per page is the
+# cheapest way to keep a join inside the `_MAX_PAGES` walk
+_PAGE_LIMIT = 100
+_ACTIVITY_PAGE_LIMIT = 1000
+# 5 x _ACTIVITY_PAGE_LIMIT rows is the ceiling on one target's activity walk, ordered by
+# descending pchembl_value. top_compounds is exact unless the walk is capped: a heavily
+# assayed target can spend every page on its own top molecules; `truncated` reports that.
+_ACTIVITY_MAX_PAGES = 5
+# the id list travels in the URL, so a `__in` batch is split
+_ID_CHUNK = 50
+# per-drug indication lists in a many-drug table are context, not the answer; the whole
+# list is one get_drug_profile call away
+_INDICATIONS_PER_DRUG = 10
+_PROFILE_INDICATION_CAP = 50
+
+
+def _phase(value: Any) -> float | None:
+    """ChEMBL max_phase: 0-4, float-ish, with -1 or None meaning unknown.
+
+    Unknown stays None. Coercing it to 0 would read as "preclinical", which is a claim
+    about the drug rather than about the annotation. 4 means approved *somewhere*, which
+    is not the same as approved by any particular regulator.
+    """
+    if value is None:
+        return None
+    phase = _number(value)
+    if phase is None or phase < 0:
+        return None
+    return phase
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sort_phase(value: Any) -> float:
+    """Phase for ordering only: an unknown one sinks below phase 0."""
+    phase = _phase(value)
+    return phase if phase is not None else -1.0
+
+
+def _passes_phase(phase: float | None, min_phase: float) -> bool:
+    """An unknown phase is kept only when nothing was asked of it."""
+    if phase is None:
+        return min_phase == 0
+    return phase >= min_phase
+
+
+def _unique_ids(records: list[Any], field: str) -> list[str]:
+    """The distinct non-empty values of `field`, in first-seen order."""
+    seen: dict[str, None] = {}
+    for record in records:
+        value = record.get(field)
+        if value:
+            seen.setdefault(str(value), None)
+    return list(seen)
+
+
+def _index_by(records: list[Any], field: str) -> dict[str, Any]:
+    return {r[field]: r for r in records if isinstance(r, dict) and r.get(field)}
 
 
 class ChEMBLClient:
@@ -164,7 +259,7 @@ class ChEMBLClient:
                 "_stage": "input",
             }
         candidate = text.upper()
-        if _CHEMBL_TARGET_RE.match(candidate):
+        if _CHEMBL_ID_RE.match(candidate):
             return await self._targets(
                 {"target_chembl_id": candidate}, text, "chembl_target", None, None
             )
@@ -255,6 +350,551 @@ class ChEMBLClient:
         if resolution.get("_no_match"):
             sentinel["_no_match"] = True
         return sentinel
+
+    # -------------------------------------------------------------------------
+    # tool methods
+    # -------------------------------------------------------------------------
+
+    async def attribution(self) -> str:
+        """The credit ChEMBL's CC BY-SA licence requires on every result.
+
+        Unversioned when status.json cannot be read: an attribution lookup must never
+        be what fails a tool. The release goes through the same TTL cache as every
+        other request, so this costs one call per cache window, not one per tool call.
+        """
+        release = await self.release()
+        if not release:
+            return "ChEMBL (CC BY-SA 3.0), EMBL-EBI"
+        return f"ChEMBL {release} (CC BY-SA 3.0), EMBL-EBI"
+
+    async def get_drug_targets_for_gene(
+        self,
+        query: str,
+        min_phase: float = 0,
+        include_indications: bool = False,
+        max_results: int = 25,
+    ) -> dict[str, Any]:
+        """Drugs and clinical candidates annotated as acting on a gene's ChEMBL target.
+
+        One row per (drug, mechanism): a drug with two annotated mechanisms on the same
+        target is two rows. `max_phase` is the molecule's — the mechanism row carries a
+        per-mechanism phase that can be lower, carried as `mechanism_max_phase` and None
+        where the two agree.
+        """
+        try:
+            # clamped like pchembl_min in get_target_bioactivity: phases run 0-4, and a
+            # negative floor would otherwise read as "asked for something" and drop the
+            # unknown-phase rows that a floor of 0 is meant to keep
+            floor = min(4.0, max(0.0, float(min_phase)))
+        except (TypeError, ValueError):
+            return self._bad_param("min_phase", min_phase, query)
+        try:
+            # the schema bound in definitions.py must match this expression — widen one
+            # without the other and rows are silently dropped below
+            result_cap = max(1, min(int(max_results), 100))
+        except (TypeError, ValueError):
+            return self._bad_param("max_results", max_results, query)
+
+        resolved = await self.resolve_target(query)
+        if _is_error(resolved):
+            return self._failed(resolved, "resolve_target", {"query": query})
+        resolution = resolved["resolution"]
+        target_id = resolved["target_chembl_id"]
+        base = {
+            "success": True,
+            "query": query,
+            "target_chembl_id": target_id,
+            "target_pref_name": resolved["pref_name"],
+            "target_type": resolved["target_type"],
+            "other_targets": resolved["other_targets"],
+            "resolution": resolution,
+            "attribution": await self.attribution(),
+        }
+        if target_id is None:
+            return {
+                **base,
+                "drugs": [],
+                "count": 0,
+                "n_matching": 0,
+                "n_mechanisms": 0,
+                "truncated": False,
+                "note": resolution["note"],
+            }
+
+        mechanisms = await self._get_all(
+            "mechanism",
+            {"target_chembl_id": target_id, "limit": _PAGE_LIMIT},
+            _MECHANISM_FIELDS,
+        )
+        if _is_error(mechanisms):
+            return self._failed(mechanisms, "mechanism", resolution)
+        mechanism_records = mechanisms["records"]
+        molecule_ids = _unique_ids(mechanism_records, "molecule_chembl_id")
+        molecules = await self._by_ids(
+            "molecule", "molecule_chembl_id", molecule_ids, _MOLECULE_FIELDS
+        )
+        if _is_error(molecules):
+            return self._failed(molecules, "molecule", resolution)
+        by_molecule = _index_by(molecules["records"], "molecule_chembl_id")
+
+        drugs = []
+        for record in mechanism_records:
+            molecule_id = record.get("molecule_chembl_id")
+            molecule = by_molecule.get(molecule_id) or {}
+            row = {
+                **self._molecule_row(molecule, molecule_id),
+                "action_type": record.get("action_type"),
+                "mechanism_of_action": record.get("mechanism_of_action"),
+            }
+            mechanism_phase = _phase(record.get("max_phase"))
+            # always present, None when it agrees with the molecule's, so the downloaded
+            # table's columns do not depend on which rows came back
+            row["mechanism_max_phase"] = (
+                mechanism_phase if mechanism_phase != row["max_phase"] else None
+            )
+            drugs.append(row)
+
+        drugs = [d for d in drugs if _passes_phase(d["max_phase"], floor)]
+        drugs.sort(key=lambda d: (-_sort_phase(d["max_phase"]), d["pref_name"] or ""))
+        n_matching = len(drugs)
+        drugs = drugs[:result_cap]
+
+        indications_truncated = False
+        if include_indications:
+            indications = await self._by_ids(
+                "drug_indication",
+                "molecule_chembl_id",
+                _unique_ids(drugs, "molecule_chembl_id"),
+                _INDICATION_BATCH_FIELDS,
+                limit=_ACTIVITY_PAGE_LIMIT,
+            )
+            if _is_error(indications):
+                return self._failed(indications, "drug_indication", resolution)
+            indications_truncated = bool(indications["truncated"])
+            grouped = self._group_indications(indications["records"])
+            for row in drugs:
+                for_drug = grouped.get(row["molecule_chembl_id"], [])
+                row["indications"] = for_drug[:_INDICATIONS_PER_DRUG]
+                row["n_indications"] = len(for_drug)
+
+        return {
+            **base,
+            "drugs": drugs,
+            "count": len(drugs),
+            "n_matching": n_matching,
+            "n_mechanisms": len(mechanism_records),
+            "truncated": bool(
+                mechanisms["truncated"]
+                or molecules["truncated"]
+                or indications_truncated
+                or n_matching > len(drugs)
+            ),
+            "note": resolution["note"],
+        }
+
+    async def get_drug_profile(self, query: str) -> dict[str, Any]:
+        """What ChEMBL holds about one drug: phase, ATC, mechanisms, indications."""
+        resolved = await self._resolve_molecule(query)
+        if _is_error(resolved):
+            return self._failed(resolved, "molecule", {"query": query})
+        resolution = resolved["resolution"]
+        molecule = resolved["molecule"]
+        base = {
+            "success": True,
+            "query": query,
+            "resolution": resolution,
+            "attribution": await self.attribution(),
+        }
+        if molecule is None:
+            return {
+                **base,
+                "drug": None,
+                "mechanisms": [],
+                "indications": [],
+                "n_indications": 0,
+                "note": resolution["note"],
+            }
+
+        molecule_id = molecule["molecule_chembl_id"]
+        mechanisms = await self._get_all(
+            "mechanism",
+            {"molecule_chembl_id": molecule_id, "limit": _PAGE_LIMIT},
+            _PROFILE_MECHANISM_FIELDS,
+        )
+        if _is_error(mechanisms):
+            return self._failed(mechanisms, "mechanism", resolution)
+        targets = await self._by_ids(
+            "target",
+            "target_chembl_id",
+            _unique_ids(mechanisms["records"], "target_chembl_id"),
+            _TARGET_DETAIL_FIELDS,
+        )
+        if _is_error(targets):
+            return self._failed(targets, "target", resolution)
+        by_target = _index_by(targets["records"], "target_chembl_id")
+        mechanism_rows = [
+            {
+                "target_chembl_id": record.get("target_chembl_id"),
+                "target_pref_name": (by_target.get(record.get("target_chembl_id")) or {}).get(
+                    "pref_name"
+                ),
+                "target_type": (by_target.get(record.get("target_chembl_id")) or {}).get(
+                    "target_type"
+                ),
+                "organism": (by_target.get(record.get("target_chembl_id")) or {}).get("organism"),
+                "components": self._target_components(
+                    by_target.get(record.get("target_chembl_id")) or {}
+                ),
+                "action_type": record.get("action_type"),
+                "mechanism_of_action": record.get("mechanism_of_action"),
+                "max_phase": _phase(record.get("max_phase")),
+            }
+            for record in mechanisms["records"]
+        ]
+
+        indications = await self._get_all(
+            "drug_indication",
+            {"molecule_chembl_id": molecule_id, "limit": _PAGE_LIMIT},
+            _INDICATION_FIELDS,
+        )
+        if _is_error(indications):
+            return self._failed(indications, "drug_indication", resolution)
+        indication_rows = [
+            {k: record.get(k) for k in _INDICATION_FIELDS} for record in indications["records"]
+        ]
+        indication_rows.sort(key=lambda i: -_sort_phase(i.get("max_phase_for_ind")))
+
+        return {
+            **base,
+            "drug": molecule,
+            "mechanisms": mechanism_rows,
+            "n_mechanisms": len(mechanism_rows),
+            "indications": indication_rows[:_PROFILE_INDICATION_CAP],
+            "n_indications": len(indication_rows),
+            "truncated": bool(
+                mechanisms["truncated"] or targets["truncated"] or indications["truncated"]
+            ),
+            # popped into the download hint like _all_compounds: the full list is a TSV,
+            # while the result carries the best-evidenced _PROFILE_INDICATION_CAP
+            "_all_indications": indication_rows,
+        }
+
+    async def get_target_bioactivity(
+        self, query: str, pchembl_min: float = 6.0, max_results: int = 25
+    ) -> dict[str, Any]:
+        """Potency summary for a target: how many compounds bind it, and the best ones.
+
+        The activity table is the largest resource in ChEMBL, so this returns counts and
+        one row per molecule rather than per assay measurement.
+        """
+        try:
+            # pChEMBL is -log10(molar), so anything outside 0-14 is a typo rather than a filter
+            threshold = min(14.0, max(0.0, float(pchembl_min)))
+        except (TypeError, ValueError):
+            return self._bad_param("pchembl_min", pchembl_min, query)
+        try:
+            # the schema bound in definitions.py must match this expression — widen one
+            # without the other and rows are silently dropped below
+            result_cap = max(1, min(int(max_results), 100))
+        except (TypeError, ValueError):
+            return self._bad_param("max_results", max_results, query)
+
+        resolved = await self.resolve_target(query)
+        if _is_error(resolved):
+            return self._failed(resolved, "resolve_target", {"query": query})
+        resolution = resolved["resolution"]
+        target_id = resolved["target_chembl_id"]
+        base = {
+            "success": True,
+            "query": query,
+            "target_chembl_id": target_id,
+            "target_pref_name": resolved["pref_name"],
+            "target_type": resolved["target_type"],
+            "pchembl_min": threshold,
+            "resolution": resolution,
+            "attribution": await self.attribution(),
+        }
+        empty = {
+            "n_activities": 0,
+            "total_count": 0,
+            "truncated": False,
+            "n_distinct_molecules": 0,
+            "by_standard_type": {},
+            "top_compounds": [],
+        }
+        if target_id is None:
+            return {**base, **empty, "note": resolution["note"]}
+
+        activities = await self._get_all(
+            "activity",
+            {
+                "target_chembl_id": target_id,
+                "pchembl_value__gte": threshold,
+                "limit": _ACTIVITY_PAGE_LIMIT,
+                "order_by": "-pchembl_value",
+            },
+            _ACTIVITY_FIELDS,
+            max_pages=_ACTIVITY_MAX_PAGES,
+        )
+        if _is_error(activities):
+            return self._failed(activities, "activity", resolution)
+        records = activities["records"]
+        if not records:
+            return {
+                **base,
+                **empty,
+                "total_count": activities["total_count"],
+                "note": f"no activity at or above pChEMBL {threshold} is recorded for {target_id}",
+            }
+
+        by_standard_type: dict[str, int] = {}
+        summary: dict[str, dict[str, Any]] = {}
+        for record in records:
+            standard_type = record.get("standard_type")
+            if standard_type:
+                by_standard_type[standard_type] = by_standard_type.get(standard_type, 0) + 1
+            molecule_id = record.get("molecule_chembl_id")
+            if not molecule_id:
+                continue
+            entry = summary.setdefault(
+                molecule_id,
+                {
+                    "molecule_chembl_id": molecule_id,
+                    "best_pchembl": None,
+                    "standard_type": None,
+                    "n_activities": 0,
+                },
+            )
+            entry["n_activities"] += 1
+            value = _number(record.get("pchembl_value"))
+            if value is not None and (
+                entry["best_pchembl"] is None or value > entry["best_pchembl"]
+            ):
+                entry["best_pchembl"] = value
+                entry["standard_type"] = standard_type
+
+        ordered = sorted(
+            summary.values(),
+            key=lambda r: (
+                -(r["best_pchembl"] if r["best_pchembl"] is not None else -1.0),
+                r["molecule_chembl_id"],
+            ),
+        )
+        # copied out of `ordered` so naming these rows does not add a pref_name column to
+        # every row of the download, where no name is ever fetched
+        top = [dict(row) for row in ordered[:result_cap]]
+        molecules = await self._by_ids(
+            "molecule", "molecule_chembl_id", [r["molecule_chembl_id"] for r in top], _TOP_FIELDS
+        )
+        if _is_error(molecules):
+            return self._failed(molecules, "molecule", resolution)
+        by_molecule = _index_by(molecules["records"], "molecule_chembl_id")
+        for row in top:
+            molecule = by_molecule.get(row["molecule_chembl_id"]) or {}
+            row["pref_name"] = molecule.get("pref_name")
+            row["max_phase"] = _phase(molecule.get("max_phase"))
+
+        return {
+            **base,
+            "n_activities": len(records),
+            "total_count": activities["total_count"],
+            "truncated": bool(activities["truncated"] or molecules["truncated"]),
+            "n_distinct_molecules": len(summary),
+            "by_standard_type": dict(
+                sorted(by_standard_type.items(), key=lambda kv: (-kv[1], kv[0]))
+            ),
+            "top_compounds": top,
+            # the executor pops this into the download hint; the whole per-molecule
+            # summary is a TSV, not something to put in front of the model
+            "_all_compounds": ordered,
+        }
+
+    async def _resolve_molecule(self, query: str) -> dict[str, Any]:
+        """Work out which ChEMBL molecule a drug name or id means.
+
+        A `CHEMBL<number>` is used as given; a name is tried as the preferred name
+        before the synonym list, because pref_name is one per molecule while a synonym
+        ("Advil") is shared by every formulation carrying it. Several matches are not an
+        error: `_candidate_rank` picks one and the rest are listed.
+        """
+        text = (query or "").strip()
+        if not text:
+            return {
+                "_error": "ChEMBL: empty query, nothing to resolve",
+                "_status": None,
+                "_stage": "input",
+            }
+        if _CHEMBL_ID_RE.match(text.upper()):
+            ladder = [("chembl_id", {"molecule_chembl_id": text.upper()})]
+        else:
+            ladder = [
+                ("pref_name", {"pref_name__iexact": text}),
+                ("synonym", {"molecule_synonyms__molecule_synonym__iexact": text}),
+            ]
+        for kind, params in ladder:
+            body = await self._get_all(
+                "molecule", {**params, "limit": _PAGE_LIMIT}, _CANDIDATE_FIELDS
+            )
+            if _is_error(body):
+                return {**body, "_stage": "molecule"}
+            records = body["records"]
+            if not records:
+                continue
+            chosen = min(records, key=self._candidate_rank)
+            others = [
+                {
+                    "molecule_chembl_id": r.get("molecule_chembl_id"),
+                    "pref_name": r.get("pref_name"),
+                }
+                for r in records
+                if r is not chosen
+            ]
+            note = f"matched {query!r} on {kind}"
+            if others:
+                note += (
+                    f"; {len(others)} other candidate(s) matched, kept the highest max_phase, "
+                    "preferring a parent molecule over its salts and then the lowest id"
+                )
+            return {
+                "resolution": {
+                    "query": query,
+                    "kind": kind,
+                    "n_candidates": len(records),
+                    "other_candidates": others,
+                    "note": note,
+                },
+                "molecule": self._molecule_row(chosen, chosen.get("molecule_chembl_id")),
+            }
+        return {
+            "resolution": {
+                "query": query,
+                "kind": None,
+                "n_candidates": 0,
+                "other_candidates": [],
+                "note": f"no ChEMBL molecule matches {query!r} by preferred name or synonym",
+            },
+            "molecule": None,
+        }
+
+    @staticmethod
+    def _candidate_rank(record: dict[str, Any]) -> tuple[float, int, str]:
+        """Sort key for the name ladder's candidates; the smallest wins.
+
+        Phase alone leaves a salt and its parent tied, and a tie was previously settled
+        by whichever ChEMBL listed first. The parent is the molecule the annotations hang
+        off, so it wins the tie; the id settles the rest so the answer is stable.
+        """
+        molecule_id = str(record.get("molecule_chembl_id") or "")
+        hierarchy = record.get("molecule_hierarchy")
+        is_parent = (
+            isinstance(hierarchy, dict) and hierarchy.get("parent_chembl_id") == molecule_id
+        )
+        return (-_sort_phase(record.get("max_phase")), 0 if is_parent else 1, molecule_id)
+
+    async def _by_ids(
+        self,
+        resource: str,
+        field: str,
+        ids: list[str],
+        only: list[str],
+        limit: int = _PAGE_LIMIT,
+        max_pages: int = _MAX_PAGES,
+    ) -> dict[str, Any]:
+        """Fetch `resource` rows for many ids through `<field>__in`, in chunks.
+
+        The alternative — one request per drug — is what the mechanism -> molecule join
+        costs otherwise. Chunked because the id list travels in the URL.
+        Returns `{"records", "truncated"}`, or the sentinel of the chunk that failed.
+        """
+        records: list[Any] = []
+        truncated = False
+        for start in range(0, len(ids), _ID_CHUNK):
+            body = await self._get_all(
+                resource,
+                {f"{field}__in": ",".join(ids[start : start + _ID_CHUNK]), "limit": limit},
+                only,
+                max_pages,
+            )
+            if _is_error(body):
+                return body
+            records.extend(body["records"])
+            truncated = truncated or bool(body["truncated"])
+        return {"records": records, "truncated": truncated}
+
+    @staticmethod
+    def _molecule_row(molecule: dict[str, Any], molecule_id: str | None) -> dict[str, Any]:
+        """The drug fields of a result row, rebuilt out of a cached molecule record."""
+        return {
+            "pref_name": molecule.get("pref_name"),
+            "molecule_chembl_id": molecule.get("molecule_chembl_id") or molecule_id,
+            "molecule_type": molecule.get("molecule_type"),
+            "max_phase": _phase(molecule.get("max_phase")),
+            "first_approval": molecule.get("first_approval"),
+            "withdrawn_flag": molecule.get("withdrawn_flag"),
+            "atc_codes": list(molecule.get("atc_classifications") or []),
+        }
+
+    @staticmethod
+    def _group_indications(records: list[Any]) -> dict[str, list[dict[str, Any]]]:
+        """drug_indication rows per molecule, best-evidenced phase first."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            molecule_id = record.get("molecule_chembl_id")
+            if not molecule_id:
+                continue
+            grouped.setdefault(molecule_id, []).append(
+                {k: record.get(k) for k in _INDICATION_FIELDS}
+            )
+        for rows in grouped.values():
+            rows.sort(key=lambda i: -_sort_phase(i.get("max_phase_for_ind")))
+        return grouped
+
+    @staticmethod
+    def _target_components(target: dict[str, Any]) -> list[dict[str, Any]]:
+        """Accessions and gene symbols out of a target's components.
+
+        `only=target_components` projects the column, not the objects inside it, so the
+        record arrives with each component's full xref list — hundreds of PDBe entries
+        for a well-studied target. Everything but the accession and the GENE_SYMBOL
+        synonyms is dropped here rather than carried into a result.
+        """
+        components = []
+        for component in target.get("target_components") or []:
+            if not isinstance(component, dict):
+                continue
+            symbols = [
+                synonym.get("component_synonym")
+                for synonym in component.get("target_component_synonyms") or []
+                if isinstance(synonym, dict)
+                and synonym.get("syn_type") == "GENE_SYMBOL"
+                and synonym.get("component_synonym")
+            ]
+            components.append(
+                {"accession": component.get("accession"), "gene_symbols": symbols}
+            )
+        return components
+
+    @staticmethod
+    def _failed(
+        sentinel: dict[str, Any], stage: str, resolution: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Turn a stage's sentinel into a tool result; never raises past a tool method."""
+        return {
+            "success": False,
+            "error": sentinel.get("_error"),
+            "stage": sentinel.get("_stage") or stage,
+            "resolution": resolution,
+        }
+
+    @staticmethod
+    def _bad_param(name: str, value: Any, query: str) -> dict[str, Any]:
+        """Result for an argument that failed to coerce, caught before any request is made."""
+        return {
+            "success": False,
+            "error": f"ChEMBL: {name}={value!r} is not a number",
+            "stage": "input",
+            "resolution": {"query": query},
+        }
 
     async def _get_url(self, url: httpx.URL) -> dict[str, Any]:
         """The single request funnel: origin pin, TTL cache, 20s timeout, sentinel.
