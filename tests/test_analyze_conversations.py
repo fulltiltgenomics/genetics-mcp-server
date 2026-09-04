@@ -369,6 +369,17 @@ class TestKeywordCategorization:
         )
         assert topic == "clinical_genetics"
 
+    def test_drug_target_query(self):
+        topic, _ = categorize_by_keywords(
+            "Is PPARG a druggable target? Which approved drugs or inhibitors exist?"
+        )
+        assert topic == "drug_target"
+
+    def test_medication_endpoint_is_not_a_drug_question(self):
+        # "medication" names FinnGen's drug-purchase endpoints, not a drug-target question
+        topic, _ = categorize_by_keywords("Which endpoint covers statin medication purchases?")
+        assert topic != "drug_target"
+
     def test_general_fallback(self):
         topic, conf = categorize_by_keywords("Hello how are you?")
         assert topic == "general_genetics"
