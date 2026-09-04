@@ -492,18 +492,16 @@ print(executor.bigquery_url)
 
 
 def test_the_pruned_install_fallback_matches_settings_defaults():
-    """The fallback restates five of Settings' defaults rather than importing them; this
-    is what stops the two copies drifting."""
+    """The fallback restates Settings' defaults rather than importing them; this is what
+    stops the two copies drifting."""
     from genetics_mcp_server.config.settings import Settings
     from genetics_mcp_server.tools.executor import _PrunedInstallSettings
 
     fallback = _PrunedInstallSettings()
-    for name in (
-        "myvariant_api_url",
-        "uniprot_api_url",
-        "ebi_proteins_api_url",
-        "uniprot_cache_ttl",
-    ):
+    # iterated off the dataclass so a field added to it cannot be forgotten here
+    for name in _PrunedInstallSettings.__dataclass_fields__:
+        if name == "internal_api_secret":
+            continue
         # Settings reads the environment, so compare against its declared default rather
         # than against a live instance
         default = Settings.__dataclass_fields__[name].default_factory

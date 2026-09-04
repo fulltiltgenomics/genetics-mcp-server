@@ -195,6 +195,17 @@ class Settings:
         default_factory=lambda: int(os.environ.get("UNIPROT_CACHE_TTL", "86400"))
     )
 
+    # ChEMBL REST API (drug/target mechanisms, indications, bioactivity)
+    chembl_api_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHEMBL_API_URL", "https://www.ebi.ac.uk/chembl/api/data"
+        )
+    )
+    # ChEMBL releases quarterly, so a day is safe
+    chembl_cache_ttl: int = field(
+        default_factory=lambda: int(os.environ.get("CHEMBL_CACHE_TTL", "86400"))
+    )
+
     # RAG MCP server (separate from always-on external servers)
     rag_mcp_server: str | None = field(
         default_factory=lambda: os.environ.get("RAG_MCP_SERVER")

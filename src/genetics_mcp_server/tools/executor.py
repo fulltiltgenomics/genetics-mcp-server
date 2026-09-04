@@ -59,6 +59,8 @@ class _PrunedInstallSettings:
     uniprot_api_url: str = "https://rest.uniprot.org"
     ebi_proteins_api_url: str = "https://www.ebi.ac.uk/proteins/api"
     uniprot_cache_ttl: int = 86400
+    chembl_api_url: str = "https://www.ebi.ac.uk/chembl/api/data"
+    chembl_cache_ttl: int = 86400
 
 
 _PRUNED_INSTALL_SETTINGS = _PrunedInstallSettings()
