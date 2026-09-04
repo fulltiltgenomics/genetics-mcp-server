@@ -610,6 +610,7 @@ class ChEMBLClient:
             "target_chembl_id": target_id,
             "target_pref_name": resolved["pref_name"],
             "target_type": resolved["target_type"],
+            "other_targets": resolved["other_targets"],
             "pchembl_min": threshold,
             "resolution": resolution,
             "attribution": await self.attribution(),

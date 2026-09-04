@@ -61,6 +61,8 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
             "get_protein_annotations",
             "map_protein_variants",
             "search_uniprot",
+            "get_drug_targets_for_gene",
+            "get_drug_profile",
         ],
     ),
     "database_analysis": SkillDefinition(

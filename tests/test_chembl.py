@@ -1033,6 +1033,11 @@ class TestTargetBioactivity(_ChEMBLToolCase):
         assert result["total_count"] == 4210
         assert result["n_distinct_molecules"] == 3
         assert result["pchembl_min"] == 6.0
+        # carried through from resolve_target, same as get_drug_targets_for_gene
+        assert [t["target_chembl_id"] for t in result["other_targets"]] == [
+            "CHEMBL2111342",
+            "CHEMBL2094122",
+        ]
         assert result["by_standard_type"] == {"IC50": 3, "EC50": 1, "Ki": 1}
         top = result["top_compounds"]
         assert [r["molecule_chembl_id"] for r in top] == ["CHEMBL595", "CHEMBL121", "CHEMBL9999"]
