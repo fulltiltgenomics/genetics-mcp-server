@@ -2491,6 +2491,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_myvariant.py` | myvariant.info annotation tool |
 | `test_uniprot.py` | UniProt client: resolution tiers, TTL cache, variant effect |
 | `test_chembl.py` | ChEMBL client: target resolution through UniProt, paging caps, phase filtering, attribution |
+| `test_chembl_descriptions.py` | Every backticked name in the three ChEMBL tool descriptions and in the ChEMBL prompt blocks resolves to a parameter, a tool name, or a key of that tool's mocked happy-path result |
 | `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
