@@ -230,6 +230,78 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 
 **Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
 
+#### ChEMBL (native tools, chat-backend only)
+
+Three tools answer the druggability question — "is this gene a drug target, and for what?" —
+from ChEMBL's REST API instead of from memory. That question is the most common downstream
+follow-up to a GWAS or pQTL finding, and a survey of production chat history found no
+structured drug record behind any phase or approval claim in the drug sessions: clinical
+phases and approvals were asserted from parametric memory, not read from ChEMBL. The survey's
+numbers live in the epic's beads notes.
+
+| Tool | Description |
+|------|-------------|
+| `get_drug_targets_for_gene` | Gene → the drugs and clinical candidates ChEMBL records against its protein target, each with mechanism of action, action type, highest clinical phase, first approval year, withdrawal flag and ATC codes; `include_indications` adds what each is developed for. Chat-backend only — excluded from MCP server |
+| `get_drug_profile` | One named drug or `CHEMBL<number>` → its targets with mechanisms, its ATC classification, and its indications as EFO/MeSH terms each with their own max phase. Chat-backend only — excluded from MCP server |
+| `get_target_bioactivity` | Gene → the medicinal chemistry recorded against its target: how many potency measurements sit at or above a pChEMBL threshold, over how many compounds, broken down by assay type, with the most potent compounds. A tractability question, not a clinical one. Chat-backend only — excluded from MCP server |
+
+**Client layer** (`tools/chembl.py`): `ChEMBLClient` holds the transport, the resolution and
+the tool methods, the same split as `tools/uniprot.py`, so the executor carries only
+delegates. It reuses `tools/uniprot.py`'s `_TTLCache` class rather than a second
+implementation, but constructs its own cache instance.
+
+- **Gene resolution goes through UniProt first**, not through ChEMBL's own gene-symbol
+  synonyms. Shape cannot decide what an agent-supplied string is — `P2RY12`, `B4GAT1` and the
+  `H2AC*` histone families are valid HGNC symbols *and* valid accession syntax — and the
+  UniProt resolver already reports which reading it took and follows merged accessions. Using
+  ChEMBL's synonyms instead would make two differently curated naming authorities answer
+  "which protein is this". The accession then selects the ChEMBL target: a heteromer, a
+  protein family and a cell line can all share one accession, so the `SINGLE PROTEIN` target
+  wins where one exists and the rest are returned in `other_targets` rather than dropped. A
+  `CHEMBL<number>` target id skips resolution entirely. A gene with no ChEMBL target is a
+  normal result with `count` 0.
+- **`only=` projection on every resource, not just molecules.** ChEMBL's records are far
+  larger than the answer: three target records are 55 KB, 200 indications 76 KB, a single
+  molecule 6-8 KB. Every request except `release()`'s status.json call names the fields it
+  wants. `only=target_components` is the one place that is not enough — it projects the
+  column, not the objects inside it, so a
+  well-studied target still arrives with hundreds of PDBe xrefs, and everything but the
+  accession and the `GENE_SYMBOL` synonyms is dropped before the record is used.
+- **Bounded walks.** A filter that matches half of ChEMBL must bound round trips, not just
+  rows: paged joins stop after `_MAX_PAGES` pages of `_PAGE_LIMIT` rows, except the
+  indication batch, which pages at 1000 (`_ACTIVITY_PAGE_LIMIT`), and the target walk, which
+  passes no limit and takes ChEMBL's default page size. The activity walk is separate — it
+  is ordered by descending `pchembl_value` so a cap costs the weakest measurements rather
+  than an arbitrary slice, and it stops after `_ACTIVITY_MAX_PAGES` pages of 1000. When it
+  stops early the result sets `truncated`, and `n_activities`, `n_distinct_molecules` and
+  the assay-type breakdown count only the rows read, while `total_count` stays ChEMBL's count
+  for the whole filter.
+- **`max_phase` is annotated, never inferred.** ChEMBL's 0–4 is the highest phase reached
+  anywhere by any regulator for any indication, so 4 means approved somewhere, not
+  FDA-approved. `-1` and a missing value both become `None` — unknown, not preclinical —
+  because coercing them to 0 would state something about the drug rather than about the
+  annotation.
+- **Attribution is required and is not fabricated.** ChEMBL is CC BY-SA 3.0, so every
+  successful result carries an `attribution` line naming the release — the `chembl_db_version`
+  read verbatim from the API's own `status.json`, giving `ChEMBL ChEMBL_37 (CC BY-SA 3.0),
+  EMBL-EBI` — and an unversioned string when that read fails, because an attribution lookup
+  must never be what fails a tool call. Failure dicts carry no `attribution`: there is
+  nothing to credit.
+
+**Exposure decision**: chat-backend only, like the UniProt and MGI tools — the three names are
+in `_mcp_disabled` in `mcp_server.py`, so they are never registered on the standalone MCP
+server. Category is `general`, so they survive every profile split. `get_drug_targets_for_gene`
+and `get_drug_profile` are in the `literature_review` skill's `extra_tools`;
+`get_target_bioactivity` is not, since assay counts are not a literature question. The system
+prompt's `### Drug and Target Evidence (ChEMBL)` block routes to them, and the
+"Contextualizing Findings" rule that told the model to consider whether drugs already exist
+for a gene now names `get_drug_targets_for_gene` instead of leaving it to memory.
+
+`tools/chembl.py` is imported eagerly by `tools/executor.py`, so it is inside the SDK import
+closure and ships in the sandbox image. It is unreachable from `run_analysis` all the same:
+the sandbox's egress allow-list names db-api and results-api only, and nothing there serves
+`www.ebi.ac.uk`.
+
 ### Code execution tools
 
 Tool halves of the sandbox design (`genetics-results-suite-4h6`). **Whether a sandbox is
@@ -588,7 +660,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
@@ -732,7 +804,7 @@ via the `X-Columns` response header results-api added for
 `genetics-results-suite-6uk` (see "Empty results keep their schema").
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
-cBioPortal, myvariant, UniProt), the presentation tools (`analyze_variant_list`,
+cBioPortal, myvariant, UniProt, ChEMBL), the presentation tools (`analyze_variant_list`,
 `get_credible_sets_stats`) and `get_phenotype_report`. The first group is
 not genetics-results data; the second is model-facing summarisation that a script writes for
 itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
@@ -762,7 +834,7 @@ deployment and not about the policy.
 Reachability therefore divides this list along a different axis than the one that put tools on
 it. The third-party tools **are** genuinely unreachable from a sandboxed script — but for the
 network reason, not the SDK one: no permitted egress target serves myvariant.info, Europe PMC,
-MGI, cBioPortal, UniProt or a web-search API (Perplexity/Tavily), so reaching
+MGI, cBioPortal, UniProt, ChEMBL or a web-search API (Perplexity/Tavily), so reaching
 `get_myvariant_annotations` through `._executor` still fails to connect. The presentation tools and `get_phenotype_report` are **reachable**: results-api is a
 permitted target and the sandbox credential is not scoped per route, so `._executor` or a
 hand-rolled httpx call gets them. For those, what the omission costs is the affordance and not
@@ -1016,10 +1088,10 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py` ships too but sits outside
   the closure, resolved lazily so the servers never import matplotlib.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
-  environment variable of the suite — so `uniprot.py` now imports `Settings` under
+  environment variable of the suite — so `uniprot.py` and `chembl.py` import `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
   first use rather than in `__init__`, falling back to `_PrunedInstallSettings` (a frozen copy
-  of the four public-URL/TTL defaults, and an empty `internal_api_secret`, since a sandbox
+  of the six public-URL/TTL defaults, and an empty `internal_api_secret`, since a sandbox
   holds no secret) when `config.settings` is *itself* not installed — a `ModuleNotFoundError`
   naming anything else in its import chain is re-raised, so a broken install cannot degrade
   into the credential-less fallback, and taking the fallback logs one warning naming no
@@ -2058,6 +2130,13 @@ All configuration is via environment variables (`.env` file supported):
 | `EBI_PROTEINS_API_URL` | EBI Proteins API base URL (protein↔genome coordinate mapping) | `https://www.ebi.ac.uk/proteins/api` |
 | `UNIPROT_CACHE_TTL` | TTL in seconds for cached UniProt responses; `0` disables caching | `86400` (24 h) |
 
+### ChEMBL (optional, chat-backend only)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CHEMBL_API_URL` | ChEMBL REST API base URL (targets, mechanisms, molecules, indications, activities) | `https://www.ebi.ac.uk/chembl/api/data` |
+| `CHEMBL_CACHE_TTL` | TTL in seconds for cached ChEMBL responses; `0` disables caching | `86400` (24 h) |
+
 ### Search tools (optional)
 
 | Variable | Description |
@@ -2411,6 +2490,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_literature_search.py` | Literature backend selection, Perplexity metadata hydration |
 | `test_myvariant.py` | myvariant.info annotation tool |
 | `test_uniprot.py` | UniProt client: resolution tiers, TTL cache, variant effect |
+| `test_chembl.py` | ChEMBL client: target resolution through UniProt, paging caps, phase filtering, attribution |
 | `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
