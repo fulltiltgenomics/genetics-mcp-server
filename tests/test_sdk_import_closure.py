@@ -62,6 +62,7 @@ SDK_IMPORT_CLOSURE = frozenset(
         "genetics_mcp_server.sdk.client",
         "genetics_mcp_server.sdk.errors",
         "genetics_mcp_server.tools",
+        "genetics_mcp_server.tools.chembl",
         "genetics_mcp_server.tools.executor",
         "genetics_mcp_server.tools.sql_safety",
         "genetics_mcp_server.tools.uniprot",

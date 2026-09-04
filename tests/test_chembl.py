@@ -13,7 +13,7 @@ import pytest
 from genetics_mcp_server.tools import chembl
 from genetics_mcp_server.tools.chembl import ChEMBLClient
 from genetics_mcp_server.tools.executor import ToolExecutor
-from genetics_mcp_server.tools.uniprot import _TTLCache
+from genetics_mcp_server.tools.uniprot import _is_error, _TTLCache
 
 
 class _Settings:
@@ -31,8 +31,8 @@ def clear_chembl_cache():
     chembl._CACHE.clear()
 
 
-def _client(http=None) -> ChEMBLClient:
-    return ChEMBLClient(http or MagicMock(), _Settings())
+def _client(http=None, uniprot=None) -> ChEMBLClient:
+    return ChEMBLClient(http or MagicMock(), _Settings(), uniprot or MagicMock())
 
 
 def _resp(body=None, status=200, text=""):
@@ -73,7 +73,7 @@ class TestUrlBuilding:
     def test_a_trailing_slash_on_the_configured_base_is_dropped(self):
         settings = _Settings()
         settings.chembl_api_url = "https://www.ebi.ac.uk/chembl/api/data/"
-        client = ChEMBLClient(MagicMock(), settings)
+        client = ChEMBLClient(MagicMock(), settings, MagicMock())
         assert client._build_url("target", {}, ["x"]).path == "/chembl/api/data/target.json"
 
 
@@ -191,7 +191,9 @@ class TestHttpBehaviour:
     @pytest.fixture(autouse=True)
     async def setup_executor(self):
         self.executor = ToolExecutor()
-        self.client = ChEMBLClient(self.executor.external_client, _Settings())
+        self.client = ChEMBLClient(
+            self.executor.external_client, _Settings(), self.executor.uniprot
+        )
         yield
         await self.executor.close()
 
@@ -269,3 +271,185 @@ class TestHttpBehaviour:
         patcher, _calls = self._patch_get(lambda url: _resp(status=503, text="down"))
         with patcher:
             assert await self.client.release() is None
+
+
+def _target(chembl_id, pref_name, target_type):
+    return {
+        "target_chembl_id": chembl_id,
+        "pref_name": pref_name,
+        "target_type": target_type,
+    }
+
+
+# PPARG: CHEMBL235 is the protein itself, the rest are heteromers built on it. The
+# SINGLE PROTEIN one is deliberately not first, so choosing it cannot be "took record 0".
+_PPARG_TARGETS = [
+    _target("CHEMBL2111342", "PPAR-alpha/gamma", "PROTEIN-PROTEIN INTERACTION"),
+    _target("CHEMBL235", "Peroxisome proliferator-activated receptor gamma", "SINGLE PROTEIN"),
+    _target("CHEMBL2094122", "PPAR-gamma/RXR-alpha", "PROTEIN-PROTEIN INTERACTION"),
+]
+
+_UNIPROT_PPARG = {
+    "query": "PPARG",
+    "input_kind": "symbol",
+    "accession": "P37231",
+    "entry_name": "PPARG_HUMAN",
+    "ambiguous": False,
+}
+
+_UNIPROT_ACCESSION = {**_UNIPROT_PPARG, "query": "P37231", "input_kind": "accession"}
+
+# P2RY12 is a real gene symbol that is also valid accession syntax, so only the resolver
+# can say which reading is meant; clopidogrel's target hangs off the accession it returns
+_P2RY12_TARGETS = [_target("CHEMBL1907600", "P2Y purinoceptor 12", "SINGLE PROTEIN")]
+
+_UNIPROT_P2RY12 = {
+    "query": "P2RY12",
+    "input_kind": "symbol",
+    "accession": "Q9H244",
+    "entry_name": "P2RY12_HUMAN",
+    "ambiguous": False,
+}
+
+
+@pytest.mark.asyncio
+class TestTargetResolution:
+    """resolve_target driven through the shared client, with the resolver stubbed."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_executor(self):
+        self.executor = ToolExecutor()
+        yield
+        await self.executor.close()
+
+    def _patch_get(self, resolver):
+        calls: list[str] = []
+
+        def handler(url, *args, **kwargs):
+            text = str(url)
+            calls.append(text)
+            resp = resolver(text)
+            assert resp is not None, f"unexpected request: {text}"
+            return resp
+
+        patcher = patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, side_effect=handler
+        )
+        return patcher, calls
+
+    def _stub_resolver(self, result):
+        return patch.object(
+            self.executor.uniprot, "resolve", new=AsyncMock(return_value=result)
+        )
+
+    async def test_a_symbol_resolves_through_uniprot_and_prefers_the_single_protein(self):
+        patcher, calls = self._patch_get(lambda url: _resp(body=_page("targets", _PPARG_TARGETS)))
+        with self._stub_resolver(_UNIPROT_PPARG) as resolve, patcher:
+            result = await self.executor.chembl.resolve_target("PPARG")
+
+        assert resolve.await_args.args == ("PPARG",)
+        assert result["target_chembl_id"] == "CHEMBL235"
+        assert result["target_type"] == "SINGLE PROTEIN"
+        # the heteromers are visible rather than silently dropped
+        assert [t["target_chembl_id"] for t in result["other_targets"]] == [
+            "CHEMBL2111342",
+            "CHEMBL2094122",
+        ]
+        resolution = result["resolution"]
+        assert resolution["kind"] == "symbol"
+        assert resolution["accession"] == "P37231"
+        assert resolution["uniprot"] == _UNIPROT_PPARG
+        assert resolution["n_targets"] == 3
+        assert "P37231" in calls[0] and "organism=Homo+sapiens" in calls[0]
+        assert resolution["organism"] == "Homo sapiens"
+
+    async def test_an_accession_input_is_reported_as_one_by_the_resolver(self):
+        patcher, calls = self._patch_get(lambda url: _resp(body=_page("targets", _PPARG_TARGETS)))
+        with self._stub_resolver(_UNIPROT_ACCESSION) as resolve, patcher:
+            result = await self.executor.chembl.resolve_target("P37231")
+
+        assert resolve.await_args.args == ("P37231",)
+        assert result["resolution"]["kind"] == "accession"
+        assert result["resolution"]["uniprot"] == _UNIPROT_ACCESSION
+        assert result["target_chembl_id"] == "CHEMBL235"
+        assert "target_components__accession=P37231" in calls[0]
+
+    async def test_an_accession_shaped_gene_symbol_still_goes_through_uniprot(self):
+        patcher, calls = self._patch_get(lambda url: _resp(body=_page("targets", _P2RY12_TARGETS)))
+        with self._stub_resolver(_UNIPROT_P2RY12) as resolve, patcher:
+            result = await self.executor.chembl.resolve_target("P2RY12")
+
+        assert resolve.await_args.args == ("P2RY12",)
+        # the accession UniProt found, not the symbol that merely looks like one
+        assert "target_components__accession=Q9H244" in calls[0]
+        assert "P2RY12" not in calls[0]
+        assert result["resolution"]["kind"] == "symbol"
+        assert result["resolution"]["accession"] == "Q9H244"
+        assert result["target_chembl_id"] == "CHEMBL1907600"
+
+    async def test_a_chembl_target_id_is_used_as_given(self):
+        single = [_target("CHEMBL235", "PPAR gamma", "SINGLE PROTEIN")]
+        patcher, calls = self._patch_get(lambda url: _resp(body=_page("targets", single)))
+        with self._stub_resolver(_UNIPROT_PPARG) as resolve, patcher:
+            result = await self.executor.chembl.resolve_target("chembl235")
+
+        resolve.assert_not_awaited()
+        assert result["resolution"]["kind"] == "chembl_target"
+        assert result["resolution"]["accession"] is None
+        assert result["other_targets"] == []
+        assert "target_chembl_id=CHEMBL235" in calls[0]
+        assert "accession" not in calls[0]
+
+    async def test_a_uniprot_failure_names_the_stage_and_makes_no_chembl_request(self):
+        sentinel = {"_error": "UniProt: no match for ZZZZZ", "_status": None, "_no_match": True}
+        patcher, calls = self._patch_get(lambda url: None)
+        with self._stub_resolver(sentinel), patcher:
+            result = await self.executor.chembl.resolve_target("ZZZZZ")
+
+        assert _is_error(result)
+        assert result["_stage"] == "uniprot"
+        assert result["_no_match"] is True
+        assert "UniProt: no match for ZZZZZ" in result["_error"]
+        assert calls == []
+
+    async def test_a_chembl_failure_is_a_sentinel_naming_the_chembl_stage(self):
+        patcher, _calls = self._patch_get(lambda url: _resp(status=500, text="boom"))
+        with self._stub_resolver(_UNIPROT_PPARG), patcher:
+            result = await self.executor.chembl.resolve_target("PPARG")
+
+        assert _is_error(result)
+        assert result["_status"] == 500
+        assert result["_stage"] == "chembl_target"
+
+    async def test_a_gene_with_no_chembl_target_is_a_success_shaped_answer(self):
+        patcher, _calls = self._patch_get(lambda url: _resp(body=_page("targets", [])))
+        with self._stub_resolver(_UNIPROT_PPARG), patcher:
+            result = await self.executor.chembl.resolve_target("PPARG")
+
+        assert not _is_error(result)
+        assert result["target_chembl_id"] is None
+        assert result["other_targets"] == []
+        assert result["resolution"]["n_targets"] == 0
+        assert "no ChEMBL target" in result["resolution"]["note"]
+
+    async def test_without_a_single_protein_the_first_match_is_returned_and_said_so(self):
+        complexes = [t for t in _PPARG_TARGETS if t["target_type"] != "SINGLE PROTEIN"]
+        patcher, _calls = self._patch_get(lambda url: _resp(body=_page("targets", complexes)))
+        with self._stub_resolver(_UNIPROT_PPARG), patcher:
+            result = await self.executor.chembl.resolve_target("PPARG")
+
+        assert result["target_chembl_id"] == "CHEMBL2111342"
+        assert result["target_type"] == "PROTEIN-PROTEIN INTERACTION"
+        assert [t["target_chembl_id"] for t in result["other_targets"]] == ["CHEMBL2094122"]
+        assert "no SINGLE PROTEIN target" in result["resolution"]["note"]
+
+
+@pytest.mark.asyncio
+class TestExecutorWiring:
+    async def test_the_client_shares_the_executors_resolver_and_http_client(self):
+        executor = ToolExecutor()
+        try:
+            assert executor.chembl._uniprot is executor.uniprot
+            assert executor.chembl._client is executor.external_client
+        finally:
+            await executor.close()

@@ -7,12 +7,13 @@ ToolExecutor.
 """
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import httpx
 
-from genetics_mcp_server.tools.uniprot import _is_error, _TTLCache
+from genetics_mcp_server.tools.uniprot import UniProtClient, _is_error, _TTLCache
 
 if TYPE_CHECKING:
     # type-only for the same reason as in tools/uniprot.py: a real import of
@@ -32,15 +33,30 @@ _MAX_PAGES = 10
 # not be shared.
 _CACHE = _TTLCache()
 
+_CHEMBL_TARGET_RE = re.compile(r"^CHEMBL[0-9]+$")
+
+# a heteromer, a protein family and a cell line are all "targets" for the same accession,
+# and only this one is the protein itself; the rest are reported rather than dropped
+_SINGLE_PROTEIN = "SINGLE PROTEIN"
+_TARGET_FIELDS = ["target_chembl_id", "pref_name", "target_type"]
+
 
 class ChEMBLClient:
     """Async client for the ChEMBL REST API."""
 
-    def __init__(self, external_client: httpx.AsyncClient, settings: "Settings"):
+    def __init__(
+        self,
+        external_client: httpx.AsyncClient,
+        settings: "Settings",
+        uniprot: UniProtClient,
+    ):
         # the httpx client is injected, not constructed here: the executor passes its
         # _ResilientAsyncClient, so connection failures arrive as a synthetic 503
         # instead of raising, and no internal auth header reaches EBI
         self._client = external_client
+        # the executor's own resolver, so a symbol resolved for a UniProt tool and the
+        # same symbol resolved here cost one lookup between them and cannot disagree
+        self._uniprot = uniprot
         self._base_url = settings.chembl_api_url.rstrip("/")
         self._cache_ttl = settings.chembl_cache_ttl
         # a request may only be made to the origin this deployment is configured for.
@@ -121,6 +137,124 @@ class ChEMBLClient:
             return None
         version = body.get("chembl_db_version")
         return str(version) if version else None
+
+    async def resolve_target(self, query: str) -> dict[str, Any]:
+        """Work out which ChEMBL target an agent-supplied gene, accession or id means.
+
+        A `CHEMBL<number>` target id is used as given; everything else goes through the
+        shared UniProt resolver, which reports whether it read the input as an accession
+        or a symbol. Shape alone cannot make that call here — real HGNC symbols (P2RY12,
+        B4GAT1, H2AC11) are valid accession syntax — and the resolver also maps a merged
+        or secondary accession to the primary one. Using it rather than ChEMBL's own
+        symbol synonyms, a second and differently curated naming authority, keeps one
+        answer to "which protein is this".
+
+        Returns `{resolution: {query, kind, accession, uniprot, organism, n_targets, note},
+        target_chembl_id, pref_name, target_type, other_targets}`. A gene with no ChEMBL
+        target is a normal answer, not an error: `target_chembl_id` is None and the note
+        says so. Only a failed lookup is a sentinel (test it with `_is_error`); the
+        sentinel carries `_stage` because "UniProt could not resolve the symbol" and
+        "ChEMBL refused the target query" are different problems for the caller.
+        """
+        text = (query or "").strip()
+        if not text:
+            return {
+                "_error": "ChEMBL: empty query, nothing to resolve",
+                "_status": None,
+                "_stage": "input",
+            }
+        candidate = text.upper()
+        if _CHEMBL_TARGET_RE.match(candidate):
+            return await self._targets(
+                {"target_chembl_id": candidate}, text, "chembl_target", None, None
+            )
+        resolution = await self._uniprot.resolve(text)
+        if _is_error(resolution) or not resolution.get("accession"):
+            return self._uniprot_stage_sentinel(text, resolution)
+        return await self._targets_for_accession(
+            str(resolution["accession"]),
+            text,
+            str(resolution.get("input_kind") or "symbol"),
+            resolution,
+        )
+
+    async def _targets_for_accession(
+        self, accession: str, query: str, kind: str, uniprot: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        return await self._targets(
+            # organism is filtered here rather than after the fact because the same
+            # accession's orthologues carry their own targets
+            {"target_components__accession": accession, "organism": "Homo sapiens"},
+            query,
+            kind,
+            accession,
+            uniprot,
+        )
+
+    async def _targets(
+        self,
+        params: dict[str, Any],
+        query: str,
+        kind: str,
+        accession: str | None,
+        uniprot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        body = await self._get_all("target", params, _TARGET_FIELDS)
+        if _is_error(body):
+            return {**body, "_stage": "chembl_target"}
+        organism = params.get("organism")
+        records = body["records"]
+        singles = [r for r in records if r.get("target_type") == _SINGLE_PROTEIN]
+        chosen = singles[0] if singles else (records[0] if records else None)
+        others = [r for r in records if r is not chosen]
+        if chosen is None:
+            # the organism filter is silent, so a bare "no target" would state a false
+            # reason for an accession whose targets are all non-human
+            note = f"no ChEMBL target is annotated for {accession or query}"
+            if organism:
+                note += f" in {organism}"
+        elif singles:
+            note = f"chose the {_SINGLE_PROTEIN} target"
+            if others:
+                note += f"; {len(others)} other target(s) share this accession"
+        else:
+            note = (
+                f"no {_SINGLE_PROTEIN} target for {accession or query}; "
+                f"returning the {chosen.get('target_type')} target instead"
+            )
+        if body.get("truncated"):
+            total = body.get("total_count")
+            matched = f"{total}" if isinstance(total, int) else f"more than {len(records)}"
+            note += f"; {matched} targets matched and the walk was capped"
+        return {
+            "resolution": {
+                "query": query,
+                "kind": kind,
+                "accession": accession,
+                "uniprot": uniprot,
+                "organism": organism,
+                "n_targets": len(records),
+                "note": note,
+            },
+            # rebuilt rather than passed through: the records are the cached page objects
+            "target_chembl_id": chosen.get("target_chembl_id") if chosen else None,
+            "pref_name": chosen.get("pref_name") if chosen else None,
+            "target_type": chosen.get("target_type") if chosen else None,
+            "other_targets": [{k: r.get(k) for k in _TARGET_FIELDS} for r in others],
+        }
+
+    @staticmethod
+    def _uniprot_stage_sentinel(query: str, resolution: dict[str, Any]) -> dict[str, Any]:
+        """Sentinel for a symbol UniProt could not turn into an accession."""
+        reason = resolution.get("_error") or "UniProt returned no accession"
+        sentinel = {
+            "_error": f"ChEMBL: could not resolve {query!r} to a UniProt accession: {reason}",
+            "_status": resolution.get("_status"),
+            "_stage": "uniprot",
+        }
+        if resolution.get("_no_match"):
+            sentinel["_no_match"] = True
+        return sentinel
 
     async def _get_url(self, url: httpx.URL) -> dict[str, Any]:
         """The single request funnel: origin pin, TTL cache, 20s timeout, sentinel.

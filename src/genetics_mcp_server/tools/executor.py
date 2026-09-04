@@ -26,6 +26,7 @@ from xml.sax.saxutils import quoteattr
 
 import httpx
 
+from genetics_mcp_server.tools.chembl import ChEMBLClient
 from genetics_mcp_server.tools.sql_safety import (
     SqlValueError,
     normalize_literal,
@@ -665,6 +666,13 @@ class ToolExecutor:
         """Shares external_client so UniProt/EBI outages arrive as the synthetic 503
         rather than raising, and so no internal auth header is ever sent to them."""
         return UniProtClient(self.external_client, _resolve_settings())
+
+    @cached_property
+    def chembl(self) -> ChEMBLClient:
+        """Shares external_client so EBI outages arrive as the synthetic 503 rather than
+        raising, and no internal auth header is ever sent to them; shares `uniprot` so
+        symbol resolution has one resolver and one cache."""
+        return ChEMBLClient(self.external_client, _resolve_settings(), self.uniprot)
 
     # -------------------------------------------------------------------------
     # myvariant.info HGVS conversion

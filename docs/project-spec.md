@@ -1012,8 +1012,8 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 - **The import closure is pinned, because the sandbox image ships exactly it.** That image
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
-  is nine modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,executor,sql_safety,uniprot}`. `sdk/plots.py` ships too but sits outside
+  is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
+  `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py` ships too but sits outside
   the closure, resolved lazily so the servers never import matplotlib.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` now imports `Settings` under
