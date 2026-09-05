@@ -691,6 +691,8 @@ Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) ar
 
 **Shipping dark is now the settled outcome, not a pending one.** The paired A/B that was to decide whether `code` became the default — `genetics-results-suite-4h6.23` — was **descoped on 2026-08-30** by user decision: initial benchmarking was done manually and further benchmarking moves outside that epic. Its kill criterion was *"if the code arm does not beat the baseline on cost AND does not regress quality, keep it behind the profile rather than defaulting it on"*, whose conservative branch is the status quo — so the benchmark's absence **accepts** the documented default rather than leaving it open: **code execution stays opt-in; `null` stays the default profile.** The arms were never measured against each other, so nothing here says the code arm lost; the decision was not taken on numbers. No 4h6.23 figure exists, and no doc should be read as quoting one.
 
+That default is the *request's*: a null `tool_profile` still resolves to the full surface. What a deployment can move is what its users start on. `DEFAULT_TOOL_PROFILE` names a profile that `GET /chat/v1/llm-config/user/settings` serves as `chat_tool_profile` for any user who has not stored one (`id: 0`, never written), and the browser adopts it exactly as it adopts a stored choice — the Tools control shows it, an explicit choice overrides it and persists, and a request that omits the field is unchanged. It rides the settings endpoint rather than the request because the browser sends null for an explicit **All**, which a request-side default could not tell from an omitted field. A value that names no profile is logged once and not served: the browser would probe it, flag it as unrecognised, and the chat would degrade to general-only, a worse default than the full surface it replaces. Which deployments set it is the suite's business (`docs/environments.md` there).
+
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
 An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
@@ -2427,6 +2429,7 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
+| `DEFAULT_TOOL_PROFILE` | Profile served as `chat_tool_profile` to users who have not chosen one (see "Profile behavior"); empty = the browser's own default, the full surface (default empty) |
 
 These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which the MCP server, the chat API and the subagents all read, so a disabled tool is invisible on every surface rather than only unregistered on one.
 

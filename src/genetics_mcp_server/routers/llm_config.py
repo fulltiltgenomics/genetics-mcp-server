@@ -7,12 +7,14 @@ Provides endpoints for:
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from genetics_mcp_server.auth import admin_required, auth_required
+from genetics_mcp_server.config import get_settings
 from genetics_mcp_server.db import get_llm_config_db
 from genetics_mcp_server.db.llm_config_db import (
     InstructionSet,
@@ -21,8 +23,12 @@ from genetics_mcp_server.db.llm_config_db import (
     InstructionSetVersion,
 )
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
+from genetics_mcp_server.tools.definitions import TOOL_PROFILE_TOOLS, TOOL_PROFILES
 
 logger = logging.getLogger(__name__)
+
+# the user-settings key the browser reads its tool profile from (chatOptionsApi.ts)
+TOOL_PROFILE_KEY = "chat_tool_profile"
 
 router = APIRouter()
 
@@ -267,7 +273,7 @@ async def get_user_settings(user: str = Depends(auth_required)):
 
     db = get_llm_config_db()
     settings = db.get_user_settings(user)
-    return {
+    response = {
         key: UserSettingResponse(
             id=s.id,
             setting_key=s.setting_key,
@@ -277,6 +283,41 @@ async def get_user_settings(user: str = Depends(auth_required)):
         )
         for key, s in settings.items()
     }
+    if TOOL_PROFILE_KEY not in response:
+        default = _deployment_default_tool_profile()
+        if default:
+            response[TOOL_PROFILE_KEY] = UserSettingResponse(
+                id=0,
+                setting_key=TOOL_PROFILE_KEY,
+                setting_value=default,
+                changed_at=datetime.fromtimestamp(0, tz=timezone.utc).isoformat(),
+                comment="deployment default (DEFAULT_TOOL_PROFILE); not stored",
+            )
+    return response
+
+
+_warned_default_profiles: set[str] = set()
+
+
+def _deployment_default_tool_profile() -> str | None:
+    """DEFAULT_TOOL_PROFILE, or None when it is unset or names no profile.
+
+    An unknown name is dropped rather than served: the browser would probe it, show
+    "not recognised by the server", and the chat would degrade to general-only — a worse
+    default than the full surface it replaces. Logged once per distinct value.
+    """
+    value = get_settings().default_tool_profile
+    if not value:
+        return None
+    if value in TOOL_PROFILES or value in TOOL_PROFILE_TOOLS:
+        return value
+    if value not in _warned_default_profiles:
+        _warned_default_profiles.add(value)
+        logger.warning(
+            "DEFAULT_TOOL_PROFILE=%r names no tool profile (known: %s); serving no default",
+            value, sorted(set(TOOL_PROFILES) | set(TOOL_PROFILE_TOOLS)),
+        )
+    return None
 
 
 @router.get(

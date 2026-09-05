@@ -559,6 +559,29 @@ class TestUserSettingsEndpoints:
         resp = client_with_auth.get("/chat/v1/llm-config/user/settings")
         assert resp.status_code == 200
         assert "chat_verbosity" not in resp.json()
+        assert "chat_tool_profile" not in resp.json()
+
+    def test_deployment_default_profile_is_served_until_the_user_chooses(self, client_with_auth):
+        """DEFAULT_TOOL_PROFILE reaches the browser through the bulk GET, as if stored, so a
+        deployment can start its users on `code` without touching the chat request's null."""
+        with settings_env(DEFAULT_TOOL_PROFILE="code"):
+            data = client_with_auth.get("/chat/v1/llm-config/user/settings").json()
+            assert data["chat_tool_profile"]["setting_value"] == "code"
+            assert data["chat_tool_profile"]["id"] == 0
+
+            client_with_auth.put(
+                "/chat/v1/llm-config/user/settings/chat_tool_profile",
+                json={"setting_value": "all"},
+            )
+            data = client_with_auth.get("/chat/v1/llm-config/user/settings").json()
+            assert data["chat_tool_profile"]["setting_value"] == "all"
+            assert data["chat_tool_profile"]["id"] != 0
+
+    def test_unknown_deployment_default_profile_is_not_served(self, client_with_auth):
+        """An unknown name would degrade the chat to general-only, so it is dropped, not passed on."""
+        with settings_env(DEFAULT_TOOL_PROFILE="nosuchprofile"):
+            data = client_with_auth.get("/chat/v1/llm-config/user/settings").json()
+            assert "chat_tool_profile" not in data
 
     def test_a_later_write_wins(self, client_with_auth):
         for value in ("detailed", "brief"):

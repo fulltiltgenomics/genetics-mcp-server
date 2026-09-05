@@ -92,6 +92,15 @@ class Settings:
         ).lower() in ("1", "true", "yes")
     )
 
+    # the tool profile a user gets before choosing one. It is served through the user-settings
+    # endpoint rather than applied to the chat request, because the browser sends its choice
+    # explicitly on every turn and sends null for "All" — a request-side default could not tell
+    # that null from an omitted field, and would make "All" unselectable. Empty means the
+    # browser's own default, which is null, the full surface.
+    default_tool_profile: str = field(
+        default_factory=lambda: os.environ.get("DEFAULT_TOOL_PROFILE", "").strip()
+    )
+
     # web search
     tavily_api_key: str | None = field(
         default_factory=lambda: os.environ.get("TAVILY_API_KEY")
