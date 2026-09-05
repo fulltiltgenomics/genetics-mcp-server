@@ -13,7 +13,7 @@ from pydantic import Field
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
-    from genetics_mcp_server.tools.executor import ToolExecutor
+    from genetics_mcp_server.tools.orchestration import ServerToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +31,13 @@ logger = logging.getLogger(__name__)
 #     see the docstring on register_mcp_tools below — because there the identical
 #     rejection just moves earlier.
 #   - CLAMPED: `web_search.max_results`, `search_mgi.max_results`,
-#     `search_cbioportal.max_results`, `search_uniprot.size` never reject; an out-of-range
-#     value is silently coerced into range and the call still succeeds. These are
-#     advisory-only on this surface (they steer the model, nothing enforces them here
+#     `search_cbioportal.max_results`, `search_uniprot.size`,
+#     `get_drug_targets_for_gene.min_phase`, `get_drug_targets_for_gene.max_results`,
+#     `get_target_bioactivity.pchembl_min`, `get_target_bioactivity.max_results` never
+#     reject a numeric out-of-range value; it is silently coerced into range and the call
+#     still succeeds (a NON-numeric value is a different matter: the ChEMBL pair returns
+#     a `stage: input` failure rather than clamping, which no bound here can express).
+#     These are advisory-only on this surface (they steer the model, nothing enforces them here
 #     directly — the enforcement is downstream) and deliberately NOT mirrored onto the MCP
 #     surface, because rejecting there would break a live client that today sends an
 #     out-of-range value and gets a clamped, successful result back.
@@ -1218,28 +1222,107 @@ Do NOT use this to look up a protein you can already name; resolving a gene symb
         },
     },
     {
-        "name": "create_phewas_plot",
+        "name": "get_drug_targets_for_gene",
         "category": "general",
-        "description": "Create a PheWAS (Phenome-Wide Association Study) plot showing all phenotype associations for a variant. Returns a base64-encoded PNG image with phenotypes grouped by category on the X-axis and -log10(p-value) on the Y-axis.",
+        "description": """List the drugs and clinical candidates ChEMBL records as acting on a gene's protein target, with each drug's mechanism of action, action type (INHIBITOR, AGONIST, ANTAGONIST, ...), highest clinical phase reached, first approval year, withdrawal flag, ATC codes, and — only with `include_indications=True` — the indications they are developed for, at most 10 per drug with `n_indications` giving the true total.
+
+Use this before calling any gene a promising or novel drug target, and whenever the user asks about drugs, druggability, inhibitors, agonists, repurposing, or clinical phase for a gene. If approved drugs or clinical candidates already exist, say so and frame the finding as supporting a known mechanism rather than as a new opportunity.
+
+`max_phase` is ChEMBL's highest phase reached ANYWHERE, by any regulator, for any indication: 4 means approved somewhere in the world, NOT "FDA-approved" — never write "FDA-approved" on the strength of this field. 0 to 3 are preclinical and clinical stages — 0 is a phase ChEMBL records, distinct from None, which means no phase recorded: unknown rather than zero. `mechanism_max_phase` is the phase of that specific mechanism annotation when it differs from the molecule's.
+
+`query` is a gene, never a drug name: a gene symbol (preferred), a UniProt accession, or a `CHEMBL<number>` target id. A symbol or accession is resolved through UniProt, then to the human ChEMBL target sharing that accession; the SINGLE PROTEIN target is chosen where one exists. Check which target answered before quoting the result — `target_chembl_id`, `target_pref_name` and `target_type` name it, `other_targets` lists any others sharing the accession, and `resolution` carries the `accession`, `n_targets` and a `note`. A gene with no ChEMBL target is a normal result with `count` 0, not an error.
+
+Examples:
+- Does anything drug this gene: get_drug_targets_for_gene(query='PCSK9')
+- Approved drugs only, with what they treat: get_drug_targets_for_gene(query='IL6R', min_phase=4, include_indications=True)
+
+NEVER cite a ChEMBL id, max_phase, mechanism or indication from memory — they must come from a tool result in this conversation. Every successful result carries an `attribution` line; include it when citing ChEMBL content.
+
+For one named drug (its targets, ATC class and indications) use get_drug_profile. For how much medicinal chemistry exists against the target — potency measurements rather than drugs — use get_target_bioactivity.""",
         "parameters": {
-            "variant": {
+            "query": {
                 "type": "string",
-                "description": "Variant ID (chr:pos:ref:alt, e.g., '19:44908684:T:C')",
+                "description": "Gene symbol (preferred, e.g. 'PCSK9'), UniProt accession, or ChEMBL target id ('CHEMBL235'). Never an accession or ChEMBL id recalled from memory.",
                 "required": True,
             },
-            "resource": {
+            "min_phase": {
+                "type": "number",
+                "description": "Keep only drugs whose max_phase is at least this (0 keeps everything including unknown-phase rows, 4 keeps only drugs approved somewhere). Default 0.",
+                "default": 0,
+                # chembl.get_drug_targets_for_gene: floor = min(4.0, max(0.0, float(min_phase)))
+                "minimum": 0,
+                "maximum": 4,
+            },
+            "include_indications": {
+                "type": "boolean",
+                "description": "Also fetch what each drug is developed or approved for (EFO/MeSH terms with a per-indication max phase), at most 10 per drug. Costs an extra request; default false.",
+                "default": False,
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum drug rows to return, highest phase first (default 25, max 100). `n_matching` reports how many passed the phase filter before this cap.",
+                "default": 25,
+                # chembl.get_drug_targets_for_gene: result_cap = max(1, min(int(max_results), 100))
+                "minimum": 1,
+                "maximum": 100,
+            },
+        },
+    },
+    {
+        "name": "get_drug_profile",
+        "category": "general",
+        "description": """Get what ChEMBL holds about one drug or compound: its preferred name and ChEMBL id, highest clinical phase, first approval year, withdrawal flag, ATC classification, the targets it acts on with mechanism of action and action type, and the indications it is developed or approved for (EFO and MeSH terms, each with its own max phase), at most 50 of them with `n_indications` giving the true total.
+
+Use this when the user names a drug — "what does metformin target?", "what is CHEMBL1431 approved for?", "is this compound withdrawn?".
+
+`max_phase` is the highest phase reached ANYWHERE, by any regulator, for any indication: 4 means approved somewhere in the world, NOT "FDA-approved". None means ChEMBL records no phase — unknown, not zero.
+
+`query` is a drug, never a gene symbol: a drug name, synonym or trade name, or a `CHEMBL<number>` molecule id. Check which molecule answered before quoting the result: `resolution.kind` says how the name matched (`chembl_id`, `pref_name` or `synonym`), `drug.molecule_chembl_id` says which molecule was chosen, `resolution.n_candidates` how many matched, and `resolution.other_candidates` lists the rest. A name with no ChEMBL molecule returns `drug` None with a note, not an error.
+
+NEVER cite a ChEMBL id, max_phase, mechanism or indication from memory — they must come from a tool result in this conversation. Every successful result carries an `attribution` line; include it when citing ChEMBL content.
+
+Start from a gene rather than a drug — "what drugs hit this gene?" — with get_drug_targets_for_gene. For the potency measurements recorded against a target, use get_target_bioactivity.""",
+        "parameters": {
+            "query": {
                 "type": "string",
-                "description": "Data resource: 'finngen', 'ukbb', or omit for all sources",
+                "description": "Drug name, synonym or trade name (e.g. 'metformin', 'evolocumab'), or a ChEMBL molecule id ('CHEMBL1431'). Never a ChEMBL id recalled from memory.",
+                "required": True,
             },
-            "significance_threshold": {
-                "type": "number",
-                "description": "Show significance line at this -log10(p) value (default 7.3, genome-wide significance)",
-                "default": 7.3,
+        },
+    },
+    {
+        "name": "get_target_bioactivity",
+        "category": "general",
+        "description": """Summarise the medicinal chemistry recorded against a gene's protein target: how many potency measurements exist at or above a pChEMBL threshold, how many distinct compounds they cover, the breakdown by assay type (IC50, Ki, EC50, ...), and the most potent compounds with their best pChEMBL value and clinical phase.
+
+Use this for "how tractable / how well explored is this target?" — whether a chemical series exists at all, and how potent the best compounds are. pChEMBL is -log10 of the molar activity value, so 6 is 1 µM, 7 is 100 nM, 9 is 1 nM; 6 is the usual "active" cut-off.
+
+This is a count of assay measurements, not evidence of clinical use. A target with thousands of activities may have no drug in humans, and a drugged target may have few measurements. For drugs and clinical candidates, and their phases, call get_drug_targets_for_gene; for one named drug, call get_drug_profile.
+
+`query` is a gene, never a drug name: a gene symbol (preferred), a UniProt accession, or a `CHEMBL<number>` target id, resolved the same way as get_drug_targets_for_gene. Check which target answered before quoting the result — `target_chembl_id`, `target_pref_name` and `target_type` name it, `other_targets` lists any others sharing the accession, and `resolution` carries the `accession`, `n_targets` and a `note`. The activity walk is capped, so read `truncated` and `total_count`: when `truncated` is true, `n_activities`, `n_distinct_molecules` and `by_standard_type` count only the rows read, while `total_count` stays ChEMBL's count for the whole filter, so you can say how much was left behind.
+
+NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they must come from a tool result in this conversation. Every successful result carries an `attribution` line; include it when citing ChEMBL content.""",
+        "parameters": {
+            "query": {
+                "type": "string",
+                "description": "Gene symbol (preferred, e.g. 'PPARG'), UniProt accession, or ChEMBL target id ('CHEMBL235'). Never an accession or ChEMBL id recalled from memory.",
+                "required": True,
             },
-            "min_mlog10p": {
+            "pchembl_min": {
                 "type": "number",
-                "description": "Only show associations with -log10(p) above this value (default 2.0)",
-                "default": 2.0,
+                "description": "Minimum pChEMBL value to count (default 6.0, i.e. 1 µM). Raise to 7 or 8 to look only at potent compounds.",
+                "default": 6.0,
+                # chembl.get_target_bioactivity: threshold = min(14.0, max(0.0, float(pchembl_min)))
+                "minimum": 0,
+                "maximum": 14,
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum top compounds to return, best pChEMBL first (default 25, max 100). The counts and the assay-type breakdown cover every activity read, not just these.",
+                "default": 25,
+                # chembl.get_target_bioactivity: result_cap = max(1, min(int(max_results), 100))
+                "minimum": 1,
+                "maximum": 100,
             },
         },
     },
@@ -1630,7 +1713,7 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "module": {
                 "type": "string",
                 "description": "SDK module to describe. Omit for the index.",
-                "enum": ["genetics", "client", "errors"],
+                "enum": ["genetics", "client", "errors", "plots"],
             },
         },
     },
@@ -1658,6 +1741,12 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             "markdown image placeholder for it. Any OTHER artifact can be read back with "
             "read_artifact by name, for about 5 minutes after the run; printing what you need "
             "is still cheaper than reading a file back, so print anything small.\n\n"
+            "Standard figures are already written: `genetics.plots` has the conventional ones "
+            "— a locuszoom and an upset among them — so a request for one is a call, not a "
+            "plot to compose from scratch. list_capabilities(module=\"plots\") lists what is "
+            "there. Every "
+            "figure is styled by the sandbox itself; a script neither needs nor should add a "
+            "style, and one that sets its own is overriding a deliberate default.\n\n"
             "Each run is independent: no variables, files or imports survive from one call to "
             "the next, so a follow-up script must redo the work it needs."
         ),
@@ -2012,7 +2101,7 @@ def get_anthropic_tools(
 
 def register_mcp_tools(
     mcp: "FastMCP",
-    executor: "ToolExecutor",
+    executor: "ServerToolExecutor",
     disabled_tools: set[str] | None = None,
 ) -> None:
     """
@@ -2020,7 +2109,7 @@ def register_mcp_tools(
 
     Args:
         mcp: FastMCP server instance
-        executor: ToolExecutor instance for making API calls
+        executor: ServerToolExecutor instance for making API calls
         disabled_tools: Optional set of tool names to skip registration.
 
     BOUNDS ON THIS SURFACE ARE NOT THE SAME DECISION AS ON THE ANTHROPIC ONE
@@ -2036,7 +2125,9 @@ def register_mcp_tools(
     runs, surfacing as FastMCP's own `ToolError`/`isError` response instead. A client
     branching on `result["success"]` sees a different envelope for the same rejection.
     The CLAMPED parameters — `web_search.max_results`, `search_mgi.max_results`,
-    `search_cbioportal.max_results`, `search_uniprot.size` — are deliberately left bare:
+    `search_cbioportal.max_results`, `search_uniprot.size`,
+    `get_drug_targets_for_gene.min_phase` / `.max_results` and
+    `get_target_bioactivity.pchembl_min` / `.max_results` — are deliberately left bare:
     the server accepts an over-large value today and silently returns the capped count, so
     declaring the cap here would turn a working MCP call into a validation error. Their
     bounds are declared only in `parameters`, where they steer the model without rejecting.
@@ -2517,17 +2608,37 @@ def register_mcp_tools(
                 query, keyword, organism_id, reviewed_only, fields, size, count_only
             )
 
-    @mcp.tool()
-    async def create_phewas_plot(
-        variant: str,
-        resource: str | None = None,
-        significance_threshold: float = 7.3,
-        min_mlog10p: float = 2.0,
-    ) -> dict:
-        """Create a PheWAS plot showing phenotype associations for a variant."""
-        return await executor.create_phewas_plot(
-            variant, resource, significance_threshold, min_mlog10p
-        )
+    if "get_drug_targets_for_gene" not in _disabled:
+
+        @mcp.tool()
+        async def get_drug_targets_for_gene(
+            query: str,
+            min_phase: float = 0,
+            include_indications: bool = False,
+            max_results: int = 25,
+        ) -> dict:
+            """List the drugs and clinical candidates ChEMBL records against a gene's target, with mechanism, action type and highest clinical phase."""
+            return await executor.get_drug_targets_for_gene(
+                query, min_phase, include_indications, max_results
+            )
+
+    if "get_drug_profile" not in _disabled:
+
+        @mcp.tool()
+        async def get_drug_profile(query: str) -> dict:
+            """Get ChEMBL's profile for one drug: highest clinical phase, approval and withdrawal, ATC class, targets and indications."""
+            return await executor.get_drug_profile(query)
+
+    if "get_target_bioactivity" not in _disabled:
+
+        @mcp.tool()
+        async def get_target_bioactivity(
+            query: str,
+            pchembl_min: float = 6.0,
+            max_results: int = 25,
+        ) -> dict:
+            """Summarise ChEMBL potency measurements against a gene's target: activity counts, assay-type breakdown and the most potent compounds."""
+            return await executor.get_target_bioactivity(query, pchembl_min, max_results)
 
     @mcp.tool()
     async def get_ld_between_variants(
@@ -2633,7 +2744,7 @@ def register_mcp_tools(
 
         @mcp.tool()
         async def list_capabilities(module: str | None = None) -> dict:
-            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors') as signatures with docstrings. Omit module for the index."""
+            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors', 'plots') as signatures with docstrings. Omit module for the index."""
             return await executor.list_capabilities(module=module)
 
     # run_analysis has NO block here, deliberately, and the omission is the point.

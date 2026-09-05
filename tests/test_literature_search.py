@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from genetics_mcp_server.llm_service import LLMService
-from genetics_mcp_server.tools import ToolExecutor
+from genetics_mcp_server.tools import ServerToolExecutor
 from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS
 from genetics_mcp_server.tools.executor import _ResilientAsyncClient
 
@@ -62,9 +62,9 @@ EPMC_RESPONSE = {
 }
 
 
-def _executor_with_transport(handler) -> ToolExecutor:
+def _executor_with_transport(handler) -> ServerToolExecutor:
     """Build an executor whose external calls are served by `handler`."""
-    executor = ToolExecutor()
+    executor = ServerToolExecutor()
     executor.external_client = _ResilientAsyncClient(
         timeout=5.0, transport=httpx.MockTransport(handler)
     )

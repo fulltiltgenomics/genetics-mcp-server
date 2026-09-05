@@ -35,9 +35,13 @@ from genetics_mcp_server.mcp_proxy import (
     is_external_tool,
 )
 from genetics_mcp_server.subagent import SubagentService
-from genetics_mcp_server.tools import TOOL_PROFILE_TOOLS, ToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools import (
+    TOOL_PROFILE_TOOLS,
+    ServerToolExecutor,
+    get_anthropic_tools,
+)
 from genetics_mcp_server.tools.definitions import tool_category
-from genetics_mcp_server.tools.executor import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
+from genetics_mcp_server.tools.orchestration import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
 
@@ -633,7 +637,7 @@ class LLMService:
     def __init__(self):
         self.openai_client = None
         self.anthropic_client = None
-        self.executor: ToolExecutor | None = None
+        self.executor: ServerToolExecutor | None = None
         self.subagent_service: SubagentService | None = None
         self._initialize_clients()
 
@@ -664,7 +668,7 @@ class LLMService:
                 logger.error(f"Error initializing Anthropic client: {e}")
 
         # initialize tool executor
-        self.executor = ToolExecutor(
+        self.executor = ServerToolExecutor(
             api_base_url=settings.genetics_api_url,
             bigquery_api_url=settings.bigquery_api_url,
         )
@@ -1160,10 +1164,10 @@ class LLMService:
                 # `input_tokens` here is the whole context, NOT the billed uncached input
                 # — it is what the browser's context meter renders against context_window,
                 # so its meaning is fixed. `cache_read` and `cache_create` are the two
-                # cached components of it, reported separately because they differ by more
-                # than 12x in price: billed uncached input is
-                # `input_tokens - cache_read - cache_create`, which is exactly the
-                # per-iteration increment of `total_input_tokens`. A consumer with no
+                # cached components of it, reported separately because a cache write is
+                # priced far above a cache read (`_PRICING` in cost.py): billed uncached
+                # input is `input_tokens - cache_read - cache_create`, which is exactly
+                # the per-iteration increment of `total_input_tokens`. A consumer with no
                 # database row (secret chat writes none) needs all three to price a turn.
                 #
                 # The two timing fields are deliberately named for their epoch, because

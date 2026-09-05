@@ -16,6 +16,7 @@ Classify each into exactly ONE primary topic category from this list:
 - variant_list_analysis: Submitting a list of variants for batch analysis
 - clinical_genetics: Clinical interpretation, Mendelian disease, patient variant interpretation
 - bigquery_advanced: Complex analytical queries requiring SQL or BigQuery
+- drug_target: Whether a gene or protein is a drug target, druggability, existing drugs or compounds and their mechanism, phase or repurposing
 - general_genetics: General genetics questions not fitting other categories
 - off_topic: Not related to genetics at all
 

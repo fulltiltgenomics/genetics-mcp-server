@@ -201,7 +201,7 @@ class SandboxNotConfigured(SandboxError):
 
     A configuration fault, not a transport one: it is in this family so nothing in the
     request flow escapes ``except SandboxError``, but the executor resolves its transport
-    through one guard (`ToolExecutor._sandbox_or_operator_error`) that catches this by name
+    through one guard (`ServerToolExecutor._sandbox_or_operator_error`) that catches this by name
     and reports it non-retryable — a second ask cannot supply a missing address.
     """
 

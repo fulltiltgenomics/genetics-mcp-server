@@ -33,7 +33,7 @@ GATEWAY_MARKER_HEADER = "X-Gateway-Auth"
 # what a caller resolves to when it presents the marker and asserts NO identity
 # (`auth_required` case 3). It names a service, not a person, and every holder of
 # INTERNAL_API_SECRET resolves to this one string — mcp-server included. Anything that must
-# act for a real user has to reject it; `ToolExecutor.run_analysis` does, because the
+# act for a real user has to reject it; `ServerToolExecutor.run_analysis` does, because the
 # NetworkPolicy admits mcp-server to chat-backend and chat-backend is the pod admitted to
 # the sandbox (genetics-results-suite-4h6.27, genetics-results-suite-th2).
 SERVICE_IDENTITY = "mcp-tool"
@@ -115,7 +115,7 @@ def is_gateway_caller(request: Request) -> bool:
     this request was written by the proxy that had just verified an oauth2-proxy session for
     that address — not merely by *some* holder of INTERNAL_API_SECRET.
 
-    That distinction is what `ToolExecutor.run_analysis` needs and what `is_internal_caller`
+    That distinction is what `ServerToolExecutor.run_analysis` needs and what `is_internal_caller`
     cannot give it (genetics-results-suite-4h6.84): every marker holder can assert any
     allow-listed identity, so without this the sandbox's `sub`, artifact scope and audit
     trail rest on mcp-server *choosing* not to assert one.

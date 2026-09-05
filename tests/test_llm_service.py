@@ -482,8 +482,8 @@ class TestUsageChunk:
 
     A benchmark run is secret=true, which writes no chat_turn_metrics row, so the
     stream is the only place its cache split can come from. Cache reads and cache
-    creations differ by more than 12x in price, so folding them into one number makes
-    an exact cost underivable — they have to arrive as separate fields.
+    creations are priced far apart, so folding them into one number makes an exact cost
+    underivable — they have to arrive as separate fields.
     """
 
     def _patch_db(self, db):

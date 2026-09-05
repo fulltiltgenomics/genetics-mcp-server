@@ -35,6 +35,8 @@ All environment variables are optional but needed for each type of functionality
 | `UNIPROT_API_URL` | UniProt REST API base URL (protein annotations, chat only) | `https://rest.uniprot.org` |
 | `EBI_PROTEINS_API_URL` | EBI Proteins API base URL (protein-to-genome mapping, chat only) | `https://www.ebi.ac.uk/proteins/api` |
 | `UNIPROT_CACHE_TTL` | TTL in seconds for cached UniProt responses (`0` disables) | `86400` |
+| `CHEMBL_API_URL` | ChEMBL REST API base URL (drug/target mechanisms, indications, bioactivity, chat only) | `https://www.ebi.ac.uk/chembl/api/data` |
+| `CHEMBL_CACHE_TTL` | TTL in seconds for cached ChEMBL responses (`0` disables) | `86400` |
 
 
 ### MCP Server

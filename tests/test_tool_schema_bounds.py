@@ -34,6 +34,10 @@ EXPECTED_BOUNDS = [
     ("search_mgi", "max_results", {"minimum": 1, "maximum": 100}),
     ("search_cbioportal", "max_results", {"minimum": 1, "maximum": 100}),
     ("search_uniprot", "size", {"maximum": 500}),
+    ("get_drug_targets_for_gene", "min_phase", {"minimum": 0, "maximum": 4}),
+    ("get_drug_targets_for_gene", "max_results", {"minimum": 1, "maximum": 100}),
+    ("get_target_bioactivity", "pchembl_min", {"minimum": 0, "maximum": 14}),
+    ("get_target_bioactivity", "max_results", {"minimum": 1, "maximum": 100}),
 ]
 
 
@@ -185,6 +189,10 @@ class TestTheMcpSurface:
             ("search_mgi", "max_results"),
             ("search_cbioportal", "max_results"),
             ("search_uniprot", "size"),
+            ("get_drug_targets_for_gene", "min_phase"),
+            ("get_drug_targets_for_gene", "max_results"),
+            ("get_target_bioactivity", "pchembl_min"),
+            ("get_target_bioactivity", "max_results"),
         ):
             prop = schemas[tool]["properties"][param]
             assert "maximum" not in prop, f"{tool}.{param}"

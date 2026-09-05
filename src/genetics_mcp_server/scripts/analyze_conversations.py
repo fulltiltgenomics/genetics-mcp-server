@@ -600,6 +600,15 @@ TOPIC_KEYWORDS = {
     "bigquery_advanced": [
         r"\bbigquery\b", r"\bsql\b", r"\bquery\b.*\btable",
     ],
+    # bare "medication" and "drug data" are deliberately absent: in this corpus they name
+    # the drug-purchase endpoints and a GWAS category far more often than a drug question
+    "drug_target": [
+        r"\bdrug\s+targets?\b", r"\bdruggab", r"\binhibitors?\b", r"\bagonists?\b",
+        r"\bantagonists?\b", r"\brepurpos", r"\bcompounds?\b", r"\bsmall.?molecule",
+        r"\btherapeutic\s+target", r"\bclinical\s+(?:trial|candidate|phase)",
+        r"\bapproved\s+drug", r"\bmechanism\s+of\s+action\b", r"\bchembl\b",
+        r"\bpharmacolog",
+    ],
 }
 
 

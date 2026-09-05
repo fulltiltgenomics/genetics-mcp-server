@@ -210,9 +210,10 @@ class TestMCPDisabledTools:
         (MouseMine + result truncation) not present in plain MCP clients.
 
         The UniProt tools (get_protein_annotations, map_protein_variants,
-        search_uniprot) are chat-backend only by explicit requirement: they
-        must stay defined for the chat backend but never reach standalone
-        MCP clients.
+        search_uniprot) and the ChEMBL tools (get_drug_targets_for_gene,
+        get_drug_profile, get_target_bioactivity) are chat-backend only by
+        explicit requirement: they must stay defined for the chat backend but
+        never reach standalone MCP clients.
 
         read_artifact is there for a stronger reason: code execution must not
         be reachable via MCP (genetics-results-suite-4h6), and membership of
@@ -234,11 +235,37 @@ class TestMCPDisabledTools:
         assert "list_capabilities" not in mcp_server._mcp_disabled
 
         names = {t["name"] for t in TOOL_DEFINITIONS}
-        for tool_name in ("get_protein_annotations", "map_protein_variants", "search_uniprot"):
+        for tool_name in (
+            "get_protein_annotations",
+            "map_protein_variants",
+            "search_uniprot",
+            "get_drug_targets_for_gene",
+            "get_drug_profile",
+            "get_target_bioactivity",
+        ):
             assert tool_name in names, f"Expected tool '{tool_name}' not found in TOOL_DEFINITIONS"
             assert tool_name in mcp_server._mcp_disabled, (
                 f"'{tool_name}' is chat-backend only and must stay in _mcp_disabled"
             )
+
+    def test_chembl_tools_excluded_from_mcp_when_disabled(self):
+        # mirror pattern for the chat-backend-only ChEMBL tools
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        chembl_tools = {
+            "get_drug_targets_for_gene",
+            "get_drug_profile",
+            "get_target_bioactivity",
+        }
+
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools=chembl_tools)
+
+        registered = self._registered_names(mcp)
+        assert not (chembl_tools & registered)
 
     def test_uniprot_tools_excluded_from_mcp_when_disabled(self):
         # mirror pattern for the chat-backend-only UniProt tools

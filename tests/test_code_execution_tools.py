@@ -18,8 +18,9 @@ from fastapi import Request
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.llm_service import _script_result_payload, _truncation_notice
 from genetics_mcp_server.sandbox_client import ArtifactResult
-from genetics_mcp_server.tools import ToolExecutor
+from genetics_mcp_server.tools import ServerToolExecutor
 from genetics_mcp_server.tools import executor as executor_module
+from genetics_mcp_server.tools import orchestration as orchestration_module
 from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS, get_anthropic_tools
 
 PNG_HEADER = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
@@ -27,15 +28,15 @@ PNG_HEADER = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
 
 @pytest.fixture
 def executor():
-    return ToolExecutor()
+    return ServerToolExecutor()
 
 
 @pytest.fixture(autouse=True)
 def _clean_manifest_registry():
     """The (sub, sid) -> execution map is process-wide state; no test may see another's rows."""
-    executor_module._ARTIFACT_MANIFESTS.clear()
+    orchestration_module._ARTIFACT_MANIFESTS.clear()
     yield
-    executor_module._ARTIFACT_MANIFESTS.clear()
+    orchestration_module._ARTIFACT_MANIFESTS.clear()
 
 
 class TestToolDefinitions:
@@ -66,14 +67,14 @@ class TestToolDefinitions:
         assert tools["read_artifact"]["input_schema"]["required"] == ["name"]
         capabilities = tools["list_capabilities"]["input_schema"]
         assert capabilities["required"] == []
-        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors"]
+        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors", "plots"]
 
 
 class TestListCapabilities:
     async def test_index_lists_every_module(self, executor):
         result = await executor.list_capabilities()
         assert result["success"] is True
-        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors"]
+        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors", "plots"]
         assert all(m["summary"] for m in result["modules"])
 
     async def test_index_covers_the_whole_sdk_export_list(self, executor):
@@ -115,7 +116,7 @@ class TestListCapabilities:
 
     async def test_discloses_no_credentials(self, executor, monkeypatch):
         monkeypatch.setenv("INTERNAL_API_SECRET", "super-secret-value")
-        for module in (None, "genetics", "client", "errors"):
+        for module in (None, "genetics", "client", "errors", "plots"):
             result = await executor.list_capabilities(module=module)
             assert "super-secret-value" not in str(result)
 
@@ -145,14 +146,14 @@ class TestListCapabilities:
             "results-api",
             "genetics-results-suite-6uk",
         )
-        for module in (None, "genetics", "client", "errors"):
+        for module in (None, "genetics", "client", "errors", "plots"):
             result = await executor.list_capabilities(module=module)
             assert "doc" not in result
             rendered = str(result)
             for token in forbidden:
                 assert token not in rendered, f"{token!r} leaked for module {module!r}"
 
-    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors"])
+    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors", "plots"])
     async def test_every_response_says_how_to_import_the_sdk(self, executor, module):
         """genetics-results-suite-706: the catalogue is the only reachable place that can.
 
@@ -164,6 +165,26 @@ class TestListCapabilities:
         """
         result = await executor.list_capabilities(module=module)
         assert "import genetics" in result["usage"]
+
+    @pytest.mark.parametrize("module", ["genetics", "client", "errors", "plots"])
+    async def test_every_module_response_shows_the_call_path_not_only_the_import(
+        self, executor, module
+    ):
+        """The import line alone reads as `genetics.<name>(...)` for every module, which is
+        right for one of the four. Measured: a session read `def locuszoom(...)` out of
+        module="plots", wrote `genetics.locuszoom(...)`, got an AttributeError and spent two
+        further executions finding `genetics.plots`."""
+        from genetics_mcp_server.tools.executor import _SDK_CALL_PREFIXES, _sdk_members
+
+        result = await executor.list_capabilities(module=module)
+        first = _sdk_members(module)[0][0]
+        assert f"{_SDK_CALL_PREFIXES[module]}{first}" in result["usage"]
+        # the example must name something the module really exports
+        assert first in result["signatures"]
+
+    async def test_the_plots_call_path_is_the_one_a_script_can_actually_write(self, executor):
+        result = await executor.list_capabilities(module="plots")
+        assert "genetics.plots.locuszoom" in result["usage"]
 
     async def test_index_summaries_do_not_come_from_module_docstrings(self, executor):
         from genetics_mcp_server import sdk
@@ -222,7 +243,7 @@ USER_B = "b@finngen.fi"
 
 
 def _record(session_id, execution_id, *names, user=USER_A):
-    executor_module._ARTIFACT_MANIFESTS.record(user, session_id, execution_id, names)
+    orchestration_module._ARTIFACT_MANIFESTS.record(user, session_id, execution_id, names)
 
 
 class TestReadArtifactProxiesOverHTTP:
@@ -256,7 +277,7 @@ class TestReadArtifactProxiesOverHTTP:
         by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
         params = by_name["read_artifact"]["parameters"]
         assert set(params) == {"name"}
-        signature = inspect.signature(ToolExecutor.read_artifact)
+        signature = inspect.signature(ServerToolExecutor.read_artifact)
         assert signature.parameters["session_id"].kind is inspect.Parameter.KEYWORD_ONLY
         assert signature.parameters["user"].kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -369,7 +390,7 @@ class TestReadArtifactSessionScoping:
     async def test_a_record_with_no_user_is_not_stored_at_all(self):
         """The write half fails closed too, so no row can sit under a user-less key."""
         _record("conv-9", EXEC_A, "hits.tsv", user=None)
-        assert executor_module._ARTIFACT_MANIFESTS._sessions == {}
+        assert orchestration_module._ARTIFACT_MANIFESTS._sessions == {}
 
     async def test_run_analysis_is_what_records_the_mapping(self, executor):
         body = _result_body(
@@ -472,7 +493,7 @@ class TestReadArtifactIsScopedToTheAuthenticatedUser:
 
     def test_the_manifest_key_carries_a_user_term(self):
         """A guard on the shape itself: a future refactor back to a bare sid must fail here."""
-        registry = executor_module._ArtifactManifests()
+        registry = orchestration_module._ArtifactManifests()
         registry.record(USER_A, "conv-9", EXEC_A, ["hits.tsv"])
         assert list(registry._sessions) == [(USER_A, "conv-9")]
         assert registry.resolve(USER_B, "conv-9", "hits.tsv") is None
@@ -557,7 +578,7 @@ class TestReadArtifactRequiresTheGatewaySecret:
         """A future caller that forgets to plumb the flag loses reads rather than inheriting
         trust, and the model cannot supply it: the declared schema is still one parameter.
         """
-        signature = inspect.signature(ToolExecutor.read_artifact)
+        signature = inspect.signature(ServerToolExecutor.read_artifact)
         parameter = signature.parameters["gateway_asserted"]
         assert parameter.default is False
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -650,7 +671,7 @@ class TestReadArtifactFailsClosedOnAMalformedIdentity:
         assert result["error_type"] == "ArtifactNotFound"
 
     def test_the_store_itself_stores_nothing_for_one(self):
-        registry = executor_module._ArtifactManifests()
+        registry = orchestration_module._ArtifactManifests()
         registry.record(["a@finngen.fi"], "conv-9", EXEC_A, ["hits.tsv"])
         assert registry._sessions == {}
         assert registry.resolve(["a@finngen.fi"], "conv-9", "hits.tsv") is None
@@ -660,14 +681,14 @@ class TestReadArtifactLifetime:
     """The map must not outlive what it points at (RETENTION_S in sandbox/supervisor.py)."""
 
     def test_the_ttl_matches_the_supervisors_retention(self):
-        assert executor_module.ARTIFACT_RETENTION_S == 300
-        assert executor_module._ArtifactManifests()._ttl_s == 300
+        assert orchestration_module.ARTIFACT_RETENTION_S == 300
+        assert orchestration_module._ArtifactManifests()._ttl_s == 300
 
     async def test_a_row_expires_with_the_artifact_it_points_at(self, executor, monkeypatch):
-        registry = executor_module._ArtifactManifests(ttl_s=60)
-        monkeypatch.setattr(executor_module, "_ARTIFACT_MANIFESTS", registry)
+        registry = orchestration_module._ArtifactManifests(ttl_s=60)
+        monkeypatch.setattr(orchestration_module, "_ARTIFACT_MANIFESTS", registry)
         clock = {"now": 1000.0}
-        monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(orchestration_module.time, "monotonic", lambda: clock["now"])
 
         registry.record(USER_A, "conv-9", EXEC_A, ["hits.tsv"])
         executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
@@ -679,7 +700,7 @@ class TestReadArtifactLifetime:
         assert expired["error_type"] == "ArtifactNotFound"
 
     def test_the_map_is_bounded_in_both_dimensions(self):
-        registry = executor_module._ArtifactManifests()
+        registry = orchestration_module._ArtifactManifests()
         for i in range(registry._MAX_SESSIONS + 50):
             registry.record(USER_A, f"conv-{i}", EXEC_A, ["a.txt"])
         assert len(registry._sessions) == registry._MAX_SESSIONS
@@ -695,7 +716,7 @@ class TestReadArtifactLifetime:
         """A persisted row would outlive both the artifacts and the supervisor-memory key
         that decrypts them, promising reads that can only 404 or 409.
         """
-        source = inspect.getsource(executor_module._ArtifactManifests)
+        source = inspect.getsource(orchestration_module._ArtifactManifests)
         assert "sqlite" not in source.lower() and "open(" not in source
 
 
@@ -706,19 +727,19 @@ class TestReadArtifactCaps:
         """
         from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
 
-        assert ToolExecutor._MAX_ARTIFACT_BYTES == ARTIFACT_READ_MAX_BYTES == 512 * 1024
-        assert executor_module.ARTIFACT_READ_MAX_BYTES == ARTIFACT_READ_MAX_BYTES
+        assert ServerToolExecutor._MAX_ARTIFACT_BYTES == ARTIFACT_READ_MAX_BYTES == 512 * 1024
+        assert orchestration_module.ARTIFACT_READ_MAX_BYTES == ARTIFACT_READ_MAX_BYTES
 
     async def test_long_text_is_still_truncated_at_the_character_cap(self, executor):
         """Survives the move because it bounds the MODEL'S CONTEXT, which no transport cap
         does: 512 KiB of TSV is well over 100k tokens in one tool result.
         """
         _record("conv-9", EXEC_A, "big.txt")
-        payload = ("x" * (ToolExecutor._MAX_ARTIFACT_TEXT_CHARS + 500)).encode()
+        payload = ("x" * (ServerToolExecutor._MAX_ARTIFACT_TEXT_CHARS + 500)).encode()
         executor._sandbox = _ArtifactSandbox({"big.txt": _served("big.txt", payload)})
         result = await executor.read_artifact(name="big.txt", user=USER_A, session_id="conv-9")
         assert result["truncated"] is True
-        assert len(result["content"]) == ToolExecutor._MAX_ARTIFACT_TEXT_CHARS
+        assert len(result["content"]) == ServerToolExecutor._MAX_ARTIFACT_TEXT_CHARS
         assert result["size"] == len(payload)
 
     async def test_a_413_tells_the_model_to_write_a_smaller_file(self, executor):
@@ -733,7 +754,7 @@ class TestReadArtifactCaps:
         result = await executor.read_artifact(name="huge.bin", user=USER_A, session_id="conv-9")
         assert result["error_type"] == "ArtifactTooLarge"
         assert result["retryable"] is False
-        assert str(ToolExecutor._MAX_ARTIFACT_BYTES) in result["error"]
+        assert str(ServerToolExecutor._MAX_ARTIFACT_BYTES) in result["error"]
 
 
 class TestReadArtifactErrorMapping:
@@ -782,7 +803,7 @@ class TestReadArtifactErrorMapping:
         """
         from genetics_mcp_server.sandbox_client import ERROR_MALFORMED_RESPONSE
 
-        executor = ToolExecutor()
+        executor = ServerToolExecutor()
         result = executor._artifact_error(
             "hits.tsv",
             ArtifactResult(
@@ -801,7 +822,7 @@ class TestReadArtifactErrorMapping:
         """
         from genetics_mcp_server.sandbox_client import ERROR_BAD_EXECUTION_ID
 
-        executor = ToolExecutor()
+        executor = ServerToolExecutor()
         result = executor._artifact_error(
             "hits.tsv",
             ArtifactResult(ok=False, name="hits.tsv", error_type=ERROR_BAD_EXECUTION_ID),
@@ -1114,7 +1135,7 @@ class TestRunAnalysisFailsClosed:
         import ast
         import textwrap
 
-        tree = ast.parse(textwrap.dedent(inspect.getsource(ToolExecutor.run_analysis)))
+        tree = ast.parse(textwrap.dedent(inspect.getsource(ServerToolExecutor.run_analysis)))
         tries = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
         # genetics-results-suite-tbg added a second try: the guard around the deferred
         # imports of the modules the sandbox image prunes. It is separated by SHAPE rather
@@ -1164,7 +1185,7 @@ class TestRunAnalysisTurnBudget:
         worst_uncapped = (
             worst_single_attempt + sandbox_client.MAX_RETRY_WAIT_S + worst_single_attempt
         )
-        deadline = ToolExecutor._RUN_ANALYSIS_DEADLINE_S
+        deadline = ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S
 
         assert deadline >= worst_single_attempt, (
             "a cap below one attempt's worst case would abandon executions the supervisor "
@@ -1173,7 +1194,7 @@ class TestRunAnalysisTurnBudget:
         assert deadline < worst_uncapped, "the whole point is that the attempts do not sum"
 
     async def test_exceeding_it_is_not_reported_as_a_script_failure(self, executor, monkeypatch):
-        monkeypatch.setattr(ToolExecutor, "_RUN_ANALYSIS_DEADLINE_S", 0.05)
+        monkeypatch.setattr(ServerToolExecutor, "_RUN_ANALYSIS_DEADLINE_S", 0.05)
 
         class _Hangs:
             async def execute(self, **kwargs):
@@ -1503,7 +1524,7 @@ class TestRunAnalysisRequiresARealUser:
         import ast
         import textwrap
 
-        tree = ast.parse(textwrap.dedent(inspect.getsource(ToolExecutor.run_analysis)))
+        tree = ast.parse(textwrap.dedent(inspect.getsource(ServerToolExecutor.run_analysis)))
         body = tree.body[0].body
         guard_index = next(
             i

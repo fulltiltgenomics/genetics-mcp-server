@@ -33,7 +33,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 ## Technical implementation considerations
 
 - polars should be used to process tabular data from the genetics API
-- matplotlib is used for generating scientific visualizations (PheWAS plots, etc.)
+- matplotlib is used only by `sdk/plots.py`, the standard figures a sandboxed script draws; the servers never import it
 - Asynchronous code execution using async/await with httpx for HTTP calls
 - The MCP server uses FastMCP from the mcp library for tool registration
 - Tool definitions are shared between MCP server and LLM service via a common module
@@ -125,8 +125,13 @@ Four evidence types that must not be conflated, because a user question about "r
 
 | Tool | Description |
 |------|-------------|
-| `create_phewas_plot` | Create a PheWAS plot showing phenotype associations for a variant (returns base64 PNG) |
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
+
+Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
+locuszoom, a phewas and an upset — as functions a `run_analysis` script calls, and the
+figure comes back as an artifact. The upset is the general one: it takes any sets a script
+has in hand (members, a frame of membership columns, or intersection counts already
+tallied) and draws them one way, in greys, with every count outside the bar it counts.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -227,10 +232,85 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 
 **Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
 
+#### ChEMBL (native tools, chat-backend only)
+
+Three tools answer the druggability question — "is this gene a drug target, and for what?" —
+from ChEMBL's REST API instead of from memory. That question is the most common downstream
+follow-up to a GWAS or pQTL finding, and a survey of production chat history found no
+structured drug record behind any phase or approval claim in the drug sessions: clinical
+phases and approvals were asserted from parametric memory, not read from ChEMBL. The survey's
+numbers live in the epic's beads notes.
+
+| Tool | Description |
+|------|-------------|
+| `get_drug_targets_for_gene` | Gene → the drugs and clinical candidates ChEMBL records against its protein target, each with mechanism of action, action type, highest clinical phase, first approval year, withdrawal flag and ATC codes; `include_indications` adds what each is developed for. Chat-backend only — excluded from MCP server |
+| `get_drug_profile` | One named drug or `CHEMBL<number>` → its targets with mechanisms, its ATC classification, and its indications as EFO/MeSH terms each with their own max phase. Chat-backend only — excluded from MCP server |
+| `get_target_bioactivity` | Gene → the medicinal chemistry recorded against its target: how many potency measurements sit at or above a pChEMBL threshold, over how many compounds, broken down by assay type, with the most potent compounds. A tractability question, not a clinical one. Chat-backend only — excluded from MCP server |
+
+**Client layer** (`tools/chembl.py`): `ChEMBLClient` holds the transport, the resolution and
+the tool methods, the same split as `tools/uniprot.py`, so the executor carries only
+delegates. It reuses `tools/uniprot.py`'s `_TTLCache` class rather than a second
+implementation, but constructs its own cache instance.
+
+- **Gene resolution goes through UniProt first**, not through ChEMBL's own gene-symbol
+  synonyms. Shape cannot decide what an agent-supplied string is — `P2RY12`, `B4GAT1` and the
+  `H2AC*` histone families are valid HGNC symbols *and* valid accession syntax — and the
+  UniProt resolver already reports which reading it took and follows merged accessions. Using
+  ChEMBL's synonyms instead would make two differently curated naming authorities answer
+  "which protein is this". The accession then selects the ChEMBL target: a heteromer, a
+  protein family and a cell line can all share one accession, so the `SINGLE PROTEIN` target
+  wins where one exists and the rest are returned in `other_targets` rather than dropped. A
+  `CHEMBL<number>` target id skips resolution entirely. A gene with no ChEMBL target is a
+  normal result with `count` 0.
+- **`only=` projection on every resource, not just molecules.** ChEMBL's records are far
+  larger than the answer: three target records are 55 KB, 200 indications 76 KB, a single
+  molecule 6-8 KB. Every request except `release()`'s status.json call names the fields it
+  wants. `only=target_components` is the one place that is not enough — it projects the
+  column, not the objects inside it, so a
+  well-studied target still arrives with hundreds of PDBe xrefs, and everything but the
+  accession and the `GENE_SYMBOL` synonyms is dropped before the record is used.
+- **Bounded walks.** A filter that matches half of ChEMBL must bound round trips, not just
+  rows: paged joins stop after `_MAX_PAGES` pages of `_PAGE_LIMIT` rows, except the
+  indication batch, which pages at 1000 (`_ACTIVITY_PAGE_LIMIT`), and the target walk, which
+  passes no limit and takes ChEMBL's default page size. The activity walk is separate — it
+  is ordered by descending `pchembl_value` so a cap costs the weakest measurements rather
+  than an arbitrary slice, and it stops after `_ACTIVITY_MAX_PAGES` pages of 1000. When it
+  stops early the result sets `truncated`, and `n_activities`, `n_distinct_molecules` and
+  the assay-type breakdown count only the rows read, while `total_count` stays ChEMBL's count
+  for the whole filter.
+- **`max_phase` is annotated, never inferred.** ChEMBL's 0–4 is the highest phase reached
+  anywhere by any regulator for any indication, so 4 means approved somewhere, not
+  FDA-approved. `-1` and a missing value both become `None` — unknown, not preclinical —
+  because coercing them to 0 would state something about the drug rather than about the
+  annotation.
+- **Attribution is required and is not fabricated.** ChEMBL is CC BY-SA 3.0, so every
+  successful result carries an `attribution` line naming the release — the `chembl_db_version`
+  read verbatim from the API's own `status.json`, giving `ChEMBL ChEMBL_37 (CC BY-SA 3.0),
+  EMBL-EBI` — and an unversioned string when that read fails, because an attribution lookup
+  must never be what fails a tool call. Failure dicts carry no `attribution`: there is
+  nothing to credit.
+
+**Exposure decision**: chat-backend only, like the UniProt and MGI tools — the three names are
+in `_mcp_disabled` in `mcp_server.py`, so they are never registered on the standalone MCP
+server. Category is `general`, so they survive every profile split. `get_drug_targets_for_gene`
+and `get_drug_profile` are in the `literature_review` skill's `extra_tools`;
+`get_target_bioactivity` is not, since assay counts are not a literature question. The system
+prompt's `### Drug and Target Evidence (ChEMBL)` block routes to them, and the
+"Contextualizing Findings" rule that told the model to consider whether drugs already exist
+for a gene now names `get_drug_targets_for_gene` instead of leaving it to memory.
+
+`tools/chembl.py` is imported eagerly by `tools/executor.py`, so it is inside the SDK import
+closure and ships in the sandbox image. It is unreachable from `run_analysis` all the same:
+the sandbox's egress allow-list names db-api and results-api only, and nothing there serves
+`www.ebi.ac.uk`.
+
 ### Code execution tools
 
-Tool halves of the sandbox design (`genetics-results-suite-4h6`). The sandbox itself is
-not deployed, so `read_artifact` has nothing to reach in any running service — and
+Tool halves of the sandbox design (`genetics-results-suite-4h6`). **Whether a sandbox is
+running is a per-deployment fact and must be read off the cluster, not off this document** —
+`kubectl -n genetics get deploy sandbox`; one has been serving on daly-staging since
+2026-08-26. Where none is deployed `read_artifact` has nothing to reach in any running
+service — and
 **`run_analysis` is withheld entirely until `SANDBOX_ENABLED` is true**
 (`genetics-results-suite-4h6.56`). The flag is a deployment fact, not a preference: with
 no sandbox at `SANDBOX_URL` the transport fails as `SandboxUnavailable` with
@@ -258,7 +338,7 @@ because a withheld tool is a deployment fact and must not read as a passing outa
 | Tool | Description |
 |------|-------------|
 | `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
-| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`); omit the argument for an index of module names and their exports. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`). Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — and its members come from `sdk/plots.py`'s `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of the four. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
 | `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated **`(sub, session_id)`** pair (`genetics-results-suite-dh3` — `session_id` alone is client-supplied and authorizes nothing); another user's or another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
 **All three are category `orchestration`**, not `general`: they hand work to another
@@ -331,7 +411,7 @@ truncation survived the move: it bounds the model's context, which no transport 
 
 **The name is resolved server-side against the authenticated USER AND session, and nothing
 else is addressable.** `run_analysis` records each completed execution's manifest in
-`_ArtifactManifests` (`tools/executor.py`) under the key **`(sub, sid)`**;
+`_ArtifactManifests` (`tools/orchestration.py`) under the key **`(sub, sid)`**;
 `llm_service._execute_tool` injects that pair into `read_artifact` exactly as it injects the
 identity into `run_analysis`, stripping any same-named key the model emitted, and the declared
 schema still has exactly one parameter, `name`. **The user term is what makes the key an
@@ -447,7 +527,7 @@ markers for every turn predating the change; `_TOOL_USE_MARKER_RE` matches both 
 the client-written `[TOOLUSE:<base64>]` marker that replaced them, so neither shape reaches
 the model on replay.
 
-**The turn budget is this layer's, not the transport's** (`ToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
+**The turn budget is this layer's, not the transport's** (`ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S`,
 300 s, applied with `asyncio.wait_for`). `sandbox_client` bounds each *attempt* correctly
 and deliberately offers no total, because its per-attempt read deadline is derived from the
 supervisor's own worst-case hold time (120 s queued + `timeout_s` + 15 s margin). The
@@ -477,7 +557,7 @@ pins both the behaviour and — by parsing the handler's AST — the clause orde
 `_sandbox` is a `cached_property` whose constructor raises when `SANDBOX_URL` is unset, so
 "nothing is configured" would otherwise surface as a bare exception at any attribute access
 — and `read_artifact` touches it in no `try` of its own. Both entry points resolve through
-`ToolExecutor._sandbox_or_operator_error`, which returns the same `SandboxNotConfigured` /
+`ServerToolExecutor._sandbox_or_operator_error`, which returns the same `SandboxNotConfigured` /
 `retryable: False` shape either way, so a new caller fails in the house style without having
 to remember a handler and there is no clause ordering to get wrong.
 
@@ -582,7 +662,7 @@ Each tool has a `category` field in its definition:
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, create_phewas_plot, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
@@ -611,6 +691,8 @@ Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) ar
 
 **Shipping dark is now the settled outcome, not a pending one.** The paired A/B that was to decide whether `code` became the default — `genetics-results-suite-4h6.23` — was **descoped on 2026-08-30** by user decision: initial benchmarking was done manually and further benchmarking moves outside that epic. Its kill criterion was *"if the code arm does not beat the baseline on cost AND does not regress quality, keep it behind the profile rather than defaulting it on"*, whose conservative branch is the status quo — so the benchmark's absence **accepts** the documented default rather than leaving it open: **code execution stays opt-in; `null` stays the default profile.** The arms were never measured against each other, so nothing here says the code arm lost; the decision was not taken on numbers. No 4h6.23 figure exists, and no doc should be read as quoting one.
 
+That default is the *request's*: a null `tool_profile` still resolves to the full surface. What a deployment can move is what its users start on. `DEFAULT_TOOL_PROFILE` names a profile that `GET /chat/v1/llm-config/user/settings` serves as `chat_tool_profile` for any user who has not stored one (`id: 0`, never written), and the browser adopts it exactly as it adopts a stored choice — the Tools control shows it, an explicit choice overrides it and persists, and a request that omits the field is unchanged. It rides the settings endpoint rather than the request because the browser sends null for an explicit **All**, which a request-side default could not tell from an omitted field. A value that names no profile is logged once and not served: the browser would probe it, flag it as unrecognised, and the chat would degrade to general-only, a worse default than the full surface it replaces. Which deployments set it is the suite's business (`docs/environments.md` there).
+
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
 An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
@@ -620,7 +702,7 @@ API-category tools one at a time. It wraps 40 of the 44; the four `api`-category
 **not** wrap are `get_phenotype_report`, `get_credible_sets_stats`, `analyze_variant_list` and
 `get_myvariant_annotations`. The "Deliberately **not** in the SDK" section below gives the
 reasoning, but it is written across categories — its list also names `general`-category tools
-such as `create_phewas_plot`, which was never one of the 44 — so it is not a substitute for
+such as `search_uniprot`, which was never one of the 44 — so it is not a substitute for
 the four named here.
 
 The four are excluded deliberately, but not for one shared reason, and the axis that separates
@@ -695,6 +777,7 @@ winner.
 | `ld(variant[, other])` | `get_variants_in_ld`, `get_ld_between_variants` |
 | `search(query=[, kind=]\|rsids=)` | `search_phenotypes`, `search_genes`, `lookup_variants_by_rsid` |
 | `lookup_phenotype_names(codes)` | `lookup_phenotype_names` |
+| `phenotypes(codes=\|dataset=\|resource=)` | — no tool: a typed query over `phenotypes_v` (name, trait type, the source's own `category`, sample sizes), keyed on `trait_original`; what `plots.phewas` groups by |
 | `get_dataset_display_names()` | `get_dataset_display_names` |
 | `normalize_gene_symbols(symbols)` | `normalize_gene_symbols` |
 | `sql(query)` | `query_database` |
@@ -725,30 +808,37 @@ via the `X-Columns` response header results-api added for
 `genetics-results-suite-6uk` (see "Empty results keep their schema").
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
-cBioPortal, myvariant, UniProt), the presentation tools (`create_phewas_plot`,
-`analyze_variant_list`, `get_credible_sets_stats`) and `get_phenotype_report`. The first group is
+cBioPortal, myvariant, UniProt, ChEMBL), the presentation tools (`analyze_variant_list`,
+`get_credible_sets_stats`) and `get_phenotype_report`. The first group is
 not genetics-results data; the second is model-facing summarisation that a script writes for
 itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
 scores and tier flags are in no view a script can query, so a script cannot write the report for
 itself — it can only fetch the document results-api serves.
 
 **"Not in the SDK" does not mean "not reachable", and this list is not an enforcement boundary.**
-`GeneticsClient` keeps the full `ToolExecutor` on `._executor` — and reaching it needs no client
+`GeneticsClient` keeps a `ToolExecutor` on `._executor` — and reaching it needs no client
 at all: `tools/executor.py` is on `sandbox/prune_venv.py`'s `SDK_ALLOWLIST` (it ships because
 `sdk/client.py` imports `ToolExecutor` directly), so a sandboxed script can simply
 `from genetics_mcp_server.tools.executor import ToolExecutor` and construct its own. httpx ships
-too, as the SDK's own transport. The leading underscore is **curation, not enforcement**: it marks
+too, as the SDK's own transport. What `._executor` is **not** is the orchestration half —
+`run_analysis`, `read_artifact`, web and literature search — which is `ServerToolExecutor` in
+`tools/orchestration.py`, the class the servers construct and the SDK never imports, in any
+environment. That absence is a disclosure decision, not a control: the sandbox cannot run code
+needing `ddgs`, `sandbox_client`, `auth.core` and `sandbox_token`, none of which it has.
+The leading underscore is **curation, not enforcement**: it marks
 the executor as outside the curated surface so that a reader or a model does not treat it as a
-recommended entry point, and it should never be cited as a control. The containment boundary, **as
-specified**, is the sandbox's deny-by-default **network egress allow-list** (db-api and results-api
-only) in `genetics-results-suite` `docs/code-execution-security.md` — specified rather than live:
-the sandbox is not deployed, and that policy stays decoration until `genetics-results-suite-4h6.7`
-ships a Deployment carrying the labels it selects.
+recommended entry point, and it should never be cited as a control. The containment boundary is
+the sandbox's deny-by-default **network egress allow-list** (db-api and results-api only) in
+`genetics-results-suite` `docs/code-execution-security.md`. `k8s/deployments/sandbox.yaml` carries
+the labels that policy selects, so the policy binds wherever that Deployment is applied — on
+daly-staging it is, and the applied policy was verified byte-equivalent to the committed manifest
+on 2026-08-31. Where no sandbox is deployed the policy selects nothing, which is a fact about that
+deployment and not about the policy.
 
 Reachability therefore divides this list along a different axis than the one that put tools on
 it. The third-party tools **are** genuinely unreachable from a sandboxed script — but for the
 network reason, not the SDK one: no permitted egress target serves myvariant.info, Europe PMC,
-MGI, cBioPortal, UniProt or a web-search API (Perplexity/Tavily), so reaching
+MGI, cBioPortal, UniProt, ChEMBL or a web-search API (Perplexity/Tavily), so reaching
 `get_myvariant_annotations` through `._executor` still fails to connect. The presentation tools and `get_phenotype_report` are **reachable**: results-api is a
 permitted target and the sandbox credential is not scoped per route, so `._executor` or a
 hand-rolled httpx call gets them. For those, what the omission costs is the affordance and not
@@ -916,6 +1006,7 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   - **`_executor` calls are NOT audited.** `genetics.get_client()._executor.<method>()`
     returns the same data and emits nothing, and `tools/executor.py` ships in the sandbox
     image, so a script can build its own executor in one import (`genetics-results-suite-4h6.33`).
+    Every data-access method is on that class; only the orchestration half is elsewhere.
     The underscore is curation, not enforcement. Closing this means instrumenting
     `ToolExecutor` itself, which is a much larger change: every MCP tool call goes through
     those same methods, so it would need chat-backend's existing `Executing tool:` line
@@ -998,12 +1089,13 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
   is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,executor,phewas_categories,sql_safety,uniprot}`.
+  `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py` ships too but sits outside
+  the closure, resolved lazily so the servers never import matplotlib.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
-  environment variable of the suite — so `uniprot.py` now imports `Settings` under
+  environment variable of the suite — so `uniprot.py` and `chembl.py` import `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
   first use rather than in `__init__`, falling back to `_PrunedInstallSettings` (a frozen copy
-  of the four public-URL/TTL defaults, and an empty `internal_api_secret`, since a sandbox
+  of the six public-URL/TTL defaults, and an empty `internal_api_secret`, since a sandbox
   holds no secret) when `config.settings` is *itself* not installed — a `ModuleNotFoundError`
   naming anything else in its import chain is re-raised, so a broken install cannot degrade
   into the credential-less fallback, and taking the fallback logs one warning naming no
@@ -1019,12 +1111,16 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   never imports it. `4h6.70` then added `from pydantic import Field` to `definitions.py` for
   the `minimum`/`maximum`/`pattern` keywords, and the sandbox image — which pins numpy, scipy,
   polars, matplotlib and httpx and nothing else — could no longer `import
-  genetics_mcp_server.sdk`. Every `__all__` entry except `ToolExecutor` — that is the rule
-  `_LAZY_FROM_DEFINITIONS` encodes, seven names as of this writing — now resolves through a
-  module `__getattr__`, so `from genetics_mcp_server.tools import TOOL_DEFINITIONS` and
-  `tools.get_anthropic_tools` behave exactly as before for chat_api, llm_service, subagent and
-  routers/llm_config, while the SDK path never imports the module. Dropping it also stops the
-  sandbox shipping the full catalogue of every tool the suite exposes.
+  genetics_mcp_server.sdk`. The `definitions` entries of `__all__` — the set
+  `_LAZY_FROM_DEFINITIONS` names — now resolve through a module `__getattr__`, so
+  `from genetics_mcp_server.tools import TOOL_DEFINITIONS` and `tools.get_anthropic_tools`
+  behave exactly as before for chat_api, llm_service, subagent and routers/llm_config, while
+  the SDK path never imports the module. Dropping it also stops the sandbox shipping the full
+  catalogue of every tool the suite exposes. `ServerToolExecutor` resolves through the same
+  hook, from `tools/orchestration.py`, for the same reason. Both sets are listed explicitly
+  rather than derived by subtracting from `__all__`: that subtraction routed every name it did
+  not recognise to `definitions`, so a name from a third submodule would have raised an
+  `AttributeError` naming the wrong file.
 - **The endpoint reads must stay behind the settings resolution.** `config/settings.py` calls
   `load_dotenv()` at module scope, so the `GENETICS_API_URL` / `GENETICS_PUBLIC_API_URL` /
   `BIGQUERY_API_URL` reads only see a `.env` file once that module has been imported. They go
@@ -1033,15 +1129,42 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   service) on the hard-coded default URL while still attaching a `.env`-supplied secret to it,
   and would silently disable the BigQuery tools. `test_sdk_import_closure.py` pins this.
 - `test_sdk_import_closure.py` measures the closure in a fresh interpreter and asserts
-  equality, and asserts the SDK imports when **every** distribution outside the transitive
-  requirement closure of the sandbox's five pinned ones is unavailable — a `sys.meta_path`
-  finder that raises `ModuleNotFoundError` for their top-level modules. That generalises what
-  was a single `dotenv` stub: a per-offender test only ever covers the offender already fixed,
-  which is why `l41`'s guard did not catch `6bv`'s pydantic. Every probe forces `src/`
-  onto the subprocess `PYTHONPATH` and asserts `genetics_mcp_server.__file__` resolves under
-  it, so an editable install pointing at another checkout cannot make it measure the wrong
-  tree. Widening the closure means widening `SDK_ALLOWLIST` in
-  `genetics-results-suite/sandbox/prune_venv.py` in the same change, or the image build fails.
+  equality, and then asserts the third-party surface twice over — once at runtime and once
+  statically, because neither shape can see the other. At runtime a `sys.meta_path` finder
+  makes every module outside the image's surface unavailable **to a shipped file**, and the SDK
+  still has to import. Statically, `ast` reads every file the closure ships and refuses any
+  import of a top-level name outside the standard library, the sandbox's five pins and the
+  package itself, **at any nesting depth** — so a function-level import, one under
+  `try`/`except ImportError`, one under `if TYPE_CHECKING` and one inside a module
+  `__getattr__` are all caught. The static half is the one that matters here: deferring an
+  import is this codebase's house style for adding capability, and a deferred import runs at
+  call time, so `import genetics_mcp_server.sdk` proves nothing about it and the
+  `ModuleNotFoundError` lands inside a container with no shell and no package manager instead.
+  Together they generalise what was a single `dotenv` stub: a per-offender test only ever
+  covers the offender already fixed, which is why `l41`'s guard did not catch `6bv`'s pydantic.
+- **The guard's verdict is a property of the commit, not of the developer's venv.** The allowed
+  module names are written down beside the pins, and the finder allows by that list rather than
+  blocking "every other installed distribution". Reading installed metadata instead did three
+  things at once: a pin absent locally (scipy) dropped silently out of the allowed set, so its
+  dependencies were over-blocked on some machines and not others; `.pth`-installed modules such
+  as `_virtualenv` belonged to no distribution and were therefore never blocked at all; and
+  every environment marker that did not mention `extra` was ignored, which admitted
+  `exceptiongroup` — a requirement `anyio` declares only below Python 3.11 — into a set
+  describing a 3.11 image, the one direction in which the guard was ever laxer than the image.
+  Nothing walks requirement metadata now, so there are no markers left to evaluate. The finder
+  is proved live by driving it from a synthetic frame carrying a shipped file's name, rather
+  than by asserting some dev-only distribution is blocked: that older self-check coupled a
+  security guard to `dotenv` and `pydantic` being installed, and so failed in a venv built from
+  the sandbox's own requirements — the environment closest to the thing under test. What is
+  left to the image build is the standard library's own version boundary: names are matched
+  against this interpreter's `sys.stdlib_module_names`, and
+  `genetics-results-suite/sandbox/build-checks.py` runs the same static scan inside the
+  builder, on 3.11, against the modules pip actually resolved.
+- Every probe forces `src/` onto the subprocess `PYTHONPATH` and asserts
+  `genetics_mcp_server.__file__` resolves under it, so an editable install pointing at another
+  checkout cannot make it measure the wrong tree. Widening the closure means widening
+  `SDK_ALLOWLIST` in `genetics-results-suite/sandbox/prune_venv.py` in the same change, or the
+  image build fails.
 
 ### SQL safety at the SDK boundary
 
@@ -1625,15 +1748,17 @@ src/genetics_mcp_server/
 ├── tools/
 │   ├── __init__.py
 │   ├── definitions.py   # tool definitions (shared)
-│   ├── executor.py      # tool execution via HTTP
+│   ├── executor.py      # tool execution via HTTP; the half the sandbox image ships
+│   ├── orchestration.py # ServerToolExecutor: run_analysis, read_artifact, web/literature search
 │   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
 │   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
-│   └── phewas_categories.py  # PheWAS plot category mappings
+│   └── chembl.py        # ChEMBL REST client (drug mechanisms, indications, bioactivity)
 ├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
 │   ├── __init__.py      # sync module-level functions, shared client lifecycle
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
-│   └── errors.py        # GeneticsError / GeneticsUsageError
+│   ├── errors.py        # GeneticsError / GeneticsUsageError
+│   └── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset)
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
@@ -1707,7 +1832,7 @@ literal at a call site.
   branched on, anything else is carried through as an opaque label.
 - **No total deadline, deliberately.** Each attempt is bounded; the sum is not (~585 s worst
   case). The cap belongs to whoever owns the chat turn, and that is `run_analysis` — see
-  `ToolExecutor._RUN_ANALYSIS_DEADLINE_S` under Code execution tools. Its only caller is that
+  `ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S` under Code execution tools. Its only caller is that
   handler.
 
 ### Turn termination and truncation
@@ -1790,8 +1915,8 @@ name says `total_`:
   meaning is deliberately frozen (`genetics-results-suite-n3p`)
 - `cache_read` — the part of `input_tokens` served from the prompt cache
 - `cache_create` — the part of `input_tokens` written into the prompt cache. Kept apart
-  from `cache_read` because the two differ by more than 12x in price, so folding them
-  together makes an exact cost underivable
+  from `cache_read` because a cache write is priced far above a cache read (see
+  `_PRICING` in `cost.py`), so folding them together makes an exact cost underivable
 - `output_tokens` — output tokens generated in this call
 - `total_input_tokens` — cumulative **billed uncached** input across all iterations so
   far, i.e. the running sum of `input_tokens - cache_read - cache_create`
@@ -2009,6 +2134,13 @@ All configuration is via environment variables (`.env` file supported):
 | `UNIPROT_API_URL` | UniProt REST API base URL (entries, search, sequences) | `https://rest.uniprot.org` |
 | `EBI_PROTEINS_API_URL` | EBI Proteins API base URL (protein↔genome coordinate mapping) | `https://www.ebi.ac.uk/proteins/api` |
 | `UNIPROT_CACHE_TTL` | TTL in seconds for cached UniProt responses; `0` disables caching | `86400` (24 h) |
+
+### ChEMBL (optional, chat-backend only)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CHEMBL_API_URL` | ChEMBL REST API base URL (targets, mechanisms, molecules, indications, activities) | `https://www.ebi.ac.uk/chembl/api/data` |
+| `CHEMBL_CACHE_TTL` | TTL in seconds for cached ChEMBL responses; `0` disables caching | `86400` (24 h) |
 
 ### Search tools (optional)
 
@@ -2297,6 +2429,7 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
+| `DEFAULT_TOOL_PROFILE` | Profile served as `chat_tool_profile` to users who have not chosen one (see "Profile behavior"); empty = the browser's own default, the full surface (default empty) |
 
 These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which the MCP server, the chat API and the subagents all read, so a disabled tool is invisible on every surface rather than only unregistered on one.
 
@@ -2353,7 +2486,6 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
 | `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
 | `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
-| `test_phewas_categories.py` | PheWAS category mappings |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint, and the regression guard for silent download failures: every malformed `_download_data` payload (including verbatim reproductions of the `bef` and `buc` positional-rows payloads, and a non-`str` `filename`) must raise `DownloadShapeError` out of `_convert_to_tsv`, must never return quietly from `_process_download_hints`, and must there yield `DOWNLOAD_SHAPE_NOTE` plus a `DOWNLOAD_SHAPE_DEFECT tool=…` ERROR line with a traceback *without* propagating; a `TypeError` from the store still propagates (pinning the narrow `except`); `ENOSPC`, an unwritable storage path and an unencodable upstream value each surface `DOWNLOAD_FAILED_NOTE` plus a `DOWNLOAD_FAILED tool=…` ERROR line |
@@ -2364,6 +2496,8 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_literature_search.py` | Literature backend selection, Perplexity metadata hydration |
 | `test_myvariant.py` | myvariant.info annotation tool |
 | `test_uniprot.py` | UniProt client: resolution tiers, TTL cache, variant effect |
+| `test_chembl.py` | ChEMBL client: target resolution through UniProt, paging caps, phase filtering, attribution |
+| `test_chembl_descriptions.py` | Every backticked name in the three ChEMBL tool descriptions and in the ChEMBL prompt blocks resolves to a parameter, a tool name, or a key of that tool's mocked happy-path result |
 | `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
@@ -2587,8 +2721,8 @@ harness issues two arms per case. `--base-url` therefore defaults to
   accumulates only the billed uncached input. `cached_input_tokens` is therefore
   derived as `sum(per-iteration input_tokens) - total_input_tokens`.
 - **Cost is exact when the stream carries the cache split, and an interval when it
-  does not — and the report says which.** Cache reads and cache creations differ by
-  more than 12x in price, so the sum alone can only be bracketed. Since
+  does not — and the report says which.** Cache reads and cache creations are priced
+  far apart, so the sum alone can only be bracketed. Since
   `genetics-results-suite-n3p` the `usage` payload reports `cache_read` and
   `cache_create` separately, and the harness prices the three token classes
   separately into `cost_usd` (`cost_basis: "exact"`). `cost_usd_min` / `cost_usd_max`

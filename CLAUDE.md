@@ -37,6 +37,7 @@ violate this; it runs from the `pre-commit` hook.
 |---|---|---|
 | `src/genetics_mcp_server/tools/definitions.py` | `docs/project-spec.md` | the "Available tools" tables, tool profile categories |
 | `src/genetics_mcp_server/tools/executor.py` | `docs/project-spec.md`, `docs/variant-list-analysis.md` | tool execution, truncation and download handling; the variant-list doc when `analyze_variant_list` changes |
+| `src/genetics_mcp_server/tools/orchestration.py` | `docs/project-spec.md` | the code-execution tool layer: the `run_analysis` gateway and its identity refusal, artifact scoping, literature and web search. What the sandbox image ships is the suite repo's `sandbox/prune_venv.py` and `docs/code-execution-security.md` |
 | `src/genetics_mcp_server/routers/**` | `docs/project-spec.md` | admin endpoint list, API token endpoints, admin access rules |
 | `src/genetics_mcp_server/config/**` | `docs/project-spec.md`, `.env.example` | env-var tables, default prompts; every new variable in `.env.example` |
 | `src/genetics_mcp_server/auth/**`, `mcp_server.py`, `mcp_proxy.py` | `docs/project-spec.md`, `README.md` | bearer auth branches, `MCP_API_KEY` being mandatory on remote transports, `MCP_ALLOW_QUERY_TOKEN` gating, external MCP proxying |
