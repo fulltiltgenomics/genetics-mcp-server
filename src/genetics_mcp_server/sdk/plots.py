@@ -3,6 +3,7 @@
     import genetics
     genetics.plots.locuszoom(phenotype="H8_HEARINGLOSS", variant="12:49578357:C:T")
     genetics.plots.phewas(variant="19:44908684:T:C")
+    genetics.plots.upset(sets={"Crohn": cd_ids, "UC": uc_ids})
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
@@ -43,7 +44,7 @@ import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsUsageError
 
-__all__ = ["locuszoom", "phewas"]
+__all__ = ["locuszoom", "phewas", "upset"]
 
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
@@ -594,13 +595,18 @@ def _significance_line(ax, significance: float) -> float:
     return line_y
 
 
-def _dress(ax, title: str) -> None:
-    """The y label, the title and the type sizes every one of these plots shares."""
-    ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=_LABEL_SIZE)
-    ax.set_title(title, fontsize=_TITLE_SIZE)
+def _size(ax) -> None:
+    """The tick type size and the rule widths every one of these plots shares."""
     ax.tick_params(labelsize=_TICK_SIZE, width=_AXIS_LINEWIDTH, length=_TICK_LENGTH)
     for spine in ax.spines.values():
         spine.set_linewidth(_AXIS_LINEWIDTH)
+
+
+def _dress(ax, title: str) -> None:
+    """The y label, the title and the type sizes an association panel shares."""
+    ax.set_ylabel(r"$-\log_{10}(p)$", fontsize=_LABEL_SIZE)
+    ax.set_title(title, fontsize=_TITLE_SIZE)
+    _size(ax)
 
 
 def locuszoom(
@@ -1194,4 +1200,268 @@ def phewas(
         "strongest_mlog10p": ys[strongest],
         "variant_consequence": _first(frame, "most_severe"),
         "variant_gene": _first(frame, "gene_most_severe"),
+    }
+
+
+# ----------------------------------------------------------------------------------- upset
+
+# Everything on an upset is one grey or another. The bars encode a count and the dots a
+# membership; colour would encode nothing a reader decodes, and in the scripts this replaced
+# it was spent on one hue per bar, which reads as a categorical the figure never explains.
+_UPSET_INK = "#333333"
+_UPSET_SET_BAR = "#8A8A8A"
+_UPSET_OFF = "#DDDDDD"
+_UPSET_BAND = "#F2F2F2"
+
+# past this many intersections the columns are thinner than their count labels; the largest
+# are kept and the rest reported, not drawn
+_UPSET_MAX_INTERSECTIONS = 30
+
+# inches: the intersection panel widens per column and the matrix deepens per set, so a plot
+# of 3 sets and 7 columns and one of 8 sets and 30 columns are both readable at 6 pt
+_UPSET_COLUMN_IN = 0.22
+_UPSET_ROW_IN = 0.24
+_UPSET_BARS_IN = 2.2
+_UPSET_SET_PANEL_IN = 1.4
+_UPSET_MAX_WIDTH_IN = 12.0
+
+# the count labels sit outside the bar they count — above an intersection bar, beyond the
+# tip of a set bar — so each scale is extended by this much past its longest bar to hold them
+_UPSET_BAR_HEADROOM = 0.14
+_UPSET_SET_HEADROOM = 0.4
+
+_SORT_BY = ("size", "degree")
+
+
+def _upset_key(key: Any) -> frozenset[str]:
+    if isinstance(key, str):
+        return frozenset([key])
+    names = frozenset(str(k) for k in key)
+    if not names:
+        raise GeneticsUsageError("an intersection key names no set")
+    return names
+
+
+def _upset_from_sets(sets: Any) -> tuple[list[str], dict[frozenset[str], int]]:
+    """Exclusive intersection sizes from the sets' members: each element counted once, in
+    the intersection of exactly the sets that hold it."""
+    members = {str(name): set(values) for name, values in dict(sets).items()}
+    where: dict[Any, set[str]] = {}
+    for name, values in members.items():
+        for element in values:
+            where.setdefault(element, set()).add(name)
+    counts: dict[frozenset[str], int] = {}
+    for names in where.values():
+        counts[frozenset(names)] = counts.get(frozenset(names), 0) + 1
+    return list(members), counts
+
+
+def _upset_from_data(
+    data: pl.DataFrame, columns: Any, count: str | None
+) -> tuple[list[str], dict[frozenset[str], int]]:
+    """Exclusive intersection sizes from a frame with one membership column per set, one row
+    per element — or, with `count=`, one row per combination already tallied."""
+    names = [str(c) for c in columns] if columns else [
+        c for c in data.columns if data.schema[c] == pl.Boolean
+    ]
+    if not names:
+        raise GeneticsUsageError(
+            f"no membership columns: pass columns=[...] naming them, or give the frame "
+            f"boolean columns; columns are {data.columns}"
+        )
+    missing = [c for c in names if c not in data.columns]
+    if missing or (count and count not in data.columns):
+        raise GeneticsUsageError(
+            f"columns {missing + ([count] if count and count not in data.columns else [])} "
+            f"are not in the frame; columns are {data.columns}"
+        )
+    flags = data.select(
+        [pl.col(c).cast(pl.Boolean, strict=False).fill_null(False) for c in names]
+        + ([pl.col(count).cast(pl.Int64).fill_null(0).alias("_n")] if count else [pl.lit(1).alias("_n")])
+    )
+    counts: dict[frozenset[str], int] = {}
+    for row in flags.iter_rows():
+        names_in = frozenset(n for n, on in zip(names, row) if on)
+        if names_in:
+            counts[names_in] = counts.get(names_in, 0) + int(row[-1])
+    return names, counts
+
+
+def _upset_from_counts(counts: Any) -> tuple[list[str], dict[frozenset[str], int]]:
+    """Exclusive intersection sizes as given; the sets are the names the keys mention, in
+    order of first mention."""
+    tallies: dict[frozenset[str], int] = {}
+    names: list[str] = []
+    for key, value in dict(counts).items():
+        names_in = _upset_key(key)
+        for name in (key,) if isinstance(key, str) else key:
+            if str(name) not in names:
+                names.append(str(name))
+        tallies[names_in] = tallies.get(names_in, 0) + int(value)
+    return names, tallies
+
+
+def upset(
+    *,
+    sets: Any = None,
+    data: pl.DataFrame | None = None,
+    columns: Any = None,
+    count: str | None = None,
+    counts: Any = None,
+    sort_by: str = "size",
+    min_count: int = 1,
+    max_intersections: int = _UPSET_MAX_INTERSECTIONS,
+    ylabel: str = "Intersection size",
+    path: str | None = None,
+    title: str | None = None,
+    ax: Any = None,
+) -> dict[str, Any]:
+    """UpSet plot: how many elements fall in each exclusive intersection of some sets.
+
+    Three ways to say what the sets are, for three shapes the data comes in:
+
+    - `sets={"Crohn": ids, "UC": ids}` — each set's members, any hashable values; every
+      element is counted once, in the intersection of exactly the sets that hold it.
+    - `data=frame` with one boolean (or 0/1) column per set and one row per element;
+      `columns=[...]` names the membership columns, else every boolean column is one. With
+      `count="n"` each row is a combination already tallied — the shape a `GROUP BY` over
+      indicator columns returns — and the column is summed rather than the rows counted.
+    - `counts={("CD",): 9, ("UC",): 48, ("CD", "UC"): 4}` — exclusive intersection sizes
+      already known, keyed by the names of the sets in each; a plain string keys one set.
+
+    Sets are rows, largest at the top, with their total size barred to the left; the
+    intersections are columns, largest first (`sort_by="degree"` orders them by how many sets
+    they span instead), each with its count above the bar and the sets it spans marked in the
+    matrix below. Only intersections of at least `min_count` are drawn, and no more than
+    `max_intersections` of them. Nothing is coloured: the bars carry a count and the dots a
+    membership, and a colour would encode nothing a reader decodes.
+
+    Returns a dict describing what was drawn: `path`, `sets` in row order top to bottom with
+    `set_sizes`, `intersections` in column order as `{"sets": [...], "count": n}`,
+    `n_intersections` (non-empty, before the cut) and `n_elements` (their sum).
+
+    `path` may be relative, in which case it is written inside the execution's artifacts
+    directory and returned to the user automatically; that is also where the default goes.
+    Pass `ax` to draw in its place in an existing figure — the axis is replaced by the three
+    panels — in which case nothing is saved.
+    """
+    import matplotlib.pyplot as plt
+
+    given = [name for name, value in (("sets", sets), ("data", data), ("counts", counts))
+             if value is not None]
+    if len(given) != 1:
+        raise GeneticsUsageError(
+            f"pass exactly one of sets=, data= or counts=; got {given or 'none'}"
+        )
+    if sort_by not in _SORT_BY:
+        raise GeneticsUsageError(f"sort_by must be one of {_SORT_BY}, not {sort_by!r}")
+    if sets is not None:
+        names, tallies = _upset_from_sets(sets)
+    elif data is not None:
+        names, tallies = _upset_from_data(data, columns, count)
+    else:
+        names, tallies = _upset_from_counts(counts)
+    if len(names) < 2:
+        raise GeneticsUsageError(f"an upset needs at least two sets; got {names}")
+    unknown = sorted(set().union(*tallies) - set(names)) if tallies else []
+    if unknown:
+        raise GeneticsUsageError(f"intersections name sets that were not given: {unknown}")
+
+    set_sizes = {n: sum(v for k, v in tallies.items() if n in k) for n in names}
+    rows = sorted(names, key=lambda n: (-set_sizes[n], names.index(n)))
+    nonempty = {k: v for k, v in tallies.items() if v >= max(min_count, 1)}
+    if not nonempty:
+        raise GeneticsUsageError(
+            f"no intersection holds {max(min_count, 1)} or more elements — nothing to plot"
+        )
+    if sort_by == "degree":
+        order = sorted(nonempty, key=lambda k: (len(k), -nonempty[k], sorted(k)))
+    else:
+        order = sorted(nonempty, key=lambda k: (-nonempty[k], len(k), sorted(k)))
+    shown = order[:max_intersections]
+    n_columns = len(shown)
+
+    matrix_in = max(3.2, _UPSET_COLUMN_IN * n_columns)
+    rows_in = max(0.6, _UPSET_ROW_IN * len(rows))
+    own_figure = ax is None
+    if own_figure:
+        figure = plt.figure(
+            figsize=(min(_UPSET_MAX_WIDTH_IN, _UPSET_SET_PANEL_IN + matrix_in + 1.9),
+                     _UPSET_BARS_IN + rows_in + 0.8),
+            constrained_layout=True,
+        )
+        grid = figure.add_gridspec
+    else:
+        figure = ax.get_figure()
+        grid = ax.get_subplotspec().subgridspec
+        ax.remove()
+    spec = grid(2, 2, width_ratios=[_UPSET_SET_PANEL_IN, matrix_in],
+                height_ratios=[_UPSET_BARS_IN, rows_in], wspace=0.04, hspace=0.04)
+    ax_bars = figure.add_subplot(spec[0, 1])
+    ax_matrix = figure.add_subplot(spec[1, 1])
+    ax_sets = figure.add_subplot(spec[1, 0])
+    figure.add_subplot(spec[0, 0]).set_axis_off()
+
+    xs = list(range(n_columns))
+    heights = [nonempty[k] for k in shown]
+    ax_bars.bar(xs, heights, width=0.6, color=_UPSET_INK)
+    for x, h in zip(xs, heights):
+        ax_bars.annotate(f"{h:,}", (x, h), textcoords="offset points", xytext=(0, 1.5),
+                         ha="center", va="bottom", fontsize=5)
+    ax_bars.set_ylim(0, max(heights) * (1 + _UPSET_BAR_HEADROOM))
+    ax_bars.set_xlim(-0.6, n_columns - 0.4)
+    ax_bars.set_xticks([])
+    ax_bars.set_ylabel(ylabel, fontsize=_LABEL_SIZE)
+    ax_bars.set_title(title or "", fontsize=_TITLE_SIZE)
+    for side in ("top", "right"):
+        ax_bars.spines[side].set_visible(False)
+
+    # y of a set is its row, top row first; the matrix and the set bars share the scale
+    y_of = {n: len(rows) - 1 - i for i, n in enumerate(rows)}
+    for i, n in enumerate(rows):
+        if i % 2:
+            for panel in (ax_matrix, ax_sets):
+                panel.axhspan(y_of[n] - 0.5, y_of[n] + 0.5, color=_UPSET_BAND, zorder=0)
+    for x, key in zip(xs, shown):
+        ys_on = [y_of[n] for n in rows if n in key]
+        ax_matrix.scatter([x] * len(rows), [y_of[n] for n in rows], s=36,
+                          color=[_UPSET_INK if n in key else _UPSET_OFF for n in rows], zorder=2)
+        if len(ys_on) > 1:
+            ax_matrix.plot([x, x], [min(ys_on), max(ys_on)], color=_UPSET_INK,
+                           linewidth=1.2, zorder=1)
+    ax_matrix.set_xlim(-0.6, n_columns - 0.4)
+    ax_matrix.set_ylim(-0.5, len(rows) - 0.5)
+    ax_matrix.set_xticks([])
+    ax_matrix.set_yticks([])
+    ax_matrix.set_axis_off()
+
+    sizes = [set_sizes[n] for n in rows]
+    ax_sets.barh([y_of[n] for n in rows], sizes, height=0.5, color=_UPSET_SET_BAR, zorder=2)
+    for n in rows:
+        ax_sets.annotate(f"{set_sizes[n]:,}", (set_sizes[n], y_of[n]), textcoords="offset points",
+                         xytext=(-2, 0), ha="right", va="center", fontsize=5)
+    ax_sets.set_xlim(max(sizes) * (1 + _UPSET_SET_HEADROOM), 0)
+    ax_sets.set_ylim(-0.5, len(rows) - 0.5)
+    ax_sets.set_yticks([y_of[n] for n in rows])
+    ax_sets.set_yticklabels([_tick_label(n) for n in rows])
+    ax_sets.tick_params(axis="y", length=0)
+    ax_sets.set_xlabel("Set size", fontsize=_LABEL_SIZE)
+    for side in ("top", "right", "left"):
+        ax_sets.spines[side].set_visible(False)
+    for panel in (ax_bars, ax_sets):
+        _size(panel)
+
+    written = None
+    if own_figure:
+        written = _resolve_path(path, "upset.png")
+        figure.savefig(written)
+        plt.close(figure)
+
+    return {
+        "path": written,
+        "sets": rows,
+        "set_sizes": set_sizes,
+        "intersections": [{"sets": [n for n in rows if n in k], "count": nonempty[k]} for k in shown],
+        "n_intersections": len(nonempty),
+        "n_elements": sum(nonempty.values()),
     }

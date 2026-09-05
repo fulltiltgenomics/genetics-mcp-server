@@ -1360,3 +1360,200 @@ def test_a_pleiotropic_variant_is_grouped_by_resource_rather_than_by_a_wall_of_c
     result, _ax = named_phewas(monkeypatch, tmp_path, phenotypes, data=associations(rows[:-1]))
     assert result["grouped_by"] == "category"
     assert len(result["groups"]) == 10
+
+
+# ----------------------------------------------------------------------------------- upset
+
+
+CD_UC = {"UC": 48, "Crohn": 9, ("Crohn", "UC"): 4}
+
+
+def drawn_upset(monkeypatch, tmp_path, **kwargs):
+    """A whole upset drawn to `tmp_path`, with its four panels kept for inspection."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    captured = {}
+    real_close = plt.close
+
+    def capture(figure=None):
+        if hasattr(figure, "axes"):
+            captured["figure"] = figure
+        real_close(figure)
+
+    monkeypatch.setattr(plt, "close", capture)
+    result = plots.upset(**kwargs)
+    bars, matrix, sets, _blank = captured["figure"].axes
+    return result, bars, matrix, sets
+
+
+def test_upset_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
+    result, *_ = drawn_upset(monkeypatch, tmp_path, counts=CD_UC)
+    assert result["path"] == str(tmp_path / "upset.png")
+    assert (tmp_path / "upset.png").stat().st_size > 0
+    assert result["sets"] == ["UC", "Crohn"]
+    assert result["set_sizes"] == {"UC": 52, "Crohn": 13}
+    assert result["intersections"] == [
+        {"sets": ["UC"], "count": 48},
+        {"sets": ["Crohn"], "count": 9},
+        {"sets": ["UC", "Crohn"], "count": 4},
+    ]
+    assert result["n_intersections"] == 3
+    assert result["n_elements"] == 61
+
+
+def test_the_three_input_shapes_agree():
+    members = {"A": range(10), "B": range(5, 20), "C": range(18, 30)}
+    from_sets = plots._upset_from_sets(members)
+    rows = [
+        {"A": i in members["A"], "B": i in members["B"], "C": i in members["C"]}
+        for i in range(30)
+    ]
+    from_data = plots._upset_from_data(pl.DataFrame(rows), None, None)
+    tallied = (
+        pl.DataFrame(rows)
+        .group_by(["A", "B", "C"])
+        .len()
+        .with_columns(pl.col("A").cast(pl.Int64))  # 0/1 columns are memberships too
+    )
+    from_tally = plots._upset_from_data(tallied, ["A", "B", "C"], "len")
+    from_counts = plots._upset_from_counts(
+        {"A": 5, ("A", "B"): 5, ("B",): 8, frozenset({"B", "C"}): 2, "C": 10}
+    )
+    expected = {
+        frozenset({"A"}): 5,
+        frozenset({"A", "B"}): 5,
+        frozenset({"B"}): 8,
+        frozenset({"B", "C"}): 2,
+        frozenset({"C"}): 10,
+    }
+    assert from_sets == (["A", "B", "C"], expected)
+    assert from_data == (["A", "B", "C"], expected)
+    assert from_tally == (["A", "B", "C"], expected)
+    assert from_counts == (["A", "B", "C"], expected)
+
+
+def test_an_element_in_no_set_and_a_null_flag_are_not_intersections():
+    frame = pl.DataFrame({"A": [True, False, None], "B": [False, False, None]})
+    assert plots._upset_from_data(frame, None, None) == (["A", "B"], {frozenset({"A"}): 1})
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({}, "exactly one of"),
+        ({"sets": {"A": [1]}, "counts": {"A": 1}}, "exactly one of"),
+        ({"sets": {"A": [1, 2]}}, "at least two sets"),
+        ({"counts": {("A", "B"): 0}}, "nothing to plot"),
+        ({"counts": {"A": 1, (): 2}}, "names no set"),
+        ({"counts": {"A": 1}, "sort_by": "colour"}, "sort_by"),
+        ({"data": pl.DataFrame({"n": [1, 2]})}, "no membership columns"),
+        ({"data": pl.DataFrame({"A": [True]}), "columns": ["A", "Z"]}, "not in the frame"),
+        ({"data": pl.DataFrame({"A": [True], "B": [True]}), "count": "n"}, "not in the frame"),
+    ],
+)
+def test_upset_refuses_what_it_cannot_draw(kwargs, message):
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.upset(**kwargs)
+
+
+def test_nothing_on_an_upset_is_coloured(monkeypatch, tmp_path):
+    _result, bars, matrix, sets = drawn_upset(monkeypatch, tmp_path, counts=CD_UC)
+    greys = set()
+    for panel in (bars, matrix, sets):
+        for patch in panel.patches:
+            greys.add(patch.get_facecolor()[:3])
+        for collection in panel.collections:
+            for colour in collection.get_facecolors():
+                greys.add(tuple(colour[:3]))
+    assert greys, "nothing was drawn"
+    assert all(abs(r - g) < 1e-9 and abs(g - b) < 1e-9 for r, g, b in greys), greys
+
+
+def test_the_counts_sit_outside_the_bars_and_the_scales_leave_room_for_them(
+    monkeypatch, tmp_path
+):
+    _result, bars, matrix, sets = drawn_upset(monkeypatch, tmp_path, counts=CD_UC)
+    # above each intersection bar, and the scale runs past the tallest
+    labels = {t.get_text(): t.xy for t in bars.texts}
+    assert labels == {"48": (0, 48), "9": (1, 9), "4": (2, 4)}
+    assert all(t.get_va() == "bottom" for t in bars.texts)
+    assert bars.get_ylim()[1] > 48
+    # beyond the tip of each set bar on an axis that runs leftwards past the longest
+    labels = {t.get_text(): (t.xy, t.get_ha()) for t in sets.texts}
+    assert labels == {"52": ((52, 1), "right"), "13": ((13, 0), "right")}
+    assert sets.get_xlim()[0] > 52 and sets.get_xlim()[1] == 0
+    # the set names are on the set-size panel only: a second copy under the matrix is what
+    # the bars overprinted in the scripts this replaced
+    assert [t.get_text() for t in sets.get_yticklabels()] == ["UC", "Crohn"]
+    assert not matrix.get_yticklabels() and not matrix.get_xticklabels()
+    # and the intersections are named by the matrix, not by a caption under it
+    assert not matrix.texts
+
+
+def test_the_matrix_marks_exactly_the_sets_each_column_spans(monkeypatch, tmp_path):
+    _result, _bars, matrix, _sets = drawn_upset(monkeypatch, tmp_path, counts=CD_UC)
+    ink = matplotlib_colour(plots._UPSET_INK)
+    marked = []
+    for collection in matrix.collections:
+        offsets = collection.get_offsets()
+        colours = collection.get_facecolors()
+        marked.append({
+            int(y) for (_x, y), colour in zip(offsets, colours)
+            if tuple(colour[:3]) == ink
+        })
+    # rows: UC is the top row (y=1), Crohn below it (y=0)
+    assert marked == [{1}, {0}, {0, 1}]
+    # one connector, on the one column spanning two sets
+    assert [tuple(line.get_xdata()) for line in matrix.lines] == [(2, 2)]
+
+
+def matplotlib_colour(hex_colour):
+    from matplotlib.colors import to_rgb
+
+    return to_rgb(hex_colour)
+
+
+def test_sets_are_rows_largest_first_and_degree_ordering_is_available(monkeypatch, tmp_path):
+    counts = {"small": 1, "big": 30, "mid": 10, ("small", "big"): 20, ("small", "big", "mid"): 2}
+    result, *_ = drawn_upset(monkeypatch, tmp_path, counts=counts, sort_by="degree")
+    assert result["sets"] == ["big", "small", "mid"]
+    assert [i["count"] for i in result["intersections"]] == [30, 10, 1, 20, 2]
+
+
+def test_the_cut_keeps_the_largest_and_the_report_keeps_the_count(monkeypatch, tmp_path):
+    counts = {"A": 5, "B": 4, "C": 3, ("A", "B"): 2, ("B", "C"): 1}
+    result, bars, *_ = drawn_upset(
+        monkeypatch, tmp_path, counts=counts, max_intersections=2, min_count=2
+    )
+    assert [i["count"] for i in result["intersections"]] == [5, 4]
+    assert result["n_intersections"] == 4
+    assert result["n_elements"] == 14
+    assert len(bars.patches) == 2
+
+
+def test_upset_into_a_caller_supplied_axis_saves_nothing(monkeypatch, tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    figure, (left, right) = plt.subplots(1, 2)
+    result = plots.upset(counts=CD_UC, ax=left)
+    assert result["path"] is None
+    assert not list(tmp_path.iterdir())
+    # the axis was replaced by the panels, and the neighbour is untouched
+    assert left not in figure.axes and right in figure.axes
+    assert len(figure.axes) == 5
+    plt.close("all")
+
+
+def test_a_long_set_name_is_wrapped_on_the_axis(monkeypatch, tmp_path):
+    name = "Set with a rather long descriptive name that keeps going"
+    _result, _bars, _matrix, sets = drawn_upset(
+        monkeypatch, tmp_path, counts={name: 3, "B": 2, (name, "B"): 1}
+    )
+    label = sets.get_yticklabels()[0].get_text()
+    assert "\n" in label and label.endswith("…")

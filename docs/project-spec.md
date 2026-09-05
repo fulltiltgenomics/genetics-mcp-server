@@ -128,8 +128,10 @@ Four evidence types that must not be conflated, because a user question about "r
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
-locuszoom and a phewas — as functions a `run_analysis` script calls, and the figure comes
-back as an artifact.
+locuszoom, a phewas and an upset — as functions a `run_analysis` script calls, and the
+figure comes back as an artifact. The upset is the general one: it takes any sets a script
+has in hand (members, a frame of membership columns, or intersection counts already
+tallied) and draws them one way, in greys, with every count outside the bar it counts.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -1747,13 +1749,14 @@ src/genetics_mcp_server/
 │   ├── executor.py      # tool execution via HTTP; the half the sandbox image ships
 │   ├── orchestration.py # ServerToolExecutor: run_analysis, read_artifact, web/literature search
 │   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
-│   └── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
+│   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
+│   └── chembl.py        # ChEMBL REST client (drug mechanisms, indications, bioactivity)
 ├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
 │   ├── __init__.py      # sync module-level functions, shared client lifecycle
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   └── plots.py         # genetics.plots: the standard figures (locuszoom, phewas)
+│   └── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset)
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI
