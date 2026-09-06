@@ -624,7 +624,13 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
         "\n- Scripts are the only data path on this surface, so a question that needs data needs a script. Everything the SDK exposes is discoverable with list_capabilities; do not conclude data is unavailable without checking there first.\n",
         excludes=_fs("get_credible_sets_by_gene", "query_database"),
     ),
-    _Block("""- When a follow-up question refers to results from a previous step, think about which of the paths above can answer it.
+    # the narrowing bullet cites "the rule above", the re-query grounding block, but the two
+    # gates differ by one name: that one takes get_credible_set_by_id where this one takes
+    # get_credible_sets_by_gene. the citation holds only because no shipped profile carries
+    # get_credible_sets_by_gene without one of get_credible_set_by_id / query_database /
+    # run_analysis — such a profile would emit this bullet with no rule above it.
+    _Block("""- **A follow-up that narrows an earlier result re-runs that retrieval with the filter added.** When the ask is the same table minus a locus, a gene family or a category, add the predicate to the query or script that produced it and run that again, rather than rebuilding the analysis from scratch. Re-running a retrieval you already wrote, with a predicate added, IS the fresh authoritative call the rule above asks for — what that rule forbids is answering from an earlier summary or from a subset you curated, not re-issuing a retrieval. Do not re-issue a schema discovery call for a schema this conversation has already used; that applies to discovery calls only — where the schema ships as files alongside your tools, reading the file for a view still comes before writing SQL.
+- When a follow-up question refers to results from a previous step, think about which of the paths above can answer it.
 - Always review your full set of available tools before concluding that data is unavailable.
 """,
         requires_any=_fs("get_credible_sets_by_gene", "query_database", "run_analysis"),

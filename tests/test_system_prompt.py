@@ -468,11 +468,15 @@ _REQUIRED_EVERYWHERE = [
     "r² > 0.95 to the lead",
     "PIPs from pseudo credible sets should be interpreted with more caution",
 ]
-# these presuppose a path to credible-set / MHC rows, which `rag` does not have
+# these presuppose a path to credible-set / MHC rows, which `rag` does not have; the
+# narrowing bullet rides the same data-path gate and cites the re-query rule by position,
+# so the two have to survive together
 _REQUIRED_WITH_A_DATA_PATH = [
     "**Membership is NOT the same as LD.**",
     "in partial LD with the lead",
     "**Re-query; do not answer from memory.**",
+    "**A follow-up that narrows an earlier result re-runs that retrieval with the filter added.**",
+    "IS the fresh authoritative call the rule above asks for",
     "### HLA / the MHC region",
     "LD across the MHC is so extensive",
     "`pval` underflows to 0",
