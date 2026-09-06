@@ -94,6 +94,7 @@ async def test_the_streaming_path_derives_no_tool_list_of_its_own(monkeypatch):
         model="claude-opus-5",
         system_prompt="prompt built from resolved.names",
         enable_tools=True,
+        code_execution=False,
         local_tools=resolved,
     ):
         pass
@@ -123,11 +124,14 @@ class _CapturingService:
         self.kwargs = None
 
     def resolve_local_tools(
-        self, tool_profile=None, enable_tools=True, custom_tool_descriptions=None
+        self, *, code_execution=False, enable_tools=True, custom_tool_descriptions=None
     ):
         self._disabled_tools = lambda: LLMService._disabled_tools(self)
         return LLMService.resolve_local_tools(
-            self, tool_profile, enable_tools, custom_tool_descriptions
+            self,
+            code_execution=code_execution,
+            enable_tools=enable_tools,
+            custom_tool_descriptions=custom_tool_descriptions,
         )
 
     def stream_chat(self, **kwargs):
@@ -150,8 +154,8 @@ def test_the_endpoint_resolves_once_and_hands_that_same_resolution_down(test_cli
     """
     calls = []
 
-    def _counting(custom_descriptions=None, tool_profile=None, disabled_tools=None):
-        calls.append(tool_profile)
+    def _counting(custom_descriptions=None, code_execution=False, disabled_tools=None):
+        calls.append(code_execution)
         return [_tool(f"tool_from_derivation_{len(calls)}")]
 
     recorded = {}
@@ -177,6 +181,12 @@ def test_the_endpoint_resolves_once_and_hands_that_same_resolution_down(test_cli
         )
     assert response.status_code == 200
 
-    assert calls == ["bigquery"], f"expected ONE local tool derivation, got {len(calls)}"
+    # the recorded value is the coerced boolean, not the wire name: the endpoint reads
+    # `tool_profile` once, at the edge, and hands the surface decision down
+    assert calls == [False], f"expected ONE local tool derivation, got {len(calls)}"
     assert recorded["tool_names"] == {"tool_from_derivation_1"}
     assert service.kwargs["local_tools"].names == recorded["tool_names"]
+    # the wire string travels on unchanged — it is persisted per message and still keys
+    # the proxied surfaces — while the surface decision beside it is the coerced boolean
+    assert service.kwargs["tool_profile"] == "bigquery"
+    assert service.kwargs["code_execution"] is False

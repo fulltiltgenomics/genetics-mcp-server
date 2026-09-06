@@ -1298,7 +1298,7 @@ async def resolve_arm_tools(
     Three things this prevents, each of which produces a run that looks fine and means
     nothing:
 
-    1. A MISSPELLED ARM. `get_anthropic_tools` resolves an unrecognised profile to the
+    1. A MISSPELLED ARM. `code_execution_requested` coerces an unrecognised profile to the
        no-code surface rather than raising — deliberately, because the value comes back
        from rows written by older clients — so `--arm-a cod` silently yields the no-code
        surface and reports plausible numbers against it. `known_profile: false` is fatal

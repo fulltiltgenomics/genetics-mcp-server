@@ -13,6 +13,7 @@ from genetics_mcp_server.tools.definitions import (
     TOOL_DEFINITIONS,
     all_anthropic_tools,
     all_local_tool_definitions,
+    code_execution_requested,
     get_anthropic_tools,
     resolve_tools,
 )
@@ -874,8 +875,8 @@ class TestToolDefinitions:
         }
 
 
-class TestProfileShim:
-    """The legacy `tool_profile` wire value, mapped onto the boolean.
+class TestProfileCoercionAtTheEdge:
+    """The wire `tool_profile`, coerced to the boolean by `code_execution_requested`.
 
     Only "code" asks for code execution. Every other value a client can still send — the
     four names this collapse retired, `nocode`, None, and anything unrecognised — resolves
@@ -885,28 +886,58 @@ class TestProfileShim:
 
     def test_code_resolves_to_the_code_surface(self):
         assert {
-            t["name"] for t in get_anthropic_tools(tool_profile="code")
+            t["name"]
+            for t in get_anthropic_tools(
+                code_execution=code_execution_requested("code")
+            )
         } == _CODE_SURFACE_NAMES
 
     @pytest.mark.parametrize(
         "tool_profile", [None, "api", "bigquery", "rag", "nocode", "unknown", ""]
     )
     def test_every_other_value_resolves_to_the_no_code_surface(self, tool_profile):
-        assert {t["name"] for t in get_anthropic_tools(tool_profile=tool_profile)} == {
-            t["name"] for t in resolve_tools(code_execution=False)
-        }
+        assert code_execution_requested(tool_profile) is False
+        assert {
+            t["name"]
+            for t in get_anthropic_tools(
+                code_execution=code_execution_requested(tool_profile)
+            )
+        } == {t["name"] for t in resolve_tools(code_execution=False)}
 
     def test_unknown_profile_does_not_raise(self):
         """Pinned deliberately: the value is persisted per message in
         chat_messages.tool_profile and read back from rows written by older clients, so
-        raising would turn a stale row into a 500."""
-        assert get_anthropic_tools(tool_profile="cdoe")
+        raising would turn a stale row into a 500.
 
-    def test_disabled_tools_still_applies_through_the_shim(self):
+        A typo must still leave the model a usable surface, and specifically the no-code
+        one: refusing to resolve, or resolving to something empty, would strand the turn.
+        """
+        assert code_execution_requested("cdoe") is False
+
+        surface = get_anthropic_tools(None, code_execution=code_execution_requested("cdoe"))
+
+        assert surface
+        assert {t["name"] for t in surface} == {
+            t["name"] for t in get_anthropic_tools(code_execution=False)
+        }
+
+    def test_the_surface_functions_take_no_profile_name_at_all(self):
+        """The coercion happens once, at the edge, and nothing below it re-reads a name.
+
+        A `tool_profile=` keyword surviving on either resolver is the second reading this
+        split exists to delete: it would let a request's tools and its prompt be resolved
+        from the same string twice and disagree.
+        """
+        import inspect
+
+        for fn in (get_anthropic_tools, resolve_tools):
+            assert "tool_profile" not in inspect.signature(fn).parameters
+
+    def test_disabled_tools_still_applies_after_the_coercion(self):
         names = {
             t["name"]
             for t in get_anthropic_tools(
-                tool_profile="code", disabled_tools={"read_artifact"}
+                code_execution=True, disabled_tools={"read_artifact"}
             )
         }
 

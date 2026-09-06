@@ -43,7 +43,7 @@ def _schemas():
     """Both surfaces at once: `run_analysis` is on one and every other bound on the other."""
     return {
         t["name"]: t["input_schema"]
-        for t in get_anthropic_tools() + get_anthropic_tools(tool_profile="code")
+        for t in get_anthropic_tools() + get_anthropic_tools(code_execution=True)
     }
 
 

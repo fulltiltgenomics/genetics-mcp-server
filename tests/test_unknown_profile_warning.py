@@ -15,7 +15,10 @@ import logging
 import pytest
 
 from genetics_mcp_server.tools import definitions
-from genetics_mcp_server.tools.definitions import get_anthropic_tools
+from genetics_mcp_server.tools.definitions import (
+    code_execution_requested,
+    get_anthropic_tools,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -31,13 +34,17 @@ def _warnings(caplog):
 
 def test_unknown_profile_warns_naming_the_value_and_the_known_set(caplog):
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
-        get_anthropic_tools(tool_profile="cdoe")
+        code_execution_requested("cdoe")
 
     records = _warnings(caplog)
     assert len(records) == 1
     message = records[0].getMessage()
     assert "cdoe" in message
-    # the known set has to be IN the warning: "unknown profile" alone does not tell an
+    # what it RESOLVED TO has to be in the warning, not just that the value was unknown:
+    # the degrade is silent to the caller, so this line is the only place an operator
+    # learns the turn ran without code execution
+    assert "no-code" in message
+    # the known set has to be IN the warning too: "unknown profile" alone does not tell an
     # operator whether the browser or the server is the side that drifted
     for known in definitions.KNOWN_TOOL_PROFILES:
         assert known in message
@@ -46,15 +53,15 @@ def test_unknown_profile_warns_naming_the_value_and_the_known_set(caplog):
 def test_the_same_unknown_value_warns_only_once(caplog):
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
         for _ in range(25):
-            get_anthropic_tools(tool_profile="cdoe")
+            code_execution_requested("cdoe")
 
     assert len(_warnings(caplog)) == 1
 
 
 def test_a_second_distinct_unknown_value_still_warns(caplog):
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
-        get_anthropic_tools(tool_profile="cdoe")
-        get_anthropic_tools(tool_profile="bigqeury")
+        code_execution_requested("cdoe")
+        code_execution_requested("bigqeury")
 
     assert {"cdoe", "bigqeury"} <= {r.getMessage().split("'")[1] for r in _warnings(caplog)}
 
@@ -62,7 +69,7 @@ def test_a_second_distinct_unknown_value_still_warns(caplog):
 def test_known_profiles_and_no_profile_stay_quiet(caplog):
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
         for profile in (None, *definitions.KNOWN_TOOL_PROFILES):
-            get_anthropic_tools(tool_profile=profile)
+            code_execution_requested(profile)
 
     assert _warnings(caplog) == []
 
@@ -71,7 +78,7 @@ def test_distinct_unknown_values_are_bounded(caplog):
     """A client inventing a value per request must not flood the log or grow the set."""
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
         for i in range(definitions._MAX_WARNED_UNKNOWN_PROFILES + 20):
-            get_anthropic_tools(tool_profile=f"junk-{i}")
+            code_execution_requested(f"junk-{i}")
 
     assert len(_warnings(caplog)) == definitions._MAX_WARNED_UNKNOWN_PROFILES
     assert len(definitions._WARNED_UNKNOWN_PROFILES) == definitions._MAX_WARNED_UNKNOWN_PROFILES
@@ -80,9 +87,12 @@ def test_distinct_unknown_values_are_bounded(caplog):
 def test_the_degrade_itself_is_unchanged(caplog):
     """The warning is additive: an unknown profile still resolves to the no-code surface."""
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
-        names = {t["name"] for t in get_anthropic_tools(tool_profile="cdoe")}
+        code_execution = code_execution_requested("cdoe")
 
-    assert names == {t["name"] for t in get_anthropic_tools(tool_profile="nocode")}
+    assert code_execution is code_execution_requested("nocode")
+    assert {t["name"] for t in get_anthropic_tools(code_execution=code_execution)} == {
+        t["name"] for t in get_anthropic_tools(code_execution=False)
+    }
 
 
 def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
@@ -116,9 +126,7 @@ def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
         "nocode",
         "code",
     }
-    # the four legacy names now resolve to the same surface as "nocode": the shim keeps
+    # the four legacy names now resolve to the same surface as "nocode": the edge keeps
     # them accepted, and only "code" resolves anywhere else
     for legacy in ("api", "bigquery", "rag"):
-        assert {t["name"] for t in get_anthropic_tools(tool_profile=legacy)} == {
-            t["name"] for t in get_anthropic_tools(tool_profile="nocode")
-        }
+        assert code_execution_requested(legacy) is code_execution_requested("nocode")

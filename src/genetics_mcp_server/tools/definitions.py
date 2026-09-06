@@ -1971,18 +1971,17 @@ Available skills:
     },
 ]
 
-# the profile names chat clients still send. THE SHIM, and nothing else: the surface is
-# resolved by `resolve_tools` from one boolean, and this maps the wire values onto it —
-# "code" is code execution, every other value (including None and a value this server has
-# never heard of) resolves to the no-code surface, which is the safe direction. Coercing
-# the value at the edge, refusing an unknown one, and dropping the parameter belong to
-# later work; this exists so a stored value from an older client keeps resolving.
+# the values a client may still put on the wire in `tool_profile`. NOT a set of surfaces:
+# `code_execution_requested` below maps every one of them onto the single boolean the
+# surface is resolved from. It survives because two callers have to tell a value this
+# server recognises from one it does not — the admin's DEFAULT_TOOL_PROFILE validation
+# (routers/llm_config.py) and `known_profile` on /chat/v1/tools/resolved.
 KNOWN_TOOL_PROFILES: frozenset[str] = frozenset(
     {"api", "bigquery", "rag", "nocode", "code"}
 )
 
-# unknown profile values already warned about. The degrade stays silent to the caller on
-# purpose (see get_anthropic_tools' docstring), but an operator has to be able to see the
+# unknown profile values already warned about. The coercion stays silent to the caller on
+# purpose (see `code_execution_requested`), but an operator has to be able to see the
 # drift, and the value arrives on EVERY turn of a session that stored it — a per-request
 # warning would bury itself and stop being read. Bounded so a client that invents a new
 # value per request floods neither the log nor this set.
@@ -1997,12 +1996,34 @@ def _warn_unknown_profile(tool_profile: str) -> None:
         return
     _WARNED_UNKNOWN_PROFILES.add(tool_profile)
     logger.warning(
-        "Unrecognised tool_profile %r - resolving as the no-code surface. Known profiles: "
-        "%s. A client that offers a profile this server does not know has drifted from it; "
-        "GET /chat/v1/tools/resolved?tool_profile=<value> reports the same thing per request.",
+        "Unrecognised tool_profile %r - resolved to the no-code surface, so this request "
+        "gets the data tools and no code execution. Only %r selects code execution; %s are "
+        "the values this server recognises. A client offering anything else has drifted "
+        "from it; GET /chat/v1/tools/resolved?tool_profile=<value> reports the same thing "
+        "per request.",
         tool_profile,
+        "code",
         ", ".join(sorted(KNOWN_TOOL_PROFILES)),
     )
+
+
+def code_execution_requested(tool_profile: str | None) -> bool:
+    """Coerce the wire `tool_profile` to the boolean the surface is resolved from.
+
+    THE EDGE, and the only place a profile name means anything to the surface: `"code"` is
+    code execution and EVERYTHING else — `None`, the legacy `api`/`bigquery`/`rag`,
+    `"nocode"`, and a value this server has never heard of — is the no-code surface.
+
+    The fallback is universal on purpose. The value is read back from `chat_messages` rows
+    and from `user_settings.chat_tool_profile` written by older clients, and no-code is the
+    direction where a stale row loses code execution rather than acquiring it. Nothing
+    rewrites the stored string: history and the `tool_profile IS NULL` analysis still read
+    what the client sent, only its resolution is decided here. An unrecognised value logs a
+    WARNING once per distinct value and is otherwise silent to the model and the caller.
+    """
+    if tool_profile is not None and tool_profile not in KNOWN_TOOL_PROFILES:
+        _warn_unknown_profile(tool_profile)
+    return tool_profile == "code"
 
 
 def all_local_tool_definitions() -> list[dict[str, Any]]:
@@ -2071,30 +2092,26 @@ def tool_category(name: str) -> str | None:
 
 def get_anthropic_tools(
     custom_descriptions: dict[str, str] | None = None,
-    tool_profile: str | None = None,
+    # keyword-only: every profile string is truthy, so an old-style positional call
+    # `get_anthropic_tools(None, "nocode")` would resolve to the CODE surface
+    *,
+    code_execution: bool = False,
     disabled_tools: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Return the tool definitions a request carrying `tool_profile` is handed, in Anthropic's
-    format.
+    Return one surface's tool definitions in Anthropic's format.
 
-    THE PROFILE SHIM. There are two surfaces and `resolve_tools` decides between them from
-    one boolean; this maps the profile value clients still send onto it. `"code"` is code
-    execution; every other value — `None`, the legacy `api`/`bigquery`/`rag`, `nocode`, and
-    anything this server has never heard of — resolves to the no-code surface, which is the
-    safe direction for a value read back from a row an older client wrote. An unrecognised
-    value logs a WARNING once per distinct value; it stays silent to the model and to the
-    caller.
+    `resolve_tools` in Anthropic clothing, and nothing more: no profile name reaches here,
+    because a request's name was coerced to this boolean by `code_execution_requested` at
+    the edge it arrived on.
 
     Args:
         custom_descriptions: Optional dict mapping tool names to custom descriptions
-        tool_profile: Legacy wire value; see above.
+        code_execution: Which of the two surfaces; see `resolve_tools`.
         disabled_tools: Optional set of tool names to exclude, applied after the surface.
     """
-    if tool_profile is not None and tool_profile not in KNOWN_TOOL_PROFILES:
-        _warn_unknown_profile(tool_profile)
     return _to_anthropic_format(
-        resolve_tools(tool_profile == "code", disabled_tools), custom_descriptions
+        resolve_tools(code_execution, disabled_tools), custom_descriptions
     )
 
 

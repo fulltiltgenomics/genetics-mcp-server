@@ -23,6 +23,7 @@ from genetics_mcp_server.tools import executor as executor_module
 from genetics_mcp_server.tools import orchestration as orchestration_module
 from genetics_mcp_server.tools.definitions import (
     CODE_EXECUTION_TOOL_DEFINITIONS,
+    code_execution_requested,
     get_anthropic_tools,
     resolve_tools,
 )
@@ -69,7 +70,7 @@ class TestToolDefinitions:
         assert params["name"]["required"] is True
 
     def test_anthropic_schema_shape(self):
-        tools = {t["name"]: t for t in get_anthropic_tools(tool_profile="code")}
+        tools = {t["name"]: t for t in get_anthropic_tools(code_execution=True)}
         assert tools["read_artifact"]["input_schema"]["required"] == ["name"]
         capabilities = tools["list_capabilities"]["input_schema"]
         assert capabilities["required"] == []
@@ -623,6 +624,7 @@ class TestReadArtifactRequiresTheGatewaySecret:
                 None,
                 "real@finngen.fi",
                 "conv-7",
+                advertised_tools={"read_artifact"},
             )
         finally:
             settings_module.get_settings.cache_clear()
@@ -926,12 +928,12 @@ class TestRunAnalysisDefinition:
         still withhold it there (see TestRunAnalysisSandboxFlag).
         """
         assert "run_analysis" in {
-            t["name"] for t in get_anthropic_tools(tool_profile="code")
+            t["name"] for t in get_anthropic_tools(code_execution=True)
         }
         enabled = Settings(sandbox_enabled=True).disabled_tools
         names = {
             t["name"]
-            for t in get_anthropic_tools(tool_profile="code", disabled_tools=enabled)
+            for t in get_anthropic_tools(code_execution=True, disabled_tools=enabled)
         }
         assert "run_analysis" in names
 
@@ -964,7 +966,10 @@ class TestRunAnalysisSandboxFlag:
         for profile in (None, "api", "bigquery", "rag", "code"):
             names = {
                 t["name"]
-                for t in get_anthropic_tools(tool_profile=profile, disabled_tools=disabled)
+                for t in get_anthropic_tools(
+                    code_execution=code_execution_requested(profile),
+                    disabled_tools=disabled,
+                )
             }
             assert "run_analysis" not in names, profile
 
@@ -1022,7 +1027,12 @@ class TestRunAnalysisSandboxFlag:
         settings_module.get_settings.cache_clear()
         try:
             result = await service._execute_tool(
-                "run_analysis", {"code": "print(1)"}, None, "real@finngen.fi", "conv-7"
+                "run_analysis",
+                {"code": "print(1)"},
+                None,
+                "real@finngen.fi",
+                "conv-7",
+                advertised_tools={"run_analysis"},
             )
         finally:
             settings_module.get_settings.cache_clear()
@@ -1627,6 +1637,7 @@ class TestSandboxDispatchRequiresTheGatewaySecret:
                 "anyone@finngen.fi",
                 "anything",
                 asserted,
+                advertised_tools={"run_analysis"},
             )
         return asserted, result
 
@@ -1792,6 +1803,7 @@ class TestRunAnalysisIdentity:
                 None,
                 "real@finngen.fi",
                 "conv-7",
+                advertised_tools={"run_analysis"},
             )
         finally:
             settings_module.get_settings.cache_clear()
@@ -1893,7 +1905,13 @@ class TestReadArtifactSessionInjection:
         service.executor = executor
         service.subagent_service = None
         return await service._execute_tool(
-            "read_artifact", tool_input, None, user, session_id, False
+            "read_artifact",
+            tool_input,
+            None,
+            user,
+            session_id,
+            False,
+            advertised_tools={"read_artifact"},
         )
 
     async def test_the_authenticated_session_is_injected(self, executor):

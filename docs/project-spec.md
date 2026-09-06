@@ -325,14 +325,29 @@ prefers. Enabling it means setting `SANDBOX_ENABLED=true` on chat-backend, the s
 db-api and results-api already gate sandbox-token verification on.
 
 Withholding the name from the list is not sufficient on its own, so `_execute_tool`
-refuses to dispatch anything in `settings.disabled_tools` before it resolves a handler —
-the same allowlist shape `subagent.py` carries for the same reason. Without it the
-`getattr(self.executor, tool_name)` lookup runs whatever the model names: `ChatMessage`
-accepts raw content blocks and `_sanitize_tool_blocks` drops only *orphaned* `tool_use`,
-so a client-supplied history containing a paired `run_analysis` `tool_use`/`tool_result`
-survives verbatim and primes the model for a tool it was never given. The refusal is
-`retryable: false` (`SandboxNotConfigured` for `run_analysis`, `ToolNotEnabled` otherwise)
-because a withheld tool is a deployment fact and must not read as a passing outage.
+refuses two ways before it resolves a handler — the same allowlist shape `subagent.py`
+carries for the same reason. Without them the `getattr(self.executor, tool_name)` lookup
+runs whatever the model names: `ChatMessage` accepts raw content blocks and
+`_sanitize_tool_blocks` drops only *orphaned* `tool_use`, so a client-supplied history
+containing a paired `tool_use`/`tool_result` survives verbatim and primes the model for a
+tool it was never given.
+
+1. anything in `settings.disabled_tools` — the deployment's exclusion, refused as
+   `ToolNotEnabled`;
+2. anything outside **the set this request advertised** — the resolved local surface plus
+   whichever proxied surfaces it carried, threaded from `_stream_anthropic`'s own tool
+   list into every dispatch as `advertised_tools`, refused as `ToolNotAvailable`.
+
+The second is what makes the surface enforced rather than advisory, and it is read from
+the resolved set rather than from `tool_profile`: the surface is decided once, at the edge,
+and re-deriving it at dispatch is how the two would come to disagree. It is also what makes
+"the code surface does not use the old per-dataset tools" true of execution and not only of
+the advertised list, and in the other direction it keeps `run_analysis` — whose dispatch
+mints a per-execution credential under the authenticated user — out of a no-code turn.
+Both refusals are `retryable: false` (`SandboxNotConfigured` for `run_analysis`) because a
+withheld tool is a fact about the deployment or the surface and must not read as a passing
+outage, and both come back as an ordinary `tool_result` the model reads rather than as an
+exception that would cost the user the turn.
 
 | Tool | Description |
 |------|-------------|
@@ -690,14 +705,26 @@ explicitly in `skills/definitions.py` and narrows from `all_anthropic_tools()`, 
 local set, because a skill names `run_analysis` alongside data tools and no single surface
 carries both.
 
-### The `tool_profile` shim
+### The `tool_profile` edge
 
-The chat API still takes a `tool_profile` parameter, and `get_anthropic_tools` maps it onto
-the boolean: **`"code"` is code execution; every other value resolves to the no-code
-surface** — `None`, the retired `api`/`bigquery`/`rag`, `nocode`, and any value this server
-has never heard of. That is the safe direction for a value read back from a `chat_messages`
-row written by an older client. Coercing the value at the edge and dropping the parameter is
-separate work; `KNOWN_TOOL_PROFILES` is the shim's own list of the values clients still send.
+The chat API still takes a `tool_profile` string, and `code_execution_requested()` coerces
+it to the boolean **once, where the request arrives**: **`"code"` is code execution; every
+other value resolves to the no-code surface** — `None`, the retired `api`/`bigquery`/`rag`,
+`nocode`, and any value this server has never heard of. That is the safe direction for a
+value read back from a `chat_messages` row written by an older client.
+
+Downstream of that edge nothing reads the name for a surface decision: `resolve_local_tools`,
+`resolve_local_tool_names`, `get_anthropic_tools` and `stream_chat` all take
+`code_execution`, and `resolve_tools` takes it too. Two things still take the string, and
+neither decides a local surface — `resolve_proxied_tools`, whose collapse onto the boolean is
+separate work, and the turn-metrics row, which records what the client actually sent.
+
+**The stored value is never rewritten.** `chat_messages.tool_profile` and
+`user_settings.chat_tool_profile` keep the string the client wrote, legacy names included,
+so history and the `tool_profile IS NULL` analysis still read a choice rather than a
+resolution. `KNOWN_TOOL_PROFILES` survives for the two callers that must tell a recognised
+value from an unrecognised one — the `DEFAULT_TOOL_PROFILE` admin validation and
+`known_profile` on `/chat/v1/tools/resolved` — and for the warning's own message.
 
 ### Tool categories
 
@@ -725,7 +752,7 @@ The proxied columns are still keyed on the profile NAME rather than on the boole
 them reach both surfaces is separate work. The resolved sets themselves are frozen in
 `tests/golden/tool_surface.json` — read the counts there rather than writing them here.
 
-The fallback row is deliberate — the value is read back from `chat_messages` rows written by older clients, so an unrecognised name must not raise — but it is no longer invisible (genetics-results-suite-4h6.74). Two things report it, neither of which changes the resolution: `get_anthropic_tools` logs a WARNING naming the value and the known set the first time it sees it, **once per distinct value** (not per request — a stored bad value arrives on every turn of its session, and a per-request warning would bury itself); and `GET /chat/v1/tools/resolved?tool_profile=<value>` returns `known_profile: false` alongside the resolved `count`/`names`. The browser calls that endpoint whenever a profile is picked or restored from the user's settings and warns next to the Tools control when the answer is false.
+The fallback row is deliberate — the value is read back from `chat_messages` rows written by older clients, so an unrecognised name must not raise — but it is no longer invisible (genetics-results-suite-4h6.74). Two things report it, neither of which changes the resolution: `code_execution_requested` logs a WARNING naming the value, what it resolved to (the no-code surface) and the recognised set, the first time it sees it, **once per distinct value** (not per request — a stored bad value arrives on every turn of its session, and a per-request warning would bury itself); and `GET /chat/v1/tools/resolved?tool_profile=<value>` returns `known_profile: false` alongside the resolved `count`/`names`. The browser calls that endpoint whenever a profile is picked or restored from the user's settings and warns next to the Tools control when the answer is false.
 
 That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, and `null` is the top row of this table — the no-code surface — so a user whose stored `chat_tool_profile` is a server-only name silently gets the no-code surface instead of the one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Since the collapse that direction can only cost a user the `code` surface: every other value
 resolves the same way whichever side invented it. Changing the accepted set here still
@@ -1575,10 +1602,10 @@ the internal channel `chat_api` assembles, not an override.
 `config/defaults.py` holds `_PROMPT_BLOCKS`, a tuple of `_Block`s rather than one string; a block
 is emitted only if every tool name appearing in its text is in `tool_names`, with `excludes`,
 `requires_any` and `requires_all` as further subtractive gates. `chat_api` gets that list from
-`LLMService.resolve_local_tool_names(tool_profile, enable_tools)`, the same profile +
+`LLMService.resolve_local_tool_names(code_execution, enable_tools)`, the same surface +
 `settings.disabled_tools` + subagent-liveness resolution that builds the tool list itself, so on
 the **Anthropic** path the prompt cannot describe a tool the model was not given. It does not
-hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor `tool_profile`
+hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor a surface
 and never sets `tools`, so that provider receives the prompt assembled for the full local set
 while getting no tools at all — pre-existing, and unchanged by 4h6.69, but unreachable since
 `genetics-results-suite-c4s` 400s `provider="openai"` before the stream opens; the mismatch is
@@ -2542,7 +2569,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_mcp_server.py` | MCP server initialization and tool registration |
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration |
 | `test_tools.py` | Tool executor methods |
-| `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still resolves to the no-code surface but logs a WARNING naming the value and the known set, once per distinct value and bounded; `KNOWN_TOOL_PROFILES` is pinned against a literal so changing the accepted set forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts`, and the collapse of the legacy names onto the no-code surface is asserted rather than assumed |
+| `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still coerces to the no-code surface but logs a WARNING naming the value, what it resolved to and the recognised set, once per distinct value and bounded; `KNOWN_TOOL_PROFILES` is pinned against a literal so changing the accepted set forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts`, and the collapse of the legacy names onto the no-code surface is asserted rather than assumed |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
 | `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s HTTP proxy and its `(sub, sid)`-scoped resolution (another **user** presenting this session id, and another session's name, both indistinguishable from a missing one — the cross-user negative for `genetics-results-suite-dh3` — the fail-closed answer when either half of the key is absent, the most-recent-wins collision tiebreak, TTL expiry, the bounded map, the 512 KiB cap and the `409`/`413` mappings), the `artifacts_retained_in_clear` signal rendered only when true, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair into **both** `run_analysis` and `read_artifact` |
@@ -2551,7 +2578,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
-| `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
+| `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting; and the dispatch guard — a tool outside the set the request advertised is refused as a `tool_result` and never reaches the executor, in both directions, with the check reading the resolved set rather than any profile string |
 | `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |

@@ -39,7 +39,7 @@ from genetics_mcp_server.tools import (
     ServerToolExecutor,
     get_anthropic_tools,
 )
-from genetics_mcp_server.tools.definitions import tool_category
+from genetics_mcp_server.tools.definitions import code_execution_requested, tool_category
 from genetics_mcp_server.tools.orchestration import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
@@ -579,6 +579,10 @@ def _script_result_payload(
     `error_type` for those, so a consumer classifies on the STATUS STRING, never on `ran`
     alone. Every non-run shape sets `error_type`, so the `"unknown"` fallback below means a
     genuinely unrecognised shape rather than "a blank script got here".
+
+    ONE CONFLATION SURVIVES IN `error_type`: `_refused_tool_result` stamps every
+    run_analysis refusal `SandboxNotConfigured`, so the no-code arm's reader sees that type
+    for an off-surface refusal on a deployment whose sandbox is configured and healthy.
     """
     status = result.get("status")
     ran = isinstance(status, str)
@@ -651,6 +655,24 @@ class ResolvedLocalTools:
         return {t["name"] for t in self.definitions}
 
 
+def _refused_tool_result(
+    tool_name: str, error: str, error_type: str
+) -> dict[str, Any]:
+    """A refusal the model reads as a tool_result, not as something to retry.
+
+    run_analysis carries the sandbox's own operator-error type whatever the reason,
+    because that is what the script_result chunk and the benchmark read; the point of both
+    is that a withheld tool must not look transient, or the model retries a fact about the
+    deployment or the surface.
+    """
+    return {
+        "success": False,
+        "error": error,
+        "error_type": "SandboxNotConfigured" if tool_name == "run_analysis" else error_type,
+        "retryable": False,
+    }
+
+
 class LLMService:
     """Service for LLM chat streaming with multi-provider support."""
 
@@ -719,11 +741,16 @@ class LLMService:
 
     def resolve_local_tools(
         self,
-        tool_profile: str | None = None,
+        *,
+        code_execution: bool = False,
         enable_tools: bool = True,
         custom_tool_descriptions: dict[str, str] | None = None,
     ) -> ResolvedLocalTools:
         """Resolve this request's local tool definitions ONCE.
+
+        Keyed on the boolean and never on a profile name: the wire value is coerced by
+        `code_execution_requested` at the edge it arrives on, so nothing downstream can
+        read the name a second time and reach a different surface.
 
         The prompt gate (genetics-results-suite-4h6.69) requires the system prompt to be
         assembled against the tools the model is actually handed. Returning one object
@@ -737,7 +764,7 @@ class LLMService:
         return ResolvedLocalTools(
             get_anthropic_tools(
                 custom_tool_descriptions,
-                tool_profile=tool_profile,
+                code_execution=code_execution,
                 disabled_tools=self._disabled_tools(),
             )
         )
@@ -759,8 +786,14 @@ class LLMService:
         the model is not given, or miss one it is. `source` distinguishes them because only
         the local half has a category to group by — proxied tools carry the remote server's
         own name and description and are not part of any profile category.
+
+        Takes the wire value rather than the boolean because it is called straight off a
+        query parameter and the proxied half is still keyed on the name; the local half is
+        coerced here through the same edge function a chat request goes through.
         """
-        local = self.resolve_local_tools(tool_profile, enable_tools)
+        local = self.resolve_local_tools(
+            code_execution=code_execution_requested(tool_profile), enable_tools=enable_tools
+        )
         tools: list[dict[str, Any]] = [
             {
                 "name": t["name"],
@@ -789,14 +822,16 @@ class LLMService:
         return tools
 
     def resolve_local_tool_names(
-        self, tool_profile: str | None = None, enable_tools: bool = True
+        self, *, code_execution: bool = False, enable_tools: bool = True
     ) -> set[str]:
         """Local tool names this service would advertise for such a request.
 
         External and RAG tools are excluded: they are proxied surfaces the system prompt
         does not name tool-by-tool.
         """
-        return self.resolve_local_tools(tool_profile, enable_tools).names
+        return self.resolve_local_tools(
+            code_execution=code_execution, enable_tools=enable_tools
+        ).names
 
     async def stream_chat(
         self,
@@ -808,6 +843,8 @@ class LLMService:
         custom_tool_descriptions: dict[str, str] | None = None,
         literature_backend: str | None = None,
         tool_profile: str | None = None,
+        *,
+        code_execution: bool,
         secret: bool = False,
         user: str | None = None,
         session_id: str | None = None,
@@ -829,8 +866,15 @@ class LLMService:
             enable_tools: Whether to enable MCP tools (Anthropic only)
             custom_tool_descriptions: Custom descriptions for tools
             literature_backend: Backend for literature search ('europepmc' or 'perplexity')
-            tool_profile: Legacy profile value; "code" resolves to the code-execution
-                surface and every other value, None included, to the no-code one.
+            tool_profile: The wire value verbatim, and NOT a surface decision: it is
+                recorded with the turn's metrics and still keys `resolve_proxied_tools`,
+                which the collapse to one boolean has not reached. The local surface comes
+                from `code_execution` below, coerced at the edge, so a request cannot get
+                its tools from one reading of this value and its prompt from another.
+            code_execution: Which of the two surfaces this request is on, from
+                `code_execution_requested(tool_profile)` at the edge. Only consulted when
+                no `local_tools` is supplied, and to enforce the advertised set at
+                dispatch.
             secret: If True, suppress detailed logging to avoid persisting chat content.
             user: Authenticated user email for logging.
             session_id: Client conversation id, logged (id only) to count distinct conversations.
@@ -872,8 +916,14 @@ class LLMService:
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile, secret, user, session_id,
-                user_instructions, message_id, capture_thinking,
+                literature_backend, tool_profile,
+                code_execution=code_execution,
+                secret=secret,
+                user=user,
+                session_id=session_id,
+                user_instructions=user_instructions,
+                message_id=message_id,
+                capture_thinking=capture_thinking,
                 gateway_asserted=gateway_asserted,
                 local_tools=local_tools,
             ):
@@ -945,6 +995,8 @@ class LLMService:
         custom_tool_descriptions: dict[str, str] | None = None,
         literature_backend: str | None = None,
         tool_profile: str | None = None,
+        *,
+        code_execution: bool,
         secret: bool = False,
         user: str | None = None,
         session_id: str | None = None,
@@ -1027,6 +1079,11 @@ class LLMService:
 
         # add tool definitions if enabled
         tool_definitions = None
+        # the names this request actually advertised, local and proxied alike; every
+        # dispatch below is checked against it. Empty when tools are off, which is the
+        # right answer rather than a missing one: a turn handed no tools may dispatch
+        # none, whatever a replayed history names.
+        advertised_tools: set[str] = set()
         if enable_tools and settings.mcp_enabled:
             # the caller's resolution when it has one, so the tools the model gets are the
             # same objects the system prompt's tool names were projected off; resolving
@@ -1046,7 +1103,9 @@ class LLMService:
             #     tools and zero local ones, where pre-4h6.77 it yielded the full local
             #     set. Dormant: chat_api passes `request.enable_tools` to both.
             resolved = local_tools if local_tools is not None else self.resolve_local_tools(
-                tool_profile, enable_tools, custom_tool_descriptions
+                code_execution=code_execution,
+                enable_tools=enable_tools,
+                custom_tool_descriptions=custom_tool_descriptions,
             )
             tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
@@ -1062,10 +1121,12 @@ class LLMService:
                     "cache_control": {"type": "ephemeral"},
                 }
             request_params["tools"] = tool_definitions
+            advertised_tools = {t["name"] for t in tool_definitions}
             if not secret:
                 logger.info(
                     f"Including {len(tool_definitions)} MCP tools "
-                    f"(profile={tool_profile or 'all'}, {local_count} local, "
+                    f"(surface={'code' if code_execution else 'nocode'}, "
+                    f"tool_profile={tool_profile or 'unset'}, {local_count} local, "
                     f"{len(external_tools)} external, {len(rag_tools)} RAG)"
                 )
 
@@ -1392,7 +1453,11 @@ class LLMService:
                 subagent_tool = None
                 regular_tool_uses = []
                 for tu in tool_uses:
-                    if tu.name == "launch_subagents" and self.subagent_service:
+                    if (
+                        tu.name == "launch_subagents"
+                        and self.subagent_service
+                        and tu.name in advertised_tools
+                    ):
                         subagent_tool = tu
                     else:
                         regular_tool_uses.append(tu)
@@ -1439,7 +1504,7 @@ class LLMService:
                     if regular_tool_uses:
                         regular_task = asyncio.create_task(
                             asyncio.gather(
-                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
+                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted, advertised_tools=advertised_tools) for tu in regular_tool_uses)
                             )
                         )
                     else:
@@ -1462,7 +1527,7 @@ class LLMService:
                 else:
                     # no subagent tool — execute all tools in parallel as before
                     regular_results = await asyncio.gather(
-                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
+                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted, advertised_tools=advertised_tools) for tu in regular_tool_uses)
                     )
                     for tu, res in zip(regular_tool_uses, regular_results):
                         raw_results_map[tu.id] = res
@@ -1665,39 +1730,55 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         gateway_asserted: bool = False,
+        *,
+        advertised_tools: set[str],
     ) -> dict[str, Any]:
-        """Execute a tool by name using the executor or external proxy."""
+        """Execute a tool by name using the executor or external proxy.
+
+        `advertised_tools` is the set this request actually handed the model — the
+        resolved local surface plus whichever proxied surfaces it advertised — and it is
+        required rather than defaulted so no caller can dispatch without stating one.
+        """
+        log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
         try:
-            # dispatch only what the resolved tool list actually advertised, the same
-            # allowlist shape subagent.py's `_execute_subagent_tool` carries and for the
-            # same reason: the local branch below calls any executor attribute the model
-            # names, which makes withholding a tool advisory rather than enforced. The
-            # model does not have to invent the name — ChatMessage.content accepts raw
-            # blocks and _sanitize_tool_blocks drops only ORPHANED tool_use, so a
-            # client-supplied history with a paired run_analysis tool_use/tool_result
-            # survives verbatim and primes the model for a tool it was not given.
-            # disabled_tools is the profile-independent complement (it is applied before
-            # the profile filter at the resolution site above), so a name in it is
-            # advertised by no profile.
             disabled = get_settings().disabled_tools
             if tool_name in disabled:
                 logger.warning(
-                    f"Refusing to dispatch '{tool_name}': not enabled in this deployment"
+                    f"{log_prefix}Refusing to dispatch '{tool_name}': "
+                    f"not enabled in this deployment"
                 )
-                return {
-                    "success": False,
-                    "error": f"Tool '{tool_name}' is not available in this deployment.",
-                    # run_analysis carries the sandbox's own operator-error type because
-                    # that is what the script_result chunk and the benchmark read; the
-                    # point of both is that a withheld tool must not look transient, or
-                    # the model retries a deployment fact (genetics-results-suite-4h6.56)
-                    "error_type": (
-                        "SandboxNotConfigured"
-                        if tool_name == "run_analysis"
-                        else "ToolNotEnabled"
-                    ),
-                    "retryable": False,
-                }
+                return _refused_tool_result(
+                    tool_name,
+                    f"Tool '{tool_name}' is not available in this deployment.",
+                    "ToolNotEnabled",
+                )
+
+            # dispatch only what this request advertised, the same allowlist shape
+            # subagent.py's `_execute_subagent_tool` carries and for the same reason: the
+            # local branch below calls any executor attribute the model names, so without
+            # this the surface would be advisory — a name it withheld still executes. The
+            # model does not have to invent the name: ChatMessage.content accepts raw
+            # blocks and _sanitize_tool_blocks drops only ORPHANED tool_use, so a
+            # client-supplied history with a paired tool_use/tool_result survives verbatim
+            # and primes the model for a tool this surface does not carry. On the code
+            # surface that is the whole of requirement 2 — the old per-dataset tools are
+            # not merely unlisted, they cannot run — and in the other direction it is what
+            # keeps run_analysis, whose dispatch mints a per-execution credential under
+            # this user, out of a no-code turn.
+            #
+            # The check reads the RESOLVED set and never the profile string: the surface
+            # was decided once, at the edge, and re-deriving it here from a name is how
+            # the two would come to disagree.
+            if tool_name not in advertised_tools:
+                logger.warning(
+                    f"{log_prefix}Refusing to dispatch '{tool_name}': not in the tool "
+                    f"surface this request advertised"
+                )
+                return _refused_tool_result(
+                    tool_name,
+                    f"Tool '{tool_name}' is not available in this conversation.",
+                    "ToolNotAvailable",
+                )
 
             # subagent tool
             if tool_name == "launch_subagents":

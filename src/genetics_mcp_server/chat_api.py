@@ -57,7 +57,10 @@ from genetics_mcp_server.routers import (
     llm_config_router,
 )
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
-from genetics_mcp_server.tools.definitions import KNOWN_TOOL_PROFILES
+from genetics_mcp_server.tools.definitions import (
+    KNOWN_TOOL_PROFILES,
+    code_execution_requested,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,11 +306,12 @@ class ChatRequest(BaseModel):
     )
     tool_profile: str | None = Field(
         None,
-        description="Tool profile controlling which tools are available. 'code' "
-        "selects the code-execution surface; every other value, None included, selects "
-        "the no-code surface. An unrecognised value is warned about once server-side and "
-        "treated as no-code. The legacy names 'api', 'bigquery' and 'rag' are still "
-        "accepted, but only until the edge coerces this field to a boolean.",
+        description="Which tool surface this turn runs on. The server reads exactly one "
+        "thing from it: 'code' selects the code-execution surface and every other value "
+        "— None, the legacy 'api'/'bigquery'/'rag', 'nocode', and anything unrecognised "
+        "— selects the no-code surface. An unrecognised value is warned about once "
+        "server-side and is otherwise silent. The field stays a string because it is "
+        "stored per message and per user and older rows still carry the legacy names.",
     )
     verbosity: str | None = Field(
         None,
@@ -473,8 +477,8 @@ async def list_resolved_tools(
     `resolve_local_tools(...).names` (genetics-results-suite-4h6.69, -4h6.77) — so what it
     reports is what the model was handed.
 
-    IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `get_anthropic_tools` resolves an
-    unrecognised profile as the no-code surface rather than raising, deliberately, because
+    IT EXISTS TO MAKE THE SILENT FALLBACK LOUD. `code_execution_requested` coerces an
+    unrecognised profile to the no-code surface rather than raising, deliberately, because
     the value is read back from `chat_messages` rows written by older clients — so a typo
     asking for code execution silently gets the data tools instead, while the request
     succeeds. A benchmark arm
@@ -489,7 +493,11 @@ async def list_resolved_tools(
     for the per-profile external/RAG columns.
     """
     service = get_llm_service()
-    names = sorted(service.resolve_local_tool_names(tool_profile, enable_tools))
+    names = sorted(
+        service.resolve_local_tool_names(
+            code_execution=code_execution_requested(tool_profile), enable_tools=enable_tools
+        )
+    )
     known = tool_profile is None or tool_profile in KNOWN_TOOL_PROFILES
     return {
         "tool_profile": tool_profile,
@@ -654,7 +662,13 @@ async def stream_chat(
     # resolved object is handed to stream_chat below, so the names the prompt is built
     # from are projected off the very definitions the model receives — one derivation, not
     # two that happen to agree (genetics-results-suite-4h6.77).
-    local_tools = service.resolve_local_tools(request.tool_profile, request.enable_tools)
+    # THE EDGE: the wire value is read once, here, and everything downstream is handed
+    # the boolean. The string itself travels on unmodified to the stored row and to
+    # `resolve_proxied_tools`.
+    code_execution = code_execution_requested(request.tool_profile)
+    local_tools = service.resolve_local_tools(
+        code_execution=code_execution, enable_tools=request.enable_tools
+    )
     system_prompt = default_system_prompt(
         settings.app_name,
         tool_names=local_tools.names,
@@ -675,6 +689,7 @@ async def stream_chat(
                 enable_tools=request.enable_tools,
                 literature_backend=request.literature_backend,
                 tool_profile=request.tool_profile,
+                code_execution=code_execution,
                 secret=request.secret,
                 user=user,
                 session_id=request.session_id,

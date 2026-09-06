@@ -1033,7 +1033,7 @@ class _CapturingService:
         self.kwargs = None
 
     def resolve_local_tools(
-        self, tool_profile=None, enable_tools=True, custom_tool_descriptions=None
+        self, *, code_execution=False, enable_tools=True, custom_tool_descriptions=None
     ):
         """The real resolution, not a stub: the endpoint assembles the system prompt from
         it (genetics-results-suite-4h6.69), so a stub here would stop these tests from
@@ -1042,7 +1042,10 @@ class _CapturingService:
 
         self._disabled_tools = lambda: LLMService._disabled_tools(self)
         return LLMService.resolve_local_tools(
-            self, tool_profile, enable_tools, custom_tool_descriptions
+            self,
+            code_execution=code_execution,
+            enable_tools=enable_tools,
+            custom_tool_descriptions=custom_tool_descriptions,
         )
 
     def stream_chat(self, **kwargs):
@@ -1131,6 +1134,7 @@ async def _system_blocks(system_prompt, user_instructions):
         model="claude-opus-5",
         system_prompt=system_prompt,
         enable_tools=False,
+        code_execution=False,
         user_instructions=user_instructions,
     ):
         pass
@@ -1252,6 +1256,7 @@ class TestClientSystemRoleMessages:
             model="claude-opus-5",
             system_prompt="SERVER-ASSEMBLED-PROMPT",
             enable_tools=False,
+            code_execution=False,
         ):
             pass
 
@@ -1352,6 +1357,7 @@ class TestOpenAIUserInstructions:
             async for _ in svc.stream_chat(
                 messages=[{"role": "user", "content": "hi"}],
                 provider="openai",
+                code_execution=False,
                 user_instructions="USER ENVELOPE",
             ):
                 pass

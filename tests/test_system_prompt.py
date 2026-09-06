@@ -26,6 +26,7 @@ from genetics_mcp_server.config.defaults import (
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.tools.definitions import (
     all_local_tool_definitions,
+    code_execution_requested,
     get_anthropic_tools,
 )
 
@@ -60,7 +61,7 @@ def resolve(profile: str | None, *, subagents: bool, sandbox: bool = True) -> se
     return {
         t["name"]
         for t in get_anthropic_tools(
-            tool_profile=profile,
+            code_execution=code_execution_requested(profile),
             disabled_tools=flag_disabled_tools(subagents=subagents, sandbox=sandbox),
         )
     }

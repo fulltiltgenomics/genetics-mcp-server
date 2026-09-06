@@ -95,6 +95,7 @@ async def _collect(svc, **kwargs):
         model="claude-opus-5",
         system_prompt=None,
         enable_tools=False,
+        code_execution=False,
         **kwargs,
     ):
         chunks.append(chunk)
@@ -398,6 +399,7 @@ async def test_adaptive_thinking_omitted_for_older_model():
         model="claude-haiku-4-5",
         system_prompt=None,
         enable_tools=False,
+        code_execution=False,
     ):
         pass
     assert "thinking" not in svc.anthropic_client.messages.calls[0]
@@ -421,6 +423,7 @@ async def _collect_with_tool(svc):
         model="claude-opus-5",
         system_prompt=None,
         enable_tools=False,
+        code_execution=False,
     ):
         chunks.append(chunk)
     return chunks
