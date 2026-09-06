@@ -84,10 +84,6 @@
             "search_uniprot",
             "web_search"
           ]
-        },
-        "proxied": {
-          "external_tools": true,
-          "rag_tools": false
         }
       },
       "bigquery": {
@@ -159,10 +155,6 @@
             "search_uniprot",
             "web_search"
           ]
-        },
-        "proxied": {
-          "external_tools": true,
-          "rag_tools": false
         }
       },
       "code": {
@@ -188,10 +180,6 @@
             "search_uniprot",
             "web_search"
           ]
-        },
-        "proxied": {
-          "external_tools": false,
-          "rag_tools": false
         }
       },
       "nocode": {
@@ -263,10 +251,6 @@
             "search_uniprot",
             "web_search"
           ]
-        },
-        "proxied": {
-          "external_tools": true,
-          "rag_tools": false
         }
       },
       "null": {
@@ -338,10 +322,6 @@
             "search_uniprot",
             "web_search"
           ]
-        },
-        "proxied": {
-          "external_tools": true,
-          "rag_tools": true
         }
       },
       "rag": {
@@ -413,12 +393,12 @@
             "search_uniprot",
             "web_search"
           ]
-        },
-        "proxied": {
-          "external_tools": false,
-          "rag_tools": true
         }
       }
+    },
+    "proxied": {
+      "external_tools": true,
+      "rag_tools": true
     }
   },
   "local_tool_definitions": {

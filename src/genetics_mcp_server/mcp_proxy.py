@@ -408,7 +408,12 @@ async def {prefixed_name}({params_str}) -> dict:
         except Exception as e:
             logger.error(f"Failed to register proxy tool {prefixed_name}: {e}")
 
-    # register proxy client globally for LLM service use
+    # register proxy client globally for LLM service use.
+    # this loop does NOT re-apply `exclude_tools`, so a tool skipped above still gets a
+    # _proxy_clients entry. Harmless only because nothing in the mcp-server process
+    # dispatches through that registry — llm_service, which does, populates it from
+    # initialize_external_servers(), where the exclusion is applied. A dispatch path in
+    # THIS process reading _proxy_clients would make an excluded tool callable again.
     for tool in tools:
         tool_name = proxy_client.get_prefixed_name(tool.get("name", ""))
         _proxy_clients[tool_name] = proxy_client
@@ -530,13 +535,19 @@ def _parse_server_config(server_entry: str) -> tuple[str, str | None]:
     return server_entry, None
 
 
-def _initialize_rag_server() -> int:
+def _initialize_rag_server(exclude_tools: set[str] | None = None) -> int:
     """
     Initialize connection to the RAG MCP server from RAG_MCP_SERVER env var.
+
+    Args:
+        exclude_tools: Tool names EXTERNAL_MCP_EXCLUDE_TOOLS withholds. The RAG registry
+            honours the same list as the external one, so an excluded name enters neither
+            registry and no surface can advertise it.
 
     Returns:
         Number of tools registered from the RAG server
     """
+    exclude_tools = exclude_tools or set()
     rag_server = os.environ.get("RAG_MCP_SERVER", "")
     if not rag_server:
         logger.debug("RAG_MCP_SERVER not set, skipping RAG server initialization")
@@ -552,12 +563,20 @@ def _initialize_rag_server() -> int:
             logger.warning(f"No tools returned from RAG server {server_url}")
             return 0
 
+        registered = 0
         for tool in tools:
-            tool_name = proxy_client.get_prefixed_name(tool.get("name", ""))
-            _rag_proxy_clients[tool_name] = proxy_client
+            original_name = tool.get("name", "")
+            if original_name in exclude_tools:
+                logger.debug(f"Skipping excluded RAG tool: {original_name}")
+                continue
+            _rag_proxy_clients[proxy_client.get_prefixed_name(original_name)] = proxy_client
+            registered += 1
 
-        logger.info(f"Registered {len(tools)} RAG tools from {server_url}")
-        return len(tools)
+        logger.info(
+            f"Registered {registered} RAG tools from {server_url} "
+            f"(excluded {len(tools) - registered})"
+        )
+        return registered
 
     except Exception as e:
         logger.error(f"Failed to connect to RAG MCP server {server_url}: {e}", exc_info=True)
@@ -569,7 +588,7 @@ def initialize_external_servers() -> int:
     Initialize connections to external MCP servers from environment config.
 
     Reads EXTERNAL_MCP_SERVERS env var (always-on servers like gnomAD, Open Targets)
-    and RAG_MCP_SERVER env var (RAG server, only included in 'rag' tool profile).
+    and RAG_MCP_SERVER env var (RAG server, registered into its own registry).
 
     Returns:
         Number of tools registered from all external servers
@@ -619,7 +638,7 @@ def initialize_external_servers() -> int:
         logger.debug("EXTERNAL_MCP_SERVERS not set, skipping external server initialization")
 
     # initialize RAG server separately
-    total_tools += _initialize_rag_server()
+    total_tools += _initialize_rag_server(exclude_tools)
 
     logger.info(
         f"External MCP initialization complete: {total_tools} total tools "

@@ -25,7 +25,8 @@ resolve_local_tools` and `resolve_proxied_tools` — rather than through `get_an
 underneath them, so a collapse wired correctly in one and wrongly in the other is invisible
 to a baseline taken below them. The profile names in `PROFILES` reach the local half only
 through `code_execution_requested`, the edge every chat request goes through; the proxied
-half is still keyed on the name itself.
+half takes no surface argument at all, so it is recorded once for the whole chat backend
+rather than per profile — six copies of one answer would be six things to keep agreeing.
 """
 
 from __future__ import annotations
@@ -131,12 +132,12 @@ class _ResolverService:
 _PROXY_SENTINEL = [{"name": "_present"}]
 
 
-def _proxied_inclusion(tool_profile: str | None) -> dict[str, bool]:
-    """Which proxied groups `resolve_proxied_tools` hands a request on this profile.
+def _proxied_inclusion() -> dict[str, bool]:
+    """Which proxied groups `resolve_proxied_tools` hands a request — any request.
 
     The proxy registries are empty in a test process, so both groups come back empty whatever
-    the gate decided and the decision would be unrecordable. Sentinels make it observable
-    while leaving the gate under test the production one.
+    the rule decided and the decision would be unrecordable. Sentinels make it observable
+    while leaving the rule under test the production one.
     """
     with (
         patch.object(
@@ -146,7 +147,7 @@ def _proxied_inclusion(tool_profile: str | None) -> dict[str, bool]:
             llm_service_module, "get_rag_anthropic_tools", lambda: _PROXY_SENTINEL
         ),
     ):
-        external, rag = resolve_proxied_tools(tool_profile)
+        external, rag = resolve_proxied_tools()
     return {"external_tools": bool(external), "rag_tools": bool(rag)}
 
 
@@ -206,10 +207,10 @@ def build_surface() -> dict:
                         code_execution=code_execution_requested(profile)
                     ).definitions
                 ),
-                "proxied": _proxied_inclusion(profile),
             }
             for key, profile in PROFILES
         }
+        proxied = _proxied_inclusion()
 
     with _deployed_env("mcp_server") as mcp_settings:
         settings_disabled = sorted(mcp_settings.disabled_tools)
@@ -240,6 +241,7 @@ def build_surface() -> dict:
                 set(_DISABLED_TOOLS_ENV_VARS) - set(DEPLOYED_FLAGS["chat_backend"])
             ),
             "disabled_tools": chat_disabled,
+            "proxied": proxied,
             "profiles": profiles,
         },
         "mcp_server": {
@@ -278,10 +280,7 @@ def _diff(actual: dict, expected: dict) -> str:
 
 
 def _profile_diff(actual: dict, expected: dict) -> str:
-    return (
-        _diff(actual["local"], expected["local"])
-        + f"; proxied {expected['proxied']} -> {actual['proxied']}"
-    )
+    return _diff(actual["local"], expected["local"])
 
 
 class TestResolvedProfiles:
@@ -301,17 +300,17 @@ class TestResolvedProfiles:
         expected = golden["chat_backend"]["profiles"][key]
         assert actual == expected, f"profile {key} moved: " + _profile_diff(actual, expected)
 
-    @pytest.mark.parametrize("key", [key for key, _ in PROFILES])
-    def test_every_profile_gets_the_frozen_proxied_groups(self, key, resolved, golden):
-        """The second layer the collapse has to get right.
+    def test_the_proxied_groups_are_frozen_and_shared_by_both_surfaces(self, resolved, golden):
+        """The second layer the collapse has to get right, and it is now one answer.
 
-        `resolve_proxied_tools` is keyed on the profile too, so a collapse wired correctly in
-        the local resolver and wrongly here would hand a profile ~20 external tools it was
-        defined to exclude, with every local set still matching.
+        The externals have no route into the sandbox, so withholding them from the code
+        surface would leave it with no way to reach them; RAG follows RAG_MCP_SERVER alone.
+        Recorded outside `profiles` because the resolver takes no surface argument — a
+        per-profile record here would be the shape a per-profile rule grows back into.
         """
-        actual = resolved["chat_backend"]["profiles"][key]["proxied"]
-        expected = golden["chat_backend"]["profiles"][key]["proxied"]
-        assert actual == expected, f"profile {key} proxied groups moved: {expected} -> {actual}"
+        actual = resolved["chat_backend"]["proxied"]
+        expected = golden["chat_backend"]["proxied"]
+        assert actual == expected, f"proxied groups moved: {expected} -> {actual}"
 
     @pytest.mark.parametrize("key", ["null", "api", "bigquery", "rag"])
     def test_the_legacy_names_collapsed_onto_nocode(self, key, resolved, golden):
@@ -320,8 +319,8 @@ class TestResolvedProfiles:
         Before this change each of these resolved to a different local set; now the shim
         maps every value except "code" onto the no-code surface. The golden would show a
         legacy name drifting away from `nocode` only as an unexplained diff, so it is
-        asserted here too. Local tools only: the proxied groups are still keyed on the
-        profile NAME, so `rag` and `null` legitimately differ from `nocode` there.
+        asserted here too. Local tools are all a profile name reaches: the proxied half is
+        the same for every request.
         """
         assert (
             resolved["chat_backend"]["profiles"][key]["local"]
@@ -366,9 +365,11 @@ class TestMCPToolList:
     def test_every_hardcoded_exclusion_actually_excludes(self, resolved):
         """An excluded name that still registers is an inert control.
 
-        Only some handlers consult `disabled_tools`, so adding a name to the literal without
-        adding the guard beside its registration reads as a tightening and does nothing; the
-        frozen list above would show it only as a regeneration diff nobody has to explain.
+        Every handler now consults `disabled_tools` through one gate, so this holds by
+        construction rather than by each site having remembered a guard — which is exactly
+        why it is still asserted: a site that reached for `mcp.tool()` directly would make a
+        name in the literal inert again, and the frozen list above would show it only as a
+        regeneration diff nobody has to explain.
         """
         hardcoded = set(resolved["mcp_server"]["hardcoded_exclusions"])
         registered = set(resolved["mcp_server"]["registered_tools"]["tools"])

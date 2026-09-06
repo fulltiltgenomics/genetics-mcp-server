@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from test_stream_truncation import _Block, _delta_event, _FakeMessage, _service
 
+from genetics_mcp_server import mcp_proxy
 from genetics_mcp_server.cost import estimate_cost
 from genetics_mcp_server.llm_service import (
     LLMService,
@@ -28,6 +29,7 @@ from genetics_mcp_server.llm_service import (
     _sanitize_tool_blocks,
     _strip_tool_use_markers,
     _truncation_notice,
+    resolve_proxied_tools,
 )
 from genetics_mcp_server.tools.definitions import get_anthropic_tools
 
@@ -1008,3 +1010,112 @@ class TestSubagentIdentityThreading:
         assert kwargs["user"] == "real@example.org"
         assert kwargs["session_id"] == "sess-real"
         assert kwargs["gateway_asserted"] is True
+
+
+def _proxied(name):
+    return {"name": name, "description": "proxied", "input_schema": {"type": "object"}}
+
+
+class _FakeProxyClient:
+    """Enough of MCPProxyClient for the registration pass; it never opens a socket."""
+
+    prefix = ""
+
+    def __init__(self, base_url, timeout=30.0, auth_token=None):
+        self.base_url = base_url
+        self._tools = [
+            {"name": "aou_hidden", "description": "d", "inputSchema": {"type": "object"}},
+            {"name": "gnomad_variant", "description": "d", "inputSchema": {"type": "object"}},
+        ]
+
+    def list_tools_sync(self):
+        return self._tools
+
+    def get_prefixed_name(self, name):
+        return name
+
+
+class TestProxiedToolsReachBothSurfaces:
+    """The proxied servers and RAG are handed to the code surface and the no-code one alike.
+
+    Nothing in the sandbox can reach an external MCP server — its egress allow-list admits
+    db-api and results-api only — so a code-surface request denied them would have no route
+    to them at all. The subtraction that remains is EXTERNAL_MCP_EXCLUDE_TOOLS, which is a
+    deployment's and applies to everybody.
+    """
+
+    def test_the_resolver_takes_no_surface_argument(self):
+        """The parameter is where a per-surface rule would grow back, so there is none."""
+        import inspect
+
+        assert list(inspect.signature(resolve_proxied_tools).parameters) == []
+
+    @pytest.mark.parametrize("code_execution", [False, True])
+    @pytest.mark.asyncio
+    async def test_both_surfaces_advertise_the_configured_proxied_tools(self, code_execution):
+        """And advertising is what the dispatch guard reads, so this is also what makes them
+        callable: `advertised_tools` is projected off this very list."""
+        svc = _service([_answer_turn(input_tokens=1, output_tokens=1)])
+
+        with (
+            patch(
+                "genetics_mcp_server.llm_service.get_external_anthropic_tools",
+                lambda: [_proxied("gnomad_variant")],
+            ),
+            patch(
+                "genetics_mcp_server.llm_service.get_rag_anthropic_tools",
+                lambda: [_proxied("rag_search")],
+            ),
+        ):
+            await _run(svc, enable_tools=True, code_execution=code_execution)
+
+        sent = {t["name"] for t in svc.anthropic_client.messages.calls[0]["tools"]}
+        assert {"gnomad_variant", "rag_search"} <= sent
+
+    @pytest.mark.asyncio
+    async def test_a_proxied_tool_the_code_surface_named_actually_dispatches(self):
+        """The end of the same thread: the dispatch guard refuses anything the turn did not
+        advertise, so a proxied tool runs only if the code surface really carries it. The
+        primed history is the shape a client's replayed conversation has."""
+        primed = [_Block("tool_use", id="t1", name="gnomad_variant", input={"v": "1-1-A-T"})]
+        turns = [
+            ([], _usage(_FakeMessage(primed, "tool_use"), input_tokens=1, output_tokens=1)),
+            _answer_turn(input_tokens=1, output_tokens=1),
+        ]
+        svc = _service(turns, executor=_DispatchRecorder())
+        external = AsyncMock(return_value={"success": True, "external": True})
+
+        with (
+            patch(
+                "genetics_mcp_server.llm_service.get_external_anthropic_tools",
+                lambda: [_proxied("gnomad_variant")],
+            ),
+            patch("genetics_mcp_server.llm_service.get_rag_anthropic_tools", list),
+            patch(
+                "genetics_mcp_server.llm_service.is_external_tool",
+                lambda name: name == "gnomad_variant",
+            ),
+            patch("genetics_mcp_server.llm_service.execute_external_tool", external),
+        ):
+            await _run(svc, enable_tools=True, code_execution=True)
+
+        external.assert_awaited_once()
+        assert svc.executor.calls == []
+
+    def test_the_exclude_list_still_subtracts_and_no_surface_sees_it(self, monkeypatch):
+        """EXTERNAL_MCP_EXCLUDE_TOOLS is applied where the proxy clients are registered, so
+        an excluded tool never enters the registry either surface reads. BOTH registries:
+        the RAG server honours the same list, so the name is gone from the external list
+        and the RAG one alike."""
+        monkeypatch.setenv("EXTERNAL_MCP_SERVERS", "https://external.invalid/mcp")
+        monkeypatch.setenv("EXTERNAL_MCP_EXCLUDE_TOOLS", "aou_hidden")
+        monkeypatch.setenv("RAG_MCP_SERVER", "https://rag.invalid/mcp")
+        monkeypatch.setattr(mcp_proxy, "_proxy_clients", {})
+        monkeypatch.setattr(mcp_proxy, "_rag_proxy_clients", {})
+        monkeypatch.setattr(mcp_proxy, "MCPProxyClient", _FakeProxyClient)
+
+        mcp_proxy.initialize_external_servers()
+        external, rag = resolve_proxied_tools()
+
+        assert {t["name"] for t in external} == {"gnomad_variant"}
+        assert {t["name"] for t in rag} == {"gnomad_variant"}

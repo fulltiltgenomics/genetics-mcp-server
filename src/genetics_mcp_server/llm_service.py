@@ -608,31 +608,27 @@ def _script_result_payload(
     }
 
 
-def resolve_proxied_tools(
-    tool_profile: str | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """The proxied surfaces a request with this profile is handed: (external, RAG).
+def resolve_proxied_tools() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The proxied surfaces EVERY request is handed: (external, RAG).
 
-    Still keyed on the profile name while the local surface is keyed on a boolean, so this
-    is the one place the two halves can disagree; reaching both surfaces is separate work.
-    Always-on external tools (gnomAD, Open Targets) are excluded in the RAG profile and in
-    "code", which names its surface exactly, so re-adding ~20 proxied tools would defeat the
-    surface it exists to measure. RAG tools are included only when the profile is None (all)
-    or "rag".
+    NO SURFACE ARGUMENT, and that is the answer rather than an omission. The proxied
+    servers are whatever EXTERNAL_MCP_SERVERS names, and nothing inside the sandbox can
+    reach them: its egress allow-list admits db-api and results-api only. So they are not
+    SDK-replaceable, and withholding them from the code surface would remove a capability
+    that surface has no other route to. RAG is now a deployment fact keyed on
+    RAG_MCP_SERVER alone — registered or not, for everybody. Both groups being "everything
+    that is configured", a parameter neither reads would only be somewhere for a third
+    surface rule to grow back.
+
+    EXTERNAL_MCP_EXCLUDE_TOOLS still subtracts, and now subtracts from both surfaces
+    alike: it is applied where the proxy clients are registered (`mcp_proxy`), so an
+    excluded tool never enters the registries these two getters read.
 
     Extracted for the same reason `resolve_local_tools` exists: `/chat/v1/tools?resolved=true`
     has to answer with the tools this rule would actually hand the model, and a second copy
     of the rule beside the panel that shows them is a copy that drifts.
     """
-    external_tools: list[dict[str, Any]] = []
-    if tool_profile not in ("rag", "code"):
-        external_tools = get_external_anthropic_tools()
-
-    rag_tools: list[dict[str, Any]] = []
-    if tool_profile is None or tool_profile == "rag":
-        rag_tools = get_rag_anthropic_tools()
-
-    return external_tools, rag_tools
+    return get_external_anthropic_tools(), get_rag_anthropic_tools()
 
 
 @dataclass(frozen=True)
@@ -785,11 +781,12 @@ class LLMService:
         (`resolve_local_tools`, `resolve_proxied_tools`), so the panel cannot list a tool
         the model is not given, or miss one it is. `source` distinguishes them because only
         the local half has a category to group by — proxied tools carry the remote server's
-        own name and description and are not part of any profile category.
+        own name and description and have no category at all.
 
         Takes the wire value rather than the boolean because it is called straight off a
-        query parameter and the proxied half is still keyed on the name; the local half is
-        coerced here through the same edge function a chat request goes through.
+        query parameter; it is coerced here through the same edge function a chat request
+        goes through, and reaches only the local half — the proxied half is the same for
+        both surfaces.
         """
         local = self.resolve_local_tools(
             code_execution=code_execution_requested(tool_profile), enable_tools=enable_tools
@@ -808,7 +805,7 @@ class LLMService:
         if not (enable_tools and get_settings().mcp_enabled):
             return tools
 
-        external_tools, rag_tools = resolve_proxied_tools(tool_profile)
+        external_tools, rag_tools = resolve_proxied_tools()
         for source, definitions in (("external", external_tools), ("rag", rag_tools)):
             tools.extend(
                 {
@@ -866,11 +863,12 @@ class LLMService:
             enable_tools: Whether to enable MCP tools (Anthropic only)
             custom_tool_descriptions: Custom descriptions for tools
             literature_backend: Backend for literature search ('europepmc' or 'perplexity')
-            tool_profile: The wire value verbatim, and NOT a surface decision: it is
-                recorded with the turn's metrics and still keys `resolve_proxied_tools`,
-                which the collapse to one boolean has not reached. The local surface comes
-                from `code_execution` below, coerced at the edge, so a request cannot get
-                its tools from one reading of this value and its prompt from another.
+            tool_profile: The wire value verbatim, RECORDED AND NOTHING ELSE: it is
+                stored with the turn's metrics and reaches no surface decision on any path
+                from here. The local surface comes from `code_execution` below, coerced at
+                the edge; the proxied surfaces are the same for both. A request therefore
+                cannot get its tools from one reading of this value and its prompt from
+                another, because only one reading exists.
             code_execution: Which of the two surfaces this request is on, from
                 `code_execution_requested(tool_profile)` at the edge. Only consulted when
                 no `local_tools` is supplied, and to enforce the advertised set at
@@ -1110,7 +1108,7 @@ class LLMService:
             tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
 
-            external_tools, rag_tools = resolve_proxied_tools(tool_profile)
+            external_tools, rag_tools = resolve_proxied_tools()
             tool_definitions.extend(external_tools)
             tool_definitions.extend(rag_tools)
 

@@ -488,9 +488,10 @@ async def list_resolved_tools(
     signal (genetics-results-suite-4h6.74). The browser calls this endpoint when a profile
     is picked or restored and shows the user when it comes back false.
 
-    `count` is LOCAL tools only. External (gnomAD / Open Targets) and RAG tools are proxied
-    surfaces resolved separately and are not included; see docs/chat-tool-reference.md § 3
-    for the per-profile external/RAG columns.
+    `count` is LOCAL tools only. External and RAG tools are proxied surfaces resolved
+    separately and are not included; they are also the same for every profile, so this
+    endpoint's answer is the only half a profile name still moves (see
+    docs/chat-tool-reference.md § 3).
     """
     service = get_llm_service()
     names = sorted(
@@ -663,8 +664,7 @@ async def stream_chat(
     # from are projected off the very definitions the model receives — one derivation, not
     # two that happen to agree (genetics-results-suite-4h6.77).
     # THE EDGE: the wire value is read once, here, and everything downstream is handed
-    # the boolean. The string itself travels on unmodified to the stored row and to
-    # `resolve_proxied_tools`.
+    # the boolean. The string itself travels on unmodified to the stored row.
     code_execution = code_execution_requested(request.tool_profile)
     local_tools = service.resolve_local_tools(
         code_execution=code_execution, enable_tools=request.enable_tools
