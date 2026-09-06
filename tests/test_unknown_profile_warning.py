@@ -95,29 +95,24 @@ def test_the_degrade_itself_is_unchanged(caplog):
     }
 
 
-def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
-    """Adding or renaming a profile here must be a deliberate, two-repo decision.
+def test_the_profile_key_set_is_pinned_against_the_admin_default_and_the_browser():
+    """Adding or renaming a profile here must be a deliberate decision, checked two ways.
 
-    The other list is TOOL_PROFILES in
-    genetics-results-browser/src/features/chat/chat.types.ts, plus TOOL_PROFILE_LABELS in
-    src/features/chat/LLMChat.tsx which decides whether the Tools control offers it. The
-    two repos cannot import each other, so nothing but a literal on each side pins them
-    together, and BOTH drift directions are silent by construction:
+    KNOWN_TOOL_PROFILES is what routers/llm_config.py validates DEFAULT_TOOL_PROFILE
+    against (an unrecognised deployment default is rejected, not silently degraded), so
+    the full literal below pins that admin-facing set.
 
-      - a name the browser offers and this server dropped resolves to the no-code surface
-        here (the degrade above), so a user who picked "code" would get the data tools;
-      - a name added HERE that the browser predates is narrowed to null there, and null
-        means no `tool_profile` on the request, which now also resolves to the no-code
-        surface — so the only value that can be lost this way is "code".
+    The browser's ToolProfile union in
+    genetics-results-browser/src/features/chat/chat.types.ts is now just "code" | "nocode"
+    — every other name here is a legacy value the browser no longer emits but old stored
+    rows can still carry, so it isn't part of the union to pin. The one thing the two repos
+    still share is that "code" and "nocode" both have to resolve here, which is the
+    remaining cross-repo pin: if the browser ever emits a
+    third value, this assertion alone won't catch it, but the degrade above ensures it
+    still lands on the no-code surface rather than failing the request.
 
-    The browser has had the mirror of this test since useChatOptions.test.ts:196 ("lists
-    code alongside the three original profiles"), which is why its own drift already fails
-    a test. This is the missing half (genetics-results-suite-4h6.74).
-
-    If this fails: update the browser's TOOL_PROFILES and decide whether the new profile
-    gets a TOOL_PROFILE_LABELS entry (offered in the UI) or `null` (resolvable but not
-    selectable, as `rag` is), then update the literal below and the "Profile behavior"
-    table in docs/project-spec.md.
+    If this fails: update the literal below, and if a profile name changed rather than
+    being added, update the "Profile behavior" table in docs/project-spec.md.
     """
     assert set(definitions.KNOWN_TOOL_PROFILES) == {
         "api",
@@ -126,7 +121,8 @@ def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
         "nocode",
         "code",
     }
-    # the four legacy names now resolve to the same surface as "nocode": the edge keeps
+    assert {"code", "nocode"} <= set(definitions.KNOWN_TOOL_PROFILES)
+    # the three legacy names now resolve to the same surface as "nocode": the edge keeps
     # them accepted, and only "code" resolves anywhere else
     for legacy in ("api", "bigquery", "rag"):
         assert code_execution_requested(legacy) is code_execution_requested("nocode")
