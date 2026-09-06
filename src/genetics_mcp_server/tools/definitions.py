@@ -1860,7 +1860,7 @@ Available skills:
 - **genetics_data_extraction**: Extract genetics data (GWAS, QTL, credible sets, gene expression, LD, etc.)
 - **literature_review**: Search scientific literature and web for relevant publications
 - **database_analysis**: Run complex SQL queries against the genetics database
-- **data_analysis**: Draft a Python script for statistical analysis or custom visualizations — the subagent only writes the script, and you run it yourself afterwards with `run_analysis`
+- **data_analysis**: Write and run a Python script for statistical analysis or data processing — the subagent writes the script, runs it in the sandbox itself, iterates on failures, and reports the printed output. Figures it produces are NOT displayed to the user, so call `run_analysis` yourself when the answer is a plot
 - **variant_list_analysis**: Analyze a list of variants for phenotype, QTL, and tissue patterns""",
         "parameters": {
             "tasks": {

@@ -1,5 +1,6 @@
 """Tests for the subagent system: skills, sandbox tools, and subagent service."""
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -214,7 +215,7 @@ class TestSubagentService:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._run_subagent(skill, "Find papers about PCSK9")
+            result = await service._run_subagent(skill, "Find papers about PCSK9", user=None, session_id=None, gateway_asserted=False)
 
         assert result.success is True
         assert result.output == "Analysis complete."
@@ -248,7 +249,7 @@ class TestSubagentService:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service.run_subagents(tasks)
+            result = await service.run_subagents(tasks, user=None, session_id=None, gateway_asserted=False)
 
         assert result["success"] is True
         assert len(result["results"]) == 2
@@ -260,7 +261,7 @@ class TestSubagentService:
         mock_executor = MagicMock()
         service = SubagentService(mock_client, mock_executor)
 
-        result = await service.run_subagents([{"skill": "nonexistent", "query": "test"}])
+        result = await service.run_subagents([{"skill": "nonexistent", "query": "test"}], user=None, session_id=None, gateway_asserted=False)
         assert result["success"] is False
         assert "Unknown skill" in result["error"]
 
@@ -311,15 +312,14 @@ class TestOrchestrationCategoryExclusion:
                 f"launch_subagents should be excluded for skill '{skill_name}'"
             )
 
-    def test_code_execution_tools_excluded_from_every_skill(self):
-        """The orchestration *category* excludes nothing — the name list does.
+    def test_artifact_tools_excluded_from_every_skill(self):
+        """read_artifact and list_capabilities stay off every skill.
 
-        TOOL_PROFILES puts "orchestration" in both the api and bigquery profiles, so
-        run_analysis, read_artifact and list_capabilities reach three of the five skills
-        unless subagent.py names them. A subagent must not be able to execute code or to
-        retrieve another execution's artifacts (genetics-results-suite-4h6): it has no
-        session of its own, and the session is what the per-execution credential is minted
-        against.
+        read_artifact resolves a model-supplied NAME against the executions one
+        (user, session) pair ran, and every subagent of one turn shares that pair, so a
+        subagent could otherwise reach an artifact another execution wrote. run_analysis is
+        a different case — it is minted against the identity the caller threads in — and is
+        checked on its own below.
         """
         mock_client = MagicMock()
         mock_executor = MagicMock()
@@ -337,9 +337,6 @@ class TestOrchestrationCategoryExclusion:
                 tools = service._get_tool_definitions(skill)
 
             tool_names = {t["name"] for t in tools}
-            assert "run_analysis" not in tool_names, (
-                f"run_analysis should be excluded for skill '{skill_name}'"
-            )
             assert "read_artifact" not in tool_names, (
                 f"read_artifact should be excluded for skill '{skill_name}'"
             )
@@ -387,7 +384,7 @@ class TestSubagentDispatchAllowList:
                     "user": "attacker@evil.example",
                     "session_id": "other-sid",
                 },
-                skill,
+                skill, user=None, session_id=None, gateway_asserted=False
             )
 
         mock_executor.run_analysis.assert_not_awaited()
@@ -405,11 +402,71 @@ class TestSubagentDispatchAllowList:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             self._settings(mock_settings)
-            result = await service._execute_subagent_tool("close", {}, skill)
+            result = await service._execute_subagent_tool("close", {}, skill, user=None, session_id=None, gateway_asserted=False)
 
         mock_executor.close.assert_not_awaited()
         assert result["success"] is False
         assert "not available to this subagent" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_subagent_cannot_name_the_user_it_executes_as(self):
+        """A skill that CAN run code still cannot choose the subject it runs under.
+
+        data_analysis declares run_analysis, so the allow-list lets the call through; what
+        must not get through is the `user`/`session_id` the model wrote, because those
+        become the sub/sid of both per-execution JWTs and of every audit record.
+        """
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.run_analysis = AsyncMock(return_value={"success": True})
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("data_analysis")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            await service._execute_subagent_tool(
+                "run_analysis",
+                {
+                    "code": "print(1)",
+                    "user": "attacker@evil.example",
+                    "session_id": "someone-elses-session",
+                    "gateway_asserted": True,
+                },
+                skill,
+                user="real@example.org",
+                session_id="sess-real",
+                gateway_asserted=False,
+            )
+
+        kwargs = mock_executor.run_analysis.await_args.kwargs
+        assert kwargs["user"] == "real@example.org"
+        assert kwargs["session_id"] == "sess-real"
+        assert kwargs["gateway_asserted"] is False
+
+    @pytest.mark.asyncio
+    async def test_missing_identity_is_not_replaced_by_model_input(self):
+        """A caller that threads nothing hands run_analysis nothing, not the model's guess.
+
+        run_analysis refuses without an authenticated pair; that refusal is only reachable
+        if the forged pair was dropped rather than passed on.
+        """
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.run_analysis = AsyncMock(return_value={"success": True})
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("data_analysis")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            await service._execute_subagent_tool(
+                "run_analysis",
+                {"code": "print(1)", "user": "attacker@evil.example", "session_id": "x"},
+                skill, user=None, session_id=None, gateway_asserted=False
+            )
+
+        kwargs = mock_executor.run_analysis.await_args.kwargs
+        assert kwargs["user"] is None
+        assert kwargs["session_id"] is None
 
     @pytest.mark.asyncio
     async def test_declared_tool_still_dispatches(self):
@@ -422,10 +479,127 @@ class TestSubagentDispatchAllowList:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             self._settings(mock_settings)
-            result = await service._execute_subagent_tool("list_datasets", {}, skill)
+            result = await service._execute_subagent_tool("list_datasets", {}, skill, user=None, session_id=None, gateway_asserted=False)
 
         mock_executor.list_datasets.assert_awaited_once()
         assert result["success"] is True
+
+
+class TestIdentityThreading:
+    """The identity reaches the dispatch from run_subagents, never from the task text."""
+
+    @staticmethod
+    def _settings(mock_settings):
+        settings = MagicMock()
+        settings.disabled_tools = set()
+        settings.enable_subagents = True
+        settings.subagent_allowed_paths_list = []
+        settings.subagent_timeout = 30
+        settings.subagent_model = ""
+        settings.fast_model = "claude-haiku-4-5"
+        settings.temperature = None
+        settings.max_continuations = 1
+        settings.mcp_max_result_size = 50000
+        mock_settings.return_value = settings
+
+    @pytest.mark.asyncio
+    async def test_run_subagents_threads_identity_to_the_dispatch(self):
+        """The whole point of the task: the pair the request authenticated reaches the sandbox."""
+        svc = TestSubagentService()
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            side_effect=[
+                svc._make_mock_message(
+                    "running",
+                    tool_uses=[{
+                        "id": "tu-1",
+                        "name": "run_analysis",
+                        # the model names an identity of its own; it must be discarded
+                        "input": {"code": "print(1)", "user": "spoofed@evil.example"},
+                    }],
+                ),
+                svc._make_mock_message("done"),
+            ]
+        )
+        mock_executor = MagicMock()
+        mock_executor.run_analysis = AsyncMock(return_value={"success": True})
+        service = SubagentService(mock_client, mock_executor)
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            result = await service.run_subagents(
+                [{"skill": "data_analysis", "query": "analyse this"}],
+                user="real@example.org",
+                session_id="sess-real",
+                gateway_asserted=True,
+            )
+
+        assert result["success"] is True
+        kwargs = mock_executor.run_analysis.await_args.kwargs
+        assert kwargs["user"] == "real@example.org"
+        assert kwargs["session_id"] == "sess-real"
+        assert kwargs["gateway_asserted"] is True
+
+    @pytest.mark.asyncio
+    async def test_image_artifacts_are_not_returned_to_the_subagent(self):
+        """base64 a subagent can neither see nor display must not reach its context."""
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.run_analysis = AsyncMock(
+            return_value={
+                "success": True,
+                "images": [{"name": "plot.png", "content_base64": "A" * 5000}],
+            }
+        )
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("data_analysis")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            self._settings(mock_settings)
+            result = await service._execute_subagent_tool(
+                "run_analysis", {"code": "print(1)"}, skill, user="u@x", session_id="s", gateway_asserted=False
+            )
+
+        assert "images" not in result
+        assert "plot.png" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_artifacts_note_written_for_the_main_path_is_dropped(self):
+        """Neither half of run_analysis's artifacts_note is true for a subagent."""
+        mock_client = MagicMock()
+        mock_executor = MagicMock()
+        mock_executor.run_analysis = AsyncMock(
+            return_value={
+                "success": True,
+                "artifacts": [{"name": "plot.png"}, {"name": "table.csv"}],
+                "artifacts_note": (
+                    "Image artifacts have been displayed to the user already; describe "
+                    "what the plot shows. Read any other artifact with read_artifact."
+                ),
+            }
+        )
+        service = SubagentService(mock_client, mock_executor)
+        skill = get_skill("data_analysis")
+
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            settings = MagicMock()
+            settings.disabled_tools = set()
+            settings.enable_subagents = True
+            settings.subagent_allowed_paths_list = []
+            mock_settings.return_value = settings
+            result = await service._execute_subagent_tool(
+                "run_analysis",
+                {"code": "print(1)"},
+                skill,
+                user="u@x",
+                session_id="s",
+                gateway_asserted=False,
+            )
+
+        assert "artifacts_note" not in result
+        rendered = json.dumps(result)
+        assert "displayed to the user" not in rendered
+        assert "read_artifact" not in rendered
 
 
 class TestDownloadHintProcessing:
@@ -454,10 +628,10 @@ class TestDownloadHintProcessing:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._execute_subagent_tool("list_datasets", {}, skill)
+            result = await service._execute_subagent_tool("list_datasets", {}, skill, user=None, session_id=None, gateway_asserted=False)
 
         # the tool name is passed so a download failure names its producer in the log
-        mock_hints.assert_called_once_with(raw_result, tool_name="list_datasets")
+        mock_hints.assert_called_once_with(raw_result, owner=None, tool_name="list_datasets")
         assert result["success"] is True
 
     @pytest.mark.asyncio
@@ -483,7 +657,7 @@ class TestDownloadHintProcessing:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._execute_subagent_tool("search_genes", {}, skill)
+            result = await service._execute_subagent_tool("search_genes", {}, skill, user=None, session_id=None, gateway_asserted=False)
 
         assert "INCLUDE_IN_RESPONSE" in result
         assert "Download" in result["INCLUDE_IN_RESPONSE"]
@@ -508,7 +682,7 @@ class TestDownloadHintProcessing:
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
-            result = await service._execute_subagent_tool("search_phenotypes", {}, skill)
+            result = await service._execute_subagent_tool("search_phenotypes", {}, skill, user=None, session_id=None, gateway_asserted=False)
 
         assert result == raw_result
         assert "INCLUDE_IN_RESPONSE" not in result
@@ -573,7 +747,7 @@ class TestTokenAccumulation:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            result = await service._run_subagent(skill, "test query")
+            result = await service._run_subagent(skill, "test query", user=None, session_id=None, gateway_asserted=False)
 
         assert result.input_tokens == 150
         assert result.output_tokens == 75
@@ -602,7 +776,7 @@ class TestTokenAccumulation:
             patch("genetics_mcp_server.subagent.is_external_tool", return_value=False),
         ):
             mock_settings.return_value = self._make_settings_mock()
-            result = await service._run_subagent(skill, "test query")
+            result = await service._run_subagent(skill, "test query", user=None, session_id=None, gateway_asserted=False)
 
         assert result.input_tokens == 500  # 200 + 300
         assert result.output_tokens == 250  # 100 + 150
@@ -621,7 +795,7 @@ class TestTokenAccumulation:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            result = await service.run_subagents(tasks)
+            result = await service.run_subagents(tasks, user=None, session_id=None, gateway_asserted=False)
 
         assert result["success"] is True
         r = result["results"][0]
@@ -688,7 +862,7 @@ class TestProgressCallback:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-1")
+            await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-1", user=None, session_id=None, gateway_asserted=False)
 
         calls = [c.args[0] for c in callback.call_args_list]
         assert any("[sa-1]" in c and "started" in c for c in calls)
@@ -717,7 +891,7 @@ class TestProgressCallback:
             patch("genetics_mcp_server.subagent.is_external_tool", return_value=False),
         ):
             mock_settings.return_value = self._make_settings_mock()
-            await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-2")
+            await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-2", user=None, session_id=None, gateway_asserted=False)
 
         calls = [c.args[0] for c in callback.call_args_list]
         assert any("[sa-2]" in c and "calling search_variants" in c for c in calls)
@@ -738,7 +912,7 @@ class TestProgressCallback:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            result = await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-1")
+            result = await service._run_subagent(skill, "test", progress_callback=callback, subagent_id="sa-1", user=None, session_id=None, gateway_asserted=False)
 
         assert result.success is False
         calls = [c.args[0] for c in callback.call_args_list]
@@ -766,7 +940,7 @@ class TestProgressCallback:
             settings = self._make_settings_mock()
             settings.subagent_timeout = 0.1  # very short timeout
             mock_settings.return_value = settings
-            await service.run_subagents(tasks, progress_callback=callback)
+            await service.run_subagents(tasks, progress_callback=callback, user=None, session_id=None, gateway_asserted=False)
 
         calls = [c.args[0] for c in callback.call_args_list]
         assert any("[sa-1]" in c and "timed out" in c for c in calls)
@@ -912,7 +1086,7 @@ class TestSubagentIdInResults:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            result = await service._run_subagent(skill, "test", subagent_id="sa-5")
+            result = await service._run_subagent(skill, "test", subagent_id="sa-5", user=None, session_id=None, gateway_asserted=False)
 
         assert result.subagent_id == "sa-5"
 
@@ -932,7 +1106,7 @@ class TestSubagentIdInResults:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._make_settings_mock()
-            result = await service.run_subagents(tasks)
+            result = await service.run_subagents(tasks, user=None, session_id=None, gateway_asserted=False)
 
         assert result["success"] is True
         assert result["results"][0]["subagent_id"] == "sa-1"
@@ -980,7 +1154,7 @@ class TestSubagentTruncation:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._settings()
-            result = await service._run_subagent(get_skill("literature_review"), "q")
+            result = await service._run_subagent(get_skill("literature_review"), "q", user=None, session_id=None, gateway_asserted=False)
 
         assert result.success is True
         assert result.truncated is False
@@ -1002,7 +1176,7 @@ class TestSubagentTruncation:
 
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._settings(max_continuations=2)
-            result = await service._run_subagent(get_skill("literature_review"), "q")
+            result = await service._run_subagent(get_skill("literature_review"), "q", user=None, session_id=None, gateway_asserted=False)
 
         assert result.truncated is True
         assert "[TRUNCATED:" in result.output
@@ -1020,7 +1194,7 @@ class TestSubagentTruncation:
 
             with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
                 mock_settings.return_value = self._settings(subagent_model=model)
-                await service._run_subagent(get_skill("literature_review"), "q")
+                await service._run_subagent(get_skill("literature_review"), "q", user=None, session_id=None, gateway_asserted=False)
 
             params = mock_client.messages.create.await_args.kwargs
             assert ("thinking" in params) is expected, model
@@ -1037,7 +1211,7 @@ class TestSubagentTruncation:
         with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
             mock_settings.return_value = self._settings(max_continuations=3)
             payload = await service.run_subagents(
-                [{"skill": "literature_review", "query": "q"}]
+                [{"skill": "literature_review", "query": "q"}], user=None, session_id=None, gateway_asserted=False
             )
 
         assert payload["results"][0]["truncated"] is True
@@ -1242,6 +1416,7 @@ _PINNED_SKILL_TOOLS: dict[str, set[str]] = {
         "map_protein_variants",
         "normalize_gene_symbols",
         "read_file",
+        "run_analysis",
         "search_cbioportal",
         "search_genes",
         "search_mgi",
@@ -1278,13 +1453,28 @@ class TestSkillToolSurface:
         )
 
     def test_no_skill_can_reach_orchestration(self):
-        """Code execution, artifacts and recursive launches stay off every skill."""
-        forbidden = {"launch_subagents", "run_analysis", "read_artifact", "list_capabilities"}
+        """Recursive launches and another execution's artifacts stay off every skill.
+
+        run_analysis has left this set — it is threaded an authenticated identity and one
+        skill declares it — so the two that remain are asserted for all five skills, and
+        run_analysis's single-skill reach is pinned below.
+        """
+        forbidden = {"launch_subagents", "read_artifact", "list_capabilities"}
         for skill_name, skill in SKILL_REGISTRY.items():
             assert not self._resolve(skill) & forbidden, skill_name
 
-    def test_data_analysis_has_no_execution_route(self):
-        """The data_analysis skill drafts scripts; nothing in it may run one."""
+    def test_only_data_analysis_can_execute(self):
+        """Exactly one skill runs code, and it is the one whose instructions say so."""
+        can_execute = {
+            name
+            for name, skill in SKILL_REGISTRY.items()
+            if "run_analysis" in self._resolve(skill)
+        }
+        assert can_execute == {"data_analysis"}
+
+    def test_data_analysis_runs_its_own_script(self):
+        """The data_analysis skill drafts a script AND runs it."""
         resolved = self._resolve(SKILL_REGISTRY["data_analysis"])
         assert resolved & {"read_file", "list_directory"} == {"read_file", "list_directory"}
-        assert not any("exec" in name or name == "run_analysis" for name in resolved)
+        assert "run_analysis" in resolved
+        assert not any("exec" in name for name in resolved)

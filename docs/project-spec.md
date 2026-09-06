@@ -336,7 +336,7 @@ because a withheld tool is a deployment fact and must not read as a passing outa
 
 | Tool | Description |
 |------|-------------|
-| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by the caller — `llm_service._execute_tool` on the main path, `subagent._execute_subagent_tool` on the subagent path — each stripping any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
 | `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — and its members come from `sdk/plots.py`'s `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of the four. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
 | `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated **`(sub, session_id)`** pair (`genetics-results-suite-dh3` — `session_id` alone is client-supplied and authorizes nothing); another user's or another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
@@ -344,12 +344,21 @@ because a withheld tool is a deployment fact and must not read as a passing outa
 runtime rather than fetching data, which is what `launch_subagents` is. The category by
 itself excludes nothing — `TOOL_PROFILES` includes `orchestration` in both the `api` and
 `bigquery` profiles, so it reaches three of the five subagent skills — so `subagent.py`
-names all four orchestration tools explicitly:
-`disabled |= {"launch_subagents", "run_analysis", "read_artifact", "list_capabilities"}`.
-That name list, not the category, is what keeps a subagent from executing code, retrieving
-another execution's artifacts or being told how to start one; `tests/test_subagent.py`
-pins it. For `run_analysis` the exclusion is also a correctness point: a subagent has no
-session of its own, and the session is what the per-execution credential is minted against.
+names the tools a subagent may not have explicitly:
+`disabled |= {"launch_subagents", "read_artifact", "list_capabilities"}`. That name list,
+not the category, is what keeps a subagent from launching subagents of its own or reaching
+another execution's artifacts; `tests/test_subagent.py` pins it.
+
+`run_analysis` is deliberately **not** in that set. It was, while `run_subagents` took no
+identity at all and a subagent that named the tool would have reached
+`mint_execution_tokens` under a `user` of its own invention. `run_subagents` now takes the
+caller's authenticated `(user, session_id)` and its provenance flag as keyword-only
+arguments, threaded from the request context through `_run_subagent` to
+`_execute_subagent_tool`, which strips and replaces the same three keys the main path does.
+So the credential a subagent's execution is minted against has the same subject as the
+request that launched it, and `tasks` — written by a model — cannot influence it. One skill
+declares the tool (`data_analysis`); the dispatch allow-list below is what keeps the other
+four from naming it.
 
 **Dropping a tool from the list only stops it being offered — the dispatcher is what
 enforces it.** `subagent.py:_execute_subagent_tool` used to resolve the model's
@@ -361,8 +370,11 @@ that skill, which covers the local, sandbox and external branches at once. Witho
 `run_analysis` handler was reachable with a model-supplied `user`/`session_id`, which
 `mint_execution_tokens` would have made the `sub`/`sid` of both per-execution JWTs and of
 every audit record — the forgery the `llm_service` strip exists to prevent, on the same
-tool. `tests/test_subagent.py::TestSubagentDispatchAllowList` pins the refusal, the
-by-name case, and that a declared tool still dispatches.
+tool. Now that one skill does declare `run_analysis`, this guard is the whole of what keeps
+the other four skills off it, and the identity strip runs on the dispatch that follows.
+`tests/test_subagent.py::TestSubagentDispatchAllowList` pins the refusal, the by-name case,
+that a declared tool still dispatches, and that a model-supplied `user` on a *declared*
+`run_analysis` is replaced by the caller's rather than honoured.
 
 #### What `run_analysis` returns, and why it is rendered rather than forwarded
 
@@ -664,7 +676,7 @@ Each tool has a `category` field in its definition:
 | `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
-| `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
+| `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops three of them **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |
 
 ### Profile behavior
 
@@ -2031,7 +2043,7 @@ The subagent system enables the main agent to launch parallel specialized agents
 - `literature_review` — scientific literature and web search
 - `database_analysis` — complex SQL queries against the genetics database
 - `variant_list_analysis` — analyze multiple variants for shared patterns
-- `data_analysis` — drafts a Python analysis script for the caller to run with `run_analysis`
+- `data_analysis` — writes a Python analysis script, runs it with `run_analysis`, and iterates on failures before reporting
 
 Each skill has:
 - A markdown instruction file (system prompt) in `skills/instructions/`
@@ -2041,6 +2053,12 @@ Each skill has:
 - `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
 **Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
+
+**Identity**: `run_subagents(tasks, progress_callback, *, user, session_id, gateway_asserted)` takes the caller's authenticated identity from the request context and carries it to `_execute_subagent_tool`, which injects it into `run_analysis` after stripping any same-named key the model wrote. It is keyword-only so no positional call site can slide a task field into the subject of a per-execution credential. Both `run_subagents` call sites are in `llm_service` (the streaming path and `_execute_tool`) and both pass the same triple the main path's own `run_analysis` injection uses.
+
+**Parallel executions do not run in parallel.** The sandbox is `replicas: 1` behind a one-running / two-waiting scheduler, so four `data_analysis` subagents means one runs, two queue and the fourth is rejected. What the fan-out buys is context isolation — each subagent's failed script attempts stay in its own context — not wall-clock.
+
+**Figures a subagent produces are not displayed.** Image artifacts are streamed to the user from the main chat loop's own `run_analysis` results; a subagent's tool result is JSON going back to the subagent, so `_execute_subagent_tool` strips the base64 and leaves the artifact names for the report.
 
 **Advertisement gated on availability**: `launch_subagents` is advertised to the LLM only when the subagent service actually initialized (`self.subagent_service is not None`), not merely when `ENABLE_SUBAGENTS` is set. The service requires a live Anthropic client + executor in addition to the flag, so `_stream_anthropic()` adds `launch_subagents` to the effective `disabled_tools` whenever the service is absent. This single source of truth prevents the LLM from seeing a tool that would return "subagent service isn't available" on call.
 

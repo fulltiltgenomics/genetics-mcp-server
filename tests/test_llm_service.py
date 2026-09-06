@@ -14,7 +14,7 @@ uses.
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from test_stream_truncation import _Block, _delta_event, _FakeMessage, _service
@@ -772,3 +772,50 @@ class TestRateLimitRetryPolicy:
         opted_in = Settings()
         assert opted_in.anthropic_retry_rate_limit is True
         assert opted_in.anthropic_max_retries == 8
+
+
+class TestSubagentIdentityThreading:
+    """`launch_subagents` carries this request's identity, not the model's tool input.
+
+    A subagent can now name `run_analysis`, so whatever `_execute_tool` hands
+    `run_subagents` becomes the subject of a per-execution credential and of the audit
+    trail. It must be the pair the request was authenticated as, and `tasks` — written by
+    the model — must not be able to influence it.
+    """
+
+    @staticmethod
+    def _svc():
+        svc = LLMService.__new__(LLMService)
+        svc.subagent_service = SimpleNamespace(
+            run_subagents=AsyncMock(return_value={"success": True, "results": []})
+        )
+        svc.executor = None
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_identity_comes_from_the_request_not_the_tasks(self, monkeypatch):
+        from genetics_mcp_server.config.settings import Settings
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.llm_service.get_settings",
+            lambda: Settings(enable_subagents=True),
+        )
+        svc = self._svc()
+
+        await svc._execute_tool(
+            "launch_subagents",
+            {
+                "tasks": [{"skill": "data_analysis", "query": "q"}],
+                "user": "spoofed@evil.example",
+                "session_id": "someone-elses-session",
+            },
+            None,
+            "real@example.org",
+            "sess-real",
+            True,
+        )
+
+        kwargs = svc.subagent_service.run_subagents.await_args.kwargs
+        assert kwargs["user"] == "real@example.org"
+        assert kwargs["session_id"] == "sess-real"
+        assert kwargs["gateway_asserted"] is True

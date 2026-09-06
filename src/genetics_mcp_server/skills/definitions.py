@@ -161,13 +161,16 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     "data_analysis": SkillDefinition(
         name="data_analysis",
         description=(
-            "Draft a Python script for statistical analysis, data processing, or a custom "
-            "visualization (matplotlib/polars/scipy), and say how to read its output. This "
-            "subagent inspects inputs but runs nothing: execute the returned script with "
-            "`run_analysis`, the only sandboxed code path."
+            "Write and RUN a Python script for statistical analysis or data processing "
+            "(polars/numpy/scipy). This subagent writes the script, runs it in the sandbox "
+            "with `run_analysis`, iterates on failures, and reports the printed output. "
+            "Figures it produces are NOT displayed to the user, so plot on the main path "
+            "by calling `run_analysis` directly instead."
         ),
         instruction_file="data_analysis.md",
-        tools=_CORE_TOOLS,
+        # the one skill that names run_analysis: it runs under the caller's authenticated
+        # identity, threaded into run_subagents from the request context
+        tools=_CORE_TOOLS | {"run_analysis"},
         allow_file_read=True,
     ),
 }

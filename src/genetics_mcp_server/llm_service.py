@@ -1408,9 +1408,16 @@ class LLMService:
 
                     async def _run_subagents() -> dict[str, Any]:
                         try:
+                            # the identity is this request's, not anything in
+                            # `subagent_tool.input`: it reaches run_analysis inside the
+                            # subagent and becomes the subject of the per-execution
+                            # credential, so it is threaded rather than re-derived.
                             result = await self.subagent_service.run_subagents(
                                 subagent_tool.input.get("tasks", []),
                                 progress_callback=_on_progress,
+                                user=user,
+                                session_id=session_id,
+                                gateway_asserted=gateway_asserted,
                             )
                             # log cost just like _execute_tool does
                             if result.get("success") and result.get("results"):
@@ -1696,7 +1703,15 @@ class LLMService:
             if tool_name == "launch_subagents":
                 if not self.subagent_service:
                     return {"success": False, "error": "Subagent service not initialized"}
-                result = await self.subagent_service.run_subagents(tool_input.get("tasks", []))
+                # same request-context identity the run_analysis branch below injects: a
+                # subagent that names run_analysis executes as this caller, never as
+                # anything the model wrote into `tasks`
+                result = await self.subagent_service.run_subagents(
+                    tool_input.get("tasks", []),
+                    user=user,
+                    session_id=session_id,
+                    gateway_asserted=gateway_asserted,
+                )
                 if result.get("success") and result.get("results"):
                     total_in = sum(r.get("input_tokens", 0) for r in result["results"])
                     total_out = sum(r.get("output_tokens", 0) for r in result["results"])
