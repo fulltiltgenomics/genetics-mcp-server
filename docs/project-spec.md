@@ -2607,7 +2607,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
-| `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to the no-code surface, and records each arm's resolved tool list in the report |
+| `test_arm_resolution.py` | The benchmark's arm preflight: the `nocode`/`code` defaults; the harness's own arm and code-execution-tool literals pinned against `code_execution_requested` and `resolve_tools`; and the three refusals — an unknown `tool_profile` (rather than silently falling back to the no-code surface), an arm that is not the surface it names (a `code` arm resolved without `run_analysis`, or another arm resolved with it), and two arms whose resolved names are equal — against the two that are deliberately survivable, an endpoint-less server and one arm failing to resolve |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
 | `test_benchmark_counters.py` | The recorded 9c6595ac baseline is exactly what the current code computes on that report, so a before/after delta is never a comparison of two different definitions; a discovery script is counted as opening a turn only when it is the first; re-execution is scoped to the case rather than the turn, which is where a refine follow-up shows up at all; every counter is present at 0 rather than absent, so an arm that did none of something is not confused with a report that never measured it |
 | `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
@@ -2761,6 +2761,18 @@ harness issues two arms per case. `--base-url` therefore defaults to
 `http://localhost:8000`, never a deployment, and `--dry-run` resolves the whole plan
 (case order, arm order, turn count) without issuing a single request.
 
+- **The arms are the boolean.** `--arm-a` defaults to `nocode` and `--arm-b` to `code`,
+  the only two wire values that straddle the surface split; `--arm-a all` still spells
+  `tool_profile: null`, which resolves to the same surface as `nocode`. The preflight asks
+  the server what each arm resolved to before anything is spent and refuses three shapes,
+  each of which otherwise produces a plausible report about something else: an arm the
+  server reports `known_profile: false` for; an arm that is not the surface it names — the
+  `code` arm resolving *without* `run_analysis`, which is what a chat service running with
+  `SANDBOX_ENABLED=false` serves, or any other arm resolving *with* it, which is a server
+  predating the collapse; and two arms whose resolved name sets are equal. An arm the
+  server did not resolve at all (transport error, non-200, or a 200 carrying no names) is
+  survivable rather than fatal, but both the `run_analysis` check and the identical-surface
+  check are skipped for it, and the harness warns saying so.
 - **Single-arm mode.** `--arm-b none` runs arm A alone. It exists because the counters that
   decide a prompt or image change are per-arm, and paying for a second arm that has not
   changed buys nothing. What it gives up is everything the pairing defends: a model swap or

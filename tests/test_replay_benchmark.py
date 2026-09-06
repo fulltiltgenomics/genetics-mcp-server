@@ -213,7 +213,6 @@ def test_count_tool_calls_uses_blocks_not_display_markers():
 def test_cli_defaults_to_localhost_not_production():
     args = build_parser().parse_args([])
     assert "localhost" in args.base_url
-    assert args.arm_a == ALL_TOOLS_ARM
     assert args.model is None
 
 

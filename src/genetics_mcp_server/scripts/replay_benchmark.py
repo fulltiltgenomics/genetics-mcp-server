@@ -63,10 +63,25 @@ logger = logging.getLogger(__name__)
 
 CHAT_PATH = "/chat/v1/chat"
 
+# the two arms the benchmark exists to compare. The surface is one boolean now — "code" is
+# code execution and every other value is the no-code surface — so these are the only two
+# wire values that straddle the line; any other pair either repeats a surface or misspells
+# one, and both of those are refused below.
+CODE_ARM = "code"
+NOCODE_ARM = "nocode"
+
+# the tool the code arm IS: an arm that resolved without it is not the surface it names.
+# Kept as the harness's OWN literal rather than imported, for the same reason as
+# MAX_ITERATIONS_MARKER below — the harness reads a REMOTE server, which may not be this
+# build — with a test pinning it against the definitions. That pin catches a rename in
+# this package, not one on the server the harness talks to.
+CODE_EXECUTION_TOOL = "run_analysis"
+
 # null is unspellable on the command line, so this literal is how a caller spells
-# `tool_profile: null` on the wire. The name is wire spelling, not a claim about breadth:
-# the shim in definitions.py resolves null — and every value except "code" — to the no-code
-# surface, so this arm is the same surface as "nocode", "api", "bigquery" and "rag".
+# `tool_profile: null` on the wire — the one value no other arm name can express, which is
+# why it survives as an explicit alias rather than as a default. It resolves to the no-code
+# surface like every value except "code", so pairing it with `nocode` is two names for one
+# surface and the identical-surface guard below refuses the run.
 ALL_TOOLS_ARM = "all"
 
 REPORTED_PERCENTILES = (25, 50, 75, 90, 95)
@@ -1283,7 +1298,8 @@ RESOLVED_TOOLS_PATH = "/chat/v1/tools/resolved"
 
 
 class ArmResolutionError(RuntimeError):
-    """An arm does not name a profile the target server knows."""
+    """An arm pair the server's own answer refuses: an unknown profile name, an arm on
+    the wrong side of the code-execution tool, or two arms that are one surface."""
 
 
 class RateLimitedError(RuntimeError):
@@ -1303,12 +1319,18 @@ async def resolve_arm_tools(
        from rows written by older clients — so `--arm-a cod` silently yields the no-code
        surface and reports plausible numbers against it. `known_profile: false` is fatal
        here: refusing to start costs nothing, and the alternative is discovering it after
-       the spend.
-    2. A SERVER RUNNING OLDER CODE. The profile is resolved in the chat service's process,
-       which imports the definitions at startup. A profile added on disk but not yet loaded
-       by a running server resolves through the same silent fallback, and locally that is
-       one forgotten restart away.
-    3. TWO ARMS THAT ARE ONE SURFACE. Since the profile names collapsed onto two surfaces,
+       the spend. It is the server's own answer, not a list this harness keeps: the
+       endpoint reports `known_profile` from `KNOWN_TOOL_PROFILES` as the running build
+       has it, so a value that server accepts is accepted here.
+    2. AN ARM THAT IS NOT THE SURFACE IT NAMES. `known_profile` says the NAME was
+       recognised; it says nothing about what came back. The flag subtraction runs AFTER
+       the surface resolves, so a chat service with SANDBOX_ENABLED=false serves a `code`
+       arm with no `run_analysis` in it — measured 2026-08-27, a run that then completed,
+       was judged, and had the code arm declared the winner on a case where it had burned
+       an iteration force-calling a tool it had not been given. The boolean makes the check
+       exact in both directions: the `code` arm must resolve WITH the code-execution tool
+       and any other arm WITHOUT it, and an arm on the wrong side of that is fatal.
+    3. TWO ARMS THAT ARE ONE SURFACE (paired runs only; a single-arm run has no pair). Since the profile names collapsed onto two surfaces,
        every legacy value except `code` resolves to the same tools, so a pair like
        `all`/`bigquery` compares a surface against itself and reports a difference of zero
        that reads as a real result. Identical resolved name sets are fatal for the same
@@ -1364,6 +1386,44 @@ async def resolve_arm_tools(
             "run would have measured a surface you did not intend. Check the spelling, and "
             "check the server has been restarted since the profile was added."
         )
+    for arm in arms:
+        names = out.get(arm, {}).get("names")
+        if not isinstance(names, list):
+            # survivable — an unresolved arm does not invalidate the run — but it disables
+            # BOTH guards for that arm silently, so say which ones stopped protecting it
+            logger.warning(
+                "arm %r did not resolve on %s, so neither the %s check nor the "
+                "identical-surface check ran for it. The run is still valid; verify the "
+                "arms by hand.",
+                arm,
+                base_url,
+                CODE_EXECUTION_TOOL,
+            )
+            continue
+        wants_code = arm == CODE_ARM
+        has_code = CODE_EXECUTION_TOOL in names
+        if wants_code == has_code:
+            continue
+        if wants_code:
+            raise ArmResolutionError(
+                f"arm {arm!r} resolved to {len(names)} local tools WITHOUT "
+                f"{CODE_EXECUTION_TOOL} on {base_url}, so this run would measure a "
+                "degraded arm and report it as the code arm. The usual cause is the flag "
+                "subtraction, which runs after the surface resolves: SANDBOX_ENABLED must "
+                "be true for chat-api, db-api and results-api, and the sandbox itself has "
+                "to be reachable."
+            )
+        raise ArmResolutionError(
+            f"arm {arm!r} resolved to {len(names)} local tools INCLUDING "
+            f"{CODE_EXECUTION_TOOL} on {base_url}. Only 'code' selects the code-execution "
+            "surface, so this server predates that collapse and both arms would be able to "
+            "run scripts — which is not the comparison this benchmark makes."
+        )
+    if len(arms) < 2:
+        # single-arm mode: there is no second surface to be identical to. The `none`
+        # sentinel is resolved to a one-arm tuple by main() and never reaches here, so an
+        # arm name is always a name the server was asked about.
+        return out
     arm_a, arm_b = arms
     names_a = out.get(arm_a, {}).get("names")
     names_b = out.get(arm_b, {}).get("names")
@@ -1788,11 +1848,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="chat service base URL. Deliberately localhost by default: pointing this at "
         "production spends real money (measured mean $2.01/turn).",
     )
-    parser.add_argument("--arm-a", default=ALL_TOOLS_ARM, help=f"tool_profile for arm A ('{ALL_TOOLS_ARM}' = all tools)")
+    parser.add_argument(
+        "--arm-a",
+        default=NOCODE_ARM,
+        help=f"tool_profile for arm A, the baseline (default {NOCODE_ARM!r}; "
+        f"'{ALL_TOOLS_ARM}' spells tool_profile: null, which is the same surface)",
+    )
     parser.add_argument(
         "--arm-b",
-        default="bigquery",
-        help="tool_profile for arm B, or 'none' to run arm A alone (no pairing, no judging)",
+        default=CODE_ARM,
+        help=f"tool_profile for arm B, the candidate (default {CODE_ARM!r}; it is the only "
+        "value that selects the code-execution surface), or 'none' to run arm A alone "
+        "(no pairing, no judging)",
     )
     parser.add_argument("--limit", type=int, default=None, help="max cases to replay")
     parser.add_argument("--max-turns", type=int, default=None, help="max user turns per case")
@@ -1896,7 +1963,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {arm:>8} resolves to {info['count']} local tools")
         for i, c in enumerate(cases):
             order = arm_order_for_case(arms, i)
-            print(f"  {i:>3} {c.get('session_id')} order={order[0]},{order[1]}")
+            print(f"  {i:>3} {c.get('session_id')} order={','.join(order)}")
         if args.judge:
             # the ceiling: every turn matching on both arms. Turns that fail on one arm are
             # not judged, so the real pair count can only be lower — an over-estimate is the
@@ -1923,6 +1990,9 @@ def main(argv: list[str] | None = None) -> int:
                 capture_thinking=args.capture_thinking,
             )
         )
+    except ArmResolutionError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        return 2
     except RateLimitedError as exc:
         turns_needed = sum(
             len((c.get("user_turns") or [])[: args.max_turns])
