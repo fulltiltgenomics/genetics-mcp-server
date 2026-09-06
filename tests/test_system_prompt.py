@@ -484,6 +484,14 @@ _REQUIRED_WITH_A_DATA_PATH = [
 _WITH_A_DATA_PATH = [p for p in PROFILES if _DATA_PATH_TOOLS & resolve(p, subagents=False)]
 
 
+_SCRIPT_ONLY_GUIDANCE = [
+    "$GENETICS_SCHEMA_DIR",
+    "one markdown file per view",
+    "do not try to widen it with `pl.Config`",
+    "genetics.show(df)",
+]
+
+
 class TestLoadBearingTextIsPresent:
     """Absence-only assertions cannot see text going missing.
 
@@ -523,6 +531,20 @@ class TestLoadBearingTextIsPresent:
     def test_database_tool_surfaces_do_not_get_the_sdk_route(self):
         prompt = default_system_prompt("FinnGenie", tool_names=resolve("bigquery", subagents=False))
         assert "genetics.schema()" not in prompt
+
+    # both of these answer things the model spent whole executions rediscovering: the
+    # per-view markdown that already ships at $GENETICS_SCHEMA_DIR, and polars' column
+    # elision, which it kept attacking with pl.Config knobs that do not govern column count
+    @pytest.mark.parametrize("text", _SCRIPT_ONLY_GUIDANCE)
+    def test_the_script_surface_is_told_where_the_schema_and_the_full_frame_are(self, text):
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("code", subagents=False))
+        assert text in prompt
+
+    @pytest.mark.parametrize("text", _SCRIPT_ONLY_GUIDANCE)
+    def test_a_surface_without_scripts_is_not_told_about_either(self, text):
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("nocode", subagents=False))
+        assert "run_analysis" not in resolve("nocode", subagents=False)
+        assert text not in prompt
 
 
 _RUN_ANALYSIS_BULLET_START = "- **Write one script with run_analysis"

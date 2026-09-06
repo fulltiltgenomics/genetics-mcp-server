@@ -80,6 +80,11 @@ def _frame(
         return pl.from_dicts(rows, infer_schema_length=None, strict=False)
 
 
+def _pairs(row: Any) -> str:
+    """One row as `column=value` pairs — the line format `show` prints."""
+    return " | ".join(f"{k}={v}" for k, v in row.items())
+
+
 def _one_of(**candidates: Any) -> tuple[str, Any]:
     """Return the single supplied argument, or raise. This is the grid collapse."""
     given = [(k, v) for k, v in candidates.items() if v is not None]
@@ -1016,6 +1021,53 @@ class GeneticsClient:
             await self._executor.list_datasets(resource=resource, include_stats=include_stats)
         )["datasets"]
 
+    async def resource_metadata(self, resource: str) -> pl.DataFrame:
+        """Harmonized per-trait metadata for one resource — one row per trait it serves.
+
+        `resources()` names the resources and `datasets()` gives the dataset-level
+        aggregates; this is the rows behind them: the trait code, its human-readable name,
+        the sample sizes, and for a collection like `eqtl_catalogue` the sub-study each
+        trait belongs to. The columns are whatever the resource's harmonized metadata
+        carries, so they differ between resources — read them off the frame rather than
+        assuming a fixed schema.
+        """
+        return self._rows(await self._executor.get_resource_metadata(resource), key="metadata")
+
+    async def show(self, data: Any) -> None:
+        """Print every column of every row, one row per line. Nothing is elided.
+
+        polars' repr is built for a terminal — 8 columns and 10 rows by default — so a
+        printed frame silently drops columns, and widening the repr only moves the cut to
+        the 64 KiB stdout window. This prints `column=value` pairs instead: nothing is
+        dropped, and a value is findable by the name of its column. Select or filter first
+        when the frame is large; printing everything is the point, not a size guarantee.
+
+        A dict prints one line per key, and a list prints one line per element (a list of
+        row dicts prints as rows), so a `schema()`/`resources()`/`datasets()` payload can
+        be shown without building a frame first. Anything else prints as itself.
+        """
+        if isinstance(data, pl.Series):
+            data = data.to_frame()
+        if isinstance(data, pl.DataFrame):
+            if data.height == 0:
+                print(f"(0 rows; columns: {', '.join(data.columns) or 'none'})")
+                return
+            for row in data.iter_rows(named=True):
+                print(_pairs(row))
+            return
+        if isinstance(data, (dict, list, tuple)) and not data:
+            print("(empty)")
+            return
+        if isinstance(data, dict):
+            for key, value in data.items():
+                print(f"{key}={value}")
+            return
+        if isinstance(data, (list, tuple)):
+            for item in data:
+                print(_pairs(item) if isinstance(item, dict) else item)
+            return
+        print(data)
+
 
 # --------------------------------------------------------------------------- audit trail
 
@@ -1502,8 +1554,15 @@ def _audited(method):
 def _instrument(cls: type) -> None:
     """Instrument at the client, not at `sdk._make_sync`: the sync functions delegate here,
     so one wrapper covers both surfaces and neither double-counts."""
+    # `show` is exempt because it reaches no executor: a record for it would put a display
+    # call in the same stream as the reads, counted as a one-row read by anything tallying
+    # them.
     for name, method in list(vars(cls).items()):
-        if name.startswith("_") or name == "close" or not inspect.iscoroutinefunction(method):
+        if (
+            name.startswith("_")
+            or name in ("close", "show")
+            or not inspect.iscoroutinefunction(method)
+        ):
             continue
         setattr(cls, name, _audited(method))
 

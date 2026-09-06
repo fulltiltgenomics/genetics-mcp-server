@@ -782,6 +782,8 @@ winner.
 | `normalize_gene_symbols(symbols)` | `normalize_gene_symbols` |
 | `sql(query)` | `query_database` |
 | `schema()`, `resources()`, `datasets()` | `get_database_schema`, `get_available_resources`, `list_datasets` |
+| `resource_metadata(resource)` | `get_resource_metadata` — the per-trait rows behind a resource; `resources()` reaches a different endpoint and does not carry them |
+| `show(data)` | — no executor: prints a frame, dict or list one row per line with every column, so nothing is elided |
 
 `mpra_pip_concordance` stays a separate function rather than a keyword on `mpra()`: it is a
 join of `credible_sets_v` and `mpra_v` and returns credible-set columns alongside MPRA
@@ -934,8 +936,9 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the
   same functions as awaitables.
 - **Every call through the SDK surface is audited — `_executor` is not**
-  (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine
-  method is wrapped at import time (`_instrument` in `sdk/client.py`) so one line per call goes
+  (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine method that reaches the
+  executor is wrapped at import time (`_instrument` in `sdk/client.py`; `close` and `show` are
+  exempt because neither fetches anything) so one line per call goes
   to the `genetics_mcp_server.sdk.audit` logger:
   `[user=…] [session=…] [execution=…] Executing SDK function: <name> with input: {…} rows: <n>`,
   plus ` error: <ExceptionType>` when the call raised. It mirrors chat-backend's
@@ -1635,8 +1638,9 @@ in that tool's description, where they travel with it and reach MCP clients too 
 "call `get_database_schema` first" lives in `query_database`'s description and is no longer
 repeated in the prompt. A surface with `run_analysis` but no `query_database` (profiles `api`
 and `code`) has neither that tool nor `get_database_schema` yet still reads all the SQL
-guidance, so it gets the SDK's own route — `genetics.schema()` / `genetics.schema('<view>')`,
-emitted only there.
+guidance, so it gets the SDK's own route — the per-view markdown the sandbox image ships at
+`$GENETICS_SCHEMA_DIR`, and `genetics.schema()` / `genetics.schema('<view>')` — emitted only
+there.
 
 Which routing variant is emitted turns on two facts about the surface: whether the per-entity API
 tools are present (`get_credible_sets_by_gene` is the sentinel the database-only variant already

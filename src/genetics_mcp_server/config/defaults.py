@@ -451,7 +451,7 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
         requires_any=_fs("query_database", "run_analysis"),
     ),
     _Block(
-        "`genetics.sql(...)` inside a script is the only route to the database on this surface. Discover the schema before writing a query — `genetics.schema()` returns the column-level schema of every view and `genetics.schema('credible_sets_v')` just one — rather than guessing a column name.\n",
+        "`genetics.sql(...)` inside a script is the only route to the database on this surface. Discover the schema before writing a query rather than guessing a column name. The sandbox ships the schema as documentation: one markdown file per view under `$GENETICS_SCHEMA_DIR`, named after the view (`credible_sets_v.md`, `colocalization_v.md`, …) with a `README.md` indexing them all. Each file lists the view's columns and their BigQuery types, the allowed values of its categorical columns, and worked example SQL — read the file for the view before writing SQL, e.g. `import os; print(open(os.environ['GENETICS_SCHEMA_DIR'] + '/credible_sets_v.md').read())`. `genetics.schema()` returns the same column-level schema as a live call, for every view, and `genetics.schema('credible_sets_v')` just one.\n",
         excludes=_fs("query_database"),
         requires_any=_fs("run_analysis"),
     ),
@@ -613,6 +613,13 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
 - **Write one script with run_analysis when an answer needs several retrievals combined.** One script can query, join, filter and summarise in a single call, and its intermediate rows never enter this conversation — so prefer it when the work is a chain (fetch, then fetch again keyed on the first result, then aggregate) or when the intermediate data is large and only the summary matters. Call list_capabilities first for the exact SDK signatures rather than guessing them, print what you want to see, and print a SUMMARY — counts, top rows, the statistic asked for — rather than dumping raw rows.
 - For a question a single tool answers, call the tool. A script is not cheaper than one call.
 """),
+    _Block(
+        "- **`genetics.show(df)` is the route that prints a frame in full** — every column of every row, "
+        "one row per line, nothing elided. polars' own repr is built for a terminal and silently drops "
+        "columns and rows; do not try to widen it with `pl.Config`, use `show()`. If output still looks "
+        "cut, that is the 64 KiB stdout window — print less rather than printing again wider.\n",
+        requires_any=_fs("run_analysis"),
+    ),
     _Block(
         "\n- Scripts are the only data path on this surface, so a question that needs data needs a script. Everything the SDK exposes is discoverable with list_capabilities; do not conclude data is unavailable without checking there first.\n",
         excludes=_fs("get_credible_sets_by_gene", "query_database"),

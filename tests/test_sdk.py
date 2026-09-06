@@ -607,3 +607,75 @@ def test_sdk_imports_without_the_chat_backend():
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "", f"SDK import pulled in: {proc.stdout.strip()}"
+
+
+# --------------------------------------------------------------------- catalog and display
+
+
+async def test_resource_metadata_reaches_the_per_trait_endpoint():
+    """`resources()` calls get_available_resources, a different endpoint: without this
+    function the per-trait rows behind a resource have no SDK route at all."""
+    client, executor = make_client(
+        {
+            "success": True,
+            "metadata": [
+                {"phenotype": "I9_CHD", "trait_name": "Coronary heart disease", "n_cases": 21012},
+                {"phenotype": "T1D", "trait_name": "Type 1 diabetes", "n_cases": 5928},
+            ],
+        }
+    )
+    frame = await client.resource_metadata("finngen")
+    assert executor.last[0] == "get_resource_metadata"
+    assert executor.last[1] == ("finngen",)
+    assert frame.height == 2
+    assert frame["trait_name"].to_list() == ["Coronary heart disease", "Type 1 diabetes"]
+
+
+async def test_resource_metadata_refuses_a_truncated_result():
+    client, _ = make_client(
+        {"success": True, "metadata": [{"phenotype": "T1D"}], "truncated": True}
+    )
+    with pytest.raises(GeneticsError, match="truncated"):
+        await client.resource_metadata("finngen")
+
+
+async def test_show_prints_every_column_of_every_row(capsys):
+    """polars' repr keeps 8 columns; this frame has 11, so a printed repr drops three."""
+    client, _ = make_client()
+    frame = pl.DataFrame({f"c{i}": [i, i + 100] for i in range(11)})
+    await client.show(frame)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert lines[0] == " | ".join(f"c{i}={i}" for i in range(11))
+    assert "\u2026" not in lines[0] and "..." not in lines[0]
+
+
+async def test_show_says_so_rather_than_printing_nothing_for_an_empty_frame(capsys):
+    client, _ = make_client()
+    await client.show(pl.DataFrame({"pip": [], "variant": []}))
+    assert capsys.readouterr().out.strip() == "(0 rows; columns: pip, variant)"
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ([{"a": 1, "b": 2}, {"a": 3, "b": 4}], ["a=1 | b=2", "a=3 | b=4"]),
+        ({"credible_sets_v": "one", "colocalization_v": "two"},
+         ["credible_sets_v=one", "colocalization_v=two"]),
+        ([], ["(empty)"]),
+        (["IL7R", "TP53"], ["IL7R", "TP53"]),
+        ("plain", ["plain"]),
+    ],
+)
+async def test_show_accepts_what_the_non_frame_functions_return(capsys, data, expected):
+    """schema(), resources() and datasets() return nested dicts, so show() has to take one
+    without the caller building a frame first."""
+    client, _ = make_client()
+    await client.show(data)
+    assert capsys.readouterr().out.splitlines() == expected
+
+
+def test_show_is_kept_out_of_the_audit_trail():
+    """It reaches no executor, so a record for it would be counted as a one-row read."""
+    assert not hasattr(GeneticsClient.show, "__wrapped__")
+    assert hasattr(GeneticsClient.credible_sets, "__wrapped__")
