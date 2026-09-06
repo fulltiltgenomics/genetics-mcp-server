@@ -28,7 +28,6 @@ from genetics_mcp_server.skills.definitions import (
     get_skill_instructions,
 )
 from genetics_mcp_server.skills.sandbox_tools import (
-    execute_script,
     get_sandbox_tool_definitions,
     list_directory,
     read_file,
@@ -385,25 +384,15 @@ class SubagentService:
             )
 
     def _get_tool_definitions(self, skill: SkillDefinition) -> list[dict[str, Any]]:
-        """Build tool definitions for a skill based on its categories and extras."""
+        """Build tool definitions for a skill from the tool names it declares."""
         settings = get_settings()
-
-        # determine tool_profile from categories
-        # map skill categories to the closest tool_profile
-        if {"api", "general"} <= skill.tool_categories:
-            tool_profile = "api"
-        elif {"bigquery", "general"} <= skill.tool_categories:
-            tool_profile = "bigquery"
-        else:
-            tool_profile = "rag"  # general-only
 
         # exclude orchestration tools to prevent recursive subagent launches, to keep a
         # subagent away from another execution's artifacts, and to keep code execution on
         # the one path that holds the authenticated identity the per-execution credential is
-        # minted from — a subagent has no session of its own. The exclusion is by NAME, not
-        # by category: TOOL_PROFILES puts "orchestration" in both the api and bigquery
-        # profiles, so the category is present in three of the five skills and every
-        # orchestration tool must be listed here individually to actually be dropped
+        # minted from — a subagent has no session of its own. This is belt-and-braces over
+        # the skills not naming them: it also strips whatever the operator disabled, and a
+        # skill list is the kind of thing that gets extended without re-deriving the hazard
         disabled = set(settings.disabled_tools) if settings.disabled_tools else set()
         disabled |= {
             "launch_subagents",
@@ -412,29 +401,15 @@ class SubagentService:
             "list_capabilities",
         }
 
-        tools = get_anthropic_tools(
-            tool_profile=tool_profile,
-            disabled_tools=disabled,
-        )
-
-        # filter to only extra_tools if categories are minimal
-        if skill.extra_tools:
-            extra_names = set(skill.extra_tools)
-            existing_names = {t["name"] for t in tools}
-            # add any extra tools that aren't already included
-            if not extra_names.issubset(existing_names):
-                # `disabled`, not settings.disabled_tools: this fallback is a second path
-                # into the tool list and would otherwise re-add the orchestration tools
-                # excluded above for any skill that named one in extra_tools
-                all_tools = get_anthropic_tools(disabled_tools=disabled)
-                for tool in all_tools:
-                    if tool["name"] in extra_names and tool["name"] not in existing_names:
-                        tools.append(tool)
+        tools = [
+            tool
+            for tool in get_anthropic_tools(disabled_tools=disabled)
+            if tool["name"] in skill.tools
+        ]
 
         # add sandbox tools
         sandbox_tools = get_sandbox_tool_definitions(
             allow_file_read=skill.allow_file_read and settings.enable_subagents,
-            allow_script_exec=skill.allow_script_exec and settings.enable_script_execution,
         )
         tools.extend(sandbox_tools)
 
@@ -478,16 +453,6 @@ class SubagentService:
             if tool_name == "list_directory":
                 allowed = skill.allowed_paths or settings.subagent_allowed_paths_list
                 return await list_directory(tool_input["path"], allowed)
-
-            if tool_name == "execute_script":
-                allowed = skill.allowed_paths or settings.subagent_allowed_paths_list
-                return await execute_script(
-                    interpreter=tool_input["interpreter"],
-                    script=tool_input["script"],
-                    working_dir=allowed[0] if allowed else "/tmp",
-                    allowed_paths=allowed,
-                    timeout=settings.subagent_script_timeout,
-                )
 
             # external tools
             if is_external_tool(tool_name):

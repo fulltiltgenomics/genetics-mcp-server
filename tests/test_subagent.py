@@ -13,12 +13,12 @@ from genetics_mcp_server.skills.definitions import (
 )
 from genetics_mcp_server.skills.sandbox_tools import (
     _validate_path,
-    execute_script,
     get_sandbox_tool_definitions,
     list_directory,
     read_file,
 )
 from genetics_mcp_server.subagent import SubagentResult, SubagentService, _format_tool_params
+from genetics_mcp_server.tools.definitions import get_anthropic_tools
 
 
 class TestSkillDefinitions:
@@ -45,12 +45,12 @@ class TestSkillDefinitions:
         assert "database_analysis" in desc
         assert "data_analysis" in desc
 
-    def test_skill_categories_are_valid(self):
-        valid = {"general", "api", "bigquery"}
+    def test_declared_tools_exist(self):
+        """A skill may only name tools that exist, or the name is silently a no-op."""
+        known = {t["name"] for t in get_anthropic_tools()}
         for skill in SKILL_REGISTRY.values():
-            assert skill.tool_categories.issubset(valid), (
-                f"Skill '{skill.name}' has invalid categories: {skill.tool_categories - valid}"
-            )
+            unknown = skill.tools - known
+            assert not unknown, f"Skill '{skill.name}' names unknown tools: {unknown}"
 
     def test_instruction_caching(self):
         """Loading same instruction twice returns cached result."""
@@ -132,110 +132,15 @@ class TestSandboxFileOps:
         assert result["success"] is False
 
 
-class TestSandboxScriptExecution:
-    """Tests for sandbox script execution."""
-
-    @pytest.mark.asyncio
-    async def test_execute_python_script(self, tmp_path):
-        result = await execute_script(
-            interpreter="python3",
-            script="print('hello from python')",
-            working_dir=str(tmp_path),
-            allowed_paths=[str(tmp_path)],
-        )
-        assert result["success"] is True
-        assert "hello from python" in result["stdout"]
-
-    @pytest.mark.asyncio
-    async def test_execute_bash_script(self, tmp_path):
-        result = await execute_script(
-            interpreter="bash",
-            script="echo 'hello from bash'",
-            working_dir=str(tmp_path),
-            allowed_paths=[str(tmp_path)],
-        )
-        assert result["success"] is True
-        assert "hello from bash" in result["stdout"]
-
-    @pytest.mark.asyncio
-    async def test_disallowed_interpreter(self, tmp_path):
-        result = await execute_script(
-            interpreter="perl",
-            script="print 'hello'",
-            working_dir=str(tmp_path),
-            allowed_paths=[str(tmp_path)],
-        )
-        assert result["success"] is False
-        assert "not allowed" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_script_timeout(self, tmp_path):
-        result = await execute_script(
-            interpreter="python3",
-            script="import time; time.sleep(10)",
-            working_dir=str(tmp_path),
-            allowed_paths=[str(tmp_path)],
-            timeout=1,
-        )
-        assert result["success"] is False
-        assert "timed out" in result["error"].lower()
-
-    @pytest.mark.asyncio
-    async def test_script_working_dir_restricted(self, tmp_path):
-        result = await execute_script(
-            interpreter="python3",
-            script="print('hi')",
-            working_dir="/etc",
-            allowed_paths=[str(tmp_path)],
-        )
-        assert result["success"] is False
-        assert "outside allowed" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_sensitive_env_stripped(self, tmp_path):
-        """API keys should not leak into script environment."""
-        result = await execute_script(
-            interpreter="python3",
-            script="import os; print(os.environ.get('ANTHROPIC_API_KEY', 'NOT_SET'))",
-            working_dir=str(tmp_path),
-            allowed_paths=[str(tmp_path)],
-        )
-        assert result["success"] is True
-        assert "NOT_SET" in result["stdout"]
-
-    @pytest.mark.asyncio
-    async def test_script_failure_returns_stderr(self, tmp_path):
-        result = await execute_script(
-            interpreter="python3",
-            script="raise ValueError('test error')",
-            working_dir=str(tmp_path),
-            allowed_paths=[str(tmp_path)],
-        )
-        assert result["success"] is False
-        assert result["return_code"] != 0
-        assert "test error" in result["stderr"]
-
-
 class TestSandboxToolDefinitions:
     """Tests for sandbox tool definition generation."""
 
-    def test_no_tools_when_disabled(self):
-        tools = get_sandbox_tool_definitions(False, False)
-        assert tools == []
+    def test_no_tools_when_read_disabled(self):
+        assert get_sandbox_tool_definitions(False) == []
 
     def test_file_tools_when_read_enabled(self):
-        tools = get_sandbox_tool_definitions(True, False)
-        names = [t["name"] for t in tools]
-        assert "read_file" in names
-        assert "list_directory" in names
-        assert "execute_script" not in names
-
-    def test_all_tools_when_both_enabled(self):
-        tools = get_sandbox_tool_definitions(True, True)
-        names = [t["name"] for t in tools]
-        assert "read_file" in names
-        assert "list_directory" in names
-        assert "execute_script" in names
+        names = [t["name"] for t in get_sandbox_tool_definitions(True)]
+        assert names == ["read_file", "list_directory"]
 
 
 class TestSubagentResult:
@@ -304,9 +209,7 @@ class TestSubagentService:
             settings.temperature = 0.3
             settings.mcp_max_result_size = 50000
             settings.subagent_timeout = 120
-            settings.subagent_script_timeout = 30
             settings.enable_subagents = True
-            settings.enable_script_execution = False
             settings.disabled_tools = set()
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
@@ -340,9 +243,7 @@ class TestSubagentService:
             settings.temperature = 0.3
             settings.mcp_max_result_size = 50000
             settings.subagent_timeout = 120
-            settings.subagent_script_timeout = 30
             settings.enable_subagents = True
-            settings.enable_script_execution = False
             settings.disabled_tools = set()
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
@@ -380,7 +281,6 @@ class TestOrchestrationCategoryExclusion:
             settings = MagicMock()
             settings.disabled_tools = set()
             settings.enable_subagents = True
-            settings.enable_script_execution = False
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
@@ -401,7 +301,6 @@ class TestOrchestrationCategoryExclusion:
                 settings = MagicMock()
                 settings.disabled_tools = set()
                 settings.enable_subagents = True
-                settings.enable_script_execution = False
                 settings.subagent_allowed_paths_list = []
                 mock_settings.return_value = settings
 
@@ -432,7 +331,6 @@ class TestOrchestrationCategoryExclusion:
                 settings = MagicMock()
                 settings.disabled_tools = set()
                 settings.enable_subagents = True
-                settings.enable_script_execution = False
                 settings.subagent_allowed_paths_list = []
                 mock_settings.return_value = settings
 
@@ -464,7 +362,6 @@ class TestSubagentDispatchAllowList:
         settings = MagicMock()
         settings.disabled_tools = set()
         settings.enable_subagents = True
-        settings.enable_script_execution = False
         settings.subagent_allowed_paths_list = []
         mock_settings.return_value = settings
 
@@ -627,9 +524,7 @@ class TestTokenAccumulation:
         settings.temperature = 0.3
         settings.mcp_max_result_size = 50000
         settings.subagent_timeout = 120
-        settings.subagent_script_timeout = 30
         settings.enable_subagents = True
-        settings.enable_script_execution = False
         settings.disabled_tools = set()
         settings.subagent_allowed_paths_list = []
         settings.max_continuations = 3
@@ -744,9 +639,7 @@ class TestProgressCallback:
         settings.temperature = 0.3
         settings.mcp_max_result_size = 50000
         settings.subagent_timeout = 120
-        settings.subagent_script_timeout = 30
         settings.enable_subagents = True
-        settings.enable_script_execution = False
         settings.disabled_tools = set()
         settings.subagent_allowed_paths_list = []
         return settings
@@ -943,7 +836,6 @@ class TestExternalToolInclusion:
             settings = MagicMock()
             settings.disabled_tools = set()
             settings.enable_subagents = True
-            settings.enable_script_execution = False
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
@@ -967,7 +859,6 @@ class TestExternalToolInclusion:
             settings = MagicMock()
             settings.disabled_tools = set()
             settings.enable_subagents = True
-            settings.enable_script_execution = False
             settings.subagent_allowed_paths_list = []
             mock_settings.return_value = settings
 
@@ -989,9 +880,7 @@ class TestSubagentIdInResults:
         settings.temperature = 0.3
         settings.mcp_max_result_size = 50000
         settings.subagent_timeout = 120
-        settings.subagent_script_timeout = 30
         settings.enable_subagents = True
-        settings.enable_script_execution = False
         settings.disabled_tools = set()
         settings.subagent_allowed_paths_list = []
         return settings
@@ -1060,9 +949,7 @@ class TestSubagentTruncation:
         settings.temperature = None
         settings.mcp_max_result_size = 50000
         settings.subagent_timeout = 120
-        settings.subagent_script_timeout = 30
         settings.enable_subagents = True
-        settings.enable_script_execution = False
         settings.disabled_tools = set()
         settings.subagent_allowed_paths_list = []
         settings.max_continuations = max_continuations
@@ -1154,3 +1041,250 @@ class TestSubagentTruncation:
             )
 
         assert payload["results"][0]["truncated"] is True
+
+
+# The exact tool names each skill resolves to. Pinned rather than derived: a skill's surface
+# used to be a function of tool `category` and the tool_profile table, so retuning either for
+# the main agent silently changed what a subagent could reach. A failure here means a skill
+# gained or lost a tool — decide whether that was intended, then update this map.
+_PINNED_SKILL_TOOLS: dict[str, set[str]] = {
+    "genetics_data_extraction": {
+        "analyze_variant_list",
+        "get_asm_qtl_by_gene",
+        "get_asm_qtl_by_variant",
+        "get_colocalization",
+        "get_colocalization_by_credible_set",
+        "get_credible_set_by_id",
+        "get_credible_set_leads_by_phenotype",
+        "get_credible_sets_by_gene",
+        "get_credible_sets_by_phenotype",
+        "get_credible_sets_by_qtl_gene",
+        "get_credible_sets_by_region",
+        "get_credible_sets_by_variant",
+        "get_credible_sets_stats",
+        "get_dataset_display_names",
+        "get_drug_profile",
+        "get_drug_targets_for_gene",
+        "get_exome_results_by_gene",
+        "get_exome_results_by_phenotype",
+        "get_exome_results_by_region",
+        "get_exome_results_by_variant",
+        "get_gene_based_results",
+        "get_gene_based_results_by_phenotype",
+        "get_gene_disease_associations",
+        "get_gene_expression",
+        "get_gene_group_members",
+        "get_gene_to_peaks",
+        "get_genes_in_region",
+        "get_hla_by_allele",
+        "get_hla_by_phenotype",
+        "get_ld_between_variants",
+        "get_mpra_by_gene",
+        "get_mpra_by_region",
+        "get_mpra_by_variant",
+        "get_mpra_pip_concordance_by_gene",
+        "get_myvariant_annotations",
+        "get_nearest_genes",
+        "get_open_chromatin_by_gene",
+        "get_open_chromatin_by_peak",
+        "get_open_chromatin_by_region",
+        "get_open_chromatin_by_variant",
+        "get_peak_to_genes",
+        "get_phenotype_report",
+        "get_protein_annotations",
+        "get_resource_metadata",
+        "get_summary_stats",
+        "get_summary_stats_by_region",
+        "get_target_bioactivity",
+        "get_variant_annotations",
+        "get_variant_effect_by_gene",
+        "get_variant_effect_by_variant",
+        "get_variant_protein_effect",
+        "get_variants_in_ld",
+        "list_datasets",
+        "lookup_phenotype_names",
+        "lookup_variants_by_rsid",
+        "map_protein_variants",
+        "normalize_gene_symbols",
+        "search_cbioportal",
+        "search_genes",
+        "search_mgi",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "search_uniprot",
+        "web_search",
+    },
+    "literature_review": {
+        "get_dataset_display_names",
+        "get_drug_profile",
+        "get_drug_targets_for_gene",
+        "get_gene_group_members",
+        "get_protein_annotations",
+        "get_resource_metadata",
+        "get_target_bioactivity",
+        "get_variant_protein_effect",
+        "list_datasets",
+        "lookup_phenotype_names",
+        "lookup_variants_by_rsid",
+        "map_protein_variants",
+        "normalize_gene_symbols",
+        "search_cbioportal",
+        "search_genes",
+        "search_mgi",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "search_uniprot",
+        "web_search",
+    },
+    "database_analysis": {
+        "get_database_schema",
+        "get_dataset_display_names",
+        "get_drug_profile",
+        "get_drug_targets_for_gene",
+        "get_gene_group_members",
+        "get_protein_annotations",
+        "get_resource_metadata",
+        "get_target_bioactivity",
+        "get_variant_protein_effect",
+        "list_datasets",
+        "lookup_phenotype_names",
+        "lookup_variants_by_rsid",
+        "map_protein_variants",
+        "normalize_gene_symbols",
+        "query_database",
+        "search_cbioportal",
+        "search_genes",
+        "search_mgi",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "search_uniprot",
+        "web_search",
+    },
+    "variant_list_analysis": {
+        "analyze_variant_list",
+        "get_asm_qtl_by_gene",
+        "get_asm_qtl_by_variant",
+        "get_colocalization",
+        "get_colocalization_by_credible_set",
+        "get_credible_set_by_id",
+        "get_credible_set_leads_by_phenotype",
+        "get_credible_sets_by_gene",
+        "get_credible_sets_by_phenotype",
+        "get_credible_sets_by_qtl_gene",
+        "get_credible_sets_by_region",
+        "get_credible_sets_by_variant",
+        "get_credible_sets_stats",
+        "get_dataset_display_names",
+        "get_drug_profile",
+        "get_drug_targets_for_gene",
+        "get_exome_results_by_gene",
+        "get_exome_results_by_phenotype",
+        "get_exome_results_by_region",
+        "get_exome_results_by_variant",
+        "get_gene_based_results",
+        "get_gene_based_results_by_phenotype",
+        "get_gene_disease_associations",
+        "get_gene_expression",
+        "get_gene_group_members",
+        "get_gene_to_peaks",
+        "get_genes_in_region",
+        "get_hla_by_allele",
+        "get_hla_by_phenotype",
+        "get_ld_between_variants",
+        "get_mpra_by_gene",
+        "get_mpra_by_region",
+        "get_mpra_by_variant",
+        "get_mpra_pip_concordance_by_gene",
+        "get_myvariant_annotations",
+        "get_nearest_genes",
+        "get_open_chromatin_by_gene",
+        "get_open_chromatin_by_peak",
+        "get_open_chromatin_by_region",
+        "get_open_chromatin_by_variant",
+        "get_peak_to_genes",
+        "get_phenotype_report",
+        "get_protein_annotations",
+        "get_resource_metadata",
+        "get_summary_stats",
+        "get_summary_stats_by_region",
+        "get_target_bioactivity",
+        "get_variant_annotations",
+        "get_variant_effect_by_gene",
+        "get_variant_effect_by_variant",
+        "get_variant_protein_effect",
+        "get_variants_in_ld",
+        "list_datasets",
+        "lookup_phenotype_names",
+        "lookup_variants_by_rsid",
+        "map_protein_variants",
+        "normalize_gene_symbols",
+        "search_cbioportal",
+        "search_genes",
+        "search_mgi",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "search_uniprot",
+        "web_search",
+    },
+    "data_analysis": {
+        "get_dataset_display_names",
+        "get_drug_profile",
+        "get_drug_targets_for_gene",
+        "get_gene_group_members",
+        "get_protein_annotations",
+        "get_resource_metadata",
+        "get_target_bioactivity",
+        "get_variant_protein_effect",
+        "list_datasets",
+        "list_directory",
+        "lookup_phenotype_names",
+        "lookup_variants_by_rsid",
+        "map_protein_variants",
+        "normalize_gene_symbols",
+        "read_file",
+        "search_cbioportal",
+        "search_genes",
+        "search_mgi",
+        "search_phenotypes",
+        "search_scientific_literature",
+        "search_uniprot",
+        "web_search",
+    },
+}
+
+
+class TestSkillToolSurface:
+    """Pins the resolved tool set of every skill."""
+
+    def _resolve(self, skill):
+        service = SubagentService(MagicMock(), MagicMock())
+        with patch("genetics_mcp_server.subagent.get_settings") as mock_settings:
+            settings = MagicMock()
+            settings.disabled_tools = set()
+            settings.enable_subagents = True
+            mock_settings.return_value = settings
+            return {t["name"] for t in service._get_tool_definitions(skill)}
+
+    def test_every_skill_is_pinned(self):
+        assert set(_PINNED_SKILL_TOOLS) == set(SKILL_REGISTRY)
+
+    @pytest.mark.parametrize("skill_name", sorted(_PINNED_SKILL_TOOLS))
+    def test_resolved_tools_match_pin(self, skill_name):
+        resolved = self._resolve(SKILL_REGISTRY[skill_name])
+        expected = _PINNED_SKILL_TOOLS[skill_name]
+        assert resolved == expected, (
+            f"{skill_name} lost {sorted(expected - resolved)} "
+            f"and gained {sorted(resolved - expected)}"
+        )
+
+    def test_no_skill_can_reach_orchestration(self):
+        """Code execution, artifacts and recursive launches stay off every skill."""
+        forbidden = {"launch_subagents", "run_analysis", "read_artifact", "list_capabilities"}
+        for skill_name, skill in SKILL_REGISTRY.items():
+            assert not self._resolve(skill) & forbidden, skill_name
+
+    def test_data_analysis_has_no_execution_route(self):
+        """The data_analysis skill drafts scripts; nothing in it may run one."""
+        resolved = self._resolve(SKILL_REGISTRY["data_analysis"])
+        assert resolved & {"read_file", "list_directory"} == {"read_file", "list_directory"}
+        assert not any("exec" in name or name == "run_analysis" for name in resolved)

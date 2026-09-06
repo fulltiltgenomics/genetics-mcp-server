@@ -230,7 +230,7 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 - **A process-wide TTL cache** (`UNIPROT_CACHE_TTL`, default 24 h, monotonic-clock deadlines, LRU-bounded). UniProt releases at most weekly, so a long TTL is safe; setting the TTL to `0` disables caching.
 - **Genomic-HGVS variant effect** — `get_variant_protein_effect` converts each `chr:pos:ref:alt` into a GRCh38 RefSeq genomic HGVS (`NC_0000NN.V:g.<pos><ref>><alt>`, from a pinned per-chromosome accession table) and looks it up through the EBI `variation/hgvs` endpoint. The assembly is pinned to GRCh38 — a variant id carries no build, and guessing one would silently answer for the wrong genome. Reviewed entries are distinguished from the TrEMBL predicted entries the endpoint also returns by their Swiss-Prot mnemonic `entryName` and non-`Predicted` protein existence.
 
-**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
+**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and all four are in the tool list every subagent skill gets (`_CORE_TOOLS` in `skills/definitions.py`), so a subagent doing gene/protein biology can reach them.
 
 #### ChEMBL (native tools, chat-backend only)
 
@@ -292,9 +292,8 @@ implementation, but constructs its own cache instance.
 
 **Exposure decision**: chat-backend only, like the UniProt and MGI tools — the three names are
 in `_mcp_disabled` in `mcp_server.py`, so they are never registered on the standalone MCP
-server. Category is `general`, so they survive every profile split. `get_drug_targets_for_gene`
-and `get_drug_profile` are in the `literature_review` skill's `extra_tools`;
-`get_target_bioactivity` is not, since assay counts are not a literature question. The system
+server. Category is `general`, so they survive every profile split. All three are in
+`_CORE_TOOLS` (`skills/definitions.py`), the tool list every subagent skill gets. The system
 prompt's `### Drug and Target Evidence (ChEMBL)` block routes to them, and the
 "Contextualizing Findings" rule that told the model to consider whether drugs already exist
 for a gene now names `get_drug_targets_for_gene` instead of leaving it to memory.
@@ -654,7 +653,7 @@ fault and reads as "not found" rather than as a read.
 
 The chat API supports a `tool_profile` parameter that controls which tools are available per request. This enables A/B testing of different tool strategies (API vs BigQuery vs RAG vs code execution) by sending identical prompts with different profiles.
 
-Two mechanisms resolve a profile, in `tools/definitions.py`. `TOOL_PROFILES` maps a profile to whole **categories**; `TOOL_PROFILE_TOOLS` maps a profile to an explicit list of tool **names** and takes precedence. The second exists for `code`, whose surface cannot be written as categories — its orchestration tools share a category with `launch_subagents`, which must stay out — and recategorising tools to make it fit was ruled out, since a tool's `category` also decides what the `api` profile advertises and what subagent skills declaring `tool_categories={"general","api"}` can call.
+Two mechanisms resolve a profile, in `tools/definitions.py`. `TOOL_PROFILES` maps a profile to whole **categories**; `TOOL_PROFILE_TOOLS` maps a profile to an explicit list of tool **names** and takes precedence. The second exists for `code`, whose surface cannot be written as categories — its orchestration tools share a category with `launch_subagents`, which must stay out — and recategorising tools to make it fit was ruled out, since a tool's `category` also decides what the `api` profile advertises. Subagent skills are not affected: each names its tools explicitly in `skills/definitions.py`.
 
 ### Tool categories
 
@@ -2032,13 +2031,13 @@ The subagent system enables the main agent to launch parallel specialized agents
 - `literature_review` — scientific literature and web search
 - `database_analysis` — complex SQL queries against the genetics database
 - `variant_list_analysis` — analyze multiple variants for shared patterns
-- `data_analysis` — Python script execution for custom analysis and visualizations
+- `data_analysis` — drafts a Python analysis script for the caller to run with `run_analysis`
 
 Each skill has:
 - A markdown instruction file (system prompt) in `skills/instructions/`
-- Tool categories controlling which tools the subagent can use
+- An explicit set of tool names controlling which tools the subagent can use
 - Configurable model, max iterations, and timeout
-- Optional sandbox tools (file read, script execution)
+- Optional file read, for skills that inspect uploaded files
 - `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
 **Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
@@ -2086,11 +2085,12 @@ partial findings instead of treating a fragment as the subagent's complete answe
 6. Main agent synthesizes subagent outputs into its response
 
 **Security**:
-- File access restricted to configured `SUBAGENT_ALLOWED_PATHS` directories
-- Script execution gated behind `ENABLE_SCRIPT_EXECUTION` flag
-- Interpreter whitelist: `python3`, `Rscript`, `bash`
-- Sensitive environment variables stripped from script processes
-- Per-subagent and per-script timeouts
+- Each skill names the tools it gets (`skills/definitions.py`), so retuning a tool profile for
+  the main agent cannot widen a subagent's surface
+- File access is read-only and restricted to `SUBAGENT_ALLOWED_PATHS`
+- Subagents cannot execute code: `run_analysis` is excluded by name and a subagent has no
+  session identity for a per-execution credential to be minted from
+- Per-subagent timeout
 
 ## Configuration
 
@@ -2455,8 +2455,6 @@ Default external servers:
 | `SUBAGENT_MODEL` | Model for subagents (falls back to `fast_model`) | `""` |
 | `SUBAGENT_TIMEOUT` | Seconds per subagent execution | `120` |
 | `SUBAGENT_ALLOWED_PATHS` | Comma-separated directories for file access | `""` |
-| `ENABLE_SCRIPT_EXECUTION` | Allow subagents to execute scripts | `false` |
-| `SUBAGENT_SCRIPT_TIMEOUT` | Seconds per script execution | `30` |
 
 ## Logging
 

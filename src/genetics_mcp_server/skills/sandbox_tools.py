@@ -1,26 +1,16 @@
-"""Sandbox tools for subagent file access and script execution.
+"""Sandbox tools for subagent file access.
 
 These tools are only available to subagents, not exposed via MCP or the main agent.
-All operations are restricted to configured allowed paths.
+All operations are restricted to configured allowed paths. Code execution is not here:
+it belongs to `run_analysis`, which runs in the sandbox pod under a per-execution
+credential, and nothing in this process may execute model-authored code.
 """
 
-import asyncio
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-_ALLOWED_INTERPRETERS = {"python3", "Rscript", "bash"}
-
-# Environment passed to model-authored scripts, as an allow-list. This was previously a
-# deny-list of key prefixes, which missed INTERNAL_API_SECRET (the credential that
-# authenticates as "mcp-tool" to results-api) along with the internal service URLs — every
-# variable nobody thought to add stayed exposed. Anything not named here is dropped.
-_ALLOWED_ENV_KEYS = frozenset(
-    {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TZ", "TERM", "PWD", "SHELL", "USER"}
-)
 
 
 def _validate_path(path: str, allowed_paths: list[str]) -> Path:
@@ -40,11 +30,6 @@ def _validate_path(path: str, allowed_paths: list[str]) -> Path:
     raise ValueError(
         f"Path '{path}' is outside allowed directories: {allowed_paths}"
     )
-
-
-def _make_safe_env() -> dict[str, str]:
-    """Build the script environment from an allow-list, so nothing leaks by omission."""
-    return {k: v for k, v in os.environ.items() if k in _ALLOWED_ENV_KEYS}
 
 
 async def read_file(path: str, allowed_paths: list[str]) -> dict[str, Any]:
@@ -101,80 +86,7 @@ async def list_directory(path: str, allowed_paths: list[str]) -> dict[str, Any]:
         return {"success": False, "error": f"Failed to list directory: {e}"}
 
 
-async def execute_script(
-    interpreter: str,
-    script: str,
-    working_dir: str,
-    allowed_paths: list[str],
-    timeout: int = 30,
-) -> dict[str, Any]:
-    """Execute a script using a whitelisted interpreter.
-
-    The script content is passed via stdin to the interpreter.
-    """
-    if interpreter not in _ALLOWED_INTERPRETERS:
-        return {
-            "success": False,
-            "error": f"Interpreter '{interpreter}' not allowed. Allowed: {_ALLOWED_INTERPRETERS}",
-        }
-
-    try:
-        resolved_dir = _validate_path(working_dir, allowed_paths)
-        if not resolved_dir.is_dir():
-            return {"success": False, "error": f"Working directory not found: {working_dir}"}
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
-
-    safe_env = _make_safe_env()
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            interpreter,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(resolved_dir),
-            env=safe_env,
-        )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=script.encode()),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            return {
-                "success": False,
-                "error": f"Script execution timed out after {timeout}s",
-            }
-
-        stdout_str = stdout.decode(errors="replace")
-        stderr_str = stderr.decode(errors="replace")
-
-        # truncate large outputs
-        max_output = 50_000
-        if len(stdout_str) > max_output:
-            stdout_str = stdout_str[:max_output] + "\n[TRUNCATED]"
-        if len(stderr_str) > max_output:
-            stderr_str = stderr_str[:max_output] + "\n[TRUNCATED]"
-
-        return {
-            "success": process.returncode == 0,
-            "return_code": process.returncode,
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-        }
-    except Exception as e:
-        logger.error(f"Error executing script with {interpreter}: {e}")
-        return {"success": False, "error": f"Script execution failed: {e}"}
-
-
-def get_sandbox_tool_definitions(
-    allow_file_read: bool,
-    allow_script_exec: bool,
-) -> list[dict[str, Any]]:
+def get_sandbox_tool_definitions(allow_file_read: bool) -> list[dict[str, Any]]:
     """Get Anthropic-format tool definitions for sandbox tools."""
     tools = []
 
@@ -205,32 +117,6 @@ def get_sandbox_tool_definitions(
                     },
                 },
                 "required": ["path"],
-            },
-        })
-
-    if allow_script_exec:
-        tools.append({
-            "name": "execute_script",
-            "description": (
-                "Execute a script using python3, Rscript, or bash. "
-                "The script content is passed via stdin. "
-                "Available Python libraries: matplotlib, polars, scipy, numpy, pandas. "
-                "For plots, save to the working directory as PNG."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "interpreter": {
-                        "type": "string",
-                        "enum": list(_ALLOWED_INTERPRETERS),
-                        "description": "Script interpreter to use",
-                    },
-                    "script": {
-                        "type": "string",
-                        "description": "Script content to execute",
-                    },
-                },
-                "required": ["interpreter", "script"],
             },
         })
 

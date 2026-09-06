@@ -1860,7 +1860,7 @@ Available skills:
 - **genetics_data_extraction**: Extract genetics data (GWAS, QTL, credible sets, gene expression, LD, etc.)
 - **literature_review**: Search scientific literature and web for relevant publications
 - **database_analysis**: Run complex SQL queries against the genetics database
-- **data_analysis**: Execute Python scripts for statistical analysis or custom visualizations
+- **data_analysis**: Draft a Python script for statistical analysis or custom visualizations — the subagent only writes the script, and you run it yourself afterwards with `run_analysis`
 - **variant_list_analysis**: Analyze a list of variants for phenotype, QTL, and tissue patterns""",
         "parameters": {
             "tasks": {
@@ -1941,10 +1941,10 @@ TOOL_PROFILES: dict[str, set[str]] = {
 #
 # This second mechanism exists because the "code" surface is not expressible as categories
 # and recategorising tools to make it so was ruled out: a tool's category also decides what
-# the api/bigquery chat profiles advertise and what subagent skills declaring
-# tool_categories={"general","api"} can call (skills/definitions.py), so moving one to suit
-# a profile silently changes live chat behaviour. Naming the tools here changes nothing
-# about how any existing profile resolves.
+# the api/bigquery chat profiles advertise, so moving one to suit a profile silently changes
+# live chat behaviour. Naming the tools here changes nothing about how any existing profile
+# resolves. Subagent skills are unaffected either way: they name their tools
+# (skills/definitions.py) rather than inheriting a category.
 #
 # "code" (genetics-results-suite-4h6.16) is the minimal code-execution surface: run an
 # analysis script instead of chaining data tools, plus the entity lookups a script needs a

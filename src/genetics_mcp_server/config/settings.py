@@ -419,14 +419,6 @@ class Settings:
     subagent_allowed_paths: str = field(
         default_factory=lambda: os.environ.get("SUBAGENT_ALLOWED_PATHS", "")
     )
-    enable_script_execution: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_SCRIPT_EXECUTION", "false"
-        ).lower() in ("1", "true", "yes")
-    )
-    subagent_script_timeout: int = field(
-        default_factory=lambda: int(os.environ.get("SUBAGENT_SCRIPT_TIMEOUT", "30"))
-    )
 
     @property
     def subagent_allowed_paths_list(self) -> list[str]:
