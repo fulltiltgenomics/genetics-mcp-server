@@ -6,6 +6,7 @@ This module provides tool definitions in two formats:
 """
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
@@ -2183,10 +2184,56 @@ def _to_anthropic_format(
     return anthropic_tools
 
 
+def _gate(
+    mcp: "FastMCP",
+    disabled: set[str],
+    code_execution: bool | None,
+) -> Callable[[], Callable[[Callable], Callable]]:
+    """The one admission rule every `register_mcp_tools` handler goes through.
+
+    Handlers used to divide into two classes — a few wrapped in `if "x" not in disabled:`
+    and the rest registered whatever the caller asked for — so naming a tool in
+    `disabled_tools` was an inert control over most of the surface, and no caller could
+    subtract a data tool from /mcp at all. Routing every site through one decorator makes
+    the withheld set the only thing a caller has to get right.
+
+    The decision is taken on the handler's own `__name__`, which is the registered tool
+    name, so a site cannot drift from the name it is gated under. A withheld handler is
+    returned undecorated: the function exists in the enclosing scope, FastMCP never learns
+    of it.
+
+    `code_execution` is None where the caller has chosen no surface — nothing beyond
+    `disabled` is withheld, which is what the deployed server does. Given a boolean it
+    subtracts by the same rule `resolve_tools` applies to a chat request, so the two cannot
+    disagree about what belongs to a surface.
+
+    This can only ever SUBTRACT. A handler that does not exist is registered by no argument
+    to this function (`run_analysis` has none, deliberately — see the comment at its place
+    in the ordering below), and neither is a name `resolve_tools` does not return.
+    """
+    surface = (
+        None
+        if code_execution is None
+        else {tool["name"] for tool in resolve_tools(code_execution)}
+    )
+
+    def tool() -> Callable[[Callable], Callable]:
+        def register(handler: Callable) -> Callable:
+            name = handler.__name__
+            if name in disabled or (surface is not None and name not in surface):
+                return handler
+            return mcp.tool()(handler)
+
+        return register
+
+    return tool
+
+
 def register_mcp_tools(
     mcp: "FastMCP",
     executor: "ServerToolExecutor",
     disabled_tools: set[str] | None = None,
+    code_execution: bool | None = None,
 ) -> None:
     """
     Register all tools with a FastMCP server instance.
@@ -2195,6 +2242,14 @@ def register_mcp_tools(
         mcp: FastMCP server instance
         executor: ServerToolExecutor instance for making API calls
         disabled_tools: Optional set of tool names to skip registration.
+        code_execution: Optional surface to register, by the same rule `resolve_tools`
+            uses — True for the code surface, False for the no-code one. None registers
+            everything `disabled_tools` leaves, which is what the deployed server does;
+            the startup setting that would pass a boolean does not exist yet.
+
+    EVERY handler below registers through `_gate`, never through `mcp.tool()` directly. A
+    site that reaches for the raw decorator is unreachable by both filters and silently
+    re-opens whatever the caller was trying to withhold.
 
     BOUNDS ON THIS SURFACE ARE NOT THE SAME DECISION AS ON THE ANTHROPIC ONE
     (genetics-results-suite-4h6.70). FastMCP derives each schema from the signature below,
@@ -2216,24 +2271,29 @@ def register_mcp_tools(
     declaring the cap here would turn a working MCP call into a validation error. Their
     bounds are declared only in `parameters`, where they steer the model without rejecting.
     """
-    _disabled = disabled_tools or set()
+    if code_execution is not None and not isinstance(code_execution, bool):
+        # every non-empty env string is truthy, so an unconverted "false" would select the
+        # code surface; refuse it here rather than register the wrong one
+        raise TypeError(f"code_execution must be a bool or None, got {type(code_execution).__name__}")
 
-    @mcp.tool()
+    _tool = _gate(mcp, disabled_tools or set(), code_execution)
+
+    @_tool()
     async def search_phenotypes(query: str, limit: int = 100) -> dict:
         """Look up phenotypes by disease/trait name. Supports comma-separated values for batch lookup."""
         return await executor.search_phenotypes(query, limit)
 
-    @mcp.tool()
+    @_tool()
     async def search_genes(query: str, limit: int = 10) -> dict:
         """Look up gene symbols and positions. Supports comma-separated values for batch lookup."""
         return await executor.search_genes(query, limit)
 
-    @mcp.tool()
+    @_tool()
     async def lookup_variants_by_rsid(rsids: str) -> dict:
         """Convert rsIDs to variant IDs (chr:pos:ref:alt format)."""
         return await executor.lookup_variants_by_rsid(rsids)
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_sets_by_gene(
         gene: str,
         window: int = 500000,
@@ -2246,7 +2306,7 @@ def register_mcp_tools(
             gene, window, resource, data_types, summarize
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_sets_by_variant(
         variant: str,
         resource: str | None = None,
@@ -2258,7 +2318,7 @@ def register_mcp_tools(
             variant, resource, data_types, summarize
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_sets_by_region(
         region: str,
         resource: str | None = None,
@@ -2270,7 +2330,7 @@ def register_mcp_tools(
             region, resource, coding_only, summarize
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_sets_by_phenotype(
         phenotype: str,
         resource: str = "finngen",
@@ -2281,14 +2341,14 @@ def register_mcp_tools(
             phenotype, resource, summarize
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_set_leads_by_phenotype(
         phenotype: str, resource: str = "finngen"
     ) -> dict:
         """Get one lead variant per credible set for a phenotype."""
         return await executor.get_credible_set_leads_by_phenotype(phenotype, resource)
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_set_by_id(
         resource: str,
         phenotype: str,
@@ -2297,7 +2357,7 @@ def register_mcp_tools(
         """Get all variants in a specific credible set."""
         return await executor.get_credible_set_by_id(resource, phenotype, credible_set_id)
 
-    @mcp.tool()
+    @_tool()
     async def get_credible_sets_by_qtl_gene(
         gene: str,
         data_types: str | None = None,
@@ -2314,12 +2374,12 @@ def register_mcp_tools(
             gene, data_types, resource, summarize
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_gene_expression(gene: str) -> dict:
         """Get tissue-specific gene expression levels."""
         return await executor.get_gene_expression(gene)
 
-    @mcp.tool()
+    @_tool()
     async def get_asm_qtl_by_variant(
         variant: str,
         resources: str | None = None,
@@ -2327,7 +2387,7 @@ def register_mcp_tools(
         """Get ASM-QTL data for a variant."""
         return await executor.get_asm_qtl_by_variant(variant, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_asm_qtl_by_gene(
         gene: str,
         resources: str | None = None,
@@ -2336,7 +2396,7 @@ def register_mcp_tools(
         """Get ASM-QTL data for variants near a gene."""
         return await executor.get_asm_qtl_by_gene(gene, resources, window)
 
-    @mcp.tool()
+    @_tool()
     async def get_open_chromatin_by_variant(
         variant: str,
         resources: str | None = None,
@@ -2344,7 +2404,7 @@ def register_mcp_tools(
         """Get open-chromatin atlas peaks overlapping a variant's position."""
         return await executor.get_open_chromatin_by_variant(variant, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_open_chromatin_by_region(
         chrom: str,
         start: int,
@@ -2354,7 +2414,7 @@ def register_mcp_tools(
         """Get open-chromatin atlas peaks overlapping a genomic region."""
         return await executor.get_open_chromatin_by_region(chrom, start, end, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_open_chromatin_by_peak(
         peak_id: str,
         resources: str | None = None,
@@ -2362,7 +2422,7 @@ def register_mcp_tools(
         """Get one open-chromatin atlas peak by its peak id."""
         return await executor.get_open_chromatin_by_peak(peak_id, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_open_chromatin_by_gene(
         gene: str,
         resources: str | None = None,
@@ -2371,7 +2431,7 @@ def register_mcp_tools(
         """Get open-chromatin atlas peaks near a gene."""
         return await executor.get_open_chromatin_by_gene(gene, resources, window)
 
-    @mcp.tool()
+    @_tool()
     async def get_peak_to_genes(
         peak_id: str,
         resources: str | None = None,
@@ -2380,7 +2440,7 @@ def register_mcp_tools(
         """Get the genes an Open4Gene chromatin peak is linked to, per cell type."""
         return await executor.get_peak_to_genes(peak_id, resources, gencode_version)
 
-    @mcp.tool()
+    @_tool()
     async def get_gene_to_peaks(
         gene: str,
         resources: str | None = None,
@@ -2389,7 +2449,7 @@ def register_mcp_tools(
         """Get the Open4Gene chromatin peaks linked to a gene, per cell type."""
         return await executor.get_gene_to_peaks(gene, resources, gencode_version)
 
-    @mcp.tool()
+    @_tool()
     async def get_variant_effect_by_variant(
         variant: str,
         resources: str | None = None,
@@ -2397,7 +2457,7 @@ def register_mcp_tools(
         """Get in-silico predicted variant effect on chromatin accessibility for a variant."""
         return await executor.get_variant_effect_by_variant(variant, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_variant_effect_by_gene(
         gene: str,
         resources: str | None = None,
@@ -2406,7 +2466,7 @@ def register_mcp_tools(
         """Get in-silico predicted variant effects on chromatin accessibility near a gene."""
         return await executor.get_variant_effect_by_gene(gene, resources, window)
 
-    @mcp.tool()
+    @_tool()
     async def get_mpra_by_variant(
         variant: str,
         resources: str | None = None,
@@ -2414,7 +2474,7 @@ def register_mcp_tools(
         """Get measured MPRA cis-regulatory allelic activity (emVar/active/log2Skew) for a variant."""
         return await executor.get_mpra_by_variant(variant, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_mpra_by_region(
         chrom: str,
         start: int,
@@ -2424,7 +2484,7 @@ def register_mcp_tools(
         """Get measured MPRA cis-regulatory allelic activity for variants overlapping a region."""
         return await executor.get_mpra_by_region(chrom, start, end, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_mpra_by_gene(
         gene: str,
         resources: str | None = None,
@@ -2433,7 +2493,7 @@ def register_mcp_tools(
         """Get measured MPRA cis-regulatory allelic activity for variants near a gene."""
         return await executor.get_mpra_by_gene(gene, resources, window)
 
-    @mcp.tool()
+    @_tool()
     async def get_mpra_pip_concordance_by_gene(
         gene: str,
         window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
@@ -2443,17 +2503,17 @@ def register_mcp_tools(
         """Cross-reference FinnGen fine-mapped credible-set PIP against measured MPRA emVar calls near a gene."""
         return await executor.get_mpra_pip_concordance_by_gene(gene, window, resource, min_pip)
 
-    @mcp.tool()
+    @_tool()
     async def get_gene_disease_associations(gene: str) -> dict:
         """Get Mendelian/rare disease gene-disease relationships."""
         return await executor.get_gene_disease_associations(gene)
 
-    @mcp.tool()
+    @_tool()
     async def get_colocalization(variant: str) -> dict:
         """Get colocalization results for a variant."""
         return await executor.get_colocalization(variant)
 
-    @mcp.tool()
+    @_tool()
     async def get_colocalization_by_credible_set(
         resource: str,
         phenotype: str,
@@ -2465,80 +2525,76 @@ def register_mcp_tools(
             resource, phenotype, credible_set_id, dual_format
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_exome_results_by_gene(gene: str) -> dict:
         """Get rare variant burden test results for a gene."""
         return await executor.get_exome_results_by_gene(gene)
 
-    @mcp.tool()
+    @_tool()
     async def get_exome_results_by_variant(
         variant: str, resources: str | None = None
     ) -> dict:
         """Get rare-variant exome association results for one variant."""
         return await executor.get_exome_results_by_variant(variant, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_exome_results_by_region(
         region: str, resources: str | None = None
     ) -> dict:
         """Get rare-variant exome association results overlapping a genomic region."""
         return await executor.get_exome_results_by_region(region, resources)
 
-    @mcp.tool()
+    @_tool()
     async def get_exome_results_by_phenotype(resource: str, phenotype: str) -> dict:
         """Get individual variant exome results for a specific phenotype within an exome dataset."""
         return await executor.get_exome_results_by_phenotype(resource, phenotype)
 
-    @mcp.tool()
+    @_tool()
     async def get_gene_based_results(gene: str) -> dict:
         """Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA."""
         return await executor.get_gene_based_results(gene)
 
-    @mcp.tool()
+    @_tool()
     async def get_gene_based_results_by_phenotype(resource: str, phenotype: str) -> dict:
         """Get the complete unfiltered gene burden results for one phenotype."""
         return await executor.get_gene_based_results_by_phenotype(resource, phenotype)
 
-    if "get_phenotype_report" not in _disabled:
+    @_tool()
+    async def get_phenotype_report(resource: str, phenotype_code: str) -> dict:
+        """Get a detailed markdown report for a phenotype."""
+        return await executor.get_phenotype_report(resource, phenotype_code)
 
-        @mcp.tool()
-        async def get_phenotype_report(resource: str, phenotype_code: str) -> dict:
-            """Get a detailed markdown report for a phenotype."""
-            return await executor.get_phenotype_report(resource, phenotype_code)
-
-    @mcp.tool()
+    @_tool()
     async def lookup_phenotype_names(codes: list[str]) -> dict:
         """Translate phenotype codes to human-readable names."""
         return await executor.lookup_phenotype_names(codes)
 
-    @mcp.tool()
+    @_tool()
     async def list_datasets(
         resource: str | None = None, include_stats: bool = True
     ) -> dict:
         """List all datasets with descriptions, products, and sample sizes."""
         return await executor.list_datasets(resource, include_stats)
 
-    @mcp.tool()
+    @_tool()
     async def get_resource_metadata(resource: str) -> dict:
         """Get the harmonized per-trait metadata of one resource."""
         return await executor.get_resource_metadata(resource)
 
-    @mcp.tool()
+    @_tool()
     async def get_dataset_display_names() -> dict:
         """Get display-name overrides keyed by the raw dataset column value."""
         return await executor.get_dataset_display_names()
 
-    if "get_credible_sets_stats" not in _disabled:
+    @_tool()
+    async def get_credible_sets_stats(
+        resource_or_dataset: str,
+        trait: str | None = None,
+    ) -> dict:
+        """Get credible sets stats. CRITICAL: Include the INCLUDE_IN_RESPONSE field value verbatim in your response."""
+        return await executor.get_credible_sets_stats(resource_or_dataset, trait)
 
-        @mcp.tool()
-        async def get_credible_sets_stats(
-            resource_or_dataset: str,
-            trait: str | None = None,
-        ) -> dict:
-            """Get credible sets stats. CRITICAL: Include the INCLUDE_IN_RESPONSE field value verbatim in your response."""
-            return await executor.get_credible_sets_stats(resource_or_dataset, trait)
-
-    @mcp.tool()
+    @_tool()
     async def get_nearest_genes(
         variant: str,
         gene_type: str = "protein_coding",
@@ -2557,7 +2613,7 @@ def register_mcp_tools(
             return_hgnc_symbol_if_only_ensg,
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_genes_in_region(
         chr: str,
         start: int,
@@ -2570,7 +2626,7 @@ def register_mcp_tools(
             chr, start, end, gene_type, gencode_version
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_gene_group_members(
         group_id: int | None = None,
         group_name: str | None = None,
@@ -2581,150 +2637,128 @@ def register_mcp_tools(
             group_id, group_name, exclude_olfactory
         )
 
-    @mcp.tool()
+    @_tool()
     async def normalize_gene_symbols(symbols: list[str]) -> dict:
         """Resolve gene symbols/aliases/previous symbols to current approved HGNC symbols (exact match). Returns mappings plus any unresolved inputs."""
         return await executor.normalize_gene_symbols(symbols)
 
-    if "search_scientific_literature" not in _disabled:
+    @_tool()
+    async def search_scientific_literature(
+        query: str,
+        max_results: int = 10,
+        include_preprints: bool = True,
+        date_range: str | None = None,
+    ) -> dict:
+        """Search scientific literature via Europe PMC or Perplexity. The backend is set by configuration, not by the caller."""
+        return await executor.search_scientific_literature(
+            query, max_results, include_preprints, date_range
+        )
 
-        @mcp.tool()
-        async def search_scientific_literature(
-            query: str,
-            max_results: int = 10,
-            include_preprints: bool = True,
-            date_range: str | None = None,
-        ) -> dict:
-            """Search scientific literature via Europe PMC or Perplexity. The backend is set by configuration, not by the caller."""
-            return await executor.search_scientific_literature(
-                query, max_results, include_preprints, date_range
-            )
+    @_tool()
+    async def web_search(
+        query: str,
+        max_results: int = 5,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+    ) -> dict:
+        """Search the web for general information."""
+        return await executor.web_search(
+            query, max_results, include_domains, exclude_domains
+        )
 
-    if "web_search" not in _disabled:
+    @_tool()
+    async def search_mgi(
+        query: str,
+        query_type: str = "gene_phenotypes",
+        species: str = "mouse",
+        max_results: int = 25,
+    ) -> dict:
+        """Search Jackson Lab MGI for curated mouse phenotypes, alleles, and orthologs."""
+        return await executor.search_mgi(
+            query, query_type, species, max_results
+        )
 
-        @mcp.tool()
-        async def web_search(
-            query: str,
-            max_results: int = 5,
-            include_domains: list[str] | None = None,
-            exclude_domains: list[str] | None = None,
-        ) -> dict:
-            """Search the web for general information."""
-            return await executor.web_search(
-                query, max_results, include_domains, exclude_domains
-            )
+    @_tool()
+    async def search_cbioportal(
+        query: str,
+        query_type: str = "gene_summary",
+        cancer_types: list[str] | None = None,
+        max_results: int = 25,
+    ) -> dict:
+        """Search cBioPortal for somatic alteration frequency in cancer cohorts. Coordinates are mostly GRCh37 — match on gene symbol and protein change, not position."""
+        return await executor.search_cbioportal(
+            query, query_type, cancer_types, max_results
+        )
 
-    if "search_mgi" not in _disabled:
+    @_tool()
+    async def get_protein_annotations(
+        query: str,
+        organism_id: int | None = 9606,
+        include: list[str] | None = None,
+        feature_types: list[str] | None = None,
+        residue_range: str | None = None,
+    ) -> dict:
+        """Get UniProt protein annotations (residue features, function, sequence). Pass a gene symbol, not a remembered accession."""
+        return await executor.get_protein_annotations(
+            query, organism_id, include, feature_types, residue_range
+        )
 
-        @mcp.tool()
-        async def search_mgi(
-            query: str,
-            query_type: str = "gene_phenotypes",
-            species: str = "mouse",
-            max_results: int = 25,
-        ) -> dict:
-            """Search Jackson Lab MGI for curated mouse phenotypes, alleles, and orthologs."""
-            return await executor.search_mgi(
-                query, query_type, species, max_results
-            )
+    @_tool()
+    async def map_protein_variants(
+        variants: list[str],
+        query: str,
+        organism_id: int | None = 9606,
+    ) -> dict:
+        """Map amino-acid substitutions (e.g. ['P70A','R438H'] in TPO) to genomic coordinates and rsIDs via UniProt."""
+        return await executor.map_protein_variants(variants, query, organism_id)
 
-    if "search_cbioportal" not in _disabled:
+    @_tool()
+    async def get_variant_protein_effect(variants: list[str]) -> dict:
+        """Map genomic coding SNVs (e.g. ['12:40340400:G:A'], GRCh38) to the amino-acid change and curated UniProt/ClinVar annotation."""
+        return await executor.get_variant_protein_effect(variants)
 
-        @mcp.tool()
-        async def search_cbioportal(
-            query: str,
-            query_type: str = "gene_summary",
-            cancer_types: list[str] | None = None,
-            max_results: int = 25,
-        ) -> dict:
-            """Search cBioPortal for somatic alteration frequency in cancer cohorts. Coordinates are mostly GRCh37 — match on gene symbol and protein change, not position."""
-            return await executor.search_cbioportal(
-                query, query_type, cancer_types, max_results
-            )
+    @_tool()
+    async def search_uniprot(
+        query: str | None = None,
+        keyword: str | None = None,
+        organism_id: int | None = 9606,
+        reviewed_only: bool = True,
+        fields: str = "accession,id,protein_name,gene_names,organism_name",
+        size: int = 25,
+        count_only: bool = False,
+    ) -> dict:
+        """Search UniProtKB for the set of proteins matching a keyword, family, location or free-text query."""
+        return await executor.search_uniprot(
+            query, keyword, organism_id, reviewed_only, fields, size, count_only
+        )
 
-    if "get_protein_annotations" not in _disabled:
+    @_tool()
+    async def get_drug_targets_for_gene(
+        query: str,
+        min_phase: float = 0,
+        include_indications: bool = False,
+        max_results: int = 25,
+    ) -> dict:
+        """List the drugs and clinical candidates ChEMBL records against a gene's target, with mechanism, action type and highest clinical phase."""
+        return await executor.get_drug_targets_for_gene(
+            query, min_phase, include_indications, max_results
+        )
 
-        @mcp.tool()
-        async def get_protein_annotations(
-            query: str,
-            organism_id: int | None = 9606,
-            include: list[str] | None = None,
-            feature_types: list[str] | None = None,
-            residue_range: str | None = None,
-        ) -> dict:
-            """Get UniProt protein annotations (residue features, function, sequence). Pass a gene symbol, not a remembered accession."""
-            return await executor.get_protein_annotations(
-                query, organism_id, include, feature_types, residue_range
-            )
+    @_tool()
+    async def get_drug_profile(query: str) -> dict:
+        """Get ChEMBL's profile for one drug: highest clinical phase, approval and withdrawal, ATC class, targets and indications."""
+        return await executor.get_drug_profile(query)
 
-    if "map_protein_variants" not in _disabled:
+    @_tool()
+    async def get_target_bioactivity(
+        query: str,
+        pchembl_min: float = 6.0,
+        max_results: int = 25,
+    ) -> dict:
+        """Summarise ChEMBL potency measurements against a gene's target: activity counts, assay-type breakdown and the most potent compounds."""
+        return await executor.get_target_bioactivity(query, pchembl_min, max_results)
 
-        @mcp.tool()
-        async def map_protein_variants(
-            variants: list[str],
-            query: str,
-            organism_id: int | None = 9606,
-        ) -> dict:
-            """Map amino-acid substitutions (e.g. ['P70A','R438H'] in TPO) to genomic coordinates and rsIDs via UniProt."""
-            return await executor.map_protein_variants(variants, query, organism_id)
-
-    if "get_variant_protein_effect" not in _disabled:
-
-        @mcp.tool()
-        async def get_variant_protein_effect(variants: list[str]) -> dict:
-            """Map genomic coding SNVs (e.g. ['12:40340400:G:A'], GRCh38) to the amino-acid change and curated UniProt/ClinVar annotation."""
-            return await executor.get_variant_protein_effect(variants)
-
-    if "search_uniprot" not in _disabled:
-
-        @mcp.tool()
-        async def search_uniprot(
-            query: str | None = None,
-            keyword: str | None = None,
-            organism_id: int | None = 9606,
-            reviewed_only: bool = True,
-            fields: str = "accession,id,protein_name,gene_names,organism_name",
-            size: int = 25,
-            count_only: bool = False,
-        ) -> dict:
-            """Search UniProtKB for the set of proteins matching a keyword, family, location or free-text query."""
-            return await executor.search_uniprot(
-                query, keyword, organism_id, reviewed_only, fields, size, count_only
-            )
-
-    if "get_drug_targets_for_gene" not in _disabled:
-
-        @mcp.tool()
-        async def get_drug_targets_for_gene(
-            query: str,
-            min_phase: float = 0,
-            include_indications: bool = False,
-            max_results: int = 25,
-        ) -> dict:
-            """List the drugs and clinical candidates ChEMBL records against a gene's target, with mechanism, action type and highest clinical phase."""
-            return await executor.get_drug_targets_for_gene(
-                query, min_phase, include_indications, max_results
-            )
-
-    if "get_drug_profile" not in _disabled:
-
-        @mcp.tool()
-        async def get_drug_profile(query: str) -> dict:
-            """Get ChEMBL's profile for one drug: highest clinical phase, approval and withdrawal, ATC class, targets and indications."""
-            return await executor.get_drug_profile(query)
-
-    if "get_target_bioactivity" not in _disabled:
-
-        @mcp.tool()
-        async def get_target_bioactivity(
-            query: str,
-            pchembl_min: float = 6.0,
-            max_results: int = 25,
-        ) -> dict:
-            """Summarise ChEMBL potency measurements against a gene's target: activity counts, assay-type breakdown and the most potent compounds."""
-            return await executor.get_target_bioactivity(query, pchembl_min, max_results)
-
-    @mcp.tool()
+    @_tool()
     async def get_ld_between_variants(
         variant1: str,
         variant2: str,
@@ -2736,7 +2770,7 @@ def register_mcp_tools(
             variant1, variant2, r2_threshold, panel
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_variants_in_ld(
         variant: str,
         window: int = 1500000,
@@ -2746,7 +2780,7 @@ def register_mcp_tools(
         """Get all variants in LD with a given variant from FinnGen reference panel."""
         return await executor.get_variants_in_ld(variant, window, r2_threshold, panel)
 
-    @mcp.tool()
+    @_tool()
     async def analyze_variant_list(
         variants: str,
         resource: str | None = None,
@@ -2754,7 +2788,7 @@ def register_mcp_tools(
         """Analyze a list of variants for phenotype, QTL, and tissue patterns."""
         return await executor.analyze_variant_list(variants, resource)
 
-    @mcp.tool()
+    @_tool()
     async def get_summary_stats(
         variants: list[str],
         phenotypes: list[str],
@@ -2764,7 +2798,7 @@ def register_mcp_tools(
         """Get summary statistics for specific variant-phenotype pairs."""
         return await executor.get_summary_stats(variants, phenotypes, resource, data_type)
 
-    @mcp.tool()
+    @_tool()
     async def get_summary_stats_by_region(
         region: str,
         phenotypes: list[str],
@@ -2776,7 +2810,7 @@ def register_mcp_tools(
             region, phenotypes, resource, data_type
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_hla_by_phenotype(
         phenotypes: list[str],
         genes: str | None = None,
@@ -2785,7 +2819,7 @@ def register_mcp_tools(
         """Get classical HLA allele associations for one or more phenotypes."""
         return await executor.get_hla_by_phenotype(phenotypes, genes, resource)
 
-    @mcp.tool()
+    @_tool()
     async def get_hla_by_allele(
         allele: str,
         min_mlogp: float = 7.3,
@@ -2798,7 +2832,7 @@ def register_mcp_tools(
             allele, min_mlogp, min_info, resource, max_rows
         )
 
-    @mcp.tool()
+    @_tool()
     async def get_variant_annotations(
         variant: str | None = None,
         region: str | None = None,
@@ -2811,45 +2845,40 @@ def register_mcp_tools(
             variant=variant, region=region, gene=gene, variants=variants, source=source
         )
 
-    if "get_myvariant_annotations" not in _disabled:
+    @_tool()
+    async def get_myvariant_annotations(
+        variant: str | None = None,
+        variants: list[str] | None = None,
+        fields: str = "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp",
+    ) -> dict:
+        """Get clinical/functional variant annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data)."""
+        return await executor.get_myvariant_annotations(
+            variant=variant, variants=variants, fields=fields
+        )
 
-        @mcp.tool()
-        async def get_myvariant_annotations(
-            variant: str | None = None,
-            variants: list[str] | None = None,
-            fields: str = "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp",
-        ) -> dict:
-            """Get clinical/functional variant annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data)."""
-            return await executor.get_myvariant_annotations(
-                variant=variant, variants=variants, fields=fields
-            )
-
-    if "list_capabilities" not in _disabled:
-
-        @mcp.tool()
-        async def list_capabilities(module: str | None = None) -> dict:
-            """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors', 'plots') as signatures with docstrings. Omit module for the index."""
-            return await executor.list_capabilities(module=module)
+    @_tool()
+    async def list_capabilities(module: str | None = None) -> dict:
+        """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors', 'plots') as signatures with docstrings. Omit module for the index."""
+        return await executor.list_capabilities(module=module)
 
     # run_analysis has NO block here, deliberately, and the omission is the point.
-    # docs/code-execution-security.md §5 makes membership of mcp_server.py's _mcp_disabled
-    # the sole registration-layer control and then says layer 1 is assumed defeatable. A
-    # missing block is a second, independent registration-layer control that no set passed
-    # to this function can undo: `disabled_tools` can only subtract. It also matches what
+    # docs/code-execution-security.md §5 layer 1 names two registration-layer controls for
+    # run_analysis — membership of mcp_server.py's _mcp_disabled, and the absent handler
+    # here — and then says the layer as a whole is assumed defeatable. The missing block is
+    # the half no set passed to this function can undo: `disabled_tools` can only subtract. It also matches what
     # the tool needs — the handler is given the authenticated user and the chat session id
     # by the caller, and an MCP session has neither, so a registered wrapper could only
     # ever pass identity it does not have. Keep _mcp_disabled's entry as well: it is the
     # named control the security doc and the tests reason about, and it is what catches a
     # future block added here without this comment being read.
-    if "read_artifact" not in _disabled:
 
-        @mcp.tool()
-        async def read_artifact(name: str) -> dict:
-            """Read a named file an analysis script wrote to its artifacts directory."""
-            return await executor.read_artifact(name=name)
+    @_tool()
+    async def read_artifact(name: str) -> dict:
+        """Read a named file an analysis script wrote to its artifacts directory."""
+        return await executor.read_artifact(name=name)
 
     # BigQuery tools - available via MCP server for direct SQL queries
-    @mcp.tool()
+    @_tool()
     async def query_database(
         sql: str,
         max_rows: int = 1000,
@@ -2858,7 +2887,7 @@ def register_mcp_tools(
         """Execute SQL against the genetics database. Call get_database_schema first to discover available tables."""
         return await executor.query_database(sql, max_rows, dry_run)
 
-    @mcp.tool()
+    @_tool()
     async def get_database_schema(table: str | None = None) -> dict:
         """Get schema for database tables. Always call this before writing queries. Pass a table name to get just that table's schema."""
         return await executor.get_database_schema(table)

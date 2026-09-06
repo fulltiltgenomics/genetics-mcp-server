@@ -593,10 +593,15 @@ requires that code execution is not reachable via MCP. `run_analysis` additional
 that no configuration can undo, since `disabled_tools` can only subtract: the entry in
 `_mcp_disabled` is the half an env-driven `disabled_tools` and a future refactor can
 disturb, and it is what would catch a block added later. Both are asserted against the
-*registered tool list* rather than against the constant. Note what does **not** protect
-anything here: `register_mcp_tools` registers from `all_local_tool_definitions()` and reads
-no surface at all, so "the MCP server does not select the code surface" is precisely the
-condition under which an unguarded tool would be registered.
+*registered tool list* rather than against the constant. Every handler in
+`register_mcp_tools` is registered through one gate (`_gate`), so a name in `disabled_tools`
+is withheld wherever it appears rather than only where someone remembered to write a guard
+around it — previously most handlers registered unconditionally, which made naming a data
+tool in the set inert. The gate takes an optional `code_execution` surface that subtracts by
+the same rule `resolve_tools` uses; the deployed server passes none, so /mcp is still every
+handler minus `_mcp_disabled`. It can only ever subtract, which is what the missing
+`run_analysis` handler survives: selecting the code surface names `run_analysis` and still
+registers nothing.
 `list_capabilities` is deliberately **not** excluded: what it renders is per-function SDK
 signatures and docstrings, which describe the SDK's shape rather than data, session state
 or any execution, and an exclusion set padded with harmless names stops reading as a
@@ -713,11 +718,11 @@ other value resolves to the no-code surface** — `None`, the retired `api`/`big
 `nocode`, and any value this server has never heard of. That is the safe direction for a
 value read back from a `chat_messages` row written by an older client.
 
-Downstream of that edge nothing reads the name for a surface decision: `resolve_local_tools`,
-`resolve_local_tool_names`, `get_anthropic_tools` and `stream_chat` all take
-`code_execution`, and `resolve_tools` takes it too. Two things still take the string, and
-neither decides a local surface — `resolve_proxied_tools`, whose collapse onto the boolean is
-separate work, and the turn-metrics row, which records what the client actually sent.
+Downstream of that edge nothing reads the name for any surface decision at all:
+`resolve_local_tools`, `resolve_local_tool_names`, `get_anthropic_tools` and `stream_chat`
+all take `code_execution`, `resolve_tools` takes it too, and `resolve_proxied_tools` takes
+no surface argument of any kind. The one thing still handed the string is the turn-metrics
+row, which records what the client actually sent.
 
 **The stored value is never rewritten.** `chat_messages.tool_profile` and
 `user_settings.chat_tool_profile` keep the string the client wrote, legacy names included,
@@ -740,21 +745,24 @@ by it, via `tool_category()`). **No surface decision reads it.**
 
 ### Profile behavior
 
-| `tool_profile` value | Local tools | External tools |
-|----------------------|-------------|----------------|
-| `null` (default) | the no-code surface | always-on (gnomAD, OT) + RAG |
-| `"api"`, `"bigquery"`, `"nocode"` | the no-code surface | always-on only |
-| `"rag"` | the no-code surface | RAG only |
-| `"code"` | the code surface | **none** |
-| any other string | the no-code surface (fallback, no error) | always-on only |
+| `tool_profile` value | Local tools |
+|----------------------|-------------|
+| `"code"` | the code surface |
+| `null` (default), `"api"`, `"bigquery"`, `"rag"`, `"nocode"`, any other string | the no-code surface (the last as a fallback, no error) |
 
-The proxied columns are still keyed on the profile NAME rather than on the boolean; making
-them reach both surfaces is separate work. The resolved sets themselves are frozen in
+**There is no external-tools column, and that is the change rather than an omission.**
+`resolve_proxied_tools()` takes no argument: both surfaces are handed every proxied tool
+`EXTERNAL_MCP_SERVERS` registered and every RAG tool `RAG_MCP_SERVER` registered, minus
+whatever `EXTERNAL_MCP_EXCLUDE_TOOLS` removed at registration time. The externals are the
+tools the sandbox cannot reach — its egress allow-list admits db-api and results-api only —
+so withholding them from the code surface would leave that surface no route to them at all,
+and whether the RAG group is empty is a deployment fact about `RAG_MCP_SERVER` rather than
+anything a request chooses. The resolved sets themselves are frozen in
 `tests/golden/tool_surface.json` — read the counts there rather than writing them here.
 
 The fallback row is deliberate — the value is read back from `chat_messages` rows written by older clients, so an unrecognised name must not raise — but it is no longer invisible (genetics-results-suite-4h6.74). Two things report it, neither of which changes the resolution: `code_execution_requested` logs a WARNING naming the value, what it resolved to (the no-code surface) and the recognised set, the first time it sees it, **once per distinct value** (not per request — a stored bad value arrives on every turn of its session, and a per-request warning would bury itself); and `GET /chat/v1/tools/resolved?tool_profile=<value>` returns `known_profile: false` alongside the resolved `count`/`names`. The browser calls that endpoint whenever a profile is picked or restored from the user's settings and warns next to the Tools control when the answer is false.
 
-That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, and `null` is the top row of this table — the no-code surface — so a user whose stored `chat_tool_profile` is a server-only name silently gets the no-code surface instead of the one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Since the collapse that direction can only cost a user the `code` surface: every other value
+That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, which resolves to the no-code surface — so a user whose stored `chat_tool_profile` is a server-only name silently gets the no-code surface instead of the one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Since the collapse that direction can only cost a user the `code` surface: every other value
 resolves the same way whichever side invented it. Changing the accepted set here still
 requires editing that file: `tests/test_unknown_profile_warning.py::test_the_profile_key_set_is_pinned_against_the_browsers_copy` pins `KNOWN_TOOL_PROFILES` against a literal so the decision is deliberate, mirroring the browser's own pin in `useChatOptions.test.ts`.
 
