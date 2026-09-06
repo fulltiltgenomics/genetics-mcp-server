@@ -7,12 +7,13 @@ from genetics_mcp_server.tools.executor import ToolExecutor
 if TYPE_CHECKING:
     from genetics_mcp_server.tools.definitions import (
         BIGQUERY_TOOL_DEFINITIONS,
+        CODE_EXECUTION_TOOL_DEFINITIONS,
         SUBAGENT_TOOL_DEFINITIONS,
         TOOL_DEFINITIONS,
-        TOOL_PROFILE_TOOLS,
-        TOOL_PROFILES,
+        all_anthropic_tools,
         get_anthropic_tools,
         register_mcp_tools,
+        resolve_tools,
     )
     from genetics_mcp_server.tools.orchestration import ServerToolExecutor
 
@@ -22,10 +23,11 @@ __all__ = [
     "TOOL_DEFINITIONS",
     "BIGQUERY_TOOL_DEFINITIONS",
     "SUBAGENT_TOOL_DEFINITIONS",
-    "TOOL_PROFILES",
-    "TOOL_PROFILE_TOOLS",
+    "CODE_EXECUTION_TOOL_DEFINITIONS",
     "register_mcp_tools",
     "get_anthropic_tools",
+    "all_anthropic_tools",
+    "resolve_tools",
 ]
 
 # `definitions` is resolved on first attribute access, not at import (genetics-results-suite-6bv).
@@ -67,12 +69,13 @@ __all__ = [
 _LAZY_FROM_DEFINITIONS = frozenset(
     {
         "BIGQUERY_TOOL_DEFINITIONS",
+        "CODE_EXECUTION_TOOL_DEFINITIONS",
         "SUBAGENT_TOOL_DEFINITIONS",
         "TOOL_DEFINITIONS",
-        "TOOL_PROFILES",
-        "TOOL_PROFILE_TOOLS",
+        "all_anthropic_tools",
         "get_anthropic_tools",
         "register_mcp_tools",
+        "resolve_tools",
     }
 )
 

@@ -1,7 +1,9 @@
-"""Frozen baseline of every resolvable tool surface, taken before the profile collapse.
+"""Frozen baseline of every resolvable tool surface, across the profile collapse.
 
-The upcoming replacement of the six tool profiles by a single `code_execution` boolean has to
-be provably non-destructive for `nocode`. Nothing else in the suite compares a whole resolved
+The replacement of the six tool profiles by a single `code_execution` boolean had to be
+provably non-destructive for `nocode`, and the golden is what proved it: that set is
+byte-identical either side of the change. The four legacy values and `None` now resolve to
+that same set, and `code` to the surface the boolean's other half selects. Nothing else in the suite compares a whole resolved
 tool list against a recorded one — the existing tests assert membership of individual names —
 so a profile that silently gained or lost tools during the refactor would pass every one of
 them. This file records the lists themselves.
@@ -68,8 +70,10 @@ DEPLOYED_FLAGS: dict[str, dict[str, str]] = {
     "mcp_server": {"ENABLE_SUBAGENTS": "false"},
 }
 
-# the profile values a chat request can carry. None is the unfiltered surface and is not a
-# profile name, so it is keyed as the string "null" for JSON's sake.
+# the profile values a chat request can carry. None is not a profile name, so it is keyed as
+# the string "null" for JSON's sake. Every one of them is still recorded even though only two
+# distinct surfaces remain: the collapse is a claim about what each stored value resolves to,
+# and dropping the four that coincide would delete the evidence for it.
 PROFILES: list[tuple[str, str | None]] = [
     ("null", None),
     ("api", "api"),
@@ -278,7 +282,7 @@ class TestResolvedProfiles:
     def test_nocode_matches_the_frozen_set(self, resolved, golden):
         """The one the collapse to a boolean must not move.
 
-        `code_execution=False` is the profile the collapse maps onto `nocode`, so drift here
+        `code_execution=False` is the surface the collapse maps `nocode` onto, so drift here
         is the collapse being destructive rather than a rename — whoever is on the profile.
         """
         actual = resolved["chat_backend"]["profiles"]["nocode"]
@@ -302,6 +306,28 @@ class TestResolvedProfiles:
         actual = resolved["chat_backend"]["profiles"][key]["proxied"]
         expected = golden["chat_backend"]["profiles"][key]["proxied"]
         assert actual == expected, f"profile {key} proxied groups moved: {expected} -> {actual}"
+
+    @pytest.mark.parametrize("key", ["null", "api", "bigquery", "rag"])
+    def test_the_legacy_names_collapsed_onto_nocode(self, key, resolved, golden):
+        """The collapse itself, recorded rather than left as a coincidence in the golden.
+
+        Before this change each of these resolved to a different local set; now the shim
+        maps every value except "code" onto the no-code surface. The golden would show a
+        legacy name drifting away from `nocode` only as an unexplained diff, so it is
+        asserted here too. Local tools only: the proxied groups are still keyed on the
+        profile NAME, so `rag` and `null` legitimately differ from `nocode` there.
+        """
+        assert (
+            resolved["chat_backend"]["profiles"][key]["local"]
+            == resolved["chat_backend"]["profiles"]["nocode"]["local"]
+        )
+
+    def test_code_is_the_only_value_that_resolves_anywhere_else(self, resolved):
+        code = resolved["chat_backend"]["profiles"]["code"]["local"]
+        nocode = resolved["chat_backend"]["profiles"]["nocode"]["local"]
+        assert code != nocode
+        assert "run_analysis" in code["tools"]
+        assert "run_analysis" not in nocode["tools"]
 
     def test_the_profile_set_itself_has_not_changed(self, resolved, golden):
         assert set(resolved["chat_backend"]["profiles"]) == set(

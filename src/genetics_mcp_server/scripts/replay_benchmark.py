@@ -63,8 +63,10 @@ logger = logging.getLogger(__name__)
 
 CHAT_PATH = "/chat/v1/chat"
 
-# `tool_profile: null` means "all tools" (definitions.py), and null is unspellable on
-# the command line, so this literal is how a caller asks for it.
+# null is unspellable on the command line, so this literal is how a caller spells
+# `tool_profile: null` on the wire. The name is wire spelling, not a claim about breadth:
+# the shim in definitions.py resolves null — and every value except "code" — to the no-code
+# surface, so this arm is the same surface as "nocode", "api", "bigquery" and "rag".
 ALL_TOOLS_ARM = "all"
 
 REPORTED_PERCENTILES = (25, 50, 75, 90, 95)
@@ -1293,18 +1295,24 @@ async def resolve_arm_tools(
 ) -> dict[str, Any]:
     """Ask the SERVER what each arm actually resolves to, before spending anything.
 
-    Two things this prevents, both of which produce a run that looks fine and means nothing:
+    Three things this prevents, each of which produces a run that looks fine and means
+    nothing:
 
-    1. A MISSPELLED ARM. `get_anthropic_tools` degrades an unrecognised profile to
-       general-only rather than raising — deliberately, because the value comes back from
-       rows written by older clients — so `--arm-a nocod` silently yields an 18-tool
-       baseline and reports plausible numbers against it. `known_profile: false` is fatal
+    1. A MISSPELLED ARM. `get_anthropic_tools` resolves an unrecognised profile to the
+       no-code surface rather than raising — deliberately, because the value comes back
+       from rows written by older clients — so `--arm-a cod` silently yields the no-code
+       surface and reports plausible numbers against it. `known_profile: false` is fatal
        here: refusing to start costs nothing, and the alternative is discovering it after
        the spend.
     2. A SERVER RUNNING OLDER CODE. The profile is resolved in the chat service's process,
        which imports the definitions at startup. A profile added on disk but not yet loaded
        by a running server resolves through the same silent fallback, and locally that is
        one forgotten restart away.
+    3. TWO ARMS THAT ARE ONE SURFACE. Since the profile names collapsed onto two surfaces,
+       every legacy value except `code` resolves to the same tools, so a pair like
+       `all`/`bigquery` compares a surface against itself and reports a difference of zero
+       that reads as a real result. Identical resolved name sets are fatal for the same
+       reason a misspelling is.
 
     The resolved counts and names are recorded in the report so a saved run PROVES what each
     arm was given, rather than leaving it to be re-derived later from a tree that has since
@@ -1347,11 +1355,29 @@ async def resolve_arm_tools(
         else:
             logger.info("arm %r resolves to %s local tools", arm, data.get("count"))
     if unknown:
+        detail = ", ".join(
+            f"{arm} (resolved to {out[arm].get('count')} local tools)" for arm in unknown
+        )
         raise ArmResolutionError(
-            f"{base_url} does not recognise these arm profiles: {', '.join(unknown)}. "
-            "An unrecognised profile silently degrades to general-only (18 tools), so this "
+            f"{base_url} does not recognise these arm profiles: {detail}. An unrecognised "
+            "profile silently resolves to the no-code surface rather than raising, so this "
             "run would have measured a surface you did not intend. Check the spelling, and "
             "check the server has been restarted since the profile was added."
+        )
+    arm_a, arm_b = arms
+    names_a = out.get(arm_a, {}).get("names")
+    names_b = out.get(arm_b, {}).get("names")
+    if (
+        isinstance(names_a, list)
+        and isinstance(names_b, list)
+        and set(names_a) == set(names_b)
+    ):
+        raise ArmResolutionError(
+            f"arms {arm_a!r} and {arm_b!r} both resolve to the same {len(set(names_a))} "
+            f"local tools on {base_url}, so this run would compare a surface against "
+            "itself and report a difference of zero that reads as a real result. Every "
+            "profile name except 'code' now selects the no-code surface, so pick arms "
+            "that straddle that line."
         )
     return out
 

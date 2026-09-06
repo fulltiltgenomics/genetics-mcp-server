@@ -4,7 +4,7 @@ import pytest
 
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
-    SUBAGENT_TOOL_DEFINITIONS,
+    CODE_EXECUTION_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
     get_anthropic_tools,
     register_mcp_tools,
@@ -72,9 +72,9 @@ class TestAnthropicToolFormat:
         assert isinstance(tools, list)
 
     def test_anthropic_tools_count_matches(self):
-        """Test that default (no profile) returns all tools."""
+        """No profile is the no-code surface: every data tool and none of the sandbox's."""
         tools = get_anthropic_tools()
-        assert len(tools) == len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS) + len(SUBAGENT_TOOL_DEFINITIONS)
+        assert len(tools) == len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS)
 
     def test_anthropic_tool_structure(self):
         """Test that Anthropic tools have correct structure."""
@@ -153,7 +153,9 @@ class TestMCPToolRegistration:
         # verify expected tools are registered. run_analysis is the one definition with no
         # registration block at all — see the comment in register_mcp_tools; it is a
         # security control, so this exemption is the assertion, not a gap in it.
-        expected = {t["name"] for t in TOOL_DEFINITIONS} - {"run_analysis"}
+        expected = {
+            t["name"] for t in TOOL_DEFINITIONS + CODE_EXECUTION_TOOL_DEFINITIONS
+        } - {"run_analysis"}
 
         # if we have tool manager access, verify all tools
         if registered_names:

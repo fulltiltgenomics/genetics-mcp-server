@@ -90,14 +90,19 @@ class TestToolsEndpoint:
         assert {t["source"] for t in data} <= {"local", "external", "rag"}
 
     def test_resolved_narrows_with_the_profile(self, test_client):
-        """A narrower profile means a shorter list — the panel is per-conversation."""
+        """The code surface is a shorter list than the no-code one — the panel is
+        per-conversation. `rag` and the other legacy names now resolve to the no-code
+        surface, so "code" is the only value that narrows anything."""
         everything = test_client.get("/chat/v1/tools", params={"resolved": "true"}).json()
-        rag = test_client.get(
-            "/chat/v1/tools", params={"resolved": "true", "tool_profile": "rag"}
+        code = test_client.get(
+            "/chat/v1/tools", params={"resolved": "true", "tool_profile": "code"}
         ).json()
 
-        assert len(rag) < len(everything)
-        assert {t["category"] for t in rag} == {"general"}
+        assert len(code) < len(everything)
+        # list_capabilities rather than run_analysis: the latter is gated on SANDBOX_ENABLED,
+        # which is false here, so its absence would say nothing about the surface
+        assert "list_capabilities" in {t["name"] for t in code}
+        assert "get_credible_sets_by_gene" not in {t["name"] for t in code}
 
     def test_resolved_with_tools_off_is_empty(self, test_client):
         """enable_tools=false is the one case where the assistant really has no tools."""

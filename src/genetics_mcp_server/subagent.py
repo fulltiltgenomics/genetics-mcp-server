@@ -32,7 +32,7 @@ from genetics_mcp_server.skills.sandbox_tools import (
     list_directory,
     read_file,
 )
-from genetics_mcp_server.tools import ServerToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools import ServerToolExecutor, all_anthropic_tools
 
 logger = logging.getLogger(__name__)
 
@@ -444,14 +444,15 @@ class SubagentService:
             "list_capabilities",
         }
 
-        # no tool_profile is consulted: the skill's tool set and `disabled` are the only
-        # narrowing. That bites the day launch_subagents is granted on a surface which
-        # withholds run_analysis — data_analysis would hand it straight back. Today no such
-        # surface exists, and SANDBOX_ENABLED=false is not one: it drops run_analysis into
-        # `disabled`.
+        # neither surface is consulted: the skill's tool set and `disabled` are the only
+        # narrowing, and a skill names both data tools and run_analysis, which no single
+        # surface carries. That bites the day launch_subagents is granted on a surface which
+        # withholds run_analysis — data_analysis would hand it straight back. Today no
+        # surface carries launch_subagents at all, and SANDBOX_ENABLED=false is not such a
+        # surface either: it drops run_analysis into `disabled`.
         tools = [
             tool
-            for tool in get_anthropic_tools(disabled_tools=disabled)
+            for tool in all_anthropic_tools(disabled_tools=disabled)
             if tool["name"] in skill.tools
         ]
 

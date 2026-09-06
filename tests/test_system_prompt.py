@@ -25,19 +25,16 @@ from genetics_mcp_server.config.defaults import (
 )
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.tools.definitions import (
-    BIGQUERY_TOOL_DEFINITIONS,
-    SUBAGENT_TOOL_DEFINITIONS,
-    TOOL_DEFINITIONS,
+    all_local_tool_definitions,
     get_anthropic_tools,
 )
 
-ALL_TOOL_NAMES = frozenset(
-    t["name"] for t in (*TOOL_DEFINITIONS, *BIGQUERY_TOOL_DEFINITIONS, *SUBAGENT_TOOL_DEFINITIONS)
-)
+ALL_TOOL_NAMES = frozenset(t["name"] for t in all_local_tool_definitions())
 
-# every profile the chat surface can be asked for. `None` is the deployed default (no
-# filtering at all); "code" is the A/B arm from genetics-results-suite-4h6.16 and "nocode"
-# is the arm it is measured against, so both have to be exercised here.
+# every profile value the chat surface can still be asked for. Four of them — None and the
+# three legacy names — now resolve to the same no-code surface as "nocode"; they stay in the
+# list because the prompt has to be right for a stored value an older client sends, and a
+# collapse that stopped being true in one of them would show up here.
 PROFILES = [None, "api", "bigquery", "rag", "code", "nocode"]
 
 
@@ -69,6 +66,20 @@ def resolve(profile: str | None, *, subagents: bool, sandbox: bool = True) -> se
     }
 
 
+# Shapes no profile value resolves to any more. No surface carries `launch_subagents`, and
+# the two surfaces are disjoint in the sandbox's tools, so nothing resolves to "every tool
+# at once" either; the database-without-API-tools shape went with the `bigquery` profile.
+# All three are still real prompt inputs — the gate is keyed on tool names, not on a
+# profile — so they are built here rather than dropped.
+_EVERY_TOOL = resolve(None, subagents=True) | {
+    "launch_subagents",
+    "run_analysis",
+    "list_capabilities",
+    "read_artifact",
+}
+_DATABASE_ONLY = resolve(None, subagents=False) - {"get_credible_sets_by_gene"}
+
+
 class TestPromptNamesOnlyAvailableTools:
     @pytest.mark.parametrize("subagents", [True, False], ids=["subagents_on", "subagents_off"])
     @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
@@ -79,14 +90,14 @@ class TestPromptNamesOnlyAvailableTools:
 
     def test_the_scan_finds_tool_names_at_all(self):
         """Guards the test above from passing because it detects nothing."""
-        available = resolve(None, subagents=True)
+        available = _EVERY_TOOL
         mentioned = tool_names_mentioned(default_system_prompt("FinnGenie", tool_names=available))
         assert len(mentioned) > 20
         assert "get_credible_sets_by_gene" in mentioned
         assert "launch_subagents" in mentioned
 
     def test_subagent_guidance_disappears_with_the_flag(self):
-        on = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=True))
+        on = default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL)
         off = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False))
         assert "launch_subagents" in on
         assert "Subagent Orchestration" in on
@@ -116,11 +127,9 @@ class TestPromptNamesOnlyAvailableTools:
 
     def test_run_analysis_guidance_follows_the_tool(self):
         """The gate is what makes the run_analysis flag (4h6.56) free."""
-        with_tool = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False))
+        with_tool = default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL)
         assert "run_analysis" in with_tool
-        without = default_system_prompt(
-            "FinnGenie", tool_names=resolve(None, subagents=False) - {"run_analysis"}
-        )
+        without = default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL - {"run_analysis"})
         assert "run_analysis" not in without
         assert "list_capabilities" not in without
         # and the surviving routing guidance still describes the paths that remain
@@ -155,8 +164,10 @@ class TestRoutingArbitrationHasOneHomePerSurface:
         prompt = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False))
         assert "Prefer the dedicated API tools over the database" in prompt
 
-    def test_bigquery_arm_gets_the_database_wording(self):
-        prompt = default_system_prompt("FinnGenie", tool_names=resolve("bigquery", subagents=False))
+    def test_a_surface_without_the_api_tools_gets_the_database_wording(self):
+        """Driven by the tool set rather than by a profile: since the collapse no profile
+        value resolves to a database-without-API-tools surface."""
+        prompt = default_system_prompt("FinnGenie", tool_names=_DATABASE_ONLY)
         assert "The database is the data path here" in prompt
         assert "Prefer the dedicated API tools" not in prompt
 
@@ -247,7 +258,7 @@ def _tool_sets_to_probe() -> dict[str, set[str]]:
     examples, so the bullet's dependence on them was invisible. Driving from the full tool
     set with single tools and plausible flag-shaped groups removed exposes it.
     """
-    full = resolve(None, subagents=True)
+    full = _EVERY_TOOL
     sets = {"full": set(full)}
     for name in sorted(full):
         sets[f"-{name}"] = full - {name}
@@ -367,84 +378,38 @@ _SHARED_TAIL = [
     "## Prohibited",
     "## Terminology",
 ]
+# The no-code surface, which is what every profile value except "code" resolves to since
+# the collapse — so the four legacy names and None are pinned to the same list, and that
+# sameness is the collapse itself rather than a coincidence to tidy away.
+_NOCODE_HEADINGS = [
+    "## Core Principles",
+    "## Analyzing data",
+    "## Tool Usage Guidelines",
+    "### Mouse Model Evidence (search_mgi)",
+    "## Variant Annotation Sources",
+    "### Functional / Regulatory Readouts",
+    "### HLA / the MHC region",
+    "### Protein Annotation (UniProt)",
+    "### Drug and Target Evidence (ChEMBL)",
+    "## Data Sources and Resource Names",
+    "### Pseudo Credible Sets",
+    "## Choosing How to Get Data",
+    *_SHARED_TAIL,
+]
 _EXPECTED_HEADINGS = {
-    None: [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
-        "### Mouse Model Evidence (search_mgi)",
-        "## Variant Annotation Sources",
-        "### Functional / Regulatory Readouts",
-        "### HLA / the MHC region",
-        "### Protein Annotation (UniProt)",
-        "### Drug and Target Evidence (ChEMBL)",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        "## Choosing How to Get Data",
-        *_SHARED_TAIL,
-    ],
-    "api": [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
-        "### Mouse Model Evidence (search_mgi)",
-        "## Variant Annotation Sources",
-        "### Functional / Regulatory Readouts",
-        "### HLA / the MHC region",
-        "### Protein Annotation (UniProt)",
-        "### Drug and Target Evidence (ChEMBL)",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        "## Choosing How to Get Data",
-        *_SHARED_TAIL,
-    ],
-    "bigquery": [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
-        "### Mouse Model Evidence (search_mgi)",
-        "### Functional / Regulatory Readouts",
-        "### HLA / the MHC region",
-        "### Protein Annotation (UniProt)",
-        "### Drug and Target Evidence (ChEMBL)",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        "## Choosing How to Get Data",
-        *_SHARED_TAIL,
-    ],
-    "rag": [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
-        "### Mouse Model Evidence (search_mgi)",
-        "### Functional / Regulatory Readouts",
-        "### Protein Annotation (UniProt)",
-        "### Drug and Target Evidence (ChEMBL)",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        *_SHARED_TAIL,
-    ],
+    None: _NOCODE_HEADINGS,
+    "api": _NOCODE_HEADINGS,
+    "bigquery": _NOCODE_HEADINGS,
+    "rag": _NOCODE_HEADINGS,
+    "nocode": _NOCODE_HEADINGS,
+    # the code surface keeps every outside-resource section — those are the tools a script
+    # cannot reach — and loses "## Variant Annotation Sources", whose internal annotation
+    # tools the SDK stands in for.
     "code": [
         "## Core Principles",
         "## Analyzing data",
         "## Tool Usage Guidelines",
-        "### Functional / Regulatory Readouts",
-        "### HLA / the MHC region",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        "## Choosing How to Get Data",
-        *_SHARED_TAIL,
-    ],
-    # the `code` arm's comparator: everything except the code trio, so it currently emits
-    # the same sections as the unfiltered prompt. Pinned separately anyway — the point of
-    # this dict is that a section disappearing from one arm is a decision, and the two
-    # lists coinciding today is a fact about the tool split, not something to rely on.
-    "nocode": [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
         "### Mouse Model Evidence (search_mgi)",
-        "## Variant Annotation Sources",
         "### Functional / Regulatory Readouts",
         "### HLA / the MHC region",
         "### Protein Annotation (UniProt)",
@@ -520,12 +485,11 @@ class TestLoadBearingTextIsPresent:
         for text in _REQUIRED_WITH_A_DATA_PATH:
             assert text in prompt, f"{profile} lost: {text!r}"
 
-    @pytest.mark.parametrize("profile", ["api", "code"], ids=["api", "code"])
-    def test_sql_surfaces_without_a_database_tool_get_a_schema_route(self, profile):
-        """These have `run_analysis` (whose SDK exposes `sql()`) but neither
-        `query_database` nor `get_database_schema`, so they read all the SQL guidance with
+    def test_sql_surfaces_without_a_database_tool_get_a_schema_route(self):
+        """The code surface has `run_analysis` (whose SDK exposes `sql()`) but neither
+        `query_database` nor `get_database_schema`, so it reads all the SQL guidance with
         no way to discover a column name unless the prompt gives them one."""
-        available = resolve(profile, subagents=False)
+        available = resolve("code", subagents=False)
         assert "query_database" not in available
         assert "get_database_schema" not in available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
@@ -533,7 +497,7 @@ class TestLoadBearingTextIsPresent:
         assert "genetics.sql(...)` inside a script is the only route" in prompt
 
     def test_database_tool_surfaces_do_not_get_the_sdk_route(self):
-        prompt = default_system_prompt("FinnGenie", tool_names=resolve("bigquery", subagents=False))
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("nocode", subagents=False))
         assert "genetics.schema()" not in prompt
 
     # both of these answer things the model spent whole executions rediscovering: the
@@ -570,18 +534,26 @@ class TestRunAnalysisWordingIsArmNeutral:
     """
 
     def test_the_bullet_is_byte_identical_across_the_arms_that_carry_it(self):
+        """One profile value carries run_analysis since the collapse, so the second arm is
+        constructed: the no-code surface with the sandbox's tools added back. That is the
+        shape the benchmark's baseline arm had, and the wording has to match it exactly."""
         carriers = [p for p in PROFILES if "run_analysis" in resolve(p, subagents=False)]
-        assert carriers == [None, "api", "bigquery", "code"]
+        assert carriers == ["code"]
+        arms = {
+            "code": resolve("code", subagents=False),
+            "nocode+sandbox": resolve("nocode", subagents=False)
+            | {"run_analysis", "list_capabilities", "read_artifact"},
+        }
         bullets = {
-            p: _run_analysis_bullet(
-                default_system_prompt("FinnGenie", tool_names=resolve(p, subagents=False))
+            label: _run_analysis_bullet(
+                default_system_prompt("FinnGenie", tool_names=tools)
             )
-            for p in carriers
+            for label, tools in arms.items()
         }
         assert len(set(bullets.values())) == 1, "run_analysis wording differs between arms"
 
     def test_the_bullet_is_absent_where_the_tool_is(self):
-        prompt = default_system_prompt("FinnGenie", tool_names=resolve("rag", subagents=False))
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("nocode", subagents=False))
         assert _RUN_ANALYSIS_BULLET_START not in prompt
 
 
@@ -641,8 +613,9 @@ class TestGuidanceKeyedOnAParameterOrAFieldIsGated:
             "run_analysis" in available and "query_database" not in available
         )
 
-    def test_rag_is_told_to_count_by_neither_route_because_it_has_neither(self):
-        available = resolve("rag", subagents=False)
+    def test_a_surface_with_neither_route_is_told_to_count_by_neither(self):
+        """No profile value resolves to this shape since the collapse, so it is built."""
+        available = resolve("nocode", subagents=False) - {"query_database", "run_analysis"}
         assert not {"query_database", "run_analysis"} & available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
         assert _TRUNCATION_RULE in prompt
@@ -682,8 +655,12 @@ _ANNOTATION_SDK_AND_PROTEIN = "Fetch consequence, allele frequency and gene in a
 _ANNOTATION_SDK_ONLY = "Fetch them in a script instead: `genetics.variant_annotation("
 _ANNOTATION_DB_PROTEIN_ROUTE = "The database is not an alternative route to them. For a coding SNV"
 _ANNOTATION_NO_ROUTE = "there is no variant-annotation tool on this surface"
+# the code surface's route: it carries myvariant (an outside resource) without the FinnGen
+# annotation tool, a shape no profile produced before the collapse
+_ANNOTATION_MYVARIANT_ROUTE = "`get_myvariant_annotations` returns a variant's consequence"
 _ANNOTATION_ROUTES = (
     _ANNOTATION_TOOL_ROUTE,
+    _ANNOTATION_MYVARIANT_ROUTE,
     _ANNOTATION_SDK_AND_PROTEIN,
     _ANNOTATION_SDK_ONLY,
     _ANNOTATION_DB_PROTEIN_ROUTE,
@@ -743,10 +720,11 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert _ANNOTATION_TOOL_ROUTE in prompt
 
     def test_the_sandbox_surface_with_the_protein_tool_gets_both_halves(self):
-        """`bigquery` + sandbox: the SDK covers consequence/AF/gene, and
-        `get_variant_protein_effect` covers a coding SNV's ClinVar significance and rsID.
-        The earlier wording asserted clinical significance was unavailable here."""
-        available = resolve("bigquery", subagents=False)
+        """A script surface without either annotation tool: the SDK covers
+        consequence/AF/gene, and `get_variant_protein_effect` covers a coding SNV's ClinVar
+        significance and rsID. The earlier wording asserted clinical significance was
+        unavailable here. Built from the code surface, which carries myvariant."""
+        available = resolve("code", subagents=False) - {"get_myvariant_annotations"}
         assert not {"get_variant_annotations", "get_myvariant_annotations"} & available
         assert {"run_analysis", "get_variant_protein_effect"} <= available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
@@ -757,9 +735,12 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert _ANNOTATION_TOOL_ROUTE not in prompt
 
     def test_the_sandbox_surface_without_the_protein_tool_gets_the_sdk_alone(self):
-        """`code`: seven tools, no annotation tool of any kind, so the SDK is the whole
+        """A script surface with no annotation tool of any kind, so the SDK is the whole
         route and "clinical significance is not available" is true as written."""
-        available = resolve("code", subagents=False)
+        available = resolve("code", subagents=False) - {
+            "get_myvariant_annotations",
+            "get_variant_protein_effect",
+        }
         assert not {
             "get_variant_annotations",
             "get_myvariant_annotations",
@@ -772,11 +753,13 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert _ANNOTATION_SDK_AND_PROTEIN not in prompt
 
     def test_the_database_only_surface_is_pointed_at_the_protein_tool_it_has(self):
-        """`bigquery` with the sandbox flag off — what chat-backend.yaml declares today.
-        `query_database` keeps the prohibition alive while `run_analysis` is gone, but
-        `get_variant_protein_effect` is still there, so telling the model to say a coding
-        SNV's consequence is unavailable would be false on the deployed surface."""
-        available = resolve("bigquery", subagents=False, sandbox=False)
+        """A database surface with no script and no annotation tool but the protein-effect
+        one. `query_database` keeps the prohibition alive while `run_analysis` is gone, so
+        telling the model to say a coding SNV's consequence is unavailable would be false."""
+        available = resolve("nocode", subagents=False, sandbox=False) - {
+            "get_variant_annotations",
+            "get_myvariant_annotations",
+        }
         assert "run_analysis" not in available
         assert {"query_database", "get_variant_protein_effect"} <= available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
@@ -789,8 +772,10 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         """The blanket refusal is not dead: it is what a database-only surface WITHOUT
         the protein-effect tool gets. No shipped profile is that shape today, so this
         drives the assembly directly rather than through a profile."""
-        available = resolve("bigquery", subagents=False, sandbox=False) - {
-            "get_variant_protein_effect"
+        available = resolve("nocode", subagents=False, sandbox=False) - {
+            "get_variant_annotations",
+            "get_myvariant_annotations",
+            "get_variant_protein_effect",
         }
         prompt = default_system_prompt("FinnGenie", tool_names=available)
         assert _ANNOTATION_PROHIBITION in prompt

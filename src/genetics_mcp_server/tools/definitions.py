@@ -58,9 +58,17 @@ logger = logging.getLogger(__name__)
 #     accepted, so a regex matching the validator would reject inputs the server handles.
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    # The three entity lookups that open this list — search_phenotypes, search_genes,
+    # lookup_variants_by_rsid — are the exception to what `sdk_replaceable` otherwise means.
+    # The SDK does cover them (`genetics.search`), so True would be the mechanical answer;
+    # they are False because resolving a symbol or a phenotype name to an id is what the
+    # model does BEFORE it writes a script, and the code surface would otherwise force a
+    # sandbox round-trip for it. This is the same allow-list the pre-collapse `code` profile
+    # carried. Flip one to True and the code surface loses that lookup.
     {
         "name": "search_phenotypes",
         "category": "general",
+        "sdk_replaceable": False,
         "description": "Look up phenotypes. Use when you need to find if there is a phenotype for a disease/trait name or the exact phenotype code for a disease/trait name. Do NOT use this to find disease associations - use get_credible_sets_by_gene instead.",
         "parameters": {
             "query": {
@@ -78,6 +86,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "search_genes",
         "category": "general",
+        "sdk_replaceable": False,
         "description": "Look up gene symbols and positions. Use ONLY when you need to verify a gene symbol or find its genomic coordinates. Do NOT use this to find gene associations.",
         "parameters": {
             "query": {
@@ -95,6 +104,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "lookup_variants_by_rsid",
         "category": "general",
+        "sdk_replaceable": False,
         "description": "Convert rsIDs to variant IDs (chr:pos:ref:alt format). Use this when you have rsIDs and need to convert them to variant format for use with other tools.",
         "parameters": {
             "rsids": {
@@ -107,6 +117,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get credible sets for variants near a gene. Returns fine-mapped variants with phenotype codes, p-values, effect sizes, and PIPs. **IMPORTANT**: Always use the data_types parameter to filter results ('GWAS', 'eQTL', 'pQTL', 'sQTL', 'caQTL'). Without filtering, results may be truncated.",
         "parameters": {
             "gene": {
@@ -143,6 +154,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_variant",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get credible sets containing a specific variant. Returns fine-mapped associations where this variant is part of a credible set. Use this to find which phenotypes/traits a variant is associated with and its causal probability (PIP). NOTE: For 3+ variants, use analyze_variant_list instead — it is much faster and provides aggregated pattern analysis.",
         "parameters": {
             "variant": {
@@ -174,6 +186,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_region",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get credible sets overlapping a genomic region across all resources. Use this when the locus is defined by coordinates rather than a gene or a variant — e.g. a GWAS peak boundary, a fine-mapping window from a paper, or 'what else is fine-mapped in this interval'. For a gene use get_credible_sets_by_gene (it applies the window for you) and for a single variant use get_credible_sets_by_variant.",
         "parameters": {
             "region": {
@@ -205,6 +218,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_phenotype",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "**PRIMARY TOOL for phenotype-to-gene queries.** Get ALL genes/variants associated with a phenotype from GWAS fine-mapping. Returns genome-wide significant loci with causal variant candidates ranked by PIP.",
         "parameters": {
             "phenotype": {
@@ -227,6 +241,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_set_leads_by_phenotype",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get ONE row per credible set for a phenotype: the lead variant of each set (the flagged lead, else highest PIP with ties broken by p-value). Use this to enumerate a trait's independent signals — 'how many loci does this trait have', 'list the lead variants' — without pulling every member variant. get_credible_sets_by_phenotype returns all member variants of all sets, which is far larger; use that only when you need the members.",
         "parameters": {
             "phenotype": {
@@ -244,6 +259,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_set_by_id",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get all variants in a specific credible set. Use this to investigate a credible set in detail - see all variants, their consequences, PIPs, and count how many variants are in the set.",
         "parameters": {
             "resource": {
@@ -266,6 +282,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_credible_sets_by_qtl_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": (
             "Get QTL associations where a gene is the molecular trait (target). Returns variants "
             "ANYWHERE in the genome that affect expression/splicing/protein levels of the gene. "
@@ -315,6 +332,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_gene_expression",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get tissue-specific gene expression levels. Returns expression data across tissues/cell types. Use this to understand where a gene is expressed.",
         "parameters": {
             "gene": {"type": "string", "description": "Gene symbol or comma-separated list of gene symbols", "required": True},
@@ -323,6 +341,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_asm_qtl_by_variant",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get allele-specific methylation QTL (ASM-QTL) data for a variant. Returns associations between a sequence variant and CpG/MDS methylation rates, including effect sizes, methylation rates on reference and alternative haplotypes, and variant rank (primary/secondary).",
         "parameters": {
             "variant": {
@@ -339,6 +358,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_asm_qtl_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get allele-specific methylation QTL (ASM-QTL) data for variants near a gene. Returns associations between sequence variants and CpG/MDS methylation rates for variants within the gene body ± window, selected by genomic coordinates (not by most-severe-consequence attribution, which misses nearby regulatory variants).",
         "parameters": {
             "gene": {
@@ -363,6 +383,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_open_chromatin_by_variant",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks overlapping a variant's position. Answers 'in which cell types/tissues/conditions is this variant's region of open/accessible chromatin?'. Returns overlapping accessible regions labeled by cell_type, tissue, life_stage and condition (resting/stimulated/AD/control) so cell-type specificity can be reported. This is a peak ATLAS (measured accessibility across brain, heart, immune and body-wide contexts) — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
         "parameters": {
             "variant": {
@@ -379,6 +400,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_open_chromatin_by_region",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks overlapping a genomic region. Answers 'in which cell types/tissues/conditions is this region of open/accessible chromatin?'. Returns overlapping accessible regions labeled by cell_type, tissue, life_stage and condition. This is a peak ATLAS of measured accessibility — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
         "parameters": {
             "chrom": {
@@ -405,6 +427,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_open_chromatin_by_peak",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get one open-chromatin atlas peak by its peak id, returning every cell_type/tissue/condition row recorded for it. Use this to follow up a peak id returned by get_open_chromatin_by_variant/_by_region when you want that peak's full annotation rather than everything overlapping a position. Atlas peak ids are a SEPARATE id space from caQTL/Open4Gene peak ids (credible_sets trait, get_peak_to_genes): those will not be found here, so reach the atlas from a caQTL peak by region overlap (get_open_chromatin_by_region) instead.",
         "parameters": {
             "peak_id": {
@@ -421,6 +444,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_peak_to_genes",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get the GENES an Open4Gene chromatin peak is linked to, with the cell type each link was significant in. This is the peak-to-gene LINK table (which gene a regulatory region acts on) — distinct from get_open_chromatin_by_peak, which returns measured accessibility of the peak itself. Use this to interpret a caQTL signal: caQTL credible sets are keyed by peak, and this is what turns a peak id into candidate target genes.",
         "parameters": {
             "peak_id": {
@@ -441,6 +465,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_gene_to_peaks",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get the Open4Gene chromatin PEAKS linked to a gene, per cell type — the inverse of get_peak_to_genes. Answers 'which regulatory regions act on this gene, and in which cell types'. Distinct from get_open_chromatin_by_gene, which returns measured accessibility near the gene by coordinate overlap with no link evidence. Rows are capped at 500 inline; `truncated` says whether more exist.",
         "parameters": {
             "gene": {
@@ -461,6 +486,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_open_chromatin_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory/enhancer peaks). Answers 'in which cell types/tissues/conditions is the chromatin around this gene open/accessible?'. Returns accessible regions labeled by cell_type, tissue, life_stage and condition. This is a peak ATLAS of measured accessibility — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
         "parameters": {
             "gene": {
@@ -485,6 +511,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_variant_effect_by_variant",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get in-silico PREDICTED variant effect on chromatin accessibility for a variant. Answers 'is this variant predicted to disrupt chromatin accessibility, how strongly, and in which cell types?'. Returns per-model, per-cell-type predicted scores: ChromBPNet (model=chrombpnet) gives the predicted accessibility effect (score/mlog10p/quantile_rank/is_significant) in specific cell_type/tissue contexts; FLARE (model=flare) gives a pan-context regulatory score (cell_type/tissue may be null). These are MODEL PREDICTIONS — distinct from measured caqtl (accessibility QTL) and open_chromatin (measured accessibility atlas).",
         "parameters": {
             "variant": {
@@ -501,6 +528,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_variant_effect_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get in-silico PREDICTED variant effects on chromatin accessibility for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'how strongly and in which cell types are this gene's variants predicted to affect chromatin accessibility?'. Returns per-model, per-cell-type predicted-effect rows: ChromBPNet (model=chrombpnet) predicted accessibility effect in specific cell_type/tissue contexts; FLARE (model=flare) pan-context regulatory score (cell_type/tissue may be null). These are MODEL PREDICTIONS — distinct from measured caqtl (accessibility QTL) and open_chromatin (measured accessibility atlas).",
         "parameters": {
             "gene": {
@@ -525,6 +553,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_mpra_by_variant",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get MEASURED cis-regulatory allelic activity for a variant from a massively parallel reporter assay (MPRA; Siraj et al. 2026). Answers 'does this variant's allele actually change reporter/enhancer activity, and in which cell lines?'. Returns one LONG row per cell_line: cell_line is 'meta' (cross-cell-line meta-analysis summary) or one of K562/HEPG2/SKNSH/HCT116/A549. Key calls per row: emVar (allele modulates reporter expression — allelic skew significant), active (element drives reporter above background); plus log2Skew (signed allelic effect log2(alt/ref), positive = alt drives higher expression), log2FC (element activity), log2Skew_mlog10p/log2FC_mlog10p (significance), mean_RNA_ref/alt (per-line reporter levels). MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL. emVar rate and allelic-effect concordance scale with FinnGen fine-mapping PIP, so this corroborates that a fine-mapped/credible-set variant is functionally active. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
         "parameters": {
             "variant": {
@@ -541,6 +570,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_mpra_by_region",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get MEASURED cis-regulatory allelic MPRA activity (Siraj et al. 2026) for variants overlapping a genomic region. Answers 'which variants in this region have allele-modulating (emVar) or active regulatory elements, and in which cell lines?'. Returns LONG rows (one per variant per cell_line): cell_line is 'meta' (cross-cell-line summary) or one of K562/HEPG2/SKNSH/HCT116/A549; emVar (allelic skew significant — the key call), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2FC (element activity), *_mlog10p significance, mean_RNA_ref/alt. MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL; emVar rate/effect concordance scale with FinnGen fine-mapping PIP. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
         "parameters": {
             "chrom": {
@@ -567,6 +597,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_mpra_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get MEASURED cis-regulatory allelic MPRA activity (Siraj et al. 2026) for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'which of this gene's variants actually modulate reporter/enhancer activity (emVar), how strongly, and in which cell lines?'. Returns LONG rows (one per variant per cell_line): cell_line is 'meta' (cross-cell-line summary) or one of K562/HEPG2/SKNSH/HCT116/A549; emVar (allelic skew significant — the key call), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2FC (element activity), *_mlog10p significance, mean_RNA_ref/alt. MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL; emVar rate/effect concordance scale with FinnGen fine-mapping PIP, so this corroborates functionally active fine-mapped variants. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
         "parameters": {
             "gene": {
@@ -591,6 +622,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_mpra_pip_concordance_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls for variants near a gene — the core regulatory-buffering check (Kanai et al.): do high-PIP (credibly causal) fine-mapped variants actually show measured cis-regulatory allelic activity (emVar) in MPRA? Joins credible_sets_v (FinnGen fine-mapped, filtered to resource + pip>=min_pip) to the MPRA cross-cell-line meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt variant key. Per matched variant returns: FinnGen PIP, cs_id, trait, data_type, GWAS mlog10p/beta, and the meta MPRA call — emVar (allele modulates reporter expression), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2Skew_mlog10p (skew significance), log2FC (element activity), cohort. Ordered emVar then PIP. This corroborates whether fine-mapped variants are FUNCTIONALLY active in a reporter assay — MPRA measures intrinsic cis-regulatory allelic activity, distinct from in-silico variant_effect predictions and endogenous eQTL/caQTL. Distinct from get_mpra_by_gene, which returns MPRA rows WITHOUT the PIP cross-reference. FinnGen-credible-set-based and meta-row-based by default; MPRA coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants).",
         "parameters": {
             "gene": {
@@ -624,6 +656,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_gene_disease_associations",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get Mendelian/rare disease gene-disease relationships from ClinGen/GENCC. Use ONLY for rare disease genetics questions, NOT for GWAS/common variant associations.",
         "parameters": {
             "gene": {"type": "string", "description": "Gene symbol or comma-separated list of gene symbols", "required": True},
@@ -632,6 +665,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_colocalization",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get colocalization results for a variant. Returns trait pairs that share the same causal signal at this locus. Use this to find traits that may share biological mechanisms.",
         "parameters": {
             "variant": {
@@ -644,6 +678,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_colocalization_by_credible_set",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get the credible sets that colocalize with ONE specific credible set, identified by resource + phenotype + cs_id. Use this after get_credible_sets_by_gene/_by_variant/_by_region has given you a cs_id and you want that signal's colocalizations specifically — get_colocalization takes a variant and returns everything colocalizing at the position, which mixes in other signals at the same locus.",
         "parameters": {
             "resource": {
@@ -671,6 +706,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_exome_results_by_gene",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get rare variant burden test results for a gene. Returns individual variant-level association statistics from exome sequencing across available resources (genebass/UKBB filtered to p<1e-4, IBD exome containing only exome-wide significant variants). Use this for single-gene queries. For batch queries across many genes, use the database instead (call get_database_schema to find the exome results table). For full individual-trait results, use get_exome_results_by_phenotype.",
         "parameters": {
             "gene": {"type": "string", "description": "Gene symbol or comma-separated list of gene symbols", "required": True},
@@ -679,6 +715,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_exome_results_by_variant",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get rare-variant exome association results for one specific variant across exome resources (genebass/UKBB filtered to p<1e-4, IBD exome exome-wide significant). Use this to check whether a named coding variant has a rare-variant association, as the counterpart to get_credible_sets_by_variant for GWAS. For a gene use get_exome_results_by_gene.",
         "parameters": {
             "variant": {
@@ -695,6 +732,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_exome_results_by_region",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get rare-variant exome association results overlapping a genomic region across exome resources. Use this when the locus is coordinates rather than a gene — e.g. checking whether a GWAS interval also carries rare-variant signal. For a single gene use get_exome_results_by_gene. Rows are capped at 500 inline; `truncated` says whether more exist and the full result is at `_download_url`.",
         "parameters": {
             "region": {
@@ -711,6 +749,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_exome_results_by_phenotype",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get individual variant exome results for a specific phenotype within an exome dataset. Returns the full set of variant-level results for one trait from a given resource (e.g. genebass, ibd_exome_2026). Use this when you need all exome variants for a particular phenotype rather than a gene-centric view.",
         "parameters": {
             "resource": {
@@ -728,6 +767,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_gene_based_results",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA datasets. Returns gene-based association statistics aggregated at the gene level. Different from get_exome_results_by_gene which returns individual variant-level exome results. genebass rows here are limited to p<1e-4; for a gene's result in a specific trait regardless of significance use get_gene_based_results_by_phenotype, or the gene_burden_results table in the database (unfiltered) for batch queries across many genes or traits.",
         "parameters": {
             "gene": {
@@ -740,6 +780,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_gene_based_results_by_phenotype",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get the complete, unfiltered gene burden test results for one phenotype: every gene and annotation class tested in that trait, with no p-value cutoff. Use this to check whether a gene was tested in a trait and what the result was even when it is not significant, or to rank all genes within one trait. For a gene across many traits use get_gene_based_results instead.",
         "parameters": {
             "resource": {
@@ -757,6 +798,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_phenotype_report", # TODO WHEN DISCUSSING SAMPLE SIZE, INCLUDE NUMBERS OF CASES AND CONTROLS
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get a detailed markdown report for a phenotype. Returns a markdown report with credible sets and gene evidence summaries in those credible sets. This is the first line of phenotype-based inquiry and should be called first before calling other tools.",
         "parameters": {
             "resource": {
@@ -774,6 +816,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "lookup_phenotype_names",
         "category": "general",
+        "sdk_replaceable": True,
         "description": "**Use this to translate phenotype codes to human-readable names.** Takes a list of phenotype codes and returns their names. Call this ONCE with ALL codes you need.",
         "parameters": {
             "codes": {
@@ -787,6 +830,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "list_datasets",
         "category": "general",
+        "sdk_replaceable": True,
         "description": (
             "List all datasets available in the API with descriptions, provenance "
             "(author, version, publication date), sample-size statistics (number of "
@@ -813,6 +857,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_resource_metadata",
         "category": "general",
+        "sdk_replaceable": True,
         "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them.",
         "parameters": {
             "resource": {
@@ -825,12 +870,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_dataset_display_names",
         "category": "general",
+        "sdk_replaceable": True,
         "description": "Get the display-name overrides for raw `dataset` column values. Use this when a `dataset` value in a result (e.g. 'FinnGen_R13') needs to be rendered as its human-readable name in an answer, table or figure.",
         "parameters": {},
     },
     {
         "name": "get_credible_sets_stats",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get summary statistics of credible sets (fine-mapped associations) for a dataset. Returns counts of risk and protective credible sets, including those with coding/LoF variants. Use this to answer questions like 'how many protective associations in FinnGen Kanta?' CRITICAL: Your response MUST include the INCLUDE_IN_RESPONSE field value verbatim - it contains a download link the user needs.",
         "parameters": {
             "resource_or_dataset": {
@@ -847,6 +894,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_nearest_genes",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get genes nearest to a variant. Returns genes sorted by distance, with distance=0 for variants inside a gene. By default, only protein-coding genes are returned. Includes gene coordinates, strand, type, and HGNC annotations.",
         "parameters": {
             "variant": {
@@ -883,6 +931,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_genes_in_region",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get all genes in a genomic region. Returns genes overlapping the specified coordinates with gene name, position, strand, type, and HGNC annotations.",
         "parameters": {
             "chr": {
@@ -914,6 +963,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "search_scientific_literature",
         "category": "general",
+        "sdk_replaceable": False,
         "description": (
             "Search scientific literature for research papers about genes, variants, diseases, or biological mechanisms. "
             "Each call queries exactly ONE backend API: either 'europepmc' OR 'perplexity' — never both. "
@@ -951,6 +1001,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "web_search",
         "category": "general",
+        "sdk_replaceable": False,
         "description": "Search the web for general information. Use for finding drug information, clinical guidelines, news, or explanations of concepts. Use search_scientific_literature for research papers instead.",
         "parameters": {
             "query": {
@@ -980,6 +1031,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "search_mgi",
         "category": "general",
+        "sdk_replaceable": False,
         "description": "Search Jackson Lab Mouse Genome Informatics (MGI) for curated mouse gene → phenotype annotations (MP ontology), knockout/transgenic allele phenotypes, and human-mouse ortholog mappings. Returns structured records (not papers). Complements search_scientific_literature — use it for mouse KO / phenotype / MP-ontology / ortholog questions.",
         "parameters": {
             "query": {
@@ -1012,6 +1064,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "search_cbioportal",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Query cBioPortal for how often a gene is somatically altered in cancer: pan-cancer mutation and copy-number frequency, the breakdown by cancer type, recurrent protein changes (hotspots), and fusion partners. Covers ~540 studies and ~400,000 tumour samples. Returns structured counts, not papers.
 
 This is somatic tumour data. It says nothing about germline association — do not read a high mutation frequency here as evidence for a GWAS or disease-association claim, and do not read the absence of a gene as evidence against one.
@@ -1064,6 +1117,7 @@ Frequencies from gene_by_cancer_type are lower bounds: their denominator counts 
     {
         "name": "get_protein_annotations",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Get curated protein annotations from UniProt: residue-level features (active sites, binding sites, domains, disulfide bonds, signal peptides, PTMs), function and subcellular location comments, cross-references, and optionally the amino-acid sequence.
 
 ALWAYS prefer a gene symbol over an accession. Do NOT pass an accession you remember — remembered accessions are frequently wrong and will silently annotate the wrong protein. Pass query='PRSS55', not query='Q7Z5A4'. Only pass an accession the user supplied or that a previous tool result returned.
@@ -1109,6 +1163,7 @@ Do NOT use this tool for protein-position → genomic-coordinate mapping — use
     {
         "name": "map_protein_variants",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Map protein-level variants (amino-acid substitutions such as 'P70A') onto genomic coordinates, using UniProt's curated genomic coordinate mapping. Returns, per variant, the genome position, reference and alternate alleles, the codon, the transcript/exon context, and any matching curated UniProt VARIANT annotation (including disease association and dbSNP rsID when UniProt records one).
 
 This is the tool for "what is the rs ID / genomic position of this amino-acid change?". Do NOT guess candidate genomic coordinates and test them one at a time — that approach has failed here before. Do NOT use get_variant_annotations or get_myvariant_annotations first: they take genomic coordinates, which is exactly what this tool produces. Feed the coordinates or rsIDs it returns into those tools afterwards for allele frequencies and clinical significance.
@@ -1141,6 +1196,7 @@ Every result carries a resolution block naming the protein the variants were map
     {
         "name": "get_variant_protein_effect",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Map genomic coding variants onto their curated UniProt protein consequence. This is the genomic→protein direction: feed a `chr:pos:ref:alt` variant and get back the amino-acid change plus UniProt's curated annotation for it — disease association, clinical significance, population frequency and dbSNP/ClinVar cross-references.
 
 This is the tool for "what does this coding variant do to the protein, and what is known about it?". Use it instead of asserting an amino-acid change (e.g. G2019S) from memory: the residue change, disease link and clinical significance all come from UniProt/ClinVar, not from the reference sequence or recall.
@@ -1166,6 +1222,7 @@ Scope and limits:
     {
         "name": "search_uniprot",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Search UniProtKB with its native query syntax to find the set of proteins matching a property — a keyword, a family, a subcellular location, a function. Returns one summary row per entry (accession, entry name, protein name, gene names, organism, reviewed status) plus whatever extra fields you request.
 
 Use this when the question is "which proteins ...?" rather than "what about this protein?" (that is get_protein_annotations).
@@ -1224,6 +1281,7 @@ Do NOT use this to look up a protein you can already name; resolving a gene symb
     {
         "name": "get_drug_targets_for_gene",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """List the drugs and clinical candidates ChEMBL records as acting on a gene's protein target, with each drug's mechanism of action, action type (INHIBITOR, AGONIST, ANTAGONIST, ...), highest clinical phase reached, first approval year, withdrawal flag, ATC codes, and — only with `include_indications=True` — the indications they are developed for, at most 10 per drug with `n_indications` giving the true total.
 
 Use this before calling any gene a promising or novel drug target, and whenever the user asks about drugs, druggability, inhibitors, agonists, repurposing, or clinical phase for a gene. If approved drugs or clinical candidates already exist, say so and frame the finding as supporting a known mechanism rather than as a new opportunity.
@@ -1271,6 +1329,7 @@ For one named drug (its targets, ATC class and indications) use get_drug_profile
     {
         "name": "get_drug_profile",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Get what ChEMBL holds about one drug or compound: its preferred name and ChEMBL id, highest clinical phase, first approval year, withdrawal flag, ATC classification, the targets it acts on with mechanism of action and action type, and the indications it is developed or approved for (EFO and MeSH terms, each with its own max phase), at most 50 of them with `n_indications` giving the true total.
 
 Use this when the user names a drug — "what does metformin target?", "what is CHEMBL1431 approved for?", "is this compound withdrawn?".
@@ -1293,6 +1352,7 @@ Start from a gene rather than a drug — "what drugs hit this gene?" — with ge
     {
         "name": "get_target_bioactivity",
         "category": "general",
+        "sdk_replaceable": False,
         "description": """Summarise the medicinal chemistry recorded against a gene's protein target: how many potency measurements exist at or above a pChEMBL threshold, how many distinct compounds they cover, the breakdown by assay type (IC50, Ki, EC50, ...), and the most potent compounds with their best pChEMBL value and clinical phase.
 
 Use this for "how tractable / how well explored is this target?" — whether a chemical series exists at all, and how potent the best compounds are. pChEMBL is -log10 of the molar activity value, so 6 is 1 µM, 7 is 100 nM, 9 is 1 nM; 6 is the usual "active" cut-off.
@@ -1329,6 +1389,7 @@ NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they mus
     {
         "name": "get_ld_between_variants",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get linkage disequilibrium (LD) statistics between two specific variants. Returns r2 and D' values from the FinnGen reference panel. Both variants must be on the same chromosome and within 5 Mb of each other.",
         "parameters": {
             "variant1": {
@@ -1357,6 +1418,7 @@ NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they mus
     {
         "name": "get_variants_in_ld",
         "category": "api",
+        "sdk_replaceable": True,
         "description": "Get all variants in linkage disequilibrium (LD) with a given variant. Returns variants within the specified window that exceed the r2 threshold, useful for finding proxy variants or understanding LD structure.",
         "parameters": {
             "variant": {
@@ -1385,6 +1447,7 @@ NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they mus
     {
         "name": "get_summary_stats",
         "category": "api",
+        "sdk_replaceable": True,
         "description": """Get summary statistics (p-value, beta, standard error, allele frequencies) for specific variant-phenotype pairs from a resource.
 
 Use this tool when:
@@ -1422,6 +1485,7 @@ Do NOT use this as a discovery tool — use credible set tools or PheWAS for tha
     {
         "name": "get_hla_by_phenotype",
         "category": "api",
+        "sdk_replaceable": True,
         "description": """Get the classical HLA allele associations for one or more phenotypes — every imputed HLA allele (187 alleles across HLA-A, -B, -C, -DPB1, -DQA1, -DQB1, -DRB1, -DRB3, -DRB4, -DRB5) tested against the trait in FinnGen R14.
 
 Use this whenever a question touches the MHC/HLA region:
@@ -1455,6 +1519,7 @@ For the reverse question — which traits an allele is associated with — use g
     {
         "name": "get_hla_by_allele",
         "category": "api",
+        "sdk_replaceable": True,
         "description": """Get every phenotype a classical HLA allele is associated with — the PheWAS view of one HLA allele across all 2,712 FinnGen R14 endpoints.
 
 Use this when the user names an allele:
@@ -1498,6 +1563,7 @@ Results are filtered to `min_info` (default 0.5) because rare badly-imputed alle
     {
         "name": "get_summary_stats_by_region",
         "category": "api",
+        "sdk_replaceable": True,
         "description": """Get summary statistics for EVERY variant in a genomic region for one or more phenotypes — the full association profile of a locus, not just fine-mapped or significant variants.
 
 Use this when:
@@ -1532,6 +1598,7 @@ Phenotypes are REQUIRED: summary stats are stored per phenotype, so there is no 
     {
         "name": "analyze_variant_list",
         "category": "api",
+        "sdk_replaceable": True,
         "description": """Analyze a list of variants for shared phenotype associations, QTL patterns, and tissue enrichment.
 
 Use this when a user provides a list of variants (e.g., lead variants from a GWAS) and wants to know:
@@ -1562,6 +1629,7 @@ Returns aggregated counts sorted by frequency. The response already includes nea
     {
         "name": "get_variant_annotations",
         "category": "api",
+        "sdk_replaceable": True,
         "description": """Get variant annotations including allele frequency, consequence, gene, rsID, and enrichment data.
 
 Use this tool when:
@@ -1602,6 +1670,7 @@ Returns: variant ID, chromosome, position, ref/alt alleles, allele frequency (AF
     {
         "name": "get_myvariant_annotations",
         "category": "api",
+        "sdk_replaceable": False,
         "description": """Get clinical and functional variant annotations from myvariant.info.
 
 Use this tool when:
@@ -1637,6 +1706,7 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
     {
         "name": "get_gene_group_members",
         "category": "general",
+        "sdk_replaceable": True,
         "description": (
             "Enumerate the member genes of an HGNC gene group / family (e.g. all GPCRs), "
             "returning gene symbols together with their genomic coordinates. "
@@ -1673,6 +1743,7 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
     {
         "name": "normalize_gene_symbols",
         "category": "general",
+        "sdk_replaceable": True,
         "description": (
             "Resolve input gene symbols / aliases / previous symbols to their current "
             "approved HGNC symbol (exact match, not fuzzy). Useful to clean up a gene "
@@ -1688,18 +1759,23 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             },
         },
     },
-    # Code execution (genetics-results-suite-4h6). Category "orchestration" rather than
-    # "general": these hand work to another runtime instead of fetching data themselves,
-    # which is what launch_subagents is. The category alone excludes nothing from subagents
-    # — TOOL_PROFILES includes "orchestration" in both the api and bigquery profiles —
-    # so subagent.py names all four orchestration tools in its `disabled` set, which is
-    # what keeps a subagent from executing code, retrieving another execution's artifacts
-    # or being told how to start one. run_analysis and read_artifact are additionally in
-    # mcp_server.py's _mcp_disabled; run_analysis on top of that has no register_mcp_tools
-    # block at all, so no disabled_tools set can register it (see the comment there).
+]
+
+# The tools code execution IS, rather than tools it can replace: the gateway to the
+# sandbox, the SDK index a script is written against, and the reader for what a run
+# left behind. They are a list of their own because `resolve_tools` includes them on
+# exactly one surface — nothing here is a datum a script could fetch instead, so the
+# sdk_replaceable question does not arise for them.
+#
+# subagent.py names all three in its `disabled` set except where a skill is granted
+# run_analysis explicitly; run_analysis and read_artifact are additionally in
+# mcp_server.py's _mcp_disabled, and run_analysis has no register_mcp_tools block at
+# all, so no disabled_tools set can register it (see the comment there).
+CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "list_capabilities",
         "category": "orchestration",
+        "sdk_replaceable": False,
         "description": (
             "List the `genetics` SDK surface available to analysis scripts, one module at a "
             "time. Returns signatures with their docstrings, and the `usage` line saying "
@@ -1720,6 +1796,7 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
     {
         "name": "run_analysis",
         "category": "orchestration",
+        "sdk_replaceable": False,
         "description": (
             # the "use this INSTEAD OF chaining data-access tools" arbitration that used to
             # live here moved into the system prompt's "Choosing How to Get Data" section
@@ -1773,6 +1850,7 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
     {
         "name": "read_artifact",
         "category": "orchestration",
+        "sdk_replaceable": False,
         "description": (
             "Read a file that a run_analysis script in THIS conversation wrote to its "
             "artifacts directory. Takes the artifact NAME exactly as reported in that run's "
@@ -1799,6 +1877,7 @@ BIGQUERY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "query_database",
         "category": "bigquery",
+        "sdk_replaceable": True,
         "description": """Execute a SQL query against the genetics database.
 
 For simple single-gene or single-variant lookups, prefer specialized tools (get_credible_sets_by_gene, get_credible_sets_by_variant, etc.).
@@ -1838,6 +1917,7 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
     {
         "name": "get_database_schema",
         "category": "bigquery",
+        "sdk_replaceable": True,
         "description": "Get schema for database tables. **Always call this before query_database** to discover available data. Returns resource descriptions with aliases, table/column metadata with allowed filter values, and example SQL queries. Optionally pass a table name to get schema for just that table.",
         "parameters": {
             "table": {
@@ -1852,6 +1932,7 @@ SUBAGENT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "launch_subagents",
         "category": "orchestration",
+        "sdk_replaceable": False,
         "description": """Launch one or more specialized subagents in parallel to handle complex queries.
 Each subagent has its own skill (instructions + tools) and runs independently.
 Use this when the question requires multiple independent data gathering or analysis tasks that can run simultaneously.
@@ -1890,84 +1971,21 @@ Available skills:
     },
 ]
 
-# valid tool profiles and which categories each profile includes. Every profile here is a
-# union of whole categories, so each necessarily contains all 18 "general" tools.
-TOOL_PROFILES: dict[str, set[str]] = {
-    "api": {"general", "api", "orchestration"},
-    "bigquery": {"general", "bigquery", "orchestration"},
-    "rag": {"general"},
-    # the pre-code-execution surface, and the ONLY honest baseline arm for the
-    # genetics-results-suite-4h6.23 A/B. `tool_profile: null` ("all") is NOT that baseline:
-    # it contains run_analysis, so an arm asked to represent "the old implementation" can
-    # reach for the very mechanism under test. Measured 2026-08-19 — all=68 tools with
-    # run_analysis, api=66 with it, bigquery=24 with it; only `rag` (18) excluded it, and
-    # rag is far too narrow to stand in for the old surface.
-    #
-    # WHY EXCLUDING `orchestration` IS SAFE HERE, stated carefully because the obvious
-    # version of this claim is FALSE. `orchestration` holds FOUR tools, not three: the code
-    # trio plus launch_subagents. Excluding the category therefore drops launch_subagents
-    # too — which would make this a surface nobody ever shipped, if launch_subagents were
-    # ever advertised. It is not: enable_subagents defaults to false (settings.py), so
-    # settings.disabled_tools contains launch_subagents and llm_service._disabled_tools
-    # strips it again whenever the subagent service did not initialize — both BEFORE the
-    # profile filter, on every arm.
-    #
-    # So the equivalence holds through TWO runtime flags, not through the category, and the
-    # sizes are deliberately not written down here — they move with the flags and with every
-    # tool added, which is exactly the kind of number that rots in a comment. Re-derive with
-    # disabled_tools applied (the `all` arm is tool_profile=None, not a profile named "all"):
-    #
-    #   get_anthropic_tools(None, tool_profile=None,     disabled_tools=settings.disabled_tools)
-    #   get_anthropic_tools(None, tool_profile="nocode", disabled_tools=settings.disabled_tools)
-    #
-    # Under the shipped chat-backend config — SANDBOX_ENABLED=true (k8s/deployments/
-    # chat-backend.yaml) and ENABLE_SUBAGENTS unset, i.e. false — `all - nocode` is exactly
-    # {run_analysis, list_capabilities, read_artifact}, which is the equivalence this profile
-    # relies on. It holds under NEITHER flag alone: with SANDBOX_ENABLED=false the gap loses
-    # run_analysis, and with enable_subagents turned on it gains launch_subagents.
-    # RE-DERIVE rather than trusting this line if enable_subagents is ever turned on, if the
-    # sandbox is disabled, or if a non-code tool is filed under `orchestration` — each one
-    # changes the gap between the arms into something the A/B was not meant to measure.
-    #
-    # No prompt work is needed to go with it. Since genetics-results-suite-4h6.69 the system
-    # prompt is assembled from the tool list in force, so this profile also loses the
-    # run_analysis steering automatically rather than being told about a tool it lacks.
-    "nocode": {"general", "api", "bigquery"},
-}
+# the profile names chat clients still send. THE SHIM, and nothing else: the surface is
+# resolved by `resolve_tools` from one boolean, and this maps the wire values onto it —
+# "code" is code execution, every other value (including None and a value this server has
+# never heard of) resolves to the no-code surface, which is the safe direction. Coercing
+# the value at the edge, refusing an unknown one, and dropping the parameter belong to
+# later work; this exists so a stored value from an older client keeps resolving.
+KNOWN_TOOL_PROFILES: frozenset[str] = frozenset(
+    {"api", "bigquery", "rag", "nocode", "code"}
+)
 
-# profiles named as an explicit allow-list of tool NAMES rather than categories. A profile
-# here takes precedence over TOOL_PROFILES and resolves to exactly these names — nothing
-# else, general tools included.
-#
-# This second mechanism exists because the "code" surface is not expressible as categories
-# and recategorising tools to make it so was ruled out: a tool's category also decides what
-# the api/bigquery chat profiles advertise, so moving one to suit a profile silently changes
-# live chat behaviour. Naming the tools here changes nothing about how any existing profile
-# resolves. Subagent skills are unaffected either way: they name their tools
-# (skills/definitions.py) rather than inheriting a category.
-#
-# "code" (genetics-results-suite-4h6.16) is the minimal code-execution surface: run an
-# analysis script instead of chaining data tools, plus the entity lookups a script needs a
-# human-readable id for. launch_subagents is deliberately absent even though it shares the
-# "orchestration" category — this profile is measuring what one agent does with a sandbox,
-# not what a fan-out does. Ships dark: nothing defaults to it, selection is per request.
-TOOL_PROFILE_TOOLS: dict[str, set[str]] = {
-    "code": {
-        "run_analysis",
-        "list_capabilities",
-        "read_artifact",
-        "search_genes",
-        "search_phenotypes",
-        "search_scientific_literature",
-        "lookup_variants_by_rsid",
-    },
-}
-
-# unknown profile values already warned about. The degrade-to-general-only below stays silent
-# to the caller on purpose (see get_anthropic_tools' docstring), but an operator has to be able
-# to see the drift, and the value arrives on EVERY turn of a session that stored it — a
-# per-request warning would bury itself and stop being read. Bounded so a client that invents a
-# new value per request floods neither the log nor this set (genetics-results-suite-4h6.74).
+# unknown profile values already warned about. The degrade stays silent to the caller on
+# purpose (see get_anthropic_tools' docstring), but an operator has to be able to see the
+# drift, and the value arrives on EVERY turn of a session that stored it — a per-request
+# warning would bury itself and stop being read. Bounded so a client that invents a new
+# value per request floods neither the log nor this set.
 _WARNED_UNKNOWN_PROFILES: set[str] = set()
 _MAX_WARNED_UNKNOWN_PROFILES = 64
 
@@ -1979,21 +1997,60 @@ def _warn_unknown_profile(tool_profile: str) -> None:
         return
     _WARNED_UNKNOWN_PROFILES.add(tool_profile)
     logger.warning(
-        "Unrecognised tool_profile %r - degrading to general-only. Known profiles: %s. "
-        "A client that offers a profile this server does not know has drifted from it; "
+        "Unrecognised tool_profile %r - resolving as the no-code surface. Known profiles: "
+        "%s. A client that offers a profile this server does not know has drifted from it; "
         "GET /chat/v1/tools/resolved?tool_profile=<value> reports the same thing per request.",
         tool_profile,
-        ", ".join(sorted(set(TOOL_PROFILES) | set(TOOL_PROFILE_TOOLS))),
+        ", ".join(sorted(KNOWN_TOOL_PROFILES)),
     )
 
 
 def all_local_tool_definitions() -> list[dict[str, Any]]:
-    """Every locally-defined tool, before any profile or disabled filter.
+    """Every locally-defined tool, before any surface or disabled filter.
 
-    The three lists are one surface everywhere they are used together; naming that here
-    keeps `get_anthropic_tools` and `tool_category` filtering and labelling the same set.
+    The four lists are one surface everywhere they are used together; naming that here
+    keeps `register_mcp_tools` and `tool_category` registering and labelling the same set.
+    This is NOT what a chat request is handed — `resolve_tools` is — but it is where a
+    caller that narrows by explicit tool name (subagent skills) starts.
     """
-    return list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS) + list(SUBAGENT_TOOL_DEFINITIONS)
+    return (
+        list(TOOL_DEFINITIONS)
+        + list(CODE_EXECUTION_TOOL_DEFINITIONS)
+        + list(BIGQUERY_TOOL_DEFINITIONS)
+        + list(SUBAGENT_TOOL_DEFINITIONS)
+    )
+
+
+def resolve_tools(
+    code_execution: bool, disabled: set[str] | None = None
+) -> list[dict[str, Any]]:
+    """The local tool definitions one surface is handed.
+
+    There are exactly two surfaces and one boolean chooses between them:
+
+      code_execution=True  — the sandbox's own tools, plus every tool the SDK inside the
+        sandbox cannot stand in for. That is not "everything minus run_analysis": the line
+        is internal genetics data (a script fetches it through the SDK) against outside
+        resources (the sandbox egress allow-list names db-api and results-api only, so no
+        script reaches them), with the entity lookups kept because resolving a symbol or a
+        phenotype name to an id is what the model does *before* it writes a script.
+      code_execution=False — every data tool, and none of the sandbox's.
+
+    Membership is `sdk_replaceable` on the definition itself, so adding a tool is one
+    decision taken where the tool is defined rather than an edit to a table elsewhere.
+    `launch_subagents` reaches neither surface: which one should carry it is an open
+    question, and ENABLE_SUBAGENTS=false keeps it out of every deployment meanwhile.
+    """
+    data_tools = list(TOOL_DEFINITIONS) + list(BIGQUERY_TOOL_DEFINITIONS)
+    if code_execution:
+        tools = list(CODE_EXECUTION_TOOL_DEFINITIONS) + [
+            t for t in data_tools if not t["sdk_replaceable"]
+        ]
+    else:
+        tools = data_tools
+    if disabled:
+        tools = [t for t in tools if t["name"] not in disabled]
+    return tools
 
 
 _LOCAL_TOOL_CATEGORIES: dict[str, str] = {
@@ -2002,11 +2059,12 @@ _LOCAL_TOOL_CATEGORIES: dict[str, str] = {
 
 
 def tool_category(name: str) -> str | None:
-    """The category a local tool is filtered by, or None for a name defined nowhere local.
+    """A local tool's display label, or None for a name defined nowhere local.
 
-    `get_anthropic_tools` drops `category` on the way to Anthropic's format, which has no
-    field for it; a caller that has to label a resolved tool (the tools panel groups by it)
-    reads it back through here rather than re-deriving the profile filter.
+    No surface decision reads `category` — `resolve_tools` goes by `sdk_replaceable`.
+    `get_anthropic_tools` drops it on the way to Anthropic's format, which has no field for
+    it; a caller that has to label a resolved tool (the tools panel groups by it) reads it
+    back through here.
     """
     return _LOCAL_TOOL_CATEGORIES.get(name)
 
@@ -2017,43 +2075,52 @@ def get_anthropic_tools(
     disabled_tools: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Return tool definitions in Anthropic's format, filtered by tool profile.
+    Return the tool definitions a request carrying `tool_profile` is handed, in Anthropic's
+    format.
+
+    THE PROFILE SHIM. There are two surfaces and `resolve_tools` decides between them from
+    one boolean; this maps the profile value clients still send onto it. `"code"` is code
+    execution; every other value — `None`, the legacy `api`/`bigquery`/`rag`, `nocode`, and
+    anything this server has never heard of — resolves to the no-code surface, which is the
+    safe direction for a value read back from a row an older client wrote. An unrecognised
+    value logs a WARNING once per distinct value; it stays silent to the model and to the
+    caller.
 
     Args:
         custom_descriptions: Optional dict mapping tool names to custom descriptions
-        tool_profile: Profile controlling which tools to include.
-            None = all tools (no filtering at all, not a union of the profiles),
-            "api" = general+api, "bigquery" = general+bigquery,
-            "rag" = general only (RAG tools are external, handled separately),
-            "code" = the seven names in TOOL_PROFILE_TOOLS.
-            An unrecognised string degrades to general-only rather than raising, so a
-            typo costs the model most of its tools — deliberate, because the value is
-            persisted per message and read back from rows written by older clients. It is
-            no longer silent to an operator: the first request carrying a given unknown
-            value logs a WARNING naming it and the known set (once per distinct value, not
-            once per request). It is still silent to the model and to the caller.
-        disabled_tools: Optional set of tool names to exclude. Applied before the
-            profile filter, so a disabled tool stays out of an explicit profile too.
+        tool_profile: Legacy wire value; see above.
+        disabled_tools: Optional set of tool names to exclude, applied after the surface.
     """
+    if tool_profile is not None and tool_profile not in KNOWN_TOOL_PROFILES:
+        _warn_unknown_profile(tool_profile)
+    return _to_anthropic_format(
+        resolve_tools(tool_profile == "code", disabled_tools), custom_descriptions
+    )
+
+
+def all_anthropic_tools(
+    custom_descriptions: dict[str, str] | None = None,
+    disabled_tools: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Every local tool in Anthropic's format, narrowed only by `disabled_tools`.
+
+    For a caller that then narrows by explicit tool name and so must not be handed a
+    surface first: a subagent skill names both data tools and `run_analysis`, which no
+    single surface carries.
+    """
+    definitions = all_local_tool_definitions()
+    if disabled_tools:
+        definitions = [t for t in definitions if t["name"] not in disabled_tools]
+    return _to_anthropic_format(definitions, custom_descriptions)
+
+
+def _to_anthropic_format(
+    tool_definitions: list[dict[str, Any]],
+    custom_descriptions: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     anthropic_tools = []
 
-    all_tools = list(all_local_tool_definitions())
-
-    if disabled_tools:
-        all_tools = [t for t in all_tools if t["name"] not in disabled_tools]
-
-    if tool_profile is not None:
-        allowed_names = TOOL_PROFILE_TOOLS.get(tool_profile)
-        if allowed_names is not None:
-            all_tools = [t for t in all_tools if t["name"] in allowed_names]
-        else:
-            allowed_categories = TOOL_PROFILES.get(tool_profile)
-            if allowed_categories is None:
-                _warn_unknown_profile(tool_profile)
-                allowed_categories = {"general"}
-            all_tools = [t for t in all_tools if t.get("category") in allowed_categories]
-
-    for tool_def in all_tools:
+    for tool_def in tool_definitions:
         # build input_schema from parameters
         properties = {}
         required = []

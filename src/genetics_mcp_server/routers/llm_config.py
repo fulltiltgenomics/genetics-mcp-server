@@ -23,7 +23,7 @@ from genetics_mcp_server.db.llm_config_db import (
     InstructionSetVersion,
 )
 from genetics_mcp_server.tools import TOOL_DEFINITIONS
-from genetics_mcp_server.tools.definitions import TOOL_PROFILE_TOOLS, TOOL_PROFILES
+from genetics_mcp_server.tools.definitions import KNOWN_TOOL_PROFILES
 
 logger = logging.getLogger(__name__)
 
@@ -303,19 +303,19 @@ def _deployment_default_tool_profile() -> str | None:
     """DEFAULT_TOOL_PROFILE, or None when it is unset or names no profile.
 
     An unknown name is dropped rather than served: the browser would probe it, show
-    "not recognised by the server", and the chat would degrade to general-only — a worse
-    default than the full surface it replaces. Logged once per distinct value.
+    "not recognised by the server", and the chat would resolve as the no-code surface — not
+    what an operator who set the variable asked for. Logged once per distinct value.
     """
     value = get_settings().default_tool_profile
     if not value:
         return None
-    if value in TOOL_PROFILES or value in TOOL_PROFILE_TOOLS:
+    if value in KNOWN_TOOL_PROFILES:
         return value
     if value not in _warned_default_profiles:
         _warned_default_profiles.add(value)
         logger.warning(
             "DEFAULT_TOOL_PROFILE=%r names no tool profile (known: %s); serving no default",
-            value, sorted(set(TOOL_PROFILES) | set(TOOL_PROFILE_TOOLS)),
+            value, sorted(KNOWN_TOOL_PROFILES),
         )
     return None
 

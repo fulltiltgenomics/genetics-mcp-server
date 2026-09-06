@@ -484,6 +484,16 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
     # llm_service.py for every profile except `rag` and the allow-list ones) is a further
     # annotation route that nothing here accounts for, and whether one is configured is
     # not visible from this repo.
+    # the code surface carries `get_myvariant_annotations` (an outside resource no script
+    # can reach) without `get_variant_annotations`, and both SDK variants below exclude it,
+    # so without this the prohibition above reaches that surface with no route at all.
+    # Self-gating on the protein-effect tool through the text rule, which is why a surface
+    # with myvariant but no protein-effect tool would fall through — none exists.
+    _Block(
+        "\nThose per-variant annotations are not in the database. `get_myvariant_annotations` returns a variant's consequence, clinical significance, pathogenicity scores and population frequencies, and for a coding SNV `get_variant_protein_effect` adds the amino-acid change. Beyond those, say what is missing rather than approximating it from the columns above.\n",
+        requires_any=_fs("query_database", "run_analysis"),
+        excludes=_fs("get_variant_annotations"),
+    ),
     _Block(
         "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID. Beyond those two — non-coding variants, pathogenicity scores, multi-population frequencies — say what is missing rather than approximating it from the columns above.\n",
         requires_any=_fs("run_analysis"),
@@ -742,15 +752,10 @@ def known_tool_names() -> frozenset[str]:
     """
     global _known_tool_names_cache
     if _known_tool_names_cache is None:
-        from genetics_mcp_server.tools.definitions import (
-            BIGQUERY_TOOL_DEFINITIONS,
-            SUBAGENT_TOOL_DEFINITIONS,
-            TOOL_DEFINITIONS,
-        )
+        from genetics_mcp_server.tools.definitions import all_local_tool_definitions
 
         _known_tool_names_cache = frozenset(
-            t["name"]
-            for t in (*TOOL_DEFINITIONS, *BIGQUERY_TOOL_DEFINITIONS, *SUBAGENT_TOOL_DEFINITIONS)
+            t["name"] for t in all_local_tool_definitions()
         )
     return _known_tool_names_cache
 

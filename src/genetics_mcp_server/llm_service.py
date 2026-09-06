@@ -36,7 +36,6 @@ from genetics_mcp_server.mcp_proxy import (
 )
 from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import (
-    TOOL_PROFILE_TOOLS,
     ServerToolExecutor,
     get_anthropic_tools,
 )
@@ -610,17 +609,19 @@ def resolve_proxied_tools(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """The proxied surfaces a request with this profile is handed: (external, RAG).
 
-    Always-on external tools (gnomAD, Open Targets) are excluded in the RAG profile, and in
-    any explicit-allow-list profile: those name their surface exactly, so re-adding ~20
-    proxied tools would defeat the surface they exist to measure. RAG tools are included
-    only when the profile is None (all) or "rag".
+    Still keyed on the profile name while the local surface is keyed on a boolean, so this
+    is the one place the two halves can disagree; reaching both surfaces is separate work.
+    Always-on external tools (gnomAD, Open Targets) are excluded in the RAG profile and in
+    "code", which names its surface exactly, so re-adding ~20 proxied tools would defeat the
+    surface it exists to measure. RAG tools are included only when the profile is None (all)
+    or "rag".
 
     Extracted for the same reason `resolve_local_tools` exists: `/chat/v1/tools?resolved=true`
     has to answer with the tools this rule would actually hand the model, and a second copy
     of the rule beside the panel that shows them is a copy that drifts.
     """
     external_tools: list[dict[str, Any]] = []
-    if tool_profile != "rag" and tool_profile not in TOOL_PROFILE_TOOLS:
+    if tool_profile not in ("rag", "code"):
         external_tools = get_external_anthropic_tools()
 
     rag_tools: list[dict[str, Any]] = []
@@ -828,9 +829,8 @@ class LLMService:
             enable_tools: Whether to enable MCP tools (Anthropic only)
             custom_tool_descriptions: Custom descriptions for tools
             literature_backend: Backend for literature search ('europepmc' or 'perplexity')
-            tool_profile: Tool profile controlling which categories are available.
-                None = all tools, "api" = general+api, "bigquery" = general+bigquery,
-                "rag" = general+RAG external tools.
+            tool_profile: Legacy profile value; "code" resolves to the code-execution
+                surface and every other value, None included, to the no-code one.
             secret: If True, suppress detailed logging to avoid persisting chat content.
             user: Authenticated user email for logging.
             session_id: Client conversation id, logged (id only) to count distinct conversations.

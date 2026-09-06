@@ -1,8 +1,10 @@
 """The arm preflight exists to stop a run that would measure the wrong surface.
 
-`get_anthropic_tools` degrades an unrecognised profile to general-only rather than raising,
-so a misspelled arm produces a plausible-looking benchmark against 18 tools. These pin the
-three outcomes that matters: refuse, record, and degrade-with-a-warning.
+`get_anthropic_tools` resolves an unrecognised profile to the no-code surface rather than
+raising, so a misspelled arm produces a plausible-looking benchmark against the wrong tools.
+Every profile name except `code` now selects that same surface, so two correctly spelled
+arms can also be one surface. These pin the outcomes: refuse a misspelling, refuse two arms
+that resolve alike, record what was resolved, and degrade-with-a-warning.
 """
 
 import httpx
@@ -67,8 +69,11 @@ async def test_the_all_arm_is_sent_as_no_profile_not_as_the_literal_string():
     seen = []
 
     def handler(request):
-        seen.append(request.url.params.get("tool_profile"))
-        return _ok(request.url.params.get("tool_profile"), 65)
+        profile = request.url.params.get("tool_profile")
+        seen.append(profile)
+        # distinct counts so the two arms do not resolve to one surface, which is its own
+        # refusal and would mask what this test is asserting
+        return _ok(profile, 64 if profile is None else 18)
 
     async with _client(handler) as client:
         await resolve_arm_tools(client, "http://x", (ALL_TOOLS_ARM, "code"))
@@ -95,3 +100,33 @@ async def test_a_transport_error_on_one_arm_does_not_abort_the_run():
 
     assert "error" in out["nocode"], "the failure is recorded"
     assert out["code"]["count"] == 7, "and the other arm still resolves"
+
+
+@pytest.mark.asyncio
+async def test_two_arms_that_resolve_to_one_surface_abort_the_run():
+    # the shipped defaults are exactly this shape: `all` and `bigquery` are both the
+    # no-code surface, so the run would report a zero difference that means nothing
+    def handler(request):
+        return _ok(request.url.params.get("tool_profile"), 64)
+
+    async with _client(handler) as client:
+        with pytest.raises(ArmResolutionError) as exc:
+            await resolve_arm_tools(client, "http://x", (ALL_TOOLS_ARM, "bigquery"))
+
+    message = str(exc.value)
+    assert ALL_TOOLS_ARM in message and "bigquery" in message, "both arms are named"
+    assert "64" in message, "and the surface they share is quantified"
+
+
+@pytest.mark.asyncio
+async def test_arms_that_differ_by_one_tool_are_not_treated_as_one_surface():
+    # the guard compares name sets, not counts: two surfaces of equal size are still two
+    def handler(request):
+        profile = request.url.params.get("tool_profile")
+        names = ["a", "b"] if profile is None else ["a", "c"]
+        return _ok(profile, len(names), names=names)
+
+    async with _client(handler) as client:
+        out = await resolve_arm_tools(client, "http://x", (ALL_TOOLS_ARM, "code"))
+
+    assert out["code"]["names"] == ["a", "c"]

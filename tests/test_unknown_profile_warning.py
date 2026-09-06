@@ -39,7 +39,7 @@ def test_unknown_profile_warns_naming_the_value_and_the_known_set(caplog):
     assert "cdoe" in message
     # the known set has to be IN the warning: "unknown profile" alone does not tell an
     # operator whether the browser or the server is the side that drifted
-    for known in (*definitions.TOOL_PROFILES, *definitions.TOOL_PROFILE_TOOLS):
+    for known in definitions.KNOWN_TOOL_PROFILES:
         assert known in message
 
 
@@ -61,7 +61,7 @@ def test_a_second_distinct_unknown_value_still_warns(caplog):
 
 def test_known_profiles_and_no_profile_stay_quiet(caplog):
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
-        for profile in (None, *definitions.TOOL_PROFILES, *definitions.TOOL_PROFILE_TOOLS):
+        for profile in (None, *definitions.KNOWN_TOOL_PROFILES):
             get_anthropic_tools(tool_profile=profile)
 
     assert _warnings(caplog) == []
@@ -78,11 +78,11 @@ def test_distinct_unknown_values_are_bounded(caplog):
 
 
 def test_the_degrade_itself_is_unchanged(caplog):
-    """The warning is additive: an unknown profile still resolves to general-only."""
+    """The warning is additive: an unknown profile still resolves to the no-code surface."""
     with caplog.at_level(logging.WARNING, logger=definitions.__name__):
         names = {t["name"] for t in get_anthropic_tools(tool_profile="cdoe")}
 
-    assert names == {t["name"] for t in get_anthropic_tools(tool_profile="rag")}
+    assert names == {t["name"] for t in get_anthropic_tools(tool_profile="nocode")}
 
 
 def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
@@ -94,11 +94,11 @@ def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
     two repos cannot import each other, so nothing but a literal on each side pins them
     together, and BOTH drift directions are silent by construction:
 
-      - a name the browser offers and this server dropped resolves to general-only here
-        (the degrade above), so the user gets a much smaller surface than the one named;
+      - a name the browser offers and this server dropped resolves to the no-code surface
+        here (the degrade above), so a user who picked "code" would get the data tools;
       - a name added HERE that the browser predates is narrowed to null there, and null
-        means no `tool_profile` on the request, which is NO filtering — the user's stored,
-        narrower choice silently becomes the full surface.
+        means no `tool_profile` on the request, which now also resolves to the no-code
+        surface — so the only value that can be lost this way is "code".
 
     The browser has had the mirror of this test since useChatOptions.test.ts:196 ("lists
     code alongside the three original profiles"), which is why its own drift already fails
@@ -109,13 +109,16 @@ def test_the_profile_key_set_is_pinned_against_the_browsers_copy():
     selectable, as `rag` is), then update the literal below and the "Profile behavior"
     table in docs/project-spec.md.
     """
-    assert set(definitions.TOOL_PROFILES) | set(definitions.TOOL_PROFILE_TOOLS) == {
+    assert set(definitions.KNOWN_TOOL_PROFILES) == {
         "api",
         "bigquery",
         "rag",
         "nocode",
         "code",
     }
-    # the two mechanisms must stay disjoint: TOOL_PROFILE_TOOLS wins where they overlap, so a
-    # name in both would resolve to its allow-list and quietly ignore its categories
-    assert not set(definitions.TOOL_PROFILES) & set(definitions.TOOL_PROFILE_TOOLS)
+    # the four legacy names now resolve to the same surface as "nocode": the shim keeps
+    # them accepted, and only "code" resolves anywhere else
+    for legacy in ("api", "bigquery", "rag"):
+        assert {t["name"] for t in get_anthropic_tools(tool_profile=legacy)} == {
+            t["name"] for t in get_anthropic_tools(tool_profile="nocode")
+        }

@@ -693,10 +693,14 @@ class TestResolveLocalToolNames:
         the model was never handed.
         """
         self._patch_settings(monkeypatch, enable_subagents=True)
-        dead = self._svc(subagent_service=None).resolve_local_tool_names()
-        live = self._svc(subagent_service=object()).resolve_local_tool_names()
-        assert "launch_subagents" not in dead
-        assert "launch_subagents" in live
+        assert "launch_subagents" in self._svc(subagent_service=None)._disabled_tools()
+        assert "launch_subagents" not in self._svc(subagent_service=object())._disabled_tools()
+        # asserted on the disabled set rather than on the resolved names because neither
+        # surface carries launch_subagents at all now, so the resolved list cannot tell the
+        # two apart — the liveness check is still the only thing that removes it here
+        assert "launch_subagents" not in self._svc(
+            subagent_service=None
+        ).resolve_local_tool_names()
 
     def test_prompt_matches_the_resolution_when_the_service_is_dead(self, monkeypatch):
         from genetics_mcp_server.config.defaults import default_system_prompt

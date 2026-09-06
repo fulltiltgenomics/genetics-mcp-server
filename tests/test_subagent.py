@@ -19,7 +19,7 @@ from genetics_mcp_server.skills.sandbox_tools import (
     read_file,
 )
 from genetics_mcp_server.subagent import SubagentResult, SubagentService, _format_tool_params
-from genetics_mcp_server.tools.definitions import get_anthropic_tools
+from genetics_mcp_server.tools.definitions import all_anthropic_tools
 
 
 class TestSkillDefinitions:
@@ -48,7 +48,9 @@ class TestSkillDefinitions:
 
     def test_declared_tools_exist(self):
         """A skill may only name tools that exist, or the name is silently a no-op."""
-        known = {t["name"] for t in get_anthropic_tools()}
+        # the whole local set, not a surface: a skill names run_analysis alongside data
+        # tools, and no single surface carries both
+        known = {t["name"] for t in all_anthropic_tools()}
         for skill in SKILL_REGISTRY.values():
             unknown = skill.tools - known
             assert not unknown, f"Skill '{skill.name}' names unknown tools: {unknown}"
