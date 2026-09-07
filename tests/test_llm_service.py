@@ -405,6 +405,11 @@ class TestTurnMetrics:
                 mcp_max_result_size=100_000,
                 max_continuations=1,
                 disabled_tools=[],
+                # this stands in for the whole Settings object, so a new field consulted by
+                # the streaming path has to be added here too
+                anthropic_max_retries=3,
+                anthropic_retry_rate_limit=False,
+                anthropic_retry_after_max_s=60,
             )
             chunks = await _run(svc)
 
@@ -701,3 +706,69 @@ class TestResolveLocalToolNames:
         prompt = default_system_prompt("FinnGenie", tool_names=names)
         assert "launch_subagents" not in prompt
         assert "Subagent Orchestration" not in prompt
+
+
+class TestRateLimitRetryPolicy:
+    """A 429 is a refusal, not a fault, so retrying it is opt-in.
+
+    Production keeps today's behaviour — the turn fails and the user is told — because
+    retrying in front of a waiting user spends capacity the next request needs. The
+    benchmark has no waiting user and turns it on.
+    """
+
+    @staticmethod
+    def _status_error(status, headers=None, err_type=None):
+        """An APIStatusError shaped the way each channel actually delivers one."""
+        from anthropic import APIStatusError
+
+        exc = APIStatusError.__new__(APIStatusError)
+        exc.status_code = status
+        exc.body = {"error": {"type": err_type}} if err_type else None
+        exc.response = SimpleNamespace(headers=headers or {})
+        return exc
+
+    def test_retry_after_is_read_only_in_delta_seconds_form(self):
+        from genetics_mcp_server.llm_service import _retry_after_seconds
+
+        assert _retry_after_seconds(self._status_error(429, {"retry-after": "12"})) == 12.0
+        assert _retry_after_seconds(self._status_error(429, {"retry-after": "0"})) == 0.0
+        # the HTTP-date form is legal and deliberately NOT parsed: honouring it would mean
+        # trusting our clock against theirs, and erring fast is what the header prevents
+        assert (
+            _retry_after_seconds(
+                self._status_error(429, {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
+            )
+            is None
+        )
+        assert _retry_after_seconds(self._status_error(429, {"retry-after": "-5"})) is None
+        assert _retry_after_seconds(self._status_error(429, {})) is None
+        assert _retry_after_seconds(Exception("no response at all")) is None
+
+    def test_a_mid_stream_rate_limit_is_recognised_by_body_not_status(self):
+        """Mid-stream errors carry the streaming status 200, so status alone misses them —
+        the same reason the existing 5xx branch also matches on the body's error type."""
+        from genetics_mcp_server.llm_service import anthropic_error_type
+
+        mid_stream = self._status_error(200, err_type="rate_limit_error")
+        assert mid_stream.status_code != 429
+        assert anthropic_error_type(mid_stream) == "rate_limit_error"
+
+    def test_the_policy_defaults_to_production_behaviour(self, monkeypatch):
+        from genetics_mcp_server.config.settings import Settings
+
+        for var in (
+            "ANTHROPIC_RETRY_RATE_LIMIT",
+            "ANTHROPIC_MAX_RETRIES",
+            "ANTHROPIC_RETRY_AFTER_MAX_S",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        default = Settings()
+        assert default.anthropic_retry_rate_limit is False
+        assert default.anthropic_max_retries == 3       # unchanged from the literal it replaced
+        assert default.anthropic_retry_after_max_s == 60
+
+        monkeypatch.setenv("ANTHROPIC_RETRY_RATE_LIMIT", "true")
+        monkeypatch.setenv("ANTHROPIC_MAX_RETRIES", "8")
+        opted_in = Settings()
+        assert opted_in.anthropic_retry_rate_limit is True
+        assert opted_in.anthropic_max_retries == 8

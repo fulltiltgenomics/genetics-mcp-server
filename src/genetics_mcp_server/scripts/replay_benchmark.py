@@ -1039,7 +1039,7 @@ async def replay_case_arm(
     return records
 
 
-def arm_order_for_case(arms: tuple[str, str], case_index: int) -> list[str]:
+def arm_order_for_case(arms: tuple[str, ...], case_index: int) -> list[str]:
     """The alternating arm order for case i: (a, b) when even, (b, a) when odd."""
     return list(arms) if case_index % 2 == 0 else list(reversed(arms))
 
@@ -1049,7 +1049,7 @@ async def replay_case(
     base_url: str,
     case: dict[str, Any],
     case_index: int,
-    arms: tuple[str, str],
+    arms: tuple[str, ...],
     run_id: str,
     model: str | None,
     provider: str | None,
@@ -1259,7 +1259,7 @@ def summarize_arm(records: list[TurnRecord]) -> dict[str, Any]:
 
 
 def matched_pairs(
-    all_turns: list[TurnRecord], arms: tuple[str, str]
+    all_turns: list[TurnRecord], arms: tuple[str, ...]
 ) -> tuple[set[tuple[str, int]], dict[str, int]]:
     """The `(case_id, turn_index)` keys that succeeded on BOTH arms, plus per-arm dropout.
 
@@ -1289,7 +1289,7 @@ class RateLimitedError(RuntimeError):
 
 
 async def resolve_arm_tools(
-    client: httpx.AsyncClient, base_url: str, arms: tuple[str, str]
+    client: httpx.AsyncClient, base_url: str, arms: tuple[str, ...]
 ) -> dict[str, Any]:
     """Ask the SERVER what each arm actually resolves to, before spending anything.
 
@@ -1356,14 +1356,14 @@ async def resolve_arm_tools(
     return out
 
 
-async def _dry_run_resolve(base_url: str, arms: tuple[str, str]) -> dict[str, Any]:
+async def _dry_run_resolve(base_url: str, arms: tuple[str, ...]) -> dict[str, Any]:
     """resolve_arm_tools with its own short-lived client, for the --dry-run path."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         return await resolve_arm_tools(client, base_url, arms)
 
 
 def build_report(
-    cases: list[CaseResult], arms: tuple[str, str], config: dict[str, Any]
+    cases: list[CaseResult], arms: tuple[str, ...], config: dict[str, Any]
 ) -> dict[str, Any]:
     all_turns = [t for c in cases for t in c.turns]
     matched, dropped = matched_pairs(all_turns, arms)
@@ -1653,7 +1653,7 @@ def load_cases(dataset: Path, limit: int | None) -> list[dict[str, Any]]:
 async def run_benchmark(
     dataset: Path,
     base_url: str,
-    arms: tuple[str, str],
+    arms: tuple[str, ...],
     limit: int | None,
     concurrency: int,
     model: str | None,
@@ -1763,7 +1763,11 @@ def build_parser() -> argparse.ArgumentParser:
         "production spends real money (measured mean $2.01/turn).",
     )
     parser.add_argument("--arm-a", default=ALL_TOOLS_ARM, help=f"tool_profile for arm A ('{ALL_TOOLS_ARM}' = all tools)")
-    parser.add_argument("--arm-b", default="bigquery", help="tool_profile for arm B")
+    parser.add_argument(
+        "--arm-b",
+        default="bigquery",
+        help="tool_profile for arm B, or 'none' to run arm A alone (no pairing, no judging)",
+    )
     parser.add_argument("--limit", type=int, default=None, help="max cases to replay")
     parser.add_argument("--max-turns", type=int, default=None, help="max user turns per case")
     parser.add_argument("--concurrency", type=int, default=1, help="cases in flight (arms within a case are always sequential)")
@@ -1816,14 +1820,24 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
 
-    if args.arm_a == args.arm_b:
-        print("arm-a and arm-b must differ", file=sys.stderr)
+    # `--arm-b none` is the single-arm mode: measure ONE profile against a previous run's
+    # recorded numbers instead of against a live opposite arm. It is worth having because the
+    # counters that decide a prompt/image change (iterations, tool calls, wall clock, what the
+    # scripts did) are per-arm, and paying for a second arm that has not changed buys nothing.
+    # It is NOT a substitute for the paired run: everything the pairing exists to defend
+    # against — a model swap, an API slowdown, a cache warm-up mid-run — lands entirely on the
+    # single arm and is indistinguishable from the change under test, and `pairwise_judge` has
+    # nothing to compare, so QUALITY IS NOT MEASURED AT ALL. Use it to see whether a change
+    # moved the mechanics; use the paired run to decide a rollout.
+    single_arm = str(args.arm_b).lower() in ("", "none")
+    if not single_arm and args.arm_a == args.arm_b:
+        print("arm-a and arm-b must differ (use --arm-b none to run one arm)", file=sys.stderr)
         return 2
     if not args.dataset.exists():
         print(f"dataset not found: {args.dataset}", file=sys.stderr)
         return 2
 
-    arms = (args.arm_a, args.arm_b)
+    arms = (args.arm_a,) if single_arm else (args.arm_a, args.arm_b)
 
     if args.model and not has_pricing(args.model):
         print(
@@ -1841,8 +1855,8 @@ def main(argv: list[str] | None = None) -> int:
         turns = sum(
             len((c.get("user_turns") or [])[: args.max_turns]) for c in cases
         )
-        print(f"{len(cases)} cases, {turns} turns per arm, {turns * 2} model turns total")
-        print(f"arms: {arms[0]} vs {arms[1]}   target: {args.base_url}")
+        print(f"{len(cases)} cases, {turns} turns per arm, {turns * len(arms)} model turns total")
+        print(f"arms: {' vs '.join(arms)}   target: {args.base_url}")
         # the cheapest place a misspelled arm can possibly be caught, so catch it here too
         # rather than only in the paid path. Reaches the server but spends nothing.
         try:

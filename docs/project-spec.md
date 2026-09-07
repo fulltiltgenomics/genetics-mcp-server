@@ -1769,6 +1769,7 @@ src/genetics_mcp_server/
 │   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
+│   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -2121,6 +2122,9 @@ All configuration is via environment variables (`.env` file supported):
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
 | `MAX_CONTINUATIONS` | How many times a turn stopped by `stop_reason: max_tokens` is resumed before the truncation is reported to the user | `3` |
+| `ANTHROPIC_MAX_RETRIES` | Attempts the streaming call makes over connection errors, 5xx and `overloaded_error`, with exponential backoff | `3` |
+| `ANTHROPIC_RETRY_RATE_LIMIT` | Whether an Anthropic **429** is also retried. Off by default and deliberately so: a 429 means the account's capacity is spent, so retrying in front of a waiting user buys a longer spinner and takes capacity from the next request. A benchmark has no waiting user and turns it on | `false` |
+| `ANTHROPIC_RETRY_AFTER_MAX_S` | Ceiling on a honoured `retry-after`. Above it the wait is refused and the error propagates rather than being silently clamped — returning before the server said to is what the header asks us not to do | `60` |
 | `APP_NAME` | Product/brand name substituted into the assistant persona system prompt | `FinnGenie` |
 
 ### myvariant.info (optional, chat-backend only)
@@ -2509,6 +2513,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
 | `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to `{"general"}`, and records each arm's resolved tool list in the report |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
+| `test_benchmark_counters.py` | The recorded 9c6595ac baseline is exactly what the current code computes on that report, so a before/after delta is never a comparison of two different definitions; a discovery script is counted as opening a turn only when it is the first; re-execution is scoped to the case rather than the turn, which is where a refine follow-up shows up at all; every counter is present at 0 rather than absent, so an arm that did none of something is not confused with a report that never measured it |
 | `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
 | `test_benchmark_transcript.py` | The side-by-side transcript carries what distinguishes a *wide* arm from a *slow* one (per-call iteration, retry loops, script shapes) and never invents a measurement it lacks — an unattributed call has no iteration, and the final iteration's absent tool phase is not reported as a gap |
 | `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded (and `dropped_prose_blocks` returning that same text with the call it followed, for the transcript and never for the judge), length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
@@ -2660,6 +2665,36 @@ harness issues two arms per case. `--base-url` therefore defaults to
 `http://localhost:8000`, never a deployment, and `--dry-run` resolves the whole plan
 (case order, arm order, turn count) without issuing a single request.
 
+- **Single-arm mode.** `--arm-b none` runs arm A alone. It exists because the counters that
+  decide a prompt or image change are per-arm, and paying for a second arm that has not
+  changed buys nothing. What it gives up is everything the pairing defends: a model swap or
+  a slowdown mid-run lands entirely on the one arm and is indistinguishable from the change
+  under test, and `pairwise_judge` has no opposite answer, so **quality is not measured at
+  all**. `benchmark_scorecard` is a side-by-side instrument and refuses a one-arm report
+  rather than rendering half of one; `benchmark_counters.py` is the per-arm reading —
+  iterations, calls, what the scripts contained, wall clock — against a recorded baseline.
+  Use single-arm to see whether a change moved the mechanics; use the paired run to decide a
+  rollout. `run_benchmark_code.sh` is the code-profile-only wrapper.
+  `benchmark_scorecard --markdown` renders a one-arm report too — it is the only
+  human-readable output such a run has — but writes ONE file rather than the usual
+  paired-plus-per-arm set, since the per-arm view would be the same document under a
+  second name. The comparison TABLE still refuses: it is the rollout instrument and has
+  nothing to say about one arm. Failed turns in a one-arm file are reported as
+  `TURNS FAILED` rather than `NOT COMPARABLE`, because there is no partner whose
+  failure could have spoiled a comparison.
+- **Running it fast.** With one arm there is no pairing to preserve, so `--concurrency`
+  is free to rise to whatever Anthropic and the local stack will take. Two settings on
+  the stack are the binding constraint, and neither is a benchmark flag:
+  `RATE_LIMIT_PER_HOUR`/`RATE_LIMIT_PER_DAY` (chat-backend's own limiter, 20/100 by
+  default — a 50-turn run trips it and the harness treats that 429 as run-invalidating),
+  and `ANTHROPIC_RETRY_RATE_LIMIT=true`, which makes chat-backend wait out an Anthropic
+  429 rather than failing the turn. That is push-until-refused-then-back-off, not
+  header-driven pacing: nothing reads the `anthropic-ratelimit-*` headers to self-throttle
+  ahead of a refusal.
+  **Concurrency invalidates the wall-clock comparison and nothing else.** Run 9c6595ac was
+  serial; every counter except wall clock is concurrency-invariant, while wall clock sums
+  per-turn latency and a concurrent run queues against the same local stack.
+  `benchmark_counters` prints the warning when the two runs disagree.
 - **Paired design.** Both arms of a case run back to back inside one worker, so a
   model swap or an API slowdown mid-run hits both arms equally. `--concurrency`
   parallelises over *cases*; the semaphore is held for the whole case, so the two

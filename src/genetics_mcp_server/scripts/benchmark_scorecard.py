@@ -693,7 +693,7 @@ def _md_judge(pairs: list[dict], turn_index: int) -> list[str]:
 def render_markdown(
     report: dict[str, Any], case: str | None = None, only_arm: str | None = None
 ) -> str:
-    """Every case's conversation, both arms, as markdown — nothing elided.
+    """Every case's conversation as markdown — nothing elided.
 
     The terminal views (`--tools`, `--transcript`) are shaped by a column width and
     therefore truncate: a `run_analysis` script, the one argument most worth reading when an
@@ -713,10 +713,17 @@ def render_markdown(
     there is no per-arm quality number to put in its place. Comparability is still stated on
     every case — the property belongs to the PAIR, and a one-arm file that dropped it would
     read as a clean run of an arm whose partner fell over.
+
+    A SINGLE-ARM REPORT (`replay_benchmark --arm-b none`) renders too, and the difference from
+    `only_arm` is not cosmetic. One side of a PAIR can be incomparable because its partner
+    fell over, so that file says NOT COMPARABLE. A single-arm run has no partner and no
+    comparison to be spoiled, so the same failed turns are reported as what they are — turns
+    that failed — and the judge sections are absent rather than empty, because nothing was
+    judged. Calling a run of one arm "not comparable" would invent a pair that never existed.
     """
     arms = list(report.get("arms") or [])
-    if len(arms) != 2:
-        return f"expected 2 arms, report has {arms!r}"
+    if not 1 <= len(arms) <= 2:
+        return f"expected 1 or 2 arms, report has {arms!r}"
     if only_arm is not None and only_arm not in arms:
         return f"no arm {only_arm!r} in this report; it has: " + ", ".join(arms)
     shown = [only_arm] if only_arm else arms
@@ -733,8 +740,12 @@ def render_markdown(
     out = [
         title,
         "",
-        (f"- arm: `{only_arm}` (of `{arms[0]}` vs `{arms[1]}`)" if only_arm
-         else f"- arms: `{arms[0]}` vs `{arms[1]}`")
+        (
+            f"- arm: `{only_arm}` (of {' vs '.join(f'`{a}`' for a in arms)})" if only_arm
+            else f"- arm: `{arms[0]}` (single-arm run — nothing to compare against, "
+                 f"and nothing judged)" if len(arms) == 1
+            else f"- arms: `{arms[0]}` vs `{arms[1]}`"
+        )
         + "".join(
             f" · `{a}` = {(cfg.get('arm_tools') or {}).get(a, {}).get('count', '?')} tools"
             for a in arms
@@ -759,7 +770,10 @@ def render_markdown(
         out += ["---", "", f"## {case_id}", ""]
         blockers = _blockers(per_arm, arms)
         if blockers:
-            out += [f"> **NOT COMPARABLE**: {'; '.join(blockers)}", ""]
+            # with one arm there is no pair, so these are failed turns rather than a spoiled
+            # comparison; saying NOT COMPARABLE would invent a partner that never ran
+            label = "TURNS FAILED" if len(arms) == 1 else "NOT COMPARABLE"
+            out += [f"> **{label}**: {'; '.join(blockers)}", ""]
         for index in range(max(len(per_arm[a]) for a in arms)):
             turns = {
                 arm: (per_arm[arm][index] if index < len(per_arm[arm]) else None)
@@ -840,16 +854,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # one file per arm beside the paired one: the paired document answers "why did this
         # case go differently", and a single arm's file is what gets read on its own or
-        # diffed against the same arm from another run, where the other arm's calls are noise
-        written = [(args.markdown, text)] + [
-            (
-                args.markdown.with_name(
-                    f"{args.markdown.stem}.{arm}{args.markdown.suffix or '.md'}"
-                ),
-                render_markdown(report, case=args.case, only_arm=arm),
-            )
-            for arm in (report.get("arms") or [])
-        ]
+        # diffed against the same arm from another run, where the other arm's calls are noise.
+        # A single-arm report gets ONLY the main file — the per-arm view would be the same
+        # document under a second name, and two identical files invite the reader to look for
+        # a difference between them.
+        report_arms = list(report.get("arms") or [])
+        written = [(args.markdown, text)]
+        if len(report_arms) > 1:
+            written += [
+                (
+                    args.markdown.with_name(
+                        f"{args.markdown.stem}.{arm}{args.markdown.suffix or '.md'}"
+                    ),
+                    render_markdown(report, case=args.case, only_arm=arm),
+                )
+                for arm in report_arms
+            ]
         for path, body in written:
             try:
                 path.write_text(body)

@@ -61,6 +61,25 @@ def anthropic_error_type(e: Exception) -> str | None:
     return None
 
 
+def _retry_after_seconds(e: Exception) -> float | None:
+    """`retry-after` off a rate-limited response, in seconds, or None.
+
+    Only the delta-seconds form is read. The HTTP-date form is legal and Anthropic does not
+    send it; parsing it would mean trusting our clock against theirs to decide how long to
+    sleep, and getting that wrong in the fast direction is what the header exists to prevent.
+    A malformed or absent value yields None and the caller's exponential backoff applies.
+    """
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 # the display-only tool-use markers that end up in stored assistant `content`. Two shapes:
 #
 #  *[Using tool: name; k: v]*  — what this service streamed as prose until
@@ -1082,7 +1101,7 @@ class LLMService:
                 model_started = time.monotonic()
 
                 # retry transient Anthropic errors with exponential backoff
-                max_retries = 3
+                max_retries = settings.anthropic_max_retries
                 attempt = 0
                 for attempt in range(max_retries + 1):
                     text_yielded_this_attempt = False
@@ -1122,9 +1141,28 @@ class LLMService:
                             or (isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529))
                             or err_type in ("overloaded_error", "api_error", "internal_server_error")
                         )
+                        # A 429 is a REFUSAL, not a fault: the account's capacity is spent, so
+                        # this is off unless a caller with no waiting user (the benchmark) asks
+                        # for it. Matched on both channels for the same reason the 5xx branch
+                        # above is: mid-stream it arrives as an APIStatusError carrying the
+                        # streaming status 200, with the real type only in the body.
+                        is_rate_limited = (
+                            isinstance(e, APIStatusError) and e.status_code == 429
+                        ) or err_type == "rate_limit_error"
+                        if is_rate_limited and settings.anthropic_retry_rate_limit:
+                            is_retryable = True
                         if not is_retryable or attempt >= max_retries:
                             raise
                         wait = 2 ** attempt
+                        # Anthropic says when to come back; obey it rather than guessing, but
+                        # bound it so one header cannot park this worker indefinitely. Above
+                        # the cap the wait is refused outright rather than silently clamped:
+                        # coming back before the server said to is what it asked us not to do.
+                        retry_after = _retry_after_seconds(e) if is_rate_limited else None
+                        if retry_after is not None:
+                            if retry_after > settings.anthropic_retry_after_max_s:
+                                raise
+                            wait = retry_after
                         logger.warning(
                             f"{log_prefix}Retryable Anthropic error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
                             f"Retrying in {wait}s..."

@@ -137,6 +137,32 @@ class Settings:
     max_continuations: int = field(
         default_factory=lambda: int(os.environ.get("MAX_CONTINUATIONS", "3"))
     )
+    # How the streaming call reacts to a REFUSAL rather than a transient fault. Both default
+    # to the behaviour production has always had, and exist so a benchmark can push the API
+    # as hard as it allows without either changing what a real user experiences.
+    #
+    # anthropic_max_retries bounds the existing exponential backoff over connection errors,
+    # 5xx and overloaded_error.
+    #
+    # anthropic_retry_rate_limit is OFF by default, and that is a deliberate product choice
+    # rather than an oversight: a 429 means the account's capacity is already spent, so
+    # retrying in front of a waiting user buys a longer spinner and takes capacity from the
+    # next request. A benchmark has no waiting user and wants the turn to land eventually, so
+    # it turns this on. When on, `retry-after` is honoured when the response carries it and
+    # the exponential backoff is the fallback when it does not.
+    anthropic_max_retries: int = field(
+        default_factory=lambda: int(os.environ.get("ANTHROPIC_MAX_RETRIES", "3"))
+    )
+    anthropic_retry_rate_limit: bool = field(
+        default_factory=lambda: os.environ.get("ANTHROPIC_RETRY_RATE_LIMIT", "").lower()
+        in ("1", "true", "yes")
+    )
+    # cap on a single honoured `retry-after`, so a header naming an hour cannot park a worker
+    # for one. Past this the wait is refused and the error propagates as it does today.
+    anthropic_retry_after_max_s: int = field(
+        default_factory=lambda: int(os.environ.get("ANTHROPIC_RETRY_AFTER_MAX_S", "60"))
+    )
+
     # temperature is off by default; many current models (Fable, Opus 4.7+)
     # reject it. set TEMPERATURE to opt in for models that still support it.
     temperature: float | None = field(

@@ -330,3 +330,53 @@ def test_markdown_still_declares_prose_a_report_kept_only_the_length_of():
     out = render_markdown(_report(turns))
     assert "260 character(s)" in out
     assert "predates their capture" in out
+
+
+def _single_arm_report(turns):
+    return {"arms": ["code"], "turns": turns, "config": {"run_id": "solo"}}
+
+
+def test_markdown_renders_a_single_arm_report():
+    """`replay_benchmark --arm-b none` still has to produce a readable conversation file;
+    it is the only human-readable output of a one-arm run, since the scorecard table is a
+    comparison and correctly refuses one."""
+    turns = [
+        dict(_turn("c1", "code", 0), user_question="what is PCSK9", final_answer="chr1."),
+    ]
+    out = render_markdown(_single_arm_report(turns))
+    assert out.startswith("# Benchmark transcripts")
+    assert "single-arm run" in out
+    assert "**not judged**" in out
+    assert "what is PCSK9" in out and "chr1." in out
+    # no phantom second column
+    assert "vs" not in out.splitlines()[2]
+
+
+def test_a_single_arm_run_reports_failed_turns_without_inventing_a_pair():
+    """One side of a PAIR can be incomparable because its partner fell over. A one-arm run
+    has no partner, so the same failed turn is reported as a failed turn — calling it
+    'not comparable' would name a comparison that was never attempted."""
+    turns = [
+        dict(_turn("c1", "code", 0), user_question="q"),
+        dict(_turn("c1", "code", 1, status="error"), user_question="q2", error="boom"),
+    ]
+    out = render_markdown(_single_arm_report(turns))
+    assert "TURNS FAILED" in out
+    assert "NOT COMPARABLE" not in out
+
+    # the same turns as one side of a real pair keep the pairwise wording
+    paired = {
+        "arms": ["nocode", "code"],
+        "turns": turns + [dict(_turn("c1", "nocode", i), user_question="q") for i in (0, 1)],
+        "config": {"run_id": "pair"},
+    }
+    out_pair = render_markdown(paired, only_arm="code")
+    assert "NOT COMPARABLE" in out_pair
+    assert "TURNS FAILED" not in out_pair
+
+
+def test_the_comparison_table_still_refuses_a_single_arm_report():
+    """The table is the rollout instrument and has nothing to say about one arm. It must keep
+    refusing rather than rendering half a comparison."""
+    out = render(_single_arm_report([_turn("c1", "code", 0)]))
+    assert "expected 2 arms" in out
