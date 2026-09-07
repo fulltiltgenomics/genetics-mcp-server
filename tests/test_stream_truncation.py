@@ -611,3 +611,31 @@ async def test_a_tool_that_is_not_run_analysis_emits_no_script_result_chunk():
     svc = _tooled_service(turns, {"success": True, "results": []})
     chunks = await _collect_with_tool(svc)
     assert not [c for c in chunks if c.type == "script_result"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_turn_ends_with_a_notice_and_is_not_resumed():
+    """`stop_reason: refusal` with empty content is a declined request, not an answer."""
+    message = _FakeMessage([], "refusal")
+    message.stop_details = SimpleNamespace(category="bio")
+    svc = _service([([], message)])
+    chunks = await _collect(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "declined this request (bio)" in text
+    assert len(svc.anthropic_client.messages.calls) == 1
+    assert [c.type for c in chunks].count("done") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_mid_stream_refusal_keeps_the_partial_text_and_runs_no_tool():
+    block = _Block("tool_use", id="t1", name="get_variants", input={})
+    message = _FakeMessage([_Block("text", text="Partial"), block], "refusal")
+    svc = _tooled_service([([_delta_event("text_delta", "Partial")], message)], {"success": True})
+    chunks = await _collect_with_tool(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.startswith("Partial")
+    assert "declined this request" in text
+    assert not [c for c in chunks if c.type == "tool_use"]
+    assert len(svc.anthropic_client.messages.calls) == 1

@@ -122,7 +122,7 @@ class Settings:
     # LLM defaults
     default_provider: str = "anthropic"
     default_model: str = field(
-        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-opus-5")
+        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-fable-5-1")
     )
     fast_model: str = "claude-haiku-4-5"
     # caps thinking + visible text together, and is a ceiling rather than a

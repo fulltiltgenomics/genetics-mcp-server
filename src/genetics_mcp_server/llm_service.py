@@ -1335,6 +1335,24 @@ class LLMService:
                 # check for tool use
                 tool_uses = [b for b in message.content if b.type == "tool_use"]
 
+                # a safety classifier declined the request (Fable's cover research biology,
+                # so a genetics question can trip one). Content is empty when it fired
+                # before any output and partial when it fired mid-stream; either way the
+                # turn is over, and running its tools or resuming it would be answering a
+                # request the model refused. Without this the loop reported the empty
+                # turn as a completed answer.
+                if message.stop_reason == "refusal":
+                    category = getattr(getattr(message, "stop_details", None), "category", None)
+                    logger.warning(f"{log_prefix}Model refused the request (category={category})")
+                    notice = (
+                        "\n\n---\n*The model declined this request"
+                        + (f" ({category})" if category else "")
+                        + ". Try rephrasing it.*\n"
+                    )
+                    yield StreamChunk(type="text", content=notice)
+                    all_content_blocks.append({"type": "text", "text": notice})
+                    break
+
                 # a turn cut off by the output cap carries no tool_use blocks, so the loop
                 # would otherwise break and report it as a completed answer. Resume it
                 # instead. Guarded on tool_uses being empty: continuing a turn that holds
