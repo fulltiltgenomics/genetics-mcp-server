@@ -412,6 +412,7 @@ class TestTurnMetrics:
                 mcp_max_iterations=3,
                 mcp_max_result_size=100_000,
                 max_continuations=1,
+                refusal_fallback="default",
                 disabled_tools=[],
                 # this stands in for the whole Settings object, so a new field consulted by
                 # the streaming path has to be added here too

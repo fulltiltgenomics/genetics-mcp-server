@@ -20,6 +20,7 @@ from genetics_mcp_server.config import (
     get_settings,
     model_rejects_temperature,
     model_supports_adaptive_thinking,
+    model_supports_refusal_fallback,
 )
 from genetics_mcp_server.config.defaults import (
     CONTINUE_TRUNCATED_PROMPT,
@@ -270,6 +271,71 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
 # comfortably under the client's 90s inactivity timeout, so several ticks are
 # missed before a stalled stream is declared dead.
 _THINKING_KEEPALIVE_SECONDS = 10.0
+
+
+def _refusal_fallback_params(model: str, fallback: str) -> dict[str, Any]:
+    """Request fields that re-run a classifier refusal on another model, server side.
+
+    The pinned SDK does not type `fallbacks`, so it travels in `extra_body` under the beta
+    header. The two forms carry different headers and the API rejects a mismatch, so they
+    are built together here and nowhere else.
+    """
+    if not fallback or not model_supports_refusal_fallback(model):
+        return {}
+    if fallback == "default":
+        body: Any = "default"
+        beta = "server-side-fallback-2026-07-01"
+    else:
+        body = [{"model": fallback}]
+        beta = "server-side-fallback-2026-06-01"
+    return {"extra_body": {"fallbacks": body}, "extra_headers": {"anthropic-beta": beta}}
+
+
+_MODEL_ID_RE = re.compile(r"^claude-([a-z]+)-(\d+)(?:-(\d+))?")
+
+
+def _model_display_name(model_id: str | None) -> str:
+    """'claude-fable-5-1' -> 'Claude Fable 5.1', the browser's About dialog spelling."""
+    match = _MODEL_ID_RE.match(model_id or "")
+    if not match:
+        return model_id or "another model"
+    family, major, minor = match.groups()
+    return f"Claude {family.capitalize()} {major}" + (f".{minor}" if minor else "")
+
+
+def _block_field(block: Any, name: str) -> Any:
+    # a `fallback` block is a type the pinned SDK does not know, so it arrives constructed
+    # as its first union variant with the wire fields kept as extras
+    dumped = block.model_dump() if hasattr(block, "model_dump") else dict(block)
+    return dumped.get(name)
+
+
+def _fallback_notice(block: Any) -> str:
+    """The visible line that stands in for a `fallback` marker block."""
+    declined = _model_display_name((_block_field(block, "from") or {}).get("model"))
+    served = _model_display_name((_block_field(block, "to") or {}).get("model"))
+    return f"\n\n*[{declined} declined this request; {served} answered instead]*\n\n"
+
+
+def _last_fallback_index(content: list[Any]) -> int:
+    return max((i for i, b in enumerate(content) if b.type == "fallback"), default=-1)
+
+
+def _replayable_content(content: list[Any]) -> list[dict[str, Any]]:
+    """The assistant turn as it goes back to the API.
+
+    After a mid-output fallback the blocks before the last `fallback` marker were written
+    by the model that declined: its reasoning and tool calls are not part of the answer
+    the fallback model continued, and echoing them back is rejected, so only its text
+    survives. The marker itself is dropped; the API treats it as an ignorable audit line.
+    """
+    cut = _last_fallback_index(content)
+    return [
+        b.model_dump(exclude_none=True)
+        for i, b in enumerate(content)
+        if b.type != "fallback"
+        and not (i < cut and b.type in ("thinking", "redacted_thinking", "tool_use"))
+    ]
 
 # Appended to the turn when the agentic loop stops at `mcp_max_iterations`. It is the ONLY
 # signal a stream consumer has that the final iteration ran tools whose phase was never
@@ -1056,6 +1122,8 @@ class LLMService:
         if model_supports_adaptive_thinking(model):
             request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
 
+        request_params.update(_refusal_fallback_params(model, settings.refusal_fallback))
+
         # the system prompt goes out as two separately cached blocks. Block 0 is identical
         # for every user (default prompt + response-length fragment), so one cache entry
         # per verbosity value serves the whole user base; block 1 carries only this user's
@@ -1170,6 +1238,18 @@ class LLMService:
                             async with self.anthropic_client.messages.stream(**request_params) as stream:
                                 last_keepalive = 0.0
                                 async for event in stream:
+                                    # a `fallback` block marks where the requested model
+                                    # declined and another took over; say so where it
+                                    # happens, since the text after it changes voice
+                                    if (
+                                        event.type == "content_block_start"
+                                        and getattr(event.content_block, "type", None) == "fallback"
+                                    ):
+                                        text_yielded_this_attempt = True
+                                        yield StreamChunk(
+                                            type="text", content=_fallback_notice(event.content_block)
+                                        )
+                                        continue
                                     if event.type != "content_block_delta":
                                         continue
                                     delta = event.delta
@@ -1242,14 +1322,20 @@ class LLMService:
                 output_tok = usage.output_tokens
                 cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
                 cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
-                iter_cost = estimate_cost(model, input_tok, output_tok, cache_read, cache_create)
+                # the response names the model that produced it, which after a refusal
+                # fallback is not the one requested: that is the model whose rates apply
+                # and whose context window the meter should read against
+                served_model = getattr(message, "model", None) or model
+                iter_cost = estimate_cost(
+                    served_model, input_tok, output_tok, cache_read, cache_create
+                )
                 total_cost += iter_cost
                 total_input_tokens += input_tok
                 total_output_tokens += output_tok
                 total_cache_read += cache_read
                 total_cache_create += cache_create
                 logger.info(
-                    f"{log_prefix}API call iteration={iteration} model={model} "
+                    f"{log_prefix}API call iteration={iteration} model={served_model} "
                     f"input_tokens={input_tok} output_tokens={output_tok} "
                     f"cache_read={cache_read} cache_create={cache_create} "
                     f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
@@ -1257,7 +1343,7 @@ class LLMService:
 
                 # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
                 context_tokens = input_tok + cache_read + cache_create
-                context_window = get_context_window(model)
+                context_window = get_context_window(served_model)
                 # `input_tokens` here is the whole context, NOT the billed uncached input
                 # — it is what the browser's context meter renders against context_window,
                 # so its meaning is fixed. `cache_read` and `cache_create` are the two
@@ -1319,7 +1405,14 @@ class LLMService:
                 # encrypted and carries no readable text, so there is nothing to show.
                 # What DOES come through is the SUMMARY — `display: "summarized"` above —
                 # since no model exposes the raw chain of thought.
-                for block in message.content:
+                #
+                # A `fallback` marker persists as the same notice the stream showed, and
+                # the declining model's tool calls before it are dropped like its thinking:
+                # they were never executed, so replaying them would show calls that never
+                # ran. `_replayable_content` applies the same cut to what goes back to the
+                # API, and `tool_uses` below to what gets executed.
+                fallback_cut = _last_fallback_index(message.content)
+                for i, block in enumerate(message.content):
                     if block.type in ("thinking", "redacted_thinking"):
                         summary = getattr(block, "thinking", "") or ""
                         if capture_thinking and summary:
@@ -1330,10 +1423,30 @@ class LLMService:
                                 ),
                             )
                         continue
+                    if block.type == "fallback":
+                        all_content_blocks.append({"type": "text", "text": _fallback_notice(block)})
+                        continue
+                    if i < fallback_cut and block.type == "tool_use":
+                        continue
                     all_content_blocks.append(block.model_dump(exclude_none=True))
 
+                # a conversation that fell back once is routed straight to the fallback
+                # model for a while afterwards, with no marker block to announce it. The
+                # model name on the response is the only signal, so say so after the text.
+                if served_model != model and fallback_cut < 0:
+                    logger.warning(
+                        f"{log_prefix}Turn served by {served_model} instead of {model} "
+                        "(sticky refusal fallback)"
+                    )
+                    notice = f"\n\n*[Answered by {_model_display_name(served_model)}]*\n"
+                    yield StreamChunk(type="text", content=notice)
+                    all_content_blocks.append({"type": "text", "text": notice})
+
                 # check for tool use
-                tool_uses = [b for b in message.content if b.type == "tool_use"]
+                tool_uses = [
+                    b for i, b in enumerate(message.content)
+                    if b.type == "tool_use" and i > fallback_cut
+                ]
 
                 # a safety classifier declined the request (Fable's cover research biology,
                 # so a genetics question can trip one). Content is empty when it fired
@@ -1376,7 +1489,7 @@ class LLMService:
                         *request_params["messages"],
                         {
                             "role": "assistant",
-                            "content": [b.model_dump(exclude_none=True) for b in message.content],
+                            "content": _replayable_content(message.content),
                         },
                         {"role": "user", "content": CONTINUE_TRUNCATED_PROMPT},
                     ]
@@ -1412,7 +1525,7 @@ class LLMService:
                         *request_params["messages"],
                         {
                             "role": "assistant",
-                            "content": [b.model_dump(exclude_none=True) for b in message.content],
+                            "content": _replayable_content(message.content),
                         },
                         {"role": "user", "content": CONTINUE_UNFILLED_PROMPT},
                     ]
@@ -1640,7 +1753,7 @@ class LLMService:
                 # continue conversation with tool results
                 request_params["messages"] = [
                     *request_params["messages"],
-                    {"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in message.content]},
+                    {"role": "assistant", "content": _replayable_content(message.content)},
                     {"role": "user", "content": tool_results},
                 ]
 

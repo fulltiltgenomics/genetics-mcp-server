@@ -1946,9 +1946,30 @@ literal at a call site.
   back unfilled, a "results above were left unfilled" notice is appended.
 - **`stop_reason == "refusal"`** — a safety classifier declined the request (Fable's cover
   research biology, so a genetics question can trip one; `stop_details.category` names
-  which). The turn ends there: no tool in it is executed, it is not resumed, and a "model
-  declined this request" notice is appended to whatever partial text streamed before the
-  classifier fired. No fallback model is configured; the notice asks the user to rephrase.
+  which) and no fallback answered. The turn ends there: no tool in it is executed, it is
+  not resumed, and a "model declined this request" notice is appended to whatever partial
+  text streamed before the classifier fired.
+
+### Refusal fallback
+
+Every request to a model that runs refusal classifiers carries Anthropic's server-side
+`fallbacks` parameter (`REFUSAL_FALLBACK`, default `"default"`: Anthropic picks the
+substitute by refusal category; a model id pins it; empty turns it off). The pinned SDK
+does not type the parameter, so `_refusal_fallback_params()` sends it in `extra_body`
+with the matching beta header. When the fallback fires the API answers in the same
+stream and the response carries:
+
+- a `fallback` content block at the switch point, naming the model that declined and the
+  one that continued. The stream turns it into a visible "*[Claude Fable 5.1 declined this
+  request; Claude Opus 5 answered instead]*" line at that position, persists the same line
+  as a text block, and never replays the marker. Blocks before the marker were written by
+  the declining model: its thinking and any tool calls there are dropped from what is
+  executed, persisted and replayed (`_replayable_content`), since the API rejects them
+  echoed back and the calls never ran.
+- `model` naming the model that produced the message. Cost and the context-window meter
+  use that model, not the requested one. A conversation that fell back once is routed
+  straight to the fallback model for about an hour with no marker block; the loop detects
+  that from `model` alone and appends "*[Answered by Claude Opus 5]*" after the text.
 
 `_has_unfilled_output()` decides the third case from the artifact — placeholder cells such
 as `*[from query]*`, or a column-label header with no data under it — never from "let me
@@ -2225,6 +2246,7 @@ All configuration is via environment variables (`.env` file supported):
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
 | `MAX_CONTINUATIONS` | How many times a turn stopped by `stop_reason: max_tokens` is resumed before the truncation is reported to the user | `3` |
+| `REFUSAL_FALLBACK` | Who answers when a safety classifier declines a request: `default` lets Anthropic pick by refusal category, a model id pins the substitute, empty shows the refusal to the user. Sent only to models that run the classifiers (Fable, Mythos, Opus 5+) | `default` |
 | `ANTHROPIC_MAX_RETRIES` | Attempts the streaming call makes over connection errors, 5xx and `overloaded_error`, with exponential backoff | `3` |
 | `ANTHROPIC_RETRY_RATE_LIMIT` | Whether an Anthropic **429** is also retried. Off by default and deliberately so: a 429 means the account's capacity is spent, so retrying in front of a waiting user buys a longer spinner and takes capacity from the next request. A benchmark has no waiting user and turns it on | `false` |
 | `ANTHROPIC_RETRY_AFTER_MAX_S` | Ceiling on a honoured `retry-after`. Above it the wait is refused and the error propagates rather than being silently clamped — returning before the server said to is what the header asks us not to do | `60` |

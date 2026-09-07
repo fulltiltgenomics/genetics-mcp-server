@@ -639,3 +639,109 @@ async def test_a_mid_stream_refusal_keeps_the_partial_text_and_runs_no_tool():
     assert "declined this request" in text
     assert not [c for c in chunks if c.type == "tool_use"]
     assert len(svc.anthropic_client.messages.calls) == 1
+
+
+# --- server-side refusal fallback -------------------------------------------------------
+
+from genetics_mcp_server.llm_service import _refusal_fallback_params, _replayable_content
+
+
+def _fallback_block(declined="claude-fable-5-1", served="claude-opus-5"):
+    return _Block("fallback", **{"from": {"model": declined}, "to": {"model": served}})
+
+
+def _fallback_start_event(block):
+    return SimpleNamespace(type="content_block_start", content_block=block)
+
+
+class TestRefusalFallbackParams:
+    def test_default_mode_carries_its_own_beta_header(self):
+        params = _refusal_fallback_params("claude-fable-5-1", "default")
+        assert params["extra_body"] == {"fallbacks": "default"}
+        assert params["extra_headers"] == {"anthropic-beta": "server-side-fallback-2026-07-01"}
+
+    def test_a_pinned_model_uses_the_array_form_and_header(self):
+        params = _refusal_fallback_params("claude-opus-5", "claude-opus-4-8")
+        assert params["extra_body"] == {"fallbacks": [{"model": "claude-opus-4-8"}]}
+        assert params["extra_headers"] == {"anthropic-beta": "server-side-fallback-2026-06-01"}
+
+    @pytest.mark.parametrize("model", ["claude-haiku-4-5", "claude-opus-4-8", "claude-sonnet-5"])
+    def test_models_without_classifiers_get_no_fallback(self, model):
+        assert _refusal_fallback_params(model, "default") == {}
+
+    def test_empty_setting_turns_it_off(self):
+        assert _refusal_fallback_params("claude-fable-5-1", "") == {}
+
+
+@pytest.mark.asyncio
+async def test_the_chat_request_opts_into_the_fallback_by_default():
+    svc = _service([_text_turn("ok")])
+    await _collect(svc)
+    call = svc.anthropic_client.messages.calls[0]
+    assert call["extra_body"] == {"fallbacks": "default"}
+    assert "server-side-fallback" in call["extra_headers"]["anthropic-beta"]
+
+
+@pytest.mark.asyncio
+async def test_a_pre_output_fallback_is_announced_before_the_answer_and_priced_as_served():
+    marker = _fallback_block()
+    message = _FakeMessage([marker, _Block("text", text="Answer")], "end_turn")
+    message.model = "claude-opus-5"
+    turns = [([_fallback_start_event(marker), _delta_event("text_delta", "Answer")], message)]
+    svc = _service(turns)
+    chunks = await _collect(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.index("Claude Fable 5.1 declined this request; Claude Opus 5 answered instead") < text.index("Answer")
+    done = next(c for c in chunks if c.type == "done")
+    persisted = [b["text"] for b in done.message_content if b["type"] == "text"]
+    assert "declined this request" in persisted[0]
+    assert persisted[1] == "Answer"
+    assert not [b for b in done.message_content if b["type"] == "fallback"]
+    usage = json.loads(next(c for c in chunks if c.type == "usage").content)
+    assert usage["context_window"] == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_a_mid_output_fallback_drops_the_declining_models_tool_call():
+    """Blocks before the marker were the declined model's; its tool call never ran."""
+    stale = _Block("tool_use", id="t0", name="get_variants", input={})
+    live = _Block("tool_use", id="t1", name="run_analysis", input={"code": "print(1)"})
+    marker = _fallback_block()
+    turn1 = _FakeMessage([_Block("text", text="Start"), stale, marker, live], "tool_use")
+    turn1.model = "claude-opus-5"
+    svc = _tooled_service([([], turn1), _text_turn("done")], {"success": True, "output": "1"})
+    chunks = await _collect_with_tool(svc)
+
+    emitted = [json.loads(c.content)["id"] for c in chunks if c.type == "tool_use"]
+    assert emitted == ["t1"]
+    replayed = svc.anthropic_client.messages.calls[1]["messages"][-2]["content"]
+    assert [b["type"] for b in replayed] == ["text", "tool_use"]
+    assert replayed[1]["id"] == "t1"
+    done = next(c for c in chunks if c.type == "done")
+    assert [b.get("id") for b in done.message_content if b["type"] == "tool_use"] == ["t1"]
+
+
+def test_replayable_content_keeps_everything_when_nothing_fell_back():
+    content = [_Block("thinking", thinking="", signature="s"), _Block("text", text="a")]
+    assert [b["type"] for b in _replayable_content(content)] == ["thinking", "text"]
+
+
+@pytest.mark.asyncio
+async def test_a_sticky_fallback_turn_is_announced_after_the_answer():
+    message = _FakeMessage([_Block("text", text="Answer")], "end_turn")
+    message.model = "claude-opus-5"
+    svc = _service([([_delta_event("text_delta", "Answer")], message)])
+    chunks = []
+    async for chunk in svc._stream_anthropic(
+        messages=[{"role": "user", "content": "hi"}],
+        model="claude-fable-5-1",
+        system_prompt=None,
+        enable_tools=False,
+        code_execution=False,
+    ):
+        chunks.append(chunk)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.startswith("Answer")
+    assert "[Answered by Claude Opus 5]" in text

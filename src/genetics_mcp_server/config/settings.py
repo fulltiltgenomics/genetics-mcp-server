@@ -137,6 +137,14 @@ class Settings:
     max_continuations: int = field(
         default_factory=lambda: int(os.environ.get("MAX_CONTINUATIONS", "3"))
     )
+    # which model answers when a safety classifier declines the request (Fable's cover
+    # research biology, so a genetics question can trip one). "default" lets Anthropic
+    # pick by refusal category; a model id pins the substitute; empty turns the fallback
+    # off and the refusal reaches the user as a notice. Only models that run the
+    # classifiers accept the parameter (`model_supports_refusal_fallback`).
+    refusal_fallback: str = field(
+        default_factory=lambda: os.environ.get("REFUSAL_FALLBACK", "default")
+    )
     # How the streaming call reacts to a REFUSAL rather than a transient fault. Both default
     # to the behaviour production has always had, and exist so a benchmark can push the API
     # as hard as it allows without either changing what a real user experiences.
@@ -492,6 +500,21 @@ def model_rejects_disabled_thinking(model: str) -> bool:
     callers that raise effort above that must not disable thinking.
     """
     return bool(_FABLE_RE.search(model) or _MYTHOS_RE.search(model))
+
+
+# the models that run refusal classifiers, and so accept the `fallbacks` parameter
+_REFUSAL_FALLBACK_OPUS_FLOOR = (5, 0)
+
+
+def model_supports_refusal_fallback(model: str) -> bool:
+    """Check if a model accepts the server-side `fallbacks` parameter."""
+    if _FABLE_RE.search(model) or _MYTHOS_RE.search(model):
+        return True
+    match = _OPUS_VERSION_RE.search(model)
+    if match:
+        version = (int(match.group(1)), int(match.group(2) or 0))
+        return version >= _REFUSAL_FALLBACK_OPUS_FLOOR
+    return False
 
 
 @lru_cache
