@@ -859,8 +859,10 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 
 - **Return type is `polars.DataFrame`** for every row-returning function. Scripts filter and
   join, which is what a DataFrame is for, polars is already a dependency, and it is already
-  what `executor.py`'s own summarisers use. `schema()`, `resources()` and `datasets()` return
-  dicts because their payloads are nested rather than tabular.
+  what `executor.py`'s own summarisers use. `schema()` and `resources()` return dicts, and
+  `datasets()` a list of dicts, because their payloads are nested rather than tabular — each
+  one's docstring gives the exact shape, since `list_capabilities` ships those docstrings
+  verbatim and a shape a script has to discover costs a round trip to discover it.
 - **Failures raise `GeneticsError`**; argument-shape mistakes raise `GeneticsUsageError`. The
   tool layer's `{"success": False, "error": ...}` exists because a model reads the dict; a
   script author does not check a flag after every call, and an unchecked failure would

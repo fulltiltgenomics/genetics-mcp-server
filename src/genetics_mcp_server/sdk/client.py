@@ -909,6 +909,10 @@ class GeneticsClient:
         `search(kind="phenotypes")` is the fuzzy ranked index rather than a lookup, so it
         cannot answer "what is I9_CHD". One row per code; unknown codes come back with the
         upstream's 'Unknown: <code>' placeholder.
+
+        Columns are `phenotype` (the code you passed) and `name`, in that order, so the
+        join back onto a results frame is
+        `df.join(lookup_phenotype_names(codes), left_on="trait", right_on="phenotype")`.
         """
         code_list = [codes] if isinstance(codes, str) else list(codes)
         names = self._payload(await self._executor.lookup_phenotype_names(code_list))["names"]
@@ -951,17 +955,63 @@ class GeneticsClient:
         )
 
     async def schema(self, table: str | None = None) -> dict[str, Any]:
-        """Column-level schema of the BigQuery views. A dict, not a frame: it is nested."""
+        """Column-level schema of the BigQuery views. A dict, not a frame: it is nested.
+
+        The shape, so no script has to discover it::
+
+            {"tables": [{"name": "credible_sets_v",
+                         "description": str,
+                         "row_count": int,
+                         "columns": [{"name": str, "type": str, "mode": str,
+                                      "description": str,
+                                      "allowed_values": [...]}],   # only where enumerable
+                         "examples": [{"description": str, "sql": str}]}],
+             "resources": {...},
+             "warnings": [{"view": str, "error": str}]}
+
+        Columns are therefore `schema(table)["tables"][0]["columns"]`, and every table is
+        `{t["name"]: t for t in schema()["tables"]}`.
+
+        READ `examples`. Each view ships worked SQL for the questions it is usually asked -
+        the credible-set key, the partition predicate to add, the join that reaches genes -
+        and it is the same text as the schema docs in the directory named by
+        GENETICS_SCHEMA_DIR. It costs one print and saves writing a query from scratch.
+
+        `allowed_values` is present only on columns with a small enumerable set; where it
+        is, use it instead of a `SELECT DISTINCT` round trip.
+        """
         return self._payload(await self._executor.get_database_schema(table))["schema"]
 
     async def resources(self) -> dict[str, Any]:
-        """Catalog of available data resources, grouped by data product."""
+        """Catalog of available data resources, grouped by data product.
+
+        A dict keyed by product - `credible_sets`, `colocalization`, `expression`,
+        `chromatin_peaks`, `exome_results`, `gene_based`, `gene_disease` - each holding a
+        list of per-resource entries. It answers "which products exist and who supplies
+        them", not "what is in dataset X"; that is `datasets()`.
+        """
         return self._payload(await self._executor.get_available_resources())["resources"]
 
     async def datasets(
         self, resource: str | None = None, include_stats: bool = True
-    ) -> dict[str, Any]:
-        """Dataset catalog with descriptions and aggregate stats."""
+    ) -> list[dict[str, Any]]:
+        """Dataset catalog with descriptions and aggregate stats.
+
+        A LIST of dataset dicts, one per dataset - not a dict keyed by name, and not a
+        frame. Each carries::
+
+            {"dataset_id", "resource", "version", "description", "author",
+             "publication_date", "trait_type", "data_type", "products",
+             "qtl_types"?, "n_samples"?, "n_phenotypes"?, "pseudo_credible_sets"?,
+             "collection"?, "subdataset_id_field"?, "stats"?, "metadata_endpoint"?}
+
+        The trailing `?` keys are present only when the registry sets them, so read them
+        with `.get`. Filter it as a list comprehension over `data_type` or `resource`
+        rather than walking it for nested dicts.
+
+        `sql("SELECT ... FROM datasets_v")` answers the same question in SQL and joins
+        against the results views; prefer it when the answer is going into a query anyway.
+        """
         return self._payload(
             await self._executor.list_datasets(resource=resource, include_stats=include_stats)
         )["datasets"]
