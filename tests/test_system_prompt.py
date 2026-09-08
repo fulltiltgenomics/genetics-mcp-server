@@ -314,8 +314,19 @@ class TestEverySurfaceWithADataPathIsRouted:
         assert emitted == set(_ARM_ROUTING_SENTENCES)
 
 
+# Everything from this heading on is genetics-results-suite's generated view reference,
+# inlined by config/schema_docs. Its ~130 headings are the generator's output, gated by
+# `scripts/gen-sandbox-docs.py --check` in that repo's image build, and pinning them here
+# would mean re-listing every column heading of every view on every dataset change — the
+# hand-maintained enumeration this repo's conventions exist to avoid. The pins below
+# therefore guard the HAND-WRITTEN structure; that the reference is present at all (and
+# absent elsewhere) is asserted separately, in _SCRIPT_ONLY_GUIDANCE.
+_GENERATED_REFERENCE_HEADING = "# BigQuery view reference"
+
+
 def _headings(text: str) -> list[str]:
-    return [line for line in text.splitlines() if line.startswith("#")]
+    head = text.split(_GENERATED_REFERENCE_HEADING)[0]
+    return [line for line in head.splitlines() if line.startswith("#")]
 
 
 def _heading_of_each_line(text: str) -> dict[str, set[str | None]]:
@@ -456,7 +467,11 @@ _WITH_A_DATA_PATH = [p for p in PROFILES if _DATA_PATH_TOOLS & resolve(p, subage
 
 _SCRIPT_ONLY_GUIDANCE = [
     "$GENETICS_SCHEMA_DIR",
-    "one markdown file per view",
+    # the schema is IN the prompt now, so what has to survive is the instruction not to
+    # go and fetch it. The old pin was "one markdown file per view", which described the
+    # on-demand arrangement that cost 32 of 138 scripts in benchmark run a08b371d.
+    "do not spend a script discovering it",
+    "# BigQuery view reference",
     "do not try to widen it with `pl.Config`",
     "genetics.show(df)",
 ]

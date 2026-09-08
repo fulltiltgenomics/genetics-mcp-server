@@ -28,6 +28,8 @@ import re
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 
+from genetics_mcp_server import schema_docs
+
 
 @dataclass(frozen=True)
 class _Block:
@@ -451,7 +453,7 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
         requires_any=_fs("query_database", "run_analysis"),
     ),
     _Block(
-        "`genetics.sql(...)` inside a script is the only route to the database on this surface. Discover the schema before writing a query rather than guessing a column name. The sandbox ships the schema as documentation: one markdown file per view under `$GENETICS_SCHEMA_DIR`, named after the view (`credible_sets_v.md`, `colocalization_v.md`, …) with a `README.md` indexing them all. Each file lists the view's columns and their BigQuery types, the allowed values of its categorical columns, and worked example SQL — read the file for the view before writing SQL, e.g. `import os; print(open(os.environ['GENETICS_SCHEMA_DIR'] + '/credible_sets_v.md').read())`. `genetics.schema()` returns the same column-level schema as a live call, for every view, and `genetics.schema('credible_sets_v')` just one.\n",
+        "`genetics.sql(...)` inside a script is the only route to the database on this surface. The complete schema is in this prompt, under \"BigQuery view reference\" below: every view, its columns and BigQuery types, the allowed values of its categorical columns, and worked example SQL. **You already have it — do not spend a script discovering it.** Write the query directly. The same text is also on disk in the sandbox at `$GENETICS_SCHEMA_DIR`, and `genetics.schema()` returns the column-level schema as a live call, but reading either costs a round trip and tells you what is written below.\n",
         excludes=_fs("query_database"),
         requires_any=_fs("run_analysis"),
     ),
@@ -737,6 +739,24 @@ When interpreting phenotype reports from get_phenotype_report, use the following
 
 Score for each gene is an estimate between 0 and 1 for the probability that the gene is causal for the phenotype. This score is crude and based on coding variant / eQTL / pQTL / caQTL evidence for the gene as well as the gene's distance to the lead variant.
 """),
+    # LAST, and large. Two reasons for the position rather than one: a ~21k-token block
+    # that never varies belongs at the end of the cacheable prefix, and the instructions
+    # above stay closer to the conversation than the reference they are about.
+    #
+    # Gated exactly like the sql() block above — this is the surface whose ONLY route to
+    # the database is a script, so it is the surface that was paying a round trip per view
+    # to read what is now here. `query_database` surfaces keep get_database_schema, which
+    # is a live call and a different contract; giving them both would put a build-time
+    # snapshot next to a live one with nothing saying which wins.
+    _Block(
+        "\n\n# BigQuery view reference\n\n"
+        "Generated from the dataset registry at build time and complete as it stands. It is\n"
+        "the same text the sandbox carries at `$GENETICS_SCHEMA_DIR`.\n\n"
+        + schema_docs.schema_reference()
+        + "\n",
+        excludes=_fs("query_database"),
+        requires_any=_fs("run_analysis"),
+    ),
 )
 
 
