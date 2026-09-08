@@ -65,7 +65,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     # they are False because resolving a symbol or a phenotype name to an id is what the
     # model does BEFORE it writes a script, and the code surface would otherwise force a
     # sandbox round-trip for it. This is the same allow-list the pre-collapse `code` profile
-    # carried. Flip one to True and the code surface loses that lookup.
+    # carried, plus the catalogue pair (list_datasets, get_resource_metadata) further down,
+    # which is False for the same reason. Flip one to True and the code surface loses it.
     {
         "name": "search_phenotypes",
         "category": "general",
@@ -831,7 +832,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "list_datasets",
         "category": "general",
-        "sdk_replaceable": True,
+        # False for the reason the entity lookups are: a catalogue question is answered
+        # before any script is worth writing. With this True, "what X data do we have?"
+        # cost the code surface five SQL scripts surveying views one by one (100 s against
+        # 50 s on the no-code surface, benchmark2-20260908) because the model did not
+        # reach for `genetics.datasets()`.
+        "sdk_replaceable": False,
         "description": (
             "List all datasets available in the API with descriptions, provenance "
             "(author, version, publication date), sample-size statistics (number of "
@@ -858,7 +864,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "get_resource_metadata",
         "category": "general",
-        "sdk_replaceable": True,
+        # the per-trait half of the catalogue; see list_datasets
+        "sdk_replaceable": False,
         "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them.",
         "parameters": {
             "resource": {

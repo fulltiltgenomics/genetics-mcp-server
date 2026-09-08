@@ -782,6 +782,10 @@ _CODE_SURFACE_NAMES = {
     "search_genes",
     "search_phenotypes",
     "lookup_variants_by_rsid",
+    # the catalogue, kept because "what data is there?" is answered before a script is
+    # worth writing; without these the model surveys views by SQL instead
+    "list_datasets",
+    "get_resource_metadata",
 }
 
 

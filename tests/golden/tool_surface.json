@@ -159,15 +159,17 @@
       },
       "code": {
         "local": {
-          "count": 18,
+          "count": 20,
           "tools": [
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_myvariant_annotations",
             "get_protein_annotations",
+            "get_resource_metadata",
             "get_target_bioactivity",
             "get_variant_protein_effect",
             "list_capabilities",
+            "list_datasets",
             "lookup_variants_by_rsid",
             "map_protein_variants",
             "read_artifact",
