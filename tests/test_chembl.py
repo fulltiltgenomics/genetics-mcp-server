@@ -1296,3 +1296,97 @@ class TestChEMBLExecutorDelegates:
 
         assert result["_download_data"]["filename"] == "CHEMBL25_chembl_profile.tsv"
         assert len(result["_download_data"]["results"]) == 40
+
+
+class TestAListQueryIsOneRoundTrip:
+    """`query` accepting a list is what removes the N+1.
+
+    Measured on benchmark run a08b371d: one turn spent 37 tool calls and $4.80 asking
+    get_drug_targets_for_gene about 25 genes one at a time, because the schema offered no
+    way to ask about more than one. The HTTP is unchanged — what a list removes is the
+    model iteration between each call.
+    """
+
+    def setup_method(self):
+        self.executor = ToolExecutor()
+
+    async def test_every_gene_is_asked_and_every_row_names_its_gene(self):
+        calls = []
+
+        async def one(gene, **kwargs):
+            calls.append(gene)
+            return {
+                "success": True,
+                "query": gene,
+                "target_chembl_id": f"CHEMBL_{gene}",
+                "drugs": [{"molecule_chembl_id": f"M_{gene}", "pref_name": gene.lower()}],
+            }
+
+        with patch.object(self.executor.chembl, "get_drug_targets_for_gene", one):
+            result = await self.executor.get_drug_targets_for_gene(["PCSK9", "LDLR"])
+
+        assert sorted(calls) == ["LDLR", "PCSK9"]
+        assert result["batch"]["n_queries"] == 2
+        assert {row["query"] for row in result["drugs"]} == {"PCSK9", "LDLR"}
+        # the per-gene resolution block the description tells the model to read survives
+        assert set(result["per_query"]) == {"PCSK9", "LDLR"}
+
+    async def test_a_repeated_gene_is_asked_once(self):
+        calls = []
+
+        async def one(gene, **kwargs):
+            calls.append(gene)
+            return {"success": True, "query": gene, "drugs": []}
+
+        with patch.object(self.executor.chembl, "get_drug_targets_for_gene", one):
+            result = await self.executor.get_drug_targets_for_gene(["PCSK9", "PCSK9", " PCSK9 "])
+
+        assert calls == ["PCSK9"]
+        assert result["batch"]["n_queries"] == 1
+
+    async def test_one_failure_does_not_sink_the_others(self):
+        async def one(gene, **kwargs):
+            if gene == "BOOM":
+                raise RuntimeError("upstream exploded")
+            return {"success": True, "query": gene, "drugs": [{"pref_name": gene}]}
+
+        with patch.object(self.executor.chembl, "get_drug_targets_for_gene", one):
+            result = await self.executor.get_drug_targets_for_gene(["PCSK9", "BOOM", "LDLR"])
+
+        assert result["success"] is True
+        assert [row["query"] for row in result["drugs"]] == ["PCSK9", "LDLR"]
+        assert "BOOM" in result["batch"]["failed"]
+        # and the raw exception text never reaches the model
+        assert "upstream exploded" not in str(result)
+
+    async def test_no_drugs_is_reported_apart_from_a_failure(self):
+        """"ChEMBL knows this gene and records no drug" and "the lookup broke" are
+        different answers; a batch that merges them lets the model report one as the
+        other, which a per-gene call could never do."""
+
+        async def one(gene, **kwargs):
+            if gene == "QUIET":
+                return {"success": True, "query": gene, "drugs": []}
+            return {"success": True, "query": gene, "drugs": [{"pref_name": gene}]}
+
+        with patch.object(self.executor.chembl, "get_drug_targets_for_gene", one):
+            result = await self.executor.get_drug_targets_for_gene(["QUIET", "LDLR"])
+
+        assert result["batch"]["no_rows_for"] == ["QUIET"]
+        assert result["batch"]["failed"] == {}
+
+    async def test_a_list_longer_than_the_cap_is_refused_rather_than_truncated(self):
+        result = await self.executor.get_drug_targets_for_gene(
+            [f"GENE{i}" for i in range(self.executor._BATCH_MAX + 1)]
+        )
+        assert result["success"] is False
+        assert str(self.executor._BATCH_MAX) in result["error"]
+
+    async def test_a_string_query_still_returns_the_single_shape(self):
+        async def one(gene, **kwargs):
+            return {"success": True, "query": gene, "drugs": [{"pref_name": "x"}]}
+
+        with patch.object(self.executor.chembl, "get_drug_targets_for_gene", one):
+            result = await self.executor.get_drug_targets_for_gene("PCSK9")
+
+        assert "batch" not in result and "per_query" not in result

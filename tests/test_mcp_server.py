@@ -4,7 +4,7 @@ import pytest
 
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
-    SUBAGENT_TOOL_DEFINITIONS,
+    CODE_EXECUTION_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
     get_anthropic_tools,
     register_mcp_tools,
@@ -50,17 +50,37 @@ class TestToolDefinitions:
             assert tool_name in tool_names, f"Expected tool '{tool_name}' not found"
 
     def test_tool_parameters_structure(self):
-        """Test that tool parameters have correct structure."""
+        """Test that tool parameters have correct structure.
+
+        `type` is a JSON Schema type name, or a LIST of them for a parameter that takes
+        more than one shape — the one-or-many `query` on the ChEMBL and UniProt tools is
+        `["string", "array"]`, which is what lets a caller ask about 25 genes in one
+        call while `query` stays required. A list is checked harder than a bare string,
+        not waved through: every member has to be a real JSON Schema type, and one that
+        admits an array has to say what the array holds, or a nested list would validate
+        and reach the executor to be stringified into a query literally reading
+        "['A', 'B']".
+        """
+        json_schema_types = {
+            "string", "number", "integer", "boolean", "array", "object", "null",
+        }
         for tool in TOOL_DEFINITIONS:
             params = tool["parameters"]
             for param_name, param_def in params.items():
+                where = f"{tool['name']}.{param_name}"
                 assert "type" in param_def, (
                     f"Parameter '{param_name}' in tool '{tool['name']}' missing type"
                 )
-                # type should be a string
-                assert isinstance(param_def["type"], str), (
-                    f"Parameter type should be string in {tool['name']}.{param_name}"
-                )
+                declared = param_def["type"]
+                if isinstance(declared, list):
+                    assert len(declared) >= 2, f"{where}: a one-member type list is a string"
+                    assert set(declared) <= json_schema_types, where
+                    if "array" in declared:
+                        assert param_def.get("items"), f"{where}: array type without items"
+                else:
+                    assert declared in json_schema_types, (
+                        f"Parameter type should be a JSON Schema type in {where}"
+                    )
 
 
 class TestAnthropicToolFormat:
@@ -72,9 +92,9 @@ class TestAnthropicToolFormat:
         assert isinstance(tools, list)
 
     def test_anthropic_tools_count_matches(self):
-        """Test that default (no profile) returns all tools."""
+        """No profile is the no-code surface: every data tool and none of the sandbox's."""
         tools = get_anthropic_tools()
-        assert len(tools) == len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS) + len(SUBAGENT_TOOL_DEFINITIONS)
+        assert len(tools) == len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS)
 
     def test_anthropic_tool_structure(self):
         """Test that Anthropic tools have correct structure."""
@@ -153,7 +173,9 @@ class TestMCPToolRegistration:
         # verify expected tools are registered. run_analysis is the one definition with no
         # registration block at all — see the comment in register_mcp_tools; it is a
         # security control, so this exemption is the assertion, not a gap in it.
-        expected = {t["name"] for t in TOOL_DEFINITIONS} - {"run_analysis"}
+        expected = {
+            t["name"] for t in TOOL_DEFINITIONS + CODE_EXECUTION_TOOL_DEFINITIONS
+        } - {"run_analysis"}
 
         # if we have tool manager access, verify all tools
         if registered_names:
@@ -352,6 +374,109 @@ class TestMCPDisabledTools:
             "importing the MCP server pulled in the sandbox transport; something on that "
             "app's import graph can now reach the sandbox"
         )
+
+
+class TestMCPRegistrationGate:
+    """The single admission rule, and the property that every handler goes through it.
+
+    `disabled_tools` used to be consulted at a minority of the registration sites; the rest
+    registered whatever the caller asked for, so naming a data tool in the set withheld
+    nothing and no surface could subtract one. Both halves are asserted here: that the gate
+    withholds, and that no site bypasses it.
+    """
+
+    @staticmethod
+    def _register(**kwargs) -> set[str]:
+        from mcp.server.fastmcp import FastMCP
+
+        mcp = FastMCP("Test Server")
+        register_mcp_tools(mcp, ToolExecutor(), **kwargs)
+        if not hasattr(mcp, "_tool_manager"):
+            # fail rather than skip: a skip here retires every assertion below on a FastMCP
+            # upgrade and leaves the run green
+            pytest.fail(
+                "FastMCP exposes no _tool_manager; cannot enumerate registered tools"
+            )
+        return set(mcp._tool_manager._tools.keys())
+
+    def test_every_handler_registers_through_the_gate(self):
+        """Read off the source, because one raw `@mcp.tool()` is a hole no argument closes.
+
+        A site that decorates with `mcp.tool()` directly is invisible to both filters and
+        registers unconditionally — which is exactly the state this replaced, and exactly
+        what a later addition would reintroduce without noticing.
+        """
+        import ast
+        from pathlib import Path
+
+        from genetics_mcp_server.tools import definitions
+
+        tree = ast.parse(Path(definitions.__file__).read_text())
+        registrar = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "register_mcp_tools"
+        )
+        handlers = [
+            node
+            for node in ast.walk(registrar)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node is not registrar
+        ]
+        assert handlers
+        # per handler, not over the union: a union admits an undecorated `def foo` beside
+        # decorated siblings, and a sync helper defined here would escape an async-only walk
+        for handler in handlers:
+            assert [ast.unparse(d) for d in handler.decorator_list] == ["_tool()"], (
+                f"{handler.name} does not register through the gate"
+            )
+        # and the decorator is not the only way to reach FastMCP: a bare
+        # `mcp.tool()(foo)` statement registers just as well
+        raw = [
+            ast.unparse(node.func)
+            for node in ast.walk(registrar)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) in {"mcp.tool", "mcp.add_tool"}
+        ]
+        assert raw == [], f"registration bypassing the gate: {raw}"
+        # names, not a count: a count is satisfied by any mismatched pair of the same size
+        assert {handler.name for handler in handlers} == self._register()
+
+    def test_a_data_tool_can_be_withheld(self):
+        """The thing the previous mechanism could not do at all."""
+        everything = self._register()
+        assert "get_credible_sets_by_gene" in everything
+        assert self._register(disabled_tools={"get_credible_sets_by_gene"}) == (
+            everything - {"get_credible_sets_by_gene"}
+        )
+
+    def test_a_non_bool_surface_is_refused(self):
+        """The wiring that would pass a surface does not exist yet, and when it does it will
+        read an env var: "false" is truthy, so a coercion mistake would silently register the
+        code surface instead of failing."""
+        with pytest.raises(TypeError):
+            self._register(code_execution="false")
+
+    def test_no_surface_registers_what_disabled_tools_leaves(self):
+        assert self._register(code_execution=None) == self._register()
+
+    @pytest.mark.parametrize("code_execution", [True, False])
+    def test_a_surface_subtracts_by_the_resolve_tools_rule(self, code_execution):
+        """/mcp and a chat request on the same surface must not disagree about membership."""
+        from genetics_mcp_server.tools.definitions import resolve_tools
+
+        surface = {t["name"] for t in resolve_tools(code_execution)}
+        assert self._register(code_execution=code_execution) == surface & self._register()
+
+    def test_the_code_surface_still_cannot_register_run_analysis(self):
+        """Half of layer 1 is the missing handler, and no argument can supply one.
+
+        `resolve_tools(True)` names run_analysis, so this is the case where the surface
+        argument would register it if the gate could add rather than only subtract.
+        """
+        from genetics_mcp_server.tools.definitions import resolve_tools
+
+        assert "run_analysis" in {t["name"] for t in resolve_tools(True)}
+        assert "run_analysis" not in self._register(code_execution=True, disabled_tools=set())
 
 
 @pytest.mark.integration

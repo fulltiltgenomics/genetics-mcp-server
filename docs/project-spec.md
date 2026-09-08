@@ -25,7 +25,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. `_validate_request_size` bounds the request as a whole — total text across **all** messages (`MAX_REQUEST_CHARS`, default 2M, images excluded) and message count (`MAX_MESSAGES_PER_REQUEST`, default 500) — because the per-message check only ever inspects the newest *user* message, leaving a client-sent assistant turn and every replayed history turn unbounded (`genetics-results-suite-e0u`). Applying the per-message cap to every message would have been the tighter rule and the wrong one: replayed tool results are routinely larger than any typed message, so it would reject ordinary long conversations. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) are inlined by the frontend as text blocks prefixed `[File: <name>]` — both are counted toward the attachment limit, not the character limit. The frontend (`LLMChat.tsx`) mirrors these limits for immediate feedback. Bulk data should be attached as a file rather than pasted
 - **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, so a first send needs no upload endpoint and therefore no session. (The original reason was stronger — sessions were created lazily *after* the first exchange, so there was no `session_id` to upload against at all. That is no longer true: `genetics-results-suite-vda` moved creation ahead of the request, because `run_analysis` refuses a turn whose `session_id` is null. The client-side parse is kept on its own merits, one fewer round trip.) The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
-- **Context usage tracking**: `get_context_window()` in `cost.py` maps model name prefixes to context window sizes (tokens). During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
+- **Context usage tracking**: `get_context_window()` in `cost.py` maps model families to context window sizes (tokens); pricing in the same module is keyed by family and version, so a price change between releases (Sonnet 5, Haiku 4.5, Fable 5.1's cache reads) is a row, not a rename. During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
 - **Chat history persistence**: SQLite-based storage of conversation threads. Assistant turns persist both their content blocks (`content_json`: text + `tool_use`) and the tool outputs (`tool_results_json`: the `tool_result` blocks). Persisting tool results means a **resumed** conversation replays the actual data the model saw, not just its prose summary — preventing factual drift across turns/sessions (see "Tool result persistence" under Architecture decisions)
 - **Configurable prompts**: Per-user LLM configuration stored in database
 - **Instructions**: Users store named sets of their own instructions and select one per chat; the chat request carries only the set id and the server appends the stored text to the system prompt as a second cached block (see "Instructions" below)
@@ -230,7 +230,7 @@ Four tools give the agent direct protein-level annotation, replacing the `web_se
 - **A process-wide TTL cache** (`UNIPROT_CACHE_TTL`, default 24 h, monotonic-clock deadlines, LRU-bounded). UniProt releases at most weekly, so a long TTL is safe; setting the TTL to `0` disables caching.
 - **Genomic-HGVS variant effect** — `get_variant_protein_effect` converts each `chr:pos:ref:alt` into a GRCh38 RefSeq genomic HGVS (`NC_0000NN.V:g.<pos><ref>><alt>`, from a pinned per-chromosome accession table) and looks it up through the EBI `variation/hgvs` endpoint. The assembly is pinned to GRCh38 — a variant id carries no build, and guessing one would silently answer for the wrong genome. Reviewed entries are distinguished from the TrEMBL predicted entries the endpoint also returns by their Swiss-Prot mnemonic `entryName` and non-`Predicted` protein existence.
 
-**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. Category is `general`, so they survive the `api`/`bigquery`/`rag` profile split (protein annotation is orthogonal to all three), and `get_protein_annotations`, `map_protein_variants` and `search_uniprot` are in the `literature_review` skill's `extra_tools` so subagents doing gene/protein biology can reach them (`get_variant_protein_effect` is not — it answers a genomic-coordinate question rather than a literature one).
+**Exposure decision**: like `get_myvariant_annotations` and `search_mgi`, these are chat-backend only — their names are in the `_mcp_disabled` set in `mcp_server.py`, so they are never registered on the standalone MCP server. They are `sdk_replaceable: False` — UniProt is an outside host the sandbox cannot reach — so they are on **both** surfaces, and all four are in the tool list every subagent skill gets (`_CORE_TOOLS` in `skills/definitions.py`), so a subagent doing gene/protein biology can reach them.
 
 #### ChEMBL (native tools, chat-backend only)
 
@@ -243,14 +243,42 @@ numbers live in the epic's beads notes.
 
 | Tool | Description |
 |------|-------------|
-| `get_drug_targets_for_gene` | Gene → the drugs and clinical candidates ChEMBL records against its protein target, each with mechanism of action, action type, highest clinical phase, first approval year, withdrawal flag and ATC codes; `include_indications` adds what each is developed for. Chat-backend only — excluded from MCP server |
-| `get_drug_profile` | One named drug or `CHEMBL<number>` → its targets with mechanisms, its ATC classification, and its indications as EFO/MeSH terms each with their own max phase. Chat-backend only — excluded from MCP server |
-| `get_target_bioactivity` | Gene → the medicinal chemistry recorded against its target: how many potency measurements sit at or above a pChEMBL threshold, over how many compounds, broken down by assay type, with the most potent compounds. A tractability question, not a clinical one. Chat-backend only — excluded from MCP server |
+| `get_drug_targets_for_gene` | Gene **or list of genes** → the drugs and clinical candidates ChEMBL records against its protein target, each with mechanism of action, action type, highest clinical phase, first approval year, withdrawal flag and ATC codes; `include_indications` adds what each is developed for. Chat-backend only — excluded from MCP server |
+| `get_drug_profile` | A drug **or list of drugs**, named or `CHEMBL<number>` → its targets with mechanisms, its ATC classification, and its indications as EFO/MeSH terms each with their own max phase. Chat-backend only — excluded from MCP server |
+| `get_target_bioactivity` | Gene **or list of genes** → the medicinal chemistry recorded against its target: how many potency measurements sit at or above a pChEMBL threshold, over how many compounds, broken down by assay type, with the most potent compounds. A tractability question, not a clinical one. Chat-backend only — excluded from MCP server |
 
 **Client layer** (`tools/chembl.py`): `ChEMBLClient` holds the transport, the resolution and
 the tool methods, the same split as `tools/uniprot.py`, so the executor carries only
 delegates. It reuses `tools/uniprot.py`'s `_TTLCache` class rather than a second
 implementation, but constructs its own cache instance.
+
+**`query` takes one entity or a list, and the list is the point.** All three ChEMBL tools
+plus `get_protein_annotations` declare `"type": ["string", "array"]`, and the executor fans a
+list out with `_fan_out` — `asyncio.gather` under a semaphore of `_BATCH_CONCURRENCY` (5),
+capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **The HTTP is not what
+this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
+`get_drug_targets_for_gene` about 25 genes one at a time, because the schema offered no way to
+ask about more than one; what a list removes is the ~8s model iteration and full context
+re-read between each call. Verified end to end: the same five-gene question now resolves in one
+call and two iterations.
+
+The union type is deliberate over a second `queries` parameter. `query` stays `required`, so
+"neither given" is not a shape the schema permits — the `variant`/`variants` pattern on
+`get_myvariant_annotations` has to make both optional to work. It also matches
+`get_protein_annotations`, whose executor has accepted `str | list[str]` since it was written
+(uniprot's `_annotate_batch`, "the 167-gene zymogen case") while its schema said `string` — a
+built batch path no caller could reach, which is why that tool is in this list despite needing
+no new implementation.
+
+A batch answers in the single-query shape, flattened: `per_query` keeps each input's own
+resolution block (the descriptions tell the model to read it before citing anything, and
+flattening must not lose it), every row of the flat table carries the `query` it came from so
+a row can never be attributed to the wrong entity, and `batch.no_rows_for` is kept separate
+from `batch.failed` — "ChEMBL knows this gene and records no drug" and "the lookup broke" are
+different answers, and merging them would let the model report one as the other. The rows key
+is the one the client actually returns, which for bioactivity is `top_compounds`, not the
+`compounds` a reader would guess: the single-query path never names it because it downloads
+`_all_compounds` instead.
 
 - **Gene resolution goes through UniProt first**, not through ChEMBL's own gene-symbol
   synonyms. Shape cannot decide what an agent-supplied string is — `P2RY12`, `B4GAT1` and the
@@ -292,9 +320,8 @@ implementation, but constructs its own cache instance.
 
 **Exposure decision**: chat-backend only, like the UniProt and MGI tools — the three names are
 in `_mcp_disabled` in `mcp_server.py`, so they are never registered on the standalone MCP
-server. Category is `general`, so they survive every profile split. `get_drug_targets_for_gene`
-and `get_drug_profile` are in the `literature_review` skill's `extra_tools`;
-`get_target_bioactivity` is not, since assay counts are not a literature question. The system
+server. They are `sdk_replaceable: False` — ChEMBL is an outside host the sandbox cannot reach — so they are on both surfaces. All three are in
+`_CORE_TOOLS` (`skills/definitions.py`), the tool list every subagent skill gets. The system
 prompt's `### Drug and Target Evidence (ChEMBL)` block routes to them, and the
 "Contextualizing Findings" rule that told the model to consider whether drugs already exist
 for a gene now names `get_drug_targets_for_gene` instead of leaving it to memory.
@@ -317,8 +344,8 @@ no sandbox at `SANDBOX_URL` the transport fails as `SandboxUnavailable` with
 `retryable: True`, which reads as a passing outage, while the system prompt tells the
 model to *prefer* the tool — so an ungated deployment steers every turn into a tool that
 always fails and asks to be retried. `settings.disabled_tools` carries the exclusion, so
-it applies **before** the profile filter and no `tool_profile` (including the name-listed
-`code` arm) can restore it, and because the prompt is assembled from the resolved tool
+it applies to the resolved surface and no `tool_profile` (the `code` value included) can
+restore it, and because the prompt is assembled from the resolved tool
 list the "Choosing How to Get Data" steering disappears with the tool rather than being
 edited separately. Only `run_analysis` is gated: `list_capabilities` and `read_artifact`
 are inert without a sandbox rather than broken by it, and neither is a tool the prompt
@@ -326,31 +353,54 @@ prefers. Enabling it means setting `SANDBOX_ENABLED=true` on chat-backend, the s
 db-api and results-api already gate sandbox-token verification on.
 
 Withholding the name from the list is not sufficient on its own, so `_execute_tool`
-refuses to dispatch anything in `settings.disabled_tools` before it resolves a handler —
-the same allowlist shape `subagent.py` carries for the same reason. Without it the
-`getattr(self.executor, tool_name)` lookup runs whatever the model names: `ChatMessage`
-accepts raw content blocks and `_sanitize_tool_blocks` drops only *orphaned* `tool_use`,
-so a client-supplied history containing a paired `run_analysis` `tool_use`/`tool_result`
-survives verbatim and primes the model for a tool it was never given. The refusal is
-`retryable: false` (`SandboxNotConfigured` for `run_analysis`, `ToolNotEnabled` otherwise)
-because a withheld tool is a deployment fact and must not read as a passing outage.
+refuses two ways before it resolves a handler — the same allowlist shape `subagent.py`
+carries for the same reason. Without them the `getattr(self.executor, tool_name)` lookup
+runs whatever the model names: `ChatMessage` accepts raw content blocks and
+`_sanitize_tool_blocks` drops only *orphaned* `tool_use`, so a client-supplied history
+containing a paired `tool_use`/`tool_result` survives verbatim and primes the model for a
+tool it was never given.
+
+1. anything in `settings.disabled_tools` — the deployment's exclusion, refused as
+   `ToolNotEnabled`;
+2. anything outside **the set this request advertised** — the resolved local surface plus
+   whichever proxied surfaces it carried, threaded from `_stream_anthropic`'s own tool
+   list into every dispatch as `advertised_tools`, refused as `ToolNotAvailable`.
+
+The second is what makes the surface enforced rather than advisory, and it is read from
+the resolved set rather than from `tool_profile`: the surface is decided once, at the edge,
+and re-deriving it at dispatch is how the two would come to disagree. It is also what makes
+"the code surface does not use the old per-dataset tools" true of execution and not only of
+the advertised list, and in the other direction it keeps `run_analysis` — whose dispatch
+mints a per-execution credential under the authenticated user — out of a no-code turn.
+Both refusals are `retryable: false` (`SandboxNotConfigured` for `run_analysis`) because a
+withheld tool is a fact about the deployment or the surface and must not read as a passing
+outage, and both come back as an ordinary `tool_result` the model reads rather than as an
+exception that would cost the user the turn.
 
 | Tool | Description |
 |------|-------------|
-| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by `llm_service._execute_tool`, which strips any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
+| `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by the caller — `llm_service._execute_tool` on the main path, `subagent._execute_subagent_tool` on the subagent path — each stripping any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
 | `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — and its members come from `sdk/plots.py`'s `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of the four. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
 | `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated **`(sub, session_id)`** pair (`genetics-results-suite-dh3` — `session_id` alone is client-supplied and authorizes nothing); another user's or another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
-**All three are category `orchestration`**, not `general`: they hand work to another
-runtime rather than fetching data, which is what `launch_subagents` is. The category by
-itself excludes nothing — `TOOL_PROFILES` includes `orchestration` in both the `api` and
-`bigquery` profiles, so it reaches three of the five subagent skills — so `subagent.py`
-names all four orchestration tools explicitly:
-`disabled |= {"launch_subagents", "run_analysis", "read_artifact", "list_capabilities"}`.
-That name list, not the category, is what keeps a subagent from executing code, retrieving
-another execution's artifacts or being told how to start one; `tests/test_subagent.py`
-pins it. For `run_analysis` the exclusion is also a correctness point: a subagent has no
-session of its own, and the session is what the per-execution credential is minted against.
+**All three live in `CODE_EXECUTION_TOOL_DEFINITIONS`**, the list `resolve_tools` includes
+on the code surface and no other; they hand work to another runtime rather than fetching
+data, which is what `launch_subagents` is. Living in that list excludes nothing from a
+subagent — a skill narrows by name from the whole local set — so `subagent.py` names the
+tools a subagent may not have explicitly:
+`disabled |= {"launch_subagents", "read_artifact", "list_capabilities"}`. That name list is what keeps a subagent from launching subagents of
+its own or reaching another execution's artifacts; `tests/test_subagent.py` pins it.
+
+`run_analysis` is deliberately **not** in that set. It was, while `run_subagents` took no
+identity at all and a subagent that named the tool would have reached
+`mint_execution_tokens` under a `user` of its own invention. `run_subagents` now takes the
+caller's authenticated `(user, session_id)` and its provenance flag as keyword-only
+arguments, threaded from the request context through `_run_subagent` to
+`_execute_subagent_tool`, which strips and replaces the same three keys the main path does.
+So the credential a subagent's execution is minted against has the same subject as the
+request that launched it, and `tasks` — written by a model — cannot influence it. One skill
+declares the tool (`data_analysis`); the dispatch allow-list below is what keeps the other
+four from naming it.
 
 **Dropping a tool from the list only stops it being offered — the dispatcher is what
 enforces it.** `subagent.py:_execute_subagent_tool` used to resolve the model's
@@ -362,8 +412,11 @@ that skill, which covers the local, sandbox and external branches at once. Witho
 `run_analysis` handler was reachable with a model-supplied `user`/`session_id`, which
 `mint_execution_tokens` would have made the `sub`/`sid` of both per-execution JWTs and of
 every audit record — the forgery the `llm_service` strip exists to prevent, on the same
-tool. `tests/test_subagent.py::TestSubagentDispatchAllowList` pins the refusal, the
-by-name case, and that a declared tool still dispatches.
+tool. Now that one skill does declare `run_analysis`, this guard is the whole of what keeps
+the other four skills off it, and the identity strip runs on the dispatch that follows.
+`tests/test_subagent.py::TestSubagentDispatchAllowList` pins the refusal, the by-name case,
+that a declared tool still dispatches, and that a model-supplied `user` on a *declared*
+`run_analysis` is replaced by the caller's rather than honoured.
 
 #### What `run_analysis` returns, and why it is rendered rather than forwarded
 
@@ -568,10 +621,15 @@ requires that code execution is not reachable via MCP. `run_analysis` additional
 that no configuration can undo, since `disabled_tools` can only subtract: the entry in
 `_mcp_disabled` is the half an env-driven `disabled_tools` and a future refactor can
 disturb, and it is what would catch a block added later. Both are asserted against the
-*registered tool list* rather than against the constant. Note what does **not** protect
-anything here: `register_mcp_tools` is called with no profile, and `tool_profile=None`
-means no filtering at all, so "the MCP server does not select the `code` profile" is
-precisely the condition under which an unguarded tool would be registered.
+*registered tool list* rather than against the constant. Every handler in
+`register_mcp_tools` is registered through one gate (`_gate`), so a name in `disabled_tools`
+is withheld wherever it appears rather than only where someone remembered to write a guard
+around it — previously most handlers registered unconditionally, which made naming a data
+tool in the set inert. The gate takes an optional `code_execution` surface that subtracts by
+the same rule `resolve_tools` uses; the deployed server passes none, so /mcp is still every
+handler minus `_mcp_disabled`. It can only ever subtract, which is what the missing
+`run_analysis` handler survives: selecting the code surface names `run_analysis` and still
+registers nothing.
 `list_capabilities` is deliberately **not** excluded: what it renders is per-function SDK
 signatures and docstrings, which describe the SDK's shape rather than data, session state
 or any execution, and an exclusion set padded with harmless names stops reading as a
@@ -652,46 +710,99 @@ fault and reads as "not found" rather than as a read.
 
 ## Tool Profiles
 
-The chat API supports a `tool_profile` parameter that controls which tools are available per request. This enables A/B testing of different tool strategies (API vs BigQuery vs RAG vs code execution) by sending identical prompts with different profiles.
+## Tool surfaces
 
-Two mechanisms resolve a profile, in `tools/definitions.py`. `TOOL_PROFILES` maps a profile to whole **categories**; `TOOL_PROFILE_TOOLS` maps a profile to an explicit list of tool **names** and takes precedence. The second exists for `code`, whose surface cannot be written as categories — its orchestration tools share a category with `launch_subagents`, which must stay out — and recategorising tools to make it fit was ruled out, since a tool's `category` also decides what the `api` profile advertises and what subagent skills declaring `tool_categories={"general","api"}` can call.
+There are exactly **two** local tool surfaces, and one boolean chooses between them:
+`resolve_tools(code_execution, disabled)` in `tools/definitions.py`.
+
+Membership is one field on each tool definition, `sdk_replaceable`. The line it draws is
+**internal genetics data against outside resources**, not "everything minus run_analysis": a
+script inside the sandbox reaches internal data through the `genetics` SDK, and reaches
+nothing else, because the sandbox egress allow-list names db-api and results-api only. So a
+tool that fetches internal data is `sdk_replaceable: True` and the code surface drops it; a
+tool that calls an outside host is `sdk_replaceable: False` and both surfaces carry it.
+`get_myvariant_annotations` is the case that shows the field is not the category: it is
+categorised `api` but calls myvariant.info through `external_client`.
+
+Three tools are exempt from that rule and say so where they are defined:
+`search_genes`, `search_phenotypes` and `lookup_variants_by_rsid` have SDK routes but stay on
+the code surface, because resolving a symbol or a phenotype name to an id is what the model
+does *before* it writes a script.
+
+`CODE_EXECUTION_TOOL_DEFINITIONS` — `run_analysis`, `list_capabilities`, `read_artifact` — is
+its own list rather than a `sdk_replaceable` value: those tools *are* code execution, so the
+boolean includes them directly. `launch_subagents` reaches **neither** surface; which one
+should carry it is an open question, and `ENABLE_SUBAGENTS=false` keeps it out of every
+deployment meanwhile. Subagent skills are unaffected either way: each names its tools
+explicitly in `skills/definitions.py` and narrows from `all_anthropic_tools()`, the whole
+local set, because a skill names `run_analysis` alongside data tools and no single surface
+carries both.
+
+### The `tool_profile` edge
+
+The chat API still takes a `tool_profile` string, and `code_execution_requested()` coerces
+it to the boolean **once, where the request arrives**: **`"code"` is code execution; every
+other value resolves to the no-code surface** — `None`, the retired `api`/`bigquery`/`rag`,
+`nocode`, and any value this server has never heard of. That is the safe direction for a
+value read back from a `chat_messages` row written by an older client.
+
+Downstream of that edge nothing reads the name for any surface decision at all:
+`resolve_local_tools`, `resolve_local_tool_names`, `get_anthropic_tools` and `stream_chat`
+all take `code_execution`, `resolve_tools` takes it too, and `resolve_proxied_tools` takes
+no surface argument of any kind. The one thing still handed the string is the turn-metrics
+row, which records what the client actually sent.
+
+**The stored value is never rewritten.** `chat_messages.tool_profile` and
+`user_settings.chat_tool_profile` keep the string the client wrote, legacy names included,
+so history and the `tool_profile IS NULL` analysis still read a choice rather than a
+resolution. `KNOWN_TOOL_PROFILES` survives for the two callers that must tell a recognised
+value from an unrecognised one — the `DEFAULT_TOOL_PROFILE` admin validation and
+`known_profile` on `/chat/v1/tools/resolved` — and for the warning's own message.
 
 ### Tool categories
 
-Each tool has a `category` field in its definition:
+Each tool still has a `category` field, used for labelling (the browser's tools panel groups
+by it, via `tool_category()`). **No surface decision reads it.**
 
 | Category | Description |
 |----------|-------------|
 | `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
-| `orchestration` | Main-agent-only tools: launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops all four **by name** (the category is in the `api` and `bigquery` profiles, so it is not itself an exclusion), to prevent recursive launches, to keep code execution on the one path that holds the authenticated identity, and to keep a subagent away from another execution's artifacts. |
+| `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |
 
 ### Profile behavior
 
-| `tool_profile` value | Local tools | External tools |
-|----------------------|-------------|----------------|
-| `null` (default) | no filtering at all — every definition | always-on (gnomAD, OT) + RAG |
-| `"api"` | general + api + orchestration | always-on only |
-| `"bigquery"` | general + bigquery + orchestration | always-on only |
-| `"rag"` | general only | RAG only |
-| `"nocode"` | general + api + bigquery — everything except `orchestration`, so no run_analysis, list_capabilities, read_artifact or launch_subagents | always-on only |
-| `"code"` | exactly 7 by name: run_analysis, list_capabilities, read_artifact, search_genes, search_phenotypes, search_scientific_literature, lookup_variants_by_rsid | **none** |
-| any other string | general only (fallback, no error) | always-on only |
+| `tool_profile` value | Local tools |
+|----------------------|-------------|
+| `"code"` | the code surface |
+| `null` (default), `"api"`, `"bigquery"`, `"rag"`, `"nocode"`, any other string | the no-code surface (the last as a fallback, no error) |
 
-The fallback row is deliberate — the value is read back from `chat_messages` rows written by older clients, so an unrecognised name must not raise — but it is no longer invisible (genetics-results-suite-4h6.74). Two things report it, neither of which changes the resolution: `get_anthropic_tools` logs a WARNING naming the value and the known set the first time it sees it, **once per distinct value** (not per request — a stored bad value arrives on every turn of its session, and a per-request warning would bury itself); and `GET /chat/v1/tools/resolved?tool_profile=<value>` returns `known_profile: false` alongside the resolved `count`/`names`. The browser calls that endpoint whenever a profile is picked or restored from the user's settings and warns next to the Tools control when the answer is false.
+**There is no external-tools column, and that is the change rather than an omission.**
+`resolve_proxied_tools()` takes no argument: both surfaces are handed every proxied tool
+`EXTERNAL_MCP_SERVERS` registered and every RAG tool `RAG_MCP_SERVER` registered, minus
+whatever `EXTERNAL_MCP_EXCLUDE_TOOLS` removed at registration time. The externals are the
+tools the sandbox cannot reach — its egress allow-list admits db-api and results-api only —
+so withholding them from the code surface would leave that surface no route to them at all,
+and whether the RAG group is empty is a deployment fact about `RAG_MCP_SERVER` rather than
+anything a request chooses. The resolved sets themselves are frozen in
+`tests/golden/tool_surface.json` — read the counts there rather than writing them here.
 
-That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, and `null` is the top row of this table — no filtering at all — so a user whose stored `chat_tool_profile` is a server-only name silently gets the FULL surface instead of the narrower one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Adding or renaming a profile here still requires editing that file: `tests/test_unknown_profile_warning.py::test_the_profile_key_set_is_pinned_against_the_browsers_copy` pins `TOOL_PROFILES | TOOL_PROFILE_TOOLS` against a literal so the decision is deliberate, mirroring the browser's own pin in `useChatOptions.test.ts`.
+The fallback row is deliberate — the value is read back from `chat_messages` rows written by older clients, so an unrecognised name must not raise — but it is no longer invisible (genetics-results-suite-4h6.74). Two things report it, neither of which changes the resolution: `code_execution_requested` logs a WARNING naming the value, what it resolved to (the no-code surface) and the recognised set, the first time it sees it, **once per distinct value** (not per request — a stored bad value arrives on every turn of its session, and a per-request warning would bury itself); and `GET /chat/v1/tools/resolved?tool_profile=<value>` returns `known_profile: false` alongside the resolved `count`/`names`. The browser calls that endpoint whenever a profile is picked or restored from the user's settings and warns next to the Tools control when the answer is false.
+
+That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, which resolves to the no-code surface — so a user whose stored `chat_tool_profile` is a server-only name silently gets the no-code surface instead of the one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Since the collapse that direction can only cost a user the `code` surface: every other value
+resolves the same way whichever side invented it. Changing the accepted set here still
+requires editing that file: `tests/test_unknown_profile_warning.py::test_the_profile_key_set_is_pinned_against_the_browsers_copy` pins `KNOWN_TOOL_PROFILES` against a literal so the decision is deliberate, mirroring the browser's own pin in `useChatOptions.test.ts`.
 
 `GET /chat/v1/tools?resolved=true[&tool_profile=<value>][&enable_tools=false]` answers this table for a caller: a list of `{name, description, category, source}`, where `source` is `local`, `external` or `rag` and `category` is null for the two proxied sources. Bare (`resolved` omitted) the endpoint keeps its older answer — `TOOL_DEFINITIONS` verbatim, with each tool's full `parameters`, but no profile filter, no `disabled_tools`, and neither the BigQuery nor the subagent list — which is the raw catalogue, not a surface anyone is ever handed. The browser's Tools panel (`genetics-results-browser/src/features/chat/ToolsDialog.tsx`) shows a user what the assistant on screen can do, so it asks with `resolved=true` and the conversation's own profile. Both halves resolve through the same functions a chat request does — `LLMService.resolve_local_tools` and `resolve_proxied_tools`, the latter extracted from `stream_chat` for exactly this reason — so the panel cannot name a tool the model was not given, or miss one it was.
 
-Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included in every profile except `"rag"` and the explicit-allow-list profiles — a `code` profile that named seven tools would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included for every profile value except `"rag"` and `"code"` — a code surface that names its tools exactly would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
 
-`code` (genetics-results-suite-4h6.16) **ships dark**: nothing defaults to it, the server-side default remains `null`, and it is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). Rollback is deleting one dict entry. It deliberately omits `launch_subagents` — the profile measures what one agent does with a sandbox, not what a fan-out does. Its two "search_entities"/"search_literature" names from the bead do not exist in the codebase; the profile ships today's four search tools instead, and the consolidation into merged search tools remains a separate future decision. `nocode` is its comparator arm rather than a user-facing choice — the pre-code-execution surface, added by `genetics-results-suite-4h6.78`/`.79` so an A/B has an honest baseline that `null` cannot provide (`null` contains `run_analysis`); the browser's Tools control does not list it as an option, though a user whose stored setting is already `nocode` now keeps it (see the drift note above). See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved per-profile counts.
+`code` is **opt-in**: the server-side default for a request remains `null`, and the profile is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). It omits `launch_subagents`, as every surface now does. `nocode` was added by `genetics-results-suite-4h6.78`/`.79` as the code arm's comparator — an honest baseline `null` could not then provide, because `null` contained `run_analysis` — and after the collapse it is what `null` resolves to, so the two are the same surface. The browser's Tools control does not list `nocode` as an option, though a user whose stored setting is already `nocode` keeps it (see the drift note above). A deployment can still start its users on `code` without moving the request default, and staging does: `DEFAULT_TOOL_PROFILE=code` in the suite's `.env.daly-staging`. Other environments leave the variable unset, so their users start on `null`, which resolves to the no-code surface. See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved counts.
 
-**Shipping dark is now the settled outcome, not a pending one.** The paired A/B that was to decide whether `code` became the default — `genetics-results-suite-4h6.23` — was **descoped on 2026-08-30** by user decision: initial benchmarking was done manually and further benchmarking moves outside that epic. Its kill criterion was *"if the code arm does not beat the baseline on cost AND does not regress quality, keep it behind the profile rather than defaulting it on"*, whose conservative branch is the status quo — so the benchmark's absence **accepts** the documented default rather than leaving it open: **code execution stays opt-in; `null` stays the default profile.** The arms were never measured against each other, so nothing here says the code arm lost; the decision was not taken on numbers. No 4h6.23 figure exists, and no doc should be read as quoting one.
+**Staying opt-in is now the settled outcome, not a pending one.** The paired A/B that was to decide whether `code` became the default — `genetics-results-suite-4h6.23` — was **descoped on 2026-08-30** by user decision: initial benchmarking was done manually and further benchmarking moves outside that epic. Its kill criterion was *"if the code arm does not beat the baseline on cost AND does not regress quality, keep it behind the profile rather than defaulting it on"*, whose conservative branch is the status quo — so the benchmark's absence **accepts** the documented default rather than leaving it open: **code execution stays opt-in; `null` stays the default profile.** The arms were never measured against each other, so nothing here says the code arm lost; the decision was not taken on numbers. No 4h6.23 figure exists, and no doc should be read as quoting one.
 
-That default is the *request's*: a null `tool_profile` still resolves to the full surface. What a deployment can move is what its users start on. `DEFAULT_TOOL_PROFILE` names a profile that `GET /chat/v1/llm-config/user/settings` serves as `chat_tool_profile` for any user who has not stored one (`id: 0`, never written), and the browser adopts it exactly as it adopts a stored choice — the Tools control shows it, an explicit choice overrides it and persists, and a request that omits the field is unchanged. It rides the settings endpoint rather than the request because the browser sends null for an explicit **All**, which a request-side default could not tell from an omitted field. A value that names no profile is logged once and not served: the browser would probe it, flag it as unrecognised, and the chat would degrade to general-only, a worse default than the full surface it replaces. Which deployments set it is the suite's business (`docs/environments.md` there).
+That default is the *request's*: a null `tool_profile` resolves to the no-code surface, and nothing here changes it. What a deployment can move is what its users start on. `DEFAULT_TOOL_PROFILE` names a profile that `GET /chat/v1/llm-config/user/settings` serves as `chat_tool_profile` for any user who has not stored one (`id: 0`, never written), and the browser adopts it exactly as it adopts a stored choice — the Tools control shows it, an explicit choice overrides it and persists, and a request that omits the field is unchanged. It rides the settings endpoint rather than the request because the browser sends null for an explicit **All**, which a request-side default could not tell from an omitted field. A value that names no profile is logged once and not served: the browser would probe it, flag it as unrecognised, and the chat would resolve to the no-code surface anyway. Which deployments set it is the suite's business (`docs/environments.md` there).
 
 ## Genetics SDK (`genetics_mcp_server.sdk`)
 
@@ -782,6 +893,8 @@ winner.
 | `normalize_gene_symbols(symbols)` | `normalize_gene_symbols` |
 | `sql(query)` | `query_database` |
 | `schema()`, `resources()`, `datasets()` | `get_database_schema`, `get_available_resources`, `list_datasets` |
+| `resource_metadata(resource)` | `get_resource_metadata` — the per-trait rows behind a resource; `resources()` reaches a different endpoint and does not carry them |
+| `show(data)` | — no executor: prints a frame, dict or list one row per line with every column, so nothing is elided |
 
 `mpra_pip_concordance` stays a separate function rather than a keyword on `mpra()`: it is a
 join of `credible_sets_v` and `mpra_v` and returns credible-set columns alongside MPRA
@@ -859,8 +972,10 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 
 - **Return type is `polars.DataFrame`** for every row-returning function. Scripts filter and
   join, which is what a DataFrame is for, polars is already a dependency, and it is already
-  what `executor.py`'s own summarisers use. `schema()`, `resources()` and `datasets()` return
-  dicts because their payloads are nested rather than tabular.
+  what `executor.py`'s own summarisers use. `schema()` and `resources()` return dicts, and
+  `datasets()` a list of dicts, because their payloads are nested rather than tabular — each
+  one's docstring gives the exact shape, since `list_capabilities` ships those docstrings
+  verbatim and a shape a script has to discover costs a round trip to discover it.
 - **Failures raise `GeneticsError`**; argument-shape mistakes raise `GeneticsUsageError`. The
   tool layer's `{"success": False, "error": ...}` exists because a model reads the dict; a
   script author does not check a flag after every call, and an unchecked failure would
@@ -932,8 +1047,9 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the
   same functions as awaitables.
 - **Every call through the SDK surface is audited — `_executor` is not**
-  (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine
-  method is wrapped at import time (`_instrument` in `sdk/client.py`) so one line per call goes
+  (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine method that reaches the
+  executor is wrapped at import time (`_instrument` in `sdk/client.py`; `close` and `show` are
+  exempt because neither fetches anything) so one line per call goes
   to the `genetics_mcp_server.sdk.audit` logger:
   `[user=…] [session=…] [execution=…] Executing SDK function: <name> with input: {…} rows: <n>`,
   plus ` error: <ExceptionType>` when the call raised. It mirrors chat-backend's
@@ -1522,10 +1638,10 @@ the internal channel `chat_api` assembles, not an override.
 `config/defaults.py` holds `_PROMPT_BLOCKS`, a tuple of `_Block`s rather than one string; a block
 is emitted only if every tool name appearing in its text is in `tool_names`, with `excludes`,
 `requires_any` and `requires_all` as further subtractive gates. `chat_api` gets that list from
-`LLMService.resolve_local_tool_names(tool_profile, enable_tools)`, the same profile +
+`LLMService.resolve_local_tool_names(code_execution, enable_tools)`, the same surface +
 `settings.disabled_tools` + subagent-liveness resolution that builds the tool list itself, so on
 the **Anthropic** path the prompt cannot describe a tool the model was not given. It does not
-hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor `tool_profile`
+hold for `provider="openai"`: `_stream_openai` takes neither `enable_tools` nor a surface
 and never sets `tools`, so that provider receives the prompt assembled for the full local set
 while getting no tools at all — pre-existing, and unchanged by 4h6.69, but unreachable since
 `genetics-results-suite-c4s` 400s `provider="openai"` before the stream opens; the mismatch is
@@ -1584,8 +1700,10 @@ ClinVar significance, population frequency and rsID:
   `get_variant_protein_effect` for coding SNVs and told to say so for everything else.
 
 The blanket "there is no variant-annotation tool on this surface" wording survives only for a
-surface with `query_database`, no sandbox and no `get_variant_protein_effect` — no shipped profile
-today, so its test drives the assembly directly. Naming `get_variant_protein_effect` in the two
+surface with `query_database`, no sandbox and no `get_variant_protein_effect` — no shipped surface
+today, so its test drives the assembly directly. The code surface added a shape none of the earlier
+variants covered — `get_myvariant_annotations` (an outside resource) without `get_variant_annotations`
+— and has a variant of its own, or the prohibition would reach it with no route at all. Naming `get_variant_protein_effect` in the two
 bigquery-facing variants makes them self-gating under the text rule, which is exactly their
 precondition. All of this reasons about LOCAL tools: the always-on external MCP servers attached in
 `llm_service.py` (gnomAD, Open Targets) never appear in the prompt's tool list, so an annotation
@@ -1597,9 +1715,11 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` holds **ten** test classes, **seven** of them parametrised
-over the `None`/`api`/`bigquery`/`rag`/`code`/`nocode` profiles (`nocode`, the `code` arm's
-comparator, was added to `PROFILES` by `genetics-results-suite-4h6.78`/`.79`). Three of
+`tests/test_system_prompt.py` holds **ten** test classes, most of them parametrised over the
+`None`/`api`/`bigquery`/`rag`/`code`/`nocode` profile values. Only two distinct surfaces remain
+behind those six values, so the ones that need a shape no surface produces — a database surface
+without the API tools, a surface carrying `launch_subagents`, one carrying every tool at once —
+build the tool set directly instead; the gate is keyed on tool names, not on a profile. Three of
 those seven pin the core property families — the first, and the heading-body half of the
 third, with `ENABLE_SUBAGENTS` both true and false:
 **absence** (every tool name in the emitted prompt is in the resolved list, tokenising
@@ -1631,10 +1751,42 @@ data-access tools"), which contradicted it and was invisible to anyone reading t
 `run_analysis`'s description now states its capability only. Preconditions of a single tool stay
 in that tool's description, where they travel with it and reach MCP clients too — which is why
 "call `get_database_schema` first" lives in `query_database`'s description and is no longer
-repeated in the prompt. A surface with `run_analysis` but no `query_database` (profiles `api`
-and `code`) has neither that tool nor `get_database_schema` yet still reads all the SQL
-guidance, so it gets the SDK's own route — `genetics.schema()` / `genetics.schema('<view>')`,
-emitted only there.
+repeated in the prompt. A surface with `run_analysis` but no `query_database` (the code
+surface) has neither that tool nor `get_database_schema` yet still reads all the SQL
+guidance, so it gets the schema itself.
+
+**The schema is IN the prompt on that surface, and telling the model where to find it was not
+enough.** The block used to name `$GENETICS_SCHEMA_DIR` and the one-file-per-view layout and
+say to read the file for a view before writing SQL. The model complied, and complying is what
+cost: measured over benchmark run a08b371d, **32 of 138 `run_analysis` scripts did nothing but
+print one of those files**, 18 of 20 cases opened with one, and together they were 658s of
+4272s of model time — a round trip per view to fetch bytes the container already held. Progressive
+disclosure is the right instinct when the thing disclosed is expensive to carry; this one is
+~21k tokens that never change between builds, so the prompt cache carries it for one write.
+
+So `schema_docs/` holds the same rendered markdown the sandbox image ships, and
+`_PROMPT_BLOCKS` ends with a single `# BigQuery view reference` section carrying all of it,
+gated identically to the block above (`requires_any=run_analysis`, `excludes=query_database`)
+— the surface that was paying. It is **last** because a block that never varies belongs at
+the end of the cacheable prefix and because the instructions should sit closer to the
+conversation than the reference they are about. `schema_docs.schema_reference()` demotes every
+heading one level on the way in, so fifteen view files that each start at `#` become `##`
+sections of one reference rather than fifteen top-level sections competing with "Prohibited";
+`tests/test_system_prompt.py` pins the hand-written headings only, stopping at that boundary,
+because pinning the generated ones would mean re-listing every view's columns on every dataset
+change.
+
+**Those `.md` files are generated, by the other repo.** genetics-results-suite's
+`scripts/gen-sandbox-docs.py` renders them from its `configs/datasets.yaml` and writes the
+identical bytes to its own `sandbox/schema/` and to `schema_docs/` here; its `--check`
+fails that repo's image build when either copy drifts. So the prompt cannot describe a column
+the sandbox does not have — the alternative, a hand-copied schema in a second repo, is the
+enumeration rot this suite's conventions exist to prevent. Edit `configs/datasets.yaml` there
+and regenerate; the files here carry a do-not-edit banner and `schema_docs/__init__.py`
+strips it before the text reaches a prompt, where it would read as an instruction.
+
+`genetics.schema()` / `genetics.schema('<view>')` remain as a live call, and the image still
+ships the files, but the prompt no longer tells the model to reach for either.
 
 Which routing variant is emitted turns on two facts about the surface: whether the per-entity API
 tools are present (`get_credible_sets_by_gene` is the sentinel the database-only variant already
@@ -1753,6 +1905,8 @@ src/genetics_mcp_server/
 │   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
 │   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
 │   └── chembl.py        # ChEMBL REST client (drug mechanisms, indications, bioactivity)
+├── schema_docs/          # the BigQuery view docs inlined into the `code` system prompt;
+│                         # GENERATED by genetics-results-suite/scripts/gen-sandbox-docs.py
 ├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
 │   ├── __init__.py      # sync module-level functions, shared client lifecycle
 │   ├── client.py        # GeneticsClient: one async method per data product
@@ -1767,6 +1921,7 @@ src/genetics_mcp_server/
 │   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
+│   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -1850,6 +2005,32 @@ literal at a call site.
   placeholders in place of the answer. Resumed the same way with
   `CONTINUE_UNFILLED_PROMPT`, sharing the `MAX_CONTINUATIONS` budget; if it keeps coming
   back unfilled, a "results above were left unfilled" notice is appended.
+- **`stop_reason == "refusal"`** — a safety classifier declined the request (Fable's cover
+  research biology, so a genetics question can trip one; `stop_details.category` names
+  which) and no fallback answered. The turn ends there: no tool in it is executed, it is
+  not resumed, and a "model declined this request" notice is appended to whatever partial
+  text streamed before the classifier fired.
+
+### Refusal fallback
+
+Every request to a model that runs refusal classifiers carries Anthropic's server-side
+`fallbacks` parameter (`REFUSAL_FALLBACK`, default `"default"`: Anthropic picks the
+substitute by refusal category; a model id pins it; empty turns it off). The pinned SDK
+does not type the parameter, so `_refusal_fallback_params()` sends it in `extra_body`
+with the matching beta header. When the fallback fires the API answers in the same
+stream and the response carries:
+
+- a `fallback` content block at the switch point, naming the model that declined and the
+  one that continued. The stream turns it into a visible "*[Claude Fable 5.1 declined this
+  request; Claude Opus 5 answered instead]*" line at that position, persists the same line
+  as a text block, and never replays the marker. Blocks before the marker were written by
+  the declining model: its thinking and any tool calls there are dropped from what is
+  executed, persisted and replayed (`_replayable_content`), since the API rejects them
+  echoed back and the calls never ran.
+- `model` naming the model that produced the message. Cost and the context-window meter
+  use that model, not the requested one. A conversation that fell back once is routed
+  straight to the fallback model for about an hour with no marker block; the loop detects
+  that from `model` alone and appends "*[Answered by Claude Opus 5]*" after the text.
 
 `_has_unfilled_output()` decides the third case from the artifact — placeholder cells such
 as `*[from query]*`, or a column-label header with no data under it — never from "let me
@@ -2025,16 +2206,22 @@ The subagent system enables the main agent to launch parallel specialized agents
 - `literature_review` — scientific literature and web search
 - `database_analysis` — complex SQL queries against the genetics database
 - `variant_list_analysis` — analyze multiple variants for shared patterns
-- `data_analysis` — Python script execution for custom analysis and visualizations
+- `data_analysis` — writes a Python analysis script, runs it with `run_analysis`, and iterates on failures before reporting
 
 Each skill has:
 - A markdown instruction file (system prompt) in `skills/instructions/`
-- Tool categories controlling which tools the subagent can use
+- An explicit set of tool names controlling which tools the subagent can use
 - Configurable model, max iterations, and timeout
-- Optional sandbox tools (file read, script execution)
+- Optional file read, for skills that inspect uploaded files
 - `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
 **Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
+
+**Identity**: `run_subagents(tasks, progress_callback, *, user, session_id, gateway_asserted)` takes the caller's authenticated identity from the request context and carries it to `_execute_subagent_tool`, which injects it into `run_analysis` after stripping any same-named key the model wrote. It is keyword-only so no positional call site can slide a task field into the subject of a per-execution credential. Both `run_subagents` call sites are in `llm_service` (the streaming path and `_execute_tool`) and both pass the same triple the main path's own `run_analysis` injection uses.
+
+**Parallel executions do not run in parallel.** The sandbox is `replicas: 1` behind a one-running / two-waiting scheduler, so four `data_analysis` subagents means one runs, two queue and the fourth is rejected. What the fan-out buys is context isolation — each subagent's failed script attempts stay in its own context — not wall-clock.
+
+**Figures a subagent produces are not displayed.** Image artifacts are streamed to the user from the main chat loop's own `run_analysis` results; a subagent's tool result is JSON going back to the subagent, so `_execute_subagent_tool` strips the base64 and leaves the artifact names for the report.
 
 **Advertisement gated on availability**: `launch_subagents` is advertised to the LLM only when the subagent service actually initialized (`self.subagent_service is not None`), not merely when `ENABLE_SUBAGENTS` is set. The service requires a live Anthropic client + executor in addition to the flag, so `_stream_anthropic()` adds `launch_subagents` to the effective `disabled_tools` whenever the service is absent. This single source of truth prevents the LLM from seeing a tool that would return "subagent service isn't available" on call.
 
@@ -2079,11 +2266,12 @@ partial findings instead of treating a fragment as the subagent's complete answe
 6. Main agent synthesizes subagent outputs into its response
 
 **Security**:
-- File access restricted to configured `SUBAGENT_ALLOWED_PATHS` directories
-- Script execution gated behind `ENABLE_SCRIPT_EXECUTION` flag
-- Interpreter whitelist: `python3`, `Rscript`, `bash`
-- Sensitive environment variables stripped from script processes
-- Per-subagent and per-script timeouts
+- Each skill names the tools it gets (`skills/definitions.py`), so retuning a tool profile for
+  the main agent cannot widen a subagent's surface
+- File access is read-only and restricted to `SUBAGENT_ALLOWED_PATHS`
+- Subagents cannot execute code: `run_analysis` is excluded by name and a subagent has no
+  session identity for a per-execution credential to be minted from
+- Per-subagent timeout
 
 ## Configuration
 
@@ -2115,10 +2303,14 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|---------|
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude | - |
 | `OPENAI_API_KEY` | OpenAI API key. Still read and still plumbed through, but unreachable: `stream_chat` refuses `provider="openai"` with a 400 since `genetics-results-suite-c4s` | - |
-| `DEFAULT_MODEL` | Default chat model | `claude-opus-5` |
+| `DEFAULT_MODEL` | Default chat model. The nightly analysis job does not read it: `ANALYZE_TOPIC_MODEL` / `ANALYZE_QUALITY_MODEL` have their own defaults | `claude-fable-5-1` |
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
 | `MAX_CONTINUATIONS` | How many times a turn stopped by `stop_reason: max_tokens` is resumed before the truncation is reported to the user | `3` |
+| `REFUSAL_FALLBACK` | Who answers when a safety classifier declines a request: `default` lets Anthropic pick by refusal category, a model id pins the substitute, empty shows the refusal to the user. Sent only to models that run the classifiers (Fable, Mythos, Opus 5+) | `default` |
+| `ANTHROPIC_MAX_RETRIES` | Attempts the streaming call makes over connection errors, 5xx and `overloaded_error`, with exponential backoff | `3` |
+| `ANTHROPIC_RETRY_RATE_LIMIT` | Whether an Anthropic **429** is also retried. Off by default and deliberately so: a 429 means the account's capacity is spent, so retrying in front of a waiting user buys a longer spinner and takes capacity from the next request. A benchmark has no waiting user and turns it on | `false` |
+| `ANTHROPIC_RETRY_AFTER_MAX_S` | Ceiling on a honoured `retry-after`. Above it the wait is refused and the error propagates rather than being silently clamped — returning before the server said to is what the header asks us not to do | `60` |
 | `APP_NAME` | Product/brand name substituted into the assistant persona system prompt | `FinnGenie` |
 
 ### myvariant.info (optional, chat-backend only)
@@ -2429,7 +2621,7 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
 | `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
-| `DEFAULT_TOOL_PROFILE` | Profile served as `chat_tool_profile` to users who have not chosen one (see "Profile behavior"); empty = the browser's own default, the full surface (default empty) |
+| `DEFAULT_TOOL_PROFILE` | Profile served as `chat_tool_profile` to users who have not chosen one (see "Profile behavior"); empty = the browser's own default, which resolves to the no-code surface (default empty) |
 
 These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which the MCP server, the chat API and the subagents all read, so a disabled tool is invisible on every surface rather than only unregistered on one.
 
@@ -2445,8 +2637,6 @@ Default external servers:
 | `SUBAGENT_MODEL` | Model for subagents (falls back to `fast_model`) | `""` |
 | `SUBAGENT_TIMEOUT` | Seconds per subagent execution | `120` |
 | `SUBAGENT_ALLOWED_PATHS` | Comma-separated directories for file access | `""` |
-| `ENABLE_SCRIPT_EXECUTION` | Allow subagents to execute scripts | `false` |
-| `SUBAGENT_SCRIPT_TIMEOUT` | Seconds per script execution | `30` |
 
 ## Logging
 
@@ -2475,7 +2665,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_mcp_server.py` | MCP server initialization and tool registration |
 | `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration |
 | `test_tools.py` | Tool executor methods |
-| `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still degrades to general-only but logs a WARNING naming the value and the known set, once per distinct value and bounded, and the full profile key set (`TOOL_PROFILES | TOOL_PROFILE_TOOLS`) is pinned against a literal so adding or renaming one forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts` |
+| `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still coerces to the no-code surface but logs a WARNING naming the value, what it resolved to and the recognised set, once per distinct value and bounded; `KNOWN_TOOL_PROFILES` is pinned against a literal so changing the accepted set forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts`, and the collapse of the legacy names onto the no-code surface is asserted rather than assumed |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
 | `test_sandbox_client.py` | Sandbox transport against a stubbed HTTP layer (no sandbox, no credentials): the exact request field set, the tokens travelling in the body and never in a header, `execution_id` being the `jti` of both tokens, fail-closed on an unset signing key (nothing is sent), token redaction from logs and exception text (from `error.message` and from `error.type`, the latter asserted on `SandboxError.error_type` too), the result returned unchanged (including a failing script, which is a 200 and not an exception, and an unrecognised open-ended `error.type`), the 429 retry minting a **fresh** `execution_id`, `Retry-After` honoured and capped, `409 TokenExpired` retried immediately while `409 DuplicateExecutionId` is not retried at all, the read deadline clearing queue wait plus the full run, unreachable/`NotReady`/gateway failures separated from script failures, and the local pre-flight rejections, which cover every caller-supplied value the body carries (over-ceiling `timeout_s` rejected not clamped, empty or oversized `code`, an `execution_id` that is not §2's canonical uuid4, an empty `user` or `session_id` — all `SandboxRejected`, so a caller catching `SandboxError` cannot miss one) |
 | `test_code_execution_tools.py` | The code-execution tool layer with no sandbox and no credentials: the SDK catalogue rendering (and what it does **not** disclose), `read_artifact`'s HTTP proxy and its `(sub, sid)`-scoped resolution (another **user** presenting this session id, and another session's name, both indistinguishable from a missing one — the cross-user negative for `genetics-results-suite-dh3` — the fail-closed answer when either half of the key is absent, the most-recent-wins collision tiebreak, TTL expiry, the bounded map, the 512 KiB cap and the `409`/`413` mappings), the `artifacts_retained_in_clear` signal rendered only when true, and `run_analysis` against a stubbed transport — the fail-closed path reported as a non-retryable operator error with **nothing sent**, the handler's exception clauses asserted by AST so no `except Exception` can reappear above the named one, the 300 s turn budget (checked against the transport's own constants, not a copied number) reported as "may still be running" rather than as a script failure, each transport failure class kept distinct from a broken script, `execution_id` never reaching the model, a manifest rebuilt to name/size/content_type with paths and URLs dropped, an unknown `status`, an unknown `error.type` and unknown top-level fields all tolerated, and `llm_service` stripping a model-supplied `user`/`session_id` before injecting the authenticated pair into **both** `run_analysis` and `read_artifact` |
@@ -2484,7 +2674,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_llm_config_router.py` | LLM config API |
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
-| `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting |
+| `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting; and the dispatch guard — a tool outside the set the request advertised is refused as a `tool_result` and never reaches the executor, in both directions, with the check reading the resolved set rather than any profile string |
 | `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
@@ -2505,8 +2695,9 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
-| `test_arm_resolution.py` | Preflight that aborts on an unknown `tool_profile` rather than silently falling back to `{"general"}`, and records each arm's resolved tool list in the report |
+| `test_arm_resolution.py` | The benchmark's arm preflight: the `nocode`/`code` defaults; the harness's own arm and code-execution-tool literals pinned against `code_execution_requested` and `resolve_tools`; and the three refusals — an unknown `tool_profile` (rather than silently falling back to the no-code surface), an arm that is not the surface it names (a `code` arm resolved without `run_analysis`, or another arm resolved with it), and two arms whose resolved names are equal — against the two that are deliberately survivable, an endpoint-less server and one arm failing to resolve |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
+| `test_benchmark_counters.py` | The recorded 9c6595ac baseline is exactly what the current code computes on that report, so a before/after delta is never a comparison of two different definitions; a discovery script is counted as opening a turn only when it is the first; re-execution is scoped to the case rather than the turn, which is where a refine follow-up shows up at all; every counter is present at 0 rather than absent, so an arm that did none of something is not confused with a report that never measured it |
 | `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
 | `test_benchmark_transcript.py` | The side-by-side transcript carries what distinguishes a *wide* arm from a *slow* one (per-call iteration, retry loops, script shapes) and never invents a measurement it lacks — an unattributed call has no iteration, and the final iteration's absent tool phase is not reported as a gap |
 | `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded (and `dropped_prose_blocks` returning that same text with the call it followed, for the transcript and never for the judge), length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
@@ -2658,6 +2849,48 @@ harness issues two arms per case. `--base-url` therefore defaults to
 `http://localhost:8000`, never a deployment, and `--dry-run` resolves the whole plan
 (case order, arm order, turn count) without issuing a single request.
 
+- **The arms are the boolean.** `--arm-a` defaults to `nocode` and `--arm-b` to `code`,
+  the only two wire values that straddle the surface split; `--arm-a all` still spells
+  `tool_profile: null`, which resolves to the same surface as `nocode`. The preflight asks
+  the server what each arm resolved to before anything is spent and refuses three shapes,
+  each of which otherwise produces a plausible report about something else: an arm the
+  server reports `known_profile: false` for; an arm that is not the surface it names — the
+  `code` arm resolving *without* `run_analysis`, which is what a chat service running with
+  `SANDBOX_ENABLED=false` serves, or any other arm resolving *with* it, which is a server
+  predating the collapse; and two arms whose resolved name sets are equal. An arm the
+  server did not resolve at all (transport error, non-200, or a 200 carrying no names) is
+  survivable rather than fatal, but both the `run_analysis` check and the identical-surface
+  check are skipped for it, and the harness warns saying so.
+- **Single-arm mode.** `--arm-b none` runs arm A alone. It exists because the counters that
+  decide a prompt or image change are per-arm, and paying for a second arm that has not
+  changed buys nothing. What it gives up is everything the pairing defends: a model swap or
+  a slowdown mid-run lands entirely on the one arm and is indistinguishable from the change
+  under test, and `pairwise_judge` has no opposite answer, so **quality is not measured at
+  all**. `benchmark_scorecard` is a side-by-side instrument and refuses a one-arm report
+  rather than rendering half of one; `benchmark_counters.py` is the per-arm reading —
+  iterations, calls, what the scripts contained, wall clock — against a recorded baseline.
+  Use single-arm to see whether a change moved the mechanics; use the paired run to decide a
+  rollout. `run_benchmark_code.sh` is the code-profile-only wrapper.
+  `benchmark_scorecard --markdown` renders a one-arm report too — it is the only
+  human-readable output such a run has — but writes ONE file rather than the usual
+  paired-plus-per-arm set, since the per-arm view would be the same document under a
+  second name. The comparison TABLE still refuses: it is the rollout instrument and has
+  nothing to say about one arm. Failed turns in a one-arm file are reported as
+  `TURNS FAILED` rather than `NOT COMPARABLE`, because there is no partner whose
+  failure could have spoiled a comparison.
+- **Running it fast.** With one arm there is no pairing to preserve, so `--concurrency`
+  is free to rise to whatever Anthropic and the local stack will take. Two settings on
+  the stack are the binding constraint, and neither is a benchmark flag:
+  `RATE_LIMIT_PER_HOUR`/`RATE_LIMIT_PER_DAY` (chat-backend's own limiter, 20/100 by
+  default — a 50-turn run trips it and the harness treats that 429 as run-invalidating),
+  and `ANTHROPIC_RETRY_RATE_LIMIT=true`, which makes chat-backend wait out an Anthropic
+  429 rather than failing the turn. That is push-until-refused-then-back-off, not
+  header-driven pacing: nothing reads the `anthropic-ratelimit-*` headers to self-throttle
+  ahead of a refusal.
+  **Concurrency invalidates the wall-clock comparison and nothing else.** Run 9c6595ac was
+  serial; every counter except wall clock is concurrency-invariant, while wall clock sums
+  per-turn latency and a concurrent run queues against the same local stack.
+  `benchmark_counters` prints the warning when the two runs disagree.
 - **Paired design.** Both arms of a case run back to back inside one worker, so a
   model swap or an API slowdown mid-run hits both arms equally. `--concurrency`
   parallelises over *cases*; the semaphore is held for the whole case, so the two

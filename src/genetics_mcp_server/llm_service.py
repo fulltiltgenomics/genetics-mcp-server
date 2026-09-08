@@ -20,6 +20,7 @@ from genetics_mcp_server.config import (
     get_settings,
     model_rejects_temperature,
     model_supports_adaptive_thinking,
+    model_supports_refusal_fallback,
 )
 from genetics_mcp_server.config.defaults import (
     CONTINUE_TRUNCATED_PROMPT,
@@ -36,11 +37,10 @@ from genetics_mcp_server.mcp_proxy import (
 )
 from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import (
-    TOOL_PROFILE_TOOLS,
     ServerToolExecutor,
     get_anthropic_tools,
 )
-from genetics_mcp_server.tools.definitions import tool_category
+from genetics_mcp_server.tools.definitions import code_execution_requested, tool_category
 from genetics_mcp_server.tools.orchestration import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,25 @@ def anthropic_error_type(e: Exception) -> str | None:
         if isinstance(err, dict) and isinstance(err.get("type"), str):
             return err["type"]
     return None
+
+
+def _retry_after_seconds(e: Exception) -> float | None:
+    """`retry-after` off a rate-limited response, in seconds, or None.
+
+    Only the delta-seconds form is read. The HTTP-date form is legal and Anthropic does not
+    send it; parsing it would mean trusting our clock against theirs to decide how long to
+    sleep, and getting that wrong in the fast direction is what the header exists to prevent.
+    A malformed or absent value yields None and the caller's exponential backoff applies.
+    """
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
 
 # the display-only tool-use markers that end up in stored assistant `content`. Two shapes:
@@ -252,6 +271,71 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
 # comfortably under the client's 90s inactivity timeout, so several ticks are
 # missed before a stalled stream is declared dead.
 _THINKING_KEEPALIVE_SECONDS = 10.0
+
+
+def _refusal_fallback_params(model: str, fallback: str) -> dict[str, Any]:
+    """Request fields that re-run a classifier refusal on another model, server side.
+
+    The pinned SDK does not type `fallbacks`, so it travels in `extra_body` under the beta
+    header. The two forms carry different headers and the API rejects a mismatch, so they
+    are built together here and nowhere else.
+    """
+    if not fallback or not model_supports_refusal_fallback(model):
+        return {}
+    if fallback == "default":
+        body: Any = "default"
+        beta = "server-side-fallback-2026-07-01"
+    else:
+        body = [{"model": fallback}]
+        beta = "server-side-fallback-2026-06-01"
+    return {"extra_body": {"fallbacks": body}, "extra_headers": {"anthropic-beta": beta}}
+
+
+_MODEL_ID_RE = re.compile(r"^claude-([a-z]+)-(\d+)(?:-(\d+))?")
+
+
+def _model_display_name(model_id: str | None) -> str:
+    """'claude-fable-5-1' -> 'Claude Fable 5.1', the browser's About dialog spelling."""
+    match = _MODEL_ID_RE.match(model_id or "")
+    if not match:
+        return model_id or "another model"
+    family, major, minor = match.groups()
+    return f"Claude {family.capitalize()} {major}" + (f".{minor}" if minor else "")
+
+
+def _block_field(block: Any, name: str) -> Any:
+    # a `fallback` block is a type the pinned SDK does not know, so it arrives constructed
+    # as its first union variant with the wire fields kept as extras
+    dumped = block.model_dump() if hasattr(block, "model_dump") else dict(block)
+    return dumped.get(name)
+
+
+def _fallback_notice(block: Any) -> str:
+    """The visible line that stands in for a `fallback` marker block."""
+    declined = _model_display_name((_block_field(block, "from") or {}).get("model"))
+    served = _model_display_name((_block_field(block, "to") or {}).get("model"))
+    return f"\n\n*[{declined} declined this request; {served} answered instead]*\n\n"
+
+
+def _last_fallback_index(content: list[Any]) -> int:
+    return max((i for i, b in enumerate(content) if b.type == "fallback"), default=-1)
+
+
+def _replayable_content(content: list[Any]) -> list[dict[str, Any]]:
+    """The assistant turn as it goes back to the API.
+
+    After a mid-output fallback the blocks before the last `fallback` marker were written
+    by the model that declined: its reasoning and tool calls are not part of the answer
+    the fallback model continued, and echoing them back is rejected, so only its text
+    survives. The marker itself is dropped; the API treats it as an ignorable audit line.
+    """
+    cut = _last_fallback_index(content)
+    return [
+        b.model_dump(exclude_none=True)
+        for i, b in enumerate(content)
+        if b.type != "fallback"
+        and not (i < cut and b.type in ("thinking", "redacted_thinking", "tool_use"))
+    ]
 
 # Appended to the turn when the agentic loop stops at `mcp_max_iterations`. It is the ONLY
 # signal a stream consumer has that the final iteration ran tools whose phase was never
@@ -561,6 +645,10 @@ def _script_result_payload(
     `error_type` for those, so a consumer classifies on the STATUS STRING, never on `ran`
     alone. Every non-run shape sets `error_type`, so the `"unknown"` fallback below means a
     genuinely unrecognised shape rather than "a blank script got here".
+
+    ONE CONFLATION SURVIVES IN `error_type`: `_refused_tool_result` stamps every
+    run_analysis refusal `SandboxNotConfigured`, so the no-code arm's reader sees that type
+    for an off-surface refusal on a deployment whose sandbox is configured and healthy.
     """
     status = result.get("status")
     ran = isinstance(status, str)
@@ -586,29 +674,27 @@ def _script_result_payload(
     }
 
 
-def resolve_proxied_tools(
-    tool_profile: str | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """The proxied surfaces a request with this profile is handed: (external, RAG).
+def resolve_proxied_tools() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The proxied surfaces EVERY request is handed: (external, RAG).
 
-    Always-on external tools (gnomAD, Open Targets) are excluded in the RAG profile, and in
-    any explicit-allow-list profile: those name their surface exactly, so re-adding ~20
-    proxied tools would defeat the surface they exist to measure. RAG tools are included
-    only when the profile is None (all) or "rag".
+    NO SURFACE ARGUMENT, and that is the answer rather than an omission. The proxied
+    servers are whatever EXTERNAL_MCP_SERVERS names, and nothing inside the sandbox can
+    reach them: its egress allow-list admits db-api and results-api only. So they are not
+    SDK-replaceable, and withholding them from the code surface would remove a capability
+    that surface has no other route to. RAG is now a deployment fact keyed on
+    RAG_MCP_SERVER alone — registered or not, for everybody. Both groups being "everything
+    that is configured", a parameter neither reads would only be somewhere for a third
+    surface rule to grow back.
+
+    EXTERNAL_MCP_EXCLUDE_TOOLS still subtracts, and now subtracts from both surfaces
+    alike: it is applied where the proxy clients are registered (`mcp_proxy`), so an
+    excluded tool never enters the registries these two getters read.
 
     Extracted for the same reason `resolve_local_tools` exists: `/chat/v1/tools?resolved=true`
     has to answer with the tools this rule would actually hand the model, and a second copy
     of the rule beside the panel that shows them is a copy that drifts.
     """
-    external_tools: list[dict[str, Any]] = []
-    if tool_profile != "rag" and tool_profile not in TOOL_PROFILE_TOOLS:
-        external_tools = get_external_anthropic_tools()
-
-    rag_tools: list[dict[str, Any]] = []
-    if tool_profile is None or tool_profile == "rag":
-        rag_tools = get_rag_anthropic_tools()
-
-    return external_tools, rag_tools
+    return get_external_anthropic_tools(), get_rag_anthropic_tools()
 
 
 @dataclass(frozen=True)
@@ -629,6 +715,24 @@ class ResolvedLocalTools:
     @property
     def names(self) -> set[str]:
         return {t["name"] for t in self.definitions}
+
+
+def _refused_tool_result(
+    tool_name: str, error: str, error_type: str
+) -> dict[str, Any]:
+    """A refusal the model reads as a tool_result, not as something to retry.
+
+    run_analysis carries the sandbox's own operator-error type whatever the reason,
+    because that is what the script_result chunk and the benchmark read; the point of both
+    is that a withheld tool must not look transient, or the model retries a fact about the
+    deployment or the surface.
+    """
+    return {
+        "success": False,
+        "error": error,
+        "error_type": "SandboxNotConfigured" if tool_name == "run_analysis" else error_type,
+        "retryable": False,
+    }
 
 
 class LLMService:
@@ -699,11 +803,16 @@ class LLMService:
 
     def resolve_local_tools(
         self,
-        tool_profile: str | None = None,
+        *,
+        code_execution: bool = False,
         enable_tools: bool = True,
         custom_tool_descriptions: dict[str, str] | None = None,
     ) -> ResolvedLocalTools:
         """Resolve this request's local tool definitions ONCE.
+
+        Keyed on the boolean and never on a profile name: the wire value is coerced by
+        `code_execution_requested` at the edge it arrives on, so nothing downstream can
+        read the name a second time and reach a different surface.
 
         The prompt gate (genetics-results-suite-4h6.69) requires the system prompt to be
         assembled against the tools the model is actually handed. Returning one object
@@ -717,7 +826,7 @@ class LLMService:
         return ResolvedLocalTools(
             get_anthropic_tools(
                 custom_tool_descriptions,
-                tool_profile=tool_profile,
+                code_execution=code_execution,
                 disabled_tools=self._disabled_tools(),
             )
         )
@@ -738,9 +847,16 @@ class LLMService:
         (`resolve_local_tools`, `resolve_proxied_tools`), so the panel cannot list a tool
         the model is not given, or miss one it is. `source` distinguishes them because only
         the local half has a category to group by — proxied tools carry the remote server's
-        own name and description and are not part of any profile category.
+        own name and description and have no category at all.
+
+        Takes the wire value rather than the boolean because it is called straight off a
+        query parameter; it is coerced here through the same edge function a chat request
+        goes through, and reaches only the local half — the proxied half is the same for
+        both surfaces.
         """
-        local = self.resolve_local_tools(tool_profile, enable_tools)
+        local = self.resolve_local_tools(
+            code_execution=code_execution_requested(tool_profile), enable_tools=enable_tools
+        )
         tools: list[dict[str, Any]] = [
             {
                 "name": t["name"],
@@ -755,7 +871,7 @@ class LLMService:
         if not (enable_tools and get_settings().mcp_enabled):
             return tools
 
-        external_tools, rag_tools = resolve_proxied_tools(tool_profile)
+        external_tools, rag_tools = resolve_proxied_tools()
         for source, definitions in (("external", external_tools), ("rag", rag_tools)):
             tools.extend(
                 {
@@ -769,14 +885,16 @@ class LLMService:
         return tools
 
     def resolve_local_tool_names(
-        self, tool_profile: str | None = None, enable_tools: bool = True
+        self, *, code_execution: bool = False, enable_tools: bool = True
     ) -> set[str]:
         """Local tool names this service would advertise for such a request.
 
         External and RAG tools are excluded: they are proxied surfaces the system prompt
         does not name tool-by-tool.
         """
-        return self.resolve_local_tools(tool_profile, enable_tools).names
+        return self.resolve_local_tools(
+            code_execution=code_execution, enable_tools=enable_tools
+        ).names
 
     async def stream_chat(
         self,
@@ -788,6 +906,8 @@ class LLMService:
         custom_tool_descriptions: dict[str, str] | None = None,
         literature_backend: str | None = None,
         tool_profile: str | None = None,
+        *,
+        code_execution: bool,
         secret: bool = False,
         user: str | None = None,
         session_id: str | None = None,
@@ -809,9 +929,16 @@ class LLMService:
             enable_tools: Whether to enable MCP tools (Anthropic only)
             custom_tool_descriptions: Custom descriptions for tools
             literature_backend: Backend for literature search ('europepmc' or 'perplexity')
-            tool_profile: Tool profile controlling which categories are available.
-                None = all tools, "api" = general+api, "bigquery" = general+bigquery,
-                "rag" = general+RAG external tools.
+            tool_profile: The wire value verbatim, RECORDED AND NOTHING ELSE: it is
+                stored with the turn's metrics and reaches no surface decision on any path
+                from here. The local surface comes from `code_execution` below, coerced at
+                the edge; the proxied surfaces are the same for both. A request therefore
+                cannot get its tools from one reading of this value and its prompt from
+                another, because only one reading exists.
+            code_execution: Which of the two surfaces this request is on, from
+                `code_execution_requested(tool_profile)` at the edge. Only consulted when
+                no `local_tools` is supplied, and to enforce the advertised set at
+                dispatch.
             secret: If True, suppress detailed logging to avoid persisting chat content.
             user: Authenticated user email for logging.
             session_id: Client conversation id, logged (id only) to count distinct conversations.
@@ -853,8 +980,14 @@ class LLMService:
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
                 messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile, secret, user, session_id,
-                user_instructions, message_id, capture_thinking,
+                literature_backend, tool_profile,
+                code_execution=code_execution,
+                secret=secret,
+                user=user,
+                session_id=session_id,
+                user_instructions=user_instructions,
+                message_id=message_id,
+                capture_thinking=capture_thinking,
                 gateway_asserted=gateway_asserted,
                 local_tools=local_tools,
             ):
@@ -926,6 +1059,8 @@ class LLMService:
         custom_tool_descriptions: dict[str, str] | None = None,
         literature_backend: str | None = None,
         tool_profile: str | None = None,
+        *,
+        code_execution: bool,
         secret: bool = False,
         user: str | None = None,
         session_id: str | None = None,
@@ -987,6 +1122,8 @@ class LLMService:
         if model_supports_adaptive_thinking(model):
             request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
 
+        request_params.update(_refusal_fallback_params(model, settings.refusal_fallback))
+
         # the system prompt goes out as two separately cached blocks. Block 0 is identical
         # for every user (default prompt + response-length fragment), so one cache entry
         # per verbosity value serves the whole user base; block 1 carries only this user's
@@ -1008,6 +1145,11 @@ class LLMService:
 
         # add tool definitions if enabled
         tool_definitions = None
+        # the names this request actually advertised, local and proxied alike; every
+        # dispatch below is checked against it. Empty when tools are off, which is the
+        # right answer rather than a missing one: a turn handed no tools may dispatch
+        # none, whatever a replayed history names.
+        advertised_tools: set[str] = set()
         if enable_tools and settings.mcp_enabled:
             # the caller's resolution when it has one, so the tools the model gets are the
             # same objects the system prompt's tool names were projected off; resolving
@@ -1027,12 +1169,14 @@ class LLMService:
             #     tools and zero local ones, where pre-4h6.77 it yielded the full local
             #     set. Dormant: chat_api passes `request.enable_tools` to both.
             resolved = local_tools if local_tools is not None else self.resolve_local_tools(
-                tool_profile, enable_tools, custom_tool_descriptions
+                code_execution=code_execution,
+                enable_tools=enable_tools,
+                custom_tool_descriptions=custom_tool_descriptions,
             )
             tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
 
-            external_tools, rag_tools = resolve_proxied_tools(tool_profile)
+            external_tools, rag_tools = resolve_proxied_tools()
             tool_definitions.extend(external_tools)
             tool_definitions.extend(rag_tools)
 
@@ -1043,10 +1187,12 @@ class LLMService:
                     "cache_control": {"type": "ephemeral"},
                 }
             request_params["tools"] = tool_definitions
+            advertised_tools = {t["name"] for t in tool_definitions}
             if not secret:
                 logger.info(
                     f"Including {len(tool_definitions)} MCP tools "
-                    f"(profile={tool_profile or 'all'}, {local_count} local, "
+                    f"(surface={'code' if code_execution else 'nocode'}, "
+                    f"tool_profile={tool_profile or 'unset'}, {local_count} local, "
                     f"{len(external_tools)} external, {len(rag_tools)} RAG)"
                 )
 
@@ -1082,7 +1228,7 @@ class LLMService:
                 model_started = time.monotonic()
 
                 # retry transient Anthropic errors with exponential backoff
-                max_retries = 3
+                max_retries = settings.anthropic_max_retries
                 attempt = 0
                 for attempt in range(max_retries + 1):
                     text_yielded_this_attempt = False
@@ -1092,6 +1238,18 @@ class LLMService:
                             async with self.anthropic_client.messages.stream(**request_params) as stream:
                                 last_keepalive = 0.0
                                 async for event in stream:
+                                    # a `fallback` block marks where the requested model
+                                    # declined and another took over; say so where it
+                                    # happens, since the text after it changes voice
+                                    if (
+                                        event.type == "content_block_start"
+                                        and getattr(event.content_block, "type", None) == "fallback"
+                                    ):
+                                        text_yielded_this_attempt = True
+                                        yield StreamChunk(
+                                            type="text", content=_fallback_notice(event.content_block)
+                                        )
+                                        continue
                                     if event.type != "content_block_delta":
                                         continue
                                     delta = event.delta
@@ -1122,9 +1280,28 @@ class LLMService:
                             or (isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529))
                             or err_type in ("overloaded_error", "api_error", "internal_server_error")
                         )
+                        # A 429 is a REFUSAL, not a fault: the account's capacity is spent, so
+                        # this is off unless a caller with no waiting user (the benchmark) asks
+                        # for it. Matched on both channels for the same reason the 5xx branch
+                        # above is: mid-stream it arrives as an APIStatusError carrying the
+                        # streaming status 200, with the real type only in the body.
+                        is_rate_limited = (
+                            isinstance(e, APIStatusError) and e.status_code == 429
+                        ) or err_type == "rate_limit_error"
+                        if is_rate_limited and settings.anthropic_retry_rate_limit:
+                            is_retryable = True
                         if not is_retryable or attempt >= max_retries:
                             raise
                         wait = 2 ** attempt
+                        # Anthropic says when to come back; obey it rather than guessing, but
+                        # bound it so one header cannot park this worker indefinitely. Above
+                        # the cap the wait is refused outright rather than silently clamped:
+                        # coming back before the server said to is what it asked us not to do.
+                        retry_after = _retry_after_seconds(e) if is_rate_limited else None
+                        if retry_after is not None:
+                            if retry_after > settings.anthropic_retry_after_max_s:
+                                raise
+                            wait = retry_after
                         logger.warning(
                             f"{log_prefix}Retryable Anthropic error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
                             f"Retrying in {wait}s..."
@@ -1145,14 +1322,20 @@ class LLMService:
                 output_tok = usage.output_tokens
                 cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
                 cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
-                iter_cost = estimate_cost(model, input_tok, output_tok, cache_read, cache_create)
+                # the response names the model that produced it, which after a refusal
+                # fallback is not the one requested: that is the model whose rates apply
+                # and whose context window the meter should read against
+                served_model = getattr(message, "model", None) or model
+                iter_cost = estimate_cost(
+                    served_model, input_tok, output_tok, cache_read, cache_create
+                )
                 total_cost += iter_cost
                 total_input_tokens += input_tok
                 total_output_tokens += output_tok
                 total_cache_read += cache_read
                 total_cache_create += cache_create
                 logger.info(
-                    f"{log_prefix}API call iteration={iteration} model={model} "
+                    f"{log_prefix}API call iteration={iteration} model={served_model} "
                     f"input_tokens={input_tok} output_tokens={output_tok} "
                     f"cache_read={cache_read} cache_create={cache_create} "
                     f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
@@ -1160,7 +1343,7 @@ class LLMService:
 
                 # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
                 context_tokens = input_tok + cache_read + cache_create
-                context_window = get_context_window(model)
+                context_window = get_context_window(served_model)
                 # `input_tokens` here is the whole context, NOT the billed uncached input
                 # — it is what the browser's context meter renders against context_window,
                 # so its meaning is fixed. `cache_read` and `cache_create` are the two
@@ -1222,7 +1405,14 @@ class LLMService:
                 # encrypted and carries no readable text, so there is nothing to show.
                 # What DOES come through is the SUMMARY — `display: "summarized"` above —
                 # since no model exposes the raw chain of thought.
-                for block in message.content:
+                #
+                # A `fallback` marker persists as the same notice the stream showed, and
+                # the declining model's tool calls before it are dropped like its thinking:
+                # they were never executed, so replaying them would show calls that never
+                # ran. `_replayable_content` applies the same cut to what goes back to the
+                # API, and `tool_uses` below to what gets executed.
+                fallback_cut = _last_fallback_index(message.content)
+                for i, block in enumerate(message.content):
                     if block.type in ("thinking", "redacted_thinking"):
                         summary = getattr(block, "thinking", "") or ""
                         if capture_thinking and summary:
@@ -1233,10 +1423,48 @@ class LLMService:
                                 ),
                             )
                         continue
+                    if block.type == "fallback":
+                        all_content_blocks.append({"type": "text", "text": _fallback_notice(block)})
+                        continue
+                    if i < fallback_cut and block.type == "tool_use":
+                        continue
                     all_content_blocks.append(block.model_dump(exclude_none=True))
 
+                # a conversation that fell back once is routed straight to the fallback
+                # model for a while afterwards, with no marker block to announce it. The
+                # model name on the response is the only signal, so say so after the text.
+                if served_model != model and fallback_cut < 0:
+                    logger.warning(
+                        f"{log_prefix}Turn served by {served_model} instead of {model} "
+                        "(sticky refusal fallback)"
+                    )
+                    notice = f"\n\n*[Answered by {_model_display_name(served_model)}]*\n"
+                    yield StreamChunk(type="text", content=notice)
+                    all_content_blocks.append({"type": "text", "text": notice})
+
                 # check for tool use
-                tool_uses = [b for b in message.content if b.type == "tool_use"]
+                tool_uses = [
+                    b for i, b in enumerate(message.content)
+                    if b.type == "tool_use" and i > fallback_cut
+                ]
+
+                # a safety classifier declined the request (Fable's cover research biology,
+                # so a genetics question can trip one). Content is empty when it fired
+                # before any output and partial when it fired mid-stream; either way the
+                # turn is over, and running its tools or resuming it would be answering a
+                # request the model refused. Without this the loop reported the empty
+                # turn as a completed answer.
+                if message.stop_reason == "refusal":
+                    category = getattr(getattr(message, "stop_details", None), "category", None)
+                    logger.warning(f"{log_prefix}Model refused the request (category={category})")
+                    notice = (
+                        "\n\n---\n*The model declined this request"
+                        + (f" ({category})" if category else "")
+                        + ". Try rephrasing it.*\n"
+                    )
+                    yield StreamChunk(type="text", content=notice)
+                    all_content_blocks.append({"type": "text", "text": notice})
+                    break
 
                 # a turn cut off by the output cap carries no tool_use blocks, so the loop
                 # would otherwise break and report it as a completed answer. Resume it
@@ -1261,7 +1489,7 @@ class LLMService:
                         *request_params["messages"],
                         {
                             "role": "assistant",
-                            "content": [b.model_dump(exclude_none=True) for b in message.content],
+                            "content": _replayable_content(message.content),
                         },
                         {"role": "user", "content": CONTINUE_TRUNCATED_PROMPT},
                     ]
@@ -1297,7 +1525,7 @@ class LLMService:
                         *request_params["messages"],
                         {
                             "role": "assistant",
-                            "content": [b.model_dump(exclude_none=True) for b in message.content],
+                            "content": _replayable_content(message.content),
                         },
                         {"role": "user", "content": CONTINUE_UNFILLED_PROMPT},
                     ]
@@ -1354,7 +1582,11 @@ class LLMService:
                 subagent_tool = None
                 regular_tool_uses = []
                 for tu in tool_uses:
-                    if tu.name == "launch_subagents" and self.subagent_service:
+                    if (
+                        tu.name == "launch_subagents"
+                        and self.subagent_service
+                        and tu.name in advertised_tools
+                    ):
                         subagent_tool = tu
                     else:
                         regular_tool_uses.append(tu)
@@ -1370,9 +1602,16 @@ class LLMService:
 
                     async def _run_subagents() -> dict[str, Any]:
                         try:
+                            # the identity is this request's, not anything in
+                            # `subagent_tool.input`: it reaches run_analysis inside the
+                            # subagent and becomes the subject of the per-execution
+                            # credential, so it is threaded rather than re-derived.
                             result = await self.subagent_service.run_subagents(
                                 subagent_tool.input.get("tasks", []),
                                 progress_callback=_on_progress,
+                                user=user,
+                                session_id=session_id,
+                                gateway_asserted=gateway_asserted,
                             )
                             # log cost just like _execute_tool does
                             if result.get("success") and result.get("results"):
@@ -1394,7 +1633,7 @@ class LLMService:
                     if regular_tool_uses:
                         regular_task = asyncio.create_task(
                             asyncio.gather(
-                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
+                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted, advertised_tools=advertised_tools) for tu in regular_tool_uses)
                             )
                         )
                     else:
@@ -1417,7 +1656,7 @@ class LLMService:
                 else:
                     # no subagent tool — execute all tools in parallel as before
                     regular_results = await asyncio.gather(
-                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted) for tu in regular_tool_uses)
+                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted, advertised_tools=advertised_tools) for tu in regular_tool_uses)
                     )
                     for tu, res in zip(regular_tool_uses, regular_results):
                         raw_results_map[tu.id] = res
@@ -1514,7 +1753,7 @@ class LLMService:
                 # continue conversation with tool results
                 request_params["messages"] = [
                     *request_params["messages"],
-                    {"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in message.content]},
+                    {"role": "assistant", "content": _replayable_content(message.content)},
                     {"role": "user", "content": tool_results},
                 ]
 
@@ -1620,45 +1859,69 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         gateway_asserted: bool = False,
+        *,
+        advertised_tools: set[str],
     ) -> dict[str, Any]:
-        """Execute a tool by name using the executor or external proxy."""
+        """Execute a tool by name using the executor or external proxy.
+
+        `advertised_tools` is the set this request actually handed the model — the
+        resolved local surface plus whichever proxied surfaces it advertised — and it is
+        required rather than defaulted so no caller can dispatch without stating one.
+        """
+        log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
         try:
-            # dispatch only what the resolved tool list actually advertised, the same
-            # allowlist shape subagent.py's `_execute_subagent_tool` carries and for the
-            # same reason: the local branch below calls any executor attribute the model
-            # names, which makes withholding a tool advisory rather than enforced. The
-            # model does not have to invent the name — ChatMessage.content accepts raw
-            # blocks and _sanitize_tool_blocks drops only ORPHANED tool_use, so a
-            # client-supplied history with a paired run_analysis tool_use/tool_result
-            # survives verbatim and primes the model for a tool it was not given.
-            # disabled_tools is the profile-independent complement (it is applied before
-            # the profile filter at the resolution site above), so a name in it is
-            # advertised by no profile.
             disabled = get_settings().disabled_tools
             if tool_name in disabled:
                 logger.warning(
-                    f"Refusing to dispatch '{tool_name}': not enabled in this deployment"
+                    f"{log_prefix}Refusing to dispatch '{tool_name}': "
+                    f"not enabled in this deployment"
                 )
-                return {
-                    "success": False,
-                    "error": f"Tool '{tool_name}' is not available in this deployment.",
-                    # run_analysis carries the sandbox's own operator-error type because
-                    # that is what the script_result chunk and the benchmark read; the
-                    # point of both is that a withheld tool must not look transient, or
-                    # the model retries a deployment fact (genetics-results-suite-4h6.56)
-                    "error_type": (
-                        "SandboxNotConfigured"
-                        if tool_name == "run_analysis"
-                        else "ToolNotEnabled"
-                    ),
-                    "retryable": False,
-                }
+                return _refused_tool_result(
+                    tool_name,
+                    f"Tool '{tool_name}' is not available in this deployment.",
+                    "ToolNotEnabled",
+                )
+
+            # dispatch only what this request advertised, the same allowlist shape
+            # subagent.py's `_execute_subagent_tool` carries and for the same reason: the
+            # local branch below calls any executor attribute the model names, so without
+            # this the surface would be advisory — a name it withheld still executes. The
+            # model does not have to invent the name: ChatMessage.content accepts raw
+            # blocks and _sanitize_tool_blocks drops only ORPHANED tool_use, so a
+            # client-supplied history with a paired tool_use/tool_result survives verbatim
+            # and primes the model for a tool this surface does not carry. On the code
+            # surface that is the whole of requirement 2 — the old per-dataset tools are
+            # not merely unlisted, they cannot run — and in the other direction it is what
+            # keeps run_analysis, whose dispatch mints a per-execution credential under
+            # this user, out of a no-code turn.
+            #
+            # The check reads the RESOLVED set and never the profile string: the surface
+            # was decided once, at the edge, and re-deriving it here from a name is how
+            # the two would come to disagree.
+            if tool_name not in advertised_tools:
+                logger.warning(
+                    f"{log_prefix}Refusing to dispatch '{tool_name}': not in the tool "
+                    f"surface this request advertised"
+                )
+                return _refused_tool_result(
+                    tool_name,
+                    f"Tool '{tool_name}' is not available in this conversation.",
+                    "ToolNotAvailable",
+                )
 
             # subagent tool
             if tool_name == "launch_subagents":
                 if not self.subagent_service:
                     return {"success": False, "error": "Subagent service not initialized"}
-                result = await self.subagent_service.run_subagents(tool_input.get("tasks", []))
+                # same request-context identity the run_analysis branch below injects: a
+                # subagent that names run_analysis executes as this caller, never as
+                # anything the model wrote into `tasks`
+                result = await self.subagent_service.run_subagents(
+                    tool_input.get("tasks", []),
+                    user=user,
+                    session_id=session_id,
+                    gateway_asserted=gateway_asserted,
+                )
                 if result.get("success") and result.get("results"):
                     total_in = sum(r.get("input_tokens", 0) for r in result["results"])
                     total_out = sum(r.get("output_tokens", 0) for r in result["results"])

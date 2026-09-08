@@ -232,6 +232,7 @@ class TestBackendIsCallerControlled:
             "search_scientific_literature",
             {"query": "platelet count", "backend": "europepmc"},
             literature_backend="perplexity",
+            advertised_tools={"search_scientific_literature"},
         )
         await service.executor.close()
 
@@ -242,6 +243,7 @@ class TestBackendIsCallerControlled:
             "search_scientific_literature",
             {"query": "platelet count"},
             literature_backend="europepmc",
+            advertised_tools={"search_scientific_literature"},
         )
         await service.executor.close()
 
@@ -254,6 +256,7 @@ class TestBackendIsCallerControlled:
             "search_scientific_literature",
             {"query": "platelet count", "backend": "europepmc"},
             literature_backend=None,
+            advertised_tools={"search_scientific_literature"},
         )
         await service.executor.close()
 

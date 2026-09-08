@@ -28,12 +28,11 @@ from genetics_mcp_server.skills.definitions import (
     get_skill_instructions,
 )
 from genetics_mcp_server.skills.sandbox_tools import (
-    execute_script,
     get_sandbox_tool_definitions,
     list_directory,
     read_file,
 )
-from genetics_mcp_server.tools import ServerToolExecutor, get_anthropic_tools
+from genetics_mcp_server.tools import ServerToolExecutor, all_anthropic_tools
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +93,10 @@ class SubagentService:
         self,
         tasks: list[dict[str, str]],
         progress_callback: Callable[[str], None] | None = None,
+        *,
+        user: str | None,
+        session_id: str | None,
+        gateway_asserted: bool,
     ) -> dict[str, Any]:
         """Run multiple subagents in parallel and return collected results.
 
@@ -101,6 +104,13 @@ class SubagentService:
             tasks: List of dicts with 'skill', 'query', and optional 'context' keys.
             progress_callback: Optional callback invoked with progress messages
                 at subagent start, tool calls, completion, and failure.
+            user, session_id, gateway_asserted: the caller's authenticated identity, taken
+                from the REQUEST CONTEXT and threaded down to `run_analysis` so a subagent
+                can execute code under the subject the request was authenticated as.
+                `tasks` is model-written and is never a source for these; keyword-only so
+                that no positional call site can slide a task field into the subject of a
+                per-execution credential, and required so that a call site which forgets
+                them fails with a TypeError rather than running anonymously.
         """
         settings = get_settings()
 
@@ -129,7 +139,12 @@ class SubagentService:
         ) -> SubagentResult:
             try:
                 return await asyncio.wait_for(
-                    self._run_subagent(skill, query, context, progress_callback, subagent_id),
+                    self._run_subagent(
+                        skill, query, context, progress_callback, subagent_id,
+                        user=user,
+                        session_id=session_id,
+                        gateway_asserted=gateway_asserted,
+                    ),
                     timeout=timeout,
                 )
             except asyncio.TimeoutError:
@@ -145,6 +160,11 @@ class SubagentService:
                     error=f"Timed out after {timeout}s",
                 )
 
+        # what parallelism here buys is CONTEXT ISOLATION, not wall-clock: each subagent
+        # debugs its own script without the failed attempts landing in the main
+        # conversation. The sandbox is replicas: 1 behind a one-running / two-waiting
+        # scheduler, so four parallel run_analysis subagents means one runs, two queue and
+        # the fourth is rejected.
         results = await asyncio.gather(
             *(
                 _run_with_timeout(s, q, c, f"sa-{i + 1}")
@@ -189,8 +209,15 @@ class SubagentService:
         context: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
         subagent_id: str = "sa-0",
+        *,
+        user: str | None,
+        session_id: str | None,
+        gateway_asserted: bool,
     ) -> SubagentResult:
-        """Run a single subagent with its own agentic loop."""
+        """Run a single subagent with its own agentic loop.
+
+        The identity triple is carried through untouched; see `run_subagents`.
+        """
         settings = get_settings()
         model = skill.model or settings.subagent_model or settings.fast_model
 
@@ -314,14 +341,24 @@ class SubagentService:
                 tool_results = []
                 for tool_use in tool_uses:
                     tools_used.append(tool_use.name)
-                    params_str = _format_tool_params(tool_use.input)
+                    # a model-invented identity is discarded at dispatch, so it must not
+                    # reach the log either: a forged `user` in an operator log reads as
+                    # identity in a log join. Same strip as the main chat path.
+                    logged_input = dict(tool_use.input)
+                    if tool_use.name == "run_analysis":
+                        for key in ("user", "session_id", "gateway_asserted"):
+                            logged_input.pop(key, None)
+                    params_str = _format_tool_params(logged_input)
                     logger.info(
                         f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}"
                     )
                     if progress_callback:
                         progress_callback(f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}")
                     result = await self._execute_subagent_tool(
-                        tool_use.name, dict(tool_use.input), skill
+                        tool_use.name, dict(tool_use.input), skill,
+                        user=user,
+                        session_id=session_id,
+                        gateway_asserted=gateway_asserted,
                     )
                     result_json = json.dumps(result)
 
@@ -385,56 +422,43 @@ class SubagentService:
             )
 
     def _get_tool_definitions(self, skill: SkillDefinition) -> list[dict[str, Any]]:
-        """Build tool definitions for a skill based on its categories and extras."""
+        """Build tool definitions for a skill from the tool names it declares."""
         settings = get_settings()
 
-        # determine tool_profile from categories
-        # map skill categories to the closest tool_profile
-        if {"api", "general"} <= skill.tool_categories:
-            tool_profile = "api"
-        elif {"bigquery", "general"} <= skill.tool_categories:
-            tool_profile = "bigquery"
-        else:
-            tool_profile = "rag"  # general-only
-
-        # exclude orchestration tools to prevent recursive subagent launches, to keep a
-        # subagent away from another execution's artifacts, and to keep code execution on
-        # the one path that holds the authenticated identity the per-execution credential is
-        # minted from — a subagent has no session of its own. The exclusion is by NAME, not
-        # by category: TOOL_PROFILES puts "orchestration" in both the api and bigquery
-        # profiles, so the category is present in three of the five skills and every
-        # orchestration tool must be listed here individually to actually be dropped
+        # exclude orchestration tools to prevent recursive subagent launches and to keep a
+        # subagent away from another execution's artifacts: read_artifact resolves a
+        # model-supplied name against the executions one (user, session) pair ran, and
+        # several subagents share the caller's session here. This is belt-and-braces over
+        # the skills not naming them: it also strips whatever the operator disabled, and a
+        # skill list is the kind of thing that gets extended without re-deriving the hazard.
+        #
+        # run_analysis is deliberately NOT in this set. The caller threads its authenticated
+        # (user, session_id) into run_subagents, so an execution a subagent starts is minted
+        # against the subject the request was authenticated as; a skill still has to name the
+        # tool, and a caller that threads no identity gets run_analysis's own refusal rather
+        # than an execution attributed to nobody.
         disabled = set(settings.disabled_tools) if settings.disabled_tools else set()
         disabled |= {
             "launch_subagents",
-            "run_analysis",
             "read_artifact",
             "list_capabilities",
         }
 
-        tools = get_anthropic_tools(
-            tool_profile=tool_profile,
-            disabled_tools=disabled,
-        )
-
-        # filter to only extra_tools if categories are minimal
-        if skill.extra_tools:
-            extra_names = set(skill.extra_tools)
-            existing_names = {t["name"] for t in tools}
-            # add any extra tools that aren't already included
-            if not extra_names.issubset(existing_names):
-                # `disabled`, not settings.disabled_tools: this fallback is a second path
-                # into the tool list and would otherwise re-add the orchestration tools
-                # excluded above for any skill that named one in extra_tools
-                all_tools = get_anthropic_tools(disabled_tools=disabled)
-                for tool in all_tools:
-                    if tool["name"] in extra_names and tool["name"] not in existing_names:
-                        tools.append(tool)
+        # neither surface is consulted: the skill's tool set and `disabled` are the only
+        # narrowing, and a skill names both data tools and run_analysis, which no single
+        # surface carries. That bites the day launch_subagents is granted on a surface which
+        # withholds run_analysis — data_analysis would hand it straight back. Today no
+        # surface carries launch_subagents at all, and SANDBOX_ENABLED=false is not such a
+        # surface either: it drops run_analysis into `disabled`.
+        tools = [
+            tool
+            for tool in all_anthropic_tools(disabled_tools=disabled)
+            if tool["name"] in skill.tools
+        ]
 
         # add sandbox tools
         sandbox_tools = get_sandbox_tool_definitions(
             allow_file_read=skill.allow_file_read and settings.enable_subagents,
-            allow_script_exec=skill.allow_script_exec and settings.enable_script_execution,
         )
         tools.extend(sandbox_tools)
 
@@ -448,8 +472,16 @@ class SubagentService:
         tool_name: str,
         tool_input: dict[str, Any],
         skill: SkillDefinition,
+        *,
+        user: str | None,
+        session_id: str | None,
+        gateway_asserted: bool,
     ) -> dict[str, Any]:
-        """Execute a tool call from a subagent."""
+        """Execute a tool call from a subagent.
+
+        The identity triple comes from the caller's request context, never from
+        `tool_input`; see the run_analysis branch below.
+        """
         settings = get_settings()
 
         try:
@@ -457,8 +489,8 @@ class SubagentService:
             # branch below calls any executor attribute the model names, which makes the
             # by-name exclusion in _get_tool_definitions advisory rather than enforced: a
             # subagent whose task text is written by a model that DOES have run_analysis
-            # could name it here and reach mint_execution_tokens under a `user` it supplied,
-            # forging the subject of both per-execution JWTs and the audit trail
+            # could name it here. run_analysis is declared by one skill, so this guard is
+            # what keeps the other four from reaching it by naming it
             declared = {t["name"] for t in self._get_tool_definitions(skill)}
             if tool_name not in declared:
                 logger.warning(
@@ -479,16 +511,6 @@ class SubagentService:
                 allowed = skill.allowed_paths or settings.subagent_allowed_paths_list
                 return await list_directory(tool_input["path"], allowed)
 
-            if tool_name == "execute_script":
-                allowed = skill.allowed_paths or settings.subagent_allowed_paths_list
-                return await execute_script(
-                    interpreter=tool_input["interpreter"],
-                    script=tool_input["script"],
-                    working_dir=allowed[0] if allowed else "/tmp",
-                    allowed_paths=allowed,
-                    timeout=settings.subagent_script_timeout,
-                )
-
             # external tools
             if is_external_tool(tool_name):
                 return await execute_external_tool(tool_name, tool_input)
@@ -498,12 +520,49 @@ class SubagentService:
             if method is None:
                 return {"success": False, "error": f"Unknown tool: {tool_name}"}
 
+            # the identity a sandbox execution runs as is the CALLER'S, threaded from the
+            # request context — never the subagent's tool input, which a model writes.
+            # Stripped first and then injected, exactly as llm_service._execute_tool does on
+            # the main chat path: run_analysis is splatted with **tool_input, so a
+            # model-invented `user` would otherwise become the subject of both
+            # per-execution JWTs and of every audit record.
+            if tool_name == "run_analysis":
+                tool_input = {
+                    k: v
+                    for k, v in tool_input.items()
+                    if k not in ("user", "session_id", "gateway_asserted")
+                }
+                tool_input["user"] = user
+                tool_input["session_id"] = session_id
+                tool_input["gateway_asserted"] = gateway_asserted
+
             result = await method(**tool_input)
+
+            if tool_name == "run_analysis" and isinstance(result, dict):
+                # artifacts_note is written for the main chat path and both of its branches
+                # are false here: nothing rendered from a subagent reaches the user, and
+                # read_artifact is denied to subagents in _get_tool_definitions.
+                result = {k: v for k, v in result.items() if k != "artifacts_note"}
+
+                if isinstance(result.get("images"), list):
+                    # the same strip the main chat path does, for its reason plus one more:
+                    # there a figure is pulled out and streamed to the user, whereas a
+                    # subagent's tool result is JSON going back to the subagent, so the
+                    # base64 is tokens nobody can see. The names survive — they are what the
+                    # caller has to work with.
+                    names = [
+                        img.get("name") for img in result["images"] if isinstance(img, dict)
+                    ]
+                    result = {k: v for k, v in result.items() if k != "images"}
+                    result["note"] = (
+                        "Image artifacts are not displayed from a subagent. Name them in "
+                        f"your report so the caller can retrieve them: {names}"
+                    )
 
             # lazy import to avoid circular dependency with llm_service
             from genetics_mcp_server.llm_service import _process_download_hints
 
-            return _process_download_hints(result, tool_name=tool_name)
+            return _process_download_hints(result, owner=user, tool_name=tool_name)
 
         except Exception as e:
             logger.error(f"Subagent tool '{tool_name}' error: {e}")

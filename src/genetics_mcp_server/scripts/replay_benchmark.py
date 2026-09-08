@@ -63,8 +63,25 @@ logger = logging.getLogger(__name__)
 
 CHAT_PATH = "/chat/v1/chat"
 
-# `tool_profile: null` means "all tools" (definitions.py), and null is unspellable on
-# the command line, so this literal is how a caller asks for it.
+# the two arms the benchmark exists to compare. The surface is one boolean now — "code" is
+# code execution and every other value is the no-code surface — so these are the only two
+# wire values that straddle the line; any other pair either repeats a surface or misspells
+# one, and both of those are refused below.
+CODE_ARM = "code"
+NOCODE_ARM = "nocode"
+
+# the tool the code arm IS: an arm that resolved without it is not the surface it names.
+# Kept as the harness's OWN literal rather than imported, for the same reason as
+# MAX_ITERATIONS_MARKER below — the harness reads a REMOTE server, which may not be this
+# build — with a test pinning it against the definitions. That pin catches a rename in
+# this package, not one on the server the harness talks to.
+CODE_EXECUTION_TOOL = "run_analysis"
+
+# null is unspellable on the command line, so this literal is how a caller spells
+# `tool_profile: null` on the wire — the one value no other arm name can express, which is
+# why it survives as an explicit alias rather than as a default. It resolves to the no-code
+# surface like every value except "code", so pairing it with `nocode` is two names for one
+# surface and the identical-surface guard below refuses the run.
 ALL_TOOLS_ARM = "all"
 
 REPORTED_PERCENTILES = (25, 50, 75, 90, 95)
@@ -1039,7 +1056,7 @@ async def replay_case_arm(
     return records
 
 
-def arm_order_for_case(arms: tuple[str, str], case_index: int) -> list[str]:
+def arm_order_for_case(arms: tuple[str, ...], case_index: int) -> list[str]:
     """The alternating arm order for case i: (a, b) when even, (b, a) when odd."""
     return list(arms) if case_index % 2 == 0 else list(reversed(arms))
 
@@ -1049,7 +1066,7 @@ async def replay_case(
     base_url: str,
     case: dict[str, Any],
     case_index: int,
-    arms: tuple[str, str],
+    arms: tuple[str, ...],
     run_id: str,
     model: str | None,
     provider: str | None,
@@ -1259,7 +1276,7 @@ def summarize_arm(records: list[TurnRecord]) -> dict[str, Any]:
 
 
 def matched_pairs(
-    all_turns: list[TurnRecord], arms: tuple[str, str]
+    all_turns: list[TurnRecord], arms: tuple[str, ...]
 ) -> tuple[set[tuple[str, int]], dict[str, int]]:
     """The `(case_id, turn_index)` keys that succeeded on BOTH arms, plus per-arm dropout.
 
@@ -1281,7 +1298,8 @@ RESOLVED_TOOLS_PATH = "/chat/v1/tools/resolved"
 
 
 class ArmResolutionError(RuntimeError):
-    """An arm does not name a profile the target server knows."""
+    """An arm pair the server's own answer refuses: an unknown profile name, an arm on
+    the wrong side of the code-execution tool, or two arms that are one surface."""
 
 
 class RateLimitedError(RuntimeError):
@@ -1289,22 +1307,34 @@ class RateLimitedError(RuntimeError):
 
 
 async def resolve_arm_tools(
-    client: httpx.AsyncClient, base_url: str, arms: tuple[str, str]
+    client: httpx.AsyncClient, base_url: str, arms: tuple[str, ...]
 ) -> dict[str, Any]:
     """Ask the SERVER what each arm actually resolves to, before spending anything.
 
-    Two things this prevents, both of which produce a run that looks fine and means nothing:
+    Three things this prevents, each of which produces a run that looks fine and means
+    nothing:
 
-    1. A MISSPELLED ARM. `get_anthropic_tools` degrades an unrecognised profile to
-       general-only rather than raising — deliberately, because the value comes back from
-       rows written by older clients — so `--arm-a nocod` silently yields an 18-tool
-       baseline and reports plausible numbers against it. `known_profile: false` is fatal
+    1. A MISSPELLED ARM. `code_execution_requested` coerces an unrecognised profile to the
+       no-code surface rather than raising — deliberately, because the value comes back
+       from rows written by older clients — so `--arm-a cod` silently yields the no-code
+       surface and reports plausible numbers against it. `known_profile: false` is fatal
        here: refusing to start costs nothing, and the alternative is discovering it after
-       the spend.
-    2. A SERVER RUNNING OLDER CODE. The profile is resolved in the chat service's process,
-       which imports the definitions at startup. A profile added on disk but not yet loaded
-       by a running server resolves through the same silent fallback, and locally that is
-       one forgotten restart away.
+       the spend. It is the server's own answer, not a list this harness keeps: the
+       endpoint reports `known_profile` from `KNOWN_TOOL_PROFILES` as the running build
+       has it, so a value that server accepts is accepted here.
+    2. AN ARM THAT IS NOT THE SURFACE IT NAMES. `known_profile` says the NAME was
+       recognised; it says nothing about what came back. The flag subtraction runs AFTER
+       the surface resolves, so a chat service with SANDBOX_ENABLED=false serves a `code`
+       arm with no `run_analysis` in it — measured 2026-08-27, a run that then completed,
+       was judged, and had the code arm declared the winner on a case where it had burned
+       an iteration force-calling a tool it had not been given. The boolean makes the check
+       exact in both directions: the `code` arm must resolve WITH the code-execution tool
+       and any other arm WITHOUT it, and an arm on the wrong side of that is fatal.
+    3. TWO ARMS THAT ARE ONE SURFACE (paired runs only; a single-arm run has no pair). Since the profile names collapsed onto two surfaces,
+       every legacy value except `code` resolves to the same tools, so a pair like
+       `all`/`bigquery` compares a surface against itself and reports a difference of zero
+       that reads as a real result. Identical resolved name sets are fatal for the same
+       reason a misspelling is.
 
     The resolved counts and names are recorded in the report so a saved run PROVES what each
     arm was given, rather than leaving it to be re-derived later from a tree that has since
@@ -1347,23 +1377,79 @@ async def resolve_arm_tools(
         else:
             logger.info("arm %r resolves to %s local tools", arm, data.get("count"))
     if unknown:
+        detail = ", ".join(
+            f"{arm} (resolved to {out[arm].get('count')} local tools)" for arm in unknown
+        )
         raise ArmResolutionError(
-            f"{base_url} does not recognise these arm profiles: {', '.join(unknown)}. "
-            "An unrecognised profile silently degrades to general-only (18 tools), so this "
+            f"{base_url} does not recognise these arm profiles: {detail}. An unrecognised "
+            "profile silently resolves to the no-code surface rather than raising, so this "
             "run would have measured a surface you did not intend. Check the spelling, and "
             "check the server has been restarted since the profile was added."
+        )
+    for arm in arms:
+        names = out.get(arm, {}).get("names")
+        if not isinstance(names, list):
+            # survivable — an unresolved arm does not invalidate the run — but it disables
+            # BOTH guards for that arm silently, so say which ones stopped protecting it
+            logger.warning(
+                "arm %r did not resolve on %s, so neither the %s check nor the "
+                "identical-surface check ran for it. The run is still valid; verify the "
+                "arms by hand.",
+                arm,
+                base_url,
+                CODE_EXECUTION_TOOL,
+            )
+            continue
+        wants_code = arm == CODE_ARM
+        has_code = CODE_EXECUTION_TOOL in names
+        if wants_code == has_code:
+            continue
+        if wants_code:
+            raise ArmResolutionError(
+                f"arm {arm!r} resolved to {len(names)} local tools WITHOUT "
+                f"{CODE_EXECUTION_TOOL} on {base_url}, so this run would measure a "
+                "degraded arm and report it as the code arm. The usual cause is the flag "
+                "subtraction, which runs after the surface resolves: SANDBOX_ENABLED must "
+                "be true for chat-api, db-api and results-api, and the sandbox itself has "
+                "to be reachable."
+            )
+        raise ArmResolutionError(
+            f"arm {arm!r} resolved to {len(names)} local tools INCLUDING "
+            f"{CODE_EXECUTION_TOOL} on {base_url}. Only 'code' selects the code-execution "
+            "surface, so this server predates that collapse and both arms would be able to "
+            "run scripts — which is not the comparison this benchmark makes."
+        )
+    if len(arms) < 2:
+        # single-arm mode: there is no second surface to be identical to. The `none`
+        # sentinel is resolved to a one-arm tuple by main() and never reaches here, so an
+        # arm name is always a name the server was asked about.
+        return out
+    arm_a, arm_b = arms
+    names_a = out.get(arm_a, {}).get("names")
+    names_b = out.get(arm_b, {}).get("names")
+    if (
+        isinstance(names_a, list)
+        and isinstance(names_b, list)
+        and set(names_a) == set(names_b)
+    ):
+        raise ArmResolutionError(
+            f"arms {arm_a!r} and {arm_b!r} both resolve to the same {len(set(names_a))} "
+            f"local tools on {base_url}, so this run would compare a surface against "
+            "itself and report a difference of zero that reads as a real result. Every "
+            "profile name except 'code' now selects the no-code surface, so pick arms "
+            "that straddle that line."
         )
     return out
 
 
-async def _dry_run_resolve(base_url: str, arms: tuple[str, str]) -> dict[str, Any]:
+async def _dry_run_resolve(base_url: str, arms: tuple[str, ...]) -> dict[str, Any]:
     """resolve_arm_tools with its own short-lived client, for the --dry-run path."""
     async with httpx.AsyncClient(timeout=30.0) as client:
         return await resolve_arm_tools(client, base_url, arms)
 
 
 def build_report(
-    cases: list[CaseResult], arms: tuple[str, str], config: dict[str, Any]
+    cases: list[CaseResult], arms: tuple[str, ...], config: dict[str, Any]
 ) -> dict[str, Any]:
     all_turns = [t for c in cases for t in c.turns]
     matched, dropped = matched_pairs(all_turns, arms)
@@ -1653,7 +1739,7 @@ def load_cases(dataset: Path, limit: int | None) -> list[dict[str, Any]]:
 async def run_benchmark(
     dataset: Path,
     base_url: str,
-    arms: tuple[str, str],
+    arms: tuple[str, ...],
     limit: int | None,
     concurrency: int,
     model: str | None,
@@ -1762,8 +1848,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="chat service base URL. Deliberately localhost by default: pointing this at "
         "production spends real money (measured mean $2.01/turn).",
     )
-    parser.add_argument("--arm-a", default=ALL_TOOLS_ARM, help=f"tool_profile for arm A ('{ALL_TOOLS_ARM}' = all tools)")
-    parser.add_argument("--arm-b", default="bigquery", help="tool_profile for arm B")
+    parser.add_argument(
+        "--arm-a",
+        default=NOCODE_ARM,
+        help=f"tool_profile for arm A, the baseline (default {NOCODE_ARM!r}; "
+        f"'{ALL_TOOLS_ARM}' spells tool_profile: null, which is the same surface)",
+    )
+    parser.add_argument(
+        "--arm-b",
+        default=CODE_ARM,
+        help=f"tool_profile for arm B, the candidate (default {CODE_ARM!r}; it is the only "
+        "value that selects the code-execution surface), or 'none' to run arm A alone "
+        "(no pairing, no judging)",
+    )
     parser.add_argument("--limit", type=int, default=None, help="max cases to replay")
     parser.add_argument("--max-turns", type=int, default=None, help="max user turns per case")
     parser.add_argument("--concurrency", type=int, default=1, help="cases in flight (arms within a case are always sequential)")
@@ -1816,14 +1913,24 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
 
-    if args.arm_a == args.arm_b:
-        print("arm-a and arm-b must differ", file=sys.stderr)
+    # `--arm-b none` is the single-arm mode: measure ONE profile against a previous run's
+    # recorded numbers instead of against a live opposite arm. It is worth having because the
+    # counters that decide a prompt/image change (iterations, tool calls, wall clock, what the
+    # scripts did) are per-arm, and paying for a second arm that has not changed buys nothing.
+    # It is NOT a substitute for the paired run: everything the pairing exists to defend
+    # against — a model swap, an API slowdown, a cache warm-up mid-run — lands entirely on the
+    # single arm and is indistinguishable from the change under test, and `pairwise_judge` has
+    # nothing to compare, so QUALITY IS NOT MEASURED AT ALL. Use it to see whether a change
+    # moved the mechanics; use the paired run to decide a rollout.
+    single_arm = str(args.arm_b).lower() in ("", "none")
+    if not single_arm and args.arm_a == args.arm_b:
+        print("arm-a and arm-b must differ (use --arm-b none to run one arm)", file=sys.stderr)
         return 2
     if not args.dataset.exists():
         print(f"dataset not found: {args.dataset}", file=sys.stderr)
         return 2
 
-    arms = (args.arm_a, args.arm_b)
+    arms = (args.arm_a,) if single_arm else (args.arm_a, args.arm_b)
 
     if args.model and not has_pricing(args.model):
         print(
@@ -1841,8 +1948,8 @@ def main(argv: list[str] | None = None) -> int:
         turns = sum(
             len((c.get("user_turns") or [])[: args.max_turns]) for c in cases
         )
-        print(f"{len(cases)} cases, {turns} turns per arm, {turns * 2} model turns total")
-        print(f"arms: {arms[0]} vs {arms[1]}   target: {args.base_url}")
+        print(f"{len(cases)} cases, {turns} turns per arm, {turns * len(arms)} model turns total")
+        print(f"arms: {' vs '.join(arms)}   target: {args.base_url}")
         # the cheapest place a misspelled arm can possibly be caught, so catch it here too
         # rather than only in the paid path. Reaches the server but spends nothing.
         try:
@@ -1856,7 +1963,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {arm:>8} resolves to {info['count']} local tools")
         for i, c in enumerate(cases):
             order = arm_order_for_case(arms, i)
-            print(f"  {i:>3} {c.get('session_id')} order={order[0]},{order[1]}")
+            print(f"  {i:>3} {c.get('session_id')} order={','.join(order)}")
         if args.judge:
             # the ceiling: every turn matching on both arms. Turns that fail on one arm are
             # not judged, so the real pair count can only be lower — an over-estimate is the
@@ -1883,6 +1990,9 @@ def main(argv: list[str] | None = None) -> int:
                 capture_thinking=args.capture_thinking,
             )
         )
+    except ArmResolutionError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        return 2
     except RateLimitedError as exc:
         turns_needed = sum(
             len((c.get("user_turns") or [])[: args.max_turns])

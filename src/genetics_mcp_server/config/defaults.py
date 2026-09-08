@@ -28,6 +28,8 @@ import re
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 
+from genetics_mcp_server import schema_docs
+
 
 @dataclass(frozen=True)
 class _Block:
@@ -451,7 +453,7 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
         requires_any=_fs("query_database", "run_analysis"),
     ),
     _Block(
-        "`genetics.sql(...)` inside a script is the only route to the database on this surface. Discover the schema before writing a query — `genetics.schema()` returns the column-level schema of every view and `genetics.schema('credible_sets_v')` just one — rather than guessing a column name.\n",
+        "`genetics.sql(...)` inside a script is the only route to the database on this surface. The complete schema is in this prompt, under \"BigQuery view reference\" below: every view, its columns and BigQuery types, the allowed values of its categorical columns, and worked example SQL. **You already have it — do not spend a script discovering it.** Write the query directly. The same text is also on disk in the sandbox at `$GENETICS_SCHEMA_DIR`, and `genetics.schema()` returns the column-level schema as a live call, but reading either costs a round trip and tells you what is written below.\n",
         excludes=_fs("query_database"),
         requires_any=_fs("run_analysis"),
     ),
@@ -484,6 +486,16 @@ A single resource often contains multiple datasets (e.g. `finngen` includes the 
     # llm_service.py for every profile except `rag` and the allow-list ones) is a further
     # annotation route that nothing here accounts for, and whether one is configured is
     # not visible from this repo.
+    # the code surface carries `get_myvariant_annotations` (an outside resource no script
+    # can reach) without `get_variant_annotations`, and both SDK variants below exclude it,
+    # so without this the prohibition above reaches that surface with no route at all.
+    # Self-gating on the protein-effect tool through the text rule, which is why a surface
+    # with myvariant but no protein-effect tool would fall through — none exists.
+    _Block(
+        "\nThose per-variant annotations are not in the database. `get_myvariant_annotations` returns a variant's consequence, clinical significance, pathogenicity scores and population frequencies, and for a coding SNV `get_variant_protein_effect` adds the amino-acid change. Beyond those, say what is missing rather than approximating it from the columns above.\n",
+        requires_any=_fs("query_database", "run_analysis"),
+        excludes=_fs("get_variant_annotations"),
+    ),
     _Block(
         "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID. Beyond those two — non-coding variants, pathogenicity scores, multi-population frequencies — say what is missing rather than approximating it from the columns above.\n",
         requires_any=_fs("run_analysis"),
@@ -550,7 +562,7 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
 - **literature_review**: Best for searching scientific literature and the web for papers, biological context, and drug/target information
 - **database_analysis**: Best for complex SQL queries — cross-dataset comparisons, custom aggregations, or filters the API tools cannot express
 - **variant_list_analysis**: Best for analyzing 3+ variants together — shared phenotype associations, QTL patterns, tissue enrichment, nearest genes
-- **data_analysis**: Best for statistical computations, data processing, or generating plots with Python (matplotlib/polars/scipy)
+- **data_analysis**: Best for a Python analysis the subagent runs itself in the sandbox — statistical computations or data processing — iterating on failures and reporting the printed output. Its figures are NOT displayed to the user, so call `run_analysis` yourself when you need a plot
 
 **Structuring subagent tasks effectively:**
 - Give each subagent a clear, self-contained question — it cannot see the main conversation
@@ -614,10 +626,23 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
 - For a question a single tool answers, call the tool. A script is not cheaper than one call.
 """),
     _Block(
+        "- **`genetics.show(df)` is the route that prints a frame in full** — every column of every row, "
+        "one row per line, nothing elided. polars' own repr is built for a terminal and silently drops "
+        "columns and rows; do not try to widen it with `pl.Config`, use `show()`. If output still looks "
+        "cut, that is the 64 KiB stdout window — print less rather than printing again wider.\n",
+        requires_any=_fs("run_analysis"),
+    ),
+    _Block(
         "\n- Scripts are the only data path on this surface, so a question that needs data needs a script. Everything the SDK exposes is discoverable with list_capabilities; do not conclude data is unavailable without checking there first.\n",
         excludes=_fs("get_credible_sets_by_gene", "query_database"),
     ),
-    _Block("""- When a follow-up question refers to results from a previous step, think about which of the paths above can answer it.
+    # the narrowing bullet cites "the rule above", the re-query grounding block, but the two
+    # gates differ by one name: that one takes get_credible_set_by_id where this one takes
+    # get_credible_sets_by_gene. the citation holds only because no shipped profile carries
+    # get_credible_sets_by_gene without one of get_credible_set_by_id / query_database /
+    # run_analysis — such a profile would emit this bullet with no rule above it.
+    _Block("""- **A follow-up that narrows an earlier result re-runs that retrieval with the filter added.** When the ask is the same table minus a locus, a gene family or a category, add the predicate to the query or script that produced it and run that again, rather than rebuilding the analysis from scratch. Re-running a retrieval you already wrote, with a predicate added, IS the fresh authoritative call the rule above asks for — what that rule forbids is answering from an earlier summary or from a subset you curated, not re-issuing a retrieval. Do not re-issue a schema discovery call for a schema this conversation has already used; that applies to discovery calls only — where the schema ships as files alongside your tools, reading the file for a view still comes before writing SQL.
+- When a follow-up question refers to results from a previous step, think about which of the paths above can answer it.
 - Always review your full set of available tools before concluding that data is unavailable.
 """,
         requires_any=_fs("get_credible_sets_by_gene", "query_database", "run_analysis"),
@@ -714,6 +739,24 @@ When interpreting phenotype reports from get_phenotype_report, use the following
 
 Score for each gene is an estimate between 0 and 1 for the probability that the gene is causal for the phenotype. This score is crude and based on coding variant / eQTL / pQTL / caQTL evidence for the gene as well as the gene's distance to the lead variant.
 """),
+    # LAST, and large. Two reasons for the position rather than one: a ~21k-token block
+    # that never varies belongs at the end of the cacheable prefix, and the instructions
+    # above stay closer to the conversation than the reference they are about.
+    #
+    # Gated exactly like the sql() block above — this is the surface whose ONLY route to
+    # the database is a script, so it is the surface that was paying a round trip per view
+    # to read what is now here. `query_database` surfaces keep get_database_schema, which
+    # is a live call and a different contract; giving them both would put a build-time
+    # snapshot next to a live one with nothing saying which wins.
+    _Block(
+        "\n\n# BigQuery view reference\n\n"
+        "Generated from the dataset registry at build time and complete as it stands. It is\n"
+        "the same text the sandbox carries at `$GENETICS_SCHEMA_DIR`.\n\n"
+        + schema_docs.schema_reference()
+        + "\n",
+        excludes=_fs("query_database"),
+        requires_any=_fs("run_analysis"),
+    ),
 )
 
 
@@ -729,15 +772,10 @@ def known_tool_names() -> frozenset[str]:
     """
     global _known_tool_names_cache
     if _known_tool_names_cache is None:
-        from genetics_mcp_server.tools.definitions import (
-            BIGQUERY_TOOL_DEFINITIONS,
-            SUBAGENT_TOOL_DEFINITIONS,
-            TOOL_DEFINITIONS,
-        )
+        from genetics_mcp_server.tools.definitions import all_local_tool_definitions
 
         _known_tool_names_cache = frozenset(
-            t["name"]
-            for t in (*TOOL_DEFINITIONS, *BIGQUERY_TOOL_DEFINITIONS, *SUBAGENT_TOOL_DEFINITIONS)
+            t["name"] for t in all_local_tool_definitions()
         )
     return _known_tool_names_cache
 

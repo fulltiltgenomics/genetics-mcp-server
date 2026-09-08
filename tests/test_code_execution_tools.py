@@ -21,7 +21,12 @@ from genetics_mcp_server.sandbox_client import ArtifactResult
 from genetics_mcp_server.tools import ServerToolExecutor
 from genetics_mcp_server.tools import executor as executor_module
 from genetics_mcp_server.tools import orchestration as orchestration_module
-from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS, get_anthropic_tools
+from genetics_mcp_server.tools.definitions import (
+    CODE_EXECUTION_TOOL_DEFINITIONS,
+    code_execution_requested,
+    get_anthropic_tools,
+    resolve_tools,
+)
 
 PNG_HEADER = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
 
@@ -41,29 +46,31 @@ def _clean_manifest_registry():
 
 class TestToolDefinitions:
     def test_both_tools_defined(self):
-        names = {t["name"] for t in TOOL_DEFINITIONS}
+        names = {t["name"] for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         assert {"list_capabilities", "read_artifact"} <= names
 
-    def test_category_is_orchestration(self):
-        """They hand work to another runtime rather than fetching data.
+    def test_they_reach_the_code_surface_and_no_other(self):
+        """Their list is what `resolve_tools` includes on exactly one surface.
 
-        The category does NOT by itself keep them out of subagents — TOOL_PROFILES
-        includes orchestration in the api and bigquery profiles — so subagent.py names
-        them; tests/test_subagent.py pins that.
+        Living in it does NOT by itself keep them out of subagents — a skill narrows by
+        name from the whole local set — so subagent.py names them; tests/test_subagent.py
+        pins that.
         """
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
-        assert by_name["list_capabilities"]["category"] == "orchestration"
-        assert by_name["read_artifact"]["category"] == "orchestration"
+        code = {t["name"] for t in resolve_tools(code_execution=True)}
+        nocode = {t["name"] for t in resolve_tools(code_execution=False)}
+        for name in ("list_capabilities", "read_artifact"):
+            assert name in code
+            assert name not in nocode
 
     def test_read_artifact_takes_a_name_not_a_path(self):
         """The parameter name is load-bearing: an execution id or path is never accepted."""
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         params = by_name["read_artifact"]["parameters"]
         assert set(params) == {"name"}
         assert params["name"]["required"] is True
 
     def test_anthropic_schema_shape(self):
-        tools = {t["name"]: t for t in get_anthropic_tools()}
+        tools = {t["name"]: t for t in get_anthropic_tools(code_execution=True)}
         assert tools["read_artifact"]["input_schema"]["required"] == ["name"]
         capabilities = tools["list_capabilities"]["input_schema"]
         assert capabilities["required"] == []
@@ -274,7 +281,7 @@ class TestReadArtifactProxiesOverHTTP:
 
     async def test_the_model_never_supplies_an_execution_id(self):
         """The declared schema is one parameter. The id is resolved server-side or nowhere."""
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         params = by_name["read_artifact"]["parameters"]
         assert set(params) == {"name"}
         signature = inspect.signature(ServerToolExecutor.read_artifact)
@@ -582,7 +589,7 @@ class TestReadArtifactRequiresTheGatewaySecret:
         parameter = signature.parameters["gateway_asserted"]
         assert parameter.default is False
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         assert set(by_name["read_artifact"]["parameters"]) == {"name"}
 
     async def test_llm_service_injects_the_provenance_and_strips_the_models(self, monkeypatch):
@@ -617,6 +624,7 @@ class TestReadArtifactRequiresTheGatewaySecret:
                 None,
                 "real@finngen.fi",
                 "conv-7",
+                advertised_tools={"read_artifact"},
             )
         finally:
             settings_module.get_settings.cache_clear()
@@ -890,12 +898,12 @@ async def _run(executor, sandbox, **kwargs):
 
 class TestRunAnalysisDefinition:
     def test_defined_as_an_orchestration_tool(self):
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         assert by_name["run_analysis"]["category"] == "orchestration"
 
     def test_takes_code_and_a_timeout_and_no_identity(self):
         """The identity is the caller's, never the model's: it is not an argument."""
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         params = by_name["run_analysis"]["parameters"]
         assert params["code"]["required"] is True
         assert params["timeout_s"]["type"] == "integer"
@@ -910,18 +918,23 @@ class TestRunAnalysisDefinition:
         the tool read a local directory that was never the sandbox's /scratch; saying so now
         would cost the model the retrieval it is entitled to.
         """
-        by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
         description = by_name["run_analysis"]["description"]
         assert "read_artifact" in description
         assert "CANNOT BE RETRIEVED" not in description
 
     def test_reaches_the_chat_tool_list_when_the_sandbox_is_enabled(self):
-        """Registered unconditionally; it is `disabled_tools` that withholds it, so the
-        unfiltered registry is NOT what chat resolves (see TestRunAnalysisSandboxFlag).
+        """On the code surface, which is the only one it reaches; `disabled_tools` can
+        still withhold it there (see TestRunAnalysisSandboxFlag).
         """
-        assert "run_analysis" in {t["name"] for t in get_anthropic_tools()}
+        assert "run_analysis" in {
+            t["name"] for t in get_anthropic_tools(code_execution=True)
+        }
         enabled = Settings(sandbox_enabled=True).disabled_tools
-        names = {t["name"] for t in get_anthropic_tools(disabled_tools=enabled)}
+        names = {
+            t["name"]
+            for t in get_anthropic_tools(code_execution=True, disabled_tools=enabled)
+        }
         assert "run_analysis" in names
 
 
@@ -953,7 +966,10 @@ class TestRunAnalysisSandboxFlag:
         for profile in (None, "api", "bigquery", "rag", "code"):
             names = {
                 t["name"]
-                for t in get_anthropic_tools(tool_profile=profile, disabled_tools=disabled)
+                for t in get_anthropic_tools(
+                    code_execution=code_execution_requested(profile),
+                    disabled_tools=disabled,
+                )
             }
             assert "run_analysis" not in names, profile
 
@@ -1011,7 +1027,12 @@ class TestRunAnalysisSandboxFlag:
         settings_module.get_settings.cache_clear()
         try:
             result = await service._execute_tool(
-                "run_analysis", {"code": "print(1)"}, None, "real@finngen.fi", "conv-7"
+                "run_analysis",
+                {"code": "print(1)"},
+                None,
+                "real@finngen.fi",
+                "conv-7",
+                advertised_tools={"run_analysis"},
             )
         finally:
             settings_module.get_settings.cache_clear()
@@ -1616,6 +1637,7 @@ class TestSandboxDispatchRequiresTheGatewaySecret:
                 "anyone@finngen.fi",
                 "anything",
                 asserted,
+                advertised_tools={"run_analysis"},
             )
         return asserted, result
 
@@ -1781,6 +1803,7 @@ class TestRunAnalysisIdentity:
                 None,
                 "real@finngen.fi",
                 "conv-7",
+                advertised_tools={"run_analysis"},
             )
         finally:
             settings_module.get_settings.cache_clear()
@@ -1882,7 +1905,13 @@ class TestReadArtifactSessionInjection:
         service.executor = executor
         service.subagent_service = None
         return await service._execute_tool(
-            "read_artifact", tool_input, None, user, session_id, False
+            "read_artifact",
+            tool_input,
+            None,
+            user,
+            session_id,
+            False,
+            advertised_tools={"read_artifact"},
         )
 
     async def test_the_authenticated_session_is_injected(self, executor):

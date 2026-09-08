@@ -90,14 +90,19 @@ class TestToolsEndpoint:
         assert {t["source"] for t in data} <= {"local", "external", "rag"}
 
     def test_resolved_narrows_with_the_profile(self, test_client):
-        """A narrower profile means a shorter list — the panel is per-conversation."""
+        """The code surface is a shorter list than the no-code one — the panel is
+        per-conversation. `rag` and the other legacy names now resolve to the no-code
+        surface, so "code" is the only value that narrows anything."""
         everything = test_client.get("/chat/v1/tools", params={"resolved": "true"}).json()
-        rag = test_client.get(
-            "/chat/v1/tools", params={"resolved": "true", "tool_profile": "rag"}
+        code = test_client.get(
+            "/chat/v1/tools", params={"resolved": "true", "tool_profile": "code"}
         ).json()
 
-        assert len(rag) < len(everything)
-        assert {t["category"] for t in rag} == {"general"}
+        assert len(code) < len(everything)
+        # list_capabilities rather than run_analysis: the latter is gated on SANDBOX_ENABLED,
+        # which is false here, so its absence would say nothing about the surface
+        assert "list_capabilities" in {t["name"] for t in code}
+        assert "get_credible_sets_by_gene" not in {t["name"] for t in code}
 
     def test_resolved_with_tools_off_is_empty(self, test_client):
         """enable_tools=false is the one case where the assistant really has no tools."""
@@ -1028,7 +1033,7 @@ class _CapturingService:
         self.kwargs = None
 
     def resolve_local_tools(
-        self, tool_profile=None, enable_tools=True, custom_tool_descriptions=None
+        self, *, code_execution=False, enable_tools=True, custom_tool_descriptions=None
     ):
         """The real resolution, not a stub: the endpoint assembles the system prompt from
         it (genetics-results-suite-4h6.69), so a stub here would stop these tests from
@@ -1037,7 +1042,10 @@ class _CapturingService:
 
         self._disabled_tools = lambda: LLMService._disabled_tools(self)
         return LLMService.resolve_local_tools(
-            self, tool_profile, enable_tools, custom_tool_descriptions
+            self,
+            code_execution=code_execution,
+            enable_tools=enable_tools,
+            custom_tool_descriptions=custom_tool_descriptions,
         )
 
     def stream_chat(self, **kwargs):
@@ -1126,6 +1134,7 @@ async def _system_blocks(system_prompt, user_instructions):
         model="claude-opus-5",
         system_prompt=system_prompt,
         enable_tools=False,
+        code_execution=False,
         user_instructions=user_instructions,
     ):
         pass
@@ -1247,6 +1256,7 @@ class TestClientSystemRoleMessages:
             model="claude-opus-5",
             system_prompt="SERVER-ASSEMBLED-PROMPT",
             enable_tools=False,
+            code_execution=False,
         ):
             pass
 
@@ -1347,6 +1357,7 @@ class TestOpenAIUserInstructions:
             async for _ in svc.stream_chat(
                 messages=[{"role": "user", "content": "hi"}],
                 provider="openai",
+                code_execution=False,
                 user_instructions="USER ENVELOPE",
             ):
                 pass

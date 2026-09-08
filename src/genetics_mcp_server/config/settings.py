@@ -122,7 +122,7 @@ class Settings:
     # LLM defaults
     default_provider: str = "anthropic"
     default_model: str = field(
-        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-opus-5")
+        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-fable-5-1")
     )
     fast_model: str = "claude-haiku-4-5"
     # caps thinking + visible text together, and is a ceiling rather than a
@@ -137,6 +137,40 @@ class Settings:
     max_continuations: int = field(
         default_factory=lambda: int(os.environ.get("MAX_CONTINUATIONS", "3"))
     )
+    # which model answers when a safety classifier declines the request (Fable's cover
+    # research biology, so a genetics question can trip one). "default" lets Anthropic
+    # pick by refusal category; a model id pins the substitute; empty turns the fallback
+    # off and the refusal reaches the user as a notice. Only models that run the
+    # classifiers accept the parameter (`model_supports_refusal_fallback`).
+    refusal_fallback: str = field(
+        default_factory=lambda: os.environ.get("REFUSAL_FALLBACK", "default")
+    )
+    # How the streaming call reacts to a REFUSAL rather than a transient fault. Both default
+    # to the behaviour production has always had, and exist so a benchmark can push the API
+    # as hard as it allows without either changing what a real user experiences.
+    #
+    # anthropic_max_retries bounds the existing exponential backoff over connection errors,
+    # 5xx and overloaded_error.
+    #
+    # anthropic_retry_rate_limit is OFF by default, and that is a deliberate product choice
+    # rather than an oversight: a 429 means the account's capacity is already spent, so
+    # retrying in front of a waiting user buys a longer spinner and takes capacity from the
+    # next request. A benchmark has no waiting user and wants the turn to land eventually, so
+    # it turns this on. When on, `retry-after` is honoured when the response carries it and
+    # the exponential backoff is the fallback when it does not.
+    anthropic_max_retries: int = field(
+        default_factory=lambda: int(os.environ.get("ANTHROPIC_MAX_RETRIES", "3"))
+    )
+    anthropic_retry_rate_limit: bool = field(
+        default_factory=lambda: os.environ.get("ANTHROPIC_RETRY_RATE_LIMIT", "").lower()
+        in ("1", "true", "yes")
+    )
+    # cap on a single honoured `retry-after`, so a header naming an hour cannot park a worker
+    # for one. Past this the wait is refused and the error propagates as it does today.
+    anthropic_retry_after_max_s: int = field(
+        default_factory=lambda: int(os.environ.get("ANTHROPIC_RETRY_AFTER_MAX_S", "60"))
+    )
+
     # temperature is off by default; many current models (Fable, Opus 4.7+)
     # reject it. set TEMPERATURE to opt in for models that still support it.
     temperature: float | None = field(
@@ -393,14 +427,6 @@ class Settings:
     subagent_allowed_paths: str = field(
         default_factory=lambda: os.environ.get("SUBAGENT_ALLOWED_PATHS", "")
     )
-    enable_script_execution: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_SCRIPT_EXECUTION", "false"
-        ).lower() in ("1", "true", "yes")
-    )
-    subagent_script_timeout: int = field(
-        default_factory=lambda: int(os.environ.get("SUBAGENT_SCRIPT_TIMEOUT", "30"))
-    )
 
     @property
     def subagent_allowed_paths_list(self) -> list[str]:
@@ -474,6 +500,21 @@ def model_rejects_disabled_thinking(model: str) -> bool:
     callers that raise effort above that must not disable thinking.
     """
     return bool(_FABLE_RE.search(model) or _MYTHOS_RE.search(model))
+
+
+# the models that run refusal classifiers, and so accept the `fallbacks` parameter
+_REFUSAL_FALLBACK_OPUS_FLOOR = (5, 0)
+
+
+def model_supports_refusal_fallback(model: str) -> bool:
+    """Check if a model accepts the server-side `fallbacks` parameter."""
+    if _FABLE_RE.search(model) or _MYTHOS_RE.search(model):
+        return True
+    match = _OPUS_VERSION_RE.search(model)
+    if match:
+        version = (int(match.group(1)), int(match.group(2) or 0))
+        return version >= _REFUSAL_FALLBACK_OPUS_FLOOR
+    return False
 
 
 @lru_cache

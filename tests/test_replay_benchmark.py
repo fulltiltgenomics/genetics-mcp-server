@@ -213,7 +213,6 @@ def test_count_tool_calls_uses_blocks_not_display_markers():
 def test_cli_defaults_to_localhost_not_production():
     args = build_parser().parse_args([])
     assert "localhost" in args.base_url
-    assert args.arm_a == ALL_TOOLS_ARM
     assert args.model is None
 
 
@@ -381,6 +380,56 @@ async def test_paired_execution_keeps_arms_adjacent_and_alternates_order(
     # ...and on the wire the two arms of a case are adjacent, so drift hits both equally
     profiles = [b["tool_profile"] for b in stub_server.requests]
     assert profiles == [None, "bigquery", "bigquery", None, None, "bigquery", "bigquery", None]
+
+
+async def test_single_arm_runs_one_profile_and_costs_one_turn_per_case(
+    stub_server, tmp_path
+):
+    """`--arm-b none` measures one profile against a previous run's recorded numbers.
+
+    The pairing exists to make a mid-run model swap or slowdown hit both arms equally, so
+    a single-arm run gives up that defence and gives up judging entirely — what it must NOT
+    give up is spending exactly one arm's worth of turns. A single-arm run that still paid
+    for two would be the paired run with the comparison thrown away.
+    """
+    ok_turn = [_usage(1, 100, 10, 100, 10), _done()]
+    stub_server.plan = {"code": list(ok_turn)}
+    cases = [make_case(sid) for sid in ("aaa", "bbb", "ccc")]
+    dataset = write_dataset(tmp_path, cases)
+
+    report = await run_benchmark(
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=("code",),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
+    )
+
+    assert report["arms"] == ["code"]
+    for sid in ("aaa", "bbb", "ccc"):
+        assert report["arm_order_per_case"][sid] == ["code"]
+    assert report["per_arm"]["code"]["turns_ok"] == 3
+    # one turn per case on the wire, not two: the opposite arm is not silently still running
+    assert [b["tool_profile"] for b in stub_server.requests] == ["code", "code", "code"]
+    # and the matched set is the arm's own ok turns, since there is nothing to intersect with
+    assert len(report["matched"]) == 3
+
+
+def test_single_arm_is_opt_in_and_a_repeated_arm_is_still_refused(tmp_path, capsys):
+    """The `arm-a == arm-b` guard catches a typo that would otherwise run one profile twice
+    and judge it against itself. Making single-arm explicit ('none') keeps that guard
+    meaningful rather than trading it for an empty-string special case nobody sees."""
+    dataset = write_dataset(tmp_path, [make_case("aaa")])
+    import genetics_mcp_server.scripts.replay_benchmark as replay_benchmark
+    rc = replay_benchmark.main(
+        ["--dataset", str(dataset), "--arm-a", "code", "--arm-b", "code", "--dry-run"]
+    )
+    assert rc == 2
+    assert "must differ" in capsys.readouterr().err
 
 
 async def test_concurrency_parallelises_cases_never_the_arms_within_one(

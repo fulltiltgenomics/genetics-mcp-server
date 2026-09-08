@@ -14,20 +14,24 @@ uses.
 import json
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from test_stream_truncation import _Block, _delta_event, _FakeMessage, _service
 
+from genetics_mcp_server import mcp_proxy
 from genetics_mcp_server.cost import estimate_cost
 from genetics_mcp_server.llm_service import (
     LLMService,
+    ResolvedLocalTools,
     _count_result_items,
     _mark_history_cache_breakpoint,
     _sanitize_tool_blocks,
     _strip_tool_use_markers,
     _truncation_notice,
+    resolve_proxied_tools,
 )
+from genetics_mcp_server.tools.definitions import get_anthropic_tools
 
 
 def _tool_use(tid):
@@ -255,6 +259,7 @@ async def _run(svc, **kwargs):
         model=MODEL,
         system_prompt=None,
         enable_tools=False,
+        code_execution=False,
         session_id="sess1",
         message_id="msg1",
     )
@@ -274,12 +279,15 @@ def _with_tools(svc):
         user=None,
         session_id=None,
         gateway_asserted=False,
+        *,
+        advertised_tools,
     ):
         # the signature stays exact: the loop calls this positionally, so a widened
         # *args stub would silently accept a call shape production could never make.
         # `gateway_asserted` is the sixth positional since genetics-results-suite-4h6.84;
         # it arrives here because the loop forwards it to every tool, and only
-        # run_analysis reads it
+        # run_analysis reads it. `advertised_tools` is keyword-only and has no default,
+        # so a dispatch that stopped stating this turn's surface fails here
         return {"success": True, "rows": []}
 
     svc._execute_tool = _execute
@@ -404,7 +412,13 @@ class TestTurnMetrics:
                 mcp_max_iterations=3,
                 mcp_max_result_size=100_000,
                 max_continuations=1,
+                refusal_fallback="default",
                 disabled_tools=[],
+                # this stands in for the whole Settings object, so a new field consulted by
+                # the streaming path has to be added here too
+                anthropic_max_retries=3,
+                anthropic_retry_rate_limit=False,
+                anthropic_retry_after_max_s=60,
             )
             chunks = await _run(svc)
 
@@ -438,6 +452,7 @@ class TestTurnMetrics:
                 model=MODEL,
                 system_prompt=None,
                 enable_tools=False,
+                code_execution=False,
                 session_id="sess1",
                 message_id="msg1",
                 user="user@example.com",
@@ -688,10 +703,14 @@ class TestResolveLocalToolNames:
         the model was never handed.
         """
         self._patch_settings(monkeypatch, enable_subagents=True)
-        dead = self._svc(subagent_service=None).resolve_local_tool_names()
-        live = self._svc(subagent_service=object()).resolve_local_tool_names()
-        assert "launch_subagents" not in dead
-        assert "launch_subagents" in live
+        assert "launch_subagents" in self._svc(subagent_service=None)._disabled_tools()
+        assert "launch_subagents" not in self._svc(subagent_service=object())._disabled_tools()
+        # asserted on the disabled set rather than on the resolved names because neither
+        # surface carries launch_subagents at all now, so the resolved list cannot tell the
+        # two apart — the liveness check is still the only thing that removes it here
+        assert "launch_subagents" not in self._svc(
+            subagent_service=None
+        ).resolve_local_tool_names()
 
     def test_prompt_matches_the_resolution_when_the_service_is_dead(self, monkeypatch):
         from genetics_mcp_server.config.defaults import default_system_prompt
@@ -701,3 +720,403 @@ class TestResolveLocalToolNames:
         prompt = default_system_prompt("FinnGenie", tool_names=names)
         assert "launch_subagents" not in prompt
         assert "Subagent Orchestration" not in prompt
+
+
+class TestRateLimitRetryPolicy:
+    """A 429 is a refusal, not a fault, so retrying it is opt-in.
+
+    Production keeps today's behaviour — the turn fails and the user is told — because
+    retrying in front of a waiting user spends capacity the next request needs. The
+    benchmark has no waiting user and turns it on.
+    """
+
+    @staticmethod
+    def _status_error(status, headers=None, err_type=None):
+        """An APIStatusError shaped the way each channel actually delivers one."""
+        from anthropic import APIStatusError
+
+        exc = APIStatusError.__new__(APIStatusError)
+        exc.status_code = status
+        exc.body = {"error": {"type": err_type}} if err_type else None
+        exc.response = SimpleNamespace(headers=headers or {})
+        return exc
+
+    def test_retry_after_is_read_only_in_delta_seconds_form(self):
+        from genetics_mcp_server.llm_service import _retry_after_seconds
+
+        assert _retry_after_seconds(self._status_error(429, {"retry-after": "12"})) == 12.0
+        assert _retry_after_seconds(self._status_error(429, {"retry-after": "0"})) == 0.0
+        # the HTTP-date form is legal and deliberately NOT parsed: honouring it would mean
+        # trusting our clock against theirs, and erring fast is what the header prevents
+        assert (
+            _retry_after_seconds(
+                self._status_error(429, {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})
+            )
+            is None
+        )
+        assert _retry_after_seconds(self._status_error(429, {"retry-after": "-5"})) is None
+        assert _retry_after_seconds(self._status_error(429, {})) is None
+        assert _retry_after_seconds(Exception("no response at all")) is None
+
+    def test_a_mid_stream_rate_limit_is_recognised_by_body_not_status(self):
+        """Mid-stream errors carry the streaming status 200, so status alone misses them —
+        the same reason the existing 5xx branch also matches on the body's error type."""
+        from genetics_mcp_server.llm_service import anthropic_error_type
+
+        mid_stream = self._status_error(200, err_type="rate_limit_error")
+        assert mid_stream.status_code != 429
+        assert anthropic_error_type(mid_stream) == "rate_limit_error"
+
+    def test_the_policy_defaults_to_production_behaviour(self, monkeypatch):
+        from genetics_mcp_server.config.settings import Settings
+
+        for var in (
+            "ANTHROPIC_RETRY_RATE_LIMIT",
+            "ANTHROPIC_MAX_RETRIES",
+            "ANTHROPIC_RETRY_AFTER_MAX_S",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        default = Settings()
+        assert default.anthropic_retry_rate_limit is False
+        assert default.anthropic_max_retries == 3       # unchanged from the literal it replaced
+        assert default.anthropic_retry_after_max_s == 60
+
+        monkeypatch.setenv("ANTHROPIC_RETRY_RATE_LIMIT", "true")
+        monkeypatch.setenv("ANTHROPIC_MAX_RETRIES", "8")
+        opted_in = Settings()
+        assert opted_in.anthropic_retry_rate_limit is True
+        assert opted_in.anthropic_max_retries == 8
+
+
+class _DispatchRecorder:
+    """An executor that would run ANY tool the model names.
+
+    The point of every test below is that a name never reaches it; a recorder that
+    answers to everything is what makes "never reached" mean something, since a stub
+    with a fixed method list would refuse the wrong names for the wrong reason.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        async def _call(**tool_input):
+            self.calls.append((name, tool_input))
+            return {"success": True}
+
+        return _call
+
+
+class TestResolvedSurfaceEnforcement:
+    """Dispatch is limited to the tools this request actually advertised.
+
+    Without this the surface is advisory: `_execute_tool` calls whatever executor
+    attribute the model names, and the model does not have to invent the name —
+    ChatMessage.content accepts raw blocks and `_sanitize_tool_blocks` drops only ORPHANED
+    tool_use, so a client-supplied history can prime it for a tool this turn withheld.
+    """
+
+    @staticmethod
+    def _svc():
+        svc = LLMService.__new__(LLMService)
+        svc.executor = _DispatchRecorder()
+        svc.subagent_service = None
+        return svc
+
+    @staticmethod
+    def _surface(code_execution):
+        return {
+            t["name"] for t in get_anthropic_tools(code_execution=code_execution)
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_no_code_tool_named_on_the_code_surface_is_refused(self):
+        """Requirement 2: the code surface does not use the old per-dataset tools at all."""
+        code_surface = self._surface(True)
+        withheld = sorted(self._surface(False) - code_surface)[0]
+        svc = self._svc()
+
+        result = await svc._execute_tool(withheld, {}, advertised_tools=code_surface)
+
+        assert result["success"] is False
+        assert withheld in result["error"]
+        assert result["retryable"] is False
+        assert svc.executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_run_analysis_is_refused_on_the_no_code_surface(self, monkeypatch):
+        """The other direction, and the one with a credential behind it: dispatching
+        run_analysis mints a per-execution token under the authenticated user.
+
+        The sandbox flag is ON here on purpose. With it off the tool is in
+        `disabled_tools` and the deployment branch refuses it first, which would leave
+        this passing whether or not the surface is enforced at all.
+        """
+        from genetics_mcp_server.config.settings import Settings
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.llm_service.get_settings",
+            lambda: Settings(sandbox_enabled=True),
+        )
+        svc = self._svc()
+        assert "run_analysis" not in Settings(sandbox_enabled=True).disabled_tools
+
+        result = await svc._execute_tool(
+            "run_analysis",
+            {"code": "print(1)"},
+            advertised_tools=self._surface(False),
+        )
+
+        assert result["success"] is False
+        # a withheld tool must not look transient, or the model spends the turn retrying
+        assert result["retryable"] is False
+        assert result["error_type"] == "SandboxNotConfigured"
+        assert svc.executor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_advertised_external_tool_still_dispatches(self):
+        """The proxied surfaces are part of what a request advertises, so the guard must
+        be built from the whole advertised list and not from the local half."""
+        svc = self._svc()
+
+        with (
+            patch(
+                "genetics_mcp_server.llm_service.is_external_tool",
+                lambda name: name == "uniprot_search",
+            ),
+            patch(
+                "genetics_mcp_server.llm_service.execute_external_tool",
+                AsyncMock(return_value={"success": True, "external": True}),
+            ),
+        ):
+            result = await svc._execute_tool(
+                "uniprot_search",
+                {"query": "TP53"},
+                advertised_tools=self._surface(True) | {"uniprot_search"},
+            )
+
+        assert result == {"success": True, "external": True}
+
+    @pytest.mark.asyncio
+    async def test_the_check_reads_the_resolved_set_not_the_profile_string(self):
+        """Membership is decided by the set this request resolved, and by nothing else.
+
+        Both halves matter. A name every named surface carries is still refused when this
+        request did not advertise it, and a name no surface carries at all is dispatched
+        when it did — so nothing here can be re-deriving a surface from the tool's name or
+        from a profile value.
+        """
+        svc = self._svc()
+        on_both_surfaces = sorted(self._surface(True) & self._surface(False))[0]
+
+        refused = await svc._execute_tool(
+            on_both_surfaces, {}, advertised_tools={"only_this_one"}
+        )
+        assert refused["success"] is False
+        assert svc.executor.calls == []
+
+        dispatched = await svc._execute_tool(
+            "only_this_one", {}, advertised_tools={"only_this_one"}
+        )
+        assert dispatched == {"success": True}
+        assert [name for name, _ in svc.executor.calls] == ["only_this_one"]
+
+    @pytest.mark.asyncio
+    async def test_the_stream_enforces_the_set_it_resolved_and_the_model_sees_the_refusal(self):
+        """The whole path: the set comes from the resolution `stream_chat` was handed, and
+        the refusal comes back as a tool_result rather than as an exception — a turn that
+        raised here would lose the answer the user already paid for."""
+        primed = [_Block("tool_use", id="t1", name="search_phenotypes", input={"query": "x"})]
+        turns = [
+            ([], _usage(_FakeMessage(primed, "tool_use"), input_tokens=1, output_tokens=1)),
+            _answer_turn(input_tokens=1, output_tokens=1),
+        ]
+        svc = _service(turns, executor=_DispatchRecorder())
+
+        chunks = await _run(
+            svc,
+            enable_tools=True,
+            local_tools=ResolvedLocalTools([{"name": "search_genes", "description": "d",
+                                             "input_schema": {"type": "object"}}]),
+        )
+
+        assert svc.executor.calls == []
+        # the second request carries the refusal back to the model as this turn's result
+        followup = json.dumps(svc.anthropic_client.messages.calls[1]["messages"])
+        assert "not available in this conversation" in followup
+        assert any(c.type == "text" for c in chunks)
+
+    def test_the_enforcement_parameters_cannot_regain_a_default(self):
+        """A default on either is what would make the enforcement optional again.
+
+        `_execute_tool(advertised_tools=...)` defaulted would let a caller dispatch
+        without stating a surface; `stream_chat(code_execution=...)` defaulted would let a
+        caller pass `tool_profile="code"` alone and silently get the no-code surface.
+        Keyword-only on top, so neither can be satisfied by positional drift.
+        """
+        import inspect
+
+        for fn, name in (
+            (LLMService._execute_tool, "advertised_tools"),
+            (LLMService.stream_chat, "code_execution"),
+        ):
+            param = inspect.signature(fn).parameters[name]
+            assert param.default is inspect.Parameter.empty, fn.__name__
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY, fn.__name__
+
+
+class TestSubagentIdentityThreading:
+    """`launch_subagents` carries this request's identity, not the model's tool input.
+
+    A subagent can now name `run_analysis`, so whatever `_execute_tool` hands
+    `run_subagents` becomes the subject of a per-execution credential and of the audit
+    trail. It must be the pair the request was authenticated as, and `tasks` — written by
+    the model — must not be able to influence it.
+    """
+
+    @staticmethod
+    def _svc():
+        svc = LLMService.__new__(LLMService)
+        svc.subagent_service = SimpleNamespace(
+            run_subagents=AsyncMock(return_value={"success": True, "results": []})
+        )
+        svc.executor = None
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_identity_comes_from_the_request_not_the_tasks(self, monkeypatch):
+        from genetics_mcp_server.config.settings import Settings
+
+        monkeypatch.setattr(
+            "genetics_mcp_server.llm_service.get_settings",
+            lambda: Settings(enable_subagents=True),
+        )
+        svc = self._svc()
+
+        await svc._execute_tool(
+            "launch_subagents",
+            {
+                "tasks": [{"skill": "data_analysis", "query": "q"}],
+                "user": "spoofed@evil.example",
+                "session_id": "someone-elses-session",
+            },
+            None,
+            "real@example.org",
+            "sess-real",
+            True,
+            advertised_tools={"launch_subagents"},
+        )
+
+        kwargs = svc.subagent_service.run_subagents.await_args.kwargs
+        assert kwargs["user"] == "real@example.org"
+        assert kwargs["session_id"] == "sess-real"
+        assert kwargs["gateway_asserted"] is True
+
+
+def _proxied(name):
+    return {"name": name, "description": "proxied", "input_schema": {"type": "object"}}
+
+
+class _FakeProxyClient:
+    """Enough of MCPProxyClient for the registration pass; it never opens a socket."""
+
+    prefix = ""
+
+    def __init__(self, base_url, timeout=30.0, auth_token=None):
+        self.base_url = base_url
+        self._tools = [
+            {"name": "aou_hidden", "description": "d", "inputSchema": {"type": "object"}},
+            {"name": "gnomad_variant", "description": "d", "inputSchema": {"type": "object"}},
+        ]
+
+    def list_tools_sync(self):
+        return self._tools
+
+    def get_prefixed_name(self, name):
+        return name
+
+
+class TestProxiedToolsReachBothSurfaces:
+    """The proxied servers and RAG are handed to the code surface and the no-code one alike.
+
+    Nothing in the sandbox can reach an external MCP server — its egress allow-list admits
+    db-api and results-api only — so a code-surface request denied them would have no route
+    to them at all. The subtraction that remains is EXTERNAL_MCP_EXCLUDE_TOOLS, which is a
+    deployment's and applies to everybody.
+    """
+
+    def test_the_resolver_takes_no_surface_argument(self):
+        """The parameter is where a per-surface rule would grow back, so there is none."""
+        import inspect
+
+        assert list(inspect.signature(resolve_proxied_tools).parameters) == []
+
+    @pytest.mark.parametrize("code_execution", [False, True])
+    @pytest.mark.asyncio
+    async def test_both_surfaces_advertise_the_configured_proxied_tools(self, code_execution):
+        """And advertising is what the dispatch guard reads, so this is also what makes them
+        callable: `advertised_tools` is projected off this very list."""
+        svc = _service([_answer_turn(input_tokens=1, output_tokens=1)])
+
+        with (
+            patch(
+                "genetics_mcp_server.llm_service.get_external_anthropic_tools",
+                lambda: [_proxied("gnomad_variant")],
+            ),
+            patch(
+                "genetics_mcp_server.llm_service.get_rag_anthropic_tools",
+                lambda: [_proxied("rag_search")],
+            ),
+        ):
+            await _run(svc, enable_tools=True, code_execution=code_execution)
+
+        sent = {t["name"] for t in svc.anthropic_client.messages.calls[0]["tools"]}
+        assert {"gnomad_variant", "rag_search"} <= sent
+
+    @pytest.mark.asyncio
+    async def test_a_proxied_tool_the_code_surface_named_actually_dispatches(self):
+        """The end of the same thread: the dispatch guard refuses anything the turn did not
+        advertise, so a proxied tool runs only if the code surface really carries it. The
+        primed history is the shape a client's replayed conversation has."""
+        primed = [_Block("tool_use", id="t1", name="gnomad_variant", input={"v": "1-1-A-T"})]
+        turns = [
+            ([], _usage(_FakeMessage(primed, "tool_use"), input_tokens=1, output_tokens=1)),
+            _answer_turn(input_tokens=1, output_tokens=1),
+        ]
+        svc = _service(turns, executor=_DispatchRecorder())
+        external = AsyncMock(return_value={"success": True, "external": True})
+
+        with (
+            patch(
+                "genetics_mcp_server.llm_service.get_external_anthropic_tools",
+                lambda: [_proxied("gnomad_variant")],
+            ),
+            patch("genetics_mcp_server.llm_service.get_rag_anthropic_tools", list),
+            patch(
+                "genetics_mcp_server.llm_service.is_external_tool",
+                lambda name: name == "gnomad_variant",
+            ),
+            patch("genetics_mcp_server.llm_service.execute_external_tool", external),
+        ):
+            await _run(svc, enable_tools=True, code_execution=True)
+
+        external.assert_awaited_once()
+        assert svc.executor.calls == []
+
+    def test_the_exclude_list_still_subtracts_and_no_surface_sees_it(self, monkeypatch):
+        """EXTERNAL_MCP_EXCLUDE_TOOLS is applied where the proxy clients are registered, so
+        an excluded tool never enters the registry either surface reads. BOTH registries:
+        the RAG server honours the same list, so the name is gone from the external list
+        and the RAG one alike."""
+        monkeypatch.setenv("EXTERNAL_MCP_SERVERS", "https://external.invalid/mcp")
+        monkeypatch.setenv("EXTERNAL_MCP_EXCLUDE_TOOLS", "aou_hidden")
+        monkeypatch.setenv("RAG_MCP_SERVER", "https://rag.invalid/mcp")
+        monkeypatch.setattr(mcp_proxy, "_proxy_clients", {})
+        monkeypatch.setattr(mcp_proxy, "_rag_proxy_clients", {})
+        monkeypatch.setattr(mcp_proxy, "MCPProxyClient", _FakeProxyClient)
+
+        mcp_proxy.initialize_external_servers()
+        external, rag = resolve_proxied_tools()
+
+        assert {t["name"] for t in external} == {"gnomad_variant"}
+        assert {t["name"] for t in rag} == {"gnomad_variant"}

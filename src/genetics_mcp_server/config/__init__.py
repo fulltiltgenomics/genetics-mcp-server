@@ -6,6 +6,7 @@ from genetics_mcp_server.config.settings import (
     model_rejects_disabled_thinking,
     model_rejects_temperature,
     model_supports_adaptive_thinking,
+    model_supports_refusal_fallback,
     require_internal_api_secret,
     warn_unless_gateway_identity_secret,
 )
@@ -18,4 +19,5 @@ __all__ = [
     "model_rejects_disabled_thinking",
     "model_rejects_temperature",
     "model_supports_adaptive_thinking",
+    "model_supports_refusal_fallback",
 ]

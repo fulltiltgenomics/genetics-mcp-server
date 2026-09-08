@@ -8,11 +8,14 @@ import pytest
 from genetics_mcp_server.tools import ServerToolExecutor, ToolExecutor
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
+    CODE_EXECUTION_TOOL_DEFINITIONS,
     SUBAGENT_TOOL_DEFINITIONS,
     TOOL_DEFINITIONS,
-    TOOL_PROFILE_TOOLS,
-    TOOL_PROFILES,
+    all_anthropic_tools,
+    all_local_tool_definitions,
+    code_execution_requested,
     get_anthropic_tools,
+    resolve_tools,
 )
 
 
@@ -750,213 +753,44 @@ class TestVariantAnnotationTools:
             assert "_download_data" in result
 
 
-# Frozen expected name sets for the category-based profiles, recorded 2026-08-18.
+# The code surface, frozen as a literal recorded 2026-09-06.
 #
-# These are literals on purpose. Deriving them from TOOL_DEFINITIONS at test time makes
-# both sides of the comparison move together, so recategorising a tool - the very change
-# that was ruled out when the code profile was made an explicit allow-list - could not
-# fail the test. A literal fails on any substitution, not only on ones that change a count.
-# Update them only alongside a deliberate, reviewed change to a tool's category.
-_PROFILE_NONE_NAMES = {
-    "analyze_variant_list",
-    "get_asm_qtl_by_gene",
-    "get_asm_qtl_by_variant",
-    "get_colocalization",
-    "get_colocalization_by_credible_set",
-    "get_credible_set_by_id",
-    "get_credible_set_leads_by_phenotype",
-    "get_credible_sets_by_gene",
-    "get_credible_sets_by_phenotype",
-    "get_credible_sets_by_qtl_gene",
-    "get_credible_sets_by_region",
-    "get_credible_sets_by_variant",
-    "get_credible_sets_stats",
-    "get_database_schema",
-    "get_dataset_display_names",
-    "get_drug_profile",
-    "get_drug_targets_for_gene",
-    "get_exome_results_by_gene",
-    "get_exome_results_by_phenotype",
-    "get_exome_results_by_region",
-    "get_exome_results_by_variant",
-    "get_gene_based_results",
-    "get_gene_based_results_by_phenotype",
-    "get_gene_disease_associations",
-    "get_gene_expression",
-    "get_gene_group_members",
-    "get_gene_to_peaks",
-    "get_genes_in_region",
-    "get_hla_by_allele",
-    "get_hla_by_phenotype",
-    "get_ld_between_variants",
-    "get_mpra_by_gene",
-    "get_mpra_by_region",
-    "get_mpra_by_variant",
-    "get_mpra_pip_concordance_by_gene",
+# A literal on purpose. Deriving it from `sdk_replaceable` at test time makes both sides of
+# the comparison move together, so flipping one tool's field — the whole of what membership
+# now is — could not fail the test. A literal fails on any substitution, not only on ones
+# that change a count. The no-code surface is not frozen here: it is every data tool, and
+# tests/golden/tool_surface.json is what fails when it drifts.
+_CODE_SURFACE_NAMES = {
+    # the sandbox's own tools
+    "run_analysis",
+    "list_capabilities",
+    "read_artifact",
+    # outside resources: no script can reach these hosts through the sandbox egress policy
     "get_myvariant_annotations",
-    "get_nearest_genes",
-    "get_open_chromatin_by_gene",
-    "get_open_chromatin_by_peak",
-    "get_open_chromatin_by_region",
-    "get_open_chromatin_by_variant",
-    "get_peak_to_genes",
-    "get_phenotype_report",
     "get_protein_annotations",
-    "get_resource_metadata",
-    "get_summary_stats",
-    "get_summary_stats_by_region",
-    "get_target_bioactivity",
-    "get_variant_annotations",
-    "get_variant_effect_by_gene",
-    "get_variant_effect_by_variant",
-    "get_variant_protein_effect",
-    "get_variants_in_ld",
-    "launch_subagents",
-    "list_capabilities",
-    "list_datasets",
-    "lookup_phenotype_names",
-    "lookup_variants_by_rsid",
     "map_protein_variants",
-    "normalize_gene_symbols",
-    "query_database",
-    "read_artifact",
-    "run_analysis",
-    "search_cbioportal",
-    "search_genes",
-    "search_mgi",
-    "search_phenotypes",
-    "search_scientific_literature",
+    "get_variant_protein_effect",
     "search_uniprot",
-    "web_search",
-}
-
-_PROFILE_API_NAMES = {
-    "analyze_variant_list",
-    "get_asm_qtl_by_gene",
-    "get_asm_qtl_by_variant",
-    "get_colocalization",
-    "get_colocalization_by_credible_set",
-    "get_credible_set_by_id",
-    "get_credible_set_leads_by_phenotype",
-    "get_credible_sets_by_gene",
-    "get_credible_sets_by_phenotype",
-    "get_credible_sets_by_qtl_gene",
-    "get_credible_sets_by_region",
-    "get_credible_sets_by_variant",
-    "get_credible_sets_stats",
-    "get_dataset_display_names",
-    "get_drug_profile",
     "get_drug_targets_for_gene",
-    "get_exome_results_by_gene",
-    "get_exome_results_by_phenotype",
-    "get_exome_results_by_region",
-    "get_exome_results_by_variant",
-    "get_gene_based_results",
-    "get_gene_based_results_by_phenotype",
-    "get_gene_disease_associations",
-    "get_gene_expression",
-    "get_gene_group_members",
-    "get_gene_to_peaks",
-    "get_genes_in_region",
-    "get_hla_by_allele",
-    "get_hla_by_phenotype",
-    "get_ld_between_variants",
-    "get_mpra_by_gene",
-    "get_mpra_by_region",
-    "get_mpra_by_variant",
-    "get_mpra_pip_concordance_by_gene",
-    "get_myvariant_annotations",
-    "get_nearest_genes",
-    "get_open_chromatin_by_gene",
-    "get_open_chromatin_by_peak",
-    "get_open_chromatin_by_region",
-    "get_open_chromatin_by_variant",
-    "get_peak_to_genes",
-    "get_phenotype_report",
-    "get_protein_annotations",
-    "get_resource_metadata",
-    "get_summary_stats",
-    "get_summary_stats_by_region",
-    "get_target_bioactivity",
-    "get_variant_annotations",
-    "get_variant_effect_by_gene",
-    "get_variant_effect_by_variant",
-    "get_variant_protein_effect",
-    "get_variants_in_ld",
-    "launch_subagents",
-    "list_capabilities",
-    "list_datasets",
-    "lookup_phenotype_names",
-    "lookup_variants_by_rsid",
-    "map_protein_variants",
-    "normalize_gene_symbols",
-    "read_artifact",
-    "run_analysis",
-    "search_cbioportal",
-    "search_genes",
-    "search_mgi",
-    "search_phenotypes",
-    "search_scientific_literature",
-    "search_uniprot",
-    "web_search",
-}
-
-_PROFILE_BIGQUERY_NAMES = {
-    "get_database_schema",
-    "get_dataset_display_names",
     "get_drug_profile",
-    "get_drug_targets_for_gene",
-    "get_gene_group_members",
-    "get_protein_annotations",
-    "get_resource_metadata",
     "get_target_bioactivity",
-    "get_variant_protein_effect",
-    "launch_subagents",
-    "list_capabilities",
-    "list_datasets",
-    "lookup_phenotype_names",
-    "lookup_variants_by_rsid",
-    "map_protein_variants",
-    "normalize_gene_symbols",
-    "query_database",
-    "read_artifact",
-    "run_analysis",
-    "search_cbioportal",
-    "search_genes",
-    "search_mgi",
-    "search_phenotypes",
     "search_scientific_literature",
-    "search_uniprot",
     "web_search",
-}
-
-# also the resolved set for any unrecognised profile string, which degrades to general-only
-_PROFILE_RAG_NAMES = {
-    "get_dataset_display_names",
-    "get_drug_profile",
-    "get_drug_targets_for_gene",
-    "get_gene_group_members",
-    "get_protein_annotations",
+    "search_mgi",
+    "search_cbioportal",
+    # entity lookups, kept for the id resolution that precedes writing a script
+    "search_genes",
+    "search_phenotypes",
+    "lookup_variants_by_rsid",
+    # the catalogue, kept because "what data is there?" is answered before a script is
+    # worth writing; without these the model surveys views by SQL instead
+    "list_datasets",
     "get_resource_metadata",
-    "get_target_bioactivity",
-    "get_variant_protein_effect",
-    "list_datasets",
-    "lookup_phenotype_names",
-    "lookup_variants_by_rsid",
-    "map_protein_variants",
-    "normalize_gene_symbols",
-    "search_cbioportal",
-    "search_genes",
-    "search_mgi",
-    "search_phenotypes",
-    "search_scientific_literature",
-    "search_uniprot",
-    "web_search",
 }
 
 
 class TestToolDefinitions:
-    """Tests for tool definitions and profile filtering."""
+    """Tests for tool definitions and surface resolution."""
 
     def test_all_tools_have_category(self):
         """Every tool definition must have a category field."""
@@ -968,189 +802,160 @@ class TestToolDefinitions:
     def test_valid_categories(self):
         """Tool categories must be one of the known values."""
         valid = {"general", "api", "bigquery", "orchestration"}
-        for tool in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS + SUBAGENT_TOOL_DEFINITIONS:
+        for tool in all_local_tool_definitions():
             assert tool["category"] in valid, (
                 f"Tool {tool['name']} has invalid category {tool['category']}"
             )
 
-    def test_get_anthropic_tools_no_profile_returns_all(self):
-        """No profile returns all tools (general + api + bigquery)."""
-        tools = get_anthropic_tools()
-        names = {t["name"] for t in tools}
+    def test_every_definition_declares_sdk_replaceable(self):
+        """The field is the whole of surface membership, so a missing one is not a default.
 
-        assert "search_phenotypes" in names  # general
-        assert "get_credible_sets_by_gene" in names  # api
-        assert "query_database" in names  # bigquery
-
-        total = len(TOOL_DEFINITIONS) + len(BIGQUERY_TOOL_DEFINITIONS) + len(SUBAGENT_TOOL_DEFINITIONS)
-        assert len(tools) == total
-
-    def test_get_anthropic_tools_api_profile(self):
-        """API profile returns general + api tools only."""
-        tools = get_anthropic_tools(tool_profile="api")
-        names = {t["name"] for t in tools}
-
-        assert "search_phenotypes" in names  # general
-        assert "get_credible_sets_by_gene" in names  # api
-        assert "query_database" not in names  # bigquery excluded
-
-    def test_get_anthropic_tools_bigquery_profile(self):
-        """BigQuery profile returns general + bigquery tools only."""
-        tools = get_anthropic_tools(tool_profile="bigquery")
-        names = {t["name"] for t in tools}
-
-        assert "search_phenotypes" in names  # general
-        assert "query_database" in names  # bigquery
-        assert "get_database_schema" in names  # bigquery
-        assert "get_credible_sets_by_gene" not in names  # api excluded
-
-    def test_get_anthropic_tools_rag_profile(self):
-        """RAG profile returns general tools only (no api, no bigquery)."""
-        tools = get_anthropic_tools(tool_profile="rag")
-        names = {t["name"] for t in tools}
-
-        assert "search_phenotypes" in names  # general
-        assert "web_search" in names  # general
-        assert "get_credible_sets_by_gene" not in names  # api excluded
-        assert "query_database" not in names  # bigquery excluded
-
-    def test_get_anthropic_tools_unknown_profile_returns_general_only(self):
-        """Unknown profile falls back to general tools only."""
-        tools = get_anthropic_tools(tool_profile="unknown")
-        names = {t["name"] for t in tools}
-
-        assert "search_phenotypes" in names  # general
-        assert "get_credible_sets_by_gene" not in names
-        assert "query_database" not in names
-
-    def test_code_profile_resolves_to_exactly_its_seven_tools(self):
-        """The code profile is an explicit allow-list, not a category union.
-
-        Asserting the SET rather than the count so a silent substitution — one tool
-        renamed or swapped for another — fails instead of passing on arithmetic.
+        A tool added without it lands on the no-code surface and raises a KeyError the
+        moment anyone asks for the code surface — a runtime failure rather than a decision.
         """
-        names = {t["name"] for t in get_anthropic_tools(tool_profile="code")}
+        for tool in all_local_tool_definitions():
+            assert isinstance(tool.get("sdk_replaceable"), bool), (
+                f"Tool {tool['name']} does not declare sdk_replaceable"
+            )
+
+    def test_nocode_surface_is_every_data_tool(self):
+        """No-code carries the data tools and neither the sandbox's nor launch_subagents."""
+        names = {t["name"] for t in resolve_tools(code_execution=False)}
 
         assert names == {
-            "run_analysis",
-            "list_capabilities",
-            "read_artifact",
-            "search_genes",
-            "search_phenotypes",
-            "search_scientific_literature",
-            "lookup_variants_by_rsid",
+            t["name"] for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS
+        }
+        assert "run_analysis" not in names
+        assert "launch_subagents" not in names
+
+    def test_code_surface_resolves_to_exactly_its_frozen_names(self):
+        """Asserting the SET rather than the count, so a silent substitution fails."""
+        names = {t["name"] for t in resolve_tools(code_execution=True)}
+
+        assert names == _CODE_SURFACE_NAMES
+
+    def test_the_two_surfaces_overlap_only_where_the_sdk_cannot_reach(self):
+        """The line the boolean draws, stated as a property rather than as two lists.
+
+        Everything on both surfaces is a tool a script cannot replace with an SDK call;
+        everything the code surface drops is one it can.
+        """
+        code = {t["name"] for t in resolve_tools(code_execution=True)}
+        nocode = {t["name"] for t in resolve_tools(code_execution=False)}
+        replaceable = {
+            t["name"]
+            for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS
+            if t["sdk_replaceable"]
         }
 
-    def test_code_profile_excludes_launch_subagents(self):
-        """launch_subagents shares the orchestration category with run_analysis but is
-        deliberately not in the code profile: this profile measures one agent with a
-        sandbox, not a fan-out. It is the case a category-based profile could not express.
-        """
-        names = {t["name"] for t in get_anthropic_tools(tool_profile="code")}
+        assert code & nocode == code - {"run_analysis", "list_capabilities", "read_artifact"}
+        assert code & replaceable == set()
+        assert nocode - code == replaceable
 
-        assert "launch_subagents" not in names
-        assert "run_analysis" in names  # same category, still included
+    def test_launch_subagents_reaches_neither_surface(self):
+        """It is flag-gated, not surface-gated: which one should carry it is unanswered."""
+        for code_execution in (True, False):
+            names = {t["name"] for t in resolve_tools(code_execution)}
+            assert "launch_subagents" not in names
 
-    def test_explicit_profile_respects_disabled_tools(self):
-        """disabled_tools is applied before the profile filter, so a deployment flag or
-        the env-driven disable list still removes a tool the profile names."""
+    def test_disabled_applies_to_both_surfaces(self):
+        """A deployment flag still removes a tool the surface would otherwise carry."""
         names = {
             t["name"]
-            for t in get_anthropic_tools(tool_profile="code", disabled_tools={"read_artifact"})
+            for t in resolve_tools(code_execution=True, disabled={"read_artifact"})
         }
 
         assert "read_artifact" not in names
         assert "run_analysis" in names
 
-    def test_existing_profiles_unchanged_by_the_code_profile(self):
-        """Adding an explicit-allow-list profile must not move any existing profile.
-
-        Compares whole NAME SETS against frozen literals rather than counts: swapping two
-        tools between categories keeps every count identical while changing what each
-        profile actually sends to the model, and that is exactly the accident this test
-        exists to catch.
-        """
-        assert {t["name"] for t in get_anthropic_tools()} == _PROFILE_NONE_NAMES
-        assert {
-            t["name"] for t in get_anthropic_tools(tool_profile="api")
-        } == _PROFILE_API_NAMES
-        assert {
-            t["name"] for t in get_anthropic_tools(tool_profile="bigquery")
-        } == _PROFILE_BIGQUERY_NAMES
-        assert {
-            t["name"] for t in get_anthropic_tools(tool_profile="rag")
-        } == _PROFILE_RAG_NAMES
-
-    def test_unknown_profile_still_degrades_silently_to_general(self):
-        """Pinned deliberately: an unrecognised profile name does not raise.
-
-        The value is persisted per message in chat_messages.tool_profile and read back
-        from rows written by older clients, so raising would turn a stale row into a 500.
-        The cost is that a typo silently drops 50 tools — documented, not accidental.
-
-        Compared against the frozen literal rather than a set recomputed from
-        TOOL_DEFINITIONS, so a recategorisation cannot move both sides at once.
-        """
-        assert {
-            t["name"] for t in get_anthropic_tools(tool_profile="cdoe")
-        } == _PROFILE_RAG_NAMES
-        assert {t["name"] for t in get_anthropic_tools(tool_profile="")} == _PROFILE_RAG_NAMES
-
-    def test_explicit_and_category_profiles_have_disjoint_names(self):
-        """No profile name may appear in both dicts.
-
-        get_anthropic_tools checks TOOL_PROFILE_TOOLS first and returns on a hit, so a
-        name present in both silently redefines the category-based profile: the entry in
-        TOOL_PROFILES becomes dead code and the profile starts sending a different tool
-        set with nothing else failing.
-        """
-        overlap = set(TOOL_PROFILE_TOOLS) & set(TOOL_PROFILES)
-
-        assert not overlap, (
-            f"profile name(s) {sorted(overlap)} defined in both TOOL_PROFILE_TOOLS and "
-            "TOOL_PROFILES; the explicit allow-list wins and silently overrides the "
-            "category-based definition"
-        )
-
-    def test_explicit_profiles_only_name_tools_that_exist(self):
-        """Every name in every explicit allow-list must resolve to a real tool.
-
-        A typo or a renamed tool leaves the profile quietly one tool short, and the filter
-        cannot detect it: it intersects, so a name matching nothing simply drops out. This
-        covers all explicit profiles, not just the one that has its own resolution test.
-        """
-        defined = {
+    def test_all_local_tool_definitions_is_the_union_and_nothing_else(self):
+        """What /mcp registers and what a subagent narrows from, against the four lists."""
+        assert {t["name"] for t in all_local_tool_definitions()} == {
             t["name"]
-            for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS + SUBAGENT_TOOL_DEFINITIONS
+            for t in TOOL_DEFINITIONS
+            + CODE_EXECUTION_TOOL_DEFINITIONS
+            + BIGQUERY_TOOL_DEFINITIONS
+            + SUBAGENT_TOOL_DEFINITIONS
         }
 
-        for profile, names in TOOL_PROFILE_TOOLS.items():
-            assert names, f"explicit profile {profile} names no tools"
-            missing = set(names) - defined
-            assert not missing, (
-                f"profile {profile} names non-existent tool(s) {sorted(missing)}"
-            )
-            resolved = {t["name"] for t in get_anthropic_tools(tool_profile=profile)}
-            assert resolved == set(names), (
-                f"profile {profile} resolved to {sorted(resolved)}, expected {sorted(names)}"
-            )
 
-    def test_general_tools_present_in_all_profiles(self):
-        """General tools should appear in every category-based profile.
+class TestProfileCoercionAtTheEdge:
+    """The wire `tool_profile`, coerced to the boolean by `code_execution_requested`.
 
-        TOOL_PROFILE_TOOLS profiles are excluded by construction: they name their tools
-        explicitly and the code profile takes only 4 of the 18 general tools.
+    Only "code" asks for code execution. Every other value a client can still send — the
+    four names this collapse retired, `nocode`, None, and anything unrecognised — resolves
+    to the no-code surface, which is the safe direction for a value read back from a
+    `chat_messages` row written by an older client.
+    """
+
+    def test_code_resolves_to_the_code_surface(self):
+        assert {
+            t["name"]
+            for t in get_anthropic_tools(
+                code_execution=code_execution_requested("code")
+            )
+        } == _CODE_SURFACE_NAMES
+
+    @pytest.mark.parametrize(
+        "tool_profile", [None, "api", "bigquery", "rag", "nocode", "unknown", ""]
+    )
+    def test_every_other_value_resolves_to_the_no_code_surface(self, tool_profile):
+        assert code_execution_requested(tool_profile) is False
+        assert {
+            t["name"]
+            for t in get_anthropic_tools(
+                code_execution=code_execution_requested(tool_profile)
+            )
+        } == {t["name"] for t in resolve_tools(code_execution=False)}
+
+    def test_unknown_profile_does_not_raise(self):
+        """Pinned deliberately: the value is persisted per message in
+        chat_messages.tool_profile and read back from rows written by older clients, so
+        raising would turn a stale row into a 500.
+
+        A typo must still leave the model a usable surface, and specifically the no-code
+        one: refusing to resolve, or resolving to something empty, would strand the turn.
         """
-        general_tools = {t["name"] for t in TOOL_DEFINITIONS if t["category"] == "general"}
-        assert len(general_tools) > 0
+        assert code_execution_requested("cdoe") is False
 
-        for profile in TOOL_PROFILES:
-            tools = get_anthropic_tools(tool_profile=profile)
-            names = {t["name"] for t in tools}
-            for gen_tool in general_tools:
-                assert gen_tool in names, (
-                    f"General tool {gen_tool} missing from profile {profile}"
-                )
+        surface = get_anthropic_tools(None, code_execution=code_execution_requested("cdoe"))
+
+        assert surface
+        assert {t["name"] for t in surface} == {
+            t["name"] for t in get_anthropic_tools(code_execution=False)
+        }
+
+    def test_the_surface_functions_take_no_profile_name_at_all(self):
+        """The coercion happens once, at the edge, and nothing below it re-reads a name.
+
+        A `tool_profile=` keyword surviving on either resolver is the second reading this
+        split exists to delete: it would let a request's tools and its prompt be resolved
+        from the same string twice and disagree.
+        """
+        import inspect
+
+        for fn in (get_anthropic_tools, resolve_tools):
+            assert "tool_profile" not in inspect.signature(fn).parameters
+
+    def test_disabled_tools_still_applies_after_the_coercion(self):
+        names = {
+            t["name"]
+            for t in get_anthropic_tools(
+                code_execution=True, disabled_tools={"read_artifact"}
+            )
+        }
+
+        assert "read_artifact" not in names
+
+    def test_all_anthropic_tools_is_narrowed_by_nothing_but_disabled(self):
+        """The subagent path: it names run_analysis and data tools together, which no
+        single surface carries."""
+        names = {t["name"] for t in all_anthropic_tools()}
+
+        assert names == {t["name"] for t in all_local_tool_definitions()}
+        assert "launch_subagents" not in {
+            t["name"] for t in all_anthropic_tools(disabled_tools={"launch_subagents"})
+        }
 
 
 # MouseMine PathQuery returns row arrays whose column order is dictated by the

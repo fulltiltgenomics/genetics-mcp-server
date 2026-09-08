@@ -13,6 +13,89 @@ logger = logging.getLogger(__name__)
 
 INSTRUCTIONS_DIR = Path(__file__).parent / "instructions"
 
+# Every skill names the tools it gets. Deriving them from a tool `category` or a tool_profile
+# made a subagent's surface move whenever either was retuned for the main agent, which is the
+# wrong coupling: the profiles shape what a user's chat advertises, while a skill's list
+# bounds what a task-driven agent with no session of its own can reach.
+
+# lookup, search and metadata tools every skill gets
+_CORE_TOOLS = frozenset({
+    "get_dataset_display_names",
+    "get_drug_profile",
+    "get_drug_targets_for_gene",
+    "get_gene_group_members",
+    "get_protein_annotations",
+    "get_resource_metadata",
+    "get_target_bioactivity",
+    "get_variant_protein_effect",
+    "list_datasets",
+    "lookup_phenotype_names",
+    "lookup_variants_by_rsid",
+    "map_protein_variants",
+    "normalize_gene_symbols",
+    "search_cbioportal",
+    "search_genes",
+    "search_mgi",
+    "search_phenotypes",
+    "search_scientific_literature",
+    "search_uniprot",
+    "web_search",
+})
+
+# the results-API data tools
+_GENETICS_API_TOOLS = frozenset({
+    "analyze_variant_list",
+    "get_asm_qtl_by_gene",
+    "get_asm_qtl_by_variant",
+    "get_colocalization",
+    "get_colocalization_by_credible_set",
+    "get_credible_set_by_id",
+    "get_credible_set_leads_by_phenotype",
+    "get_credible_sets_by_gene",
+    "get_credible_sets_by_phenotype",
+    "get_credible_sets_by_qtl_gene",
+    "get_credible_sets_by_region",
+    "get_credible_sets_by_variant",
+    "get_credible_sets_stats",
+    "get_exome_results_by_gene",
+    "get_exome_results_by_phenotype",
+    "get_exome_results_by_region",
+    "get_exome_results_by_variant",
+    "get_gene_based_results",
+    "get_gene_based_results_by_phenotype",
+    "get_gene_disease_associations",
+    "get_gene_expression",
+    "get_gene_to_peaks",
+    "get_genes_in_region",
+    "get_hla_by_allele",
+    "get_hla_by_phenotype",
+    "get_ld_between_variants",
+    "get_mpra_by_gene",
+    "get_mpra_by_region",
+    "get_mpra_by_variant",
+    "get_mpra_pip_concordance_by_gene",
+    "get_myvariant_annotations",
+    "get_nearest_genes",
+    "get_open_chromatin_by_gene",
+    "get_open_chromatin_by_peak",
+    "get_open_chromatin_by_region",
+    "get_open_chromatin_by_variant",
+    "get_peak_to_genes",
+    "get_phenotype_report",
+    "get_summary_stats",
+    "get_summary_stats_by_region",
+    "get_variant_annotations",
+    "get_variant_effect_by_gene",
+    "get_variant_effect_by_variant",
+    "get_variants_in_ld",
+})
+
+# direct SQL against the genetics database
+_DATABASE_TOOLS = frozenset({
+    "get_database_schema",
+    "query_database",
+})
+
 
 @dataclass
 class SkillDefinition:
@@ -21,14 +104,12 @@ class SkillDefinition:
     name: str
     description: str
     instruction_file: str
-    tool_categories: set[str]
-    extra_tools: list[str] = field(default_factory=list)
+    tools: frozenset[str]
     model: str | None = None
     # covers thinking as well as the report text, so leave room for both
     max_tokens: int = 8192
     max_iterations: int = 10
     allow_file_read: bool = False
-    allow_script_exec: bool = False
     allowed_paths: list[str] = field(default_factory=list)
     include_external: bool = False
 
@@ -42,7 +123,7 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
             "colocalization, LD, and exome/burden test results."
         ),
         instruction_file="genetics_data_extraction.md",
-        tool_categories={"general", "api"},
+        tools=_CORE_TOOLS | _GENETICS_API_TOOLS,
         include_external=True,
     ),
     "literature_review": SkillDefinition(
@@ -53,17 +134,7 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
             "relevant papers and web sources."
         ),
         instruction_file="literature_review.md",
-        tool_categories={"general"},
-        extra_tools=[
-            "search_scientific_literature",
-            "web_search",
-            "search_mgi",
-            "get_protein_annotations",
-            "map_protein_variants",
-            "search_uniprot",
-            "get_drug_targets_for_gene",
-            "get_drug_profile",
-        ],
+        tools=_CORE_TOOLS,
     ),
     "database_analysis": SkillDefinition(
         name="database_analysis",
@@ -73,7 +144,7 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
             "specialized API tools cannot handle."
         ),
         instruction_file="database_analysis.md",
-        tool_categories={"general", "bigquery"},
+        tools=_CORE_TOOLS | _DATABASE_TOOLS,
     ),
     "variant_list_analysis": SkillDefinition(
         name="variant_list_analysis",
@@ -85,19 +156,22 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
             "individual variant details when multiple variants are given."
         ),
         instruction_file="variant_list_analysis.md",
-        tool_categories={"general", "api"},
+        tools=_CORE_TOOLS | _GENETICS_API_TOOLS,
     ),
     "data_analysis": SkillDefinition(
         name="data_analysis",
         description=(
-            "Execute Python scripts for statistical analysis, data processing, "
-            "or custom visualizations (matplotlib/polars/scipy). Use when the user "
-            "needs computations or plots beyond what built-in tools provide."
+            "Write and RUN a Python script for statistical analysis or data processing "
+            "(polars/numpy/scipy). This subagent writes the script, runs it in the sandbox "
+            "with `run_analysis`, iterates on failures, and reports the printed output. "
+            "Figures it produces are NOT displayed to the user, so plot on the main path "
+            "by calling `run_analysis` directly instead."
         ),
         instruction_file="data_analysis.md",
-        tool_categories={"general"},
+        # the one skill that names run_analysis: it runs under the caller's authenticated
+        # identity, threaded into run_subagents from the request context
+        tools=_CORE_TOOLS | {"run_analysis"},
         allow_file_read=True,
-        allow_script_exec=True,
     ),
 }
 

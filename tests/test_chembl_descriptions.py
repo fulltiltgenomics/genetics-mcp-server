@@ -186,17 +186,118 @@ class TestChEMBLDescriptionsNameOnlyRealKeys(_ChEMBLToolCase):
             "get_target_bioactivity": bioactivity_result,
         }
 
+    async def _batch_results(self) -> dict[str, dict]:
+        """The same happy paths through the EXECUTOR with a list query.
+
+        The descriptions tell the model what a list query returns — `per_query`,
+        `batch.no_rows_for`, `batch.failed` — and those keys exist only on the executor's
+        batch wrapper, not on the client result `_results` builds. Without this the
+        contract half of every description would be unchecked, which is the exact gap
+        this file exists to close. One input is enough: the wrapper's keys do not depend
+        on how many there are, and a second would just consume the mock twice.
+        """
+        indications = [
+            {
+                "molecule_chembl_id": "CHEMBL121",
+                "efo_id": "EFO:0001360",
+                "efo_term": "type II diabetes mellitus",
+                "mesh_heading": "Diabetes Mellitus, Type 2",
+                "max_phase_for_ind": 4,
+            }
+        ]
+        drug_targets = _pages(
+            status=[_STATUS],
+            target=[_page("targets", _PPARG_TARGETS)],
+            mechanism=[_page("mechanisms", [_mechanism("CHEMBL121")])],
+            molecule=_molecule_pages([_ROSIGLITAZONE, _TROGLITAZONE]),
+            drug_indication=[_page("drug_indications", indications)],
+        )
+        patcher, _calls = self._patch_get(drug_targets)
+        with self._stub_resolver(), patcher:
+            targets_batch = await self.executor.get_drug_targets_for_gene(
+                ["PPARG"], include_indications=True
+            )
+
+        profile = _pages(
+            status=[_STATUS],
+            molecule=[_page("molecules", [_ROSIGLITAZONE])],
+            mechanism=[
+                _page(
+                    "mechanisms",
+                    [
+                        {
+                            "target_chembl_id": "CHEMBL235",
+                            "mechanism_of_action": "PPAR gamma agonist",
+                            "action_type": "AGONIST",
+                            "max_phase": 4,
+                        }
+                    ],
+                )
+            ],
+            target=[_page("targets", [_PPARG_TARGET_DETAIL])],
+            drug_indication=[_page("drug_indications", indications)],
+        )
+        patcher, _calls = self._patch_get(profile)
+        with patcher:
+            profile_batch = await self.executor.get_drug_profile(["rosiglitazone"])
+
+        bioactivity = _pages(
+            status=[_STATUS],
+            target=[_page("targets", _PPARG_TARGETS)],
+            activity=[
+                _page(
+                    "activities",
+                    [_activity("CHEMBL121", "7.2"), _activity("CHEMBL595", "9.0")],
+                    total=4210,
+                )
+            ],
+            molecule=[_page("molecules", [_ROSIGLITAZONE, _TROGLITAZONE])],
+        )
+        patcher, _calls = self._patch_get(bioactivity)
+        with self._stub_resolver(), patcher:
+            bioactivity_batch = await self.executor.get_target_bioactivity(["PPARG"])
+
+        for result in (targets_batch, profile_batch, bioactivity_batch):
+            assert result["success"] is True
+            assert result["batch"]["failed"] == {}, result["batch"]
+        return {
+            "get_drug_targets_for_gene": targets_batch,
+            "get_drug_profile": profile_batch,
+            "get_target_bioactivity": bioactivity_batch,
+        }
+
     async def test_a_tool_description_names_only_parameters_tools_and_result_keys(self):
         results = await self._results()
+        batches = await self._batch_results()
         offenders = {}
         for name in _CHEMBL_TOOLS:
             tool = _tool(name)
             description = _description(tool)
             assert _tokens(description), f"{name} names nothing in backticks — check the regex"
-            unresolved = _unresolved(description, {name: results[name]}, _parameters(tool))
+            # both shapes the one description promises, and still only THIS tool's — a
+            # sibling's keys must not be what makes a name resolve
+            unresolved = _unresolved(
+                description,
+                {name: results[name], f"{name}[]": batches[name]},
+                _parameters(tool),
+            )
             if unresolved:
                 offenders[name] = unresolved
         assert not offenders
+
+    async def test_the_batch_shape_carries_each_input_identity(self):
+        """A flattened row must name the query it came from, or a table built from a
+        batch can attribute a drug to the wrong gene — the one failure mode batching
+        introduces that per-gene calls could not have."""
+        batches = await self._batch_results()
+        for name, rows_key in (
+            ("get_drug_targets_for_gene", "drugs"),
+            ("get_drug_profile", "indications"),
+            ("get_target_bioactivity", "top_compounds"),
+        ):
+            rows = batches[name][rows_key]
+            assert rows, f"{name}: batch produced no rows to check"
+            assert all(row["query"] for row in rows), name
 
     async def test_the_prompt_blocks_name_only_parameters_tools_and_result_keys(self):
         results = await self._results()
