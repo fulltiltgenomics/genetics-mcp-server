@@ -225,3 +225,33 @@ def test_sandbox_client_rejects_timeouts_outside_the_declared_range():
             "s",
             "e",
         )
+
+
+# tool -> the executor method that already accepts a list. A schema saying `string` on a
+# parameter the server will happily take a list for is not a narrower contract, it is a
+# capability the model cannot reach: get_protein_annotations has had a batch path
+# (uniprot._annotate_batch, "the 167-gene zymogen case") since it was written, and the
+# schema said "string" the whole time, so every caller went one protein at a time.
+_ONE_OR_MANY = (
+    "get_drug_targets_for_gene",
+    "get_drug_profile",
+    "get_target_bioactivity",
+    "get_protein_annotations",
+)
+
+
+@pytest.mark.parametrize("tool_name", _ONE_OR_MANY)
+def test_the_schema_admits_the_list_the_server_accepts(tool_name):
+    query = _schemas()[tool_name]["properties"]["query"]
+    assert query["type"] == ["string", "array"], tool_name
+    # without `items` a list of anything validates, and the executor stringifies whatever
+    # it is handed — a nested list would become a query literally reading "['A', 'B']"
+    assert query["items"] == {"type": "string"}, tool_name
+
+
+@pytest.mark.parametrize("tool_name", _ONE_OR_MANY)
+def test_query_stays_required(tool_name):
+    """The union type is what keeps this true. The other way of offering a batch — a
+    second `queries` parameter — makes both optional, and then a call with neither is a
+    shape the schema permits."""
+    assert "query" in _schemas()[tool_name]["required"], tool_name

@@ -1134,8 +1134,9 @@ Examples:
 Do NOT use this tool for protein-position → genomic-coordinate mapping — use map_protein_variants. Do NOT use it to find which proteins share a property — use search_uniprot.""",
         "parameters": {
             "query": {
-                "type": "string",
-                "description": "Gene symbol (strongly preferred, e.g. 'TPO', 'PRSS55'), UniProt entry name, or accession. Never supply an accession recalled from memory when a gene symbol is available.",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Gene symbol (strongly preferred, e.g. 'TPO', 'PRSS55'), UniProt entry name, or accession. Never supply an accession recalled from memory when a gene symbol is available. PASS A LIST to annotate many proteins in one call — up to 100 — rather than calling once per protein. A list answers with a flat `results` row per input, each row carrying its own identity and match_basis so a row can never be attributed to the wrong protein.",
                 "required": True,
             },
             "organism_id": {
@@ -1300,8 +1301,9 @@ NEVER cite a ChEMBL id, max_phase, mechanism or indication from memory — they 
 For one named drug (its targets, ATC class and indications) use get_drug_profile. For how much medicinal chemistry exists against the target — potency measurements rather than drugs — use get_target_bioactivity.""",
         "parameters": {
             "query": {
-                "type": "string",
-                "description": "Gene symbol (preferred, e.g. 'PCSK9'), UniProt accession, or ChEMBL target id ('CHEMBL235'). Never an accession or ChEMBL id recalled from memory.",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Gene symbol (preferred, e.g. 'PCSK9'), UniProt accession, or ChEMBL target id ('CHEMBL235'). Never an accession or ChEMBL id recalled from memory. PASS A LIST TO ASK ABOUT MANY AT ONCE — up to 50 — and do so whenever you have more than one: calling once per gene is the single most expensive mistake on this tool. A list answers in ONE call, with a flat `drugs` table whose rows each name their `query`, each gene's own resolution block under `per_query`, and `batch.no_rows_for` / `batch.failed` naming the inputs that returned nothing and the ones that failed.",
                 "required": True,
             },
             "min_phase": {
@@ -1344,8 +1346,9 @@ NEVER cite a ChEMBL id, max_phase, mechanism or indication from memory — they 
 Start from a gene rather than a drug — "what drugs hit this gene?" — with get_drug_targets_for_gene. For the potency measurements recorded against a target, use get_target_bioactivity.""",
         "parameters": {
             "query": {
-                "type": "string",
-                "description": "Drug name, synonym or trade name (e.g. 'metformin', 'evolocumab'), or a ChEMBL molecule id ('CHEMBL1431'). Never a ChEMBL id recalled from memory.",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Drug name, synonym or trade name (e.g. 'metformin', 'evolocumab'), or a ChEMBL molecule id ('CHEMBL1431'). Never a ChEMBL id recalled from memory. PASS A LIST TO ASK ABOUT MANY AT ONCE — up to 50 — and do so whenever you have more than one: calling once per drug is the single most expensive mistake on this tool. A list answers in ONE call, with a flat `indications` table whose rows each name their `query`, each drug's own resolution block under `per_query`, and `batch.no_rows_for` / `batch.failed` naming the inputs that returned nothing and the ones that failed.",
                 "required": True,
             },
         },
@@ -1365,8 +1368,9 @@ This is a count of assay measurements, not evidence of clinical use. A target wi
 NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they must come from a tool result in this conversation. Every successful result carries an `attribution` line; include it when citing ChEMBL content.""",
         "parameters": {
             "query": {
-                "type": "string",
-                "description": "Gene symbol (preferred, e.g. 'PPARG'), UniProt accession, or ChEMBL target id ('CHEMBL235'). Never an accession or ChEMBL id recalled from memory.",
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Gene symbol (preferred, e.g. 'PPARG'), UniProt accession, or ChEMBL target id ('CHEMBL235'). Never an accession or ChEMBL id recalled from memory. PASS A LIST TO ASK ABOUT MANY AT ONCE — up to 50 — and do so whenever you have more than one: calling once per target is the single most expensive mistake on this tool. A list answers in ONE call, with a flat `top_compounds` table whose rows each name their `query`, each target's own resolution block under `per_query`, and `batch.no_rows_for` / `batch.failed` naming the inputs that returned nothing and the ones that failed.",
                 "required": True,
             },
             "pchembl_min": {

@@ -4968,14 +4968,137 @@ class ToolExecutor:
     # constant — never from the agent-supplied query
     _CHEMBL_FILENAME_FALLBACK = "chembl"
 
+    # A LIST QUERY IS ONE MODEL ROUND TRIP INSTEAD OF N. Measured on benchmark run
+    # a08b371d: one turn spent 37 tool calls and $4.80 asking get_drug_targets_for_gene
+    # about 25 genes one at a time, because the schema offered no way to ask about more
+    # than one. The per-call HTTP is unchanged and still the cheap part — what the batch
+    # removes is the model iteration between each call, which is ~8s and a full context
+    # re-read apiece.
+    _BATCH_MAX = 50
+    # ChEMBL is a public API with no published burst allowance, and the point here is the
+    # round trips, not the wall clock: 5 in flight turns 25 sequential calls into 5 waves
+    # while staying a polite client. Raising it trades goodwill for a second or two.
+    _BATCH_CONCURRENCY = 5
+
+    async def _fan_out(self, queries, call):
+        """`call(q)` for every q, bounded-concurrent, one failure never sinking the rest.
+
+        Returns (results_by_query, errors_by_query) with the input order preserved. A
+        query that raised is in `errors` and absent from `results`, never both: a batch
+        that silently drops an input is worse than one that says which input it lost,
+        because the caller cannot see the gap in a table it did not write.
+        """
+        semaphore = asyncio.Semaphore(self._BATCH_CONCURRENCY)
+
+        async def one(query):
+            async with semaphore:
+                return await call(query)
+
+        settled = await asyncio.gather(
+            *(one(q) for q in queries), return_exceptions=True
+        )
+        results, errors = {}, {}
+        for query, outcome in zip(queries, settled):
+            if isinstance(outcome, BaseException):
+                logger.error(f"batch item {query!r} failed: {outcome}")
+                errors[query] = INTERNAL_ERROR_MSG
+            else:
+                results[query] = outcome
+        return results, errors
+
+    @staticmethod
+    def _batch_queries(query):
+        """The query list for a batch call, or None when this is a single-query call.
+
+        Deduplicated preserving order — a repeated gene in a model-built list would
+        otherwise buy a second identical HTTP request and a duplicate table row.
+        """
+        if isinstance(query, (list, tuple)):
+            seen, out = set(), []
+            for item in query:
+                item = str(item).strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    out.append(item)
+            return out
+        return None
+
+    def _batched(self, queries, results, errors, rows_key, filename):
+        """A batch result in the shape the single-query one has, flattened.
+
+        Every row carries the `query` it came from. That is the same rule uniprot's
+        `_annotate_batch` follows and it exists for the same reason: a table assembled
+        from a batch must never be able to attribute a row to the wrong entity.
+        `per_query` keeps each input's own resolution block, which the tool descriptions
+        tell the model to read before citing anything — flattening must not lose it.
+        """
+        rows, empty = [], []
+        for query in queries:
+            result = results.get(query)
+            if not isinstance(result, dict) or not result.get("success"):
+                if query not in errors:
+                    errors[query] = (
+                        (result or {}).get("error")
+                        or (result or {}).get("note")
+                        or "no result"
+                    )
+                continue
+            found = result.get(rows_key) or []
+            if not found:
+                empty.append(query)
+            for row in found:
+                rows.append({"query": query, **row} if isinstance(row, dict) else row)
+        out = {
+            "success": True,
+            "batch": {
+                "n_queries": len(queries),
+                "n_rows": len(rows),
+                # named rather than left to be inferred from an absent key: "ChEMBL knows
+                # this gene and records no drug" and "the lookup failed" are different
+                # answers and the model must not report one as the other
+                "no_rows_for": empty,
+                "failed": errors,
+            },
+            "per_query": {q: results[q] for q in queries if q in results},
+            rows_key: rows,
+        }
+        return self._download_hint(
+            out, filename, min_rows=self._DOWNLOAD_THRESHOLD, key=rows_key
+        )
+
     async def get_drug_targets_for_gene(
         self,
-        query: str,
+        query: str | list[str],
         min_phase: float = 0,
         include_indications: bool = False,
         max_results: int = 25,
     ) -> dict[str, Any]:
-        """Get the drugs and clinical candidates acting on a gene's ChEMBL target."""
+        """Get the drugs and clinical candidates acting on a gene's ChEMBL target.
+
+        A list `query` answers for every gene in one call; `max_results` then applies
+        per gene, not to the flattened table.
+        """
+        batch = self._batch_queries(query)
+        if batch is not None:
+            if not batch:
+                return {"success": False, "error": "query list is empty"}
+            if len(batch) > self._BATCH_MAX:
+                return {
+                    "success": False,
+                    "error": f"at most {self._BATCH_MAX} genes per call, got {len(batch)}",
+                }
+            results, errors = await self._fan_out(
+                batch,
+                lambda gene: self.get_drug_targets_for_gene(
+                    gene,
+                    min_phase=min_phase,
+                    include_indications=include_indications,
+                    max_results=max_results,
+                ),
+            )
+            return self._batched(
+                batch, results, errors, "drugs", "chembl_drugs.tsv"
+            )
         try:
             result = await self.chembl.get_drug_targets_for_gene(
                 query,
@@ -4996,8 +5119,27 @@ class ToolExecutor:
             key="drugs",
         )
 
-    async def get_drug_profile(self, query: str) -> dict[str, Any]:
-        """Get ChEMBL's profile for one drug: phase, ATC, mechanisms, indications."""
+    async def get_drug_profile(self, query: str | list[str]) -> dict[str, Any]:
+        """Get ChEMBL's profile for a drug: phase, ATC, mechanisms, indications.
+
+        A list `query` profiles every drug in one call.
+        """
+        batch = self._batch_queries(query)
+        if batch is not None:
+            if not batch:
+                return {"success": False, "error": "query list is empty"}
+            if len(batch) > self._BATCH_MAX:
+                return {
+                    "success": False,
+                    "error": f"at most {self._BATCH_MAX} drugs per call, got {len(batch)}",
+                }
+            results, errors = await self._fan_out(batch, self.get_drug_profile)
+            # `indications` rather than a `drugs` list: the single-drug result puts the
+            # drug in a scalar `drug` key, so per_query is where the profiles live and
+            # the flat table is the indications, one row each
+            return self._batched(
+                batch, results, errors, "indications", "chembl_profiles.tsv"
+            )
         try:
             result = await self.chembl.get_drug_profile(query)
         except Exception as e:
@@ -5016,9 +5158,35 @@ class ToolExecutor:
         )
 
     async def get_target_bioactivity(
-        self, query: str, pchembl_min: float = 6.0, max_results: int = 25
+        self, query: str | list[str], pchembl_min: float = 6.0, max_results: int = 25
     ) -> dict[str, Any]:
-        """Summarise the compounds with measured potency against a gene's target."""
+        """Summarise the compounds with measured potency against a gene's target.
+
+        A list `query` answers for every target in one call; `max_results` then applies
+        per target, not to the flattened table.
+        """
+        batch = self._batch_queries(query)
+        if batch is not None:
+            if not batch:
+                return {"success": False, "error": "query list is empty"}
+            if len(batch) > self._BATCH_MAX:
+                return {
+                    "success": False,
+                    "error": f"at most {self._BATCH_MAX} targets per call, got {len(batch)}",
+                }
+            results, errors = await self._fan_out(
+                batch,
+                lambda target: self.get_target_bioactivity(
+                    target, pchembl_min=pchembl_min, max_results=max_results
+                ),
+            )
+            # `top_compounds`, the key the client actually returns — the single-query
+            # path never names it because it downloads `_all_compounds` instead, so a
+            # plausible-looking "compounds" here would flatten to an empty table for
+            # every target and report n_rows 0 with no error
+            return self._batched(
+                batch, results, errors, "top_compounds", "chembl_bioactivity.tsv"
+            )
         try:
             result = await self.chembl.get_target_bioactivity(
                 query, pchembl_min=pchembl_min, max_results=max_results

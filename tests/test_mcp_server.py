@@ -50,17 +50,37 @@ class TestToolDefinitions:
             assert tool_name in tool_names, f"Expected tool '{tool_name}' not found"
 
     def test_tool_parameters_structure(self):
-        """Test that tool parameters have correct structure."""
+        """Test that tool parameters have correct structure.
+
+        `type` is a JSON Schema type name, or a LIST of them for a parameter that takes
+        more than one shape — the one-or-many `query` on the ChEMBL and UniProt tools is
+        `["string", "array"]`, which is what lets a caller ask about 25 genes in one
+        call while `query` stays required. A list is checked harder than a bare string,
+        not waved through: every member has to be a real JSON Schema type, and one that
+        admits an array has to say what the array holds, or a nested list would validate
+        and reach the executor to be stringified into a query literally reading
+        "['A', 'B']".
+        """
+        json_schema_types = {
+            "string", "number", "integer", "boolean", "array", "object", "null",
+        }
         for tool in TOOL_DEFINITIONS:
             params = tool["parameters"]
             for param_name, param_def in params.items():
+                where = f"{tool['name']}.{param_name}"
                 assert "type" in param_def, (
                     f"Parameter '{param_name}' in tool '{tool['name']}' missing type"
                 )
-                # type should be a string
-                assert isinstance(param_def["type"], str), (
-                    f"Parameter type should be string in {tool['name']}.{param_name}"
-                )
+                declared = param_def["type"]
+                if isinstance(declared, list):
+                    assert len(declared) >= 2, f"{where}: a one-member type list is a string"
+                    assert set(declared) <= json_schema_types, where
+                    if "array" in declared:
+                        assert param_def.get("items"), f"{where}: array type without items"
+                else:
+                    assert declared in json_schema_types, (
+                        f"Parameter type should be a JSON Schema type in {where}"
+                    )
 
 
 class TestAnthropicToolFormat:

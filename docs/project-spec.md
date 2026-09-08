@@ -243,14 +243,42 @@ numbers live in the epic's beads notes.
 
 | Tool | Description |
 |------|-------------|
-| `get_drug_targets_for_gene` | Gene → the drugs and clinical candidates ChEMBL records against its protein target, each with mechanism of action, action type, highest clinical phase, first approval year, withdrawal flag and ATC codes; `include_indications` adds what each is developed for. Chat-backend only — excluded from MCP server |
-| `get_drug_profile` | One named drug or `CHEMBL<number>` → its targets with mechanisms, its ATC classification, and its indications as EFO/MeSH terms each with their own max phase. Chat-backend only — excluded from MCP server |
-| `get_target_bioactivity` | Gene → the medicinal chemistry recorded against its target: how many potency measurements sit at or above a pChEMBL threshold, over how many compounds, broken down by assay type, with the most potent compounds. A tractability question, not a clinical one. Chat-backend only — excluded from MCP server |
+| `get_drug_targets_for_gene` | Gene **or list of genes** → the drugs and clinical candidates ChEMBL records against its protein target, each with mechanism of action, action type, highest clinical phase, first approval year, withdrawal flag and ATC codes; `include_indications` adds what each is developed for. Chat-backend only — excluded from MCP server |
+| `get_drug_profile` | A drug **or list of drugs**, named or `CHEMBL<number>` → its targets with mechanisms, its ATC classification, and its indications as EFO/MeSH terms each with their own max phase. Chat-backend only — excluded from MCP server |
+| `get_target_bioactivity` | Gene **or list of genes** → the medicinal chemistry recorded against its target: how many potency measurements sit at or above a pChEMBL threshold, over how many compounds, broken down by assay type, with the most potent compounds. A tractability question, not a clinical one. Chat-backend only — excluded from MCP server |
 
 **Client layer** (`tools/chembl.py`): `ChEMBLClient` holds the transport, the resolution and
 the tool methods, the same split as `tools/uniprot.py`, so the executor carries only
 delegates. It reuses `tools/uniprot.py`'s `_TTLCache` class rather than a second
 implementation, but constructs its own cache instance.
+
+**`query` takes one entity or a list, and the list is the point.** All three ChEMBL tools
+plus `get_protein_annotations` declare `"type": ["string", "array"]`, and the executor fans a
+list out with `_fan_out` — `asyncio.gather` under a semaphore of `_BATCH_CONCURRENCY` (5),
+capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **The HTTP is not what
+this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
+`get_drug_targets_for_gene` about 25 genes one at a time, because the schema offered no way to
+ask about more than one; what a list removes is the ~8s model iteration and full context
+re-read between each call. Verified end to end: the same five-gene question now resolves in one
+call and two iterations.
+
+The union type is deliberate over a second `queries` parameter. `query` stays `required`, so
+"neither given" is not a shape the schema permits — the `variant`/`variants` pattern on
+`get_myvariant_annotations` has to make both optional to work. It also matches
+`get_protein_annotations`, whose executor has accepted `str | list[str]` since it was written
+(uniprot's `_annotate_batch`, "the 167-gene zymogen case") while its schema said `string` — a
+built batch path no caller could reach, which is why that tool is in this list despite needing
+no new implementation.
+
+A batch answers in the single-query shape, flattened: `per_query` keeps each input's own
+resolution block (the descriptions tell the model to read it before citing anything, and
+flattening must not lose it), every row of the flat table carries the `query` it came from so
+a row can never be attributed to the wrong entity, and `batch.no_rows_for` is kept separate
+from `batch.failed` — "ChEMBL knows this gene and records no drug" and "the lookup broke" are
+different answers, and merging them would let the model report one as the other. The rows key
+is the one the client actually returns, which for bioactivity is `top_compounds`, not the
+`compounds` a reader would guess: the single-query path never names it because it downloads
+`_all_compounds` instead.
 
 - **Gene resolution goes through UniProt first**, not through ChEMBL's own gene-symbol
   synonyms. Shape cannot decide what an agent-supplied string is — `P2RY12`, `B4GAT1` and the
