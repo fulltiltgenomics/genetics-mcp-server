@@ -1482,6 +1482,18 @@ All under `/chat/v1`, all `Depends(auth_required)` and scoped to the authenticat
 - `DELETE /chat/v1/llm-config/user/instruction-sets/{set_id}` — archives, **204**; 404 as above
 - `GET /chat/v1/llm-config/user/instruction-sets/{set_id}/history?limit=20` — versions newest first. Archived sets stay readable here, so history survives a delete
 
+Two more endpoints under `/chat/v1`, also `Depends(auth_required)` and scoped to the caller, but
+in `routers/chat_history.py` rather than `llm_config.py` — they control cross-session memory, a
+separate opt-in feature documented under "Cross-session memory premise measurement" below. Both
+also 404 for a caller that is not an identifiable person (a service identity, or the shared
+`anonymous` of an auth-less deployment):
+
+- `GET /chat/v1/memory` — the caller's digest rendered fresh (not the frozen per-session copy), plus the `enabled` flag and the session rows it was built from; answers regardless of the opt-in, so the memory dialog can preview it before the setting is turned on
+- `PUT /chat/v1/chat/sessions/{id}/pin` — pin or unpin a session so it keeps surfacing in the digest past the recency window; 404s (not 403s) for a session the caller does not own, and for a secret chat's id, which never had a row to pin
+
+`GET /chat/v1/chat/sessions` (`list_sessions`, `routers/chat_history.py`) now returns a
+`pinned` field per session, sourced from `chat_sessions.pinned_at`.
+
 Status, detail string and response shape are identical for a foreign id and a nonexistent one on
 all three id-taking endpoints, so the API leaks no evidence that another user's set exists;
 ownership is checked *before* the length cap, so an over-cap body aimed at a foreign id still
@@ -1829,14 +1841,19 @@ may be asserted, and that the rules above win on conflict.
 | Block | Content | Cache behaviour |
 |---|---|---|
 | 0 | default system prompt + verbosity fragment | identical for every user — one entry per verbosity value serves the whole user base |
-| 1 | this user's instruction envelope (omitted entirely when there is none) | one small per-user entry |
+| 1 | this user's instruction envelope and memory envelope, joined (omitted entirely when both are empty) | one small per-user entry |
 
 Concatenating them would refragment the ~7.4K-token shared block per user per event (~$0.043)
 instead of writing the small per-user block (~$0.0025); leaving the user block uncached costs
 ~$0.05 across a 25-iteration turn. This consumes the **fourth and last** of Anthropic's cache
-breakpoints — tool definitions, the shared system block, the user system block, and the last
-replayed message. **There is no spare**: anything that wants a new breakpoint has to take one of
-these away.
+breakpoints, which is why the memory envelope, added later, joins block 1 rather than claiming
+one of its own — see `docs/chat-tool-reference.md` §4 in **genetics-results-suite** for the
+full breakpoint accounting. Both halves are per-user and both hold still for a session's whole length: the
+instruction envelope never changes mid-session, and the memory digest is rendered once, on a
+session's first turn, and read back verbatim from `chat_sessions.context_digest` on every turn
+after — so joining them costs neither fragment anything. See "Cross-session memory premise
+measurement" below and `docs/project-spec.md` ("Chat memory (recent-work digest)") in
+**genetics-results-suite** for what feeds the memory half.
 
 ### Where the choice is visible afterwards
 
@@ -1894,6 +1911,7 @@ src/genetics_mcp_server/
 ├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
 ├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
 ├── memory_digest.py     # entity extraction shared by the memory digest and its premise gate
+├── memory_gate.py       # the one place that decides whether a caller gets cross-session memory
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py      # configuration dataclass
@@ -2728,7 +2746,12 @@ view. It reads only `tool_use` **inputs**, never tool results — `extract_entit
 parameter names it keys on come from `tools/definitions.py`; `query` is resolved per tool,
 because it carries a gene for `search_genes` and a sentence for `search_scientific_literature`.
 SQL (`query_database.sql`) and script text (`run_analysis.code`) are mined with regexes for
-view names, rsids, variant ids and literals compared against a named column.
+view names, rsids, variant ids and literals compared against a named column. The premise
+script additionally calls `extract_marker_entities` (the `[TOOLUSE:<base64>]` display markers
+the browser writes into `content` for rows stored before `content_json` existed) and
+`extract_user_entities` (rsids and variant ids typed directly into a user message) — both are
+what keep the oldest sessions from reading as entity-free; the session digest itself calls
+`extract_entities` alone, because every row it reads postdates `content_json`.
 
 `scripts/memory_premise_stats.py` is the gate that decides whether cross-session memory is
 worth building. It opens chat_history.db read-only and prints one JSON object: returning-user
