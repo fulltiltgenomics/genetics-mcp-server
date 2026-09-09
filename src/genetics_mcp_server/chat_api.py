@@ -591,6 +591,7 @@ def _load_user_memory(
     gateway_asserted: bool,
     first_turn: bool,
     db: Any = None,
+    stats: dict[str, int] | None = None,
 ) -> str | None:
     """The blocking half of `_resolve_user_memory`, run in a worker thread.
 
@@ -639,6 +640,11 @@ def _load_user_memory(
         f"memory digest: user={user_log_hash(user)} "
         f"sessions={len(sessions)} chars={len(digest)}"
     )
+    if stats is not None:
+        # the caller's SSE "memory" event reads this back rather than recomputing it,
+        # so the event and the log line can never disagree
+        stats["sessions"] = len(sessions)
+        stats["chars"] = len(digest)
     return digest
 
 
@@ -650,6 +656,7 @@ async def _resolve_user_memory(
     gateway_asserted: bool,
     first_turn: bool,
     db: Any = None,
+    stats: dict[str, int] | None = None,
 ) -> str | None:
     """The rendered cross-session digest for this turn, or None.
 
@@ -672,6 +679,7 @@ async def _resolve_user_memory(
             gateway_asserted=gateway_asserted,
             first_turn=first_turn,
             db=db,
+            stats=stats,
         )
     except Exception as e:
         logger.warning(f"Could not load chat memory, continuing without it: {e}")
@@ -785,17 +793,30 @@ async def stream_chat(
     # The absence of an assistant message is exact — one is present from the moment the
     # first reply is replayed — and would only be false if a client dropped history
     first_turn = not any(m.role == "assistant" for m in request.messages)
+    memory_stats: dict[str, int] = {}
     user_memory = await _resolve_user_memory(
         user,
         request.session_id,
         secret=request.secret,
         gateway_asserted=gateway_asserted,
         first_turn=first_turn,
+        stats=memory_stats,
     )
 
     async def event_generator():
         """Generate SSE events from LLM stream."""
         try:
+            # populated only on a fresh, non-empty render (see _load_user_memory) — never
+            # on a withheld turn or a later turn reading the stored digest
+            if user_memory and "sessions" in memory_stats:
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "type": "memory",
+                        "sessions": memory_stats["sessions"],
+                        "chars": memory_stats["chars"],
+                    }),
+                }
             async for chunk in service.stream_chat(
                 messages=messages,
                 provider=provider,

@@ -1660,6 +1660,7 @@ class TestUserMemoryResolution:
         secret=False,
         gateway_asserted=True,
         first_turn=True,
+        stats=None,
     ):
         from genetics_mcp_server import chat_api, memory_gate
 
@@ -1671,6 +1672,7 @@ class TestUserMemoryResolution:
                 gateway_asserted=gateway_asserted,
                 first_turn=first_turn,
                 db=chat_history_db,
+                stats=stats,
             )
 
     @pytest.mark.asyncio
@@ -1678,17 +1680,21 @@ class TestUserMemoryResolution:
         self._seed(chat_history_db, self.USER, "APOE and LDL")
         self._opt_in(llm_config_db)
 
-        digest = await self._resolve(llm_config_db, chat_history_db)
+        stats = {}
+        digest = await self._resolve(llm_config_db, chat_history_db, stats=stats)
 
         assert digest is not None
         assert "APOE and LDL" in digest
+        assert stats == {"sessions": 1, "chars": len(digest)}
 
     @pytest.mark.asyncio
     async def test_an_absent_setting_withholds_memory(self, llm_config_db, chat_history_db):
         """Opt-in: nothing is remembered for a user who never opened the dialog."""
         self._seed(chat_history_db, self.USER, "APOE and LDL")
 
-        assert await self._resolve(llm_config_db, chat_history_db) is None
+        stats = {}
+        assert await self._resolve(llm_config_db, chat_history_db, stats=stats) is None
+        assert stats == {}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", ["off", "", "true", "ON"])
@@ -1872,9 +1878,12 @@ class TestUserMemoryResolution:
         assert first is not None
         assert chat_history_db.get_session(current.id, self.USER).context_digest == first
 
+        stats = {}
         assert await self._resolve(
-            llm_config_db, chat_history_db, session_id=current.id, first_turn=False
+            llm_config_db, chat_history_db, session_id=current.id, first_turn=False,
+            stats=stats,
         ) == first
+        assert stats == {}
 
     @pytest.mark.asyncio
     async def test_the_log_line_names_a_hash_never_an_address(
@@ -1908,3 +1917,72 @@ class TestUserMemoryResolution:
             await self._resolve(llm_config_db, chat_history_db)
 
         assert not [m for m in caplog.messages if m.startswith("memory digest:")]
+
+
+class TestMemorySSEEvent:
+    """The "memory" SSE event tells the browser a digest was actually injected. The
+    endpoint fires it off the `stats` dict `_load_user_memory` fills in — populated only
+    on a fresh, non-empty render — so the same numbers the log line reports are what
+    reaches the wire, never a second computation of them."""
+
+    def _events(self, test_client, messages, fake):
+        from genetics_mcp_server import chat_api
+
+        with (
+            patch.object(chat_api, "get_llm_service", return_value=_CapturingService()),
+            patch.object(chat_api, "_resolve_user_memory", side_effect=fake),
+        ):
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={"messages": messages, "enable_tools": False},
+                headers={
+                    "X-Goog-Authenticated-User-Email": "accounts.google.com:a@finngen.fi"
+                },
+            )
+        assert response.status_code == 200
+        return [
+            json.loads(data)
+            for line in response.text.splitlines()
+            if line.startswith("data:") and (data := line[len("data:"):].strip())
+        ]
+
+    def test_emitted_with_the_injected_numbers_on_a_first_turn(self, test_client):
+        digest = "APOE and LDL, TCF7L2 and T2D"
+
+        async def fake(user, session_id, *, stats=None, **kwargs):
+            stats["sessions"] = 3
+            stats["chars"] = len(digest)
+            return digest
+
+        events = self._events(test_client, [{"role": "user", "content": "Hi"}], fake)
+
+        memory_events = [e for e in events if e.get("type") == "memory"]
+        assert len(memory_events) == 1
+        assert memory_events[0] == {"type": "memory", "sessions": 3, "chars": len(digest)}
+
+    def test_absent_when_memory_is_withheld(self, test_client):
+        async def fake(user, session_id, *, stats=None, **kwargs):
+            return None
+
+        events = self._events(test_client, [{"role": "user", "content": "Hi"}], fake)
+
+        assert not [e for e in events if e.get("type") == "memory"]
+
+    def test_absent_on_a_later_turn_reading_the_stored_digest(self, test_client):
+        """The stored-digest path returns a digest but never touches `stats` — that's the
+        signal the endpoint relies on to tell a fresh render from a stored one."""
+
+        async def fake(user, session_id, *, stats=None, **kwargs):
+            return "APOE and LDL"
+
+        events = self._events(
+            test_client,
+            [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+                {"role": "user", "content": "More"},
+            ],
+            fake,
+        )
+
+        assert not [e for e in events if e.get("type") == "memory"]
