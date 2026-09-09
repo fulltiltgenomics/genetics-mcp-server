@@ -23,6 +23,7 @@ import re
 __all__ = [
     "SqlValueError",
     "normalize_literal",
+    "quote_like_pattern",
     "quote_literal",
     "quote_literal_list",
     "sql_float",
@@ -33,6 +34,17 @@ __all__ = [
 # whitespace, parentheses, comma, * and the comment starters - the characters an injected
 # value would need to escape a string literal or append a new clause.
 _SAFE_LITERAL = re.compile(r"^[A-Za-z0-9_.@:/+-]{1,128}$")
+
+# free-text substring searches over a human-readable name column. Adds spaces, commas,
+# parentheses and ':' on top of _SAFE_LITERAL, because the values being matched are English
+# phrases that carry an HPO id in parentheses ("Abnormality of the nervous system
+# (HP:0000707)"); it also drops '@' and gives up nothing else _SAFE_LITERAL allowed. Still
+# excludes ' " ` \ ; % and the comment starters /* */, so an accepted value can neither close
+# the literal nor widen the LIKE beyond the %...% this module wraps it in. '--' is not on
+# that exclusion list and does not need to be: SQL's line comment has no closing token, so a
+# `--` inside the still-open string literal just matches two literal characters — it cannot
+# terminate the literal or comment anything out.
+_SAFE_LIKE = re.compile(r"^[A-Za-z0-9_.,():/ +-]{1,128}$")
 
 
 class SqlValueError(ValueError):
@@ -77,6 +89,24 @@ def quote_literal(value: str, *, name: str) -> str:
     can be interpolated: nothing that survives validation can close the quote.
     """
     return f"'{normalize_literal(value, name=name)}'"
+
+
+def quote_like_pattern(value: str, *, name: str) -> str:
+    """Return `value` as a quoted `'%...%'` LIKE pattern for a substring match, or raise.
+
+    The caller supplies the search text, never the wildcards: `%` is outside the allow-list,
+    so a value cannot reach past the contains-match this builds. `_` is inside it and is a
+    single-character LIKE wildcard, which only ever widens the match.
+    """
+    if not isinstance(value, str):
+        raise SqlValueError(f"{name} must be a string, got {type(value).__name__}")
+    stripped = value.strip()
+    if not _SAFE_LIKE.match(stripped):
+        raise SqlValueError(
+            f"invalid {name}: {value!r}. Only letters, digits, spaces and _ . , ( ) : / + - "
+            f"are allowed (max 128 characters)."
+        )
+    return f"'%{stripped}%'"
 
 
 def quote_literal_list(values, *, name: str) -> str:

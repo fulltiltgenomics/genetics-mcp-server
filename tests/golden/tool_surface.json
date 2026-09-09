@@ -17,7 +17,7 @@
     "profiles": {
       "api": {
         "local": {
-          "count": 64,
+          "count": 66,
           "tools": [
             "analyze_variant_list",
             "get_asm_qtl_by_gene",
@@ -33,6 +33,7 @@
             "get_credible_sets_by_variant",
             "get_database_schema",
             "get_dataset_display_names",
+            "get_dosage_sensitivity",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_exome_results_by_gene",
@@ -61,6 +62,7 @@
             "get_open_chromatin_by_variant",
             "get_peak_to_genes",
             "get_protein_annotations",
+            "get_rcnv_associations",
             "get_resource_metadata",
             "get_summary_stats",
             "get_summary_stats_by_region",
@@ -88,7 +90,7 @@
       },
       "bigquery": {
         "local": {
-          "count": 64,
+          "count": 66,
           "tools": [
             "analyze_variant_list",
             "get_asm_qtl_by_gene",
@@ -104,6 +106,7 @@
             "get_credible_sets_by_variant",
             "get_database_schema",
             "get_dataset_display_names",
+            "get_dosage_sensitivity",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_exome_results_by_gene",
@@ -132,6 +135,7 @@
             "get_open_chromatin_by_variant",
             "get_peak_to_genes",
             "get_protein_annotations",
+            "get_rcnv_associations",
             "get_resource_metadata",
             "get_summary_stats",
             "get_summary_stats_by_region",
@@ -186,7 +190,7 @@
       },
       "nocode": {
         "local": {
-          "count": 64,
+          "count": 66,
           "tools": [
             "analyze_variant_list",
             "get_asm_qtl_by_gene",
@@ -202,6 +206,7 @@
             "get_credible_sets_by_variant",
             "get_database_schema",
             "get_dataset_display_names",
+            "get_dosage_sensitivity",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_exome_results_by_gene",
@@ -230,6 +235,7 @@
             "get_open_chromatin_by_variant",
             "get_peak_to_genes",
             "get_protein_annotations",
+            "get_rcnv_associations",
             "get_resource_metadata",
             "get_summary_stats",
             "get_summary_stats_by_region",
@@ -257,7 +263,7 @@
       },
       "null": {
         "local": {
-          "count": 64,
+          "count": 66,
           "tools": [
             "analyze_variant_list",
             "get_asm_qtl_by_gene",
@@ -273,6 +279,7 @@
             "get_credible_sets_by_variant",
             "get_database_schema",
             "get_dataset_display_names",
+            "get_dosage_sensitivity",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_exome_results_by_gene",
@@ -301,6 +308,7 @@
             "get_open_chromatin_by_variant",
             "get_peak_to_genes",
             "get_protein_annotations",
+            "get_rcnv_associations",
             "get_resource_metadata",
             "get_summary_stats",
             "get_summary_stats_by_region",
@@ -328,7 +336,7 @@
       },
       "rag": {
         "local": {
-          "count": 64,
+          "count": 66,
           "tools": [
             "analyze_variant_list",
             "get_asm_qtl_by_gene",
@@ -344,6 +352,7 @@
             "get_credible_sets_by_variant",
             "get_database_schema",
             "get_dataset_display_names",
+            "get_dosage_sensitivity",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_exome_results_by_gene",
@@ -372,6 +381,7 @@
             "get_open_chromatin_by_variant",
             "get_peak_to_genes",
             "get_protein_annotations",
+            "get_rcnv_associations",
             "get_resource_metadata",
             "get_summary_stats",
             "get_summary_stats_by_region",
@@ -406,7 +416,7 @@
   "local_tool_definitions": {
     "by_category": {
       "api": {
-        "count": 44,
+        "count": 46,
         "tools": [
           "analyze_variant_list",
           "get_asm_qtl_by_gene",
@@ -421,6 +431,7 @@
           "get_credible_sets_by_region",
           "get_credible_sets_by_variant",
           "get_credible_sets_stats",
+          "get_dosage_sensitivity",
           "get_exome_results_by_gene",
           "get_exome_results_by_phenotype",
           "get_exome_results_by_region",
@@ -446,6 +457,7 @@
           "get_open_chromatin_by_variant",
           "get_peak_to_genes",
           "get_phenotype_report",
+          "get_rcnv_associations",
           "get_summary_stats",
           "get_summary_stats_by_region",
           "get_variant_annotations",
@@ -496,7 +508,7 @@
         ]
       }
     },
-    "count": 70
+    "count": 72
   },
   "mcp_server": {
     "deployed_flags_set": {
@@ -525,7 +537,7 @@
       "web_search"
     ],
     "registered_tools": {
-      "count": 53,
+      "count": 55,
       "tools": [
         "analyze_variant_list",
         "get_asm_qtl_by_gene",
@@ -541,6 +553,7 @@
         "get_credible_sets_by_variant",
         "get_database_schema",
         "get_dataset_display_names",
+        "get_dosage_sensitivity",
         "get_exome_results_by_gene",
         "get_exome_results_by_phenotype",
         "get_exome_results_by_region",
@@ -565,6 +578,7 @@
         "get_open_chromatin_by_region",
         "get_open_chromatin_by_variant",
         "get_peak_to_genes",
+        "get_rcnv_associations",
         "get_resource_metadata",
         "get_summary_stats",
         "get_summary_stats_by_region",

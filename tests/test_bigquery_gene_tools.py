@@ -341,6 +341,8 @@ _SQL_EMITTERS = [
         _emits_via_query("get_mpra_pip_concordance_by_gene", "APOE"),
     ),
     ("get_hla_by_allele", _emits_via_query("get_hla_by_allele", "DRB1*15:01")),
+    ("get_dosage_sensitivity", _emits_via_query("get_dosage_sensitivity", ["APOE"])),
+    ("get_rcnv_associations", _emits_via_query("get_rcnv_associations", gene="APOE")),
 ]
 
 

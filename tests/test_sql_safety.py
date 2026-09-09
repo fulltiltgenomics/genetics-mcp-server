@@ -10,6 +10,7 @@ import pytest
 
 from genetics_mcp_server.tools.sql_safety import (
     SqlValueError,
+    quote_like_pattern,
     quote_literal,
     quote_literal_list,
     sql_float,
@@ -96,3 +97,15 @@ def test_sql_float_range_and_finiteness():
     for bad in (float("nan"), float("inf"), 1.5, "0.1"):
         with pytest.raises(SqlValueError):
             sql_float(bad, name="min_pip", minimum=0.0, maximum=1.0)
+
+
+def test_like_pattern_accepts_colon_for_parenthesized_hpo_ids():
+    value = "Abnormality of the nervous system (HP:0000707)"
+    assert quote_like_pattern(value, name="phenotype") == f"'%{value}%'"
+
+
+def test_like_pattern_double_dash_is_inert_not_rejected():
+    """`--` cannot close the quote it lands inside, so it is just two literal characters
+    that widen the match to nothing new — not a comment starter, and not on the exclusion
+    list."""
+    assert quote_like_pattern("foo--bar", name="phenotype") == "'%foo--bar%'"
