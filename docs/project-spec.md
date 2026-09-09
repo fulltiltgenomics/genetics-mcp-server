@@ -1074,7 +1074,19 @@ quality-over-time plots).
 - **Issue categorization**: the judge's detailed per-conversation issues are mapped
   onto a fixed taxonomy (`conversation_prompts.py:ISSUE_CATEGORIES`) via a separate
   cheap pass (batched, on the topic model) so the report surfaces recurring problems
-  instead of count-1 unique strings.
+  instead of count-1 unique strings. The judge also returns `nits` (minor blemishes)
+  and `strengths`, stored on the metrics as `llm_nits` / `llm_strengths` but never
+  categorized, so they cannot inflate the issue chart; anything the categorizer
+  files as `not_an_issue` (`NON_ISSUE_CATEGORIES`) is dropped before persistence for
+  the same reason. An issue the model did not assign — a failed batch, a skipped id —
+  is *not* defaulted and cached: it reads as `other` for that run only and is retried
+  on the next. Both batch prompts parse the answer with `extract_json_list`, which
+  accepts the requested array *or* one object per line — Opus 5 with thinking off
+  usually answers in the latter form, and the old first-value parser then dropped the
+  whole batch behind a 200 OK. That, plus the cached fallback, was the August 2026
+  "other" spike (half the nights after the 2026-07-25 Opus 5 switch came back 100%
+  `other`; a 529 at 02:30 did the same on 2026-09-03). A failed batch also makes the
+  run exit non-zero so the CronJob's `OnFailure` restart retries it.
 - **Caching**: per-session topic + quality + derived results are persisted to the
   `conversation_analysis` / `conversation_issue` SQLite tables (with the full
   `ConversationMetrics` blob in `metrics_json`) and read back via `get_analysis_map`
@@ -1096,7 +1108,15 @@ quality-over-time plots).
   (re-judge, keep topic cache), `--no-cache` (recompute all), or `--force` (reanalyze
   every conversation from scratch — a superset of `--no-cache` for the selected range;
   `--force` wins over `--refresh-quality` since it recomputes topics too). The issue text →
-  taxonomy-category map remains a small flat sidecar at `<output-dir>/.cache/issue_categories.json`.
+  taxonomy-category map remains a small sidecar at `<output-dir>/.cache/issue_categories.json`,
+  written as `{"taxonomy": <fingerprint of ISSUE_CATEGORIES>, "categories": {...}}`. The
+  sidecar is keyed only by issue text, so it is discarded wholesale when the fingerprint
+  does not match (or the file is in the older flat format): changing a category name or
+  description re-categorizes every issue on the next run with no manual wipe.
+- **API retries**: every Anthropic call goes through `create_with_backoff`, which on
+  408/409/429/5xx/529 sleeps 15→240 s across five retries on top of the SDK's own two
+  sub-second ones. The nightly run has hit multi-minute 529 "overloaded" windows that
+  the SDK retries alone did not outlast.
 
 ## Development Workflow
 

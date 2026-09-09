@@ -34,20 +34,36 @@ Messages:
 # fixed taxonomy for grouping detailed, per-conversation quality issues into
 # recurring underlying problems. each detailed issue from the judge is mapped to
 # exactly one of these so the report can count real patterns instead of unique strings.
+#
+# the descriptions are the categorizer's only guidance, so they are written to
+# separate near neighbours: platform_error vs tool_failure_handling (the outage
+# vs the assistant's handling of it), inaccurate_claim vs self_corrected_error
+# (stayed wrong vs got fixed), capability_gap vs missed_data_source (data the
+# system lacks vs data it has and did not use).
 ISSUE_CATEGORIES = [
-    ("incomplete_answer", "Answered only part of the question or omitted requested detail"),
-    ("missed_data_source", "Failed to use or find available data; claimed no data when data exists; queried the wrong source"),
-    ("inaccurate_claim", "Stated something factually wrong, misleading, or unsupported"),
+    ("incomplete_answer", "Answered only part of the question, omitted requested detail, or narrowed the scope without being asked"),
+    ("missed_data_source", "Failed to use or find data the system does have; claimed no data when data exists; queried the wrong source"),
+    ("capability_gap", "The requested data or analysis is not available through the assistant's tools (missing dataset, reference panel, plot type, external database, or API filter) and the assistant disclosed the limitation"),
+    ("inaccurate_claim", "Stated something factually wrong, misleading, or unsupported, and it was not corrected within the conversation"),
+    ("self_corrected_error", "Made an error that was later corrected, either by the assistant itself or after the user pushed back"),
     ("fabrication", "Invented data, results, numbers, citations, or tool output that was not actually returned"),
-    ("inefficient_tool_use", "Redundant, repeated, or unnecessary tool calls"),
-    ("tool_failure_handling", "A tool errored or returned nothing and the assistant gave up or failed to recover"),
-    ("misunderstood_question", "Misinterpreted what the user was actually asking"),
-    ("no_conclusion", "Did not synthesize results into a clear answer; left the conversation hanging"),
+    ("weak_grounding", "Conclusions rest on proxies, extrapolation, or speculation and are presented with more rigor than the data supports, even if caveated"),
+    ("inefficient_tool_use", "Redundant, repeated, or unnecessary tool calls; schema or column-name thrashing; per-item calls where a batch was possible"),
+    ("tool_failure_handling", "A tool errored or returned nothing and the assistant gave up, did not retry, or failed to recover"),
+    ("platform_error", "Infrastructure problem outside the assistant's control that the assistant handled acceptably: connection interrupted or response cut off mid-stream, attachment did not reach the assistant, download link or endpoint broken, external API rate-limited or down, tool output truncated"),
+    ("misunderstood_question", "Misinterpreted what the user was actually asking, or proceeded on an unconfirmed assumption where a clarifying question was warranted"),
+    ("no_conclusion", "Did not synthesize results into a clear answer; left the conversation hanging or ended awaiting a go-ahead"),
     ("missing_interpretation", "Returned raw data or tables without interpreting them for the user"),
-    ("formatting_readability", "Poor formatting or hard to read; dumped raw tables"),
+    ("missing_deliverable", "A requested file, table, plot, or download was described or promised but not actually produced or usable"),
+    ("formatting_readability", "Poor formatting or hard to read; dumped raw tables; overly long or dense output relative to the question"),
     ("overcautious", "Unnecessarily refused, hedged, or added excessive caveats"),
+    ("not_an_issue", "Not a problem at all: praise, a neutral observation, a limitation the assistant handled well, or a note about a greeting or test message"),
     ("other", "A genuine issue that does not fit any category above"),
 ]
+
+# categories that must not count as problems in the per-conversation category
+# list, the conversation_issue table, the report or the admin chart
+NON_ISSUE_CATEGORIES = frozenset({"not_an_issue"})
 
 ISSUE_CATEGORIZATION_PROMPT = """\
 You are grouping individual quality issues found across a genetics AI assistant's
@@ -56,10 +72,15 @@ conversations into recurring underlying problem categories.
 Assign each issue below to exactly ONE category from this list:
 {categories}
 
-Each issue is prefixed with a numeric ID. Respond with a JSON array, one object
-per issue, using only category names from the list above:
+Pick the closest category; an issue rarely fits a description word for word. Use
+"other" only when no category is even approximately right. If the text describes
+a strength, or something the assistant handled well, rather than a problem, use
+"not_an_issue".
+
+Each issue is prefixed with a numeric ID. Respond with a single JSON array (not
+one object per line), one object per issue, using only category names from the
+list above:
 [{{"id": 0, "category": "..."}}]
-If an issue genuinely fits none of the categories, use "other".
 
 Issues:
 {issues}
@@ -133,8 +154,21 @@ Then assess:
 3. Were tool calls efficient (no unnecessary calls)? (yes/mostly/no)
 4. Did the conversation reach a natural conclusion? (yes/no)
 
+Finally list what went wrong, split three ways. Each entry is one short sentence
+naming a single concrete problem or strength:
+- "issues": real problems that affected the answer, attributable to the assistant or
+  to a tool/infrastructure failure the user experienced. Do NOT put strengths,
+  "otherwise good" remarks, or well-handled limitations here.
+- "nits": minor blemishes that did not affect the answer (a typo, rounding, one
+  redundant call, slight verbosity). Keep these out of "issues".
+- "strengths": notable things done well. Empty if nothing stands out.
+Do not report that the conversation shown to you is elided or truncated — the
+"[... chars elided ...]" markers are a display artifact of this evaluation, not
+something the user saw. Greeting or test messages with no real question are not
+an issue either; the disposition already captures them.
+
 Respond with JSON:
-{{"disposition": "good_answer|agent_failure|technical_failure|out_of_scope|unfinished|weird_or_unclear", "answered": "yes|partially|no", "accurate": "yes|mostly|no", "efficient": "yes|mostly|no", "concluded": "yes|no", "quality_score": 1-5, "issues": ["list of problems if any"]}}
+{{"disposition": "good_answer|agent_failure|technical_failure|out_of_scope|unfinished|weird_or_unclear", "answered": "yes|partially|no", "accurate": "yes|mostly|no", "efficient": "yes|mostly|no", "concluded": "yes|no", "quality_score": 1-5, "issues": ["..."], "nits": ["..."], "strengths": ["..."]}}
 
 Conversation:
 {conversation}

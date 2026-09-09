@@ -499,10 +499,11 @@ class TestIssueCategorization:
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
         with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
-            result = await categorize_issues_with_llm(
+            result, failed = await categorize_issues_with_llm(
                 ["did not query exome data", "made 12 redundant tool calls"],
             )
 
+        assert failed == 0
         assert result["did not query exome data"] == "missed_data_source"
         assert result["made 12 redundant tool calls"] == "inefficient_tool_use"
 
@@ -515,20 +516,95 @@ class TestIssueCategorization:
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
         with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
-            result = await categorize_issues_with_llm(["some issue"])
+            result, _ = await categorize_issues_with_llm(["some issue"])
 
         assert result["some issue"] == "other"
 
     @pytest.mark.asyncio
-    async def test_api_error_falls_back_to_other(self):
+    async def test_api_error_leaves_batch_unassigned(self):
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
 
         with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
-            result = await categorize_issues_with_llm(["issue a", "issue b"])
+            result, failed = await categorize_issues_with_llm(["issue a", "issue b"])
 
-        # every input still gets a category even when the call fails
-        assert result == {"issue a": "other", "issue b": "other"}
+        # a failed batch must not be defaulted: the caller caches whatever comes
+        # back, and a cached "other" is never retried
+        assert result == {}
+        assert failed == 1
+
+    @pytest.mark.asyncio
+    async def test_skipped_id_is_not_defaulted(self):
+        mock_response = mock_llm_response([{"id": 1, "category": "fabrication"}])
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result, failed = await categorize_issues_with_llm(["issue a", "issue b"])
+
+        assert result == {"issue b": "fabrication"}
+        assert failed == 0
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"status {status_code}")
+        self.status_code = status_code
+
+
+class TestCreateWithBackoff:
+    @pytest.mark.asyncio
+    async def test_retries_transient_status_then_succeeds(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(side_effect=[_StatusError(529), _StatusError(429), "ok"])
+
+        result = await ac.create_with_backoff(client, delays=(0, 0), model="m")
+
+        assert result == "ok"
+        assert client.messages.create.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_delays_exhausted(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(side_effect=_StatusError(529))
+
+        with pytest.raises(_StatusError):
+            await ac.create_with_backoff(client, delays=(0,), model="m")
+        assert client.messages.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_transient_error_is_not_retried(self):
+        client = AsyncMock()
+        client.messages.create = AsyncMock(side_effect=_StatusError(400))
+
+        with pytest.raises(_StatusError):
+            await ac.create_with_backoff(client, delays=(0, 0), model="m")
+        assert client.messages.create.await_count == 1
+
+
+class TestIssueCategoryCache:
+    def test_round_trip(self, tmp_path):
+        path = tmp_path / ".cache" / "issue_categories.json"
+        ac.save_issue_category_cache(path, {"issue a": "fabrication"})
+        assert ac.load_issue_category_cache(path) == {"issue a": "fabrication"}
+
+    def test_missing_file_is_empty(self, tmp_path):
+        assert ac.load_issue_category_cache(tmp_path / "nope.json") == {}
+
+    def test_legacy_flat_format_is_discarded(self, tmp_path):
+        path = tmp_path / "issue_categories.json"
+        path.write_text(json.dumps({"issue a": "other"}))
+        assert ac.load_issue_category_cache(path) == {}
+
+    def test_other_taxonomy_is_discarded(self, tmp_path):
+        path = tmp_path / "issue_categories.json"
+        path.write_text(json.dumps({"taxonomy": "stale", "categories": {"issue a": "other"}}))
+        assert ac.load_issue_category_cache(path) == {}
+
+    def test_fingerprint_tracks_descriptions(self):
+        before = ac.taxonomy_fingerprint()
+        with patch.object(ac, "ISSUE_CATEGORIES", ac.ISSUE_CATEGORIES + [("x", "y")]):
+            assert ac.taxonomy_fingerprint() != before
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +911,7 @@ def _patch_llm():
                 for sid in session_ids}
 
     async def fake_issue_cats(issues, **kw):
-        return {i: "other" for i in issues}
+        return {i: "other" for i in issues}, 0
 
     return (
         patch.object(ac, "categorize_with_llm", AsyncMock(side_effect=fake_topics)),
@@ -1164,3 +1240,43 @@ class TestResolveLlmConfigDb:
         from genetics_mcp_server.scripts.analyze_conversations import resolve_llm_config_db
 
         assert resolve_llm_config_db("chat_history.db", None) == "llm_config.db"
+
+
+# ---------------------------------------------------------------------------
+# JSON-list extraction: array vs one-object-per-line responses
+# ---------------------------------------------------------------------------
+
+class TestExtractJsonList:
+    def test_plain_array(self):
+        assert ac.extract_json_list('[{"id": 0}, {"id": 1}]') == [{"id": 0}, {"id": 1}]
+
+    def test_one_object_per_line(self):
+        text = '{"id": 0, "category": "a"}\n{"id": 1, "category": "b"}\n'
+        assert ac.extract_json_list(text) == [{"id": 0, "category": "a"}, {"id": 1, "category": "b"}]
+
+    def test_fenced_array_with_prose(self):
+        text = 'Here you go:\n```json\n[{"id": 0}]\n```\nDone.'
+        assert ac.extract_json_list(text) == [{"id": 0}]
+
+    def test_bracketed_prose_before_array_is_skipped(self):
+        text = 'Issue [0] is tricky.\n[{"id": 0, "category": "other"}]'
+        assert ac.extract_json_list(text) == [{"id": 0, "category": "other"}]
+
+    def test_no_json(self):
+        assert ac.extract_json_list("nothing here") == []
+
+    @pytest.mark.asyncio
+    async def test_categorizer_accepts_one_object_per_line(self):
+        response = MagicMock()
+        response.content = [MagicMock(
+            type="text",
+            text='{"id": 0, "category": "fabrication"}\n{"id": 1, "category": "no_conclusion"}',
+        )]
+        mock_client = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=response)
+
+        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+            result, failed = await categorize_issues_with_llm(["issue a", "issue b"])
+
+        assert failed == 0
+        assert result == {"issue a": "fabrication", "issue b": "no_conclusion"}
