@@ -1696,7 +1696,7 @@ ClinVar significance, population frequency and rsID:
 - with the sandbox and `get_variant_protein_effect` (`bigquery`) — pointed at
   `genetics.variant_annotation(...)` for consequence/AF/gene and at `get_variant_protein_effect`
   for a coding SNV's clinical annotation;
-- with the sandbox but no annotation tool at all (`code`, seven tools) — pointed at
+- with the sandbox but no annotation tool at all (`code`) — pointed at
   `genetics.variant_annotation(...)`, and told that clinical significance and pathogenicity are
   genuinely unavailable, which is true only there;
 - with `query_database` alone and `get_variant_protein_effect` (`bigquery` with
@@ -1724,7 +1724,7 @@ was changed.
 behind those six values, so the ones that need a shape no surface produces — a database surface
 without the API tools, a surface carrying `launch_subagents`, one carrying every tool at once —
 build the tool set directly instead; the gate is keyed on tool names, not on a profile. Three of
-those seven pin the core property families — the first, and the heading-body half of the
+those classes pin the core property families — the first, and the heading-body half of the
 third, with `ENABLE_SUBAGENTS` both true and false:
 **absence** (every tool name in the emitted prompt is in the resolved list, tokenising
 independently of the gate's own matcher — independently on the algorithm, not on the
