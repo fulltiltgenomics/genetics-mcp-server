@@ -226,7 +226,8 @@ async def lifespan(app: FastAPI):
     warn_unless_gateway_identity_secret("chat-backend")
     configure_rate_limit(
         max_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", "20")),
-        max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "100")),
+        max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "40")),
+        max_per_week=int(os.environ.get("RATE_LIMIT_PER_WEEK", "100")),
     )
     # eagerly initialize LLM service and external MCP servers at startup
     get_llm_service()

@@ -211,7 +211,7 @@ def render(report: dict[str, Any], csv: bool = False) -> str:
         notes.append(
             f"!! THIS RUN WAS RATE-LIMITED: {len(limited)} turn(s) came back HTTP 429, so "
             f"only {comparable} of {len(rows)} cases are comparable and the numbers below "
-            "are not a benchmark. Raise RATE_LIMIT_PER_HOUR / RATE_LIMIT_PER_DAY on the "
+            "are not a benchmark. Raise RATE_LIMIT_PER_HOUR / RATE_LIMIT_PER_DAY / RATE_LIMIT_PER_WEEK on the "
             "chat service above the whole plan, restart it, and re-run."
         )
     skipped = [r for r in rows if r["blockers"]]

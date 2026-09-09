@@ -2604,9 +2604,10 @@ The `/chat/v1/auth` endpoint includes an `is_admin` boolean in its response, use
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RATE_LIMIT_PER_HOUR` | Max chat messages per user per hour | `20` |
-| `RATE_LIMIT_PER_DAY` | Max chat messages per user per day | `100` |
+| `RATE_LIMIT_PER_DAY` | Max chat messages per user per day | `40` |
+| `RATE_LIMIT_PER_WEEK` | Max chat messages per user per week | `100` |
 
-Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. Both limits use sliding windows. Returns HTTP 429 with the specific limit hit when exceeded.
+Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. All three limits use sliding windows over one in-memory timestamp list per user, so a pod restart empties every window. Returns HTTP 429 with the specific limit hit when exceeded.
 
 ### MCP server options
 
@@ -2881,8 +2882,9 @@ harness issues two arms per case. `--base-url` therefore defaults to
 - **Running it fast.** With one arm there is no pairing to preserve, so `--concurrency`
   is free to rise to whatever Anthropic and the local stack will take. Two settings on
   the stack are the binding constraint, and neither is a benchmark flag:
-  `RATE_LIMIT_PER_HOUR`/`RATE_LIMIT_PER_DAY` (chat-backend's own limiter, 20/100 by
-  default — a 50-turn run trips it and the harness treats that 429 as run-invalidating),
+  `RATE_LIMIT_PER_HOUR`/`RATE_LIMIT_PER_DAY`/`RATE_LIMIT_PER_WEEK` (chat-backend's own
+  limiter, 20/40/100 by default — a 50-turn run trips it and the harness treats that 429 as
+  run-invalidating),
   and `ANTHROPIC_RETRY_RATE_LIMIT=true`, which makes chat-backend wait out an Anthropic
   429 rather than failing the turn. That is push-until-refused-then-back-off, not
   header-driven pacing: nothing reads the `anthropic-ratelimit-*` headers to self-throttle
