@@ -32,6 +32,7 @@ fetching every row, and add the partition predicate each view's section names.
 | `hla_associations_v` | Classical HLA allele associations from FinnGen R14 — every imputed HLA allele tested against every core R14 endpoint (~2,712 phenotypes x 187 alleles across 10 genes). |
 | `gene_annotations_v` | Whole-universe gene annotations, one row per gene: HGNC core fields joined to GENCODE GRCh38 coordinates, with full-lineage HGNC gene-group arrays (gene_group_ids / gene_group_names contain the leaf group plus all of its ancestor groups, so any group can be matched with `<id> IN UNNEST(gene_group_ids)`). |
 | `dosage_sensitivity_v` | Rare-CNV dosage sensitivity scores from Collins et al. |
+| `rcnv_gene_associations_v` | Gene-level rare-CNV association statistics from Collins et al. |
 | `variant_annotation_v` | Per-variant functional annotation and FinnGen (R14) allele frequencies — one row per variant, covering all imputed variants, not only fine-mapped ones. |
 | `peak_to_gene_v` | Open4Gene peak-to-gene links from FinnGen ATAC-seq: which genes a chromatin peak's accessibility is associated with, in which cell type. |
 | `phenotypes_v` | Trait/phenotype metadata: the human-readable name, trait type, category and sample sizes behind the opaque phenotype codes the results tables store. |
