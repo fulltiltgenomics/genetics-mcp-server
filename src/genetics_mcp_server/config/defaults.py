@@ -181,6 +181,29 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
     _Block(
         "\nReach these through `get_mpra_by_variant` / `get_mpra_by_region` / `get_mpra_by_gene`, `get_variant_effect_by_variant` / `get_variant_effect_by_gene`, and `get_open_chromatin_by_variant` / `get_open_chromatin_by_region` / `get_open_chromatin_by_peak` / `get_open_chromatin_by_gene`.\n"
     ),
+    # OPT-IN IS DELIVERED BY THIS TEXT AND BY THE TOOL DESCRIPTION, AND BY NOTHING ELSE.
+    # There is no per-user setting, no per-conversation column and no UI toggle: the user
+    # was told plainly that this is persuasion rather than enforcement, that the model
+    # holds the tool either way, and chose it. So this block is the requirement, not
+    # boilerplate around it — and the tool description carries the same rules, because the
+    # model follows a description far more reliably than prose this far up the prompt.
+    # It self-gates on the tool name the way every block here does.
+    _Block("""
+### AlphaGenome variant predictions (opt-in)
+
+`get_alphagenome_variant_predictions` returns MODEL PREDICTIONS from AlphaGenome (Google DeepMind): what a deep-learning model predicts a variant does to chromatin accessibility, binding, transcription and splicing. They are not measurements, not FinnGen results, and nothing in them was observed in a person.
+
+**Call it only when the user has asked for it.** Three things count as asking: the user names AlphaGenome; the user asks for a model prediction of a variant's regulatory effect; or the user asks how a measured value in this suite compares with what a model predicts for the same variant — that comparison is a first-class use of the tool, not a workaround.
+
+- Do NOT call it as background enrichment, and do not add a prediction to an answer that did not ask for one
+- "What does this variant do?", "tell me about rs...", "is this variant causal?", "why is this locus associated?" are NOT requests for AlphaGenome. Answer them from this suite's own measured and fine-mapped data
+- Finding nothing in this suite's data is not a reason to call it either. Say the data is silent; you may OFFER a prediction in one line and then wait to be asked
+- It is an additional source of evidence, not a fallback for gaps. Being available is not a reason to use it
+
+When you report a prediction, read the per-modality `validation` block and carry it into the answer: `quantity: "magnitude"` means the direction is not reported and you must not state one; `status: "unvalidated"` means the modality was never checked against anything measured here; `population_rho` is a cohort-level correlation for the modality and never a confidence for the variant in hand.
+
+Predicted and measured values may be presented side by side, and there the labelling matters MORE, not less: label every predicted number as predicted, name the source of every measured number, never merge or average the two into one figure, and where they disagree say that they disagree.
+"""),
     # the MHC caution and the two result-reading traps are domain science, not routing: they
     # hold however the data is reached, and the surfaces that lose the HLA tools keep
     # `credible_sets_v` and `hla_associations_v` through SQL — i.e. exactly the readers who

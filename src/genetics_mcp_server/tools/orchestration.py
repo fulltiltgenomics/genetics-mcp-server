@@ -34,7 +34,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from genetics_mcp_server.tools.executor import ToolExecutor, _resolve_settings
+from genetics_mcp_server.tools.executor import (
+    INTERNAL_ERROR_MSG,
+    ToolExecutor,
+    _resolve_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -329,8 +333,76 @@ on JSON serialisation order and the second does not.
 """
 
 
+# Stamped on every AlphaGenome tool result. DATA rather than a sentence in the tool
+# description: it survives truncation and renderers, and the measured-vs-predicted
+# comparison this tool is a half of can key on it instead of on prose. The rest of the
+# labelling — tier, signed or magnitude, the calibration substrate and the population rho —
+# is already per-modality structured data on the client's own result and is passed through
+# untouched. Summarising it here is exactly where a cohort-level rho would turn into a
+# per-variant confidence.
+_ALPHAGENOME_LABEL = {
+    "data_kind": "model_prediction",
+    "measured": False,
+    "prediction_source": "AlphaGenome (Google DeepMind)",
+}
+
+
 class ServerToolExecutor(ToolExecutor):
     """The tool executor as the chat backend and the MCP server construct it."""
+
+    # -------------------------------------------------------------------------
+    # AlphaGenome — predicted regulatory effects from an outside model
+    # -------------------------------------------------------------------------
+
+    @cached_property
+    def alphagenome(self) -> Any:
+        """The Atlas client, imported lazily and built once.
+
+        THIS IMPORT LIVES HERE AND NOWHERE IN tools/executor.py. That file is one of the
+        files the sandbox image ships (the suite's sandbox/prune_venv.py SDK_ALLOWLIST),
+        the image has no `alphagenome` package, and a deferred intra-package import
+        written inside a ToolExecutor method would satisfy every build gate and then raise
+        ModuleNotFoundError at call time in a container with no shell. Deferred here for
+        the reason `_sandbox` is deferred: the standalone MCP server imports this module,
+        and the AlphaGenome SDK drags grpc and anndata in behind it. Tests replace this by
+        assigning to the attribute.
+        """
+        from genetics_mcp_server.tools.alphagenome import AlphaGenomeClient
+
+        return AlphaGenomeClient(_resolve_settings())
+
+    async def get_alphagenome_variant_predictions(
+        self,
+        variants: str | list[str],
+        cell_type: str | None = None,
+        modalities: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """AlphaGenome's predicted regulatory effect for one or more variants.
+
+        A pass-through with a label on it. The client already answers with a
+        `success: False` dict rather than raising, and already carries each modality's
+        validation block, so there is nothing to reshape: reshaping is where the
+        prediction would start to read like a measurement.
+        """
+        requested = (
+            [v.strip() for v in variants.split(",")]
+            if isinstance(variants, str)
+            else [str(v).strip() for v in (variants or [])]
+        )
+        requested = [v for v in requested if v]
+        try:
+            result = await self.alphagenome.score_variants(requested, cell_type, modalities)
+        except Exception:
+            logger.exception("Error in get_alphagenome_variant_predictions(%r)", requested)
+            return {
+                **_ALPHAGENOME_LABEL,
+                "success": False,
+                "stage": "internal",
+                "error": INTERNAL_ERROR_MSG,
+            }
+        # the label spreads LAST: it is the one thing a client response must not be able
+        # to overwrite, and no key of the client's collides with it today
+        return {**result, **_ALPHAGENOME_LABEL}
 
     # -------------------------------------------------------------------------
     # External Search Tools

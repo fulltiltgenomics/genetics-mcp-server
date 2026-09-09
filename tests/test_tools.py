@@ -774,6 +774,7 @@ _CODE_SURFACE_NAMES = {
     "get_drug_targets_for_gene",
     "get_drug_profile",
     "get_target_bioactivity",
+    "get_alphagenome_variant_predictions",
     "search_scientific_literature",
     "web_search",
     "search_mgi",

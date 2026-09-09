@@ -663,3 +663,154 @@ async def test_default_modalities_exclude_the_unvalidated_tier():
     assert set(result["modalities"]) == set(alphagenome.DEFAULT_MODALITIES)
     assert "CHIP_TF" not in result["modalities"]
     assert all(alphagenome.MODALITIES[n].tier <= 3 for n in result["modalities"])
+
+
+# --------------------------------------------------------------------------- #
+# the tool surface: definitions and the ServerToolExecutor delegate
+# --------------------------------------------------------------------------- #
+
+TOOL = "get_alphagenome_variant_predictions"
+
+
+def _definition():
+    from genetics_mcp_server.tools.definitions import all_local_tool_definitions
+
+    [tool] = [t for t in all_local_tool_definitions() if t["name"] == TOOL]
+    return tool
+
+
+def _executor(atlas_obj, **kwargs):
+    from genetics_mcp_server.tools.orchestration import ServerToolExecutor
+
+    executor = ServerToolExecutor()
+    executor.__dict__["alphagenome"] = _client(atlas_obj, **kwargs)
+    return executor
+
+
+def test_the_declared_modalities_are_exactly_the_ones_the_client_knows():
+    """Spelled out in the schema, pinned here — the same arrangement as
+    defaults._SUMMARIZE_PARAM_TOOLS, so definitions.py does not have to import a module
+    that pulls the AlphaGenome SDK into every process that reads the tool catalogue."""
+    declared = _definition()["parameters"]["modalities"]["items"]["enum"]
+    assert sorted(declared) == sorted(alphagenome.MODALITIES)
+
+
+def test_the_tool_is_on_both_surfaces_and_no_script_can_reach_it():
+    """`sdk_replaceable` False: an outside resource, like search_uniprot. It is therefore
+    advertised on the code-execution surface as well, where a SCRIPT cannot call it — the
+    sandbox egress allow-list names db-api and results-api only. Intended for this phase."""
+    from genetics_mcp_server.tools.definitions import resolve_tools
+
+    assert _definition()["sdk_replaceable"] is False
+    for code_execution in (True, False):
+        assert TOOL in {t["name"] for t in resolve_tools(code_execution)}
+
+
+# Every file the sandbox image ships, as a path under the genetics_mcp_server package
+# root. Transcribed from SDK_ALLOWLIST in genetics-results-suite's sandbox/prune_venv.py,
+# which is the build-time authority and lives in another repo, so nothing here can import
+# it. What makes this list wrong: a module added to that allow-list and not to this one
+# then ships unchecked while this test keeps passing. The existence assertion below catches
+# the other direction, a file renamed or dropped here.
+_SHIPPED_MODULES = (
+    "__init__.py",
+    "sdk/__init__.py",
+    "sdk/_runner.py",
+    "sdk/client.py",
+    "sdk/errors.py",
+    "sdk/plots.py",
+    "tools/__init__.py",
+    "tools/executor.py",
+    "tools/sql_safety.py",
+    "tools/chembl.py",
+    "tools/uniprot.py",
+)
+
+
+def _alphagenome_imports(source: str) -> list[str]:
+    """Every name `source` imports that mentions alphagenome, at any nesting depth.
+
+    An ImportFrom contributes its module AND its imported names: `from . import
+    alphagenome` and `from genetics_mcp_server.tools import alphagenome` put the module
+    nowhere but `node.names`, and those are exactly the deferred intra-package forms
+    prune_venv.py's own comment says defeat the build gate.
+    """
+    import ast
+
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""] + [a.name for a in node.names]
+        else:
+            continue
+        found += [n for n in names if "alphagenome" in n]
+    return found
+
+
+def test_the_sandbox_never_ships_a_path_to_the_client():
+    """The hard boundary: the image ships the SDK's import closure, tools/orchestration.py
+    is not in it, and `alphagenome` is not installed there. An import at any nesting depth
+    in any shipped file would raise ModuleNotFoundError in a container with no shell."""
+    import pathlib
+
+    pkg = pathlib.Path(alphagenome.__file__).parent.parent
+    for rel in _SHIPPED_MODULES:
+        shipped = pkg / rel
+        assert shipped.is_file(), f"{rel} is allow-listed for the image but not in the tree"
+        found = _alphagenome_imports(shipped.read_text())
+        assert not found, f"{rel} imports {found}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import genetics_mcp_server.tools.alphagenome",
+        "from genetics_mcp_server.tools.alphagenome import AlphaGenomeClient",
+        "from . import alphagenome",
+        "from genetics_mcp_server.tools import alphagenome",
+        "def later():\n    from .alphagenome import AlphaGenomeClient\n",
+    ],
+)
+def test_the_shipped_import_check_catches_the_relative_and_package_forms(source):
+    """The forms the previous check missed: both name the module only in `node.names`."""
+    assert _alphagenome_imports(source), f"not caught: {source!r}"
+
+
+async def test_the_delegate_labels_the_result_as_a_prediction():
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5], quantiles=[0.9])]}})
+    result = await _executor(fake).get_alphagenome_variant_predictions(
+        ["1:100:A:G"], modalities=["DNASE"]
+    )
+    assert result["data_kind"] == "model_prediction"
+    assert result["measured"] is False
+    assert result["n_scored"] == 1
+
+
+async def test_the_delegate_passes_the_validation_block_through_structurally():
+    """Tier, quantity, substrate and the population rho reach the model as DATA. The rho
+    is the modality's, and `rho_scope` says so, so nothing downstream has to infer that it
+    is not a per-variant confidence."""
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
+    result = await _executor(fake).get_alphagenome_variant_predictions(["1:100:A:G"])
+    validation = result["results"][0]["modalities"]["DNASE"]["validation"]
+    assert validation == alphagenome.validation_metadata("DNASE")
+    assert validation["rho_scope"] == "population"
+    assert validation["population_rho"] == pytest.approx(alphagenome.MODALITIES["DNASE"].population_rho)
+
+
+async def test_the_delegate_takes_a_comma_separated_string_too():
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
+    result = await _executor(fake).get_alphagenome_variant_predictions(
+        "1:100:A:G, 99:1:A:G", modalities=["DNASE"]
+    )
+    assert result["n_requested"] == 2
+    assert result["n_scored"] == 1
+
+
+async def test_a_client_side_failure_stays_a_result_and_keeps_the_label():
+    fake = FakeAtlas()
+    result = await _executor(fake).get_alphagenome_variant_predictions([])
+    assert result["success"] is False
+    assert result["data_kind"] == "model_prediction"

@@ -336,6 +336,18 @@ closure and ships in the sandbox image. It is unreachable from `run_analysis` al
 the sandbox's egress allow-list names db-api and results-api only, and nothing there serves
 `www.ebi.ac.uk`.
 
+#### AlphaGenome (native tool, chat-backend only, opt-in)
+
+`get_alphagenome_variant_predictions` returns AlphaGenome Atlas (Google DeepMind) predictions of a variant's regulatory effect — accessibility, binding, transcription, splicing — per modality, optionally in a named cell type or tissue. It is the only tool here whose output is a MODEL'S OUTPUT rather than a retrieved measurement, and the rest of its shape follows from that:
+
+- **The opt-in is prompt guidance and nothing else.** No per-user setting, no per-conversation column, no UI toggle: the user was told plainly that this is persuasion rather than enforcement, that the model holds the tool either way, and chose it. So the rules live in the two places the model actually reads — the tool description in `tools/definitions.py`, and the `### AlphaGenome variant predictions (opt-in)` block in `config/defaults.py`, which self-gates on the tool name like every other block there. `tests/test_system_prompt.py::TestAlphaGenomeOptIn` pins the two against each other so they cannot drift apart.
+- **Labelling is structural rather than prose.** The envelope carries `data_kind: "model_prediction"` and `measured: false`; each modality carries its own `validation` block — tier, whether the exposed quantity is signed or magnitude-only, the substrate it was calibrated against, and a population-level Spearman rho whose `rho_scope` says the number describes the MODALITY and not the variant in hand. The tiers live in `tools/alphagenome.py`'s `MODALITIES` and are not restated anywhere; the delegate passes the client's result through and adds the envelope label, because reshaping is where a prediction starts to read like a measurement.
+- **The client is reached from `ServerToolExecutor` only.** `tools/alphagenome.py` is not on the suite's `sandbox/prune_venv.py` SDK_ALLOWLIST and the sandbox image has no `alphagenome` package, so an import of it from `tools/executor.py` — at any depth, `TYPE_CHECKING` or deferred inside a method — would satisfy every build gate and then raise `ModuleNotFoundError` at call time in a container with no shell. The `alphagenome` cached_property lives in `tools/orchestration.py`, and `tests/test_alphagenome.py` asserts by AST that the shipped file imports nothing of the sort.
+- `sdk_replaceable: False`, for the reason the UniProt and ChEMBL tools are: an outside resource, not internal genetics data a script fetches through the SDK. It is therefore advertised on the code-execution surface too, where a SCRIPT still cannot call it — the sandbox egress allow-list names db-api and results-api only. That is intended for this phase.
+- In `_mcp_disabled`, by product decision rather than technical limit: a free non-commercial key with a per-minute quota shared by the whole deployment, on a surface any Google-account holder can reach.
+
+Only the prediction half exists. Comparing a prediction with this suite's own measured value for the same variant is a first-class use the guidance explicitly permits and is deliberately not written as "call this when the other tools return nothing"; the comparison capability itself is separate work, and the tool surface is shaped to admit it rather than to be replaced by it.
+
 ### Code execution tools
 
 Tool halves of the sandbox design (`genetics-results-suite-4h6`). **Whether a sandbox is
@@ -771,7 +783,7 @@ by it, via `tool_category()`). **No surface decision reads it.**
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |

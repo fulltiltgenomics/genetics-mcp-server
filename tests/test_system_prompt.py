@@ -437,6 +437,7 @@ _DOMAIN_SECTIONS = [
     "## Data Domains and Outside Resources",
     "### Variant Annotation Sources",
     "### Functional / Regulatory Readouts",
+    "### AlphaGenome variant predictions (opt-in)",
     "### HLA / the MHC region",
     "### Dosage sensitivity / rare CNVs",
     "### Protein Annotation (UniProt)",
@@ -1004,3 +1005,61 @@ class TestEveryVariantHoldsTheStructuralInvariants:
             assert len(served) <= len(other), (
                 f"the served prompt is larger than {variant!r} on the {surface} surface"
             )
+
+
+class TestAlphaGenomeOptIn:
+    """The opt-in is prompt guidance and nothing else, so the guidance is the feature.
+
+    There is no per-user setting, no per-conversation column and no UI toggle behind it:
+    the user was told this is persuasion rather than enforcement and chose it. Each rule
+    below is pinned because losing one silently turns an opt-in tool into a reflex.
+    """
+
+    TOOL = "get_alphagenome_variant_predictions"
+
+    # the four things the block must say, in the order it says them
+    RULES = [
+        "Call it only when the user has asked for it",
+        "the user names AlphaGenome",
+        "first-class use of the tool",
+        "Do NOT call it as background enrichment",
+        "are NOT requests for AlphaGenome",
+        "not a fallback for gaps",
+        "never a confidence for the variant in hand",
+        "the labelling matters MORE, not less",
+    ]
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_block_reaches_every_surface_that_has_the_tool(self, profile):
+        available = resolve(profile, subagents=False)
+        assert self.TOOL in available, "sdk_replaceable False puts it on both surfaces"
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        for rule in self.RULES:
+            assert rule in prompt, f"{profile} lost: {rule!r}"
+
+    def test_the_block_goes_when_the_tool_goes(self):
+        """It self-gates on the tool NAME: drop the name and the block goes with it.
+
+        The other half — removing the name when no key is configured — does not exist
+        yet. Settings.disabled_tools has no AlphaGenome entry and the tool sits
+        unconditionally in TOOL_DEFINITIONS, so this test subtracts the name by hand.
+        """
+        available = resolve(None, subagents=False) - {self.TOOL}
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        assert "AlphaGenome" not in prompt
+
+    def test_the_tool_description_carries_the_same_rules(self):
+        """The strongest wording lives in the description, which the model follows more
+        reliably than prose this far up the prompt — so the two must not drift apart."""
+        [tool] = [t for t in all_local_tool_definitions() if t["name"] == self.TOOL]
+        text = tool["description"]
+        for phrase in (
+            "CALL THIS ONLY WHEN THE USER HAS ASKED FOR IT",
+            "Do NOT call it as background enrichment",
+            "are NOT requests for AlphaGenome",
+            "NOT a reason to call it",
+            "first-class use of this tool",
+            "never be quoted as one",
+            "the labelling matters MORE, not less",
+        ):
+            assert phrase in text, f"tool description lost: {phrase!r}"

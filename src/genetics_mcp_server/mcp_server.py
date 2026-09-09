@@ -96,6 +96,12 @@ _mcp_disabled = _settings.disabled_tools | {
     "get_drug_targets_for_gene",
     "get_drug_profile",
     "get_target_bioactivity",
+    # product decision, not a technical limit — the same one the UniProt, ChEMBL and
+    # myvariant entries above record. AlphaGenome runs on a free non-commercial key with a
+    # per-minute quota shared by the whole deployment; /mcp is reachable by any
+    # Google-account holder, so the tool stays on the chat surface where a person asked
+    # for it by name.
+    "get_alphagenome_variant_predictions",
     # SECURITY CONTROL, not a product decision: code execution must not be reachable via
     # MCP (genetics-results-suite-4h6). run_analysis IS code execution; read_artifact
     # returns files a script wrote for the chat session that ran it, and resolving a name

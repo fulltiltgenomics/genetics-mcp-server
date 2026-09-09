@@ -1399,6 +1399,71 @@ NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they mus
         },
     },
     {
+        "name": "get_alphagenome_variant_predictions",
+        "category": "general",
+        # False for the same reason search_uniprot is: this is an OUTSIDE resource, not
+        # internal genetics data the SDK can fetch, so it belongs on both surfaces by
+        # `resolve_tools`' own rule. The consequence is deliberate for this phase: the
+        # tool is advertised to the code-execution surface, but a SCRIPT cannot call it —
+        # the sandbox egress allow-list names db-api and results-api only, and the image
+        # has no `alphagenome`. The model calls the tool; the script does not.
+        "sdk_replaceable": False,
+        "description": """MODEL PREDICTIONS from AlphaGenome (Google DeepMind) — what a deep-learning model predicts one variant does to regulatory activity: chromatin accessibility, histone and TF binding, transcription, splicing, optionally in a named cell type or tissue. NOTHING HERE WAS MEASURED IN ANYONE. It is not a FinnGen result and not an assay; never present a number from this tool as either.
+
+CALL THIS ONLY WHEN THE USER HAS ASKED FOR IT. Exactly three things count as asking:
+1. the user names AlphaGenome;
+2. the user asks for a model prediction of a variant's regulatory effect;
+3. the user asks how a measured value in this suite compares with what a model predicts for the same variant — that comparison is a first-class use of this tool, not a workaround.
+
+Nothing else is. In particular:
+- Do NOT call it as background enrichment, and do not add a prediction to an answer nobody asked one for.
+- "What does this variant do?", "tell me about rs...", "is this variant causal?", "why is this locus associated?" are NOT requests for AlphaGenome. Answer them from this suite's own measured and fine-mapped data.
+- This suite having nothing to say about a variant is NOT a reason to call it. Say the data is silent; you may OFFER a prediction in one line and then wait to be asked.
+- It is an ADDITIONAL source of evidence, not a fallback for gaps — and having it available is not a reason to use it. It is a rate-limited external model under a non-commercial licence.
+
+READ THE `validation` BLOCK BEFORE QUOTING A NUMBER. Every modality in the result carries its own — `tier`, `status`, `quantity`, `calibrated_against`, `population_rho`, `rho_scope`:
+- `tier` is how deeply the MODALITY was calibrated here — 1-3 against this suite's own measurements, 4 against nothing. It is a property of the modality and says nothing about how good this variant's prediction is; it is not a score, a rank or a confidence.
+- `quantity: "signed"` — the sign is meaningful (negative is a predicted decrease). `quantity: "magnitude"` — the direction is NOT reported and you must not state or infer one.
+- `population_rho` with `rho_scope: "population"` is a cohort-level Spearman correlation between this MODALITY and `calibrated_against`, across many variants. It is a property of the modality. It is NOT a confidence for the variant in hand and must never be quoted as one.
+- `status: "unvalidated"` (no `population_rho`) means the modality was never checked against anything measured in this suite. Say so whenever you report one.
+- `quantile` ranks the score against a genome-wide background and usually says more than the raw value.
+
+SIDE BY SIDE WITH MEASURED DATA the labelling matters MORE, not less: label every number from this tool as predicted, name the source of every measured number, never merge or average the two into one figure, and where they disagree say that they disagree.""",
+        "parameters": {
+            "variants": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 25 per call, and one call per variant is the expensive mistake here. A variant the model cannot score comes back as its own failed row, leaving the rest of the batch intact.",
+                "required": True,
+            },
+            "cell_type": {
+                "type": "string",
+                "description": "Cell type or tissue to score in, matched against AlphaGenome's own biosample names (e.g. 'liver', 'K562'). Omit to take the strongest effect across all tracks. A request that matches nothing falls back to all tracks and says so in `cell_type_match`.",
+            },
+            "modalities": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "DNASE",
+                        "ATAC",
+                        "CHIP_HISTONE",
+                        "CHIP_TF",
+                        "CAGE",
+                        "PROCAP",
+                        "RNA_SEQ",
+                        "SPLICE_SITES",
+                        "SPLICE_SITE_USAGE",
+                        "SPLICE_JUNCTIONS",
+                        "POLYADENYLATION",
+                        "CONTACT_MAPS",
+                    ],
+                },
+                "description": "Modalities to score. Omit for the default set, which is exactly the modalities calibrated against this suite's own measurements. Any modality NOT in that default is uncalibrated and has to be asked for by name; its result says so in `validation`.",
+            },
+        },
+    },
+    {
         "name": "get_ld_between_variants",
         "category": "api",
         "sdk_replaceable": True,
@@ -2831,6 +2896,15 @@ def register_mcp_tools(
         return await executor.search_uniprot(
             query, keyword, organism_id, reviewed_only, fields, size, count_only
         )
+
+    @_tool()
+    async def get_alphagenome_variant_predictions(
+        variants: list[str],
+        cell_type: str | None = None,
+        modalities: list[str] | None = None,
+    ) -> dict:
+        """AlphaGenome's PREDICTED regulatory effect of one or more variants — a model's output, never a measurement."""
+        return await executor.get_alphagenome_variant_predictions(variants, cell_type, modalities)
 
     @_tool()
     async def get_drug_targets_for_gene(

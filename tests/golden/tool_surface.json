@@ -17,9 +17,10 @@
     "profiles": {
       "api": {
         "local": {
-          "count": 66,
+          "count": 67,
           "tools": [
             "analyze_variant_list",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -90,9 +91,10 @@
       },
       "bigquery": {
         "local": {
-          "count": 66,
+          "count": 67,
           "tools": [
             "analyze_variant_list",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -163,8 +165,9 @@
       },
       "code": {
         "local": {
-          "count": 20,
+          "count": 21,
           "tools": [
+            "get_alphagenome_variant_predictions",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_myvariant_annotations",
@@ -190,9 +193,10 @@
       },
       "nocode": {
         "local": {
-          "count": 66,
+          "count": 67,
           "tools": [
             "analyze_variant_list",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -263,9 +267,10 @@
       },
       "null": {
         "local": {
-          "count": 66,
+          "count": 67,
           "tools": [
             "analyze_variant_list",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -336,9 +341,10 @@
       },
       "rag": {
         "local": {
-          "count": 66,
+          "count": 67,
           "tools": [
             "analyze_variant_list",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -474,8 +480,9 @@
         ]
       },
       "general": {
-        "count": 20,
+        "count": 21,
         "tools": [
+          "get_alphagenome_variant_predictions",
           "get_dataset_display_names",
           "get_drug_profile",
           "get_drug_targets_for_gene",
@@ -508,7 +515,7 @@
         ]
       }
     },
-    "count": 72
+    "count": 73
   },
   "mcp_server": {
     "deployed_flags_set": {
@@ -521,6 +528,7 @@
       "SANDBOX_ENABLED"
     ],
     "hardcoded_exclusions": [
+      "get_alphagenome_variant_predictions",
       "get_drug_profile",
       "get_drug_targets_for_gene",
       "get_myvariant_annotations",
