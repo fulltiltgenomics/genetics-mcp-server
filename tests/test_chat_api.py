@@ -1196,58 +1196,6 @@ class TestInstructionSetWiring:
         self._client = test_client
 
 
-class TestFirstTurnDetection:
-    """Only a session's first turn may render a digest, so the endpoint has to tell one
-    from the history the browser replays."""
-
-    def _first_turn(self, test_client, messages):
-        from genetics_mcp_server import chat_api
-
-        captured = {}
-
-        async def fake(user, session_id, **kwargs):
-            captured.update(kwargs)
-            return None
-
-        with (
-            patch.object(chat_api, "get_llm_service", return_value=_CapturingService()),
-            patch.object(chat_api, "_resolve_user_memory", side_effect=fake),
-        ):
-            response = test_client.post(
-                "/chat/v1/chat",
-                json={"messages": messages, "enable_tools": False},
-                headers={
-                    "X-Goog-Authenticated-User-Email": "accounts.google.com:a@finngen.fi"
-                },
-            )
-        assert response.status_code == 200
-        return captured["first_turn"]
-
-    def test_one_user_message_opens_a_session(self, test_client):
-        assert self._first_turn(test_client, [{"role": "user", "content": "Hi"}]) is True
-
-    def test_a_replayed_tool_result_is_not_a_first_turn(self, test_client):
-        """A tool result is replayed as a `user` message, so counting user messages would
-        call this a first turn; the assistant turn above it is what settles it."""
-        messages = [
-            {"role": "user", "content": "Hi"},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "tool_use", "id": "t1", "name": "search", "input": {}}
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
-                ],
-            },
-        ]
-
-        assert self._first_turn(test_client, messages) is False
-
-
 async def _system_blocks(system_prompt, user_instructions):
     """Run one Anthropic turn and return the `system` parameter it sent."""
     from test_stream_truncation import _service, _text_turn
@@ -1726,13 +1674,16 @@ class TestClassifyErrorSubclasses:
 
 
 class TestUserMemoryResolution:
-    """chat_api._resolve_user_memory: an opt-in, gateway-asserted, per-person feature that
-    may never cost a caller their turn."""
+    """chat_api._resolve_user_memory: an opt-in, gateway-asserted, per-person feature
+    scoped to the project a session is filed into, which may never cost a caller their
+    turn."""
 
     USER = "a@finngen.fi"
 
-    def _seed(self, chat_history_db, user, title, message="What about APOE?"):
-        session = chat_history_db.create_session(user)
+    def _seed(
+        self, chat_history_db, user, title, message="What about APOE?", project_id=None
+    ):
+        session = chat_history_db.create_session(user, project_id=project_id)
         chat_history_db.update_session(session.id, user, title=title)
         chat_history_db.add_message(session.id, f"m-{session.id}", "user", message)
         return session
@@ -1750,7 +1701,6 @@ class TestUserMemoryResolution:
         session_id=None,
         secret=False,
         gateway_asserted=True,
-        first_turn=True,
         stats=None,
     ):
         from genetics_mcp_server import chat_api, memory_gate
@@ -1761,30 +1711,63 @@ class TestUserMemoryResolution:
                 session_id,
                 secret=secret,
                 gateway_asserted=gateway_asserted,
-                first_turn=first_turn,
                 db=chat_history_db,
                 stats=stats,
             )
 
     @pytest.mark.asyncio
-    async def test_opt_in_injects_the_digest(self, llm_config_db, chat_history_db):
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+    async def test_opt_in_injects_the_project_digest(self, llm_config_db, chat_history_db):
         self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         stats = {}
-        digest = await self._resolve(llm_config_db, chat_history_db, stats=stats)
+        digest = await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id, stats=stats
+        )
 
         assert digest is not None
         assert "APOE and LDL" in digest
-        assert stats == {"sessions": 1, "chars": len(digest)}
+        assert stats == {"sessions": 1, "chars": len(digest), "project": "IBD"}
+
+    @pytest.mark.asyncio
+    async def test_a_project_name_failure_costs_the_name_not_the_turn(
+        self, llm_config_db, chat_history_db
+    ):
+        """_project_name runs after set_context_digest has already committed, so a
+        failure there must not throw away the digest this turn just rendered."""
+        self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
+
+        stats = {}
+        boom = patch.object(
+            type(chat_history_db),
+            "list_projects",
+            side_effect=RuntimeError("database is locked"),
+        )
+        with boom:
+            digest = await self._resolve(
+                llm_config_db, chat_history_db, session_id=current.id, stats=stats
+            )
+
+        assert digest is not None
+        assert "APOE and LDL" in digest
+        assert stats == {"sessions": 1, "chars": len(digest), "project": None}
 
     @pytest.mark.asyncio
     async def test_an_absent_setting_withholds_memory(self, llm_config_db, chat_history_db):
         """Opt-in: nothing is remembered for a user who never opened the dialog."""
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         stats = {}
-        assert await self._resolve(llm_config_db, chat_history_db, stats=stats) is None
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id, stats=stats
+        ) is None
         assert stats == {}
 
     @pytest.mark.asyncio
@@ -1792,10 +1775,14 @@ class TestUserMemoryResolution:
     async def test_any_value_but_on_withholds_memory(
         self, llm_config_db, chat_history_db, value
     ):
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
         self._opt_in(llm_config_db, value=value)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
-        assert await self._resolve(llm_config_db, chat_history_db) is None
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        ) is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("user", ["mcp-tool", "anonymous", None, ""])
@@ -1804,44 +1791,150 @@ class TestUserMemoryResolution:
     ):
         """`mcp-tool` is a service and `anonymous` is shared by every caller of an
         auth-less deployment, so neither names a person whose memory this could be."""
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
         self._opt_in(llm_config_db)
+        session_id = None
         if user:
             self._opt_in(llm_config_db, user=user)
-            self._seed(chat_history_db, user, "Service work")
+            project = chat_history_db.create_project(user, "IBD")
+            self._seed(chat_history_db, user, "Service work", project_id=project.id)
+            session_id = chat_history_db.create_session(user, project_id=project.id).id
 
-        assert await self._resolve(llm_config_db, chat_history_db, user=user) is None
+        assert await self._resolve(
+            llm_config_db, chat_history_db, user=user, session_id=session_id
+        ) is None
 
     @pytest.mark.asyncio
     async def test_an_unasserted_identity_withholds_memory(
         self, llm_config_db, chat_history_db
     ):
         """Without the gateway's assertion, `user` is a header any marker holder can type."""
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
         self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         assert await self._resolve(
-            llm_config_db, chat_history_db, gateway_asserted=False
+            llm_config_db, chat_history_db, session_id=current.id, gateway_asserted=False
         ) is None
 
     @pytest.mark.asyncio
     async def test_secret_mode_withholds_memory(self, llm_config_db, chat_history_db):
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
         self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
-        assert await self._resolve(llm_config_db, chat_history_db, secret=True) is None
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id, secret=True
+        ) is None
 
     @pytest.mark.asyncio
-    async def test_the_session_being_started_is_excluded(
+    async def test_an_unfiled_session_gets_no_memory_and_never_opens_the_window(
         self, llm_config_db, chat_history_db
     ):
-        """A session has no history of its own on its first turn."""
+        """The window called without a project is the recency window this replaced, so an
+        unfiled conversation must not reach it even to have the result thrown away."""
         self._opt_in(llm_config_db)
-        current = self._seed(chat_history_db, self.USER, "The current one")
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        unfiled = chat_history_db.create_session(self.USER)
+
+        with patch.object(type(chat_history_db), "get_recent_sessions_for_digest") as window:
+            assert await self._resolve(
+                llm_config_db, chat_history_db, session_id=unfiled.id
+            ) is None
+        window.assert_not_called()
+        assert chat_history_db.get_session(unfiled.id, self.USER).context_digest is None
+
+    @pytest.mark.asyncio
+    async def test_unfiling_a_session_drops_its_memory_on_the_next_turn(
+        self, llm_config_db, chat_history_db
+    ):
+        """Deliberate, and worth one uncached turn: the digest describes a project this
+        conversation is no longer in."""
+        self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        ) is not None
+
+        assert chat_history_db.set_session_project(self.USER, current.id, None)
 
         assert await self._resolve(
             llm_config_db, chat_history_db, session_id=current.id
         ) is None
+
+    @pytest.mark.asyncio
+    async def test_a_turn_without_a_session_id_gets_no_memory(
+        self, llm_config_db, chat_history_db
+    ):
+        """The browser creates the row lazily; until it exists there is no project to
+        index and nothing to pin a digest to."""
+        self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+
+        with patch.object(type(chat_history_db), "get_recent_sessions_for_digest") as window:
+            assert await self._resolve(
+                llm_config_db, chat_history_db, session_id=None
+            ) is None
+        window.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_render_is_stored_and_stays_empty(
+        self, llm_config_db, chat_history_db, caplog
+    ):
+        """The first session in a project renders nothing, and the stored '' is what keeps
+        memory from appearing mid-conversation once a second session is filed there."""
+        import logging
+
+        self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        ) is None
+        assert chat_history_db.get_session(current.id, self.USER).context_digest == ""
+
+        self._seed(chat_history_db, self.USER, "A later question", project_id=project.id)
+
+        stats = {}
+        caplog.clear()
+        with patch.object(type(chat_history_db), "get_recent_sessions_for_digest") as window, \
+                caplog.at_level(logging.INFO):
+            assert await self._resolve(
+                llm_config_db, chat_history_db, session_id=current.id, stats=stats
+            ) is None
+        window.assert_not_called()
+        assert not [m for m in caplog.messages if m.startswith("memory digest:")]
+        assert stats == {}
+
+    @pytest.mark.asyncio
+    async def test_a_later_turn_reads_the_stored_bytes(
+        self, llm_config_db, chat_history_db
+    ):
+        self._opt_in(llm_config_db)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
+
+        first = await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        )
+        assert first is not None
+        assert chat_history_db.get_session(current.id, self.USER).context_digest == first
+
+        stats = {}
+        with patch.object(type(chat_history_db), "get_recent_sessions_for_digest") as window:
+            assert await self._resolve(
+                llm_config_db, chat_history_db, session_id=current.id, stats=stats
+            ) == first
+        window.assert_not_called()
+        assert stats == {}
 
     @pytest.mark.asyncio
     async def test_the_digest_is_byte_stable_across_a_session(
@@ -1849,12 +1942,15 @@ class TestUserMemoryResolution:
     ):
         """Turn 2 and 3 read the stored copy, so the cache block never moves under them."""
         self._opt_in(llm_config_db)
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
-        current = chat_history_db.create_session(self.USER)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         first = await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
-        # a session that lands mid-conversation would change a freshly rendered digest
-        self._seed(chat_history_db, self.USER, "A later, unrelated question")
+        # a session filed into the project mid-conversation would change a fresh render
+        self._seed(
+            chat_history_db, self.USER, "A later, unrelated question", project_id=project.id
+        )
         second = await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
         third = await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
 
@@ -1864,34 +1960,48 @@ class TestUserMemoryResolution:
         assert chat_history_db.get_session(current.id, self.USER).context_digest == first
 
     @pytest.mark.asyncio
-    async def test_a_turn_without_a_session_id_renders_but_persists_nothing(
+    async def test_only_this_projects_sessions_are_indexed(
         self, llm_config_db, chat_history_db
     ):
+        """Including pinned ones: a pin is a preference inside a project, not a way into
+        another project's memory."""
         self._opt_in(llm_config_db)
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        ibd = chat_history_db.create_project(self.USER, "IBD")
+        pqtl = chat_history_db.create_project(self.USER, "pQTL network")
+        self._seed(chat_history_db, self.USER, "IBD fine-mapping", project_id=ibd.id)
+        elsewhere = self._seed(
+            chat_history_db, self.USER, "pQTL colocalisation", project_id=pqtl.id
+        )
+        chat_history_db.set_pinned(elsewhere.id, self.USER, True)
+        unfiled = self._seed(chat_history_db, self.USER, "Loose ends")
+        chat_history_db.set_pinned(unfiled.id, self.USER, True)
+        current = chat_history_db.create_session(self.USER, project_id=ibd.id)
 
-        digest = await self._resolve(llm_config_db, chat_history_db, session_id=None)
+        digest = await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        )
 
-        assert digest is not None
-        stored = chat_history_db._conn.execute(
-            "SELECT COUNT(*) FROM chat_sessions WHERE context_digest IS NOT NULL"
-        ).fetchone()[0]
-        assert stored == 0
+        assert "IBD fine-mapping" in digest
+        assert "pQTL colocalisation" not in digest
+        assert "Loose ends" not in digest
 
     @pytest.mark.asyncio
     async def test_a_deleted_conversation_is_gone_from_the_next_session(
         self, llm_config_db, chat_history_db
     ):
         self._opt_in(llm_config_db)
-        doomed = self._seed(chat_history_db, self.USER, "Regrettable question")
-        first = chat_history_db.create_session(self.USER)
+        project = chat_history_db.create_project(self.USER, "IBD")
+        doomed = self._seed(
+            chat_history_db, self.USER, "Regrettable question", project_id=project.id
+        )
+        first = chat_history_db.create_session(self.USER, project_id=project.id)
 
         assert "Regrettable question" in await self._resolve(
             llm_config_db, chat_history_db, session_id=first.id
         )
 
         chat_history_db.delete_session(doomed.id, self.USER)
-        later = chat_history_db.create_session(self.USER)
+        later = chat_history_db.create_session(self.USER, project_id=project.id)
 
         # `first` is still there, so a digest is still rendered — it just may not name
         # the conversation the user asked to be forgotten
@@ -1904,7 +2014,9 @@ class TestUserMemoryResolution:
         self, llm_config_db, chat_history_db
     ):
         self._opt_in(llm_config_db)
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         boom = patch.object(
             type(chat_history_db),
@@ -1912,7 +2024,9 @@ class TestUserMemoryResolution:
             side_effect=RuntimeError("database is locked"),
         )
         with boom:
-            assert await self._resolve(llm_config_db, chat_history_db) is None
+            assert await self._resolve(
+                llm_config_db, chat_history_db, session_id=current.id
+            ) is None
 
     @pytest.mark.asyncio
     async def test_a_settings_db_failure_costs_the_memory_not_the_turn(
@@ -1922,7 +2036,9 @@ class TestUserMemoryResolution:
         import logging
 
         self._opt_in(llm_config_db)
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         boom = patch.object(
             type(llm_config_db),
@@ -1930,70 +2046,40 @@ class TestUserMemoryResolution:
             side_effect=RuntimeError("no such table: user_settings_history"),
         )
         with boom, caplog.at_level(logging.WARNING):
-            assert await self._resolve(llm_config_db, chat_history_db) is None
+            assert await self._resolve(
+                llm_config_db, chat_history_db, session_id=current.id
+            ) is None
 
         assert any(
             m.startswith("Could not load chat memory") for m in caplog.messages
         )
 
     @pytest.mark.asyncio
-    async def test_an_empty_first_turn_never_becomes_memory_later(
-        self, llm_config_db, chat_history_db
-    ):
-        """A user with no history renders nothing, and an empty render is not pinned. The
-        session must not pick memory up mid-conversation once a second session exists."""
-        self._opt_in(llm_config_db)
-        current = chat_history_db.create_session(self.USER)
-
-        assert await self._resolve(
-            llm_config_db, chat_history_db, session_id=current.id
-        ) is None
-
-        self._seed(chat_history_db, self.USER, "A later, unrelated question")
-
-        assert await self._resolve(
-            llm_config_db, chat_history_db, session_id=current.id, first_turn=False
-        ) is None
-
-    @pytest.mark.asyncio
-    async def test_a_later_turn_reads_the_stored_bytes(
-        self, llm_config_db, chat_history_db
-    ):
-        self._opt_in(llm_config_db)
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
-        current = chat_history_db.create_session(self.USER)
-
-        first = await self._resolve(
-            llm_config_db, chat_history_db, session_id=current.id
-        )
-        assert first is not None
-        assert chat_history_db.get_session(current.id, self.USER).context_digest == first
-
-        stats = {}
-        assert await self._resolve(
-            llm_config_db, chat_history_db, session_id=current.id, first_turn=False,
-            stats=stats,
-        ) == first
-        assert stats == {}
-
-    @pytest.mark.asyncio
-    async def test_the_log_line_names_a_hash_never_an_address(
+    async def test_the_log_line_names_hashes_never_an_address_or_a_project(
         self, llm_config_db, chat_history_db, caplog
     ):
         import logging
 
         self._opt_in(llm_config_db)
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         with caplog.at_level(logging.INFO):
-            digest = await self._resolve(llm_config_db, chat_history_db)
+            digest = await self._resolve(
+                llm_config_db, chat_history_db, session_id=current.id
+            )
 
         line = next(m for m in caplog.messages if m.startswith("memory digest:"))
         assert re.fullmatch(
-            r"memory digest: user=[0-9a-f]{12} sessions=1 chars=\d+", line
+            r"memory digest: user=[0-9a-f]{12} project=[0-9a-f]{12} "
+            r"sessions=1 chars=\d+",
+            line,
         )
         assert f"chars={len(digest)}" in line
         assert "@" not in line
+        assert "IBD" not in line
+        assert project.id not in line
         assert "APOE" not in caplog.text
 
     @pytest.mark.asyncio
@@ -2002,10 +2088,12 @@ class TestUserMemoryResolution:
     ):
         import logging
 
-        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        project = chat_history_db.create_project(self.USER, "IBD")
+        self._seed(chat_history_db, self.USER, "APOE and LDL", project_id=project.id)
+        current = chat_history_db.create_session(self.USER, project_id=project.id)
 
         with caplog.at_level(logging.INFO):
-            await self._resolve(llm_config_db, chat_history_db)
+            await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
 
         assert not [m for m in caplog.messages if m.startswith("memory digest:")]
 
@@ -2037,19 +2125,25 @@ class TestMemorySSEEvent:
             if line.startswith("data:") and (data := line[len("data:"):].strip())
         ]
 
-    def test_emitted_with_the_injected_numbers_on_a_first_turn(self, test_client):
+    def test_emitted_with_the_injected_numbers_and_the_project_name(self, test_client):
         digest = "APOE and LDL, TCF7L2 and T2D"
 
         async def fake(user, session_id, *, stats=None, **kwargs):
             stats["sessions"] = 3
             stats["chars"] = len(digest)
+            stats["project"] = "IBD"
             return digest
 
         events = self._events(test_client, [{"role": "user", "content": "Hi"}], fake)
 
         memory_events = [e for e in events if e.get("type") == "memory"]
         assert len(memory_events) == 1
-        assert memory_events[0] == {"type": "memory", "sessions": 3, "chars": len(digest)}
+        assert memory_events[0] == {
+            "type": "memory",
+            "project": "IBD",
+            "sessions": 3,
+            "chars": len(digest),
+        }
 
     def test_absent_when_memory_is_withheld(self, test_client):
         async def fake(user, session_id, *, stats=None, **kwargs):
@@ -2077,3 +2171,35 @@ class TestMemorySSEEvent:
         )
 
         assert not [e for e in events if e.get("type") == "memory"]
+
+    def test_a_db_failure_inside_the_resolve_still_streams_a_normal_turn(
+        self, test_client
+    ):
+        """The real `_resolve_user_memory` this time, with its blocking half raising: the
+        turn loses its memory block and nothing else."""
+        from genetics_mcp_server import chat_api
+
+        service = _CapturingService()
+        with (
+            patch.object(chat_api, "get_llm_service", return_value=service),
+            patch.object(
+                chat_api, "_load_user_memory", side_effect=RuntimeError("database is locked")
+            ),
+        ):
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={"messages": [{"role": "user", "content": "Hi"}], "enable_tools": False},
+                headers={
+                    "X-Goog-Authenticated-User-Email": "accounts.google.com:a@finngen.fi"
+                },
+            )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(data)
+            for line in response.text.splitlines()
+            if line.startswith("data:") and (data := line[len("data:"):].strip())
+        ]
+        assert not [e for e in events if e.get("type") == "memory"]
+        assert not [e for e in events if e.get("type") == "error"]
+        assert service.kwargs["user_memory"] is None

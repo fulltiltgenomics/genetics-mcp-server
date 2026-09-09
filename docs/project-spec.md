@@ -2774,7 +2774,7 @@ kubectl -n genetics exec -i deploy/chat-backend -- python - < /tmp/premise.py > 
 `--bundle` inlines `memory_digest.py` above the script and strips the import, because the
 deployed image predates that module. Everything the measurement needs therefore has to live
 in `memory_digest.py` or be re-stated in the script: `DIGEST_WINDOW_SESSIONS` and `user_hash`
-are copies of `memory_gate.MEMORY_DIGEST_SESSION_LIMIT` and `memory_gate.user_log_hash`, and
+are copies of `memory_gate.MEMORY_PROJECT_SESSION_CAP` and `memory_gate.user_log_hash`, and
 a test asserts the pseudonyms agree. Production also predates `chat_turn_metrics`, where the
 script reports `"table missing"`; the cost baseline then comes from the BigQuery log sink
 instead — `scripts/memory_premise_cost.sql`, run with `bq query --use_legacy_sql=false`.

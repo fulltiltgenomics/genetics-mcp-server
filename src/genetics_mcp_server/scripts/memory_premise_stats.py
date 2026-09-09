@@ -43,7 +43,7 @@ EXCLUDED_USERS = ("anonymous", "mcp-tool")
 WINDOW_DAYS = 90
 # a value this short matches too much prose to mean anything as a re-mention
 MIN_REMENTION_CHARS = 3
-# memory_gate.MEMORY_DIGEST_SESSION_LIMIT, copied rather than imported because the bundle
+# memory_gate.MEMORY_PROJECT_SESSION_CAP, copied rather than imported because the bundle
 # may import nothing of this package; a drift between the two makes M3 measure a window
 # the product does not have
 DIGEST_WINDOW_SESSIONS = 20

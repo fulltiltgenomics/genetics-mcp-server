@@ -52,8 +52,9 @@ from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_sto
 from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
 from genetics_mcp_server.memory_digest import render_digest
 from genetics_mcp_server.memory_gate import (
-    MEMORY_DIGEST_SESSION_LIMIT,
+    MEMORY_PROJECT_SESSION_CAP,
     memory_gate_open,
+    project_log_hash,
     user_log_hash,
 )
 from genetics_mcp_server.rate_limit import check_rate_limit
@@ -630,69 +631,100 @@ def _resolve_user_instructions(
         return None
 
 
+def _project_name(db: Any, user: str, project_id: str) -> str | None:
+    """The project's display name, for the SSE event that reports a fresh render.
+
+    chat_history_db exposes no get-by-id accessor for a project, only the owner-scoped
+    `list_projects`, which PROJECTS_MAX_PER_USER holds to 20 rows — so the name is picked
+    out of that list. None when the row has gone (a delete racing this turn); the event
+    still carries the counts.
+    """
+    return next((p.name for p in db.list_projects(user) if p.id == project_id), None)
+
+
 def _load_user_memory(
     user: str | None,
     session_id: str | None,
     *,
     secret: bool,
     gateway_asserted: bool,
-    first_turn: bool,
     db: Any = None,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> str | None:
     """The blocking half of `_resolve_user_memory`, run in a worker thread.
 
-    Every step is a database call — the opt-in setting, the session row, the content of
-    up to MEMORY_DIGEST_SESSION_LIMIT sessions, and the write — and chat_history.db
-    shares its volume with the nightly analysis job, so a turn resolving memory on the
-    event loop would hold it for that job's busy timeout before the first SSE byte.
+    Every step is a database call — the opt-in setting, the session row, the content of up
+    to MEMORY_PROJECT_SESSION_CAP sessions in this session's project, and the write — and
+    chat_history.db shares its volume with the nightly analysis job, so a turn resolving
+    memory on the event loop would hold it for that job's busy timeout before the first
+    SSE byte.
     """
     if not memory_gate_open(user, gateway_asserted=gateway_asserted, secret=secret):
         return None
 
     db = db or get_chat_history_db()
     session = db.get_session(session_id, user) if session_id else None
-    if session is not None and session.context_digest:
-        # byte-stable for the life of the session: a cache block that changed between
-        # turns would invalidate the whole prefix on every follow-up. Nothing is
-        # logged here — the stored bytes were logged when they were rendered, and
-        # this path has no session count to report
-        return session.context_digest
-
-    if not first_turn:
-        # nothing stored on a later turn means the first turn had nothing to pin: an
-        # empty render is deliberately not persisted. Rendering now would inject memory
-        # into the middle of a conversation that opened without it, as soon as a second
-        # session existed to render — so a turn that is not the first gets none
+    if session is None or session.project_id is None:
+        # memory is per project, so an unfiled session has none — and neither has a turn
+        # whose session row the browser has not created yet. The digest window is not
+        # queried at all here: called without a project it is the old unrestricted
+        # recency window, which is exactly the thing being replaced.
+        #
+        # Two consequences are deliberate. Filing or moving a session mid-conversation
+        # renders a fresh digest on its next turn (set_session_project nulls the stored
+        # one), and UNFILING a session drops its memory block on its next turn. Each
+        # moves block 1 once, so each costs one uncached turn; that is the price of
+        # "unfiled gets no memory" and of a digest that always matches the project the
+        # session is in.
         return None
+
+    if session.context_digest is not None:
+        # tri-state, and '' is a hit rather than a miss: it means this session already
+        # rendered and its project had nothing else in it. Reading it as falsy would
+        # re-render on every turn until the project gained a second session, which is
+        # memory appearing mid-conversation — and first-writer-wins means the re-render
+        # could not be stored anyway. Byte-stable for the life of the session: a cache
+        # block that changed between turns would invalidate the whole prefix on every
+        # follow-up. Nothing is logged here — the stored bytes were logged when they
+        # were rendered, and this path has no session count to report
+        return session.context_digest or None
 
     sessions = db.get_recent_sessions_for_digest(
         user,
-        MEMORY_DIGEST_SESSION_LIMIT,
+        MEMORY_PROJECT_SESSION_CAP,
+        project_id=session.project_id,
         include_pinned=True,
         exclude_session_id=session_id,
     )
     digest = render_digest(sessions, datetime.now(timezone.utc))
-    if not digest:
-        return None
-    if session_id:
-        # first writer wins. That costs the loser nothing unless another session's title
-        # or updated_at moved between the two renders; then this turn ran on bytes the
-        # stored copy does not match and the next turn reads the stored ones back — one
-        # cache miss, after which the session is byte-stable again
-        db.set_context_digest(session_id, user, digest)
-    # a turn with no session id (the browser creates the row lazily) has nothing to
-    # pin the digest to, so it renders fresh and persists nothing
+    # an empty render is stored too, and that is what replaced the old "only on the
+    # conversation's first turn" guard: the stored '' covers the guard's one storable
+    # case — session already existed, project was empty. A session created lazily and
+    # filed into a project after its first turn still gets memory starting on its next
+    # turn, the same one-move-of-block-1 cost as filing mid-conversation, and that is
+    # deliberate. First writer wins, which costs the loser nothing unless another
+    # session's title or updated_at moved between two concurrent renders; then this turn
+    # ran on bytes the stored copy does not match and the next turn reads the stored ones
+    # back — one cache miss, after which the session is byte-stable again
+    db.set_context_digest(session_id, user, digest)
     logger.info(
         f"memory digest: user={user_log_hash(user)} "
+        f"project={project_log_hash(session.project_id)} "
         f"sessions={len(sessions)} chars={len(digest)}"
     )
-    if stats is not None:
+    if stats is not None and digest:
         # the caller's SSE "memory" event reads this back rather than recomputing it,
-        # so the event and the log line can never disagree
+        # so the event and the log line can never disagree. Left untouched by an empty
+        # render: there is no memory block to announce
         stats["sessions"] = len(sessions)
         stats["chars"] = len(digest)
-    return digest
+        # runs after set_context_digest has already committed, so a failure here must not
+        # cost a second uncached turn on top of this one's — the event just carries no name
+        try:
+            stats["project"] = _project_name(db, user, session.project_id)
+        except Exception:
+            stats["project"] = None
+    return digest or None
 
 
 async def _resolve_user_memory(
@@ -701,11 +733,10 @@ async def _resolve_user_memory(
     *,
     secret: bool,
     gateway_asserted: bool,
-    first_turn: bool,
     db: Any = None,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> str | None:
-    """The rendered cross-session digest for this turn, or None.
+    """The rendered digest of this session's project, or None.
 
     Returns the digest TEXT, not a prompt fragment: the caller hands it to the model
     layer, which wraps it in `memory_envelope` beside the instruction envelope so both
@@ -724,7 +755,6 @@ async def _resolve_user_memory(
             session_id,
             secret=secret,
             gateway_asserted=gateway_asserted,
-            first_turn=first_turn,
             db=db,
             stats=stats,
         )
@@ -846,18 +876,12 @@ async def stream_chat(
     user_instructions = _resolve_user_instructions(
         user, request.instruction_set_id, secret=request.secret
     )
-    # the browser replays the whole conversation and a tool result comes back as a `user`
-    # message, so counting user messages would call a mid-turn continuation a first turn.
-    # The absence of an assistant message is exact — one is present from the moment the
-    # first reply is replayed — and would only be false if a client dropped history
-    first_turn = not any(m.role == "assistant" for m in request.messages)
-    memory_stats: dict[str, int] = {}
+    memory_stats: dict[str, Any] = {}
     user_memory = await _resolve_user_memory(
         user,
         request.session_id,
         secret=request.secret,
         gateway_asserted=gateway_asserted,
-        first_turn=first_turn,
         stats=memory_stats,
     )
 
@@ -871,6 +895,7 @@ async def stream_chat(
                     "event": "message",
                     "data": json.dumps({
                         "type": "memory",
+                        "project": memory_stats.get("project"),
                         "sessions": memory_stats["sessions"],
                         "chars": memory_stats["chars"],
                     }),
