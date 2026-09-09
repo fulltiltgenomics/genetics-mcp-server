@@ -1915,7 +1915,7 @@ src/genetics_mcp_server/
 ├── download_store.py    # disk-persisted download storage for TSV files
 ├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
 ├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
-├── memory_digest.py     # entity extraction shared by the memory digest and its premise gate
+├── memory_digest.py     # entity extraction and session clustering, shared by the digest and its premise gate
 ├── memory_gate.py       # the one place that decides whether a caller gets cross-session memory
 ├── config/
 │   ├── __init__.py
@@ -2718,7 +2718,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
-| `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from |
+| `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from. Also `cluster_sessions` (chain linkage, the `min_shared` threshold, strict kinds only, order-independent numbering) and the M1/M2/M3 shares over a two-project synthetic history, including the pseudonym agreeing with `memory_gate.user_log_hash` |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
@@ -2772,9 +2772,59 @@ kubectl -n genetics exec -i deploy/chat-backend -- python - < /tmp/premise.py > 
 ```
 
 `--bundle` inlines `memory_digest.py` above the script and strips the import, because the
-deployed image predates that module. Production also predates `chat_turn_metrics`, where the
+deployed image predates that module. Everything the measurement needs therefore has to live
+in `memory_digest.py` or be re-stated in the script: `DIGEST_WINDOW_SESSIONS` and `user_hash`
+are copies of `memory_gate.MEMORY_DIGEST_SESSION_LIMIT` and `memory_gate.user_log_hash`, and
+a test asserts the pseudonyms agree. Production also predates `chat_turn_metrics`, where the
 script reports `"table missing"`; the cost baseline then comes from the BigQuery log sink
 instead — `scripts/memory_premise_cost.sql`, run with `bq query --use_legacy_sql=false`.
+
+### Are those sessions one line of work or several?
+
+The `clusters` section answers the question the counts above cannot: whether a user's
+history is one project or several, and so whether a memory over *recent* sessions is
+carrying the wrong project's context. `memory_digest.cluster_sessions(entity_sets,
+min_shared)` groups a user's sessions by single-linkage over the entities they share,
+restricted to `STRICT_KINDS` (gene, phenotype, variant) — a `resource` argument makes
+`dataset:finngen` an entity of nearly every session, so linking on it would collapse a
+history into one cluster. Single linkage chains, so the threshold matters and both are
+reported: `min_shared=1` merges two lines of work that touch one gene in common,
+`min_shared=2` asks a project to be recognisable by more than one identifier. The function
+is a pure mapping of session key → cluster id, numbered from each cluster's smallest key so
+the result cannot depend on iteration order; it is written to be reused by the product, not
+only by this script.
+
+`analyse_clusters` computes three shares per window and threshold. **M1** is the share of
+users with at least `M1_MIN_SESSIONS` in-window sessions that have two or more clusters of
+three or more sessions — are users multi-threaded at all. **M2** takes the returning
+sessions whose first user message re-mentions a strict entity from an earlier session and
+reports the share where the session the digest would have led with — the newest earlier
+session in `recency_key` order, which reproduces `get_recent_sessions_for_digest`'s
+`updated_at DESC, id DESC` — sits in a different cluster from where that entity was worked
+on. **M3** shares that denominator and counts the re-mentions whose source session (the most
+recent earlier session naming the entity, the one the digest would surface) has fallen out
+of the last-`DIGEST_WINDOW_SESSIONS` window while still belonging to the current session's
+cluster: the miss a project-scoped memory recovers and a recency-scoped one cannot. A pinned
+source session is treated as in-window regardless of recency, matching
+`get_recent_sessions_for_digest`, which returns pinned sessions in addition to the recency
+window; `collect` reports whether that distinction was even readable, as
+`clusters.pinned_visible` — false when `chat_sessions` predates the `pinned_at` column (the
+production schema at the time this was written), in which case every pinned source outside
+the window is counted as a miss anyway and `m3_window_miss_share` is biased up. Most
+re-mentions cannot structurally be a window miss, because the user had at most
+`DIGEST_WINDOW_SESSIONS` prior in-window sessions at that point and every one of those is
+trivially inside the window; `analyse_clusters` also reports `m3_eligible_remention_sessions`
+and `m3_window_miss_share_eligible`, restricting the denominator to re-mentions where the
+user had more prior in-window sessions than that, which is the share the premise's gate
+should read. An entity worked on in earlier sessions of more than one cluster is counted as
+evidence for neither M2 nor M3, and those sessions are reported separately as
+`remention_sessions_with_ambiguous_entity`.
+
+`cluster_quality` dumps the shapes behind the shares so they can be judged by eye: per user,
+cluster sizes and each multi-session cluster's most frequent entities. Users are named by
+`user_hash` alone and no session id, address or message text is emitted, on the same rule as
+the rest of the output. The kill criterion these numbers feed is the epic's, not this
+document's.
 
 ## Conversation Analysis
 

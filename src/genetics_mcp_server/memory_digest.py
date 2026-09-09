@@ -9,6 +9,8 @@ list of prior sessions into the text block a new session's prompt is seeded with
 import base64
 import json
 import re
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from typing import Any
 
@@ -254,6 +256,82 @@ def extract_user_entities(text: Any) -> set[Entity]:
     for match in _VARIANT_RE.finditer(text):
         chrom, pos, ref, alt = match.groups()
         out.add(("variant", f"{chrom}-{pos}-{ref}-{alt}".lower()))
+    return out
+
+
+# --- session clustering -------------------------------------------------------------
+
+# the kinds that say what a user was working on. A `resource` argument makes
+# ("dataset", "finngen") an entity of nearly every session and a view is shared by every
+# query of that shape, so linking on either would collapse a whole history into one cluster
+STRICT_KINDS: frozenset[str] = frozenset({"gene", "phenotype", "variant"})
+
+
+def cluster_sessions(
+    entity_sets: Mapping[Any, Iterable[Entity]], min_shared: int = 1
+) -> dict[Any, int]:
+    """Group sessions into single-linkage clusters over the STRICT_KINDS they share.
+
+    `entity_sets` maps a session key to that session's entities. Two sessions link when
+    they share at least `min_shared` strict entities, and a cluster is a connected
+    component of those links, so a chain A-B-C is one cluster even where A and C share
+    nothing. Returns {session key: cluster id}; a session that links to nothing is a
+    cluster of its own, and a session with no strict entities always is.
+
+    Cluster ids number from zero in order of each cluster's smallest key, so the same
+    input gives the same numbering however the mapping happened to be iterated. Keys must
+    be mutually comparable.
+    """
+    if min_shared < 1:
+        raise ValueError("min_shared must be at least 1")
+
+    keys = sorted(entity_sets)
+    parent: dict[Any, Any] = {key: key for key in keys}
+
+    def find(key: Any) -> Any:
+        root = key
+        while parent[root] != root:
+            root = parent[root]
+        while parent[key] != root:
+            parent[key], key = root, parent[key]
+        return root
+
+    def union(a: Any, b: Any) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # smallest key wins, so the result cannot depend on the order unions ran in
+            lo, hi = (ra, rb) if ra <= rb else (rb, ra)
+            parent[hi] = lo
+
+    by_entity: dict[Entity, list[Any]] = defaultdict(list)
+    for key in keys:
+        for entity in entity_sets[key]:
+            if entity[0] in STRICT_KINDS:
+                by_entity[entity].append(key)
+
+    if min_shared == 1:
+        for members in by_entity.values():
+            for other in members[1:]:
+                union(members[0], other)
+    else:
+        # pairs are counted only within an entity's own member list, so two sessions that
+        # share nothing never meet
+        shared: dict[tuple[Any, Any], int] = defaultdict(int)
+        for members in by_entity.values():
+            for index, first in enumerate(members):
+                for second in members[index + 1 :]:
+                    shared[(first, second)] += 1
+        for (first, second), count in shared.items():
+            if count >= min_shared:
+                union(first, second)
+
+    numbering: dict[Any, int] = {}
+    out: dict[Any, int] = {}
+    for key in keys:
+        root = find(key)
+        if root not in numbering:
+            numbering[root] = len(numbering)
+        out[key] = numbering[root]
     return out
 
 

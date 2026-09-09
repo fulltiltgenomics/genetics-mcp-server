@@ -10,10 +10,12 @@ from datetime import datetime, timedelta
 
 from genetics_mcp_server.memory_digest import (
     KINDS,
+    cluster_sessions,
     extract_entities,
     extract_marker_entities,
     extract_user_entities,
 )
+from genetics_mcp_server.memory_gate import user_log_hash
 from genetics_mcp_server.scripts import memory_premise_stats as stats
 
 
@@ -159,6 +161,70 @@ def test_legacy_tooluse_marker():
     assert extract_marker_entities(None) == set()
 
 
+# --- session clustering -------------------------------------------------------------
+
+
+def test_single_linkage_joins_a_chain_and_leaves_strangers_alone():
+    clusters = cluster_sessions(
+        {
+            "a": {("gene", "APOE")},
+            "b": {("gene", "APOE"), ("gene", "LDLR")},
+            "c": {("gene", "LDLR")},
+            "d": {("phenotype", "I9_CHD")},
+            "e": set(),
+        }
+    )
+    assert clusters["a"] == clusters["b"] == clusters["c"]
+    assert len({clusters["a"], clusters["d"], clusters["e"]}) == 3
+    # numbered from zero in order of each cluster's smallest key
+    assert clusters == {"a": 0, "b": 0, "c": 0, "d": 1, "e": 2}
+
+
+def test_min_shared_two_needs_a_second_identifier():
+    entity_sets = {
+        "a": {("gene", "APOE"), ("gene", "LDLR")},
+        "b": {("gene", "APOE"), ("gene", "LDLR")},
+        "c": {("gene", "APOE")},
+    }
+    assert cluster_sessions(entity_sets, min_shared=1) == {"a": 0, "b": 0, "c": 0}
+    loose = cluster_sessions(entity_sets, min_shared=2)
+    assert loose["a"] == loose["b"] != loose["c"]
+
+
+def test_only_strict_kinds_link_sessions():
+    """Nearly every session names finngen and a view; linking on those merges everything."""
+    clusters = cluster_sessions(
+        {
+            "a": {("dataset", "finngen"), ("view", "credible_sets_v")},
+            "b": {("dataset", "finngen"), ("view", "credible_sets_v")},
+        }
+    )
+    assert clusters["a"] != clusters["b"]
+
+
+def test_cluster_ids_do_not_depend_on_iteration_order():
+    entity_sets = {
+        "s3": {("gene", "APOE")},
+        "s1": {("gene", "TP53")},
+        "s2": {("gene", "APOE")},
+    }
+    reversed_order = {key: entity_sets[key] for key in reversed(list(entity_sets))}
+    assert cluster_sessions(entity_sets) == cluster_sessions(reversed_order)
+
+
+def test_min_shared_below_one_is_rejected():
+    try:
+        cluster_sessions({}, min_shared=0)
+    except ValueError:
+        return
+    raise AssertionError("min_shared=0 should be rejected")
+
+
+def test_premise_pseudonym_matches_the_memory_log():
+    """The bundle cannot import memory_gate, so its copy of the hash must be checked."""
+    assert stats.user_hash(" Alice@Example.COM ") == user_log_hash("alice@example.com")
+
+
 # --- the premise script -------------------------------------------------------------
 
 PRODUCTION_SCHEMA = """
@@ -171,6 +237,14 @@ CREATE TABLE chat_messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
     instruction_set_id TEXT, verbosity TEXT);
 CREATE TABLE conversation_analysis (session_id TEXT PRIMARY KEY, summary TEXT);
 """
+
+# chat_sessions with pinned_at, for the pin-aware M2/M3 tests below. Kept separate from
+# PRODUCTION_SCHEMA because production predates the column — that gap is exactly what
+# collect() has to tolerate, and PRODUCTION_SCHEMA is what stands in for it.
+PRODUCTION_SCHEMA_WITH_PINNING = PRODUCTION_SCHEMA.replace(
+    "phenotype_code TEXT, shared INTEGER);",
+    "phenotype_code TEXT, shared INTEGER, pinned_at TIMESTAMP);",
+)
 
 
 def build_db(path):
@@ -263,6 +337,14 @@ def test_collect_shape_and_counts(tmp_path):
         assert f'"{secret}"' not in dumped
 
 
+def test_collect_succeeds_without_pinned_at(tmp_path):
+    """Production's chat_sessions predates pinned_at; collect() must not raise for it."""
+    db = tmp_path / "chat_history.db"
+    build_db(str(db))
+    out = stats.collect(str(db))
+    assert out["clusters"]["pinned_visible"] is False
+
+
 def test_bundled_script_is_self_contained_and_agrees(tmp_path):
     db = tmp_path / "chat_history.db"
     build_db(str(db))
@@ -290,6 +372,362 @@ def test_bundled_script_is_self_contained_and_agrees(tmp_path):
     bundled.pop("generated_at")
     direct.pop("generated_at")
     assert bundled == direct
+
+
+def build_cluster_db(path):
+    """One user with two lines of work, opening the last session with a re-mention.
+
+    Sessions 1-3 are a gene project (APOE-LDLR, joined as a chain), 4-6 a phenotype
+    project, and session 7 comes back to APOE immediately after the phenotype work — so
+    the session the recency digest would lead with belongs to the other project.
+    """
+    con = sqlite3.connect(path)
+    con.executescript(PRODUCTION_SCHEMA)
+    now = datetime.now()
+    tools = [
+        tool_use("search_genes", query="APOE"),
+        tool_use("search_genes", query="APOE, LDLR"),
+        tool_use("search_genes", query="LDLR"),
+        tool_use("get_phenotype_report", phenotype_code="I9_CHD"),
+        tool_use("lookup_phenotype_names", codes=["I9_CHD"]),
+        tool_use("get_phenotype_report", phenotype_code="I9_CHD"),
+        tool_use("search_genes", query="APOE"),
+    ]
+    firsts = ["start here"] * 6 + ["back to apoe — any coding variants?"]
+    for index, (call, first) in enumerate(zip(tools, firsts)):
+        session_id = f"c{index + 1}"
+        stamp = (now - timedelta(days=20 - index)).strftime("%Y-%m-%d %H:%M:%S")
+        con.execute(
+            "INSERT INTO chat_sessions (id, user_id, created_at, updated_at)"
+            " VALUES (?,?,?,?)",
+            (session_id, "carol", stamp, stamp),
+        )
+        con.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (f"{session_id}u", session_id, "user", first, stamp),
+        )
+        con.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content, content_json,"
+            " created_at) VALUES (?,?,?,?,?,?)",
+            (f"{session_id}a", session_id, "assistant", "ok", blocks(call), stamp),
+        )
+    con.commit()
+    con.close()
+
+
+def test_cluster_metrics_and_quality_dump(tmp_path):
+    db = tmp_path / "chat_history.db"
+    build_cluster_db(str(db))
+    out = stats.collect(str(db))
+    loose = out["clusters"]["all_time"]["min_shared_1"]
+    tight = out["clusters"]["all_time"]["min_shared_2"]
+
+    # two clusters of >=3 sessions: the gene chain plus session 7, and the phenotype work
+    assert loose["m1_users_with_min_sessions"] == 1
+    assert loose["m1_multi_thread_share"] == 1.0
+    assert loose["m2_remention_sessions"] == 1
+    assert loose["m2_interleaving_share"] == 1.0
+    # six prior sessions all sit inside the last-20 window, so nothing is a window miss
+    assert loose["m3_window_miss_share"] == 0.0
+
+    # at two shared entities nothing links, so APOE's earlier sessions land in different
+    # clusters and the conservative rule counts the re-mention as no evidence
+    assert tight["m1_multi_thread_share"] == 0.0
+    assert tight["m2_interleaving_share"] == 0.0
+    assert tight["remention_sessions_with_ambiguous_entity"] == 1
+
+    dump = out["clusters"]["quality_all_time"]["min_shared_1"]["users"]
+    assert [entry["sessions"] for entry in dump] == [7]
+    assert dump[0]["user"] == user_log_hash("carol")
+    biggest = dump[0]["clusters"][0]
+    assert biggest["size"] == 4
+    assert biggest["top_entities"][0] == {"entity": "gene:APOE", "sessions": 3}
+    # singleton clusters carry a size and nothing else to say
+    assert all("top_entities" not in c for c in dump[0]["clusters"] if c["size"] < 2)
+
+    dumped = json.dumps(out)
+    for secret in ("carol", "c1", "c7", "back to apoe — any coding variants?"):
+        assert f'"{secret}"' not in dumped
+
+
+def test_window_miss_counts_a_source_outside_the_recency_window(tmp_path, monkeypatch):
+    """M3 on the same data with the digest window shrunk: APOE's session falls out of it."""
+    db = tmp_path / "chat_history.db"
+    build_cluster_db(str(db))
+    monkeypatch.setattr(stats, "DIGEST_WINDOW_SESSIONS", 2)
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    # the two most recent earlier sessions are both phenotype work; the APOE session the
+    # digest would have needed is older than that, and in the returning session's cluster
+    assert loose["m3_window_miss_share"] == 1.0
+
+
+# --- M1/M2/M3 mutation coverage ------------------------------------------------------
+
+
+def build_multi_user_db(path, users):
+    """Sessions for several users, each given full control over timing and pin state.
+
+    `users` maps user_id to a list of (id, created_at, updated_at, tool_use_or_None,
+    first_user_message, pinned_at) tuples, inserted in the given order.
+    """
+    con = sqlite3.connect(path)
+    con.executescript(PRODUCTION_SCHEMA_WITH_PINNING)
+    for user_id, sessions in users.items():
+        for sid, created, updated, call, first, pinned in sessions:
+            con.execute(
+                "INSERT INTO chat_sessions (id, user_id, created_at, updated_at, pinned_at)"
+                " VALUES (?,?,?,?,?)",
+                (sid, user_id, created, updated, pinned),
+            )
+            con.execute(
+                "INSERT INTO chat_messages (id, session_id, role, content, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (f"{sid}u", sid, "user", first, created),
+            )
+            if call:
+                con.execute(
+                    "INSERT INTO chat_messages (id, session_id, role, content, content_json,"
+                    " created_at) VALUES (?,?,?,?,?,?)",
+                    (f"{sid}a", sid, "assistant", "ok", blocks(call), created),
+                )
+    con.commit()
+    con.close()
+
+
+def build_sessions_db(path, user_id, sessions):
+    """One user's sessions; see `build_multi_user_db`."""
+    build_multi_user_db(path, {user_id: sessions})
+
+
+def _day(n):
+    return (datetime.now() + timedelta(days=n)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_m3_ignores_a_source_in_a_different_cluster(tmp_path, monkeypatch):
+    """(a) an out-of-window source outside the current session's cluster is not a miss.
+
+    Kills dropping the `source_cluster == clusters[session_id]` condition: without it,
+    any out-of-window source would count regardless of which project it belongs to.
+    """
+    db = tmp_path / "chat_history.db"
+    monkeypatch.setattr(stats, "DIGEST_WINDOW_SESSIONS", 2)
+    build_sessions_db(
+        db,
+        "u",
+        [
+            ("s1", _day(-10), _day(-10), tool_use("search_genes", query="APOE"), "start", None),
+            ("s2", _day(-8), _day(-8), tool_use("search_genes", query="LDLR"), "start", None),
+            ("s3", _day(-6), _day(-6), tool_use("search_genes", query="LDLR"), "start", None),
+            (
+                "s4",
+                _day(0),
+                _day(0),
+                tool_use("search_genes", query="LDLR"),
+                "back to apoe — any coding variants?",
+                None,
+            ),
+        ],
+    )
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    assert loose["m2_remention_sessions"] == 1
+    # s1 (APOE) is out of window, but s4 joined the LDLR cluster (s2/s3), not APOE's
+    assert loose["m3_source_outside_window_same_cluster"] == 0
+    assert loose["m3_window_miss_share"] == 0.0
+
+
+def test_m3_window_boundary_is_exclusive(tmp_path, monkeypatch):
+    """(b) a source at position DIGEST_WINDOW_SESSIONS is in window; one further back misses."""
+    monkeypatch.setattr(stats, "DIGEST_WINDOW_SESSIONS", 3)
+
+    def build(n_fillers):
+        rows = [("src", _day(-100), _day(-100), tool_use("search_genes", query="APOE"), "s", None)]
+        for i in range(n_fillers):
+            rows.append(
+                (
+                    f"f{i}",
+                    _day(-50 + i),
+                    _day(-50 + i),
+                    tool_use("search_genes", query=f"FILLER{i}"),
+                    "s",
+                    None,
+                )
+            )
+        rows.append(
+            ("cur", _day(0), _day(0), tool_use("search_genes", query="APOE"), "back to apoe", None)
+        )
+        return rows
+
+    in_window_db = tmp_path / "in_window.db"
+    build_sessions_db(in_window_db, "u", build(2))  # src at position 3 == window
+    in_window = stats.collect(str(in_window_db))["clusters"]["all_time"]["min_shared_1"]
+    assert in_window["m3_source_outside_window_same_cluster"] == 0
+
+    miss_db = tmp_path / "miss.db"
+    build_sessions_db(miss_db, "u2", build(3))  # src at position 4 == window + 1
+    miss = stats.collect(str(miss_db))["clusters"]["all_time"]["min_shared_1"]
+    assert miss["m3_source_outside_window_same_cluster"] == 1
+
+
+def test_m1_needs_two_clusters_of_the_full_minimum_size(tmp_path):
+    """(c) two clusters one short of M1_MIN_CLUSTER_SIZE must not satisfy M1.
+
+    Kills M1_MIN_CLUSTER_SIZE 3->2: two pairs would satisfy a threshold of 2 but not 3.
+    """
+    db = tmp_path / "chat_history.db"
+    build_sessions_db(
+        db,
+        "u",
+        [
+            ("s1", _day(-10), _day(-10), tool_use("search_genes", query="APOE"), "s", None),
+            ("s2", _day(-9), _day(-9), tool_use("search_genes", query="APOE"), "s", None),
+            ("s3", _day(-8), _day(-8), tool_use("search_genes", query="LDLR"), "s", None),
+            ("s4", _day(-7), _day(-7), tool_use("search_genes", query="LDLR"), "s", None),
+            ("s5", _day(-6), _day(-6), tool_use("search_genes", query="MTHFR"), "s", None),
+        ],
+    )
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    assert loose["m1_users_with_min_sessions"] == 1
+    assert loose["m1_multi_cluster_users"] == 0
+    assert loose["m1_multi_thread_share"] == 0.0
+
+
+def test_m2_preceding_session_is_by_recency_not_creation_order(tmp_path):
+    """(d) a session re-touched after creation outranks its creation-order successor.
+
+    Kills reading "preceding" off creation order: s2 was created after s1 but never
+    touched again, while s1 was updated just before the re-mention — so the digest
+    would have led with s1 (APOE's own cluster), not s2.
+    """
+    db = tmp_path / "chat_history.db"
+    build_sessions_db(
+        db,
+        "u",
+        [
+            ("s1", _day(-10), _day(-1), tool_use("search_genes", query="APOE"), "s", None),
+            ("s2", _day(-8), _day(-8), tool_use("search_genes", query="MTHFR"), "s", None),
+            (
+                "s3",
+                _day(0),
+                _day(0),
+                tool_use("search_genes", query="LDLR"),
+                "back to apoe — any coding variants?",
+                None,
+            ),
+        ],
+    )
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    assert loose["m2_remention_sessions"] == 1
+    # recency-order preceding is s1 (APOE's own cluster) == the entity's source cluster
+    assert loose["m2_preceding_in_other_cluster"] == 0
+    assert loose["m2_interleaving_share"] == 0.0
+
+
+def test_m3_uses_the_newest_source_not_the_oldest(tmp_path, monkeypatch):
+    """(e) two sources for one entity; only the newer one is inside the window.
+
+    Kills picking the oldest occurrence: the digest surfaces the most recent one, so
+    that is the one whose window membership decides the miss.
+    """
+    db = tmp_path / "chat_history.db"
+    monkeypatch.setattr(stats, "DIGEST_WINDOW_SESSIONS", 1)
+    build_sessions_db(
+        db,
+        "u",
+        [
+            ("s_old", _day(-10), _day(-10), tool_use("search_genes", query="TP53"), "s", None),
+            ("s_new", _day(-5), _day(-5), tool_use("search_genes", query="TP53"), "s", None),
+            (
+                "s_cur",
+                _day(0),
+                _day(0),
+                tool_use("search_genes", query="TP53"),
+                "back to tp53 — following up",
+                None,
+            ),
+        ],
+    )
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    assert loose["m2_remention_sessions"] == 1
+    # the newest source (s_new) is the one in the 1-session recency window, so no miss
+    assert loose["m3_source_outside_window_same_cluster"] == 0
+    assert loose["m3_window_miss_share"] == 0.0
+
+
+def test_pinned_source_is_not_a_window_miss(tmp_path, monkeypatch):
+    """A pinned prior source counts as in-window, matching what the digest ships."""
+    db = tmp_path / "chat_history.db"
+    monkeypatch.setattr(stats, "DIGEST_WINDOW_SESSIONS", 1)
+    build_sessions_db(
+        db,
+        "u",
+        [
+            (
+                "s_src",
+                _day(-10),
+                _day(-10),
+                tool_use("search_genes", query="APOE"),
+                "s",
+                _day(-10),  # pinned
+            ),
+            ("s_filler", _day(-5), _day(-5), tool_use("search_genes", query="MTHFR"), "s", None),
+            (
+                "s_cur",
+                _day(0),
+                _day(0),
+                tool_use("search_genes", query="APOE"),
+                "back to apoe",
+                None,
+            ),
+        ],
+    )
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    assert loose["m2_remention_sessions"] == 1
+    assert loose["m3_source_outside_window_same_cluster"] == 0
+
+
+def test_m3_eligible_denominator_excludes_users_within_the_window(tmp_path, monkeypatch):
+    """The diluted share and the eligible share diverge once one user is past the window."""
+    db = tmp_path / "chat_history.db"
+    monkeypatch.setattr(stats, "DIGEST_WINDOW_SESSIONS", 2)
+    build_multi_user_db(
+        db,
+        {
+            # short: 1 prior session, never enough to exceed the window -> ineligible
+            "short": [
+                ("a1", _day(-10), _day(-10), tool_use("search_genes", query="GENEX"), "s", None),
+                (
+                    "a2",
+                    _day(0),
+                    _day(0),
+                    tool_use("search_genes", query="GENEX"),
+                    "back to genex",
+                    None,
+                ),
+            ],
+            # long: 3 prior sessions (> window of 2), source pushed out of the window
+            "long": [
+                ("b1", _day(-10), _day(-10), tool_use("search_genes", query="GENEY"), "s", None),
+                ("b2", _day(-8), _day(-8), tool_use("search_genes", query="FILLER1"), "s", None),
+                ("b3", _day(-6), _day(-6), tool_use("search_genes", query="FILLER2"), "s", None),
+                (
+                    "b4",
+                    _day(0),
+                    _day(0),
+                    tool_use("search_genes", query="GENEY"),
+                    "back to geney",
+                    None,
+                ),
+            ],
+        },
+    )
+
+    loose = stats.collect(str(db))["clusters"]["all_time"]["min_shared_1"]
+    assert loose["m2_remention_sessions"] == 2
+    assert loose["m3_source_outside_window_same_cluster"] == 1
+    assert loose["m3_window_miss_share"] == 0.5
+    assert loose["m3_eligible_remention_sessions"] == 1
+    assert loose["m3_window_miss_share_eligible"] == 1.0
 
 
 # --- render_digest -------------------------------------------------------------------
