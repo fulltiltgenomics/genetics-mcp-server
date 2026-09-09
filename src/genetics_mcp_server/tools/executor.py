@@ -30,6 +30,7 @@ from genetics_mcp_server.tools.chembl import ChEMBLClient
 from genetics_mcp_server.tools.sql_safety import (
     SqlValueError,
     normalize_literal,
+    quote_like_pattern,
     quote_literal,
     quote_literal_list,
     sql_float,
@@ -2044,6 +2045,218 @@ class ToolExecutor:
                     "columns": columns,
                     "rows": rows,
                     "filename": f"{name.replace('*', '_').replace(':', '_')}_hla.tsv",
+                },
+            }
+            return self._query_metadata(payload, result, with_metadata)
+        return result
+
+    # -------------------------------------------------------------------------
+    # rCNV Tools (Collins et al. 2022 dosage sensitivity map)
+    # -------------------------------------------------------------------------
+
+    # the published data spells an HPO term id without the colon (HP:0012759 -> HP0012759).
+    # Both spellings are accepted from the caller because both are in circulation and a
+    # rejection would cost a turn.
+    _HPO_ID_RE = re.compile(r"^HP:?(\d{7})$", re.IGNORECASE)
+    # matches an id-shaped string that _HPO_ID_RE rejected only on digit count, so a typo
+    # like HP:12759 gets a digit-count error instead of falling into the name branch's
+    # character-set rejection
+    _HPO_ID_LOOSE_RE = re.compile(r"^HP:?\d+$", re.IGNORECASE)
+
+    _DOSAGE_COLUMNS = (
+        "symbol, symbol_gencode_v19, ensembl_gene_id, phaplo, ptriplo, "
+        "haploinsufficient, triplosensitive"
+    )
+
+    _RCNV_COLUMNS = (
+        "r.phenotype, p.trait_name, r.cnv_type, r.symbol, r.symbol_gencode_v19, "
+        "r.ensembl_gene_id, r.n_nominal_cohorts, r.top_cohort, r.case_freq, "
+        "r.control_freq, r.beta, r.beta_lower, r.beta_upper, r.z, r.mlog10p, "
+        "r.mlog10_fdr_q, r.mlog10p_secondary, r.phaplo, r.ptriplo, "
+        "r.haploinsufficient, r.triplosensitive"
+    )
+
+    # the paper's own significance call, both tiers and the secondary-evidence requirement
+    # that gates them. Thresholding on either primary statistic alone returns a different
+    # gene list than the one Collins et al. published.
+    _RCNV_SIGNIFICANT = (
+        "(r.mlog10_fdr_q > -LOG10(0.01) OR r.mlog10p > -LOG10(2.90e-6)) "
+        "AND (r.n_nominal_cohorts >= 2 OR r.mlog10p_secondary > -LOG10(0.05))"
+    )
+
+    async def get_dosage_sensitivity(
+        self,
+        genes: list[str],
+        max_rows: int = 1000,
+        with_metadata: bool = False,
+    ) -> dict[str, Any]:
+        """Get pHaplo / pTriplo dosage-sensitivity scores for genes, via BigQuery.
+
+        Matching is case-insensitive across `symbol`, `symbol_gencode_v19` and
+        `ensembl_gene_id` in one pass: the scores were published against GENCODE v19, so a
+        gene renamed since then is reachable only under its old spelling, and a caller
+        holding either name (or the ENSG id) should not have to know which.
+
+        `max_rows` is not on the tool surface: the caller already bounds the work by the
+        list it passes, and the view holds one row per gene.
+        """
+        if not isinstance(genes, (list, tuple)):
+            return {"success": False, "error": "genes must be a list of gene symbols or Ensembl IDs"}
+        bad = next((g for g in genes if not isinstance(g, str)), None)
+        if bad is not None:
+            return {"success": False, "error": f"genes must be strings, got {bad!r}"}
+        names = [g.strip() for g in genes if g.strip()]
+        if not names:
+            return {"success": False, "error": "No genes provided"}
+
+        try:
+            # the view stores the canonical upper-case spelling; upper-casing both sides is
+            # what makes 'shank3' and 'Shank3' hit
+            quoted = quote_literal_list([n.upper() for n in names], name="genes")
+            limit_sql = sql_int(max_rows, name="max_rows", minimum=1, maximum=self._MAX_SQL_LIMIT)
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
+
+        sql = (
+            f"SELECT {self._DOSAGE_COLUMNS} "
+            f"FROM dosage_sensitivity_v "
+            f"WHERE UPPER(symbol) IN ({quoted}) "
+            f"OR UPPER(symbol_gencode_v19) IN ({quoted}) "
+            f"OR UPPER(ensembl_gene_id) IN ({quoted}) "
+            f"ORDER BY phaplo DESC LIMIT {limit_sql}"
+        )
+        result = await self.query_database(sql, max_rows=max_rows)
+        if result.get("success"):
+            columns, rows, error = self._positional_rows(result)
+            if error:
+                return error
+            payload = {
+                "success": True,
+                "genes": names,
+                "count": len(rows),
+                "results": [dict(zip(columns, row)) for row in rows],
+                "_download_data": {
+                    "columns": columns,
+                    "rows": rows,
+                    "filename": "dosage_sensitivity.tsv",
+                },
+            }
+            return self._query_metadata(payload, result, with_metadata)
+        return result
+
+    async def get_rcnv_associations(
+        self,
+        gene: str | None = None,
+        phenotype: str | None = None,
+        cnv_type: str | None = None,
+        min_mlog10p: float | None = None,
+        max_fdr_q: float | None = None,
+        significant_only: bool = False,
+        include_no_estimate: bool = False,
+        limit: int = 200,
+        with_metadata: bool = False,
+    ) -> dict[str, Any]:
+        """Get rare-CNV gene association statistics, via BigQuery.
+
+        `phenotype` takes an HPO id in either spelling or a substring of the phenotype's
+        name: search_phenotypes reads the results-api phenotype index, which does not
+        cover a BigQuery-only dataset, so the name search has to happen here against the
+        `phenotypes_v` row this query already joins for the display name.
+
+        Rows where the gene was tested but the meta-analysis produced no estimate carry
+        NULL from `beta` onward and are 65% of the view; they are excluded unless
+        `include_no_estimate` is set, because a page of NULLs answers nothing.
+        """
+        if gene is None and phenotype is None:
+            return {
+                "success": False,
+                "error": "Provide at least one of gene= or phenotype=",
+            }
+
+        filters: list[str] = []
+        try:
+            if gene is not None:
+                gene = normalize_literal(gene, name="gene")
+                gene_lit = quote_literal(gene.upper(), name="gene")
+                filters.append(
+                    f"(UPPER(r.symbol) = {gene_lit} "
+                    f"OR UPPER(r.symbol_gencode_v19) = {gene_lit} "
+                    f"OR UPPER(r.ensembl_gene_id) = {gene_lit})"
+                )
+            if phenotype is not None:
+                if not isinstance(phenotype, str) or not phenotype.strip():
+                    raise SqlValueError("phenotype must be a non-empty string")
+                text = phenotype.strip()
+                hpo = self._HPO_ID_RE.match(text)
+                if hpo:
+                    phenotype = f"HP{hpo.group(1)}"
+                    filters.append(f"r.phenotype = '{phenotype}'")
+                elif self._HPO_ID_LOOSE_RE.match(text):
+                    raise SqlValueError(
+                        f"invalid phenotype: {text!r}. An HPO id carries exactly 7 digits "
+                        f"(e.g. HP:0001249 or HP0001249)."
+                    )
+                elif text.upper() == "UNKNOWN":
+                    phenotype = "UNKNOWN"
+                    filters.append("r.phenotype = 'UNKNOWN'")
+                else:
+                    phenotype = text
+                    # upper-cased after quoting so a rejection echoes what the caller
+                    # actually wrote; the quotes and the % wrappers have no case
+                    pattern = quote_like_pattern(text, name="phenotype").upper()
+                    filters.append(f"UPPER(p.trait_name) LIKE {pattern}")
+            if cnv_type is not None:
+                if not isinstance(cnv_type, str) or cnv_type.strip().upper() not in ("DEL", "DUP"):
+                    raise SqlValueError(f"cnv_type must be 'DEL' or 'DUP', got {cnv_type!r}")
+                cnv_type = cnv_type.strip().upper()
+                filters.append(f"r.cnv_type = '{cnv_type}'")
+            if not include_no_estimate:
+                filters.append("r.beta IS NOT NULL")
+            if min_mlog10p is not None:
+                filters.append(
+                    f"r.mlog10p >= {sql_float(min_mlog10p, name='min_mlog10p', minimum=0.0)}"
+                )
+            if max_fdr_q is not None:
+                q = sql_float(max_fdr_q, name="max_fdr_q", minimum=0.0, maximum=1.0)
+                if float(max_fdr_q) == 0.0:
+                    raise SqlValueError("max_fdr_q must be > 0, got 0")
+                filters.append(f"r.mlog10_fdr_q >= -LOG10({q})")
+            if significant_only:
+                filters.append(f"({self._RCNV_SIGNIFICANT})")
+            limit_sql = sql_int(limit, name="limit", minimum=1, maximum=self._MAX_SQL_LIMIT)
+        except SqlValueError as e:
+            return {"success": False, "error": str(e)}
+
+        sql = (
+            f"SELECT {self._RCNV_COLUMNS} "
+            f"FROM rcnv_gene_associations_v r "
+            # LEFT, so a phenotype group with no row in phenotypes_v still returns its
+            # association rows on the gene and HPO-id paths; the name column is then NULL
+            # rather than the rows missing. On the name-search path this join is LEFT in
+            # name only: the LIKE filter tests p.trait_name, which is NULL for such a group,
+            # so those rows never pass WHERE and the query behaves as an INNER JOIN there.
+            f"LEFT JOIN phenotypes_v p "
+            f"ON p.dataset = r.dataset AND p.trait_original = r.phenotype "
+            f"WHERE {' AND '.join(filters)} "
+            f"ORDER BY r.mlog10p DESC LIMIT {limit_sql}"
+        )
+        result = await self.query_database(sql, max_rows=limit)
+        if result.get("success"):
+            columns, rows, error = self._positional_rows(result)
+            if error:
+                return error
+            payload = {
+                "success": True,
+                "gene": gene,
+                "phenotype": phenotype,
+                "cnv_type": cnv_type,
+                "significant_only": significant_only,
+                "count": len(rows),
+                "results": [dict(zip(columns, row)) for row in rows],
+                "_download_data": {
+                    "columns": columns,
+                    "rows": rows,
+                    "filename": f"{gene}_rcnv.tsv" if gene else "rcnv_associations.tsv",
                 },
             }
             return self._query_metadata(payload, result, with_metadata)

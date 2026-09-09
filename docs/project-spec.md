@@ -112,6 +112,8 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
 | `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlog10p`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
+| `get_dosage_sensitivity` | pHaplo / pTriplo dosage-sensitivity scores for a list of genes (Collins et al. 2022, 18,641 autosomal protein-coding genes from rare CNVs in 950,278 individuals). Executor-side SQL over BigQuery `dosage_sensitivity_v`. Symbols are matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published and the Ensembl ID in one pass, so a gene renamed since 2013 still resolves. `haploinsufficient`/`triplosensitive` are the paper's own cutoffs (0.86 / 0.94) returned as columns |
+| `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL from `beta` onward) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
@@ -881,6 +883,8 @@ winner.
 | `variant_effect(variant=\|gene=)` | `get_variant_effect_by_variant`, `_by_gene` |
 | `mpra(variant=\|region=\|gene=)` | `get_mpra_by_variant`/`_region`/`_gene` |
 | `mpra_pip_concordance(gene)` | `get_mpra_pip_concordance_by_gene` |
+| `dosage_sensitivity(genes)` | `get_dosage_sensitivity` |
+| `rcnv(gene=\|phenotype=[, cnv_type=, min_mlog10p=, max_fdr_q=, significant_only=, include_no_estimate=])` | `get_rcnv_associations` — the one product where both selectors may be given at once, so it does not go through `_one_of` |
 | `variant_annotation(variant=\|region=\|gene=\|variants=)` | `get_variant_annotations` (already collapsed) |
 | `gene_annotations(region=\|nearest_to=\|group=)` | `get_genes_in_region`, `get_nearest_genes`, `get_gene_group_members` |
 | `expression(gene)` | `get_gene_expression` |
@@ -1728,7 +1732,7 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` holds **ten** test classes, most of them parametrised over the
+`tests/test_system_prompt.py` holds **eleven** test classes, most of them parametrised over the
 `None`/`api`/`bigquery`/`rag`/`code`/`nocode` profile values. Only two distinct surfaces remain
 behind those six values, so the ones that need a shape no surface produces — a database surface
 without the API tools, a surface carrying `launch_subagents`, one carrying every tool at once —

@@ -532,6 +532,94 @@ async def test_hla_requires_exactly_one_selector():
             await client.hla(**kwargs)
 
 
+# ------------------------------------------------------------------ dosage / rCNV
+
+
+async def test_dosage_sensitivity_accepts_one_gene_or_many():
+    client, executor = make_client()
+
+    await client.dosage_sensitivity("SHANK3")
+    assert executor.last[0] == "get_dosage_sensitivity"
+    assert executor.last[1] == (["SHANK3"],)
+
+    await client.dosage_sensitivity(["SHANK3", "ENSG00000251322"])
+    assert executor.last[1] == (["SHANK3", "ENSG00000251322"],)
+
+
+async def test_dosage_sensitivity_uses_the_row_ceiling_and_asks_for_metadata():
+    """It reads a BigQuery view, so it needs `columns` back to label an empty frame and
+    `truncated` to refuse a prefix — both only arrive with_metadata."""
+    client, executor = make_client()
+    await client.dosage_sensitivity("SHANK3")
+    assert executor.last[2] == {"max_rows": 100_000, "with_metadata": True}
+
+
+async def test_rcnv_forwards_every_filter_untouched():
+    client, executor = make_client()
+    await client.rcnv(
+        gene="SHANK3",
+        phenotype="HP:0012759",
+        cnv_type="DEL",
+        min_mlog10p=3.0,
+        max_fdr_q=0.01,
+        significant_only=True,
+        include_no_estimate=True,
+        limit=25,
+    )
+    assert executor.last[0] == "get_rcnv_associations"
+    assert executor.last[2] == {
+        "gene": "SHANK3",
+        "phenotype": "HP:0012759",
+        "cnv_type": "DEL",
+        "min_mlog10p": 3.0,
+        "max_fdr_q": 0.01,
+        "significant_only": True,
+        "include_no_estimate": True,
+        "limit": 25,
+        "with_metadata": True,
+    }
+
+
+async def test_rcnv_defaults_keep_the_no_estimate_rows_out():
+    """65% of the view is NULL from `beta` onward; a default that let them through would
+    give a script a frame that is mostly nulls."""
+    client, executor = make_client()
+    await client.rcnv(gene="SHANK3")
+    assert executor.last[2]["include_no_estimate"] is False
+    assert executor.last[2]["significant_only"] is False
+    assert executor.last[2]["limit"] == 100_000
+
+
+async def test_rcnv_leaves_the_at_least_one_selector_rule_to_the_executor():
+    """Unlike the `_one_of` products, BOTH selectors may be given here, so the SDK cannot
+    use that helper and the refusal comes back as a raised GeneticsError instead."""
+    client, _ = make_client({"success": False, "error": "Provide at least one of gene= or phenotype="})
+    with pytest.raises(GeneticsError, match="at least one of"):
+        await client.rcnv()
+
+
+async def test_rcnv_empty_result_keeps_its_schema():
+    client, _ = make_client(
+        {"success": True, "results": [], "columns": ["phenotype", "beta", "mlog10p"]}
+    )
+    frame = await client.rcnv(gene="SHANK3")
+    assert frame.columns == ["phenotype", "beta", "mlog10p"]
+    assert frame.height == 0
+
+
+async def test_rcnv_rows_are_named_by_the_query_columns():
+    client, _ = make_client(
+        {
+            "success": True,
+            "results": [["HP0012759", "Neurodevelopmental abnormality", "DEL", 3.699]],
+            "columns": ["phenotype", "trait_name", "cnv_type", "beta"],
+        }
+    )
+    frame = await client.rcnv(gene="SHANK3")
+    assert frame.columns == ["phenotype", "trait_name", "cnv_type", "beta"]
+    assert frame["beta"].to_list() == [3.699]
+
+
 async def test_phenotype_codes_resolve_to_names():
     client, _ = make_client({"success": True, "names": {"I9_CHD": "Coronary heart disease"}})
     frame = await client.lookup_phenotype_names(["I9_CHD"])
