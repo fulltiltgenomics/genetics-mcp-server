@@ -2001,13 +2001,15 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"\nABORTED: the chat service is rate-limiting this run.\n  {exc}\n\n"
             f"This plan needs {turns_needed} requests; the service's default is "
-            "RATE_LIMIT_PER_HOUR=20 and RATE_LIMIT_PER_DAY=100, both counted per user. A "
+            "RATE_LIMIT_PER_HOUR=20, RATE_LIMIT_PER_DAY=40 and RATE_LIMIT_PER_WEEK=100, all "
+            "counted per user. A "
             "run that hits this does not fail cleanly — the turns already replayed keep "
             "their cost while their later turns cascade to not_attempted, so the report "
             "looks complete and carries almost no matched pairs.\n\n"
             "Raise the limits above the whole plan and restart the chat service:\n"
             f"  RATE_LIMIT_PER_HOUR={max(2000, turns_needed * 2)} "
             f"RATE_LIMIT_PER_DAY={max(10000, turns_needed * 10)} "
+            f"RATE_LIMIT_PER_WEEK={max(10000, turns_needed * 10)} "
             "scripts/dev-stack.sh up chat-api\n",
             file=sys.stderr,
         )

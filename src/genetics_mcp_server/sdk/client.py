@@ -476,6 +476,88 @@ class GeneticsClient:
             )
         )
 
+    # ------------------------------------------------------------------ dosage / rCNV
+
+    async def dosage_sensitivity(
+        self, genes: str | list[str], *, limit: int = MAX_ROWS
+    ) -> pl.DataFrame:
+        """Rare-CNV dosage sensitivity scores (pHaplo, pTriplo) for one or many genes.
+
+        Collins et al. 2022, the reference dosage-sensitivity map: pHaplo is the
+        probability that one functional copy is not enough, pTriplo the probability that a
+        third copy is harmful, both over 18,641 autosomal protein-coding genes. Columns:
+        `symbol`, `symbol_gencode_v19`, `ensembl_gene_id`, `phaplo`, `ptriplo`,
+        `haploinsufficient` (pHaplo >= 0.86), `triplosensitive` (pTriplo >= 0.94).
+
+        Accepts current symbols, the GENCODE v19 symbols the paper published, and Ensembl
+        gene IDs in one list, matched case-insensitively — a gene renamed since 2013 still
+        resolves under either spelling. One row per matched gene, so a symbol that is
+        missing from the frame is a gene the map does not score, not a lookup failure;
+        joining the result back onto the input list is how you tell them apart.
+
+        This score is per gene, not per disease. For the phenotype a deletion or
+        duplication is associated with, use `rcnv()`.
+        """
+        given = [genes] if isinstance(genes, str) else list(genes)
+        return self._rows(
+            await self._executor.get_dosage_sensitivity(
+                [str(g) for g in given], max_rows=limit, with_metadata=True
+            )
+        )
+
+    async def rcnv(
+        self,
+        *,
+        gene: str | None = None,
+        phenotype: str | None = None,
+        cnv_type: str | None = None,
+        min_mlog10p: float | None = None,
+        max_fdr_q: float | None = None,
+        significant_only: bool = False,
+        include_no_estimate: bool = False,
+        limit: int = MAX_ROWS,
+    ) -> pl.DataFrame:
+        """Rare-CNV gene associations: which phenotype a DEL or DUP of a gene is linked to.
+
+        Collins et al. 2022, 54 HPO phenotype groups x {DEL, DUP} x 17,263 genes. At least
+        one of `gene` or `phenotype` is required — the whole view is 1.86M rows and there
+        is no unfiltered shape. Both may be given.
+
+        `phenotype` takes an HPO id in either spelling ('HP:0012759' or 'HP0012759'), the
+        literal 'UNKNOWN', or a case-insensitive substring of the phenotype's name
+        ('intellectual disability'). `search()` does not reach this dataset's phenotypes —
+        the index it queries does not carry them — so the substring form is how a name
+        becomes a filter. 'HP0000118' is every case pooled, overlapping all 53 other
+        groups rather than being a peer of them.
+
+        `beta` is ln(odds ratio): OR = exp(beta), and `beta_lower`/`beta_upper` are the 95%
+        CI on the same scale. Every gene is present for every phenotype and CNV type,
+        including the 65% of rows where the gene was tested but no estimate came out (NULL
+        from `beta` onward); those are dropped unless `include_no_estimate=True`, so the
+        frame is never mostly nulls by accident. Do not use `n_nominal_cohorts` as a proxy
+        for that filter — the null rows are not the n_nominal_cohorts=0 rows.
+
+        `significant_only=True` applies the paper's own rule, both tiers with the
+        secondary-evidence gate: (FDR < 1% or P <= 2.90e-6) and (>= 2 nominal cohorts or
+        the leave-top-cohort-out p-value still nominally significant). A bare cut on
+        `mlog10p` or `mlog10_fdr_q` returns a different gene list than the publication.
+        Rows come back ranked by `mlog10p`, with `trait_name` joined on for the readable
+        phenotype name and the gene's `phaplo`/`ptriplo` on every row.
+        """
+        return self._rows(
+            await self._executor.get_rcnv_associations(
+                gene=gene,
+                phenotype=phenotype,
+                cnv_type=cnv_type,
+                min_mlog10p=min_mlog10p,
+                max_fdr_q=max_fdr_q,
+                significant_only=significant_only,
+                include_no_estimate=include_no_estimate,
+                limit=limit,
+                with_metadata=True,
+            )
+        )
+
     # ------------------------------------------------------------------ regulatory
 
     async def asm_qtl(

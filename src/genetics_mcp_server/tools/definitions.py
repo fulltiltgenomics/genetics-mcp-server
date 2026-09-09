@@ -1573,6 +1573,80 @@ Results are filtered to `min_info` (default 0.5) because rare badly-imputed alle
         },
     },
     {
+        "name": "get_dosage_sensitivity",
+        "category": "api",
+        "sdk_replaceable": True,
+        "description": """Get the rare-CNV dosage sensitivity scores (pHaplo, pTriplo) for one or more genes — Collins et al. 2022, the reference dosage-sensitivity map of the human genome (18,641 autosomal protein-coding genes, learned from rare CNVs in 950,278 individuals).
+
+Use this whenever the question is about gene dosage rather than about a variant:
+- "Is GENE haploinsufficient?" / "Would a deletion of GENE matter?" / "Is a third copy harmful?"
+- You have a list of candidate genes and want to rank them by how badly they tolerate a copy-number change
+
+pHaplo is the probability that ONE functional copy is not enough; pTriplo the probability that a THIRD copy is harmful. The paper's own cutoffs are pHaplo >= 0.86 (`haploinsufficient`) and pTriplo >= 0.94 (`triplosensitive`), returned as columns so you need not restate them — but rank on the probabilities, which are the continuous evidence.
+
+This is a general, per-gene score, not a per-disease result. For "which phenotype is a deletion of this gene associated with" use get_rcnv_associations.""",
+        "parameters": {
+            "genes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Gene symbols or Ensembl gene IDs, e.g. ['SHANK3', 'NRXN1', 'ENSG00000251322']. Matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published, and the Ensembl ID, so an outdated gene name still resolves",
+                "required": True,
+            },
+        },
+    },
+    {
+        "name": "get_rcnv_associations",
+        "category": "api",
+        "sdk_replaceable": True,
+        "description": """Get rare-CNV gene association statistics from Collins et al. 2022 — which HPO phenotype group a DELETION or DUPLICATION of a gene is associated with, across 54 phenotype groups x {DEL, DUP} x 17,263 genes.
+
+Use this for the per-phenotype dosage question:
+- "What is a deletion of NRXN1 associated with?" (pass gene=)
+- "Which genes are associated with intellectual disability when duplicated?" (pass phenotype= and cnv_type='DUP')
+- You found a dosage-sensitive gene with get_dosage_sensitivity and want the disease it points at
+
+At least one of `gene` or `phenotype` is required. `phenotype` takes an HPO id in either spelling ('HP:0012759' or 'HP0012759'), the literal 'UNKNOWN', or a substring of the phenotype's name ('intellectual disability') matched case-insensitively — search_phenotypes does NOT cover this dataset, so do not try to resolve the code with it first. 'HP0000118' is every case pooled, not a peer of the other 53 groups.
+
+`beta` is ln(odds ratio), so OR = EXP(beta). Every gene appears for every phenotype and CNV type, including the 65% of rows where the gene was TESTED BUT NO ESTIMATE was produced because no qualifying CNV was seen; those carry NULL from `beta` onward and are excluded unless you set include_no_estimate. Rank on `mlog10p`; for the paper's own gene lists set significant_only, which applies both significance tiers (FDR < 1% or P <= 2.90e-6) together with the secondary-evidence requirement (>= 2 nominal cohorts, or the leave-top-cohort-out p-value still nominally significant) — a bare threshold on mlog10p or mlog10_fdr_q does not reproduce the published results.""",
+        "parameters": {
+            "gene": {
+                "type": "string",
+                "description": "Gene symbol or Ensembl gene ID. Matched case-insensitively against the current symbol, the GENCODE v19 symbol and the Ensembl ID",
+            },
+            "phenotype": {
+                "type": "string",
+                "description": "HPO id in either spelling ('HP:0012759' or 'HP0012759'), 'UNKNOWN', or a case-insensitive substring of the phenotype name ('intellectual disability')",
+            },
+            "cnv_type": {
+                "type": "string",
+                "description": "Restrict to one CNV class: 'DEL' or 'DUP'. Omit for both",
+            },
+            "min_mlog10p": {
+                "type": "number",
+                "description": "Minimum -log10 p-value of the meta-analysis",
+            },
+            "max_fdr_q": {
+                "type": "number",
+                "description": "Maximum FDR q-value, e.g. 0.01 for the paper's FDR tier. Applied as mlog10_fdr_q >= -LOG10(max_fdr_q)",
+            },
+            "significant_only": {
+                "type": "boolean",
+                "description": "Apply the paper's full significance rule: (FDR < 1% OR P <= 2.90e-6) AND (>= 2 nominal cohorts OR secondary P < 0.05)",
+                "default": False,
+            },
+            "include_no_estimate": {
+                "type": "boolean",
+                "description": "Keep the 'tested, no estimate' rows (NULL beta onward, 65% of the view). Off by default",
+                "default": False,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum rows to return, ranked by mlog10p",
+                "default": 200,
+            },
+        },
+    },
+    {
         "name": "get_summary_stats_by_region",
         "category": "api",
         "sdk_replaceable": True,
@@ -2841,6 +2915,34 @@ def register_mcp_tools(
         """Get every phenotype a classical HLA allele is associated with."""
         return await executor.get_hla_by_allele(
             allele, min_mlogp, min_info, resource, max_rows
+        )
+
+    @_tool()
+    async def get_dosage_sensitivity(genes: list[str]) -> dict:
+        """Get rare-CNV dosage sensitivity scores (pHaplo, pTriplo) for genes."""
+        return await executor.get_dosage_sensitivity(genes)
+
+    @_tool()
+    async def get_rcnv_associations(
+        gene: str | None = None,
+        phenotype: str | None = None,
+        cnv_type: str | None = None,
+        min_mlog10p: float | None = None,
+        max_fdr_q: float | None = None,
+        significant_only: bool = False,
+        include_no_estimate: bool = False,
+        limit: int = 200,
+    ) -> dict:
+        """Get rare-CNV gene associations (DEL/DUP) for a gene or an HPO phenotype group."""
+        return await executor.get_rcnv_associations(
+            gene=gene,
+            phenotype=phenotype,
+            cnv_type=cnv_type,
+            min_mlog10p=min_mlog10p,
+            max_fdr_q=max_fdr_q,
+            significant_only=significant_only,
+            include_no_estimate=include_no_estimate,
+            limit=limit,
         )
 
     @_tool()

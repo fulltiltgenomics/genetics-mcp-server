@@ -1120,3 +1120,83 @@ class TestProxiedToolsReachBothSurfaces:
 
         assert {t["name"] for t in external} == {"gnomad_variant"}
         assert {t["name"] for t in rag} == {"gnomad_variant"}
+
+
+class TestUserMemoryBlock:
+    """The memory envelope joins the per-user system block instead of taking a fifth
+    cache breakpoint, and a turn without memory must be byte-for-byte what it was."""
+
+    INSTRUCTIONS = "## Your instructions (user setting)\n\nAnswer in Finnish.\n"
+    DIGEST = "Earlier conversations (newest first):\n2026-09-01 | APOE and LDL"
+
+    async def _params(self, **kwargs):
+        svc = _service([_answer_turn(input_tokens=1, output_tokens=1)])
+        await _run(svc, enable_tools=True, system_prompt="SHARED", **kwargs)
+        return svc.anthropic_client.messages.calls[0]
+
+    @staticmethod
+    def _breakpoints(params):
+        count = sum(1 for block in params.get("system", []) if "cache_control" in block)
+        count += sum(1 for tool in params.get("tools", []) if "cache_control" in tool)
+        for message in params["messages"]:
+            content = message.get("content")
+            if isinstance(content, list):
+                count += sum(
+                    1 for block in content
+                    if isinstance(block, dict) and "cache_control" in block
+                )
+        return count
+
+    @pytest.mark.asyncio
+    async def test_four_breakpoints_with_and_without_memory(self):
+        without = await self._params(user_instructions=self.INSTRUCTIONS)
+        with_memory = await self._params(
+            user_instructions=self.INSTRUCTIONS, user_memory=self.DIGEST
+        )
+
+        assert self._breakpoints(without) == 4
+        assert self._breakpoints(with_memory) == 4
+
+    @pytest.mark.asyncio
+    async def test_block_one_is_unchanged_when_there_is_no_memory(self):
+        """A user who never opted in must get exactly the bytes they got before."""
+        params = await self._params(user_instructions=self.INSTRUCTIONS)
+
+        assert params["system"][1]["text"] == self.INSTRUCTIONS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty", [None, "", "   \n "])
+    async def test_empty_memory_adds_no_separator_and_no_block(self, empty):
+        params = await self._params(user_instructions=self.INSTRUCTIONS, user_memory=empty)
+        assert params["system"][1]["text"] == self.INSTRUCTIONS
+
+        bare = await self._params(user_memory=empty)
+        assert len(bare["system"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_memory_alone_becomes_the_per_user_block(self):
+        from genetics_mcp_server.config.defaults import memory_envelope
+
+        params = await self._params(user_memory=self.DIGEST)
+
+        assert len(params["system"]) == 2
+        assert params["system"][1]["text"] == memory_envelope(self.DIGEST)
+
+    @pytest.mark.asyncio
+    async def test_memory_follows_the_instructions_in_one_block(self):
+        from genetics_mcp_server.config.defaults import memory_envelope
+
+        params = await self._params(
+            user_instructions=self.INSTRUCTIONS, user_memory=self.DIGEST
+        )
+
+        assert len(params["system"]) == 2
+        assert params["system"][1]["text"] == (
+            self.INSTRUCTIONS + "\n\n" + memory_envelope(self.DIGEST)
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_digest_never_reaches_the_shared_block(self):
+        params = await self._params(user_memory=self.DIGEST)
+
+        assert "APOE and LDL" not in params["system"][0]["text"]

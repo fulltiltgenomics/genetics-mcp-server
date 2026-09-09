@@ -12,7 +12,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from dotenv import load_dotenv
@@ -44,10 +46,16 @@ from genetics_mcp_server.config.defaults import (
     instruction_envelope,
     verbosity_prompt,
 )
-from genetics_mcp_server.db import get_llm_config_db
+from genetics_mcp_server.db import get_chat_history_db, get_llm_config_db
 from genetics_mcp_server.db.llm_config_db import INSTRUCTION_SET_MAX_BODY_CHARS
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
+from genetics_mcp_server.memory_digest import render_digest
+from genetics_mcp_server.memory_gate import (
+    MEMORY_DIGEST_SESSION_LIMIT,
+    memory_gate_open,
+    user_log_hash,
+)
 from genetics_mcp_server.rate_limit import check_rate_limit
 from genetics_mcp_server.rate_limit import configure as configure_rate_limit
 from genetics_mcp_server.routers import (
@@ -85,6 +93,14 @@ def _classify_error(e: Exception) -> str:
     if name == "APIConnectionError":
         return "Could not connect to the LLM service. Please try again later."
     if name in ("BadRequestError", "UnprocessableEntityError"):
+        # a context overflow arrives as a plain 400 and was reported byte-identical to a
+        # malformed request, which sends the user looking for a bug in what they typed
+        # rather than at the length of the conversation
+        if "prompt is too long" in str(e):
+            return (
+                "This conversation is too long for the model's context window. "
+                "Start a new chat to continue."
+            )
         return "Invalid request sent to LLM service."
     if name == "InternalServerError" or err_type in ("api_error", "internal_server_error"):
         return "Claude had a temporary upstream error. Please try again."
@@ -105,6 +121,44 @@ def _classify_error(e: Exception) -> str:
 
 # prefix the frontend uses to inline data-file attachments as text blocks
 _FILE_BLOCK_PREFIX = "[File: "
+
+# the frontend carries a generated plot inside the assistant's TEXT as
+# [IMAGE:<format>:<alt>:<base64>], so that one render path and one persisted field cover
+# both prose and artifacts. Mirrors MessageContent.tsx's marker regex; the payload cannot
+# contain "]" because it is base64.
+_IMAGE_MARKER_RE = re.compile(r"\[IMAGE:([^:\]]+):([^:\]]+):[^\]]+\]")
+
+
+def _strip_image_markers(content: Any) -> Any:
+    """Replace inline [IMAGE:...] payloads with a short note.
+
+    llm_service strips image bytes out of a tool result before the model sees them — the
+    model cannot read an image it is handed as base64 — but the same bytes came back in
+    the NEXT request inside the replayed assistant text, where nothing removed them. A
+    plotting session paid ~180k tokens per plotted turn to resend pictures the model
+    cannot see, and reached the 1M context limit in six turns.
+
+    Done for every role, not just assistant: no client has a use for these bytes, and a
+    client that replays them in a user turn costs the same tokens.
+    """
+
+    def sub(text: str) -> str:
+        return _IMAGE_MARKER_RE.sub(lambda m: f"[image shown to the user: {m.group(2)}]", text)
+
+    if isinstance(content, str):
+        return sub(content)
+    if not isinstance(content, list):
+        return content
+    out = []
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            block = {**block, "text": sub(block["text"])}
+        out.append(block)
+    return out
 
 
 def _message_text_len(content) -> int:
@@ -226,7 +280,8 @@ async def lifespan(app: FastAPI):
     warn_unless_gateway_identity_secret("chat-backend")
     configure_rate_limit(
         max_per_hour=int(os.environ.get("RATE_LIMIT_PER_HOUR", "20")),
-        max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "100")),
+        max_per_day=int(os.environ.get("RATE_LIMIT_PER_DAY", "40")),
+        max_per_week=int(os.environ.get("RATE_LIMIT_PER_WEEK", "100")),
     )
     # eagerly initialize LLM service and external MCP servers at startup
     get_llm_service()
@@ -575,6 +630,109 @@ def _resolve_user_instructions(
         return None
 
 
+def _load_user_memory(
+    user: str | None,
+    session_id: str | None,
+    *,
+    secret: bool,
+    gateway_asserted: bool,
+    first_turn: bool,
+    db: Any = None,
+    stats: dict[str, int] | None = None,
+) -> str | None:
+    """The blocking half of `_resolve_user_memory`, run in a worker thread.
+
+    Every step is a database call — the opt-in setting, the session row, the content of
+    up to MEMORY_DIGEST_SESSION_LIMIT sessions, and the write — and chat_history.db
+    shares its volume with the nightly analysis job, so a turn resolving memory on the
+    event loop would hold it for that job's busy timeout before the first SSE byte.
+    """
+    if not memory_gate_open(user, gateway_asserted=gateway_asserted, secret=secret):
+        return None
+
+    db = db or get_chat_history_db()
+    session = db.get_session(session_id, user) if session_id else None
+    if session is not None and session.context_digest:
+        # byte-stable for the life of the session: a cache block that changed between
+        # turns would invalidate the whole prefix on every follow-up. Nothing is
+        # logged here — the stored bytes were logged when they were rendered, and
+        # this path has no session count to report
+        return session.context_digest
+
+    if not first_turn:
+        # nothing stored on a later turn means the first turn had nothing to pin: an
+        # empty render is deliberately not persisted. Rendering now would inject memory
+        # into the middle of a conversation that opened without it, as soon as a second
+        # session existed to render — so a turn that is not the first gets none
+        return None
+
+    sessions = db.get_recent_sessions_for_digest(
+        user,
+        MEMORY_DIGEST_SESSION_LIMIT,
+        include_pinned=True,
+        exclude_session_id=session_id,
+    )
+    digest = render_digest(sessions, datetime.now(timezone.utc))
+    if not digest:
+        return None
+    if session_id:
+        # first writer wins. That costs the loser nothing unless another session's title
+        # or updated_at moved between the two renders; then this turn ran on bytes the
+        # stored copy does not match and the next turn reads the stored ones back — one
+        # cache miss, after which the session is byte-stable again
+        db.set_context_digest(session_id, user, digest)
+    # a turn with no session id (the browser creates the row lazily) has nothing to
+    # pin the digest to, so it renders fresh and persists nothing
+    logger.info(
+        f"memory digest: user={user_log_hash(user)} "
+        f"sessions={len(sessions)} chars={len(digest)}"
+    )
+    if stats is not None:
+        # the caller's SSE "memory" event reads this back rather than recomputing it,
+        # so the event and the log line can never disagree
+        stats["sessions"] = len(sessions)
+        stats["chars"] = len(digest)
+    return digest
+
+
+async def _resolve_user_memory(
+    user: str | None,
+    session_id: str | None,
+    *,
+    secret: bool,
+    gateway_asserted: bool,
+    first_turn: bool,
+    db: Any = None,
+    stats: dict[str, int] | None = None,
+) -> str | None:
+    """The rendered cross-session digest for this turn, or None.
+
+    Returns the digest TEXT, not a prompt fragment: the caller hands it to the model
+    layer, which wraps it in `memory_envelope` beside the instruction envelope so both
+    share one cache block.
+
+    The gate is `memory_gate_open` — opt-in, gateway-asserted, non-secret, a named person.
+    Every failure past it degrades to 'no memory' the way instruction sets do: memory is a
+    convenience, and a convenience must never fail a chat turn. The opt-in read is inside
+    the try for that reason — it is a query against a second database, and it used to be
+    able to fail the turn.
+    """
+    try:
+        return await asyncio.to_thread(
+            _load_user_memory,
+            user,
+            session_id,
+            secret=secret,
+            gateway_asserted=gateway_asserted,
+            first_turn=first_turn,
+            db=db,
+            stats=stats,
+        )
+    except Exception as e:
+        logger.warning(f"Could not load chat memory, continuing without it: {e}")
+        return None
+
+
 @app.post("/chat/v1/chat")
 async def stream_chat(
     request: ChatRequest,
@@ -647,8 +805,19 @@ async def stream_chat(
             detail="Unsupported model. Only Claude models are available.",
         )
 
-    # convert messages to dicts
-    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    # convert messages to dicts, dropping the base64 the client's [IMAGE:...] markers carry
+    messages = [
+        {"role": msg.role, "content": _strip_image_markers(msg.content)}
+        for msg in request.messages
+    ]
+    stripped_chars = sum(
+        _message_text_len(m.content) for m in request.messages
+    ) - sum(_message_text_len(m["content"]) for m in messages)
+    if stripped_chars:
+        logger.info(
+            f"[user={user}] [session={request.session_id}] "
+            f"Stripped {stripped_chars} chars of inline image data from replayed history"
+        )
 
     # the system prompt is assembled server-side and is never client-supplied: it carries
     # the grounding, citation, truncation and out-of-scope rules, so a request may not
@@ -677,10 +846,35 @@ async def stream_chat(
     user_instructions = _resolve_user_instructions(
         user, request.instruction_set_id, secret=request.secret
     )
+    # the browser replays the whole conversation and a tool result comes back as a `user`
+    # message, so counting user messages would call a mid-turn continuation a first turn.
+    # The absence of an assistant message is exact — one is present from the moment the
+    # first reply is replayed — and would only be false if a client dropped history
+    first_turn = not any(m.role == "assistant" for m in request.messages)
+    memory_stats: dict[str, int] = {}
+    user_memory = await _resolve_user_memory(
+        user,
+        request.session_id,
+        secret=request.secret,
+        gateway_asserted=gateway_asserted,
+        first_turn=first_turn,
+        stats=memory_stats,
+    )
 
     async def event_generator():
         """Generate SSE events from LLM stream."""
         try:
+            # populated only on a fresh, non-empty render (see _load_user_memory) — never
+            # on a withheld turn or a later turn reading the stored digest
+            if user_memory and "sessions" in memory_stats:
+                yield {
+                    "event": "message",
+                    "data": json.dumps({
+                        "type": "memory",
+                        "sessions": memory_stats["sessions"],
+                        "chars": memory_stats["chars"],
+                    }),
+                }
             async for chunk in service.stream_chat(
                 messages=messages,
                 provider=provider,
@@ -694,6 +888,7 @@ async def stream_chat(
                 user=user,
                 session_id=request.session_id,
                 user_instructions=user_instructions,
+                user_memory=user_memory,
                 message_id=request.message_id,
                 capture_thinking=request.capture_thinking,
                 gateway_asserted=gateway_asserted,

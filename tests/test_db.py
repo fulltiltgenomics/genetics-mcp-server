@@ -438,6 +438,239 @@ class TestChatHistoryDB:
         assert updated_session.updated_at > original_updated
 
 
+OLD_CHAT_SESSIONS_DDL = """
+    CREATE TABLE chat_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        title TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        rating INTEGER,
+        comment TEXT,
+        phenotype_code TEXT
+    )
+"""
+
+
+class TestContextDigestAndPinned:
+    """context_digest and pinned_at: migration, ownership, and the digest accessor."""
+
+    def test_migration_adds_columns_to_an_old_schema_db_and_is_idempotent(self, tmp_path):
+        from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+
+        db_path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(OLD_CHAT_SESSIONS_DDL)
+        conn.execute(
+            "INSERT INTO chat_sessions (id, user_id, title) VALUES (?, ?, ?)",
+            ("s1", USER, "pre-existing session"),
+        )
+        conn.commit()
+        conn.close()
+
+        Singleton._instances.pop(ChatHistoryDB, None)
+        db = ChatHistoryDB(db_path)
+        try:
+            columns = {row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")}
+            assert "context_digest" in columns
+            assert "pinned_at" in columns
+            # the pre-existing row survives the ALTER with the new columns NULL
+            session = db.get_session("s1", USER)
+            assert session.title == "pre-existing session"
+            assert session.context_digest is None
+            assert session.pinned_at is None
+
+            # re-running the migration over a populated, already-migrated db is a no-op
+            db._init_db()
+            columns_after = [
+                row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")
+            ]
+            assert columns_after.count("context_digest") == 1
+            assert columns_after.count("pinned_at") == 1
+        finally:
+            Singleton._instances.pop(ChatHistoryDB, None)
+
+    def test_set_context_digest_first_writer_wins(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+
+        written = chat_history_db.set_context_digest(session.id, USER, "first digest")
+        assert written is True
+        assert chat_history_db.get_session(session.id, USER).context_digest == "first digest"
+
+        written_again = chat_history_db.set_context_digest(session.id, USER, "second digest")
+        assert written_again is False
+        assert chat_history_db.get_session(session.id, USER).context_digest == "first digest"
+
+    def test_set_context_digest_wrong_user_is_a_no_op(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        written = chat_history_db.set_context_digest(session.id, "other@example.com", "digest")
+        assert written is False
+        assert chat_history_db.get_session(session.id, USER).context_digest is None
+
+    def test_set_context_digest_empty_text_does_not_occupy_the_slot(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+
+        assert chat_history_db.set_context_digest(session.id, USER, "") is False
+        assert chat_history_db.set_context_digest(session.id, USER, "   ") is False
+        assert chat_history_db.get_session(session.id, USER).context_digest is None
+
+        written = chat_history_db.set_context_digest(session.id, USER, "real digest")
+        assert written is True
+        assert chat_history_db.get_session(session.id, USER).context_digest == "real digest"
+
+    def test_set_pinned_toggles_owner_only(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+
+        assert chat_history_db.set_pinned(session.id, USER, True) is True
+        assert chat_history_db.get_session(session.id, USER).pinned_at is not None
+
+        assert chat_history_db.set_pinned(session.id, "other@example.com", False) is False
+        assert chat_history_db.get_session(session.id, USER).pinned_at is not None
+
+        assert chat_history_db.set_pinned(session.id, USER, False) is True
+        assert chat_history_db.get_session(session.id, USER).pinned_at is None
+
+    def test_shared_read_hides_context_digest(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_context_digest(session.id, USER, "owner's private index")
+        chat_history_db.set_shared(session.id, USER, True)
+
+        owner_view, is_owner = chat_history_db.get_session_for_access(session.id, USER)
+        assert is_owner is True
+        assert owner_view.context_digest == "owner's private index"
+
+        shared_view, is_owner = chat_history_db.get_session_for_access(
+            session.id, "other@example.com"
+        )
+        assert is_owner is False
+        assert shared_view.context_digest is None
+
+    def test_fork_does_not_copy_context_digest_or_pinned_at(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_context_digest(session.id, USER, "owner's private index")
+        chat_history_db.set_pinned(session.id, USER, True)
+        chat_history_db.set_shared(session.id, USER, True)
+
+        forked = chat_history_db.fork_session(session.id, "other@example.com")
+        forked_full = chat_history_db.get_session(forked.id, "other@example.com")
+        assert forked_full.context_digest is None
+        assert forked_full.pinned_at is None
+
+    def test_delete_session_cascade_unchanged_with_digest_and_pin_set(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(session.id, "msg1", "user", "Hello")
+        chat_history_db.set_context_digest(session.id, USER, "digest")
+        chat_history_db.set_pinned(session.id, USER, True)
+
+        deleted = chat_history_db.delete_session(session.id, USER)
+
+        assert deleted is True
+        assert chat_history_db.get_session(session.id, USER) is None
+        assert chat_history_db.get_messages(session.id) == []
+
+
+class TestGetRecentSessionsForDigest:
+    """get_recent_sessions_for_digest: ordering, the recency/pinned window, exclusion."""
+
+    def _session_with_turn(self, db, user, user_text="hi", assistant_json=None):
+        session = db.create_session(user)
+        db.add_message(session.id, f"{session.id}-u", "user", user_text)
+        db.add_message(
+            session.id, f"{session.id}-a", "assistant", "reply", content_json=assistant_json
+        )
+        return session
+
+    def _set_updated_at(self, db, session_id, value):
+        db._conn.execute(
+            "UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (value, session_id)
+        )
+        db._conn.commit()
+
+    def test_newest_first_and_content_shape(self, chat_history_db):
+        s1 = self._session_with_turn(chat_history_db, USER, "first question")
+        self._set_updated_at(chat_history_db, s1.id, "2024-01-01 00:00:01")
+        s2 = self._session_with_turn(
+            chat_history_db, USER, "second question", assistant_json='[{"type": "tool_use"}]'
+        )
+        self._set_updated_at(chat_history_db, s2.id, "2024-01-01 00:00:02")
+
+        results = chat_history_db.get_recent_sessions_for_digest(USER, limit=10)
+
+        assert [r["id"] for r in results] == [s2.id, s1.id]
+        assert results[0]["first_user_message"] == "second question"
+        assert results[0]["assistant_content_json"] == ['[{"type": "tool_use"}]']
+        assert results[1]["assistant_content_json"] == []
+
+    def test_limit_bounds_the_recency_window(self, chat_history_db):
+        sessions = []
+        for i in range(3):
+            sessions.append(self._session_with_turn(chat_history_db, USER, f"q{i}"))
+            self._set_updated_at(chat_history_db, sessions[i].id, f"2024-01-01 00:00:0{i}")
+
+        results = chat_history_db.get_recent_sessions_for_digest(USER, limit=2)
+
+        assert [r["id"] for r in results] == [sessions[2].id, sessions[1].id]
+
+    def test_tie_on_updated_at_is_stable_and_id_desc(self, chat_history_db):
+        sessions = []
+        for i in range(3):
+            sessions.append(self._session_with_turn(chat_history_db, USER, f"q{i}"))
+            self._set_updated_at(chat_history_db, sessions[i].id, "2024-01-01 00:00:00")
+
+        expected_ids = sorted((s.id for s in sessions), reverse=True)
+
+        first_call = [r["id"] for r in chat_history_db.get_recent_sessions_for_digest(USER, limit=2)]
+        second_call = [r["id"] for r in chat_history_db.get_recent_sessions_for_digest(USER, limit=2)]
+
+        assert first_call == expected_ids[:2]
+        assert first_call == second_call
+
+    def test_pinned_session_included_outside_the_recency_window(self, chat_history_db):
+        old = self._session_with_turn(chat_history_db, USER, "old but pinned")
+        chat_history_db.set_pinned(old.id, USER, True)
+        self._set_updated_at(chat_history_db, old.id, "2024-01-01 00:00:00")
+        for i in range(2):
+            session = self._session_with_turn(chat_history_db, USER, f"recent {i}")
+            self._set_updated_at(chat_history_db, session.id, f"2024-01-01 00:00:0{i + 1}")
+
+        results = chat_history_db.get_recent_sessions_for_digest(USER, limit=2)
+        ids = {r["id"] for r in results}
+        assert old.id in ids
+        assert len(results) == 3
+
+    def test_include_pinned_false_respects_the_window_only(self, chat_history_db):
+        old = self._session_with_turn(chat_history_db, USER, "old but pinned")
+        chat_history_db.set_pinned(old.id, USER, True)
+        self._set_updated_at(chat_history_db, old.id, "2024-01-01 00:00:00")
+        recent = self._session_with_turn(chat_history_db, USER, "recent")
+        self._set_updated_at(chat_history_db, recent.id, "2024-01-01 00:00:01")
+
+        results = chat_history_db.get_recent_sessions_for_digest(
+            USER, limit=1, include_pinned=False
+        )
+
+        assert [r["id"] for r in results] == [recent.id]
+
+    def test_exclude_session_id_drops_the_starting_session(self, chat_history_db):
+        s1 = self._session_with_turn(chat_history_db, USER, "existing")
+        s2 = chat_history_db.create_session(USER)
+
+        results = chat_history_db.get_recent_sessions_for_digest(
+            USER, limit=10, exclude_session_id=s2.id
+        )
+
+        assert [r["id"] for r in results] == [s1.id]
+
+    def test_other_users_sessions_excluded(self, chat_history_db):
+        mine = self._session_with_turn(chat_history_db, USER, "mine")
+        self._session_with_turn(chat_history_db, "other@example.com", "not mine")
+
+        results = chat_history_db.get_recent_sessions_for_digest(USER, limit=10)
+
+        assert [r["id"] for r in results] == [mine.id]
+
+
 class TestLLMConfigDB:
     """Tests for LLMConfigDB."""
 
@@ -1599,6 +1832,20 @@ CHAT_WRITE_ACCESSORS = [
         "UPDATE",
         lambda db: db.create_session(USER).id,
         lambda db, ctx: db.set_shared(ctx, USER, True),
+    ),
+    (
+        "set_context_digest",
+        "chat_sessions",
+        "UPDATE",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.set_context_digest(ctx, USER, "digest text"),
+    ),
+    (
+        "set_pinned",
+        "chat_sessions",
+        "UPDATE",
+        lambda db: db.create_session(USER).id,
+        lambda db, ctx: db.set_pinned(ctx, USER, True),
     ),
     (
         "delete_session",

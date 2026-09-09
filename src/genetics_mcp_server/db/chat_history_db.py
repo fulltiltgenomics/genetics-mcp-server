@@ -30,6 +30,12 @@ class ChatSession:
     comment: str | None
     phenotype_code: str | None
     shared: bool = False
+    # written once, at the session's first turn; first writer wins. Hidden from
+    # non-owner (shared) reads and never copied by fork_session — it describes
+    # the owner's other conversations, not this one
+    context_digest: str | None = None
+    # NULL unless the owner pinned this session; not copied by fork_session
+    pinned_at: datetime | None = None
     # analysis fields populated only by list_all_sessions (LEFT JOIN); None/0
     # for sessions without an analysis row or for callers that don't query it
     disposition: str | None = None
@@ -175,6 +181,10 @@ class ChatHistoryDB(object, metaclass=Singleton):
         session_columns = {row[1] for row in cursor.fetchall()}
         if "shared" not in session_columns:
             cursor.execute("ALTER TABLE chat_sessions ADD COLUMN shared BOOLEAN DEFAULT 0")
+        if "context_digest" not in session_columns:
+            cursor.execute("ALTER TABLE chat_sessions ADD COLUMN context_digest TEXT")
+        if "pinned_at" not in session_columns:
+            cursor.execute("ALTER TABLE chat_sessions ADD COLUMN pinned_at TIMESTAMP")
 
         # migrations: add columns to chat_attachments if they don't exist
         cursor.execute("PRAGMA table_info(chat_attachments)")
@@ -349,7 +359,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
+                   shared, context_digest, pinned_at
             FROM chat_sessions
             WHERE id = ? AND user_id = ?
             """,
@@ -367,7 +378,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
+                   shared, pinned_at
             FROM chat_sessions
             WHERE user_id = ?
             ORDER BY updated_at DESC
@@ -500,6 +512,148 @@ class ChatHistoryDB(object, metaclass=Singleton):
             raise
         return cursor.rowcount > 0
 
+    def set_context_digest(self, session_id: str, user_id: str, text: str) -> bool:
+        """Write the digest text pinned to a session. First writer wins.
+
+        No-op (returns False) when the session already carries a digest or
+        does not belong to user_id — the digest is rendered once, at the
+        session's first turn, and never overwritten after that.
+        """
+        # an empty digest must not block a later real one from ever being written
+        if not text or not text.strip():
+            return False
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE chat_sessions
+                SET context_digest = ?
+                WHERE id = ? AND user_id = ? AND context_digest IS NULL
+                """,
+                (text, session_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def set_pinned(self, session_id: str, user_id: str, pinned: bool) -> bool:
+        """Pin or unpin a session. Owner-only; returns True if a row was updated."""
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE chat_sessions
+                SET pinned_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END
+                WHERE id = ? AND user_id = ?
+                """,
+                (pinned, session_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def get_recent_sessions_for_digest(
+        self,
+        user_id: str,
+        limit: int,
+        include_pinned: bool = True,
+        exclude_session_id: str | None = None,
+    ) -> list[dict]:
+        """Return this user's own sessions for digest rendering, newest first.
+
+        Each dict carries id, title, created_at, updated_at, phenotype_code,
+        pinned_at, first_user_message (the opening user turn's content), and
+        assistant_content_json (that session's assistant messages' content_json,
+        in conversation order — the renderer extracts entities from tool_use
+        inputs there and never needs tool_results_json, so that column is not
+        fetched at all).
+
+        limit bounds the recency window by updated_at. With include_pinned, a
+        pinned session (pinned_at NOT NULL) is still returned even when it
+        falls outside that window, so a session pinned weeks ago keeps
+        surfacing. exclude_session_id drops the session currently being
+        started, which has no history of its own yet. Only user_id's own
+        sessions are considered, never another user's shared sessions.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+
+        conditions = ["user_id = ?"]
+        where_params: list = [user_id]
+        if exclude_session_id is not None:
+            conditions.append("id != ?")
+            where_params.append(exclude_session_id)
+        where = " AND ".join(conditions)
+        pinned_clause = "OR pinned_at IS NOT NULL" if include_pinned else ""
+
+        # id DESC because updated_at is CURRENT_TIMESTAMP and has one-second resolution: the
+        # digest rendered from this list must be byte-stable, so ties must resolve the same
+        # way every run, both for which rows make the limit and for the order they're returned in
+        cursor.execute(
+            f"""
+            SELECT id, title, created_at, updated_at, phenotype_code, pinned_at
+            FROM chat_sessions
+            WHERE {where}
+              AND (
+                id IN (
+                    SELECT id FROM chat_sessions
+                    WHERE {where}
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                )
+                {pinned_clause}
+              )
+            ORDER BY updated_at DESC, id DESC
+            """,
+            where_params + where_params + [limit],
+        )
+        session_rows = cursor.fetchall()
+        if not session_rows:
+            return []
+
+        session_ids = [row["id"] for row in session_rows]
+        placeholders = ",".join("?" for _ in session_ids)
+        cursor.execute(
+            f"""
+            SELECT session_id, role, content, content_json
+            FROM chat_messages
+            WHERE session_id IN ({placeholders}) AND role IN ('user', 'assistant')
+            ORDER BY session_id, created_at ASC, rowid ASC
+            """,
+            session_ids,
+        )
+        first_user_message: dict[str, str] = {}
+        assistant_content_json: dict[str, list[str]] = dd(list)
+        for row in cursor.fetchall():
+            sid = row["session_id"]
+            if row["role"] == "user" and sid not in first_user_message:
+                first_user_message[sid] = row["content"]
+            elif row["role"] == "assistant" and row["content_json"]:
+                assistant_content_json[sid].append(row["content_json"])
+
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "phenotype_code": row["phenotype_code"],
+                "pinned_at": row["pinned_at"],
+                "first_user_message": first_user_message.get(row["id"]),
+                "assistant_content_json": assistant_content_json.get(row["id"], []),
+            }
+            for row in session_rows
+        ]
+
     def get_session_for_access(
         self, session_id: str, user_id: str
     ) -> tuple[ChatSession, bool] | None:
@@ -512,7 +666,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
+                   shared, context_digest, pinned_at
             FROM chat_sessions
             WHERE id = ?
             """,
@@ -525,6 +680,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
         if session.user_id == user_id:
             return (session, True)
         if session.shared:
+            # the digest describes the owner's OWN other conversations, so a shared
+            # (non-owner) reader must never see it
+            session.context_digest = None
             return (session, False)
         return None
 
@@ -1375,6 +1533,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
             comment=row["comment"],
             phenotype_code=row["phenotype_code"],
             shared=bool(row["shared"]) if row["shared"] is not None else False,
+            context_digest=row["context_digest"] if "context_digest" in keys else None,
+            pinned_at=(
+                datetime.fromisoformat(row["pinned_at"])
+                if "pinned_at" in keys and row["pinned_at"]
+                else None
+            ),
             disposition=row["disposition"] if "disposition" in keys else None,
             llm_quality_score=row["llm_quality_score"] if "llm_quality_score" in keys else None,
             success_label=row["success_label"] if "success_label" in keys else None,

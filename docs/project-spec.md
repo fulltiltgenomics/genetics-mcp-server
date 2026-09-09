@@ -23,6 +23,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-user API tokens**: Users can create personal bearer tokens for MCP server access, with create/list/revoke management via the chat API
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
 - **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. `_validate_request_size` bounds the request as a whole — total text across **all** messages (`MAX_REQUEST_CHARS`, default 2M, images excluded) and message count (`MAX_MESSAGES_PER_REQUEST`, default 500) — because the per-message check only ever inspects the newest *user* message, leaving a client-sent assistant turn and every replayed history turn unbounded (`genetics-results-suite-e0u`). Applying the per-message cap to every message would have been the tighter rule and the wrong one: replayed tool results are routinely larger than any typed message, so it would reject ordinary long conversations. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) are inlined by the frontend as text blocks prefixed `[File: <name>]` — both are counted toward the attachment limit, not the character limit. The frontend (`LLMChat.tsx`) mirrors these limits for immediate feedback. Bulk data should be attached as a file rather than pasted
+- **Inline image markers are stripped before the model call**: the frontend carries a generated plot inside the assistant's *text* as `[IMAGE:<format>:<alt>:<base64>]`, one marker shape that survives both rendering and persistence. Replayed verbatim that is base64 the model cannot read, charged as text on every later turn — measured at ~180k tokens added per plotted turn, reaching the 1M window in six turns and failing with `prompt is too long`. `_strip_image_markers` (in `chat_api.py`) replaces each payload with `[image shown to the user: <alt>]` for every role, mirroring what `llm_service` already does to a tool result's image bytes. It is a belt, not the fix, and the client-side causes were two: `ChatPage` attached `content_json` only to the copy it saved, so a **live** session replayed `content` while a reloaded one (which comes back with `content_json`) did not; and a turn that never delivered `done` — stopped by the user, or a dropped connection — is stored with `content_json` NULL and therefore replays `content` however it is loaded. Both are fixed in `LLMChat.tsx`, but only the belt covers a client that is not this frontend. `MAX_REQUEST_CHARS` does count these markers, but at 2M characters it sits above what the model will accept for base64-heavy text, which tokenises at roughly one token per character
 - **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, so a first send needs no upload endpoint and therefore no session. (The original reason was stronger — sessions were created lazily *after* the first exchange, so there was no `session_id` to upload against at all. That is no longer true: `genetics-results-suite-vda` moved creation ahead of the request, because `run_analysis` refuses a turn whose `session_id` is null. The client-side parse is kept on its own merits, one fewer round trip.) The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model families to context window sizes (tokens); pricing in the same module is keyed by family and version, so a price change between releases (Sonnet 5, Haiku 4.5, Fable 5.1's cache reads) is a row, not a rename. During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
@@ -111,6 +112,8 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
 | `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlog10p`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
+| `get_dosage_sensitivity` | pHaplo / pTriplo dosage-sensitivity scores for a list of genes (Collins et al. 2022, 18,641 autosomal protein-coding genes from rare CNVs in 950,278 individuals). Executor-side SQL over BigQuery `dosage_sensitivity_v`. Symbols are matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published and the Ensembl ID in one pass, so a gene renamed since 2013 still resolves. `haploinsufficient`/`triplosensitive` are the paper's own cutoffs (0.86 / 0.94) returned as columns |
+| `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL from `beta` onward) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
@@ -880,6 +883,8 @@ winner.
 | `variant_effect(variant=\|gene=)` | `get_variant_effect_by_variant`, `_by_gene` |
 | `mpra(variant=\|region=\|gene=)` | `get_mpra_by_variant`/`_region`/`_gene` |
 | `mpra_pip_concordance(gene)` | `get_mpra_pip_concordance_by_gene` |
+| `dosage_sensitivity(genes)` | `get_dosage_sensitivity` |
+| `rcnv(gene=\|phenotype=[, cnv_type=, min_mlog10p=, max_fdr_q=, significant_only=, include_no_estimate=])` | `get_rcnv_associations` — the one product where both selectors may be given at once, so it does not go through `_one_of` |
 | `variant_annotation(variant=\|region=\|gene=\|variants=)` | `get_variant_annotations` (already collapsed) |
 | `gene_annotations(region=\|nearest_to=\|group=)` | `get_genes_in_region`, `get_nearest_genes`, `get_gene_group_members` |
 | `expression(gene)` | `get_gene_expression` |
@@ -1482,6 +1487,18 @@ All under `/chat/v1`, all `Depends(auth_required)` and scoped to the authenticat
 - `DELETE /chat/v1/llm-config/user/instruction-sets/{set_id}` — archives, **204**; 404 as above
 - `GET /chat/v1/llm-config/user/instruction-sets/{set_id}/history?limit=20` — versions newest first. Archived sets stay readable here, so history survives a delete
 
+Two more endpoints under `/chat/v1`, also `Depends(auth_required)` and scoped to the caller, but
+in `routers/chat_history.py` rather than `llm_config.py` — they control cross-session memory, a
+separate opt-in feature documented under "Cross-session memory premise measurement" below. Both
+also 404 for a caller that is not an identifiable person (a service identity, or the shared
+`anonymous` of an auth-less deployment):
+
+- `GET /chat/v1/memory` — the caller's digest rendered fresh (not the frozen per-session copy), plus the `enabled` flag and the session rows it was built from; answers regardless of the opt-in, so the memory dialog can preview it before the setting is turned on
+- `PUT /chat/v1/chat/sessions/{id}/pin` — pin or unpin a session so it keeps surfacing in the digest past the recency window; 404s (not 403s) for a session the caller does not own, and for a secret chat's id, which never had a row to pin
+
+`GET /chat/v1/chat/sessions` (`list_sessions`, `routers/chat_history.py`) now returns a
+`pinned` field per session, sourced from `chat_sessions.pinned_at`.
+
 Status, detail string and response shape are identical for a foreign id and a nonexistent one on
 all three id-taking endpoints, so the API leaks no evidence that another user's set exists;
 ownership is checked *before* the length cap, so an over-cap body aimed at a foreign id still
@@ -1692,7 +1709,7 @@ ClinVar significance, population frequency and rsID:
 - with the sandbox and `get_variant_protein_effect` (`bigquery`) — pointed at
   `genetics.variant_annotation(...)` for consequence/AF/gene and at `get_variant_protein_effect`
   for a coding SNV's clinical annotation;
-- with the sandbox but no annotation tool at all (`code`, seven tools) — pointed at
+- with the sandbox but no annotation tool at all (`code`) — pointed at
   `genetics.variant_annotation(...)`, and told that clinical significance and pathogenicity are
   genuinely unavailable, which is true only there;
 - with `query_database` alone and `get_variant_protein_effect` (`bigquery` with
@@ -1715,12 +1732,12 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` holds **ten** test classes, most of them parametrised over the
+`tests/test_system_prompt.py` holds **eleven** test classes, most of them parametrised over the
 `None`/`api`/`bigquery`/`rag`/`code`/`nocode` profile values. Only two distinct surfaces remain
 behind those six values, so the ones that need a shape no surface produces — a database surface
 without the API tools, a surface carrying `launch_subagents`, one carrying every tool at once —
 build the tool set directly instead; the gate is keyed on tool names, not on a profile. Three of
-those seven pin the core property families — the first, and the heading-body half of the
+those classes pin the core property families — the first, and the heading-body half of the
 third, with `ENABLE_SUBAGENTS` both true and false:
 **absence** (every tool name in the emitted prompt is in the resolved list, tokenising
 independently of the gate's own matcher — independently on the algorithm, not on the
@@ -1829,14 +1846,19 @@ may be asserted, and that the rules above win on conflict.
 | Block | Content | Cache behaviour |
 |---|---|---|
 | 0 | default system prompt + verbosity fragment | identical for every user — one entry per verbosity value serves the whole user base |
-| 1 | this user's instruction envelope (omitted entirely when there is none) | one small per-user entry |
+| 1 | this user's instruction envelope and memory envelope, joined (omitted entirely when both are empty) | one small per-user entry |
 
 Concatenating them would refragment the ~7.4K-token shared block per user per event (~$0.043)
 instead of writing the small per-user block (~$0.0025); leaving the user block uncached costs
 ~$0.05 across a 25-iteration turn. This consumes the **fourth and last** of Anthropic's cache
-breakpoints — tool definitions, the shared system block, the user system block, and the last
-replayed message. **There is no spare**: anything that wants a new breakpoint has to take one of
-these away.
+breakpoints, which is why the memory envelope, added later, joins block 1 rather than claiming
+one of its own — see `docs/chat-tool-reference.md` §4 in **genetics-results-suite** for the
+full breakpoint accounting. Both halves are per-user and both hold still for a session's whole length: the
+instruction envelope never changes mid-session, and the memory digest is rendered once, on a
+session's first turn, and read back verbatim from `chat_sessions.context_digest` on every turn
+after — so joining them costs neither fragment anything. See "Cross-session memory premise
+measurement" below and `docs/project-spec.md` ("Chat memory (recent-work digest)") in
+**genetics-results-suite** for what feeds the memory half.
 
 ### Where the choice is visible afterwards
 
@@ -1893,6 +1915,8 @@ src/genetics_mcp_server/
 ├── download_store.py    # disk-persisted download storage for TSV files
 ├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
 ├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
+├── memory_digest.py     # entity extraction shared by the memory digest and its premise gate
+├── memory_gate.py       # the one place that decides whether a caller gets cross-session memory
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py      # configuration dataclass
@@ -1922,6 +1946,7 @@ src/genetics_mcp_server/
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
 │   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
+│   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -2604,9 +2629,10 @@ The `/chat/v1/auth` endpoint includes an `is_admin` boolean in its response, use
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `RATE_LIMIT_PER_HOUR` | Max chat messages per user per hour | `20` |
-| `RATE_LIMIT_PER_DAY` | Max chat messages per user per day | `100` |
+| `RATE_LIMIT_PER_DAY` | Max chat messages per user per day | `40` |
+| `RATE_LIMIT_PER_WEEK` | Max chat messages per user per week | `100` |
 
-Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. Both limits use sliding windows. Returns HTTP 429 with the specific limit hit when exceeded.
+Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. All three limits use sliding windows over one in-memory timestamp list per user, so a pod restart empties every window. Returns HTTP 429 with the specific limit hit when exceeded.
 
 ### MCP server options
 
@@ -2692,6 +2718,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
+| `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
@@ -2714,6 +2741,40 @@ collection order. The seed is printed in the pytest header; reproduce a failure 
 `pytest --randomly-seed=<seed>`, or take the collection order out of the picture with
 `pytest -p no:randomly`. The pin is deliberate — the seed-to-order mapping is not stable
 across plugin versions, so a seed quoted in a bug report only means something at one version.
+
+## Cross-session memory premise measurement
+
+`memory_digest.py` extracts entities from an assistant message's stored `content_json`:
+`(kind, value)` pairs over a closed set of kinds — gene, phenotype, variant, dataset,
+view. It reads only `tool_use` **inputs**, never tool results — `extract_entities` takes
+`tool_results_json` and ignores it, so memory can never be built from fetched rows. The
+parameter names it keys on come from `tools/definitions.py`; `query` is resolved per tool,
+because it carries a gene for `search_genes` and a sentence for `search_scientific_literature`.
+SQL (`query_database.sql`) and script text (`run_analysis.code`) are mined with regexes for
+view names, rsids, variant ids and literals compared against a named column. The premise
+script additionally calls `extract_marker_entities` (the `[TOOLUSE:<base64>]` display markers
+the browser writes into `content` for rows stored before `content_json` existed) and
+`extract_user_entities` (rsids and variant ids typed directly into a user message) — both are
+what keep the oldest sessions from reading as entity-free; the session digest itself calls
+`extract_entities` alone, because every row it reads postdates `content_json`.
+
+`scripts/memory_premise_stats.py` is the gate that decides whether cross-session memory is
+worth building. It opens chat_history.db read-only and prints one JSON object: returning-user
+share of sessions, the share of returning sessions whose first user message re-mentions an
+entity from one of that user's earlier sessions, refer-back phrase share, first-turn tool-arg
+overlap, inter-session gap and sessions-per-user distributions, all-time and last 90 days,
+plus per-turn cost from `chat_turn_metrics` where that table exists. It emits no user id,
+email or session id, because the production run pipes it into a pod over stdin:
+
+```bash
+python -m genetics_mcp_server.scripts.memory_premise_stats --bundle > /tmp/premise.py
+kubectl -n genetics exec -i deploy/chat-backend -- python - < /tmp/premise.py > out.json
+```
+
+`--bundle` inlines `memory_digest.py` above the script and strips the import, because the
+deployed image predates that module. Production also predates `chat_turn_metrics`, where the
+script reports `"table missing"`; the cost baseline then comes from the BigQuery log sink
+instead — `scripts/memory_premise_cost.sql`, run with `bq query --use_legacy_sql=false`.
 
 ## Conversation Analysis
 
@@ -2881,8 +2942,9 @@ harness issues two arms per case. `--base-url` therefore defaults to
 - **Running it fast.** With one arm there is no pairing to preserve, so `--concurrency`
   is free to rise to whatever Anthropic and the local stack will take. Two settings on
   the stack are the binding constraint, and neither is a benchmark flag:
-  `RATE_LIMIT_PER_HOUR`/`RATE_LIMIT_PER_DAY` (chat-backend's own limiter, 20/100 by
-  default — a 50-turn run trips it and the harness treats that 429 as run-invalidating),
+  `RATE_LIMIT_PER_HOUR`/`RATE_LIMIT_PER_DAY`/`RATE_LIMIT_PER_WEEK` (chat-backend's own
+  limiter, 20/40/100 by default — a 50-turn run trips it and the harness treats that 429 as
+  run-invalidating),
   and `ANTHROPIC_RETRY_RATE_LIMIT=true`, which makes chat-backend wait out an Anthropic
   429 rather than failing the turn. That is push-until-refused-then-back-off, not
   header-driven pacing: nothing reads the `anthropic-ratelimit-*` headers to self-throttle
@@ -3391,7 +3453,7 @@ already written) — a run produces cost and latency numbers with no judge call 
 3. **Graceful degradation**: External service failures don't crash the server; fallbacks are used where available
 4. **Streaming responses**: Chat API streams tokens via SSE for responsive UX. Multiple event types (`content`, `thinking`, `usage`, `script_result`, `image`, `error`, `done`) provide real-time feedback. Context usage tracking via `usage` events enables the frontend to show a live progress bar of context window consumption (see SSE event types section).
 5. **Agentic loop**: LLM service supports multi-turn tool use with configurable iteration limit
-6. **Retry on transient errors**: Anthropic API calls are retried up to 3 times with exponential backoff (1s, 2s, 4s) for transient errors. Retryability is detected two ways because of a streaming quirk: connection errors and `APIStatusError` with HTTP status 500/502/503/529, **and** by the error type carried in the body (`overloaded_error`, `api_error`, `internal_server_error`). The latter is essential — errors that arrive mid-stream (after the SSE connection returns HTTP 200) surface as a base `APIStatusError` with `status_code=200`, so status-code matching alone misses them (`anthropic_error_type()` in `llm_service.py` reads the real type from the body). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. When retries are exhausted, `_classify_error` (in `chat_api.py`) maps the error to a user-facing message keyed on the same body type: overload → "Claude is temporarily overloaded… please wait a moment and resend"; internal/upstream → "Claude had a temporary upstream error." Non-retryable errors (auth, bad request, rate limit) propagate immediately.
+6. **Retry on transient errors**: Anthropic API calls are retried up to 3 times with exponential backoff (1s, 2s, 4s) for transient errors. Retryability is detected two ways because of a streaming quirk: connection errors and `APIStatusError` with HTTP status 500/502/503/529, **and** by the error type carried in the body (`overloaded_error`, `api_error`, `internal_server_error`). The latter is essential — errors that arrive mid-stream (after the SSE connection returns HTTP 200) surface as a base `APIStatusError` with `status_code=200`, so status-code matching alone misses them (`anthropic_error_type()` in `llm_service.py` reads the real type from the body). If text was already streamed before the error, the user is notified with a "[Connection interrupted, retrying...]" message. When retries are exhausted, `_classify_error` (in `chat_api.py`) maps the error to a user-facing message keyed on the same body type: overload → "Claude is temporarily overloaded… please wait a moment and resend"; internal/upstream → "Claude had a temporary upstream error." A prompt over the model's context window arrives as a plain `BadRequestError` like any malformed body, so `_classify_error` reads `prompt is too long` out of the message and says the conversation is too long rather than "Invalid request sent to LLM service." — which sent the user looking at what they typed instead of at the length of the conversation. Non-retryable errors (auth, bad request, rate limit) propagate immediately.
 7. **Result truncation**: Large responses are truncated with warnings to prevent context overflow. The cap is `settings.mcp_max_result_size` (50,000 chars) applied to the serialized tool result in `llm_service.py`. The notice is built by `_truncation_notice()`, which re-attaches the `artifacts_retained_in_clear` warning when the pre-truncation result carried it — a `run_analysis` result's `output` is script-controlled up to 64 KiB, so without that a script could both provoke the exposure condition and print ~50 KB to cut its own security warning out of the prefix (`_render_analysis` also orders that field ahead of `output` for the same reason; the two defences are independent because only the first depends on serialisation order) — and which states that what survives is an ordered PREFIX rather than a sample, that entire categories may be invisible, and that the result must not be used to count, to enumerate, or to conclude absence — pointing instead at narrower arguments, `summarize=true`, or the download link. Its item count comes from `_count_result_items()`, which understands every shape the data tools return (`results`, `rows`/`total_rows`, and `n_cs`/`cs`); counting only `results` previously dropped the count for exactly the credible-set summaries, degrading the notice to a bare "response too large". The system prompt carries the matching rule (`config/defaults.py`, under Tool Usage Guidelines). Truncation is positional, so it interacts badly with server-side row ordering: an unfiltered `get_credible_sets_by_qtl_gene` for a well-studied gene returns thousands of rows sorted by chromosome/position, and the tail — which may be the only rows of the requested data type — is cut before the model sees it. This produced a real wrong answer ("no caQTL rows at all" for IL7R, which in fact has 3,058). The fix is to filter server-side: the `data_types` parameter on `get_credible_sets_by_gene` / `_by_variant` / `_by_qtl_gene` is now a real API query parameter (previously it was sent and silently ignored by the results-api, which is also why the truncation was reached), and the results-api rejects undeclared query parameters with 422 so this class of drift cannot recur silently. `get_credible_sets_by_qtl_gene` also now defaults `summarize=True`, matching its sibling credible-set tools; it was the only one defaulting to variant-level rows, which is how a routine gene query reached 1.57 M chars. The summary is credible set-level, sorted by `mlog10p` and grouped by `data_type`, so what truncation drops is the weakest-signal tail rather than an entire chromosome's worth of rows. **A credible set is keyed by `(resource, dataset, trait, cell_type, cs_id)`, never by `cs_id` alone** — `cs_id` is unique only within one dataset's fine-mapping run of one trait in one cell type. caQTL `cs_id`s are derived from the chromatin peak and recur in every cell type the peak was tested in; eQTL Catalogue `cs_id`s like `ENSG00000187608_L1` recur across QTD studies. `_summarize_credible_sets_simple` grouped on `cs_id` alone, merging those into one row each: for IL7R caQTL it reported 46 credible sets across 9 cell types where the data holds 129 across 13, and PCSK9 caQTL came out at 78 instead of 359. Both aggregations now run in a single `group_by` on the full key — joining them would have to match on `cell_type`, which is null for GWAS, where `null != null` silently drops rows. `_summarize_credible_sets_trait` (used only by `get_credible_sets_by_phenotype`, a single resource and phenotype per call) is unaffected, since `cs_id` genuinely is unique in that scope. The summary also carries a `counts` block (`_summary_counts`) of per-data-type distinct totals — credible sets, associations (variant-level rows, matching an equivalent BigQuery `COUNT(*)`), variants, traits, cell types, datasets, plus `n_peaks` from `trait_original` for caQTL, whose molecular trait is a chromatin peak. It is emitted before `cs` in the dict so it survives truncation: at ~500 bytes for all data types it always fits, which means "how many peaks / cell types / associations" is answerable even on a result 28x over the cap, instead of the model counting whatever credible sets happened to fit
 8. **Downloadable results**: Tools returning tabular data include `INCLUDE_IN_RESPONSE` download links. Direct API URLs are used for genetics API tools that support TSV format; other tools (BigQuery, LD, summary stats) have their results converted to TSV and stored on disk, served via `/chat/v1/downloads/{id}`. The `_download_url` and `_download_data` hints in tool results are processed by `_process_download_hints()` in `llm_service.py` before being sent to the LLM. All download links use relative URLs (e.g., `/api/v1/...` or `/chat/v1/downloads/...`) so they work correctly regardless of deployment domain. `INCLUDE_IN_RESPONSE` is placed at the front of the result dict so it survives JSON truncation for large results. For BigQuery, trailing SQL `LIMIT` clauses are stripped and `max_rows` is set to 100,000 so the download contains the full result set even when the LLM only displays a subset. The BigQuery proxy (`genetics-results-db`) enforces `MAX_ROWS=100000` as a hard cap. **A download failure is never silent.** `_process_download_hints` used to catch bare `Exception`, log a warning and return the result with `_download_data` already popped, which produced no link, no error to the user and no error to the model — indistinguishable from a result that never warranted a download, so nobody reported it. That hid the identical positional-rows defect twice (`bef`, then `buc` months later). Two things now hold: (1) `_convert_to_tsv` validates both shapes up front — including `filename`, which is `json.dump`ed into the sidecar *after* the `.tsv` is written, so a non-`str` would raise past the allow-list and orphan the data file — and raises `DownloadShapeError` (a `TypeError` subclass) naming the expected and the observed shape; (2) three failure modes are caught, each with its own ERROR log token and its own user-visible `INCLUDE_IN_RESPONSE` note, and **none of them is fatal to the chat turn**. A `DownloadShapeError` is logged as `DOWNLOAD_SHAPE_DEFECT tool=<name> shape=<observed>` with `exc_info=True` and surfaced as `DOWNLOAD_SHAPE_NOTE` (unexpected structure, results unaffected, logged for investigation, explicitly *not* worth re-running). A shape defect is not necessarily a local programming error: only the six BigQuery-backed tools and the UniProt helper build the payload locally, while most of the ~25 producers put the sibling results-api's parsed response body straight into `_download_data` unvalidated (`executor.py` `_get_ld_matrix`, `_get_summary_stats`, …), so a bad shape is as likely to be **upstream drift** — a class of failure this repo has already seen — and coupling chat-turn success to another repo's response shape would trade a missing link for a lost answer. `OSError` (everything the store can fail with — `ENOSPC`, permissions, a storage path that is not a directory) and `UnicodeEncodeError` (upstream JSON can decode lone surrogates that utf-8 cannot encode) keep the `DOWNLOAD_FAILED tool=<name> shape=<observed> error=<type>` token and `DOWNLOAD_FAILED_NOTE`, which now states the effect without asserting a cause (re-running helps for `ENOSPC` but never for an unencodable value). The distinct tokens matter operationally: `genetics-results-suite`'s `scripts/monitor/alerter.py` queries severity ≥ WARNING and pushes new alerts to Slack, so a disk problem and a producer/upstream defect are separable there. Both call sites (`_stream_anthropic`, `subagent._execute_subagent_tool`) pass `tool_name` so the log identifies the producer among the ~25 that emit `_download_data`. A recognized-but-empty payload (`{"results": []}`) still yields no link and no note — there is genuinely nothing to download.
 9. **Tool result persistence (resumed conversations carry the data substrate)**: The chat API is stateless per request — the frontend replays the full conversation each turn. Tool `tool_result` blocks are persisted (`chat_messages.tool_results_json`, added via the standard PRAGMA/ALTER migration) so a resumed conversation replays the actual tool outputs the model saw, not just its prose summary. `_stream_anthropic` collects `all_tool_results` across agentic-loop iterations and emits them in the `done` SSE event; the frontend stores them and, on resume, rebuilds the `assistant(tool_use) → user(tool_result)` pairing (its history builder splits each persisted assistant turn into the assistant message plus a synthetic user message of `tool_result` blocks). The already-truncated, image-base64-stripped result content is stored as-is. **Backward compatible**: conversations saved before this feature have `tool_results_json = NULL`; on resume they emit only the assistant message and `_sanitize_tool_blocks` (in `llm_service.py`) strips the now-orphaned `tool_use` blocks — exactly the prior behavior. **Marker-strip safeguard**: the `*[Using tool: …]*` annotations injected during streaming are display-only, but they are persisted into the assistant text. Before history reaches the model, `_strip_tool_use_markers` (in `llm_service.py`, run just before `_sanitize_tool_blocks`) removes them from replayed assistant content (both string and text-block forms). Without this, a long/repetitive conversation could teach the model to imitate the notation — writing `*[Using tool: X]*` as prose instead of emitting a real `tool_use` block, then fabricating the result (observed in a real session whose tool-less turns predated the persistence fix). Real `tool_use` blocks are left untouched. To offset the larger replayed payload, `_mark_history_cache_breakpoint` adds a `cache_control: ephemeral` breakpoint on the last replayed message (the 3rd of Anthropic's 4 breakpoints, alongside the system prompt and tool definitions). System-prompt guardrails (`config/defaults.py`) additionally instruct the model to treat credible-set membership as distinct from LD and to re-query authoritative tools for count/membership/lead questions rather than relying on earlier summaries.

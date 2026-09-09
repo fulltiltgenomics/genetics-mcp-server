@@ -56,6 +56,8 @@ _FUNCTIONS = (
     "exome",
     "gene_burden",
     "hla",
+    "dosage_sensitivity",
+    "rcnv",
     "asm_qtl",
     "open_chromatin",
     "peak_to_gene",

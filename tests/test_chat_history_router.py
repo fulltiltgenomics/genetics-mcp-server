@@ -888,3 +888,191 @@ class TestVerbosityOnMessages:
         message = detail.json()["messages"][0]
         assert message["verbosity"] == "detailed"
         assert message["literature_backend"] == "europepmc"
+
+
+@pytest.fixture
+def client_as_service(test_db):
+    """A client whose caller is the service identity rather than a person."""
+    async def mock_auth():
+        return "mcp-tool"
+
+    app.dependency_overrides[auth_required] = mock_auth
+    with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+        with TestClient(app) as client:
+            yield client
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client_as_anonymous(test_db):
+    """A client of a deployment with REQUIRE_AUTH off, where every caller is the same."""
+    async def mock_auth():
+        return "anonymous"
+
+    app.dependency_overrides[auth_required] = mock_auth
+    with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+        with TestClient(app) as client:
+            yield client
+    app.dependency_overrides.clear()
+
+
+class TestMemoryEndpoints:
+    """GET /memory and PUT /chat/sessions/{id}/pin."""
+
+    USER = "test@example.com"
+
+    def _settings(self, llm_config_db):
+        return patch(
+            "genetics_mcp_server.memory_gate.get_llm_config_db", return_value=llm_config_db
+        )
+
+    def _seed(self, test_db, title, user=USER):
+        session = test_db.create_session(user)
+        test_db.update_session(session.id, user, title=title)
+        test_db.add_message(session.id, f"m-{session.id}", "user", "What about APOE?")
+        return session
+
+    def test_memory_is_disabled_until_the_user_opts_in(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        self._seed(test_db, "APOE and LDL")
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get("/chat/v1/memory").json()
+
+        assert data["enabled"] is False
+        # the preview is served anyway, so the dialog can show what would be remembered
+        assert "APOE and LDL" in data["digest"]
+
+    def test_enabled_reflects_the_setting(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        llm_config_db.save_user_setting(
+            user_id=self.USER, setting_key="chat_memory", setting_value="on"
+        )
+
+        with self._settings(llm_config_db):
+            assert client_with_auth.get("/chat/v1/memory").json()["enabled"] is True
+
+        llm_config_db.save_user_setting(
+            user_id=self.USER, setting_key="chat_memory", setting_value="off"
+        )
+        with self._settings(llm_config_db):
+            assert client_with_auth.get("/chat/v1/memory").json()["enabled"] is False
+
+    def test_sessions_agree_with_the_digest(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        first = self._seed(test_db, "APOE and LDL")
+        second = self._seed(test_db, "T2D endpoints")
+        test_db.set_pinned(first.id, self.USER, True)
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get("/chat/v1/memory").json()
+
+        # the accessor's order verbatim: updated_at ties inside one second, so id DESC
+        # decides, and the list must not re-sort what the renderer was handed
+        assert [s["id"] for s in data["sessions"]] == [
+            row["id"] for row in test_db.get_recent_sessions_for_digest(self.USER, 20)
+        ]
+        assert {s["id"] for s in data["sessions"]} == {first.id, second.id}
+        for session in data["sessions"]:
+            assert session["title"] in data["digest"]
+            assert session["created_at"]
+        assert {s["id"]: s["pinned"] for s in data["sessions"]} == {
+            first.id: True, second.id: False
+        }
+
+    def test_char_cap_is_the_renderer_s_own_limit(
+        self, client_with_auth, llm_config_db
+    ):
+        from genetics_mcp_server.memory_digest import MAX_DIGEST_CHARS
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get("/chat/v1/memory").json()
+
+        assert data["char_cap"] == MAX_DIGEST_CHARS
+
+    def test_another_users_sessions_are_not_in_the_digest(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        self._seed(test_db, "Somebody else's work", user="other@example.com")
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get("/chat/v1/memory").json()
+
+        assert data["sessions"] == []
+        assert data["digest"] == ""
+
+    def test_a_service_identity_has_no_memory(self, client_as_service, llm_config_db):
+        with self._settings(llm_config_db):
+            assert client_as_service.get("/chat/v1/memory").status_code == 404
+
+    def test_pin_toggles_and_unpins(self, client_with_auth, test_db):
+        session = self._seed(test_db, "APOE and LDL")
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session.id}/pin", json={"pinned": True}
+        )
+        assert response.status_code == 200
+        assert response.json() == {"id": session.id, "pinned": True}
+        assert test_db.get_session(session.id, self.USER).pinned_at is not None
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session.id}/pin", json={"pinned": False}
+        )
+        assert response.json() == {"id": session.id, "pinned": False}
+        assert test_db.get_session(session.id, self.USER).pinned_at is None
+
+    def test_pinning_someone_elses_session_is_not_found(self, client_with_auth, test_db):
+        """404, never 403: a 403 would confirm the id names a real conversation."""
+        session = self._seed(test_db, "Theirs", user="other@example.com")
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session.id}/pin", json={"pinned": True}
+        )
+
+        assert response.status_code == 404
+        assert test_db.get_session(session.id, "other@example.com").pinned_at is None
+
+    def test_a_secret_session_id_has_no_row_to_pin(self, client_with_auth):
+        response = client_with_auth.put(
+            "/chat/v1/chat/sessions/8f14e45f-ceea-467a-9575-2b3a9e2f0d11/pin",
+            json={"pinned": True},
+        )
+
+        assert response.status_code == 404
+
+    def test_a_service_identity_owns_no_session_to_pin(self, client_as_service, test_db):
+        session = self._seed(test_db, "Theirs")
+
+        response = client_as_service.put(
+            f"/chat/v1/chat/sessions/{session.id}/pin", json={"pinned": True}
+        )
+
+        assert response.status_code == 404
+
+    def test_an_anonymous_caller_may_not_pin_its_own_session(
+        self, client_as_anonymous, test_db
+    ):
+        """`anonymous` owns rows with REQUIRE_AUTH off, so ownership is not the refusal —
+        naming no person is: it has no memory for a pin to steer."""
+        session = self._seed(test_db, "Ours, collectively", user="anonymous")
+
+        response = client_as_anonymous.put(
+            f"/chat/v1/chat/sessions/{session.id}/pin", json={"pinned": True}
+        )
+
+        assert response.status_code == 404
+        assert test_db.get_session(session.id, "anonymous").pinned_at is None
+
+    def test_the_session_list_carries_the_pin_state(self, client_with_auth, test_db):
+        """The browser's pin star reads it from the list, not from a second request."""
+        session = self._seed(test_db, "APOE and LDL")
+
+        listed = client_with_auth.get("/chat/v1/chat/sessions").json()
+        assert listed[0]["pinned"] is False
+
+        test_db.set_pinned(session.id, self.USER, True)
+        listed = client_with_auth.get("/chat/v1/chat/sessions").json()
+        assert listed[0]["pinned"] is True
