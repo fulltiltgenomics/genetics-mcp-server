@@ -4,11 +4,23 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
 
-RUN pip install uv --upgrade
+# pinned: an unpinned uv is an unversioned input to every resolution below it
+RUN pip install uv==0.11.3
 
-COPY pyproject.toml README.md ./
+# the lock alone is enough to install every dependency, so this layer is copied and run
+# before any source: editing src/ then reuses it instead of reinstalling the whole set.
+# --frozen fails rather than re-resolving, so the image can never ship a dependency set
+# the lockfile does not describe
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.txt \
+    && uv pip install --system -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
+# only the project itself; --no-deps keeps this step from touching the resolved set above
+COPY README.md ./
 COPY src/ src/
-RUN uv pip install --system .
+RUN uv pip install --system --no-deps .
 
 ENV PORT=8000
 ENV PYTHONPATH=/app/src
