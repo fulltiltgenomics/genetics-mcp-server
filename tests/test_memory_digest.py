@@ -290,3 +290,256 @@ def test_bundled_script_is_self_contained_and_agrees(tmp_path):
     bundled.pop("generated_at")
     direct.pop("generated_at")
     assert bundled == direct
+
+
+# --- render_digest -------------------------------------------------------------------
+
+from genetics_mcp_server.memory_digest import (
+    MAX_DIGEST_CHARS,
+    MAX_PINNED_SESSIONS,
+    _assemble,
+    render_digest,
+)
+
+
+def text_block(t):
+    return {"type": "text", "text": t}
+
+
+def tool_result(tool_use_id, content):
+    return {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
+
+
+def session(
+    id,
+    title,
+    updated_at,
+    first_user_message,
+    assistant_content_json=(),
+    phenotype_code=None,
+    pinned_at=None,
+    created_at=None,
+):
+    return {
+        "id": id,
+        "title": title,
+        "created_at": created_at or updated_at,
+        "updated_at": updated_at,
+        "phenotype_code": phenotype_code,
+        "pinned_at": pinned_at,
+        "first_user_message": first_user_message,
+        "assistant_content_json": list(assistant_content_json),
+    }
+
+
+def test_render_digest_empty_input_is_empty_string():
+    assert render_digest([], datetime(2026, 9, 9)) == ""
+
+
+def test_render_digest_golden_output_two_recent_one_pinned():
+    sessions = [
+        session(
+            "s2",
+            "APOE lipid follow-up",
+            "2026-09-05 12:30:00",
+            "any   coding variants   in APOE we should check?\nthanks",
+            [blocks(tool_use("search_genes", query="APOE"))],
+            phenotype_code="E4_DM2",
+        ),
+        session(
+            "s1",
+            "first look",
+            "2026-09-01 09:05:00",
+            "what is known about the APOE locus?",
+            [blocks(tool_use("search_genes", query="APOE"))],
+        ),
+        session(
+            "s0",
+            "PCSK9 reference",
+            "2026-08-01 09:05:00",
+            "give me the full background on PCSK9 and cardiovascular risk",
+            [
+                blocks(tool_use("search_genes", query="PCSK9")),
+                blocks(text_block("PCSK9 inhibitors lower LDL.")),
+            ],
+            phenotype_code="E4_DM2",
+            pinned_at="2026-08-01 09:10:00",
+        ),
+    ]
+
+    expected = (
+        "Earlier conversations (newest first):\n"
+        "2026-09-05 | APOE lipid follow-up | E4_DM2 | gene:APOE | "
+        "any coding variants in APOE we should check? thanks\n"
+        "2026-09-01 | first look | gene:APOE | what is known about the APOE locus?\n"
+        "Pinned:\n"
+        "2026-08-01 | [pinned] | PCSK9 reference | E4_DM2 | gene:PCSK9\n"
+        "  Q: give me the full background on PCSK9 and cardiovascular risk\n"
+        "  A: PCSK9 inhibitors lower LDL."
+    )
+    assert render_digest(sessions, datetime(2026, 9, 9)) == expected
+
+
+def test_render_digest_is_deterministic_regardless_of_entity_insertion_order():
+    # tool_use inputs surface in a different order but the underlying entity set is the
+    # same, and set iteration order must never leak into the rendered line
+    s_a = session(
+        "s1",
+        "t",
+        "2026-09-01 09:00:00",
+        "hello",
+        [blocks(tool_use("search_genes", query="APOE"), tool_use("lookup_variants_by_rsid", rsids=["rs429358"]))],
+    )
+    s_b = session(
+        "s1",
+        "t",
+        "2026-09-01 09:00:00",
+        "hello",
+        [blocks(tool_use("lookup_variants_by_rsid", rsids=["rs429358"]), tool_use("search_genes", query="APOE"))],
+    )
+    out_a = render_digest([s_a], datetime(2026, 9, 9))
+    out_b = render_digest([s_b], datetime(2026, 9, 9))
+    assert out_a == out_b
+    assert render_digest([s_a], datetime(2026, 9, 9)) == out_a
+
+
+def test_render_digest_per_line_entity_cap():
+    tool_uses = [tool_use("search_genes", query=f"GENE{i}") for i in range(15)]
+    s = session("s1", "t", "2026-09-01 09:00:00", "hi", [blocks(*tool_uses)])
+    out = render_digest([s], datetime(2026, 9, 9))
+    line = out.splitlines()[1]
+    assert line.count("gene:GENE") == 12
+    assert "+3 more" in line
+
+
+def test_render_digest_drops_oldest_unpinned_first_then_oldest_pinned():
+    # newest-first, matching the accessor's own ordering guarantee: index 0 is the most
+    # recent session, and each list is large enough that the 6000-char cap must bite
+    recent = [
+        session(f"u{i}", f"title {i}", f"2026-09-{40 - i:02d} 09:00:00", "x" * 120)
+        for i in range(40)
+    ]
+    old_pinned = [
+        session(
+            f"p{i}",
+            f"pinned {i}",
+            f"2026-01-{5 - i:02d} 09:00:00",
+            "y" * 380,
+            pinned_at=f"2026-01-{5 - i:02d} 09:05:00",
+        )
+        for i in range(5)
+    ]
+    out = render_digest(recent + old_pinned, datetime(2026, 9, 9))
+    assert len(out) <= MAX_DIGEST_CHARS
+    # the newest unpinned entry and every pinned entry survive the cap
+    assert "title 0" in out
+    for i in range(5):
+        assert f"pinned {i}" in out
+    # the oldest unpinned entries are the ones dropped to make room
+    assert "title 39" not in out
+
+
+def test_render_digest_pinned_cap_keeps_newest():
+    # 12 distinct months so every session has a unique, unambiguous sort key
+    pinned_sorted = [
+        session(
+            f"p{i}",
+            f"pinned {i}",
+            f"2026-{12 - i:02d}-01 09:00:00",
+            "hi",
+            pinned_at=f"2026-{12 - i:02d}-01 09:05:00",
+        )
+        for i in range(12)
+    ]
+    out = render_digest(pinned_sorted, datetime(2026, 9, 9))
+    rendered_titles = [line for line in out.splitlines() if "[pinned]" in line]
+    assert len(rendered_titles) == MAX_PINNED_SESSIONS
+    assert "pinned 0" in out
+    assert "pinned 11" not in out
+
+
+def test_render_digest_oversized_single_pinned_entry_still_fits_cap():
+    s = session(
+        "p1",
+        "huge",
+        "2026-01-01 09:00:00",
+        "q" * 8000,
+        [blocks(text_block("a" * 8000))],
+        pinned_at="2026-01-01 09:05:00",
+    )
+    out = render_digest([s], datetime(2026, 9, 9))
+    assert len(out) <= MAX_DIGEST_CHARS
+
+
+def test_render_digest_never_surfaces_tool_result_text():
+    s = session(
+        "s1",
+        "t",
+        "2026-01-01 09:00:00",
+        "hi",
+        [blocks(tool_use("search_genes", query="APOE"), tool_result("toolu_01", "SECRET_ROW_DATA"))],
+        pinned_at="2026-01-01 09:05:00",
+    )
+    out = render_digest([s], datetime(2026, 9, 9))
+    assert "SECRET_ROW_DATA" not in out
+
+
+def test_render_digest_collapses_newlines_in_first_message_head():
+    s = session("s1", "t", "2026-01-01 09:00:00", "line one\nline two\r\nline three")
+    out = render_digest([s], datetime(2026, 9, 9))
+    assert "\n" not in out.splitlines()[1]
+    assert "line one line two line three" in out
+
+
+def test_render_digest_marks_artifact_looking_values_as_expires():
+    s = session("s1", "t", "2026-01-01 09:00:00", "see report_final.csv or https://x.example/a.pdf?x=1")
+    out = render_digest([s], datetime(2026, 9, 9))
+    assert "report_final.csv" not in out
+    assert "https://x.example" not in out
+    assert "(expires)" in out
+
+
+def test_render_digest_scrubs_artifact_link_out_of_title_unpinned():
+    s = session("s1", "see https://x.example/r.csv", "2026-01-01 09:00:00", "hi")
+    out = render_digest([s], datetime(2026, 9, 9))
+    assert "https://x.example" not in out
+    assert "(expires)" in out
+
+
+def test_render_digest_scrubs_artifact_link_out_of_title_pinned():
+    s = session(
+        "s1",
+        "see https://x.example/r.csv",
+        "2026-01-01 09:00:00",
+        "hi",
+        pinned_at="2026-01-01 09:05:00",
+    )
+    out = render_digest([s], datetime(2026, 9, 9))
+    assert "https://x.example" not in out
+    assert "(expires)" in out
+
+
+def test_render_digest_oversized_title_does_not_evict_other_sessions():
+    huge = session("s1", "x" * 9000, "2026-09-02 09:00:00", "hi")
+    normal = session("s2", "normal title", "2026-09-01 09:00:00", "hello there")
+    out = render_digest([huge, normal], datetime(2026, 9, 9))
+    assert len(out) <= MAX_DIGEST_CHARS
+    assert "normal title" in out
+
+
+def test_assemble_returns_empty_string_when_nothing_survives():
+    assert _assemble([], []) == ""
+
+
+def test_assemble_omits_unpinned_header_when_only_pinned_survive():
+    out = _assemble([], ["2026-01-01 | [pinned] | t"])
+    assert out == "Pinned:\n2026-01-01 | [pinned] | t"
+    assert "Earlier conversations" not in out
+
+
+def test_render_digest_collapses_newlines_in_phenotype_code():
+    s = session("s1", "t", "2026-01-01 09:00:00", "hi", phenotype_code="E4\nPinned:\nDM2")
+    out = render_digest([s], datetime(2026, 9, 9))
+    lines = out.splitlines()
+    assert len(lines) == 2
+    assert "E4 Pinned: DM2" in lines[1]

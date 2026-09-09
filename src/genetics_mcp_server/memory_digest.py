@@ -1,13 +1,15 @@
-"""Entity extraction for cross-session memory.
+"""Entity extraction and cross-session digest rendering for chat memory.
 
 The premise measurement and the session digest must agree on what an entity is, so both
 call `extract_entities` here instead of each keying on its own list of parameter names.
-Kinds are a closed set: gene, phenotype, variant, dataset, view.
+Kinds are a closed set: gene, phenotype, variant, dataset, view. `render_digest` turns a
+list of prior sessions into the text block a new session's prompt is seeded with.
 """
 
 import base64
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 Entity = tuple[str, str]
@@ -253,3 +255,195 @@ def extract_user_entities(text: Any) -> set[Entity]:
         chrom, pos, ref, alt = match.groups()
         out.add(("variant", f"{chrom}-{pos}-{ref}-{alt}".lower()))
     return out
+
+
+# --- digest rendering ---------------------------------------------------------------
+
+# oldest unpinned entries are dropped first, then oldest pinned, so the newest work and
+# the sessions the user chose to keep survive longest
+MAX_DIGEST_CHARS = 6000
+
+# get_recent_sessions_for_digest(include_pinned=True) returns every pinned session with
+# no ceiling of its own; this bounds how many of them the renderer will ever look at
+MAX_PINNED_SESSIONS = 10
+
+# a per-line cap keeps one entity-heavy session from crowding out every other line
+MAX_ENTITIES_PER_LINE = 12
+
+_UNPINNED_HEAD_CHARS = 120
+_PINNED_MESSAGE_CHARS = 400
+_PINNED_ANSWER_CHARS = 200
+
+# title and phenotype_code are both model-generated or client-supplied text, not trusted
+# identifiers, so both get a hard cap: a single oversized field must never be able to
+# evict every other entry from the digest
+_TITLE_CHARS = 80
+_PHENOTYPE_CODE_CHARS = 40
+
+_HEADER = "Earlier conversations (newest first):"
+_PINNED_HEADER = "Pinned:"
+
+_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+# the simplest deterministic rule for "looks like a download/artifact link": a URL, or a
+# bare filename with an extension the sandbox/download surfaces actually produce. Storage
+# under these names expires, so replaying one into a cached prompt would go stale silently
+_ARTIFACT_RE = re.compile(
+    r"\bhttps?://\S+\b|\b[\w.-]+\.(?:csv|tsv|xlsx?|pdf|png|jpe?g|gif|zip|gz|json|parquet)\b",
+    re.I,
+)
+
+
+def _date_str(raw: Any) -> str:
+    """The calendar date out of a raw sqlite timestamp, ignoring time-of-day and TZ."""
+    if raw:
+        match = _DATE_RE.match(str(raw))
+        if match:
+            return match.group(1)
+    return "????-??-??"
+
+
+def _collapse(text: Any) -> str:
+    if not text:
+        return ""
+    return " ".join(str(text).split())
+
+
+def _scrub(text: str) -> str:
+    return _ARTIFACT_RE.sub("(expires)", text)
+
+
+def _head(text: Any, limit: int, *, scrub: bool = True) -> str:
+    collapsed = _collapse(text)
+    if scrub:
+        collapsed = _scrub(collapsed)
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit].rstrip() + "…"
+
+
+def _looks_like_artifact(value: str) -> bool:
+    return bool(_ARTIFACT_RE.search(value))
+
+
+def _collect_entities(session: dict) -> set[Entity]:
+    # the accessor returns assistant rows only when content_json is present, and
+    # content_json has been written since the schema's first commit, which predates every
+    # production row (first session 2026-04-09), so marker-only rows do not occur here;
+    # the marker extractor stays for the premise script, which reads raw rows
+    out: set[Entity] = set()
+    for content_json in session.get("assistant_content_json") or ():
+        out |= extract_entities(content_json)
+    return out
+
+
+def _entities_str(entities: set[Entity]) -> str:
+    # Entity is (kind, value), so sorting the tuples directly sorts by kind then value
+    filtered = sorted(pair for pair in entities if not _looks_like_artifact(pair[1]))
+    if not filtered:
+        return ""
+    shown = filtered[:MAX_ENTITIES_PER_LINE]
+    rendered = ", ".join(f"{kind}:{value}" for kind, value in shown)
+    remaining = len(filtered) - len(shown)
+    if remaining:
+        rendered += f", +{remaining} more"
+    return rendered
+
+
+def _final_answer_text(assistant_content_json: list) -> str:
+    """The last assistant turn's TEXT blocks only — never a tool_use input, never a result."""
+    if not assistant_content_json:
+        return ""
+    blocks = _loads(assistant_content_json[-1])
+    if isinstance(blocks, dict):
+        blocks = blocks.get("content")
+    if not isinstance(blocks, list):
+        return ""
+    texts = [
+        block["text"]
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+    ]
+    return " ".join(t for t in texts if t)
+
+
+def _render_unpinned(session: dict) -> str:
+    fields = [_date_str(session.get("updated_at")), _head(session.get("title"), _TITLE_CHARS) or "(untitled)"]
+    phenotype_code = _head(session.get("phenotype_code"), _PHENOTYPE_CODE_CHARS, scrub=False)
+    if phenotype_code:
+        fields.append(phenotype_code)
+    entity_str = _entities_str(_collect_entities(session))
+    if entity_str:
+        fields.append(entity_str)
+    head = _head(session.get("first_user_message"), _UNPINNED_HEAD_CHARS)
+    if head:
+        fields.append(head)
+    return " | ".join(fields)
+
+
+def _render_pinned(session: dict) -> str:
+    fields = [
+        _date_str(session.get("updated_at")),
+        "[pinned]",
+        _head(session.get("title"), _TITLE_CHARS) or "(untitled)",
+    ]
+    phenotype_code = _head(session.get("phenotype_code"), _PHENOTYPE_CODE_CHARS, scrub=False)
+    if phenotype_code:
+        fields.append(phenotype_code)
+    entity_str = _entities_str(_collect_entities(session))
+    if entity_str:
+        fields.append(entity_str)
+    lines = [" | ".join(fields)]
+
+    message = _head(session.get("first_user_message"), _PINNED_MESSAGE_CHARS)
+    if message:
+        lines.append(f"  Q: {message}")
+    answer = _head(_final_answer_text(session.get("assistant_content_json") or []), _PINNED_ANSWER_CHARS)
+    if answer:
+        lines.append(f"  A: {answer}")
+    return "\n".join(lines)
+
+
+def _assemble(unpinned_entries: list[str], pinned_entries: list[str]) -> str:
+    def full() -> str:
+        # the unpinned header is only meaningful when an unpinned entry survives to sit
+        # under it; dropping every unpinned entry to size must not leave a bare header
+        parts = [_HEADER, *unpinned_entries] if unpinned_entries else []
+        if pinned_entries:
+            parts.append(_PINNED_HEADER)
+            parts.extend(pinned_entries)
+        return "\n".join(parts)
+
+    text = full()
+    # newest-first order means the oldest entry in each list is the last element
+    while len(text) > MAX_DIGEST_CHARS and unpinned_entries:
+        unpinned_entries.pop()
+        text = full()
+    while len(text) > MAX_DIGEST_CHARS and len(pinned_entries) > 1:
+        pinned_entries.pop()
+        text = full()
+    if len(text) > MAX_DIGEST_CHARS and pinned_entries:
+        overflow = len(text) - MAX_DIGEST_CHARS
+        entry = pinned_entries[-1]
+        keep = max(0, len(entry) - overflow - 1)
+        pinned_entries[-1] = entry[:keep].rstrip() + "…"
+        text = full()
+    return text[:MAX_DIGEST_CHARS]
+
+
+def render_digest(sessions: list[dict], now: datetime) -> str:
+    """A cache-stable text block summarising a user's other sessions, newest first.
+
+    `now` is part of the fixed task interface signature. It is deliberately never read:
+    these bytes are a prompt-cache prefix, so they must not depend on the clock.
+    """
+    del now
+    if not sessions:
+        return ""
+
+    pinned = [s for s in sessions if s.get("pinned_at")][:MAX_PINNED_SESSIONS]
+    unpinned = [s for s in sessions if not s.get("pinned_at")]
+
+    unpinned_entries = [_render_unpinned(s) for s in unpinned]
+    pinned_entries = [_render_pinned(s) for s in pinned]
+    return _assemble(unpinned_entries, pinned_entries)
