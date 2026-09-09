@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -92,6 +93,14 @@ def _classify_error(e: Exception) -> str:
     if name == "APIConnectionError":
         return "Could not connect to the LLM service. Please try again later."
     if name in ("BadRequestError", "UnprocessableEntityError"):
+        # a context overflow arrives as a plain 400 and was reported byte-identical to a
+        # malformed request, which sends the user looking for a bug in what they typed
+        # rather than at the length of the conversation
+        if "prompt is too long" in str(e):
+            return (
+                "This conversation is too long for the model's context window. "
+                "Start a new chat to continue."
+            )
         return "Invalid request sent to LLM service."
     if name == "InternalServerError" or err_type in ("api_error", "internal_server_error"):
         return "Claude had a temporary upstream error. Please try again."
@@ -112,6 +121,44 @@ def _classify_error(e: Exception) -> str:
 
 # prefix the frontend uses to inline data-file attachments as text blocks
 _FILE_BLOCK_PREFIX = "[File: "
+
+# the frontend carries a generated plot inside the assistant's TEXT as
+# [IMAGE:<format>:<alt>:<base64>], so that one render path and one persisted field cover
+# both prose and artifacts. Mirrors MessageContent.tsx's marker regex; the payload cannot
+# contain "]" because it is base64.
+_IMAGE_MARKER_RE = re.compile(r"\[IMAGE:([^:\]]+):([^:\]]+):[^\]]+\]")
+
+
+def _strip_image_markers(content: Any) -> Any:
+    """Replace inline [IMAGE:...] payloads with a short note.
+
+    llm_service strips image bytes out of a tool result before the model sees them — the
+    model cannot read an image it is handed as base64 — but the same bytes came back in
+    the NEXT request inside the replayed assistant text, where nothing removed them. A
+    plotting session paid ~180k tokens per plotted turn to resend pictures the model
+    cannot see, and reached the 1M context limit in six turns.
+
+    Done for every role, not just assistant: no client has a use for these bytes, and a
+    client that replays them in a user turn costs the same tokens.
+    """
+
+    def sub(text: str) -> str:
+        return _IMAGE_MARKER_RE.sub(lambda m: f"[image shown to the user: {m.group(2)}]", text)
+
+    if isinstance(content, str):
+        return sub(content)
+    if not isinstance(content, list):
+        return content
+    out = []
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            block = {**block, "text": sub(block["text"])}
+        out.append(block)
+    return out
 
 
 def _message_text_len(content) -> int:
@@ -758,8 +805,19 @@ async def stream_chat(
             detail="Unsupported model. Only Claude models are available.",
         )
 
-    # convert messages to dicts
-    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    # convert messages to dicts, dropping the base64 the client's [IMAGE:...] markers carry
+    messages = [
+        {"role": msg.role, "content": _strip_image_markers(msg.content)}
+        for msg in request.messages
+    ]
+    stripped_chars = sum(
+        _message_text_len(m.content) for m in request.messages
+    ) - sum(_message_text_len(m["content"]) for m in messages)
+    if stripped_chars:
+        logger.info(
+            f"[user={user}] [session={request.session_id}] "
+            f"Stripped {stripped_chars} chars of inline image data from replayed history"
+        )
 
     # the system prompt is assembled server-side and is never client-supplied: it carries
     # the grounding, citation, truncation and out-of-scope rules, so a request may not
