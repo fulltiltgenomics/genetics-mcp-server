@@ -13,6 +13,7 @@ import io
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,12 @@ from pydantic import BaseModel, Field
 from genetics_mcp_server.auth import auth_required
 from genetics_mcp_server.config import get_settings, model_rejects_disabled_thinking
 from genetics_mcp_server.db import get_chat_history_db
+from genetics_mcp_server.memory_digest import MAX_DIGEST_CHARS, render_digest
+from genetics_mcp_server.memory_gate import (
+    MEMORY_DIGEST_SESSION_LIMIT,
+    is_identifiable_user,
+    memory_setting_on,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +46,7 @@ class SessionListItem(BaseModel):
     updated_at: str
     preview: Optional[str] = None
     rating: Optional[int] = None
+    pinned: bool = False
 
 
 class SessionCreateRequest(BaseModel):
@@ -91,6 +99,27 @@ class SessionDetailResponse(BaseModel):
 class ShareRequest(BaseModel):
     """Request to toggle session sharing."""
     shared: bool
+
+
+class PinRequest(BaseModel):
+    """Request to pin or unpin a session."""
+    pinned: bool
+
+
+class MemorySessionItem(BaseModel):
+    """One session as it enters the memory digest."""
+    id: str
+    title: Optional[str]
+    pinned: bool
+    created_at: str
+
+
+class MemoryResponse(BaseModel):
+    """What the memory dialog shows: the opt-in state and a preview of the digest."""
+    enabled: bool
+    digest: str
+    sessions: list[MemorySessionItem]
+    char_cap: int
 
 
 class MessageSaveRequest(BaseModel):
@@ -220,6 +249,7 @@ async def list_sessions(
             updated_at=session.updated_at.isoformat(),
             preview=preview,
             rating=session.rating,
+            pinned=session.pinned_at is not None,
         ))
 
     return result
@@ -371,6 +401,89 @@ async def share_session(
 
     logger.info(f"Session {session_id} shared={request.shared} by {user}")
     return {"shared": request.shared}
+
+
+@router.put(
+    "/chat/sessions/{session_id}/pin",
+    summary="Pin or unpin a session for chat memory",
+)
+async def pin_session(
+    session_id: str,
+    request: PinRequest,
+    user: str = Depends(auth_required),
+):
+    """Pin a session so it keeps surfacing in the memory digest. Owner only.
+
+    A session the caller does not own is reported as missing rather than forbidden: the id
+    is caller-supplied, and a 403 would confirm that somebody else's session exists. Secret
+    chats never wrote a row, so they are 404 here by construction.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    # a pin is a memory control, so it takes the same caller GET /memory takes: with
+    # REQUIRE_AUTH off every local caller is the same `anonymous`, and a pin from one of
+    # them would steer a digest that is not theirs
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    if not db.set_pinned(session_id, user, request.pinned):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger.info(f"Session {session_id} pinned={request.pinned} by {user}")
+    return {"id": session_id, "pinned": request.pinned}
+
+
+@router.get(
+    "/memory",
+    summary="What the next chat session will remember",
+    response_model=MemoryResponse,
+)
+async def get_memory(user: str = Depends(auth_required)):
+    """The caller's own memory digest, rendered fresh.
+
+    This is what the NEXT session will be seeded with, not what the current one carries:
+    a session's digest is frozen on its first turn, so reading that copy back would show
+    the user a stale index of their own history.
+
+    The preview is returned whether or not the setting is on, so the dialog can show what
+    would be remembered before the user opts in. Nothing is written either way.
+
+    Unlike prompt injection, this read does NOT require `gateway_asserted`. Every private
+    read in this router — session detail, messages, attachments — authorizes on the
+    resolved `user` alone, and the digest is rendered from those same rows, so this
+    endpoint discloses nothing the router does not already hand out. Requiring the flag
+    here would harden one endpoint while its source rows stayed reachable next door.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    # a service identity and the shared `anonymous` of an auth-less deployment name no
+    # person, so they own no memory — reported as missing, like an id that resolves to
+    # nobody, rather than as a permission the caller could acquire
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    sessions = db.get_recent_sessions_for_digest(
+        user, MEMORY_DIGEST_SESSION_LIMIT, include_pinned=True
+    )
+    return MemoryResponse(
+        enabled=memory_setting_on(user),
+        digest=render_digest(sessions, datetime.now(timezone.utc)),
+        # the rows that were handed to the renderer, in the order it saw them. The renderer
+        # drops its oldest entries when the character cap binds, so a long list can name a
+        # session whose line did not survive into `digest`
+        sessions=[
+            MemorySessionItem(
+                id=row["id"],
+                title=row["title"],
+                pinned=row["pinned_at"] is not None,
+                created_at=str(row["created_at"]),
+            )
+            for row in sessions
+        ],
+        char_cap=MAX_DIGEST_CHARS,
+    )
 
 
 @router.post(

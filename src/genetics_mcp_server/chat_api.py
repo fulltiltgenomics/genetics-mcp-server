@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from dotenv import load_dotenv
@@ -44,10 +45,16 @@ from genetics_mcp_server.config.defaults import (
     instruction_envelope,
     verbosity_prompt,
 )
-from genetics_mcp_server.db import get_llm_config_db
+from genetics_mcp_server.db import get_chat_history_db, get_llm_config_db
 from genetics_mcp_server.db.llm_config_db import INSTRUCTION_SET_MAX_BODY_CHARS
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
+from genetics_mcp_server.memory_digest import render_digest
+from genetics_mcp_server.memory_gate import (
+    MEMORY_DIGEST_SESSION_LIMIT,
+    memory_gate_open,
+    user_log_hash,
+)
 from genetics_mcp_server.rate_limit import check_rate_limit
 from genetics_mcp_server.rate_limit import configure as configure_rate_limit
 from genetics_mcp_server.routers import (
@@ -576,6 +583,101 @@ def _resolve_user_instructions(
         return None
 
 
+def _load_user_memory(
+    user: str | None,
+    session_id: str | None,
+    *,
+    secret: bool,
+    gateway_asserted: bool,
+    first_turn: bool,
+    db: Any = None,
+) -> str | None:
+    """The blocking half of `_resolve_user_memory`, run in a worker thread.
+
+    Every step is a database call — the opt-in setting, the session row, the content of
+    up to MEMORY_DIGEST_SESSION_LIMIT sessions, and the write — and chat_history.db
+    shares its volume with the nightly analysis job, so a turn resolving memory on the
+    event loop would hold it for that job's busy timeout before the first SSE byte.
+    """
+    if not memory_gate_open(user, gateway_asserted=gateway_asserted, secret=secret):
+        return None
+
+    db = db or get_chat_history_db()
+    session = db.get_session(session_id, user) if session_id else None
+    if session is not None and session.context_digest:
+        # byte-stable for the life of the session: a cache block that changed between
+        # turns would invalidate the whole prefix on every follow-up. Nothing is
+        # logged here — the stored bytes were logged when they were rendered, and
+        # this path has no session count to report
+        return session.context_digest
+
+    if not first_turn:
+        # nothing stored on a later turn means the first turn had nothing to pin: an
+        # empty render is deliberately not persisted. Rendering now would inject memory
+        # into the middle of a conversation that opened without it, as soon as a second
+        # session existed to render — so a turn that is not the first gets none
+        return None
+
+    sessions = db.get_recent_sessions_for_digest(
+        user,
+        MEMORY_DIGEST_SESSION_LIMIT,
+        include_pinned=True,
+        exclude_session_id=session_id,
+    )
+    digest = render_digest(sessions, datetime.now(timezone.utc))
+    if not digest:
+        return None
+    if session_id:
+        # first writer wins. That costs the loser nothing unless another session's title
+        # or updated_at moved between the two renders; then this turn ran on bytes the
+        # stored copy does not match and the next turn reads the stored ones back — one
+        # cache miss, after which the session is byte-stable again
+        db.set_context_digest(session_id, user, digest)
+    # a turn with no session id (the browser creates the row lazily) has nothing to
+    # pin the digest to, so it renders fresh and persists nothing
+    logger.info(
+        f"memory digest: user={user_log_hash(user)} "
+        f"sessions={len(sessions)} chars={len(digest)}"
+    )
+    return digest
+
+
+async def _resolve_user_memory(
+    user: str | None,
+    session_id: str | None,
+    *,
+    secret: bool,
+    gateway_asserted: bool,
+    first_turn: bool,
+    db: Any = None,
+) -> str | None:
+    """The rendered cross-session digest for this turn, or None.
+
+    Returns the digest TEXT, not a prompt fragment: the caller hands it to the model
+    layer, which wraps it in `memory_envelope` beside the instruction envelope so both
+    share one cache block.
+
+    The gate is `memory_gate_open` — opt-in, gateway-asserted, non-secret, a named person.
+    Every failure past it degrades to 'no memory' the way instruction sets do: memory is a
+    convenience, and a convenience must never fail a chat turn. The opt-in read is inside
+    the try for that reason — it is a query against a second database, and it used to be
+    able to fail the turn.
+    """
+    try:
+        return await asyncio.to_thread(
+            _load_user_memory,
+            user,
+            session_id,
+            secret=secret,
+            gateway_asserted=gateway_asserted,
+            first_turn=first_turn,
+            db=db,
+        )
+    except Exception as e:
+        logger.warning(f"Could not load chat memory, continuing without it: {e}")
+        return None
+
+
 @app.post("/chat/v1/chat")
 async def stream_chat(
     request: ChatRequest,
@@ -678,6 +780,18 @@ async def stream_chat(
     user_instructions = _resolve_user_instructions(
         user, request.instruction_set_id, secret=request.secret
     )
+    # the browser replays the whole conversation and a tool result comes back as a `user`
+    # message, so counting user messages would call a mid-turn continuation a first turn.
+    # The absence of an assistant message is exact — one is present from the moment the
+    # first reply is replayed — and would only be false if a client dropped history
+    first_turn = not any(m.role == "assistant" for m in request.messages)
+    user_memory = await _resolve_user_memory(
+        user,
+        request.session_id,
+        secret=request.secret,
+        gateway_asserted=gateway_asserted,
+        first_turn=first_turn,
+    )
 
     async def event_generator():
         """Generate SSE events from LLM stream."""
@@ -695,6 +809,7 @@ async def stream_chat(
                 user=user,
                 session_id=request.session_id,
                 user_instructions=user_instructions,
+                user_memory=user_memory,
                 message_id=request.message_id,
                 capture_thinking=request.capture_thinking,
                 gateway_asserted=gateway_asserted,

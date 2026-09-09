@@ -378,7 +378,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
+                   shared, pinned_at
             FROM chat_sessions
             WHERE user_id = ?
             ORDER BY updated_at DESC

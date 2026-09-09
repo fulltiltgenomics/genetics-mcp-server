@@ -25,6 +25,7 @@ from genetics_mcp_server.config import (
 from genetics_mcp_server.config.defaults import (
     CONTINUE_TRUNCATED_PROMPT,
     CONTINUE_UNFILLED_PROMPT,
+    memory_envelope,
 )
 from genetics_mcp_server.cost import estimate_cost, get_context_window
 from genetics_mcp_server.download_store import get_download_store
@@ -912,6 +913,7 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         user_instructions: str | None = None,
+        user_memory: str | None = None,
         message_id: str | None = None,
         capture_thinking: bool = False,
         gateway_asserted: bool = False,
@@ -946,6 +948,12 @@ class LLMService:
                 set. Kept separate from system_prompt rather than concatenated so it can occupy
                 its own cache block on the Anthropic path; the OpenAI path has no equivalent
                 breakpoint and concatenates the two into one system message.
+            user_memory: The RENDERED digest of this user's other sessions, unwrapped —
+                `memory_envelope` is applied here, beside the instruction envelope, so both
+                land in one cache block. Resolved and gated by the caller
+                (chat_api._resolve_user_memory); None whenever any gate withholds it, and
+                block 1 is then byte-identical to a turn with no memory feature at all.
+                Anthropic only: the OpenAI path is refused at the API boundary.
             message_id: Client-generated id of the assistant message this turn will become,
                 used only to key the recorded turn metrics to chat_messages. Optional: the
                 metrics row is still written without it, it just cannot be joined.
@@ -986,6 +994,7 @@ class LLMService:
                 user=user,
                 session_id=session_id,
                 user_instructions=user_instructions,
+                user_memory=user_memory,
                 message_id=message_id,
                 capture_thinking=capture_thinking,
                 gateway_asserted=gateway_asserted,
@@ -1065,6 +1074,7 @@ class LLMService:
         user: str | None = None,
         session_id: str | None = None,
         user_instructions: str | None = None,
+        user_memory: str | None = None,
         message_id: str | None = None,
         capture_thinking: bool = False,
         gateway_asserted: bool = False,
@@ -1096,8 +1106,8 @@ class LLMService:
         # message with a cache_control breakpoint. This one earns its place by offsetting the
         # larger replayed payload now that tool results are persisted and replayed.
         # Anthropic allows 4 breakpoints and all 4 are spoken for — tool definitions, the shared
-        # system block, this user's instruction block, and this one — so anything that wants a
-        # new one has to take it from these.
+        # system block, this user's own block (instructions and memory together), and this one —
+        # so anything that wants a new one has to take it from these.
         # Caveats: ephemeral cache TTL is ~5 min, and the cache lookback window means very long
         # tool-heavy single turns may not hit. Caching is most valuable for resumes and rapid
         # follow-ups.
@@ -1131,14 +1141,27 @@ class LLMService:
         # block per user per event (~$0.043) rather than writing the small per-user block
         # (~$0.0025), and leaving the user block uncached costs ~$0.05 across a
         # 25-iteration turn.
+        #
+        # the memory envelope joins block 1 rather than taking a block of its own: all four
+        # of Anthropic's cache breakpoints are already spoken for (tools, block 0, block 1,
+        # the replayed history). Both fragments are per-user, and both hold still for the
+        # length of a session — the digest is rendered on a session's first turn only and
+        # read back verbatim from the stored row on every turn after it — so they share one
+        # entry without costing either anything. A caller that rendered a digest on a later
+        # turn would falsify that and move this block mid-conversation. The join is over
+        # the non-empty parts only, so with no memory block 1 is the instruction envelope
+        # byte for byte, and with neither there is no block 1 at all.
         system_blocks: list[dict[str, Any]] = []
         if system_prompt:
             system_blocks.append(
                 {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
             )
-        if user_instructions:
+        user_block = "\n\n".join(
+            part for part in (user_instructions, memory_envelope(user_memory or "")) if part
+        )
+        if user_block:
             system_blocks.append(
-                {"type": "text", "text": user_instructions, "cache_control": {"type": "ephemeral"}}
+                {"type": "text", "text": user_block, "cache_control": {"type": "ephemeral"}}
             )
         if system_blocks:
             request_params["system"] = system_blocks

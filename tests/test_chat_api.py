@@ -1196,6 +1196,58 @@ class TestInstructionSetWiring:
         self._client = test_client
 
 
+class TestFirstTurnDetection:
+    """Only a session's first turn may render a digest, so the endpoint has to tell one
+    from the history the browser replays."""
+
+    def _first_turn(self, test_client, messages):
+        from genetics_mcp_server import chat_api
+
+        captured = {}
+
+        async def fake(user, session_id, **kwargs):
+            captured.update(kwargs)
+            return None
+
+        with (
+            patch.object(chat_api, "get_llm_service", return_value=_CapturingService()),
+            patch.object(chat_api, "_resolve_user_memory", side_effect=fake),
+        ):
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={"messages": messages, "enable_tools": False},
+                headers={
+                    "X-Goog-Authenticated-User-Email": "accounts.google.com:a@finngen.fi"
+                },
+            )
+        assert response.status_code == 200
+        return captured["first_turn"]
+
+    def test_one_user_message_opens_a_session(self, test_client):
+        assert self._first_turn(test_client, [{"role": "user", "content": "Hi"}]) is True
+
+    def test_a_replayed_tool_result_is_not_a_first_turn(self, test_client):
+        """A tool result is replayed as a `user` message, so counting user messages would
+        call this a first turn; the assistant turn above it is what settles it."""
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ],
+            },
+        ]
+
+        assert self._first_turn(test_client, messages) is False
+
+
 async def _system_blocks(system_prompt, user_instructions):
     """Run one Anthropic turn and return the `system` parameter it sent."""
     from test_stream_truncation import _service, _text_turn
@@ -1580,3 +1632,279 @@ class TestClassifyErrorSubclasses:
             message = chat_api._classify_error(err)
 
         assert "internal server error" in message.lower()
+
+
+class TestUserMemoryResolution:
+    """chat_api._resolve_user_memory: an opt-in, gateway-asserted, per-person feature that
+    may never cost a caller their turn."""
+
+    USER = "a@finngen.fi"
+
+    def _seed(self, chat_history_db, user, title, message="What about APOE?"):
+        session = chat_history_db.create_session(user)
+        chat_history_db.update_session(session.id, user, title=title)
+        chat_history_db.add_message(session.id, f"m-{session.id}", "user", message)
+        return session
+
+    def _opt_in(self, llm_config_db, user=USER, value="on"):
+        llm_config_db.save_user_setting(
+            user_id=user, setting_key="chat_memory", setting_value=value
+        )
+
+    async def _resolve(
+        self,
+        llm_config_db,
+        chat_history_db,
+        user=USER,
+        session_id=None,
+        secret=False,
+        gateway_asserted=True,
+        first_turn=True,
+    ):
+        from genetics_mcp_server import chat_api, memory_gate
+
+        with patch.object(memory_gate, "get_llm_config_db", return_value=llm_config_db):
+            return await chat_api._resolve_user_memory(
+                user,
+                session_id,
+                secret=secret,
+                gateway_asserted=gateway_asserted,
+                first_turn=first_turn,
+                db=chat_history_db,
+            )
+
+    @pytest.mark.asyncio
+    async def test_opt_in_injects_the_digest(self, llm_config_db, chat_history_db):
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        self._opt_in(llm_config_db)
+
+        digest = await self._resolve(llm_config_db, chat_history_db)
+
+        assert digest is not None
+        assert "APOE and LDL" in digest
+
+    @pytest.mark.asyncio
+    async def test_an_absent_setting_withholds_memory(self, llm_config_db, chat_history_db):
+        """Opt-in: nothing is remembered for a user who never opened the dialog."""
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+
+        assert await self._resolve(llm_config_db, chat_history_db) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["off", "", "true", "ON"])
+    async def test_any_value_but_on_withholds_memory(
+        self, llm_config_db, chat_history_db, value
+    ):
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        self._opt_in(llm_config_db, value=value)
+
+        assert await self._resolve(llm_config_db, chat_history_db) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("user", ["mcp-tool", "anonymous", None, ""])
+    async def test_an_unidentifiable_caller_withholds_memory(
+        self, llm_config_db, chat_history_db, user
+    ):
+        """`mcp-tool` is a service and `anonymous` is shared by every caller of an
+        auth-less deployment, so neither names a person whose memory this could be."""
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        self._opt_in(llm_config_db)
+        if user:
+            self._opt_in(llm_config_db, user=user)
+            self._seed(chat_history_db, user, "Service work")
+
+        assert await self._resolve(llm_config_db, chat_history_db, user=user) is None
+
+    @pytest.mark.asyncio
+    async def test_an_unasserted_identity_withholds_memory(
+        self, llm_config_db, chat_history_db
+    ):
+        """Without the gateway's assertion, `user` is a header any marker holder can type."""
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        self._opt_in(llm_config_db)
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, gateway_asserted=False
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_secret_mode_withholds_memory(self, llm_config_db, chat_history_db):
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        self._opt_in(llm_config_db)
+
+        assert await self._resolve(llm_config_db, chat_history_db, secret=True) is None
+
+    @pytest.mark.asyncio
+    async def test_the_session_being_started_is_excluded(
+        self, llm_config_db, chat_history_db
+    ):
+        """A session has no history of its own on its first turn."""
+        self._opt_in(llm_config_db)
+        current = self._seed(chat_history_db, self.USER, "The current one")
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_the_digest_is_byte_stable_across_a_session(
+        self, llm_config_db, chat_history_db
+    ):
+        """Turn 2 and 3 read the stored copy, so the cache block never moves under them."""
+        self._opt_in(llm_config_db)
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        current = chat_history_db.create_session(self.USER)
+
+        first = await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
+        # a session that lands mid-conversation would change a freshly rendered digest
+        self._seed(chat_history_db, self.USER, "A later, unrelated question")
+        second = await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
+        third = await self._resolve(llm_config_db, chat_history_db, session_id=current.id)
+
+        assert first is not None
+        assert "A later, unrelated question" not in first
+        assert first == second == third
+        assert chat_history_db.get_session(current.id, self.USER).context_digest == first
+
+    @pytest.mark.asyncio
+    async def test_a_turn_without_a_session_id_renders_but_persists_nothing(
+        self, llm_config_db, chat_history_db
+    ):
+        self._opt_in(llm_config_db)
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+
+        digest = await self._resolve(llm_config_db, chat_history_db, session_id=None)
+
+        assert digest is not None
+        stored = chat_history_db._conn.execute(
+            "SELECT COUNT(*) FROM chat_sessions WHERE context_digest IS NOT NULL"
+        ).fetchone()[0]
+        assert stored == 0
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_conversation_is_gone_from_the_next_session(
+        self, llm_config_db, chat_history_db
+    ):
+        self._opt_in(llm_config_db)
+        doomed = self._seed(chat_history_db, self.USER, "Regrettable question")
+        first = chat_history_db.create_session(self.USER)
+
+        assert "Regrettable question" in await self._resolve(
+            llm_config_db, chat_history_db, session_id=first.id
+        )
+
+        chat_history_db.delete_session(doomed.id, self.USER)
+        later = chat_history_db.create_session(self.USER)
+
+        # `first` is still there, so a digest is still rendered — it just may not name
+        # the conversation the user asked to be forgotten
+        assert "Regrettable question" not in await self._resolve(
+            llm_config_db, chat_history_db, session_id=later.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_db_failure_costs_the_memory_not_the_turn(
+        self, llm_config_db, chat_history_db
+    ):
+        self._opt_in(llm_config_db)
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+
+        boom = patch.object(
+            type(chat_history_db),
+            "get_recent_sessions_for_digest",
+            side_effect=RuntimeError("database is locked"),
+        )
+        with boom:
+            assert await self._resolve(llm_config_db, chat_history_db) is None
+
+    @pytest.mark.asyncio
+    async def test_a_settings_db_failure_costs_the_memory_not_the_turn(
+        self, llm_config_db, chat_history_db, caplog
+    ):
+        """The opt-in read is a query too, and it runs before any of the memory work."""
+        import logging
+
+        self._opt_in(llm_config_db)
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+
+        boom = patch.object(
+            type(llm_config_db),
+            "get_user_setting",
+            side_effect=RuntimeError("no such table: user_settings_history"),
+        )
+        with boom, caplog.at_level(logging.WARNING):
+            assert await self._resolve(llm_config_db, chat_history_db) is None
+
+        assert any(
+            m.startswith("Could not load chat memory") for m in caplog.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_empty_first_turn_never_becomes_memory_later(
+        self, llm_config_db, chat_history_db
+    ):
+        """A user with no history renders nothing, and an empty render is not pinned. The
+        session must not pick memory up mid-conversation once a second session exists."""
+        self._opt_in(llm_config_db)
+        current = chat_history_db.create_session(self.USER)
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        ) is None
+
+        self._seed(chat_history_db, self.USER, "A later, unrelated question")
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id, first_turn=False
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_a_later_turn_reads_the_stored_bytes(
+        self, llm_config_db, chat_history_db
+    ):
+        self._opt_in(llm_config_db)
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+        current = chat_history_db.create_session(self.USER)
+
+        first = await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id
+        )
+        assert first is not None
+        assert chat_history_db.get_session(current.id, self.USER).context_digest == first
+
+        assert await self._resolve(
+            llm_config_db, chat_history_db, session_id=current.id, first_turn=False
+        ) == first
+
+    @pytest.mark.asyncio
+    async def test_the_log_line_names_a_hash_never_an_address(
+        self, llm_config_db, chat_history_db, caplog
+    ):
+        import logging
+
+        self._opt_in(llm_config_db)
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+
+        with caplog.at_level(logging.INFO):
+            digest = await self._resolve(llm_config_db, chat_history_db)
+
+        line = next(m for m in caplog.messages if m.startswith("memory digest:"))
+        assert re.fullmatch(
+            r"memory digest: user=[0-9a-f]{12} sessions=1 chars=\d+", line
+        )
+        assert f"chars={len(digest)}" in line
+        assert "@" not in line
+        assert "APOE" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_withheld_turn_logs_nothing(
+        self, llm_config_db, chat_history_db, caplog
+    ):
+        import logging
+
+        self._seed(chat_history_db, self.USER, "APOE and LDL")
+
+        with caplog.at_level(logging.INFO):
+            await self._resolve(llm_config_db, chat_history_db)
+
+        assert not [m for m in caplog.messages if m.startswith("memory digest:")]
