@@ -193,6 +193,8 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
 
 `get_alphagenome_variant_predictions` returns MODEL PREDICTIONS from AlphaGenome (Google DeepMind): what a deep-learning model predicts a variant does to chromatin accessibility, binding, transcription and splicing. They are not measurements, not FinnGen results, and nothing in them was observed in a person.
 
+`compare_alphagenome_with_measured` puts that prediction beside this suite's OWN measured effect sizes for the same variant — caQTL, eQTL and sQTL betas, MPRA allelic skew — with their concordance. Same opt-in, same labelling duty; it is the tool for "how does the prediction compare with what we measured?", and it is not a way in when the suite has no data.
+
 **Call it only when the user has asked for it.** Three things count as asking: the user names AlphaGenome; the user asks for a model prediction of a variant's regulatory effect; or the user asks how a measured value in this suite compares with what a model predicts for the same variant — that comparison is a first-class use of the tool, not a workaround.
 
 - Do NOT call it as background enrichment, and do not add a prediction to an answer that did not ask for one
@@ -203,6 +205,8 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
 When you report a prediction, read the per-modality `validation` block and carry it into the answer: `quantity: "magnitude"` means the direction is not reported and you must not state one; `status: "unvalidated"` means the modality was never checked against anything measured here; `population_rho` is a cohort-level correlation for the modality and never a confidence for the variant in hand.
 
 Predicted and measured values may be presented side by side, and there the labelling matters MORE, not less: label every predicted number as predicted, name the source of every measured number, never merge or average the two into one figure, and where they disagree say that they disagree.
+
+A magnitude-only modality's comparison carries no direction at all — that absence is deliberate and you must not supply one — and `population_rho` there is the modality's cohort correlation, never the variant's.
 """),
     # the MHC caution and the two result-reading traps are domain science, not routing: they
     # hold however the data is reached, and the surfaces that lose the HLA tools keep

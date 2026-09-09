@@ -481,6 +481,7 @@ class Settings:
             # telling the model when to use it. Withdrawing the name takes the block with it,
             # because default_system_prompt is assembled from the resolved tool names.
             disabled.add("get_alphagenome_variant_predictions")
+            disabled.add("compare_alphagenome_with_measured")
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a
             # sandbox rather than broken by it, and neither is a tool the prompt prefers

@@ -102,6 +102,7 @@ _mcp_disabled = _settings.disabled_tools | {
     # Google-account holder, so the tool stays on the chat surface where a person asked
     # for it by name.
     "get_alphagenome_variant_predictions",
+    "compare_alphagenome_with_measured",
     # SECURITY CONTROL, not a product decision: code execution must not be reachable via
     # MCP (genetics-results-suite-4h6). run_analysis IS code execution; read_artifact
     # returns files a script wrote for the chat session that ran it, and resolving a name

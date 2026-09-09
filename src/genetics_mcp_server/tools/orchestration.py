@@ -346,6 +346,30 @@ _ALPHAGENOME_LABEL = {
     "prediction_source": "AlphaGenome (Google DeepMind)",
 }
 
+# The comparison envelope deliberately carries NO `measured` flag. A response holding both
+# kinds of number cannot have one true value for it, and `measured: false` on a payload
+# whose leaves include real assay results is the single most damaging thing this capability
+# could say. The flag lives on every leaf instead, where it is always true or always false.
+_ALPHAGENOME_COMPARISON_LABEL = {
+    "data_kind": "prediction_vs_measurement",
+    "prediction_source": "AlphaGenome (Google DeepMind)",
+    "labelling": (
+        "This response holds BOTH a model prediction and this suite's own measurements. "
+        "Every value carries its own `measured` flag, and every measured value names the "
+        "view and column it came from. Never merge or average the two into one figure."
+    ),
+}
+
+
+def _requested_variants(variants: str | list[str]) -> list[str]:
+    """The caller's variant ids, however the surface spelled them."""
+    ids = (
+        [v.strip() for v in variants.split(",")]
+        if isinstance(variants, str)
+        else [str(v).strip() for v in (variants or [])]
+    )
+    return [v for v in ids if v]
+
 
 class ServerToolExecutor(ToolExecutor):
     """The tool executor as the chat backend and the MCP server construct it."""
@@ -384,12 +408,7 @@ class ServerToolExecutor(ToolExecutor):
         validation block, so there is nothing to reshape: reshaping is where the
         prediction would start to read like a measurement.
         """
-        requested = (
-            [v.strip() for v in variants.split(",")]
-            if isinstance(variants, str)
-            else [str(v).strip() for v in (variants or [])]
-        )
-        requested = [v for v in requested if v]
+        requested = _requested_variants(variants)
         try:
             result = await self.alphagenome.score_variants(requested, cell_type, modalities)
         except Exception:
@@ -403,6 +422,92 @@ class ServerToolExecutor(ToolExecutor):
         # the label spreads LAST: it is the one thing a client response must not be able
         # to overwrite, and no key of the client's collides with it today
         return {**result, **_ALPHAGENOME_LABEL}
+
+    async def compare_alphagenome_with_measured(
+        self,
+        variants: str | list[str],
+        cell_type: str | None = None,
+        modalities: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """This suite's measured effect sizes beside AlphaGenome's prediction, per modality.
+
+        Two halves that must not be reshaped into one: the prediction comes back from the
+        Atlas client exactly as the prediction tool returns it, and the measurements come
+        from db-api by the same `query_database` path every other view goes through. The
+        joining, the quantity rule and the labelling live in tools/alphagenome_comparison.py.
+
+        Nothing here is gated on the suite's data being absent -- the comparison is valid
+        precisely when both exist, which is the point of the capability.
+        """
+        from genetics_mcp_server.tools import alphagenome_comparison as comparison
+
+        requested = _requested_variants(variants)
+        try:
+            prediction = await self.alphagenome.score_variants(
+                requested, cell_type, modalities
+            )
+        except Exception:
+            logger.exception("Error in compare_alphagenome_with_measured(%r)", requested)
+            return {
+                **_ALPHAGENOME_COMPARISON_LABEL,
+                "success": False,
+                "stage": "internal",
+                "error": INTERNAL_ERROR_MSG,
+            }
+        if not prediction.get("success"):
+            return {**prediction, **_ALPHAGENOME_COMPARISON_LABEL}
+
+        entries = prediction.get("results") or []
+        suite_ids = [
+            sid
+            for sid in (
+                comparison.suite_variant_id(entry.get("variant") or {})
+                for entry in entries
+                if entry.get("success")
+            )
+            if sid
+        ]
+        needed = comparison.views_needed(
+            {name for entry in entries for name in (entry.get("modalities") or {})}
+        )
+        rows_by_view, lookups, unavailable = {}, {}, set()
+        for view, data_types in (needed.items() if suite_ids else ()):
+            sql = (
+                comparison.credible_sets_sql(suite_ids, data_types, cell_type)
+                if view == comparison.CREDIBLE_SETS_VIEW
+                else comparison.mpra_sql(suite_ids, cell_type)
+            )
+            answer = await self.query_database(sql, max_rows=comparison.MAX_ROWS)
+            rows_by_view[view] = comparison.rows_from_query(answer)
+            lookups[view] = {
+                "success": bool(answer.get("success")),
+                "n_rows": len(rows_by_view[view]),
+                **({"error": answer["error"]} if not answer.get("success") else {}),
+            }
+            if not answer.get("success"):
+                unavailable.add(view)
+
+        by_variant = comparison.group_by_variant(rows_by_view)
+        results = [
+            comparison.compare_variant(
+                entry,
+                by_variant.get(
+                    comparison.suite_variant_id(entry.get("variant") or {}) or "", {}
+                ),
+                cell_type,
+                frozenset(unavailable),
+            )
+            for entry in entries
+        ]
+        return {
+            "success": True,
+            "n_requested": prediction.get("n_requested"),
+            "n_compared": sum(1 for r in results if r.get("success")),
+            "results": results,
+            "measured_lookup": lookups,
+            "attribution": prediction.get("attribution"),
+            **_ALPHAGENOME_COMPARISON_LABEL,
+        }
 
     # -------------------------------------------------------------------------
     # External Search Tools
