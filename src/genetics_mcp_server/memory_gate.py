@@ -1,7 +1,7 @@
 """The single place that decides whether a caller gets cross-session chat memory.
 
 The chat turn (chat_api._resolve_user_memory) and the memory dialog's endpoint
-(routers/chat_history.get_memory) must agree on what "on" means, so the setting is read
+(routers/chat_history.get_project_memory) must agree on what "on" means, so the setting is read
 here and nowhere else: a second reader is a second definition of the opt-in, and the two
 would drift the moment either side gained a default.
 """

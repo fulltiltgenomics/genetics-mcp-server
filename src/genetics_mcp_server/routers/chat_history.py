@@ -465,7 +465,8 @@ async def pin_session(
     """
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
-    # a pin is a memory control, so it takes the same caller GET /memory takes: with
+    # a pin is a memory control, so it takes the same caller the project memory
+    # endpoint takes: with
     # REQUIRE_AUTH off every local caller is the same `anonymous`, and a pin from one of
     # them would steer a digest that is not theirs
     if not is_identifiable_user(user):

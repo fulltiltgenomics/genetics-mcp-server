@@ -1487,14 +1487,27 @@ All under `/chat/v1`, all `Depends(auth_required)` and scoped to the authenticat
 - `DELETE /chat/v1/llm-config/user/instruction-sets/{set_id}` — archives, **204**; 404 as above
 - `GET /chat/v1/llm-config/user/instruction-sets/{set_id}/history?limit=20` — versions newest first. Archived sets stay readable here, so history survives a delete
 
-Two more endpoints under `/chat/v1`, also `Depends(auth_required)` and scoped to the caller, but
-in `routers/chat_history.py` rather than `llm_config.py` — they control cross-session memory, a
-separate opt-in feature documented under "Cross-session memory premise measurement" below. Both
-also 404 for a caller that is not an identifiable person (a service identity, or the shared
-`anonymous` of an auth-less deployment):
+Cross-session memory is a separate opt-in feature (documented under "Cross-session memory
+premise measurement" below), and its endpoints live in `routers/chat_history.py` rather than
+`llm_config.py`. They are scoped to a **project**: the project CRUD and per-project session list
+(`list_projects`, `create_project`, `update_project`, `delete_project`, `list_project_sessions`),
+filing a conversation into one (`set_session_project`), the project's digest rendered fresh
+(`get_project_memory` — answered regardless of the opt-in, so the memory dialog can preview it
+before the setting is turned on) and the pin toggle (`pin_session`, which keeps a conversation in
+its own project's digest after it falls out of the in-project window). Read the decorators for
+paths and status codes. Like the rest of that router they 404 rather than 403 for something that
+is not the caller's, and they 404 for a caller that is not an identifiable person (a service
+identity, or the shared `anonymous` of an auth-less deployment) — a secret chat's id 404s at the
+pin by construction, having never written a row.
 
-- `GET /chat/v1/memory` — the caller's digest rendered fresh (not the frozen per-session copy), plus the `enabled` flag and the session rows it was built from; answers regardless of the opt-in, so the memory dialog can preview it before the setting is turned on
-- `PUT /chat/v1/chat/sessions/{id}/pin` — pin or unpin a session so it keeps surfacing in the digest past the recency window; 404s (not 403s) for a session the caller does not own, and for a secret chat's id, which never had a row to pin
+`chat_projects` (id, owner, name, timestamps, capped per user by
+`chat_history_db.PROJECTS_MAX_PER_USER`) and the nullable `chat_sessions.project_id` carry the
+grouping; membership sits on the session, not on its messages, so a fork does not inherit it.
+`chat_sessions.context_digest` is **tri-state**: NULL means no digest has been rendered for that
+session, a string is replayed verbatim on every later turn, and an empty string records that the
+project held nothing else to index — a hit, so the session does not re-render on every turn until
+the project gains a second conversation. `set_session_project` nulls it whenever the project
+actually changes, which is what makes a move re-render.
 
 `GET /chat/v1/chat/sessions` (`list_sessions`, `routers/chat_history.py`) now returns a
 `pinned` field per session, sourced from `chat_sessions.pinned_at`.
@@ -1854,11 +1867,13 @@ instead of writing the small per-user block (~$0.0025); leaving the user block u
 breakpoints, which is why the memory envelope, added later, joins block 1 rather than claiming
 one of its own — see `docs/chat-tool-reference.md` §4 in **genetics-results-suite** for the
 full breakpoint accounting. Both halves are per-user and both hold still for a session's whole length: the
-instruction envelope never changes mid-session, and the memory digest is rendered once, on a
-session's first turn, and read back verbatim from `chat_sessions.context_digest` on every turn
-after — so joining them costs neither fragment anything. See "Cross-session memory premise
-measurement" below and `docs/project-spec.md` ("Chat memory (recent-work digest)") in
-**genetics-results-suite** for what feeds the memory half.
+instruction envelope never changes mid-session, and the memory digest is rendered once, on the
+first turn a session inside a project takes, and read back verbatim from
+`chat_sessions.context_digest` on every turn after — so joining them costs neither fragment
+anything. Filing, moving or unfiling the conversation re-renders it and moves block 1 once, at
+the price of that one turn's cache read. See "Cross-session memory premise measurement" below and
+`docs/project-spec.md` ("Chat memory (per-project digest)") in **genetics-results-suite** for what
+feeds the memory half.
 
 ### Where the choice is visible afterwards
 
@@ -2798,10 +2813,11 @@ only by this script.
 users with at least `M1_MIN_SESSIONS` in-window sessions that have two or more clusters of
 three or more sessions — are users multi-threaded at all. **M2** takes the returning
 sessions whose first user message re-mentions a strict entity from an earlier session and
-reports the share where the session the digest would have led with — the newest earlier
-session in `recency_key` order, which reproduces `get_recent_sessions_for_digest`'s
-`updated_at DESC, id DESC` — sits in a different cluster from where that entity was worked
-on. **M3** shares that denominator and counts the re-mentions whose source session (the most
+reports the share where the session an unscoped digest would have led with — the newest earlier
+session in `recency_key` order, mirroring `get_recent_sessions_for_digest`'s
+`updated_at DESC, id DESC` (the accessor's pinned sessions and its NULL-`updated_at` handling are
+not reproduced; `recency_key` falls back to `created_at`) — sits in a different cluster from where
+that entity was worked on. **M3** shares that denominator and counts the re-mentions whose source session (the most
 recent earlier session naming the entity, the one the digest would surface) has fallen out
 of the last-`DIGEST_WINDOW_SESSIONS` window while still belonging to the current session's
 cluster: the miss a project-scoped memory recovers and a recency-scoped one cannot. A pinned
@@ -2810,7 +2826,10 @@ source session is treated as in-window regardless of recency, matching
 window; `collect` reports whether that distinction was even readable, as
 `clusters.pinned_visible` — false when `chat_sessions` predates the `pinned_at` column (the
 production schema at the time this was written), in which case every pinned source outside
-the window is counted as a miss anyway and `m3_window_miss_share` is biased up. Most
+the window is counted as a miss anyway and `m3_window_miss_share` is biased up. The clustering
+universe is the window's own sessions, so the last-90-day figures cluster only sessions created in
+those 90 days and a line of work older than the window reads as a separate cluster or as none,
+biasing M3 down. Most
 re-mentions cannot structurally be a window miss, because the user had at most
 `DIGEST_WINDOW_SESSIONS` prior in-window sessions at that point and every one of those is
 trivially inside the window; `analyse_clusters` also reports `m3_eligible_remention_sessions`

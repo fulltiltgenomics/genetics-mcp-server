@@ -1832,7 +1832,7 @@ class TestUserMemoryResolution:
     async def test_an_unfiled_session_gets_no_memory_and_never_opens_the_window(
         self, llm_config_db, chat_history_db
     ):
-        """The window called without a project is the recency window this replaced, so an
+        """The window called without a project spans every session the user owns, so an
         unfiled conversation must not reach it even to have the result thrown away."""
         self._opt_in(llm_config_db)
         project = chat_history_db.create_project(self.USER, "IBD")

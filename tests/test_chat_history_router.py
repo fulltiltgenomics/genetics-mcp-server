@@ -945,8 +945,8 @@ def client_as_anonymous(test_db):
 
 
 class TestMemoryEndpoints:
-    """PUT /chat/sessions/{id}/pin. The recency-window GET /memory is retired; its scoped
-    replacement, GET /projects/{id}/memory, is covered in TestProjectMemoryEndpoint."""
+    """PUT /chat/sessions/{id}/pin. The digest itself is covered in
+    TestProjectMemoryEndpoint."""
 
     USER = "test@example.com"
 
@@ -955,9 +955,6 @@ class TestMemoryEndpoints:
         test_db.update_session(session.id, user, title=title)
         test_db.add_message(session.id, f"m-{session.id}", "user", "What about APOE?")
         return session
-
-    def test_the_global_memory_endpoint_is_gone(self, client_with_auth):
-        assert client_with_auth.get("/chat/v1/memory").status_code == 404
 
     def test_pin_toggles_and_unpins(self, client_with_auth, test_db):
         session = self._seed(test_db, "APOE and LDL")
@@ -1119,8 +1116,8 @@ class TestProjectMemoryEndpoint:
     def test_a_pinned_session_in_another_project_is_absent(
         self, client_with_auth, test_db, llm_config_db
     ):
-        """The digest is scoped to the project: a pin elsewhere must not leak in, unlike
-        the retired recency-window memory which pulled a pin from anywhere."""
+        """The digest is scoped to the project: a pin in another project must not leak
+        into this one's digest."""
         project = self._project(test_db, name="IBD")
         other_project = self._project(test_db, name="pQTL")
         in_project = self._seed(test_db, project.id, "APOE and LDL")

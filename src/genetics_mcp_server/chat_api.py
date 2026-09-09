@@ -667,8 +667,8 @@ def _load_user_memory(
     if session is None or session.project_id is None:
         # memory is per project, so an unfiled session has none — and neither has a turn
         # whose session row the browser has not created yet. The digest window is not
-        # queried at all here: called without a project it is the old unrestricted
-        # recency window, which is exactly the thing being replaced.
+        # queried at all here: called without a project it spans every session the user
+        # owns, which is precisely what an unfiled conversation must not reach.
         #
         # Two consequences are deliberate. Filing or moving a session mid-conversation
         # renders a fresh digest on its next turn (set_session_project nulls the stored
@@ -697,9 +697,8 @@ def _load_user_memory(
         exclude_session_id=session_id,
     )
     digest = render_digest(sessions, datetime.now(timezone.utc))
-    # an empty render is stored too, and that is what replaced the old "only on the
-    # conversation's first turn" guard: the stored '' covers the guard's one storable
-    # case — session already existed, project was empty. A session created lazily and
+    # an empty render is stored too: '' is what keeps a session whose project held
+    # nothing else from re-rendering on every turn. A session created lazily and
     # filed into a project after its first turn still gets memory starting on its next
     # turn, the same one-move-of-block-1 cost as filing mid-conversation, and that is
     # deliberate. First writer wins, which costs the loser nothing unless another
