@@ -1893,6 +1893,7 @@ src/genetics_mcp_server/
 ├── download_store.py    # disk-persisted download storage for TSV files
 ├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
 ├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
+├── memory_digest.py     # entity extraction shared by the memory digest and its premise gate
 ├── config/
 │   ├── __init__.py
 │   ├── settings.py      # configuration dataclass
@@ -1922,6 +1923,7 @@ src/genetics_mcp_server/
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
 │   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
+│   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -2693,6 +2695,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
+| `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
@@ -2715,6 +2718,35 @@ collection order. The seed is printed in the pytest header; reproduce a failure 
 `pytest --randomly-seed=<seed>`, or take the collection order out of the picture with
 `pytest -p no:randomly`. The pin is deliberate — the seed-to-order mapping is not stable
 across plugin versions, so a seed quoted in a bug report only means something at one version.
+
+## Cross-session memory premise measurement
+
+`memory_digest.py` extracts entities from an assistant message's stored `content_json`:
+`(kind, value)` pairs over a closed set of kinds — gene, phenotype, variant, dataset,
+view. It reads only `tool_use` **inputs**, never tool results — `extract_entities` takes
+`tool_results_json` and ignores it, so memory can never be built from fetched rows. The
+parameter names it keys on come from `tools/definitions.py`; `query` is resolved per tool,
+because it carries a gene for `search_genes` and a sentence for `search_scientific_literature`.
+SQL (`query_database.sql`) and script text (`run_analysis.code`) are mined with regexes for
+view names, rsids, variant ids and literals compared against a named column.
+
+`scripts/memory_premise_stats.py` is the gate that decides whether cross-session memory is
+worth building. It opens chat_history.db read-only and prints one JSON object: returning-user
+share of sessions, the share of returning sessions whose first user message re-mentions an
+entity from one of that user's earlier sessions, refer-back phrase share, first-turn tool-arg
+overlap, inter-session gap and sessions-per-user distributions, all-time and last 90 days,
+plus per-turn cost from `chat_turn_metrics` where that table exists. It emits no user id,
+email or session id, because the production run pipes it into a pod over stdin:
+
+```bash
+python -m genetics_mcp_server.scripts.memory_premise_stats --bundle > /tmp/premise.py
+kubectl -n genetics exec -i deploy/chat-backend -- python - < /tmp/premise.py > out.json
+```
+
+`--bundle` inlines `memory_digest.py` above the script and strips the import, because the
+deployed image predates that module. Production also predates `chat_turn_metrics`, where the
+script reports `"table missing"`; the cost baseline then comes from the BigQuery log sink
+instead — `scripts/memory_premise_cost.sql`, run with `bq query --use_legacy_sql=false`.
 
 ## Conversation Analysis
 
