@@ -34,6 +34,7 @@ fetching every row, and add the partition predicate each view's section names.
 | `dosage_sensitivity_v` | Rare-CNV dosage sensitivity scores from Collins et al. |
 | `rcnv_gene_associations_v` | Gene-level rare-CNV association statistics from Collins et al. |
 | `rcnv_segments_v` | The 163 disease-associated rare-CNV segments of Collins et al. |
+| `rcnv_window_associations_v` | Sliding-window rare-CNV association statistics from Collins et al. |
 | `variant_annotation_v` | Per-variant functional annotation and FinnGen (R14) allele frequencies — one row per variant, covering all imputed variants, not only fine-mapped ones. |
 | `peak_to_gene_v` | Open4Gene peak-to-gene links from FinnGen ATAC-seq: which genes a chromatin peak's accessibility is associated with, in which cell type. |
 | `phenotypes_v` | Trait/phenotype metadata: the human-readable name, trait type, category and sample sizes behind the opaque phenotype codes the results tables store. |
