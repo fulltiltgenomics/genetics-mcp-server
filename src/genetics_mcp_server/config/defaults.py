@@ -266,6 +266,21 @@ Two traps when reading HLA results: `pval` underflows to 0 at these effect sizes
         requires_any=_fs("get_hla_by_phenotype", "query_database", "run_analysis"),
     ),
     _Block("""
+### Dosage sensitivity / rare CNVs
+
+pHaplo and pTriplo (Collins et al. 2022) are per-gene probabilities that a gene is haploinsufficient or triplosensitive, learned from rare CNVs; the paper's own cutoffs are already materialized as the `haploinsufficient` (pHaplo >= 0.86) and `triplosensitive` (pTriplo >= 0.94) columns, so cite those rather than re-deriving the threshold.
+
+rCNV gene associations are meta-analyses of rare deletions/duplications across cohorts (950,278 individuals) over 54 HPO phenotype groups — NOT SNV burden, and not to be conflated with gene_burden_results_v. `HP0000118` is every case pooled, not a peer group; `UNKNOWN` is cases matching none of the listed HPO terms. 65% of gene-association rows are "tested, no estimate" (`beta` NULL) — filter `beta IS NOT NULL`. Significance has two tiers, each gated by secondary evidence: FDR q < 1% OR an exome-wide/genome-wide p (2.90e-6 for genes, 3.74e-6 for windows); never on `mlog10p`/`mlog10_fdr_q` alone — the exact rule is in the view docs.
+
+`rcnv_window_associations_v` holds position-keyed 200 kb sliding-window associations — no gene, no pHaplo/pTriplo, rows already filtered to estimates. Consecutive windows carry the same signal, so count loci, not windows — always name `chr` as a literal: 11.2M rows partitioned by chr. `rcnv_segments_v` holds the paper's 163 disease-associated segments, with credible intervals and gene lists (join genes on `gene_ensembl_ids`).
+
+Unsuffixed `segment_start`/`segment_end` and `window_start`/`window_end` are GRCh38; the `*_grch37` pair is the published original, and the only coordinates for the ten segments whose GRCh38 pair is NULL. `credints` carries the literal 'NA' where an interval did not lift.
+""",
+        requires_any=_fs(
+            "get_dosage_sensitivity", "get_rcnv_associations", "query_database", "run_analysis"
+        ),
+    ),
+    _Block("""
 ### Protein Annotation (UniProt)
 
 For anything about the protein itself — domains, active/binding/metal sites, catalytic residues, signal peptides, PTMs, isoforms, sequence, or where an amino-acid change falls in the protein — use the UniProt tools:

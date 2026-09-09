@@ -1719,7 +1719,7 @@ each remedy clause reaches exactly the profiles whose tools can act on it — bo
 prompt per profile, since a check that reads the `_Block` metadata only restates the constant that
 was changed.
 
-`tests/test_system_prompt.py` holds **ten** test classes, most of them parametrised over the
+`tests/test_system_prompt.py` holds **eleven** test classes, most of them parametrised over the
 `None`/`api`/`bigquery`/`rag`/`code`/`nocode` profile values. Only two distinct surfaces remain
 behind those six values, so the ones that need a shape no surface produces — a database surface
 without the API tools, a surface carrying `launch_subagents`, one carrying every tool at once —

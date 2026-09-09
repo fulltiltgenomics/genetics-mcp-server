@@ -196,6 +196,33 @@ class TestDomainScienceSurvives:
             assert section in prompt
 
 
+class TestDosageSensitivityBlock:
+    """rCNV / dosage-sensitivity guidance (hpa1.10), gated like the HLA block: it
+    survives on any surface that has either dedicated tool, query_database or
+    run_analysis, and disappears with all four.
+    """
+
+    _GATING_TOOLS = (
+        "get_dosage_sensitivity",
+        "get_rcnv_associations",
+        "query_database",
+        "run_analysis",
+    )
+
+    @pytest.mark.parametrize("tool", _GATING_TOOLS)
+    def test_present_with_any_one_gating_tool(self, tool):
+        prompt = default_system_prompt("FinnGenie", tool_names={tool})
+        assert "### Dosage sensitivity / rare CNVs" in prompt
+        assert "haploinsufficient" in prompt
+        assert "beta IS NOT NULL" in prompt
+
+    def test_absent_without_any_gating_tool(self):
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=ALL_TOOL_NAMES - frozenset(self._GATING_TOOLS)
+        )
+        assert "### Dosage sensitivity / rare CNVs" not in prompt
+
+
 class TestAssemblyMechanism:
     """The gate itself, independent of today's prompt text."""
 
@@ -401,6 +428,7 @@ _NOCODE_HEADINGS = [
     "## Variant Annotation Sources",
     "### Functional / Regulatory Readouts",
     "### HLA / the MHC region",
+    "### Dosage sensitivity / rare CNVs",
     "### Protein Annotation (UniProt)",
     "### Drug and Target Evidence (ChEMBL)",
     "## Data Sources and Resource Names",
@@ -424,6 +452,7 @@ _EXPECTED_HEADINGS = {
         "### Mouse Model Evidence (search_mgi)",
         "### Functional / Regulatory Readouts",
         "### HLA / the MHC region",
+        "### Dosage sensitivity / rare CNVs",
         "### Protein Annotation (UniProt)",
         "### Drug and Target Evidence (ChEMBL)",
         "## Data Sources and Resource Names",
