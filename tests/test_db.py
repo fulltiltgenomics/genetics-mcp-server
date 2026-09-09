@@ -508,16 +508,30 @@ class TestContextDigestAndPinned:
         assert written is False
         assert chat_history_db.get_session(session.id, USER).context_digest is None
 
-    def test_set_context_digest_empty_text_does_not_occupy_the_slot(self, chat_history_db):
+    def test_set_context_digest_stores_empty_and_it_occupies_the_slot(self, chat_history_db):
+        """'' is the rendered-empty state, not a missing one: it must stick."""
         session = chat_history_db.create_session(USER)
 
-        assert chat_history_db.set_context_digest(session.id, USER, "") is False
-        assert chat_history_db.set_context_digest(session.id, USER, "   ") is False
-        assert chat_history_db.get_session(session.id, USER).context_digest is None
+        assert chat_history_db.set_context_digest(session.id, USER, "") is True
+        assert chat_history_db.get_session(session.id, USER).context_digest == ""
 
-        written = chat_history_db.set_context_digest(session.id, USER, "real digest")
-        assert written is True
-        assert chat_history_db.get_session(session.id, USER).context_digest == "real digest"
+        assert chat_history_db.set_context_digest(session.id, USER, "real digest") is False
+        assert chat_history_db.get_session(session.id, USER).context_digest == ""
+
+    def test_a_whitespace_only_digest_is_stored_as_the_empty_state(self, chat_history_db):
+        """A blank render is the rendered-empty state, not a value of its own.
+
+        Stored verbatim, whitespace would hold the write-once slot under
+        something no reader can tell apart from a real digest.
+        """
+        blank = chat_history_db.create_session(USER)
+        assert chat_history_db.set_context_digest(blank.id, USER, "  \n\t ") is True
+        assert chat_history_db.get_session(blank.id, USER).context_digest == ""
+
+        # a digest with real content keeps its own surrounding whitespace
+        real = chat_history_db.create_session(USER)
+        assert chat_history_db.set_context_digest(real.id, USER, "  IBD work  ") is True
+        assert chat_history_db.get_session(real.id, USER).context_digest == "  IBD work  "
 
     def test_set_pinned_toggles_owner_only(self, chat_history_db):
         session = chat_history_db.create_session(USER)
@@ -669,6 +683,388 @@ class TestGetRecentSessionsForDigest:
         results = chat_history_db.get_recent_sessions_for_digest(USER, limit=10)
 
         assert [r["id"] for r in results] == [mine.id]
+
+
+OTHER = "other@example.com"
+
+
+class TestChatProjects:
+    """chat_projects, chat_sessions.project_id: migration, the cap, owner scoping."""
+
+    def test_migration_adds_project_id_and_table_and_is_idempotent(self, tmp_path):
+        from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+
+        db_path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(OLD_CHAT_SESSIONS_DDL)
+        conn.execute(
+            "INSERT INTO chat_sessions (id, user_id, title) VALUES (?, ?, ?)",
+            ("s1", USER, "pre-existing session"),
+        )
+        conn.commit()
+        conn.close()
+
+        Singleton._instances.pop(ChatHistoryDB, None)
+        db = ChatHistoryDB(db_path)
+        try:
+            columns = [row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")]
+            assert "project_id" in columns
+            tables = {
+                row[0]
+                for row in db._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert "chat_projects" in tables
+            # the pre-existing row survives the ALTER unfiled, and stays readable
+            session = db.get_session("s1", USER)
+            assert session.title == "pre-existing session"
+            assert session.project_id is None
+            assert db.list_projects(USER) == []
+
+            db._init_db()
+            columns_after = [
+                row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")
+            ]
+            assert columns_after.count("project_id") == 1
+        finally:
+            Singleton._instances.pop(ChatHistoryDB, None)
+
+    def test_create_and_list_projects_newest_updated_first(self, chat_history_db):
+        first = chat_history_db.create_project(USER, "IBD")
+        second = chat_history_db.create_project(USER, "pQTL network")
+        chat_history_db._conn.execute(
+            "UPDATE chat_projects SET updated_at = ? WHERE id = ?",
+            ("2024-01-01 00:00:01", first.id),
+        )
+        chat_history_db._conn.execute(
+            "UPDATE chat_projects SET updated_at = ? WHERE id = ?",
+            ("2024-01-01 00:00:02", second.id),
+        )
+        chat_history_db._conn.commit()
+
+        assert [p.id for p in chat_history_db.list_projects(USER)] == [second.id, first.id]
+        assert chat_history_db.list_projects(OTHER) == []
+
+    def test_create_project_strips_and_rejects_a_blank_name(self, chat_history_db):
+        assert chat_history_db.create_project(USER, "  IBD  ").name == "IBD"
+        with pytest.raises(ValueError):
+            chat_history_db.create_project(USER, "   ")
+
+    def test_cap_is_per_user_and_archived_projects_do_not_count(self, chat_history_db):
+        from genetics_mcp_server.db.chat_history_db import PROJECTS_MAX_PER_USER
+
+        created = [
+            chat_history_db.create_project(USER, f"p{i}") for i in range(PROJECTS_MAX_PER_USER)
+        ]
+        with pytest.raises(ValueError):
+            chat_history_db.create_project(USER, "one too many")
+
+        # another user is unaffected by this user's cap
+        assert chat_history_db.create_project(OTHER, "theirs") is not None
+
+        chat_history_db._conn.execute(
+            "UPDATE chat_projects SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (created[0].id,),
+        )
+        chat_history_db._conn.commit()
+        assert chat_history_db.create_project(USER, "replacement") is not None
+        assert len(chat_history_db.list_projects(USER)) == PROJECTS_MAX_PER_USER
+
+    def test_list_projects_hides_archived(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        chat_history_db._conn.execute(
+            "UPDATE chat_projects SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (project.id,),
+        )
+        chat_history_db._conn.commit()
+        assert chat_history_db.list_projects(USER) == []
+
+    def test_rename_project_is_owner_scoped(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+
+        assert chat_history_db.rename_project(OTHER, project.id, "hijacked") is False
+        assert chat_history_db.rename_project(USER, "no-such-project", "x") is False
+        assert chat_history_db.list_projects(USER)[0].name == "IBD"
+
+        assert chat_history_db.rename_project(USER, project.id, " IBD genetics ") is True
+        assert chat_history_db.list_projects(USER)[0].name == "IBD genetics"
+        with pytest.raises(ValueError):
+            chat_history_db.rename_project(USER, project.id, "")
+
+    def test_set_session_project_files_unfiles_and_nulls_the_digest(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_context_digest(session.id, USER, "digest of the old grouping")
+
+        assert chat_history_db.set_session_project(USER, session.id, project.id) is True
+        filed = chat_history_db.get_session(session.id, USER)
+        assert filed.project_id == project.id
+        assert filed.context_digest is None
+
+        chat_history_db.set_context_digest(session.id, USER, "digest of the project")
+        assert chat_history_db.set_session_project(USER, session.id, None) is True
+        unfiled = chat_history_db.get_session(session.id, USER)
+        assert unfiled.project_id is None
+        assert unfiled.context_digest is None
+
+    def test_set_session_project_checks_both_ends(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        others_project = chat_history_db.create_project(OTHER, "theirs")
+        others_session = chat_history_db.create_session(OTHER)
+
+        # someone else's session, someone else's project, and a project that
+        # exists but belongs to another user: all refused, none raise
+        assert chat_history_db.set_session_project(USER, others_session.id, project.id) is False
+        assert chat_history_db.set_session_project(USER, session.id, others_project.id) is False
+        assert chat_history_db.set_session_project(USER, session.id, "no-such-project") is False
+        assert chat_history_db.set_session_project(USER, others_session.id, None) is False
+        assert chat_history_db.get_session(session.id, USER).project_id is None
+        assert chat_history_db.get_session(others_session.id, OTHER).project_id is None
+
+    def test_refiling_where_the_session_already_is_keeps_the_digest(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER, project_id=project.id)
+        chat_history_db.set_context_digest(session.id, USER, "digest of the project")
+        before = chat_history_db.get_session(session.id, USER).updated_at
+
+        assert chat_history_db.set_session_project(USER, session.id, project.id) is True
+        unchanged = chat_history_db.get_session(session.id, USER)
+        assert unchanged.context_digest == "digest of the project"
+        assert unchanged.updated_at == before
+
+        elsewhere = chat_history_db.create_project(USER, "pQTL network")
+        assert chat_history_db.set_session_project(USER, session.id, elsewhere.id) is True
+        assert chat_history_db.get_session(session.id, USER).context_digest is None
+
+    def test_unfiling_an_already_unfiled_session_keeps_the_digest(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_context_digest(session.id, USER, "digest")
+
+        assert chat_history_db.set_session_project(USER, session.id, None) is True
+        still = chat_history_db.get_session(session.id, USER)
+        assert still.project_id is None
+        assert still.context_digest == "digest"
+
+    def test_create_session_files_into_an_owned_project_only(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER, project_id=project.id)
+        assert session.project_id == project.id
+        assert chat_history_db.get_session(session.id, USER).project_id == project.id
+        assert [s.id for s in chat_history_db.list_sessions_in_project(USER, project.id)] == [
+            session.id
+        ]
+
+        others_project = chat_history_db.create_project(OTHER, "theirs")
+        with pytest.raises(ValueError):
+            chat_history_db.create_session(USER, project_id=others_project.id)
+        with pytest.raises(ValueError):
+            chat_history_db.create_session(USER, project_id="no-such-project")
+
+    def test_list_projects_orders_by_the_freshest_filed_session(self, chat_history_db):
+        """The sidebar wants most-recently-used first, and only rename touches
+        the project row's own updated_at."""
+        renamed_last = chat_history_db.create_project(USER, "IBD")
+        renamed_first = chat_history_db.create_project(USER, "pQTL network")
+        conn = chat_history_db._conn
+        conn.execute(
+            "UPDATE chat_projects SET updated_at = ? WHERE id = ?",
+            ("2024-01-01 00:00:02", renamed_last.id),
+        )
+        conn.execute(
+            "UPDATE chat_projects SET updated_at = ? WHERE id = ?",
+            ("2024-01-01 00:00:01", renamed_first.id),
+        )
+        conn.commit()
+
+        empty = chat_history_db.list_projects(USER)
+        assert [p.id for p in empty] == [renamed_last.id, renamed_first.id]
+        assert all(p.last_activity_at is None for p in empty)
+
+        stale = chat_history_db.create_session(USER, project_id=renamed_last.id)
+        fresh = chat_history_db.create_session(USER, project_id=renamed_first.id)
+        conn.execute(
+            "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+            ("2024-02-01 00:00:00", stale.id),
+        )
+        conn.execute(
+            "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+            ("2024-03-01 00:00:00", fresh.id),
+        )
+        conn.commit()
+
+        listed = chat_history_db.list_projects(USER)
+        assert [p.id for p in listed] == [renamed_first.id, renamed_last.id]
+        assert listed[0].last_activity_at == datetime(2024, 3, 1)
+        assert listed[1].last_activity_at == datetime(2024, 2, 1)
+
+    def test_list_sessions_in_project_is_owner_scoped(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        mine = chat_history_db.create_session(USER)
+        chat_history_db.set_session_project(USER, mine.id, project.id)
+        unfiled = chat_history_db.create_session(USER)
+
+        assert [s.id for s in chat_history_db.list_sessions_in_project(USER, project.id)] == [
+            mine.id
+        ]
+        assert chat_history_db.list_sessions_in_project(OTHER, project.id) == []
+        assert unfiled.id not in {
+            s.id for s in chat_history_db.list_sessions_in_project(USER, project.id)
+        }
+
+    def test_list_sessions_carries_project_id(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_session_project(USER, session.id, project.id)
+
+        listed = {s.id: s for s in chat_history_db.list_sessions(USER)}
+        assert listed[session.id].project_id == project.id
+
+    def test_delete_project_unfiles_its_sessions(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(session.id, "m1", "user", "hello")
+        chat_history_db.set_session_project(USER, session.id, project.id)
+
+        assert chat_history_db.delete_project(OTHER, project.id) is False
+        assert chat_history_db.delete_project(USER, project.id) is True
+        assert chat_history_db.delete_project(USER, project.id) is False
+
+        survivor = chat_history_db.get_session(session.id, USER)
+        assert survivor is not None
+        assert survivor.project_id is None
+        assert len(chat_history_db.get_messages(session.id)) == 1
+
+    def test_delete_project_with_sessions_cascades(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(session.id, "m1", "user", "hello")
+        chat_history_db.set_session_project(USER, session.id, project.id)
+        chat_history_db.record_turn_metrics(
+            session_id=session.id,
+            message_id="m1",
+            user_id=USER,
+            iterations=1,
+            tool_call_count=0,
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cost_usd=0.01,
+            wall_ms=100,
+        )
+        unfiled = chat_history_db.create_session(USER)
+
+        assert chat_history_db.delete_project_with_sessions(OTHER, project.id) is False
+        assert chat_history_db.get_session(session.id, USER) is not None
+
+        assert chat_history_db.delete_project_with_sessions(USER, project.id) is True
+        assert chat_history_db.get_session(session.id, USER) is None
+        assert chat_history_db.get_messages(session.id) == []
+        assert chat_history_db.get_turn_metrics(session.id) == []
+        assert chat_history_db.list_projects(USER) == []
+        # a session outside the project is untouched
+        assert chat_history_db.get_session(unfiled.id, USER) is not None
+
+    def test_shared_read_hides_project_id(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_session_project(USER, session.id, project.id)
+        chat_history_db.set_context_digest(session.id, USER, "owner's private index")
+        chat_history_db.set_shared(session.id, USER, True)
+
+        owner_view, is_owner = chat_history_db.get_session_for_access(session.id, USER)
+        assert is_owner is True
+        assert owner_view.project_id == project.id
+
+        shared_view, is_owner = chat_history_db.get_session_for_access(session.id, OTHER)
+        assert is_owner is False
+        assert shared_view.project_id is None
+        assert shared_view.context_digest is None
+
+    def test_fork_copies_neither_project_nor_digest(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        session = chat_history_db.create_session(USER)
+        chat_history_db.set_session_project(USER, session.id, project.id)
+        chat_history_db.set_context_digest(session.id, USER, "owner's private index")
+        chat_history_db.set_shared(session.id, USER, True)
+
+        forked = chat_history_db.fork_session(session.id, OTHER)
+        forked_full = chat_history_db.get_session(forked.id, OTHER)
+        assert forked_full.project_id is None
+        assert forked_full.context_digest is None
+
+
+class TestProjectScopedDigestWindow:
+    """get_recent_sessions_for_digest(project_id=...): window and pins inside one project."""
+
+    def _filed_session(self, db, user, project_id, text, updated_at):
+        session = db.create_session(user)
+        db.add_message(session.id, f"{session.id}-u", "user", text)
+        if project_id is not None:
+            db.set_session_project(user, session.id, project_id)
+        db._conn.execute(
+            "UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (updated_at, session.id)
+        )
+        db._conn.commit()
+        return session
+
+    def test_window_is_restricted_to_the_project(self, chat_history_db):
+        ibd = chat_history_db.create_project(USER, "IBD")
+        pqtl = chat_history_db.create_project(USER, "pQTL")
+        a = self._filed_session(chat_history_db, USER, ibd.id, "ibd one", "2024-01-01 00:00:01")
+        b = self._filed_session(chat_history_db, USER, ibd.id, "ibd two", "2024-01-01 00:00:03")
+        self._filed_session(chat_history_db, USER, pqtl.id, "pqtl", "2024-01-01 00:00:04")
+        self._filed_session(chat_history_db, USER, None, "unfiled", "2024-01-01 00:00:05")
+
+        results = chat_history_db.get_recent_sessions_for_digest(USER, limit=10, project_id=ibd.id)
+
+        assert [r["id"] for r in results] == [b.id, a.id]
+        # unrestricted still sees everything, so the default has not changed
+        assert len(chat_history_db.get_recent_sessions_for_digest(USER, limit=10)) == 4
+
+    def test_pinned_session_from_another_project_is_not_pulled_in(self, chat_history_db):
+        ibd = chat_history_db.create_project(USER, "IBD")
+        pqtl = chat_history_db.create_project(USER, "pQTL")
+        old_in_project = self._filed_session(
+            chat_history_db, USER, ibd.id, "old but pinned", "2024-01-01 00:00:00"
+        )
+        chat_history_db.set_pinned(old_in_project.id, USER, True)
+        other_project_pin = self._filed_session(
+            chat_history_db, USER, pqtl.id, "pinned elsewhere", "2024-01-01 00:00:01"
+        )
+        chat_history_db.set_pinned(other_project_pin.id, USER, True)
+        recent = [
+            self._filed_session(
+                chat_history_db, USER, ibd.id, f"recent {i}", f"2024-01-01 00:00:0{i + 2}"
+            )
+            for i in range(2)
+        ]
+
+        results = chat_history_db.get_recent_sessions_for_digest(
+            USER, limit=2, project_id=ibd.id
+        )
+        ids = [r["id"] for r in results]
+
+        assert other_project_pin.id not in ids
+        # the in-project pin still survives falling out of the recency window
+        assert set(ids) == {old_in_project.id, recent[0].id, recent[1].id}
+
+    def test_project_scope_still_excludes_other_users(self, chat_history_db):
+        project = chat_history_db.create_project(USER, "IBD")
+        mine = self._filed_session(
+            chat_history_db, USER, project.id, "mine", "2024-01-01 00:00:01"
+        )
+        self._filed_session(chat_history_db, OTHER, None, "not mine", "2024-01-01 00:00:02")
+
+        results = chat_history_db.get_recent_sessions_for_digest(
+            USER, limit=10, project_id=project.id
+        )
+        assert [r["id"] for r in results] == [mine.id]
+        # another user asking for this project's id gets nothing rather than its rows
+        assert chat_history_db.get_recent_sessions_for_digest(
+            OTHER, limit=10, project_id=project.id
+        ) == []
 
 
 class TestLLMConfigDB:
@@ -1853,6 +2249,34 @@ CHAT_WRITE_ACCESSORS = [
         "DELETE",
         lambda db: db.create_session(USER).id,
         lambda db, ctx: db.delete_session(ctx, USER),
+    ),
+    (
+        "create_project",
+        "chat_projects",
+        "INSERT",
+        lambda db: None,
+        lambda db, ctx: db.create_project(USER, "IBD"),
+    ),
+    (
+        "rename_project",
+        "chat_projects",
+        "UPDATE",
+        lambda db: db.create_project(USER, "IBD").id,
+        lambda db, ctx: db.rename_project(USER, ctx, "renamed"),
+    ),
+    (
+        "delete_project",
+        "chat_projects",
+        "DELETE",
+        lambda db: db.create_project(USER, "IBD").id,
+        lambda db, ctx: db.delete_project(USER, ctx),
+    ),
+    (
+        "set_session_project",
+        "chat_sessions",
+        "UPDATE",
+        lambda db: (db.create_session(USER).id, db.create_project(USER, "IBD").id),
+        lambda db, ctx: db.set_session_project(USER, ctx[0], ctx[1]),
     ),
     (
         "add_message",
