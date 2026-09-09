@@ -26,7 +26,7 @@ from genetics_mcp_server.config import get_settings, model_rejects_disabled_thin
 from genetics_mcp_server.db import get_chat_history_db
 from genetics_mcp_server.memory_digest import MAX_DIGEST_CHARS, render_digest
 from genetics_mcp_server.memory_gate import (
-    MEMORY_DIGEST_SESSION_LIMIT,
+    MEMORY_PROJECT_SESSION_CAP,
     is_identifiable_user,
     memory_setting_on,
 )
@@ -47,17 +47,20 @@ class SessionListItem(BaseModel):
     preview: Optional[str] = None
     rating: Optional[int] = None
     pinned: bool = False
+    project_id: Optional[str] = None
 
 
 class SessionCreateRequest(BaseModel):
-    """Request to create a new session."""
+    """Request to create a new session, optionally filed into a project."""
     phenotype_code: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class SessionCreateResponse(BaseModel):
     """Response after creating a session."""
     id: str
     created_at: str
+    project_id: Optional[str] = None
 
 
 class SessionUpdateRequest(BaseModel):
@@ -94,6 +97,7 @@ class SessionDetailResponse(BaseModel):
     messages: list[MessageResponse]
     is_owner: Optional[bool] = None
     shared: Optional[bool] = None
+    project_id: Optional[str] = None
 
 
 class ShareRequest(BaseModel):
@@ -120,6 +124,36 @@ class MemoryResponse(BaseModel):
     digest: str
     sessions: list[MemorySessionItem]
     char_cap: int
+
+
+class ProjectCreateRequest(BaseModel):
+    """Request to create a project."""
+    name: str
+
+
+class ProjectUpdateRequest(BaseModel):
+    """Request to rename a project."""
+    name: str
+
+
+class ProjectResponse(BaseModel):
+    """A project as the sidebar shows it."""
+    id: str
+    name: str
+    created_at: str
+    updated_at: str
+    last_activity_at: Optional[str] = None
+
+
+class SessionProjectRequest(BaseModel):
+    """Request to file a session into a project, or unfile it with project_id=None."""
+    project_id: Optional[str] = None
+
+
+class SessionProjectResponse(BaseModel):
+    """Response after filing or unfiling a session."""
+    id: str
+    project_id: Optional[str] = None
 
 
 class MessageSaveRequest(BaseModel):
@@ -250,6 +284,7 @@ async def list_sessions(
             preview=preview,
             rating=session.rating,
             pinned=session.pinned_at is not None,
+            project_id=session.project_id,
         ))
 
     return result
@@ -264,17 +299,26 @@ async def create_session(
     request: SessionCreateRequest,
     user: str = Depends(auth_required),
 ):
-    """Create a new chat session for the current user."""
+    """Create a new chat session for the current user, optionally filed into a project."""
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
     db = get_chat_history_db()
-    session = db.create_session(user, phenotype_code=request.phenotype_code)
+    try:
+        session = db.create_session(
+            user, phenotype_code=request.phenotype_code, project_id=request.project_id
+        )
+    except ValueError:
+        if request.project_id is not None:
+            # a foreign or missing project_id, same 404 shape as any other owner-only check
+            raise HTTPException(status_code=404, detail="Project not found") from None
+        raise
     logger.info(f"Chat session created by {user}: {session.id}")
 
     return SessionCreateResponse(
         id=session.id,
         created_at=session.created_at.isoformat(),
+        project_id=session.project_id,
     )
 
 
@@ -309,6 +353,7 @@ async def get_session(
         phenotype_code=session.phenotype_code,
         is_owner=is_owner,
         shared=session.shared,
+        project_id=session.project_id,
         messages=[
             MessageResponse(
                 id=msg.id,
@@ -434,20 +479,231 @@ async def pin_session(
     return {"id": session_id, "pinned": request.pinned}
 
 
+@router.put(
+    "/chat/sessions/{session_id}/project",
+    summary="File a session into a project, or unfile it",
+    response_model=SessionProjectResponse,
+)
+async def set_session_project(
+    session_id: str,
+    request: SessionProjectRequest,
+    user: str = Depends(auth_required),
+):
+    """File the session into request.project_id, or unfile it with project_id=None.
+
+    Owner-only on both ends: set_session_project returns False for a session that is not
+    the caller's or a project_id that names another user's project, and either is reported
+    as a plain 404 — the same shape a caller-supplied foreign id gets everywhere else in
+    this router.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    # same gate the pin endpoint carries: a shared identity must not steer a digest
+    # that is not theirs, and filing a session into a project does exactly that
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    if not db.set_session_project(user, session_id, request.project_id):
+        raise HTTPException(status_code=404, detail="Session or project not found")
+
+    logger.info(f"Session {session_id} filed into project {request.project_id} by {user}")
+    return SessionProjectResponse(id=session_id, project_id=request.project_id)
+
+
+# --- Project Endpoints ---
+
+def _find_project(db, user: str, project_id: str):
+    """The caller's own project by id, or None. Owner-only lookup mirroring get_session."""
+    for project in db.list_projects(user):
+        if project.id == project_id:
+            return project
+    return None
+
+
+def _project_response(project) -> ProjectResponse:
+    return ProjectResponse(
+        id=project.id,
+        name=project.name,
+        created_at=project.created_at.isoformat(),
+        updated_at=project.updated_at.isoformat(),
+        last_activity_at=(
+            project.last_activity_at.isoformat() if project.last_activity_at else None
+        ),
+    )
+
+
 @router.get(
-    "/memory",
-    summary="What the next chat session will remember",
+    "/projects",
+    summary="List the caller's projects",
+    response_model=list[ProjectResponse],
+)
+async def list_projects(user: str = Depends(auth_required)):
+    """The caller's own projects, most recently active first."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    return [_project_response(p) for p in db.list_projects(user)]
+
+
+@router.post(
+    "/projects",
+    summary="Create a project",
+    response_model=ProjectResponse,
+)
+async def create_project(
+    request: ProjectCreateRequest,
+    user: str = Depends(auth_required),
+):
+    """Create a project for the caller. 400 on a blank name or past the per-user cap."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    try:
+        project = db.create_project(user, request.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+    logger.info(f"Project {project.id} created by {user}")
+    return _project_response(project)
+
+
+@router.put(
+    "/projects/{project_id}",
+    summary="Rename a project",
+    response_model=ProjectResponse,
+)
+async def update_project(
+    project_id: str,
+    request: ProjectUpdateRequest,
+    user: str = Depends(auth_required),
+):
+    """Rename the caller's own project. 400 on a blank name, 404 if not theirs."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    try:
+        renamed = db.rename_project(user, project_id, request.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    if not renamed:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    logger.info(f"Project {project_id} renamed by {user}")
+    project = _find_project(db, user, project_id)
+    if project is None:
+        # renamed True but the row is gone by the time we re-read it: archived or a
+        # concurrent delete raced us between the rename and this lookup
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _project_response(project)
+
+
+@router.delete(
+    "/projects/{project_id}",
+    summary="Delete a project",
+)
+async def delete_project(
+    project_id: str,
+    with_sessions: bool = Query(
+        False, description="Also delete every session filed in the project"
+    ),
+    user: str = Depends(auth_required),
+):
+    """Delete the caller's own project.
+
+    By default the project's sessions survive, unfiled. with_sessions=true deletes them
+    too, one delete_session call per row so the message cascade and turn-metrics cleanup
+    both run for each.
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    deleted = (
+        db.delete_project_with_sessions(user, project_id)
+        if with_sessions
+        else db.delete_project(user, project_id)
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    logger.info(f"Project {project_id} deleted by {user} (with_sessions={with_sessions})")
+    return {"deleted": True}
+
+
+@router.get(
+    "/projects/{project_id}/sessions",
+    summary="List the sessions filed in a project",
+    response_model=list[SessionListItem],
+)
+async def list_project_sessions(
+    project_id: str,
+    user: str = Depends(auth_required),
+):
+    """The caller's own sessions filed into this project, most recent first."""
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_identifiable_user(user):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    db = get_chat_history_db()
+    if _find_project(db, user, project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # generous enough to hand back a whole project's worth of sessions in one page;
+    # list_sessions' 50-item default is sized for the unfiled/all-sessions view instead
+    sessions = db.list_sessions_in_project(user, project_id, limit=500)
+
+    result = []
+    for session in sessions:
+        preview = None
+        if not session.title:
+            preview_text = db.get_first_user_message(session.id)
+            if preview_text:
+                preview = preview_text[:80] + "..." if len(preview_text) > 80 else preview_text
+
+        result.append(SessionListItem(
+            id=session.id,
+            title=session.title,
+            created_at=session.created_at.isoformat(),
+            updated_at=session.updated_at.isoformat(),
+            preview=preview,
+            rating=session.rating,
+            pinned=session.pinned_at is not None,
+            project_id=session.project_id,
+        ))
+
+    return result
+
+
+@router.get(
+    "/projects/{project_id}/memory",
+    summary="What the next session filed in this project will remember",
     response_model=MemoryResponse,
 )
-async def get_memory(user: str = Depends(auth_required)):
-    """The caller's own memory digest, rendered fresh.
+async def get_project_memory(
+    project_id: str,
+    user: str = Depends(auth_required),
+):
+    """The caller's memory digest for this project, rendered fresh.
 
-    This is what the NEXT session will be seeded with, not what the current one carries:
-    a session's digest is frozen on its first turn, so reading that copy back would show
-    the user a stale index of their own history.
+    This is what the NEXT session filed here will be seeded with, not what an existing
+    session carries: a session's digest is frozen on its first turn, so reading that copy
+    back would show the user a stale index of the project's history.
 
-    The preview is returned whether or not the setting is on, so the dialog can show what
-    would be remembered before the user opts in. Nothing is written either way.
+    The preview is returned whether or not the chat_memory setting is on, so the dialog can
+    show what would be remembered before the user opts in. Nothing is written either way.
 
     Unlike prompt injection, this read does NOT require `gateway_asserted`. Every private
     read in this router — session detail, messages, attachments — authorizes on the
@@ -458,14 +714,17 @@ async def get_memory(user: str = Depends(auth_required)):
     if not user:
         raise HTTPException(status_code=401, detail="Authentication required")
     # a service identity and the shared `anonymous` of an auth-less deployment name no
-    # person, so they own no memory — reported as missing, like an id that resolves to
-    # nobody, rather than as a permission the caller could acquire
+    # person, so they own no project and no memory — reported as missing, like an id that
+    # resolves to nobody, rather than as a permission the caller could acquire
     if not is_identifiable_user(user):
         raise HTTPException(status_code=404, detail="Not found")
 
     db = get_chat_history_db()
+    if _find_project(db, user, project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
     sessions = db.get_recent_sessions_for_digest(
-        user, MEMORY_DIGEST_SESSION_LIMIT, include_pinned=True
+        user, MEMORY_PROJECT_SESSION_CAP, project_id=project_id, include_pinned=True
     )
     return MemoryResponse(
         enabled=memory_setting_on(user),
@@ -508,6 +767,7 @@ async def fork_session(
     return SessionCreateResponse(
         id=new_session.id,
         created_at=new_session.created_at.isoformat(),
+        project_id=new_session.project_id,
     )
 
 

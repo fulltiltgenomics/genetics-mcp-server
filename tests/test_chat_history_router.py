@@ -553,6 +553,34 @@ class TestShareAndForkEndpoints:
         assert len(forked["messages"]) == 1
         assert forked["messages"][0]["content"] == "Hello from owner"
 
+    def test_fork_of_a_filed_session_lands_unfiled(self, two_user_clients):
+        """The DB layer drops project_id on fork; the router must return that null
+        rather than repopulating it from the source session."""
+        test_db, session_id = two_user_clients
+
+        with self._make_client(test_db, "owner@example.com"):
+            with TestClient(app) as client:
+                project_id = client.post(
+                    "/chat/v1/projects", json={"name": "IBD"}
+                ).json()["id"]
+                client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/project",
+                    json={"project_id": project_id},
+                )
+                client.put(
+                    f"/chat/v1/chat/sessions/{session_id}/share",
+                    json={"shared": True},
+                )
+        app.dependency_overrides.clear()
+
+        with self._make_client(test_db, "other@example.com"):
+            with TestClient(app) as client:
+                response = client.post(f"/chat/v1/chat/sessions/{session_id}/fork")
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.json()["project_id"] is None
+
     def test_fork_non_shared_session_fails(self, two_user_clients):
         """Test that forking a non-shared session returns 404."""
         test_db, session_id = two_user_clients
@@ -917,14 +945,10 @@ def client_as_anonymous(test_db):
 
 
 class TestMemoryEndpoints:
-    """GET /memory and PUT /chat/sessions/{id}/pin."""
+    """PUT /chat/sessions/{id}/pin. The recency-window GET /memory is retired; its scoped
+    replacement, GET /projects/{id}/memory, is covered in TestProjectMemoryEndpoint."""
 
     USER = "test@example.com"
-
-    def _settings(self, llm_config_db):
-        return patch(
-            "genetics_mcp_server.memory_gate.get_llm_config_db", return_value=llm_config_db
-        )
 
     def _seed(self, test_db, title, user=USER):
         session = test_db.create_session(user)
@@ -932,81 +956,8 @@ class TestMemoryEndpoints:
         test_db.add_message(session.id, f"m-{session.id}", "user", "What about APOE?")
         return session
 
-    def test_memory_is_disabled_until_the_user_opts_in(
-        self, client_with_auth, test_db, llm_config_db
-    ):
-        self._seed(test_db, "APOE and LDL")
-
-        with self._settings(llm_config_db):
-            data = client_with_auth.get("/chat/v1/memory").json()
-
-        assert data["enabled"] is False
-        # the preview is served anyway, so the dialog can show what would be remembered
-        assert "APOE and LDL" in data["digest"]
-
-    def test_enabled_reflects_the_setting(
-        self, client_with_auth, test_db, llm_config_db
-    ):
-        llm_config_db.save_user_setting(
-            user_id=self.USER, setting_key="chat_memory", setting_value="on"
-        )
-
-        with self._settings(llm_config_db):
-            assert client_with_auth.get("/chat/v1/memory").json()["enabled"] is True
-
-        llm_config_db.save_user_setting(
-            user_id=self.USER, setting_key="chat_memory", setting_value="off"
-        )
-        with self._settings(llm_config_db):
-            assert client_with_auth.get("/chat/v1/memory").json()["enabled"] is False
-
-    def test_sessions_agree_with_the_digest(
-        self, client_with_auth, test_db, llm_config_db
-    ):
-        first = self._seed(test_db, "APOE and LDL")
-        second = self._seed(test_db, "T2D endpoints")
-        test_db.set_pinned(first.id, self.USER, True)
-
-        with self._settings(llm_config_db):
-            data = client_with_auth.get("/chat/v1/memory").json()
-
-        # the accessor's order verbatim: updated_at ties inside one second, so id DESC
-        # decides, and the list must not re-sort what the renderer was handed
-        assert [s["id"] for s in data["sessions"]] == [
-            row["id"] for row in test_db.get_recent_sessions_for_digest(self.USER, 20)
-        ]
-        assert {s["id"] for s in data["sessions"]} == {first.id, second.id}
-        for session in data["sessions"]:
-            assert session["title"] in data["digest"]
-            assert session["created_at"]
-        assert {s["id"]: s["pinned"] for s in data["sessions"]} == {
-            first.id: True, second.id: False
-        }
-
-    def test_char_cap_is_the_renderer_s_own_limit(
-        self, client_with_auth, llm_config_db
-    ):
-        from genetics_mcp_server.memory_digest import MAX_DIGEST_CHARS
-
-        with self._settings(llm_config_db):
-            data = client_with_auth.get("/chat/v1/memory").json()
-
-        assert data["char_cap"] == MAX_DIGEST_CHARS
-
-    def test_another_users_sessions_are_not_in_the_digest(
-        self, client_with_auth, test_db, llm_config_db
-    ):
-        self._seed(test_db, "Somebody else's work", user="other@example.com")
-
-        with self._settings(llm_config_db):
-            data = client_with_auth.get("/chat/v1/memory").json()
-
-        assert data["sessions"] == []
-        assert data["digest"] == ""
-
-    def test_a_service_identity_has_no_memory(self, client_as_service, llm_config_db):
-        with self._settings(llm_config_db):
-            assert client_as_service.get("/chat/v1/memory").status_code == 404
+    def test_the_global_memory_endpoint_is_gone(self, client_with_auth):
+        assert client_with_auth.get("/chat/v1/memory").status_code == 404
 
     def test_pin_toggles_and_unpins(self, client_with_auth, test_db):
         session = self._seed(test_db, "APOE and LDL")
@@ -1076,3 +1027,385 @@ class TestMemoryEndpoints:
         test_db.set_pinned(session.id, self.USER, True)
         listed = client_with_auth.get("/chat/v1/chat/sessions").json()
         assert listed[0]["pinned"] is True
+
+
+class TestProjectMemoryEndpoint:
+    """GET /chat/v1/projects/{id}/memory."""
+
+    USER = "test@example.com"
+
+    def _settings(self, llm_config_db):
+        return patch(
+            "genetics_mcp_server.memory_gate.get_llm_config_db", return_value=llm_config_db
+        )
+
+    def _project(self, test_db, user=USER, name="IBD"):
+        return test_db.create_project(user, name)
+
+    def _seed(self, test_db, project_id, title, user=USER):
+        session = test_db.create_session(user, project_id=project_id)
+        test_db.update_session(session.id, user, title=title)
+        test_db.add_message(session.id, f"m-{session.id}", "user", "What about APOE?")
+        return session
+
+    def test_memory_is_disabled_until_the_user_opts_in(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        project = self._project(test_db)
+        self._seed(test_db, project.id, "APOE and LDL")
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+
+        assert data["enabled"] is False
+        # the preview is served anyway, so the dialog can show what would be remembered
+        assert "APOE and LDL" in data["digest"]
+
+    def test_enabled_reflects_the_setting(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        project = self._project(test_db)
+        llm_config_db.save_user_setting(
+            user_id=self.USER, setting_key="chat_memory", setting_value="on"
+        )
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+        assert data["enabled"] is True
+
+        llm_config_db.save_user_setting(
+            user_id=self.USER, setting_key="chat_memory", setting_value="off"
+        )
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+        assert data["enabled"] is False
+
+    def test_sessions_agree_with_the_digest(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        project = self._project(test_db)
+        first = self._seed(test_db, project.id, "APOE and LDL")
+        second = self._seed(test_db, project.id, "T2D endpoints")
+        test_db.set_pinned(first.id, self.USER, True)
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+
+        assert [s["id"] for s in data["sessions"]] == [
+            row["id"]
+            for row in test_db.get_recent_sessions_for_digest(
+                self.USER, 20, project_id=project.id
+            )
+        ]
+        assert {s["id"] for s in data["sessions"]} == {first.id, second.id}
+        for session in data["sessions"]:
+            assert session["title"] in data["digest"]
+            assert session["created_at"]
+        assert {s["id"]: s["pinned"] for s in data["sessions"]} == {
+            first.id: True, second.id: False
+        }
+
+    def test_char_cap_is_the_renderer_s_own_limit(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        from genetics_mcp_server.memory_digest import MAX_DIGEST_CHARS
+
+        project = self._project(test_db)
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+
+        assert data["char_cap"] == MAX_DIGEST_CHARS
+
+    def test_a_pinned_session_in_another_project_is_absent(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        """The digest is scoped to the project: a pin elsewhere must not leak in, unlike
+        the retired recency-window memory which pulled a pin from anywhere."""
+        project = self._project(test_db, name="IBD")
+        other_project = self._project(test_db, name="pQTL")
+        in_project = self._seed(test_db, project.id, "APOE and LDL")
+        elsewhere = self._seed(test_db, other_project.id, "Somewhere else")
+        test_db.set_pinned(elsewhere.id, self.USER, True)
+
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+
+        assert {s["id"] for s in data["sessions"]} == {in_project.id}
+
+    def test_another_users_project_is_not_found(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        project = test_db.create_project("other@example.com", "Theirs")
+
+        with self._settings(llm_config_db):
+            response = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory")
+
+        assert response.status_code == 404
+
+    def test_a_missing_project_is_not_found(self, client_with_auth, llm_config_db):
+        with self._settings(llm_config_db):
+            response = client_with_auth.get("/chat/v1/projects/does-not-exist/memory")
+
+        assert response.status_code == 404
+
+    def test_a_service_identity_has_no_memory(
+        self, client_as_service, test_db, llm_config_db
+    ):
+        project = test_db.create_project(self.USER, "IBD")
+
+        with self._settings(llm_config_db):
+            response = client_as_service.get(f"/chat/v1/projects/{project.id}/memory")
+
+        assert response.status_code == 404
+
+    def test_an_anonymous_caller_has_no_memory(
+        self, client_as_anonymous, test_db, llm_config_db
+    ):
+        project = test_db.create_project("anonymous", "Shared")
+
+        with self._settings(llm_config_db):
+            response = client_as_anonymous.get(f"/chat/v1/projects/{project.id}/memory")
+
+        assert response.status_code == 404
+
+
+class TestProjectEndpoints:
+    """GET/POST /projects, PUT/DELETE /projects/{id}, GET /projects/{id}/sessions, and
+    PUT /chat/sessions/{id}/project."""
+
+    USER = "test@example.com"
+
+    def test_create_and_list_project(self, client_with_auth):
+        created = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"})
+        assert created.status_code == 200
+        body = created.json()
+        assert body["name"] == "IBD"
+        assert body["created_at"]
+        assert body["updated_at"]
+        assert body["last_activity_at"] is None
+
+        listed = client_with_auth.get("/chat/v1/projects").json()
+        assert [p["id"] for p in listed] == [body["id"]]
+
+    def test_a_blank_name_is_rejected(self, client_with_auth):
+        response = client_with_auth.post("/chat/v1/projects", json={"name": "   "})
+        assert response.status_code == 400
+
+    def test_creating_past_the_cap_is_rejected(self, client_with_auth):
+        for i in range(20):
+            response = client_with_auth.post("/chat/v1/projects", json={"name": f"P{i}"})
+            assert response.status_code == 200
+
+        response = client_with_auth.post("/chat/v1/projects", json={"name": "P20"})
+        assert response.status_code == 400
+
+    def test_rename_project(self, client_with_auth):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+
+        response = client_with_auth.put(
+            f"/chat/v1/projects/{project_id}", json={"name": "IBD renamed"}
+        )
+        assert response.status_code == 200
+        assert response.json()["name"] == "IBD renamed"
+
+    def test_rename_to_a_blank_name_is_rejected(self, client_with_auth):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+
+        response = client_with_auth.put(
+            f"/chat/v1/projects/{project_id}", json={"name": ""}
+        )
+        assert response.status_code == 400
+
+    def test_renaming_someone_elses_project_is_not_found(self, client_with_auth, test_db):
+        project = test_db.create_project("other@example.com", "Theirs")
+
+        response = client_with_auth.put(
+            f"/chat/v1/projects/{project.id}", json={"name": "Mine now"}
+        )
+
+        assert response.status_code == 404
+
+    def test_delete_project_unfiles_its_sessions(self, client_with_auth, test_db):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+        session_id = client_with_auth.post(
+            "/chat/v1/chat/sessions", json={"project_id": project_id}
+        ).json()["id"]
+
+        response = client_with_auth.delete(f"/chat/v1/projects/{project_id}")
+        assert response.status_code == 200
+        assert response.json() == {"deleted": True}
+
+        assert test_db.get_session(session_id, self.USER).project_id is None
+        assert client_with_auth.get("/chat/v1/projects").json() == []
+
+    def test_delete_with_sessions_removes_them_too(self, client_with_auth, test_db):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+        session_id = client_with_auth.post(
+            "/chat/v1/chat/sessions", json={"project_id": project_id}
+        ).json()["id"]
+
+        response = client_with_auth.delete(
+            f"/chat/v1/projects/{project_id}", params={"with_sessions": "true"}
+        )
+        assert response.status_code == 200
+
+        assert test_db.get_session(session_id, self.USER) is None
+
+    def test_deleting_someone_elses_project_is_not_found(self, client_with_auth, test_db):
+        project = test_db.create_project("other@example.com", "Theirs")
+
+        response = client_with_auth.delete(f"/chat/v1/projects/{project.id}")
+
+        assert response.status_code == 404
+
+    def test_project_sessions_listing(self, client_with_auth):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+        in_project = client_with_auth.post(
+            "/chat/v1/chat/sessions", json={"project_id": project_id}
+        ).json()["id"]
+        client_with_auth.post("/chat/v1/chat/sessions", json={})  # unfiled
+
+        listed = client_with_auth.get(f"/chat/v1/projects/{project_id}/sessions").json()
+
+        assert [s["id"] for s in listed] == [in_project]
+        assert listed[0]["project_id"] == project_id
+
+    def test_listing_sessions_of_someone_elses_project_is_not_found(
+        self, client_with_auth, test_db
+    ):
+        project = test_db.create_project("other@example.com", "Theirs")
+
+        response = client_with_auth.get(f"/chat/v1/projects/{project.id}/sessions")
+
+        assert response.status_code == 404
+
+    def test_create_session_in_a_project(self, client_with_auth):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+
+        response = client_with_auth.post(
+            "/chat/v1/chat/sessions", json={"project_id": project_id}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["project_id"] == project_id
+
+    def test_create_session_in_someone_elses_project_is_not_found(self, client_with_auth, test_db):
+        project = test_db.create_project("other@example.com", "Theirs")
+
+        response = client_with_auth.post(
+            "/chat/v1/chat/sessions", json={"project_id": project.id}
+        )
+
+        assert response.status_code == 404
+
+    def test_move_session_into_a_project_and_unfile_it(self, client_with_auth, test_db):
+        project_id = client_with_auth.post(
+            "/chat/v1/projects", json={"name": "IBD"}
+        ).json()["id"]
+        session_id = client_with_auth.post("/chat/v1/chat/sessions", json={}).json()["id"]
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session_id}/project",
+            json={"project_id": project_id},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"id": session_id, "project_id": project_id}
+        assert test_db.get_session(session_id, self.USER).project_id == project_id
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session_id}/project",
+            json={"project_id": None},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"id": session_id, "project_id": None}
+        assert test_db.get_session(session_id, self.USER).project_id is None
+
+    def test_moving_a_session_into_someone_elses_project_is_not_found(
+        self, client_with_auth, test_db
+    ):
+        session_id = client_with_auth.post("/chat/v1/chat/sessions", json={}).json()["id"]
+        foreign_project = test_db.create_project("other@example.com", "Theirs")
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session_id}/project",
+            json={"project_id": foreign_project.id},
+        )
+
+        assert response.status_code == 404
+        assert test_db.get_session(session_id, self.USER).project_id is None
+
+    def test_moving_someone_elses_session_is_not_found(self, client_with_auth, test_db):
+        session = test_db.create_session("other@example.com")
+
+        response = client_with_auth.put(
+            f"/chat/v1/chat/sessions/{session.id}/project",
+            json={"project_id": None},
+        )
+
+        assert response.status_code == 404
+
+    def test_a_service_identity_cannot_file_a_session_into_a_project(
+        self, client_as_service, test_db
+    ):
+        """Same gate the pin endpoint carries: a shared identity must not steer a
+        digest that is not theirs, and filing a session does exactly that."""
+        session = test_db.create_session("mcp-tool")
+        response = client_as_service.put(
+            f"/chat/v1/chat/sessions/{session.id}/project",
+            json={"project_id": None},
+        )
+        assert response.status_code == 404
+
+    def test_an_anonymous_caller_cannot_file_a_session_into_a_project(
+        self, client_as_anonymous, test_db
+    ):
+        session = test_db.create_session("anonymous")
+        response = client_as_anonymous.put(
+            f"/chat/v1/chat/sessions/{session.id}/project",
+            json={"project_id": None},
+        )
+        assert response.status_code == 404
+
+    def test_a_service_identity_cannot_list_projects(self, client_as_service):
+        assert client_as_service.get("/chat/v1/projects").status_code == 404
+
+    def test_an_anonymous_caller_cannot_create_a_project(self, client_as_anonymous):
+        response = client_as_anonymous.post("/chat/v1/projects", json={"name": "Shared"})
+        assert response.status_code == 404
+
+    def test_a_non_owner_shared_read_has_no_project_id(self, test_db):
+        """The DB layer nulls project_id for a shared non-owner read; the router must
+        pass that null through rather than re-populating it."""
+        project = test_db.create_project(self.USER, "IBD")
+        session = test_db.create_session(self.USER, project_id=project.id)
+        test_db.set_shared(session.id, self.USER, True)
+
+        async def mock_auth():
+            return "other@example.com"
+
+        app.dependency_overrides[auth_required] = mock_auth
+        try:
+            with patch(
+                "genetics_mcp_server.routers.chat_history.get_chat_history_db",
+                return_value=test_db,
+            ):
+                with TestClient(app) as other_client:
+                    response = other_client.get(f"/chat/v1/chat/sessions/{session.id}")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.json()["project_id"] is None
+        assert response.json()["is_owner"] is False
