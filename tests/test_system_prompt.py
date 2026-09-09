@@ -47,24 +47,35 @@ def tool_names_mentioned(text: str) -> set[str]:
     return tokens & ALL_TOOL_NAMES
 
 
-def flag_disabled_tools(*, subagents: bool, sandbox: bool = True) -> set[str]:
+def flag_disabled_tools(
+    *, subagents: bool, sandbox: bool = True, alphagenome: bool = True
+) -> set[str]:
     """The disabled set the deployment flags actually produce.
 
     Derived from Settings rather than hard-coded, so a flag added in front of another
-    tool is picked up here without editing this file. `sandbox` defaults to True — the
-    opposite of the deployed default — because everything below is about what the prompt
-    says when a tool IS present; the flag-off direction is asserted explicitly instead
-    (genetics-results-suite-4h6.56).
+    tool is picked up here without editing this file. `sandbox` and `alphagenome` default
+    to True — for the sandbox the opposite of the deployed default, for the key the
+    opposite of a bare test environment — because everything below is about what the
+    prompt says when a tool IS present; each flag-off direction is asserted explicitly
+    instead (genetics-results-suite-4h6.56).
     """
-    return Settings(enable_subagents=subagents, sandbox_enabled=sandbox).disabled_tools
+    return Settings(
+        enable_subagents=subagents,
+        sandbox_enabled=sandbox,
+        alphagenome_api_key="test-key" if alphagenome else None,
+    ).disabled_tools
 
 
-def resolve(profile: str | None, *, subagents: bool, sandbox: bool = True) -> set[str]:
+def resolve(
+    profile: str | None, *, subagents: bool, sandbox: bool = True, alphagenome: bool = True
+) -> set[str]:
     return {
         t["name"]
         for t in get_anthropic_tools(
             code_execution=code_execution_requested(profile),
-            disabled_tools=flag_disabled_tools(subagents=subagents, sandbox=sandbox),
+            disabled_tools=flag_disabled_tools(
+                subagents=subagents, sandbox=sandbox, alphagenome=alphagenome
+            ),
         )
     }
 
@@ -1037,16 +1048,30 @@ class TestAlphaGenomeOptIn:
         for rule in self.RULES:
             assert rule in prompt, f"{profile} lost: {rule!r}"
 
-    def test_the_block_goes_when_the_tool_goes(self):
-        """It self-gates on the tool NAME: drop the name and the block goes with it.
+    def test_the_block_goes_when_the_key_is_unset(self):
+        """Both halves of the gate, exercised end to end.
 
-        The other half — removing the name when no key is configured — does not exist
-        yet. Settings.disabled_tools has no AlphaGenome entry and the tool sits
-        unconditionally in TOOL_DEFINITIONS, so this test subtracts the name by hand.
+        The block self-gates on the tool NAME, and `Settings.disabled_tools` withdraws the
+        name when no ALPHAGENOME_API_KEY is configured — so a key-less deployment ships
+        neither the tool nor the ~1 KB of prompt telling the model when to reach for it.
+        Asserting only the hand-subtracted direction would leave the deployment-level half
+        untested, which is the half that repeats the run_analysis failure.
         """
-        available = resolve(None, subagents=False) - {self.TOOL}
-        prompt = default_system_prompt("FinnGenie", tool_names=available)
-        assert "AlphaGenome" not in prompt
+        with_key = resolve(None, subagents=False, alphagenome=True)
+        assert self.TOOL in with_key
+        assert "AlphaGenome" in default_system_prompt("FinnGenie", tool_names=with_key)
+
+        without_key = resolve(None, subagents=False, alphagenome=False)
+        assert self.TOOL not in without_key
+        assert "AlphaGenome" not in default_system_prompt("FinnGenie", tool_names=without_key)
+
+    def test_the_key_is_the_only_thing_the_gate_reads(self):
+        """An empty string is as unconfigured as an unset variable — os.environ.get returns
+        "" for `ALPHAGENOME_API_KEY=` in a manifest, which is exactly what an optional
+        secret key renders to when the deployment has no key."""
+        assert self.TOOL not in Settings(alphagenome_api_key="k").disabled_tools
+        assert self.TOOL in Settings(alphagenome_api_key="").disabled_tools
+        assert self.TOOL in Settings(alphagenome_api_key=None).disabled_tools
 
     def test_the_tool_description_carries_the_same_rules(self):
         """The strongest wording lives in the description, which the model follows more

@@ -21,12 +21,14 @@ API_KEY = "test-key-not-a-real-credential"
 
 @pytest.fixture(autouse=True)
 def clear_module_state():
-    """The metadata cache and the limiter are module singletons, shared across tests."""
+    """The two caches and the limiter are module singletons, shared across tests."""
     alphagenome._METADATA_CACHE.clear()
     alphagenome._LIMITER.clear()
+    alphagenome._CACHE.clear()
     yield
     alphagenome._METADATA_CACHE.clear()
     alphagenome._LIMITER.clear()
+    alphagenome._CACHE.clear()
 
 
 def entry(values, quantiles=None, gene=None):
@@ -814,3 +816,154 @@ async def test_a_client_side_failure_stays_a_result_and_keeps_the_label():
     result = await _executor(fake).get_alphagenome_variant_predictions([])
     assert result["success"] is False
     assert result["data_kind"] == "model_prediction"
+
+
+# --------------------------------------------------------------------------- #
+# the prediction cache
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_repeated_variant_is_answered_without_a_second_request():
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
+    client = _client(fake)
+    first = await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    second = await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    assert second["results"] == first["results"]
+    assert len(fake.single_calls) == 1 and fake.batch_calls == 0
+
+
+async def test_a_partly_cached_batch_only_asks_for_what_is_missing():
+    fake = FakeAtlas(
+        responses={
+            "chr1:100": {"DNASE": [entry([0.5])]},
+            "chr2:200": {"DNASE": [entry([0.7])]},
+        }
+    )
+    client = _client(fake)
+    await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    fake.single_calls.clear()
+    result = await client.score_variants(["1:100:A:G", "2:200:A:G"], modalities=["DNASE"])
+    assert result["n_scored"] == 2
+    # two variants would have been a batch call; only the uncached one was asked for
+    assert fake.batch_calls == 0 and len(fake.single_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cell_type": "liver"},
+        {"modalities": ["DNASE", "RNA_SEQ"]},
+    ],
+    ids=["cell_type", "modalities"],
+)
+async def test_the_key_separates_requests_that_would_answer_differently(kwargs):
+    """The cell type especially: a key without it would return liver's prediction to a
+    question about K562, labelled as K562."""
+    metadata = {
+        "DNASE": FakeScorerMetadata("DNASE", ["liver"]),
+        "RNA_SEQ": FakeScorerMetadata("RNA_SEQ", ["liver"]),
+    }
+    fake = FakeAtlas(
+        responses={"chr1:100": {"DNASE": [entry([0.5])], "RNA_SEQ": [entry([0.2])]}},
+        metadata=metadata,
+    )
+    client = _client(fake)
+    await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    fake.single_calls.clear()
+    await client.score_variants(["1:100:A:G"], **{"modalities": ["DNASE"], **kwargs})
+    assert len(fake.single_calls) == 1
+
+
+def test_the_cache_key_carries_the_variant_the_cell_type_and_the_modalities():
+    variant = alphagenome.parse_variant("1:100:A:G")
+    base = alphagenome._cache_key(variant, "liver", ["DNASE"])
+    assert base != alphagenome._cache_key(variant, "K562", ["DNASE"])
+    assert base != alphagenome._cache_key(variant, None, ["DNASE"])
+    assert base != alphagenome._cache_key(variant, "liver", ["DNASE", "RNA_SEQ"])
+    assert base != alphagenome._cache_key(
+        alphagenome.parse_variant("1:100:A:T"), "liver", ["DNASE"]
+    )
+    # order of the requested modalities is not a difference in the answer
+    assert alphagenome._cache_key(variant, "liver", ["RNA_SEQ", "DNASE"]) == (
+        alphagenome._cache_key(variant, "liver", ["DNASE", "RNA_SEQ"])
+    )
+
+
+async def test_a_failed_prediction_is_never_cached():
+    fake = FakeAtlas(variant_errors={"chr1:100": RuntimeError("transient")})
+    client = _client(fake)
+    first = await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    assert first["results"][0]["success"] is False
+    fake.variant_errors.clear()
+    fake.responses = {"chr1:100": {"DNASE": [entry([0.5])]}}
+    second = await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    assert second["results"][0]["success"] is True
+
+
+async def test_a_zero_ttl_turns_the_cache_off():
+    class _Settings:
+        alphagenome_cache_ttl = 0
+
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
+    client = AlphaGenomeClient(
+        _Settings(), api_key=API_KEY, atlas_factory=lambda key: fake, sleep=_no_sleep
+    )
+    await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    assert len(fake.single_calls) == 2
+
+
+async def test_an_expired_entry_is_fetched_again():
+    now = {"t": 0.0}
+    cache = alphagenome._TTLCache(clock=lambda: now["t"])
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
+    client = _client(fake, cache=cache)
+    await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    now["t"] = alphagenome._CACHE_TTL + 1
+    await client.score_variants(["1:100:A:G"], modalities=["DNASE"])
+    assert len(fake.single_calls) == 2
+
+
+async def test_an_all_hit_batch_makes_no_metadata_round_trip():
+    metadata = {"DNASE": FakeScorerMetadata("DNASE", ["liver"])}
+    fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}}, metadata=metadata)
+    client = _client(fake)
+    await client.score_variants(["1:100:A:G"], cell_type="liver", modalities=["DNASE"])
+    alphagenome._METADATA_CACHE.clear()
+    fake.metadata_calls = 0
+    await client.score_variants(["1:100:A:G"], cell_type="liver", modalities=["DNASE"])
+    assert fake.metadata_calls == 0
+
+
+async def test_a_metadata_failure_is_not_frozen_into_the_cache():
+    """A degraded answer must not be served for the whole TTL after the Atlas recovers."""
+
+    class FlakyMetadataAtlas(FakeAtlas):
+        def scorer_metadata(self):
+            self.metadata_calls += 1
+            if self.metadata_calls == 1:
+                raise FakeGrpcError("UNAVAILABLE", "atlas metadata is down")
+            return self.metadata
+
+    fake = FlakyMetadataAtlas(
+        responses={"chr1:100": {"DNASE": [entry([0.5, 0.9])]}},
+        metadata={"DNASE": FakeScorerMetadata("DNASE", ["biosample_1"])},
+    )
+    client = _client(fake)
+
+    first = await client.score_variants(
+        ["1:100:A:G"], cell_type="biosample_1", modalities=["DNASE"]
+    )
+    degraded = first["results"][0]["modalities"]["DNASE"]["cell_type_match"]
+    assert first["results"][0]["success"] is True
+    assert degraded["resolution_failed"] is True
+    assert degraded["matched"] is False
+
+    second = await client.score_variants(
+        ["1:100:A:G"], cell_type="biosample_1", modalities=["DNASE"]
+    )
+    recovered = second["results"][0]["modalities"]["DNASE"]["cell_type_match"]
+    assert recovered["resolution_failed"] is False
+    assert recovered["matched"] is True
+    assert recovered["resolved_biosamples"] == ["biosample_1"]
+    assert len(fake.single_calls) == 2

@@ -1,6 +1,7 @@
 {
   "chat_backend": {
     "deployed_flags_set": {
+      "ALPHAGENOME_API_KEY": "configured",
       "ENABLE_SUBAGENTS": "false",
       "SANDBOX_ENABLED": "true"
     },
@@ -522,6 +523,7 @@
       "ENABLE_SUBAGENTS": "false"
     },
     "deployed_flags_unset": [
+      "ALPHAGENOME_API_KEY",
       "ENABLE_CREDIBLE_SETS_STATS",
       "ENABLE_LITERATURE_SEARCH",
       "ENABLE_PHENOTYPE_REPORT",
@@ -605,6 +607,7 @@
       ]
     },
     "settings_disabled_tools": [
+      "get_alphagenome_variant_predictions",
       "get_credible_sets_stats",
       "get_phenotype_report",
       "launch_subagents",

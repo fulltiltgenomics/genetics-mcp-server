@@ -35,6 +35,11 @@ import anndata
 from alphagenome.atlas import atlas
 from alphagenome.data import genome
 
+# the same store uniprot.py defines and chembl.py already reuses, rather than a third
+# copy of it. The import runs the other way from the one this module is forbidden to
+# make: uniprot is on the SDK allow-list and knows nothing of AlphaGenome.
+from genetics_mcp_server.tools.uniprot import _TTLCache
+
 if TYPE_CHECKING:
     # type-only for the same reason as in tools/uniprot.py: a real import of
     # config.settings would pull the module enumerating every internal env var name into
@@ -339,12 +344,16 @@ class TrackSelection:
     indices: tuple[int, ...]
     biosamples: tuple[str, ...]
     matched: bool
+    # a cell type nothing matches and a cell type nothing could be asked about produce the
+    # same empty selection; only this tells the caller which of the two they are reading
+    resolution_failed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "requested": self.requested,
             "resolved_biosamples": list(self.biosamples),
             "matched": self.matched,
+            "resolution_failed": self.resolution_failed,
         }
 
 
@@ -416,6 +425,23 @@ _LIMITER = _RateLimiter()
 _METADATA_CACHE: dict[str, Any] = {}
 _METADATA_LOCK = asyncio.Lock()
 
+# Predictions are cached IN PROCESS AND NOWHERE ELSE. The measured quota (~1320 req/min,
+# ~1.9M/day) is far above the 1e3-1e5/day this is expected to draw, so the cache is here to
+# stop one chat turn paying twice for the same variant, not to make the load fit. Keeping it
+# in memory also means no prediction is ever written down, which sidesteps the unanswered
+# question of whether DeepMind's terms permit STORING outputs rather than answering it -- a
+# SQLite table on the chat-data PVC would have had to answer it first.
+#
+# Module level for the same reason as the limiter: clients are built per executor.
+#
+# Unlike _METADATA_CACHE this is not keyed by Atlas address, which is safe only because
+# `alphagenome_address` has no Settings field and is therefore None everywhere but a test.
+# Give the address a real configuration path and two Atlases would share one cache.
+_CACHE = _TTLCache()
+
+# fallback for a client built without Settings (tests, the standalone CLI)
+_CACHE_TTL = 3600.0
+
 
 def _grpc_code(exc: BaseException) -> str | None:
     """The gRPC status name of an error, without importing grpc to find out."""
@@ -453,9 +479,12 @@ class AlphaGenomeClient:
         atlas_factory: Callable[[str], Any] | None = None,
         limiter: _RateLimiter | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        cache: _TTLCache | None = None,
     ):
-        # getattr rather than an attribute access: the settings field is added by its own
-        # subtask, and the environment is the source of record for the key either way.
+        # getattr rather than attribute access on all three: `settings` is None for tests
+        # and the standalone CLI, and executor.py's _PrunedInstallSettings carries no
+        # alphagenome fields at all. Only the key has a Settings field; the address and the
+        # timeout are read here so a test can set them on any object it likes.
         configured = api_key or getattr(settings, "alphagenome_api_key", None)
         self._api_key = configured or os.environ.get("ALPHAGENOME_API_KEY") or ""
         self._address = getattr(settings, "alphagenome_address", None)
@@ -463,6 +492,9 @@ class AlphaGenomeClient:
         self._atlas_factory = atlas_factory or self._default_factory
         self._limiter = limiter or _LIMITER
         self._sleep = sleep
+        self._cache = cache if cache is not None else _CACHE
+        ttl = getattr(settings, "alphagenome_cache_ttl", None)
+        self._cache_ttl = _CACHE_TTL if ttl is None else float(ttl)
         self._atlas: Any = None
 
     def _default_factory(self, api_key: str) -> Any:
@@ -563,12 +595,16 @@ class AlphaGenomeClient:
         tracks are worth ~0.06 rho over taking the extreme across all tissues, and the
         caller has no way to reach the biosample vocabulary. An unresolvable request falls
         back to all tracks with `matched` False rather than to no answer.
+
+        A metadata round trip that failed falls back the same way but says so in
+        `resolution_failed`, because the two are otherwise indistinguishable and only one
+        of them is a stable answer worth remembering.
         """
         if not cell_type:
             return _ALL_TRACKS
         metadata = await self.track_metadata()
         if _is_error(metadata):
-            return TrackSelection(cell_type, (), (), False)
+            return TrackSelection(cell_type, (), (), False, resolution_failed=True)
         needle = _slug(cell_type)
         indices: list[int] = []
         biosamples: list[str] = []
@@ -620,14 +656,41 @@ class AlphaGenomeClient:
             return _failed(names["_stage"], names["_error"], {"n_requested": len(requested)})
 
         parsed = [(vid, parse_variant(vid)) for vid in requested]
-        valid = [variant for _, variant in parsed if not _is_error(variant)]
-        selections = {name: await self.resolve_tracks(name, cell_type) for name in names}
+        cached: dict[str, dict[str, Any]] = {}
+        valid: list[dict[str, Any]] = []
+        for vid, variant in parsed:
+            if _is_error(variant):
+                continue
+            hit = self._cache.get(_cache_key(variant, cell_type, names))
+            if hit is not _TTLCache._MISS:
+                # the key is the parsed coordinates, so a hit may have been stored under
+                # another spelling of the same locus; re-spell the echoed id so it reads
+                # back the way this caller wrote it
+                cached[vid] = {**hit, "variant": {**hit["variant"], "id": vid}}
+            else:
+                valid.append(variant)
+        # not a defect, but lifting hits out here means a batch holding two spellings of one
+        # locus fails wholesale cold (`_split_by_variant` refuses a collapsed key) and
+        # succeeds warm, because only one spelling still needs scoring
+
+        # both are only needed for what is actually being scored: an all-hit batch must not
+        # pay for the metadata round trip cell-type resolution would make
+        selections = (
+            {name: await self.resolve_tracks(name, cell_type) for name in names} if valid else {}
+        )
+        # a failed metadata round trip resolves to the same all-tracks fallback an
+        # unmatchable cell type does, so caching it would keep serving the degraded answer
+        # for the whole TTL after the Atlas recovers
+        resolution_failed = any(s.resolution_failed for s in selections.values())
         scored = await self._score_batch(valid, names) if valid else {}
 
         results: list[dict[str, Any]] = []
         for vid, variant in parsed:
             if _is_error(variant):
                 results.append(_failed(variant["_stage"], variant["_error"], {"variant_id": vid}))
+                continue
+            if vid in cached:
+                results.append(cached[vid])
                 continue
             outcome = scored.get(vid)
             if outcome is None or _is_error(outcome):
@@ -636,14 +699,17 @@ class AlphaGenomeClient:
                     _failed(sentinel["_stage"], sentinel["_error"], {"variant_id": vid})
                 )
                 continue
-            results.append(
-                {
-                    "success": True,
-                    "variant": variant,
-                    "cell_type": cell_type,
-                    "modalities": _flatten_all(outcome, names, selections),
-                }
-            )
+            entry = {
+                "success": True,
+                "variant": variant,
+                "cell_type": cell_type,
+                "modalities": _flatten_all(outcome, names, selections),
+            }
+            # only successful entries are cached, never an error sentinel, and the stored
+            # dict is handed to every hit -- callers must not mutate what comes back
+            if not resolution_failed:
+                self._cache.set(_cache_key(variant, cell_type, names), entry, self._cache_ttl)
+            results.append(entry)
         return {
             "success": True,
             "n_requested": len(requested),
@@ -688,6 +754,32 @@ class AlphaGenomeClient:
                 _sdk_variant(variant), requested_scorers=list(names)
             ),
         )
+
+
+def _cache_key(
+    variant: dict[str, Any], cell_type: str | None, names: Sequence[str]
+) -> str:
+    """Everything that can make one prediction differ from another.
+
+    The cell type is part of the key and not an afterthought: tracks are resolved per cell
+    type, so a key without it would answer a request about heart with a cached prediction
+    for liver under the caller's own label -- silently, and with the same shape. The
+    modality list is in it for the same reason, since the result carries only what was
+    asked for. The raw cell-type string is used rather than its slug so the echoed
+    `cell_type` field always spells it the way this caller did; the variant id gets the
+    same treatment on the hit path, where the parsed coordinates deliberately do collapse
+    spellings.
+    """
+    return "|".join(
+        (
+            variant["chromosome"],
+            str(variant["position"]),
+            variant["reference_bases"],
+            variant["alternate_bases"],
+            cell_type or "",
+            ",".join(sorted(names)),
+        )
+    )
 
 
 def _sdk_variant(variant: dict[str, Any]) -> Any:
