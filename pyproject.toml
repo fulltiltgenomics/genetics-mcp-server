@@ -20,6 +20,17 @@ dependencies = [
     "google-auth[requests]==2.49.0",
     "fastexcel==0.20.2",
     "pyjwt[crypto]==2.11.0",
+    "alphagenome==0.9.0",
+    # alphagenome pulls anndata in; held one minor back. 0.13's module-level settings
+    # object is a pydantic-settings model that searches upward for a .env with extras
+    # forbidden, and the `dotenv_filtering` opt-out that would spare unrelated keys is
+    # silently ignored before pydantic-settings 2.14.0, which is what our lock holds -- so
+    # `import anndata` fails and the ValidationError echoes the values it read, secrets
+    # included, wherever a .env sits at or above the cwd (dev and CI; images carry none).
+    # Bumping pydantic-settings to >=2.14.0 activates the filtering and retires that half
+    # of the reason; 0.13's numpy>=2.1 / pandas>=2.3 / zarr>=3.1 floors are the other half
+    # and are unconditional. Price of staying: 0.12.19 needs pandas<3, capping it at 2.3.3.
+    "anndata==0.12.19",
 ]
 
 [project.optional-dependencies]
