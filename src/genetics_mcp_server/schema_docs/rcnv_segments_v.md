@@ -9,29 +9,30 @@ dosage sensitivity map of the human genome" (Cell 185:3041-3055, doi
 88 genome-wide significant and 75 FDR significant — each an interval whose deletion or
 duplication is associated with one or more of the study's phenotype groups. This is the
 region-level view of the same study whose gene-level statistics are in
-rcnv_gene_associations_v and whose per-gene scores are in dosage_sensitivity_v. TEN SEGMENTS
+rcnv_gene_associations_v and whose per-gene scores are in dosage_sensitivity_v. SIX SEGMENTS
 HAVE NO GRCh38 COORDINATES. `segment_start`/`segment_end` are the GRCh38 lift of the
-published GRCh37 interval, and they are NULL for the ten segments that do not lift as a
-whole interval — the recurrent genomic disorders over segmental-duplication-flanked regions:
-both 22q11.21 segments (the DiGeorge deletion and its reciprocal duplication),
-15q11.2-q13.3, 1q21.1-q21.2, 1p11.2-p12, 1p36.32-p36.33 DUP, 8q24.3, 10q26.3, 13q34 and
-17p13.3. Any query with a `segment_start`/`segment_end` predicate silently misses them, and
-they are exactly the best-known segments in the table. Add `AND segment_start IS NOT NULL`
-to make the exclusion explicit, and use `segment_start_grch37`/`segment_end_grch37` — always
-present — when the region matters more than the build. THE LIST COLUMNS ARE ARRAYS.
-`associated_hpos`, `credints`, `credints_grch37`, `genes`, `genes_gencode_v19` and
-`gene_ensembl_ids` are ARRAY<STRING>; use `CROSS JOIN UNNEST(<col>)` to get a row each, or
-`<value> IN UNNEST(<col>)` to match one. Each has a scalar length column next to it
-(`n_hpos`, `n_credints`, `n_genes`), so a count needs no UNNEST. `credints` and
-`credints_grch37` are positionally aligned: position i is the same credible interval in both
-builds, and `credints[i]` is the literal string 'NA' where that one interval did not lift.
-`associated_hpos` HOLDS THE STUDY'S PHENOTYPE CODES, INCLUDING THE LITERAL 'UNKNOWN'. Each
-entry is an HP0000118-style code without the colon, the same codes
-rcnv_gene_associations_v.phenotype uses — 45 real HPO codes plus the literal 'UNKNOWN',
-which 33 segments carry. Join `phenotypes_v` on `dataset` and `trait_original` to get the
-phenotype name for a code. JOIN GENES ON `gene_ensembl_ids`, NOT `genes`. `genes` holds
-current HGNC symbols mapped from the source GENCODE v19 spellings (`genes_gencode_v19` keeps
-the published ones, aligned position for position), and symbols are neither stable nor
+published GRCh37 interval: the whole interval where that lifts, otherwise composed from the
+two published 200 kb sliding windows that begin and end on the segment's boundaries. They
+are NULL where neither works — currently 1p11.2-p12, 8q24.3, 10q26.3, 13q34, 17p13.3 DEL and
+the 22q11.21 duplication, recurrent genomic disorders whose flanking segmental duplications
+are exactly the sequence GRCh37 and GRCh38 rearranged. Which segments those are follows the
+liftOver chain the load was built from, so the list moves when the source is re-munged. Any
+query with a `segment_start`/`segment_end` predicate silently misses them: add `AND
+segment_start IS NOT NULL` to make the exclusion explicit, and use
+`segment_start_grch37`/`segment_end_grch37` — always present — when the region matters more
+than the build. THE LIST COLUMNS ARE ARRAYS. `associated_hpos`, `credints`,
+`credints_grch37`, `genes`, `genes_gencode_v19` and `gene_ensembl_ids` are ARRAY<STRING>;
+use `CROSS JOIN UNNEST(<col>)` to get a row each, or `<value> IN UNNEST(<col>)` to match
+one. Each has a scalar length column next to it (`n_hpos`, `n_credints`, `n_genes`), so a
+count needs no UNNEST. `credints` and `credints_grch37` are positionally aligned: position i
+is the same credible interval in both builds, and `credints[i]` is the literal string 'NA'
+where that one interval did not lift. `associated_hpos` HOLDS THE STUDY'S PHENOTYPE CODES,
+INCLUDING THE LITERAL 'UNKNOWN'. Each entry is an HP0000118-style code without the colon,
+the same codes rcnv_gene_associations_v.phenotype uses — 45 real HPO codes plus the literal
+'UNKNOWN', which 33 segments carry. Join `phenotypes_v` on `dataset` and `trait_original` to
+get the phenotype name for a code. JOIN GENES ON `gene_ensembl_ids`, NOT `genes`. `genes`
+holds current HGNC symbols mapped from the source GENCODE v19 spellings (`genes_gencode_v19`
+keeps the published ones, aligned position for position), and symbols are neither stable nor
 unique. Twelve gene-poor segments carry empty gene arrays, not NULL. SIGNIFICANCE AND EFFECT
 SIZE ARE POOLED OVER THE SEGMENT'S PHENOTYPES. `best_significance` is the strongest tier the
 segment reached across its associated phenotypes — 'Genome-wide' (the paper's primary
@@ -47,9 +48,9 @@ likewise the pooled ln(odds ratio), so OR = EXP(beta), with `beta_lower`/`beta_u
 | `segment_id` | `STRING` | Segment identifier as published, e.g. merged_DEL_segment_22q11.21. Unique within the view |
 | `cnv_type` | `STRING` | CNV class: DEL (deletion) or DUP (duplication). A locus can appear as both, as a separate segment each |
 | `chr` | `INT64` | Chromosome number, 1-22. The published segments are autosomal only |
-| `segment_start` | `INT64` | Segment start, GRCh38. NULL for the 10 segments that do not lift as whole intervals (both 22q11.21, 15q11.2-q13.3, 1q21.1-q21.2, 1p11.2-p12, 1p36.32-p36.33 DUP, 8q24.3, 10q26.3, 13q34, 17p13.3) — a coordinate-window query misses those, so use segment_start_grch37/segment_end_grch37 as the fallback |
-| `segment_end` | `INT64` | Segment end, GRCh38. NULL for the same 10 segments as segment_start |
-| `segment_start_grch37` | `INT64` | Segment start as published (GRCh37). Always present, including for the 10 segments with no GRCh38 lift |
+| `segment_start` | `INT64` | Segment start, GRCh38 — the whole-interval lift, or the start of the 200 kb sliding window that begins on it. NULL for the six segments where neither lifts (1p11.2-p12, 8q24.3, 10q26.3, 13q34, 17p13.3 DEL, 22q11.21 DUP) — a coordinate-window query misses those, so use segment_start_grch37/segment_end_grch37 as the fallback |
+| `segment_end` | `INT64` | Segment end, GRCh38. NULL for the same six segments as segment_start |
+| `segment_start_grch37` | `INT64` | Segment start as published (GRCh37). Always present, including for the segments with no GRCh38 lift |
 | `segment_end_grch37` | `INT64` | Segment end as published (GRCh37). Always present |
 | `cytoband` | `STRING` | Cytogenetic band range the segment spans, e.g. 22q11.21. The way these loci are named clinically |
 | `best_significance` | `STRING` | Strongest significance tier the segment reached across its associated phenotypes: 'Genome-wide' (the paper's primary threshold, 88 segments) or 'FDR' (the FDR < 1% secondary tier, 75 segments) |
@@ -93,7 +94,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 Queries that run against rcnv_segments_v as written. Copy the shape rather than inventing
 one — each shows the filters this view expects.
 
-### Fine-mapped GWAS variants that fall inside a disease-associated CNV segment: is the common-variant signal in the same interval as the rare-CNV one? The BETWEEN is on the GRCh38 pair, which is why `AND s.segment_start IS NOT NULL` is spelled out — the 10 segments with no lift, both 22q11.21 among them, cannot match and would otherwise disappear without a trace.
+### Fine-mapped GWAS variants that fall inside a disease-associated CNV segment: is the common-variant signal in the same interval as the rare-CNV one? The BETWEEN is on the GRCh38 pair, which is why `AND s.segment_start IS NOT NULL` is spelled out — the handful of segments with no GRCh38 lift, the 22q11.21 duplication among them, cannot match and would otherwise disappear without a trace.
 
 ```sql
 WITH cs AS (
@@ -138,7 +139,7 @@ ORDER BY d.phaplo DESC
 LIMIT 20
 ```
 
-### Why the gene list and a coordinate window disagree, on the segment where it matters most. The 22q11.21 deletion has no GRCh38 segment_start/segment_end at all, so the window here is reconstructed from its own genes' GRCh38 coordinates; counting everything gene_annotations_v holds inside that window returns 93 against the paper's 48. The published list is protein-coding genes from GENCODE v19, gene_annotations_v is the whole current gene universe — so use gene_ensembl_ids for what the paper tested, and a window only for what is there now.
+### Why the gene list and a coordinate window disagree, on the segment where it matters most. The window here is reconstructed from the segment's own genes' GRCh38 coordinates rather than taken from segment_start/segment_end, so the comparison also works on the segments whose interval has no lift; counting everything gene_annotations_v holds inside that window returns 93 against the paper's 48. The published list is protein-coding genes from GENCODE v19, gene_annotations_v is the whole current gene universe — so use gene_ensembl_ids for what the paper tested, and a window only for what is there now.
 
 ```sql
 WITH seg AS (
