@@ -1464,6 +1464,56 @@ class TestRequestSizeLimits:
         assert chat_api._message_text_len(content) == len("look")
 
 
+class TestStripImageMarkers:
+    """The frontend keeps a generated plot inline in the assistant's text as
+    [IMAGE:format:alt:base64]. Replayed verbatim it is base64 the model cannot read, and it
+    is charged as text on every later turn — the measured failure was a plotting session
+    that added ~180k tokens per turn and hit 'prompt is too long' after six."""
+
+    def test_marker_payload_is_replaced_in_a_string_message(self):
+        from genetics_mcp_server import chat_api
+
+        content = "here it is\n\n[IMAGE:png:locuszoom APOE:" + "A" * 200_000 + "]\n\ndone"
+
+        stripped = chat_api._strip_image_markers(content)
+
+        assert "A" * 100 not in stripped
+        assert "[image shown to the user: locuszoom APOE]" in stripped
+        assert stripped.startswith("here it is")
+        assert stripped.endswith("done")
+
+    def test_marker_payload_is_replaced_in_text_blocks(self):
+        from genetics_mcp_server import chat_api
+
+        content = [
+            {"type": "text", "text": "[IMAGE:png:plot 1:" + "B" * 50_000 + "]"},
+            {"type": "text", "text": "no marker here"},
+        ]
+
+        stripped = chat_api._strip_image_markers(content)
+
+        assert stripped[0]["text"] == "[image shown to the user: plot 1]"
+        assert stripped[1]["text"] == "no marker here"
+
+    def test_real_image_blocks_are_left_alone(self):
+        """An attached image travels as a proper image block and the model CAN see it."""
+        from genetics_mcp_server import chat_api
+
+        content = [
+            {"type": "image", "source": {"type": "base64", "data": "C" * 1000}},
+            {"type": "text", "text": "what is this"},
+        ]
+
+        assert chat_api._strip_image_markers(content) == content
+
+    def test_tool_result_blocks_are_left_alone(self):
+        from genetics_mcp_server import chat_api
+
+        content = [{"type": "tool_result", "tool_use_id": "t1", "content": "{\"rows\": 3}"}]
+
+        assert chat_api._strip_image_markers(content) == content
+
+
 class TestClassifyErrorSubclasses:
     """`_classify_error` used to compare exception class names by exact string, so a
     subclass like `anthropic.NotFoundError` (raised for an unrecognised model id) fell
@@ -1494,6 +1544,47 @@ class TestClassifyErrorSubclasses:
         message = chat_api._classify_error(err)
 
         assert "internal server error" not in message.lower()
+
+    def test_context_overflow_is_not_reported_as_an_invalid_request(self):
+        """A prompt over the model's window is a 400 like any malformed body, and saying
+        "Invalid request" sends the user looking at what they typed instead of at the
+        length of the conversation."""
+        import anthropic
+        import httpx
+
+        from genetics_mcp_server import chat_api
+
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        resp = httpx.Response(400, request=req)
+        err = anthropic.BadRequestError(
+            "prompt is too long: 1214622 tokens > 1000000 maximum",
+            response=resp,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 1214622 tokens > 1000000 maximum",
+                }
+            },
+        )
+
+        message = chat_api._classify_error(err)
+
+        assert "too long" in message.lower()
+        assert "invalid request" not in message.lower()
+
+    def test_other_bad_requests_keep_the_generic_message(self):
+        import anthropic
+        import httpx
+
+        from genetics_mcp_server import chat_api
+
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        resp = httpx.Response(400, request=req)
+        err = anthropic.BadRequestError(
+            "messages: unexpected role", response=resp, body={"error": {"type": "invalid_request_error"}}
+        )
+
+        assert chat_api._classify_error(err) == "Invalid request sent to LLM service."
 
     def test_json_decode_error_is_reported_as_internal(self):
         """A real parse fault (ValueError subclass) must not be misreported as a caller
