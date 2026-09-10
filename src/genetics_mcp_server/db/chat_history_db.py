@@ -37,6 +37,9 @@ class ChatProject:
     # session is filed or unfiled, so this cannot go stale. Other accessors
     # leave it None because they do not compute it
     last_activity_at: datetime | None = None
+    # how many sessions are filed here, derived by the same read; 0 from the
+    # accessors that do not compute it
+    session_count: int = 0
 
 
 @dataclass
@@ -697,7 +700,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute(
             """
             SELECT p.id, p.user_id, p.name, p.created_at, p.updated_at, p.archived_at,
-                   MAX(s.updated_at) AS last_activity_at
+                   MAX(s.updated_at) AS last_activity_at,
+                   COUNT(s.id) AS session_count
             FROM chat_projects p
             LEFT JOIN chat_sessions s
               ON s.project_id = p.id AND s.user_id = p.user_id
@@ -1845,6 +1849,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             archived_at=(
                 datetime.fromisoformat(row["archived_at"]) if row["archived_at"] else None
             ),
+            session_count=row["session_count"] if "session_count" in keys else 0,
             last_activity_at=(
                 datetime.fromisoformat(row["last_activity_at"])
                 if "last_activity_at" in keys and row["last_activity_at"]

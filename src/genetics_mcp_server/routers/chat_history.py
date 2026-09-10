@@ -143,6 +143,7 @@ class ProjectResponse(BaseModel):
     created_at: str
     updated_at: str
     last_activity_at: Optional[str] = None
+    session_count: int = 0
 
 
 class SessionProjectRequest(BaseModel):
@@ -531,6 +532,7 @@ def _project_response(project) -> ProjectResponse:
         last_activity_at=(
             project.last_activity_at.isoformat() if project.last_activity_at else None
         ),
+        session_count=project.session_count,
     )
 
 

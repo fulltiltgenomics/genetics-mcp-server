@@ -1180,9 +1180,14 @@ class TestProjectEndpoints:
         assert body["created_at"]
         assert body["updated_at"]
         assert body["last_activity_at"] is None
+        assert body["session_count"] == 0
 
         listed = client_with_auth.get("/chat/v1/projects").json()
         assert [p["id"] for p in listed] == [body["id"]]
+
+        client_with_auth.post("/chat/v1/chat/sessions", json={"project_id": body["id"]})
+        listed = client_with_auth.get("/chat/v1/projects").json()
+        assert listed[0]["session_count"] == 1
 
     def test_a_blank_name_is_rejected(self, client_with_auth):
         response = client_with_auth.post("/chat/v1/projects", json={"name": "   "})

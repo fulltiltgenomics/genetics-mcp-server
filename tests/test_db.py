@@ -880,6 +880,7 @@ class TestChatProjects:
         empty = chat_history_db.list_projects(USER)
         assert [p.id for p in empty] == [renamed_last.id, renamed_first.id]
         assert all(p.last_activity_at is None for p in empty)
+        assert all(p.session_count == 0 for p in empty)
 
         stale = chat_history_db.create_session(USER, project_id=renamed_last.id)
         fresh = chat_history_db.create_session(USER, project_id=renamed_first.id)
@@ -897,6 +898,12 @@ class TestChatProjects:
         assert [p.id for p in listed] == [renamed_first.id, renamed_last.id]
         assert listed[0].last_activity_at == datetime(2024, 3, 1)
         assert listed[1].last_activity_at == datetime(2024, 2, 1)
+        assert [p.session_count for p in listed] == [1, 1]
+
+        chat_history_db.create_session(USER, project_id=renamed_first.id)
+        chat_history_db.set_session_project(USER, stale.id, None)
+        counted = {p.id: p.session_count for p in chat_history_db.list_projects(USER)}
+        assert counted == {renamed_first.id: 2, renamed_last.id: 0}
 
     def test_list_sessions_in_project_is_owner_scoped(self, chat_history_db):
         project = chat_history_db.create_project(USER, "IBD")
