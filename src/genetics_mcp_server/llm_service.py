@@ -24,6 +24,7 @@ from genetics_mcp_server.config import (
 )
 from genetics_mcp_server.config.defaults import (
     CONTINUE_TRUNCATED_PROMPT,
+    CONTINUE_TRUNCATED_TOOL_CALL_PROMPT,
     CONTINUE_UNFILLED_PROMPT,
     memory_envelope,
 )
@@ -322,19 +323,26 @@ def _last_fallback_index(content: list[Any]) -> int:
     return max((i for i, b in enumerate(content) if b.type == "fallback"), default=-1)
 
 
-def _replayable_content(content: list[Any]) -> list[dict[str, Any]]:
+def _replayable_content(
+    content: list[Any], drop_tool_use: bool = False
+) -> list[dict[str, Any]]:
     """The assistant turn as it goes back to the API.
 
     After a mid-output fallback the blocks before the last `fallback` marker were written
     by the model that declined: its reasoning and tool calls are not part of the answer
     the fallback model continued, and echoing them back is rejected, so only its text
     survives. The marker itself is dropped; the API treats it as an ignorable audit line.
+
+    `drop_tool_use` removes every tool call from the replay. It is for the turn the output
+    cap cut off mid-arguments: those calls are never dispatched, so replaying them would
+    send back a tool_use with no matching tool_result, which the API rejects.
     """
     cut = _last_fallback_index(content)
     return [
         b.model_dump(exclude_none=True)
         for i, b in enumerate(content)
         if b.type != "fallback"
+        and not (drop_tool_use and b.type == "tool_use")
         and not (i < cut and b.type in ("thinking", "redacted_thinking", "tool_use"))
     ]
 
@@ -1244,6 +1252,7 @@ class LLMService:
             continuations = 0
             truncated = False
             unfilled = False
+            over_budget = False
 
             while iteration < max_iterations:
                 iteration += 1
@@ -1365,6 +1374,18 @@ class LLMService:
                     f"cache_read={cache_read} cache_create={cache_create} "
                     f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
                 )
+
+                # checked after the spend is booked and before anything is dispatched, so
+                # the turn stops at the first iteration that crosses the line rather than
+                # running its tools and paying for one more model call to read them. The
+                # text this iteration already streamed stands; only the loop ends.
+                if 0 < settings.max_turn_cost_usd <= total_cost:
+                    over_budget = True
+                    logger.warning(
+                        f"{log_prefix}Turn stopped at iteration={iteration}: spend "
+                        f"${total_cost:.2f} reached the ${settings.max_turn_cost_usd:.2f} cap"
+                    )
+                    break
 
                 # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
                 context_tokens = input_tok + cache_read + cache_create
@@ -1491,11 +1512,18 @@ class LLMService:
                     all_content_blocks.append({"type": "text", "text": notice})
                     break
 
-                # a turn cut off by the output cap carries no tool_use blocks, so the loop
-                # would otherwise break and report it as a completed answer. Resume it
-                # instead. Guarded on tool_uses being empty: continuing a turn that holds
-                # an unanswered tool_use would send an unpaired block back.
-                if not tool_uses and message.stop_reason == "max_tokens":
+                # a turn cut off by the output cap is resumed rather than reported as a
+                # completed answer. The cut lands in one of two places, and they need
+                # different handling: after the text, leaving no tool_use block, or inside
+                # a tool call's streamed arguments, leaving a tool_use whose input is
+                # partial and usually empty. Dispatching that second kind calls the tool
+                # with missing arguments; the TypeError that follows reads to the model as
+                # a server fault, so it reissues the same oversized call and the turn
+                # burns full output cap per iteration until the iteration limit stops it.
+                if message.stop_reason == "max_tokens":
+                    # the calls are dropped, not answered, so they must leave the replay
+                    # too: a tool_use with no matching tool_result is rejected outright.
+                    cut_mid_tool_call = bool(tool_uses)
                     if continuations >= settings.max_continuations:
                         truncated = True
                         logger.warning(
@@ -1505,18 +1533,40 @@ class LLMService:
                         break
                     continuations += 1
                     logger.info(
-                        f"{log_prefix}Turn hit max_tokens; continuing "
-                        f"({continuations}/{settings.max_continuations})"
+                        f"{log_prefix}Turn hit max_tokens"
+                        + (
+                            f" mid-arguments of {len(tool_uses)} tool call(s), dropped"
+                            if cut_mid_tool_call
+                            else ""
+                        )
+                        + f"; continuing ({continuations}/{settings.max_continuations})"
                     )
+                    replay = _replayable_content(
+                        message.content, drop_tool_use=cut_mid_tool_call
+                    )
+                    # a turn that spent its whole budget inside the arguments can leave
+                    # nothing replayable once the calls are dropped, and an empty
+                    # assistant message is rejected. Say what happened instead.
+                    if not replay:
+                        replay = [
+                            {
+                                "type": "text",
+                                "text": "[incomplete tool call, not executed]",
+                            }
+                        ]
                     # the partial turn has to be followed by a user turn — a trailing
                     # assistant message is a prefill, which Opus 4.6+ rejects outright.
                     request_params["messages"] = [
                         *request_params["messages"],
+                        {"role": "assistant", "content": replay},
                         {
-                            "role": "assistant",
-                            "content": _replayable_content(message.content),
+                            "role": "user",
+                            "content": (
+                                CONTINUE_TRUNCATED_TOOL_CALL_PROMPT
+                                if cut_mid_tool_call
+                                else CONTINUE_TRUNCATED_PROMPT
+                            ),
                         },
-                        {"role": "user", "content": CONTINUE_TRUNCATED_PROMPT},
                     ]
                     continue
 
@@ -1791,6 +1841,14 @@ class LLMService:
                 notice = (
                     "\n\n---\n*The results above were left unfilled — the query was not "
                     "run. Ask again to retry.*\n"
+                )
+                yield StreamChunk(type="text", content=notice)
+                all_content_blocks.append({"type": "text", "text": notice})
+
+            if over_budget:
+                notice = (
+                    "\n\n---\n*This turn reached its cost limit and was stopped before "
+                    "it finished. Ask a narrower question to continue.*\n"
                 )
                 yield StreamChunk(type="text", content=notice)
                 all_content_blocks.append({"type": "text", "text": notice})

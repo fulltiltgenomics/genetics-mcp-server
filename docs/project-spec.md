@@ -2034,12 +2034,24 @@ literal at a call site.
 
 `_stream_anthropic()` decides whether to keep looping from three signals, not one:
 
-- **`tool_use` blocks present** — execute the tools and continue the loop, as before.
-- **`stop_reason == "max_tokens"` with no tool_use blocks** — the turn was cut off by the
-  output cap. The partial assistant turn is fed back followed by a user turn asking it to
-  resume (a *trailing assistant* message would be a prefill, which Opus 4.6+ rejects), up
-  to `MAX_CONTINUATIONS` times. Only if it is still truncated after that does the stream
+- **`tool_use` blocks present, turn not truncated** — execute the tools and continue the
+  loop, as before.
+- **`stop_reason == "max_tokens"`** — the turn was cut off by the output cap. The partial
+  assistant turn is fed back followed by a user turn asking it to resume (a *trailing
+  assistant* message would be a prefill, which Opus 4.6+ rejects), up to
+  `MAX_CONTINUATIONS` times. Only if it is still truncated after that does the stream
   append a visible "cut short by the output token limit" notice.
+
+  The cut lands in one of two places and the branch handles both. After the text, the turn
+  carries no `tool_use` block and `CONTINUE_TRUNCATED_PROMPT` asks the model to continue
+  where it stopped. Inside a tool call's streamed arguments, it carries a `tool_use` whose
+  input never finished arriving — commonly `{}` — and that call is **dropped rather than
+  dispatched**: it leaves the replay too, since a `tool_use` with no matching `tool_result`
+  is rejected. `CONTINUE_TRUNCATED_TOOL_CALL_PROMPT` then tells the model its arguments were
+  truncated, that nothing ran, and to reissue the work as several smaller calls. Naming the
+  cause is load-bearing. Dispatching the partial call instead raises `missing 1 required
+  positional argument`, which reads as a server fault, so the model reissues the same
+  oversized call and every iteration burns the full output cap.
 - **`stop_reason == "end_turn"`, no tool_use blocks, no tool ran all turn, and the text
   presents unfilled results** — the model announced a query it never made and tabled up
   placeholders in place of the answer. Resumed the same way with
@@ -2347,6 +2359,7 @@ All configuration is via environment variables (`.env` file supported):
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
 | `MAX_CONTINUATIONS` | How many times a turn stopped by `stop_reason: max_tokens` is resumed before the truncation is reported to the user | `3` |
+| `MAX_TURN_COST_USD` | Ceiling on what one user turn may spend. Checked after each model call's cost is booked and before its tools are dispatched, so the turn stops at the first iteration that crosses the line; the user gets a "reached its cost limit" notice. Every other bound here limits a failure shape known in advance, this one limits the bill for shapes that are not. `0` disables it | `10.0` |
 | `REFUSAL_FALLBACK` | Who answers when a safety classifier declines a request: `default` lets Anthropic pick by refusal category, a model id pins the substitute, empty shows the refusal to the user. Sent only to models that run the classifiers (Fable, Mythos, Opus 5+) | `default` |
 | `ANTHROPIC_MAX_RETRIES` | Attempts the streaming call makes over connection errors, 5xx and `overloaded_error`, with exponential backoff | `3` |
 | `ANTHROPIC_RETRY_RATE_LIMIT` | Whether an Anthropic **429** is also retried. Off by default and deliberately so: a 429 means the account's capacity is spent, so retrying in front of a waiting user buys a longer spinner and takes capacity from the next request. A benchmark has no waiting user and turns it on | `false` |

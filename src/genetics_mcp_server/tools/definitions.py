@@ -1893,6 +1893,10 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             # register_mcp_tools block.
             "Run a Python script against the genetics data in a sandbox and get back what it "
             "printed. One script can query, join, filter and summarise in a single call.\n\n"
+            "Keep a script to ONE chain of work. A run that overruns `timeout_s` returns "
+            "nothing at all, so bundling independent analyses into one script risks losing "
+            "every one of them to the slowest — split independent work across separate "
+            "calls.\n\n"
             "Write the script against the `genetics` SDK — `import genetics` — and call "
             "list_capabilities first for the exact signatures rather than guessing. PRINT "
             "EVERYTHING YOU WANT TO SEE: only the "
