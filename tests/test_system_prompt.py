@@ -62,6 +62,7 @@ def flag_disabled_tools(
     return Settings(
         enable_subagents=subagents,
         sandbox_enabled=sandbox,
+        alphagenome_enabled=alphagenome,
         alphagenome_api_key="test-key" if alphagenome else None,
     ).disabled_tools
 
@@ -1065,13 +1066,25 @@ class TestAlphaGenomeOptIn:
         assert self.TOOL not in without_key
         assert "AlphaGenome" not in default_system_prompt("FinnGenie", tool_names=without_key)
 
-    def test_the_key_is_the_only_thing_the_gate_reads(self):
-        """An empty string is as unconfigured as an unset variable — os.environ.get returns
-        "" for `ALPHAGENOME_API_KEY=` in a manifest, which is exactly what an optional
-        secret key renders to when the deployment has no key."""
-        assert self.TOOL not in Settings(alphagenome_api_key="k").disabled_tools
-        assert self.TOOL in Settings(alphagenome_api_key="").disabled_tools
-        assert self.TOOL in Settings(alphagenome_api_key=None).disabled_tools
+    def test_the_block_goes_when_the_flag_is_off_even_with_a_key(self):
+        """The flag is the deployment's intent and gates independently of the key: a
+        deployment that leaves ALPHAGENOME_ENABLED off must not advertise the tool or its
+        prompt block even if a key was ever seeded there."""
+        disabled = Settings(alphagenome_enabled=False, alphagenome_api_key="test-key").disabled_tools
+        available = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
+        assert self.TOOL not in available
+        assert "AlphaGenome" not in default_system_prompt("FinnGenie", tool_names=available)
+
+    def test_the_gate_reads_both_the_flag_and_the_key(self):
+        """Three of the four combinations withhold the tool; only flag-on with a
+        configured key advertises it. An empty string is as unconfigured as an unset
+        variable — os.environ.get returns "" for `ALPHAGENOME_API_KEY=` in a manifest,
+        which is exactly what an optional secret key renders to when the deployment has
+        no key."""
+        assert self.TOOL not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
 
     def test_the_tool_description_carries_the_same_rules(self):
         """The strongest wording lives in the description, which the model follows more

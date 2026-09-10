@@ -2,6 +2,7 @@
   "chat_backend": {
     "deployed_flags_set": {
       "ALPHAGENOME_API_KEY": "configured",
+      "ALPHAGENOME_ENABLED": "true",
       "ENABLE_SUBAGENTS": "false",
       "SANDBOX_ENABLED": "true"
     },
@@ -531,6 +532,7 @@
     },
     "deployed_flags_unset": [
       "ALPHAGENOME_API_KEY",
+      "ALPHAGENOME_ENABLED",
       "ENABLE_CREDIBLE_SETS_STATS",
       "ENABLE_LITERATURE_SEARCH",
       "ENABLE_PHENOTYPE_REPORT",

@@ -432,9 +432,10 @@ def test_the_comparison_tool_is_withheld_from_mcp_and_leaves_with_the_key():
     from genetics_mcp_server.config.settings import Settings
 
     assert TOOL in mcp_server._mcp_disabled
-    assert TOOL not in Settings(alphagenome_api_key="k").disabled_tools
-    assert TOOL in Settings(alphagenome_api_key="").disabled_tools
-    assert TOOL in Settings(alphagenome_api_key=None).disabled_tools
+    assert TOOL not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
+    assert TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
+    assert TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
+    assert TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
 
 
 def test_the_comparison_tool_is_on_both_surfaces():

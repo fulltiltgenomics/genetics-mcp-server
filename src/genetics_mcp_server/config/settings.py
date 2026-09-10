@@ -260,6 +260,15 @@ class Settings:
     alphagenome_api_key: str | None = field(
         default_factory=lambda: os.environ.get("ALPHAGENOME_API_KEY")
     )
+    # whether this deployment offers AlphaGenome at all — the deployment's intent, reviewable
+    # independently of whether a key happens to be present. `disabled_tools` withdraws both
+    # tools when this is false OR the key is absent, so a key reaching the wrong deployment
+    # does not turn the feature on.
+    alphagenome_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ALPHAGENOME_ENABLED", "false"
+        ).lower() in ("1", "true", "yes")
+    )
     # predictions are a deterministic function of the variant and the model, and the Atlas
     # response carries no version identifier, so nothing can detect a model update. A bounded
     # ttl is the only staleness control available; an hour absorbs the repeats inside a chat
@@ -475,8 +484,10 @@ class Settings:
             disabled.add("launch_subagents")
         if not self.enable_literature_search:
             disabled.add("search_scientific_literature")
-        if not self.alphagenome_api_key:
-            # a deployment with no key must not ADVERTISE the tool: every call would return
+        if not self.alphagenome_enabled or not self.alphagenome_api_key:
+            # the flag is the deployment's intent (off means "do not offer this here" even if
+            # a key is ever seeded); the key is a second, independent guard, because a
+            # deployment with no key must not ADVERTISE the tool: every call would return
             # "ALPHAGENOME_API_KEY is not set", and the opt-in prompt block would still be
             # telling the model when to use it. Withdrawing the name takes the block with it,
             # because default_system_prompt is assembled from the resolved tool names.
