@@ -1145,12 +1145,14 @@ class LLMService:
         # the memory envelope joins block 1 rather than taking a block of its own: all four
         # of Anthropic's cache breakpoints are already spoken for (tools, block 0, block 1,
         # the replayed history). Both fragments are per-user, and both hold still for the
-        # length of a session — the digest is rendered on a session's first turn only and
-        # read back verbatim from the stored row on every turn after it — so they share one
-        # entry without costing either anything. A caller that rendered a digest on a later
-        # turn would falsify that and move this block mid-conversation. The join is over
-        # the non-empty parts only, so with no memory block 1 is the instruction envelope
-        # byte for byte, and with neither there is no block 1 at all.
+        # length of a session — the digest of the session's project is rendered once, on
+        # the first turn where the session is filed, and read back verbatim from the
+        # stored row afterwards — so they share one entry without costing either anything.
+        # Filing, moving or unfiling a session mid-conversation renders a different digest
+        # or none, and moves this block once; that is a deliberate single cache miss, not
+        # a per-turn one. The join is over the non-empty parts only, so with no memory
+        # block 1 is the instruction envelope byte for byte, and with neither there is no
+        # block 1 at all.
         system_blocks: list[dict[str, Any]] = []
         if system_prompt:
             system_blocks.append(

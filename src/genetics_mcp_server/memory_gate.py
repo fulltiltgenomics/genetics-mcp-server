@@ -1,7 +1,7 @@
 """The single place that decides whether a caller gets cross-session chat memory.
 
 The chat turn (chat_api._resolve_user_memory) and the memory dialog's endpoint
-(routers/chat_history.get_memory) must agree on what "on" means, so the setting is read
+(routers/chat_history.get_project_memory) must agree on what "on" means, so the setting is read
 here and nowhere else: a second reader is a second definition of the opt-in, and the two
 would drift the moment either side gained a default.
 """
@@ -16,8 +16,13 @@ from genetics_mcp_server.db import get_llm_config_db
 MEMORY_SETTING_KEY = "chat_memory"
 MEMORY_SETTING_ON = "on"
 
-# how far back the digest looks. Pinned sessions come back regardless of this window.
-MEMORY_DIGEST_SESSION_LIMIT = 20
+# how far back the digest looks INSIDE one project. Pinned sessions filed in the same
+# project come back regardless of this window. It stays a recency window rather than the
+# whole project because the premise measurement's window-miss share was borderline at the
+# epic's own ~10% line, and at that measurement only 3 of 149 users held more than 20
+# sessions at all, so a larger cap bought nothing measurable. Raise it when a user's
+# project outgrows the window and the digest starts missing the session they mean.
+MEMORY_PROJECT_SESSION_CAP = 20
 
 _ANONYMOUS = "anonymous"
 
@@ -51,10 +56,20 @@ def memory_gate_open(user: str | None, *, gateway_asserted: bool, secret: bool) 
     return memory_setting_on(user)
 
 
+def _log_hash(value: str) -> str:
+    return hashlib.sha256(value.strip().lower().encode()).hexdigest()[:12]
+
+
 def user_log_hash(user: str) -> str:
     """A stable pseudonym, so the memory log line can name a user without the address.
 
     Other logs here do carry the raw address; this one is different because it reports on
     a read across the user's whole history, and it is emitted on every first turn.
     """
-    return hashlib.sha256(user.strip().lower().encode()).hexdigest()[:12]
+    return _log_hash(user)
+
+
+def project_log_hash(project_id: str) -> str:
+    """The same pseudonym scheme for a project id, so one log line can correlate a user's
+    turns within a project without naming either the person or the project."""
+    return _log_hash(project_id)

@@ -17,6 +17,30 @@ from .singleton import Singleton
 
 logger = logging.getLogger(__name__)
 
+# a project is a manual grouping the user maintains by hand; past twenty the sidebar
+# stops being something anyone files into, and the memory a project carries is only
+# as good as the filing
+PROJECTS_MAX_PER_USER = 20
+
+
+@dataclass
+class ChatProject:
+    """A user's project: a named container for chat sessions."""
+    id: str
+    user_id: str
+    name: str
+    created_at: datetime
+    updated_at: datetime
+    archived_at: datetime | None = None
+    # newest updated_at among the sessions filed here, None when it holds none.
+    # Derived per read by list_projects; no project row is written when a
+    # session is filed or unfiled, so this cannot go stale. Other accessors
+    # leave it None because they do not compute it
+    last_activity_at: datetime | None = None
+    # how many sessions are filed here, derived by the same read; 0 from the
+    # accessors that do not compute it
+    session_count: int = 0
+
 
 @dataclass
 class ChatSession:
@@ -30,9 +54,14 @@ class ChatSession:
     comment: str | None
     phenotype_code: str | None
     shared: bool = False
-    # written once, at the session's first turn; first writer wins. Hidden from
-    # non-owner (shared) reads and never copied by fork_session — it describes
-    # the owner's other conversations, not this one
+    # the project this session is filed into, NULL when unfiled. Hidden from
+    # non-owner (shared) reads and never copied by fork_session — which project
+    # the owner keeps a conversation in is the owner's own organization
+    project_id: str | None = None
+    # written once, at the session's first turn; first writer wins. Tri-state:
+    # NULL not rendered yet, '' rendered and deliberately empty, text rendered.
+    # Hidden from non-owner (shared) reads and never copied by fork_session — it
+    # describes the owner's other conversations, not this one
     context_digest: str | None = None
     # NULL unless the owner pinned this session; not copied by fork_session
     pinned_at: datetime | None = None
@@ -185,6 +214,34 @@ class ChatHistoryDB(object, metaclass=Singleton):
             cursor.execute("ALTER TABLE chat_sessions ADD COLUMN context_digest TEXT")
         if "pinned_at" not in session_columns:
             cursor.execute("ALTER TABLE chat_sessions ADD COLUMN pinned_at TIMESTAMP")
+        # no REFERENCES chat_projects(id): SQLite cannot add a foreign key by ALTER, and
+        # the accessors below already scope every project read and write by user_id, so
+        # the key would only restate a check that has to be made in SQL anyway
+        if "project_id" not in session_columns:
+            cursor.execute("ALTER TABLE chat_sessions ADD COLUMN project_id TEXT")
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_project
+            ON chat_sessions(user_id, project_id, updated_at DESC)
+        """)
+
+        # a user's named containers for sessions; archived_at hides one from the
+        # sidebar without unfiling the sessions it holds
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_projects (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                archived_at TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_projects_user
+            ON chat_projects(user_id, archived_at, updated_at DESC)
+        """)
 
         # migrations: add columns to chat_attachments if they don't exist
         cursor.execute("PRAGMA table_info(chat_attachments)")
@@ -320,20 +377,36 @@ class ChatHistoryDB(object, metaclass=Singleton):
         self._conn.commit()
 
     def create_session(
-        self, user_id: str, phenotype_code: str | None = None
+        self,
+        user_id: str,
+        phenotype_code: str | None = None,
+        project_id: str | None = None,
     ) -> ChatSession:
-        """Create a new chat session."""
+        """Create a new chat session, optionally filed into a project.
+
+        Raises ValueError when project_id names a project that is not this
+        user's. create_session has no falsy return — it either hands back a
+        session or raises — so a rejected project is an exception, matching
+        create_project's signal for a name it will not accept.
+        """
         session_id = str(uuid.uuid4())
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        if project_id is not None:
+            cursor.execute(
+                "SELECT id FROM chat_projects WHERE id = ? AND user_id = ?",
+                (project_id, user_id),
+            )
+            if cursor.fetchone() is None:
+                raise ValueError("project not found for this user")
         try:
             cursor.execute(
                 """
-                INSERT INTO chat_sessions (id, user_id, phenotype_code)
-                VALUES (?, ?, ?)
+                INSERT INTO chat_sessions (id, user_id, phenotype_code, project_id)
+                VALUES (?, ?, ?, ?)
                 """,
-                (session_id, user_id, phenotype_code),
+                (session_id, user_id, phenotype_code, project_id),
             )
             conn.commit()
         except BaseException:
@@ -350,6 +423,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             comment=None,
             phenotype_code=phenotype_code,
             shared=False,
+            project_id=project_id,
         )
 
     def get_session(self, session_id: str, user_id: str) -> ChatSession | None:
@@ -360,7 +434,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
-                   shared, context_digest, pinned_at
+                   shared, project_id, context_digest, pinned_at
             FROM chat_sessions
             WHERE id = ? AND user_id = ?
             """,
@@ -379,7 +453,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
-                   shared, pinned_at
+                   shared, project_id, pinned_at
             FROM chat_sessions
             WHERE user_id = ?
             ORDER BY updated_at DESC
@@ -515,16 +589,24 @@ class ChatHistoryDB(object, metaclass=Singleton):
     def set_context_digest(self, session_id: str, user_id: str, text: str) -> bool:
         """Write the digest text pinned to a session. First writer wins.
 
-        No-op (returns False) when the session already carries a digest or
-        does not belong to user_id — the digest is rendered once, at the
-        session's first turn, and never overwritten after that.
+        No-op (returns False) when the session already carries a digest —
+        including the empty string — or does not belong to user_id. The digest
+        is rendered once and never overwritten.
+
+        The stored value is tri-state: NULL means no render has happened yet,
+        '' means a render happened and produced nothing, and text is a real
+        digest. A stored '' is a hit, not a miss: this layer offers no way to
+        get back to NULL short of moving the session between projects, which
+        is why that path nulls the column rather than clearing it to ''.
+
+        A text that is empty after strip() is stored as '' rather than as
+        whitespace, so the rendered-empty state has one representation and a
+        blank render cannot occupy the slot under a value no caller can match.
         """
-        # an empty digest must not block a later real one from ever being written
-        if not text or not text.strip():
-            return False
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        stored = text if text.strip() else ""
         try:
             cursor.execute(
                 """
@@ -532,7 +614,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 SET context_digest = ?
                 WHERE id = ? AND user_id = ? AND context_digest IS NULL
                 """,
-                (text, session_id, user_id),
+                (stored, session_id, user_id),
             )
             conn.commit()
         except BaseException:
@@ -560,10 +642,234 @@ class ChatHistoryDB(object, metaclass=Singleton):
             raise
         return cursor.rowcount > 0
 
+    def create_project(self, user_id: str, name: str) -> ChatProject:
+        """Create a project for user_id.
+
+        Raises ValueError on a blank name or when the user already holds
+        PROJECTS_MAX_PER_USER non-archived projects. Archived projects are not
+        counted: they are out of the sidebar the cap exists to keep usable.
+        """
+        clean = name.strip()
+        if not clean:
+            raise ValueError("project name must not be empty")
+
+        project_id = str(uuid.uuid4())
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            # the count is read before the INSERT opens a write transaction, so two
+            # concurrent creates by the same user can both see room and leave 21. The
+            # cap is a UI comfort limit, not an invariant anything reads back, so it is
+            # not worth a lock or a trigger
+            cursor.execute(
+                "SELECT COUNT(*) FROM chat_projects WHERE user_id = ? AND archived_at IS NULL",
+                (user_id,),
+            )
+            if cursor.fetchone()[0] >= PROJECTS_MAX_PER_USER:
+                raise ValueError(f"at most {PROJECTS_MAX_PER_USER} projects per user")
+            cursor.execute(
+                "INSERT INTO chat_projects (id, user_id, name) VALUES (?, ?, ?)",
+                (project_id, user_id, clean),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+        cursor.execute(
+            "SELECT id, user_id, name, created_at, updated_at, archived_at "
+            "FROM chat_projects WHERE id = ?",
+            (project_id,),
+        )
+        return self._row_to_project(cursor.fetchone())
+
+    def list_projects(self, user_id: str) -> list[ChatProject]:
+        """List the user's non-archived projects, most recently used first.
+
+        Ordered by last_activity_at — the newest updated_at among the sessions
+        filed in the project — falling back to the project row's own
+        updated_at, which only a rename touches, for a project with no
+        sessions. Deriving it here rather than stamping the project row on
+        every file, unfile and turn keeps the write path untouched; the cost is
+        one LEFT JOIN over a list the cap holds to PROJECTS_MAX_PER_USER rows.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT p.id, p.user_id, p.name, p.created_at, p.updated_at, p.archived_at,
+                   MAX(s.updated_at) AS last_activity_at,
+                   COUNT(s.id) AS session_count
+            FROM chat_projects p
+            LEFT JOIN chat_sessions s
+              ON s.project_id = p.id AND s.user_id = p.user_id
+            WHERE p.user_id = ? AND p.archived_at IS NULL
+            GROUP BY p.id
+            ORDER BY COALESCE(last_activity_at, p.updated_at) DESC, p.id DESC
+            """,
+            (user_id,),
+        )
+        return [self._row_to_project(row) for row in cursor.fetchall()]
+
+    def rename_project(self, user_id: str, project_id: str, name: str) -> bool:
+        """Rename a project. Returns False when it is not this user's."""
+        clean = name.strip()
+        if not clean:
+            raise ValueError("project name must not be empty")
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                UPDATE chat_projects
+                SET name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (clean, project_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def delete_project(self, user_id: str, project_id: str) -> bool:
+        """Delete a project, unfiling its sessions. Returns False if it is not this user's.
+
+        The sessions survive as unfiled conversations; only the grouping goes.
+        Their context_digest is left as it stands: this layer only ever nulls
+        it on a move between projects, and an unfiled session that is filed
+        somewhere later goes through set_session_project, which nulls it then.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM chat_projects WHERE id = ? AND user_id = ?",
+                (project_id, user_id),
+            )
+            deleted = cursor.rowcount > 0
+            if deleted:
+                cursor.execute(
+                    """
+                    UPDATE chat_sessions
+                    SET project_id = NULL
+                    WHERE project_id = ? AND user_id = ?
+                    """,
+                    (project_id, user_id),
+                )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return deleted
+
+    def delete_project_with_sessions(self, user_id: str, project_id: str) -> bool:
+        """Delete a project and every session filed in it. Returns False if not this user's.
+
+        Each session goes through delete_session, so the message cascade and the
+        chat_turn_metrics deletion that carries no foreign key both happen. That
+        means one transaction per session rather than one for the whole call: a
+        failure partway through leaves the sessions already removed gone and the
+        project itself still there, which is a state the user can retry from.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id FROM chat_projects WHERE id = ? AND user_id = ?",
+            (project_id, user_id),
+        )
+        if cursor.fetchone() is None:
+            return False
+
+        cursor.execute(
+            "SELECT id FROM chat_sessions WHERE project_id = ? AND user_id = ?",
+            (project_id, user_id),
+        )
+        for row in cursor.fetchall():
+            self.delete_session(row["id"], user_id)
+
+        return self.delete_project(user_id, project_id)
+
+    def set_session_project(
+        self, user_id: str, session_id: str, project_id: str | None
+    ) -> bool:
+        """File a session into a project, or unfile it with project_id=None.
+
+        Both ends are owner-checked: returns False when the session is not this
+        user's, or when a named project is not. context_digest is nulled so the
+        next turn renders one from the sessions of the project the conversation
+        now belongs to; the stored digest describes the old grouping.
+
+        Re-filing a session where it already is (None -> None included) is a
+        no-op that returns True: nothing about the grouping changed, so the
+        digest rendered for that grouping is still the right one and throwing
+        it away would buy a re-render for nothing.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        if project_id is not None:
+            cursor.execute(
+                "SELECT id FROM chat_projects WHERE id = ? AND user_id = ?",
+                (project_id, user_id),
+            )
+            if cursor.fetchone() is None:
+                return False
+        cursor.execute(
+            "SELECT project_id FROM chat_sessions WHERE id = ? AND user_id = ?",
+            (session_id, user_id),
+        )
+        current = cursor.fetchone()
+        if current is None:
+            return False
+        if current["project_id"] == project_id:
+            return True
+        try:
+            cursor.execute(
+                """
+                UPDATE chat_sessions
+                SET project_id = ?, context_digest = NULL
+                WHERE id = ? AND user_id = ?
+                """,
+                (project_id, session_id, user_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def list_sessions_in_project(
+        self, user_id: str, project_id: str, limit: int = 50
+    ) -> list[ChatSession]:
+        """List the user's sessions filed in a project, most recent first."""
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
+                   shared, project_id, pinned_at
+            FROM chat_sessions
+            WHERE user_id = ? AND project_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, project_id, limit),
+        )
+        return [self._row_to_session(row) for row in cursor.fetchall()]
+
     def get_recent_sessions_for_digest(
         self,
         user_id: str,
         limit: int,
+        project_id: str | None = None,
         include_pinned: bool = True,
         exclude_session_id: str | None = None,
     ) -> list[dict]:
@@ -582,6 +888,13 @@ class ChatHistoryDB(object, metaclass=Singleton):
         surfacing. exclude_session_id drops the session currently being
         started, which has no history of its own yet. Only user_id's own
         sessions are considered, never another user's shared sessions.
+
+        project_id restricts BOTH the recency window and the pinned set to that
+        project: a pin is a statement about a conversation inside a project, so
+        a session pinned in another project must not leak into this project's
+        memory. Callers scoping memory to a project pass project_id;
+        project_id=None is the unrestricted window over all of the user's
+        sessions, filed or not.
         """
         conn = self._conn
         self._discard_stale_transaction(conn)
@@ -589,6 +902,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         conditions = ["user_id = ?"]
         where_params: list = [user_id]
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            where_params.append(project_id)
         if exclude_session_id is not None:
             conditions.append("id != ?")
             where_params.append(exclude_session_id)
@@ -667,7 +983,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code,
-                   shared, context_digest, pinned_at
+                   shared, project_id, context_digest, pinned_at
             FROM chat_sessions
             WHERE id = ?
             """,
@@ -680,9 +996,11 @@ class ChatHistoryDB(object, metaclass=Singleton):
         if session.user_id == user_id:
             return (session, True)
         if session.shared:
-            # the digest describes the owner's OWN other conversations, so a shared
-            # (non-owner) reader must never see it
+            # both describe how the owner keeps their OWN conversations — the digest
+            # indexes the others, the project names the group — so a shared
+            # (non-owner) reader must never see either
             session.context_digest = None
+            session.project_id = None
             return (session, False)
         return None
 
@@ -1058,7 +1376,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
         """Fork a shared session for another user.
 
         Copies the session and all messages with new UUIDs.
-        Does NOT copy attachments.
+        Does NOT copy attachments, and does not carry over the source owner's
+        project_id or context_digest: both describe how that user organizes and
+        indexes their own conversations, and the fork belongs to someone else.
         Returns the new ChatSession, or None if source is not shared/not found.
         """
         source = self.get_session_any_user(source_session_id)
@@ -1518,6 +1838,25 @@ class ChatHistoryDB(object, metaclass=Singleton):
             text_path=row["text_path"],
         )
 
+    def _row_to_project(self, row: sqlite3.Row) -> ChatProject:
+        keys = row.keys()
+        return ChatProject(
+            id=row["id"],
+            user_id=row["user_id"],
+            name=row["name"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            archived_at=(
+                datetime.fromisoformat(row["archived_at"]) if row["archived_at"] else None
+            ),
+            session_count=row["session_count"] if "session_count" in keys else 0,
+            last_activity_at=(
+                datetime.fromisoformat(row["last_activity_at"])
+                if "last_activity_at" in keys and row["last_activity_at"]
+                else None
+            ),
+        )
+
     def _row_to_session(self, row: sqlite3.Row) -> ChatSession:
         keys = row.keys()
         # GROUP_CONCAT returns a comma-joined string; surface it as a list on
@@ -1533,6 +1872,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             comment=row["comment"],
             phenotype_code=row["phenotype_code"],
             shared=bool(row["shared"]) if row["shared"] is not None else False,
+            project_id=row["project_id"] if "project_id" in keys else None,
             context_digest=row["context_digest"] if "context_digest" in keys else None,
             pinned_at=(
                 datetime.fromisoformat(row["pinned_at"])
