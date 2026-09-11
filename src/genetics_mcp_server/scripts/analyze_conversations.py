@@ -21,6 +21,7 @@ Analyzes conversations for:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ import polars as pl
 from dotenv import load_dotenv
 
 from genetics_mcp_server.config import model_rejects_disabled_thinking
+from genetics_mcp_server.scripts.conversation_prompts import ISSUE_CATEGORIES, NON_ISSUE_CATEGORIES
 
 load_dotenv()
 
@@ -141,6 +143,39 @@ def extract_first_json(text: str):
     return None
 
 
+def extract_json_list(text: str) -> list[dict]:
+    """Parse the JSON objects an LLM was asked to return as one array.
+
+    Accepts the array, or a bare sequence of objects (one per line). The batch
+    prompts ask for an array, but Opus 5 with thinking off often answers with
+    one object per line; extract_first_json then returned only the first
+    object, the ``isinstance(..., list)`` check at each call site failed, and
+    the whole batch was silently dropped behind a 200 OK — in production the
+    main source of the August 2026 issue-category "other" spike. Non-object
+    values (a stray ``[0]`` in prose) are skipped rather than returned.
+    """
+    decoder = json.JSONDecoder()
+    objects: list[dict] = []
+    i = 0
+    while i < len(text):
+        if text[i] not in "{[":
+            i += 1
+            continue
+        try:
+            value, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i += 1
+            continue
+        if isinstance(value, list):
+            dicts = [v for v in value if isinstance(v, dict)]
+            if dicts:
+                return objects + dicts
+        elif isinstance(value, dict):
+            objects.append(value)
+        i = end
+    return objects
+
+
 # thinking is off on every analysis call below (see thinking_off_kwargs), but a
 # response can still lead with a non-text block, so never index content[0]:
 # on thinking-capable models that block is a ThinkingBlock with no .text.
@@ -160,6 +195,31 @@ def thinking_off_kwargs(model: str) -> dict:
     if model_rejects_disabled_thinking(model):
         return {}
     return {"thinking": {"type": "disabled"}}
+
+
+# the SDK retries twice with sub-second backoff, which covers blips but not the
+# multi-minute 529 "overloaded" windows the 02:30 nightly run has hit; a call that
+# gives up there skips a whole batch of work for the night
+RETRY_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 529})
+RETRY_DELAYS = (15, 30, 60, 120, 240)
+
+
+async def create_with_backoff(client, *, delays=RETRY_DELAYS, **kwargs):
+    """client.messages.create with long backoff on transient status codes.
+
+    Errors are matched by status_code rather than SDK exception class so the
+    helper works against the mocked client the tests inject.
+    """
+    for attempt, delay in enumerate((*delays, None)):
+        try:
+            return await client.messages.create(**kwargs)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status not in RETRY_STATUS_CODES or delay is None:
+                raise
+            logger.warning(f"Anthropic API returned {status}; retrying in {delay}s "
+                           f"(attempt {attempt + 1}/{len(delays)})")
+            await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +789,8 @@ async def categorize_with_llm(
         prompt = TOPIC_CLASSIFICATION_PROMPT.format(messages=messages_text)
 
         try:
-            response = await client.messages.create(
+            response = await create_with_backoff(
+                client,
                 model=model,
                 max_tokens=2000,
                 **thinking_off_kwargs(model),
@@ -738,15 +799,12 @@ async def categorize_with_llm(
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
             text = response_text(response)
-            # extract JSON from response (may have markdown fences / trailing data)
-            classifications = extract_first_json(text)
-            if isinstance(classifications, list):
-                for c in classifications:
-                    results[c["id"]] = {
-                        "topic": c["topic"],
-                        "complexity": c.get("complexity", 2),
-                        "brief_reason": c.get("brief_reason", ""),
-                    }
+            for c in extract_json_list(text):
+                results[c["id"]] = {
+                    "topic": c["topic"],
+                    "complexity": c.get("complexity", 2),
+                    "brief_reason": c.get("brief_reason", ""),
+                }
         except Exception as e:
             logger.error(f"LLM categorization failed for batch {i // batch_size + 1}: {e}")
             # fall back to keyword for this batch
@@ -773,7 +831,7 @@ async def categorize_issues_with_llm(
     issues: list[str],
     model: str = "claude-opus-5",
     cost_tracker: "CostTracker | None" = None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], int]:
     """Map detailed free-text quality issues onto a fixed taxonomy.
 
     The judge emits one detailed issue string per problem, so raw issues almost
@@ -784,17 +842,22 @@ async def categorize_issues_with_llm(
         issues: distinct issue strings to categorize.
 
     Returns:
-        dict mapping each issue string to a category name (always "other" at
-        worst, so every input gets a category even if the LLM call fails).
+        (categories, failed_batches): categories maps each issue the model
+        actually assigned to a category name. Issues from a failed batch, or
+        that the model skipped, are absent rather than defaulted, so the caller
+        can treat them as "other" for this run without caching that verdict —
+        a cached fallback would never be retried (in production a single 529
+        at 02:30 turned 117 issues into permanent "other" over August 2026).
     """
     import anthropic
 
-    from .conversation_prompts import ISSUE_CATEGORIES, ISSUE_CATEGORIZATION_PROMPT
+    from .conversation_prompts import ISSUE_CATEGORIZATION_PROMPT
 
     valid = {c for c, _ in ISSUE_CATEGORIES}
     categories_text = "\n".join(f"- {c}: {d}" for c, d in ISSUE_CATEGORIES)
     client = anthropic.AsyncAnthropic()
     results: dict[str, str] = {}
+    failed_batches = 0
     batch_size = 40
 
     for i in range(0, len(issues), batch_size):
@@ -805,7 +868,8 @@ async def categorize_issues_with_llm(
         )
 
         try:
-            response = await client.messages.create(
+            response = await create_with_backoff(
+                client,
                 model=model,
                 max_tokens=2000,
                 **thinking_off_kwargs(model),
@@ -813,21 +877,52 @@ async def categorize_issues_with_llm(
             )
             if cost_tracker is not None:
                 cost_tracker.add(model, response.usage)
-            parsed = extract_first_json(response_text(response))
-            if isinstance(parsed, list):
-                for obj in parsed:
-                    idx = obj.get("id")
-                    cat = obj.get("category", "other")
-                    if isinstance(idx, int) and 0 <= idx < len(batch):
-                        results[batch[idx]] = cat if cat in valid else "other"
+            for obj in extract_json_list(response_text(response)):
+                idx = obj.get("id")
+                cat = obj.get("category", "other")
+                if isinstance(idx, int) and 0 <= idx < len(batch):
+                    results[batch[idx]] = cat if cat in valid else "other"
         except Exception as e:
+            failed_batches += 1
             logger.error(f"Issue categorization failed for batch {i // batch_size + 1}: {e}")
 
-        # anything the LLM didn't assign (or a failed batch) falls back to "other"
-        for issue in batch:
-            results.setdefault(issue, "other")
+    return results, failed_batches
 
-    return results
+
+def taxonomy_fingerprint() -> str:
+    return hashlib.sha256(
+        "\n".join(f"{c}: {d}" for c, d in ISSUE_CATEGORIES).encode()
+    ).hexdigest()[:16]
+
+
+def load_issue_category_cache(path: Path) -> dict[str, str]:
+    """Read the issue-text → category sidecar, or {} if it is unusable.
+
+    The cache is keyed only by issue text, so a taxonomy change (new category,
+    reworded description) silently leaves every old verdict stale. The file
+    carries a fingerprint of the taxonomy it was built with and is discarded
+    wholesale on mismatch, so deploying a taxonomy change re-categorizes
+    everything on the next run with no manual wipe. The pre-fingerprint flat
+    format has no fingerprint and is discarded the same way.
+    """
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logger.warning(f"  Issue category cache at {path} is not valid JSON; discarding it")
+        return {}
+    if not isinstance(data, dict) or data.get("taxonomy") != taxonomy_fingerprint():
+        logger.info("  Issue category cache was built with a different taxonomy; discarding it")
+        return {}
+    return dict(data.get("categories") or {})
+
+
+def save_issue_category_cache(path: Path, categories: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(
+        {"taxonomy": taxonomy_fingerprint(), "categories": categories}, indent=2,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -953,7 +1048,8 @@ async def evaluate_quality_with_llm(
         )
 
         try:
-            response = await client.messages.create(
+            response = await create_with_backoff(
+                client,
                 model=model,
                 max_tokens=1000,
                 **thinking_off_kwargs(model),
@@ -1028,6 +1124,10 @@ class ConversationMetrics:
     llm_disposition: str = ""
     llm_issues: list[str] | None = None
     llm_issue_categories: list[str] | None = None
+    # minor blemishes and strengths the judge keeps out of llm_issues; stored so
+    # they are not lost, but never categorized or charted
+    llm_nits: list[str] | None = None
+    llm_strengths: list[str] | None = None
 
 
 def compute_success_score(m: ConversationMetrics) -> float:
@@ -1304,6 +1404,8 @@ def cached_topic_and_quality(
                 "concluded": m.get("llm_concluded", ""),
                 "disposition": m.get("llm_disposition", ""),
                 "issues": m.get("llm_issues") or [],
+                "nits": m.get("llm_nits") or [],
+                "strengths": m.get("llm_strengths") or [],
             }
         if m.get("llm_issue_categories"):
             issue_cats[sid] = list(m["llm_issue_categories"])
@@ -1329,6 +1431,8 @@ def apply_quality_assessments(
             m.llm_concluded = qa.get("concluded", "")
             m.llm_disposition = qa.get("disposition", "")
             m.llm_issues = qa.get("issues")
+            m.llm_nits = qa.get("nits")
+            m.llm_strengths = qa.get("strengths")
             # recompute score now that LLM quality is available, then let the
             # disposition decide the bucket (out_of_scope/unfinished/weird/technical
             # don't fold into the successful/neutral/unsuccessful quality labels)
@@ -1860,11 +1964,14 @@ def generate_report(
                 all_issues.extend(m.llm_issues)
         if all_issues:
             if issue_categories:
-                cat_counter = Counter(issue_categories.get(i, "other") for i in all_issues)
+                categorized = [
+                    (i, issue_categories.get(i, "other")) for i in all_issues
+                    if issue_categories.get(i, "other") not in NON_ISSUE_CATEGORIES
+                ]
+                cat_counter = Counter(c for _, c in categorized)
                 # shortest raw issue per category as a representative example
                 examples: dict[str, str] = {}
-                for i in all_issues:
-                    c = issue_categories.get(i, "other")
+                for i, c in categorized:
                     if c not in examples or len(i) < len(examples[c]):
                         examples[c] = i
                 lines.append("### Most common issue categories\n")
@@ -1872,7 +1979,7 @@ def generate_report(
                 lines.append("|----------|------:|--:|---------|")
                 for cat, count in cat_counter.most_common():
                     ex = examples.get(cat, "")[:100].replace("|", "/").replace("\n", " ")
-                    pct = count / len(all_issues) * 100
+                    pct = count / len(categorized) * 100
                     lines.append(f"| {cat} | {count} | {pct:.0f} | {ex} |")
             else:
                 # no categorization available (e.g. --no-llm): raw frequency
@@ -2232,34 +2339,41 @@ async def main():
     # taxonomy with a cheap separate pass (cached by issue text, reuses the
     # quality cache above untouched)
     issue_categories: dict[str, str] = {}
+    categorization_failures = 0
     if not args.no_llm:
         distinct_issues = sorted({
             issue for m in all_metrics if m.llm_issues for issue in m.llm_issues
         })
         if distinct_issues:
-            cached_cats: dict[str, str] = {}
-            if issue_cat_cache.exists() and not args.no_cache:
-                cached_cats = json.loads(issue_cat_cache.read_text())
+            cached_cats = {} if args.no_cache else load_issue_category_cache(issue_cat_cache)
+            if cached_cats:
                 logger.info(f"  Loaded {len(cached_cats)} cached issue categories")
 
             uncategorized = [t for t in distinct_issues if t not in cached_cats]
             if uncategorized:
                 logger.info(f"Categorizing {len(uncategorized)} distinct issues "
                             f"(model={args.topic_model})...")
-                new_cats = await categorize_issues_with_llm(
+                new_cats, categorization_failures = await categorize_issues_with_llm(
                     uncategorized, model=args.topic_model, cost_tracker=cost_tracker,
                 )
                 cached_cats.update(new_cats)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                issue_cat_cache.write_text(json.dumps(cached_cats, indent=2))
+                save_issue_category_cache(issue_cat_cache, cached_cats)
+                left = len(uncategorized) - len(new_cats)
+                if left:
+                    # not cached, so the next run retries them; tonight they read as "other"
+                    logger.error(f"  {left} issues left uncategorized "
+                                 f"({categorization_failures} failed batch(es)); "
+                                 "counted as 'other' this run, retried next run")
             issue_categories = cached_cats
 
-            # persist per-conversation categories for downstream use / plotting
+            # persist per-conversation categories for downstream use / plotting;
+            # praise the judge filed under issues is dropped here so it never
+            # reaches conversation_issue or the admin chart
             for m in all_metrics:
                 if m.llm_issues:
                     m.llm_issue_categories = sorted({
                         issue_categories.get(i, "other") for i in m.llm_issues
-                    })
+                    } - NON_ISSUE_CATEGORIES)
 
     success_dist = Counter(m.success_label for m in all_metrics)
     logger.info(f"  Success: {dict(success_dist)}")
@@ -2327,7 +2441,12 @@ async def main():
         logger.info(f"  Wrote metrics to {metrics_path}")
 
     logger.info("Done!")
+    # a failed categorization batch is the one part of the run that is not
+    # retried within the run; a non-zero exit lets the CronJob's OnFailure
+    # restart redo it (everything else replays from cache) and makes the
+    # failure visible as a failed job rather than a quietly skewed chart
+    return 1 if categorization_failures else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
