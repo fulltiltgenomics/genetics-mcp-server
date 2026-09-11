@@ -1319,12 +1319,14 @@ def _image(name="plot.png", content_type="image/png", data="aW1hZ2UtYnl0ZXM="):
 
 
 class TestRunAnalysisImages:
-    """Image artifacts come back automatically; nothing else does.
+    """Artifacts come back automatically, images and files by separate routes.
 
-    Automatic because the picture is for the USER: routing it through a tool the model calls
-    spends a roundtrip fetching something the model cannot look at. The base64 rides on the
-    result under `images` and llm_service strips it before the tool_result is serialised —
-    tested there, since this layer is what produces it.
+    Automatic because both are for the USER: routing them through a tool the model calls
+    spends a roundtrip fetching something the model cannot use. Images ride on `images` and
+    non-images on `files`; llm_service strips both before the tool_result is serialised —
+    tested there, since this layer is what produces them. The split is not cosmetic: an image
+    is rendered inline, a file is offered as a download, and only the image carries the
+    "do not also describe it as markdown" instruction.
     """
 
     async def test_an_image_artifact_is_fetched_and_attached(self, executor):
@@ -1338,7 +1340,9 @@ class TestRunAnalysisImages:
         assert sandbox.fetched == [("8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b", "plot.png")]
         assert "displayed to the user" in result["artifacts_note"]
 
-    async def test_only_image_content_types_are_fetched(self, executor):
+    async def test_images_and_files_are_fetched_by_their_own_routes(self, executor):
+        """A CSV used to have no route to the user at all: named in the manifest, and
+        retrievable only by the model. Now both are fetched, into separate keys."""
         body = _result_body(
             artifacts=[
                 {"name": "table.csv", "size": 9, "content_type": "text/csv"},
@@ -1346,13 +1350,49 @@ class TestRunAnalysisImages:
                 {"name": "notes.txt", "size": 4, "content_type": None},
             ]
         )
-        sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        sandbox = _StubSandbox(
+            result=body,
+            artifacts={"plot.png": _image(), "table.csv": {"name": "table.csv",
+                                                           "content_type": "text/csv",
+                                                           "content_base64": "YSxiCg=="}},
+        )
         result = await _run(executor, sandbox)
 
-        assert [name for _, name in sandbox.fetched] == ["plot.png"]
+        assert [i["name"] for i in result["images"]] == ["plot.png"]
+        assert [f["name"] for f in result["files"]] == ["table.csv"]
+        # notes.txt was attempted; the stub answers None, which is the real client's answer
+        # for an unservable artifact, so it must not reach `files`
+        assert ("8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b", "notes.txt") in sandbox.fetched
         # the note has to say BOTH things: the plot is shown, the csv is read by name
         assert "displayed to the user" in result["artifacts_note"]
         assert "read_artifact" in result["artifacts_note"]
+
+    async def test_stray_writes_become_a_warning_ahead_of_output(self, executor):
+        """The supervisor reports what the script saved into its scratch cwd, which is not
+        collected. Without this the manifest is simply empty and the model, believing it
+        wrote the file, tells the user it exists."""
+        body = _result_body(artifacts=[], stray_writes=["phewas_long.csv", "plot.png"])
+        sandbox = _StubSandbox(result=body)
+        result = await _run(executor, sandbox)
+
+        warning = result["artifacts_warning"]
+        assert "phewas_long.csv" in warning and "plot.png" in warning
+        assert "SANDBOX_ARTIFACTS_DIR" in warning
+        # ahead of `output`, so a script that prints enough to trip the result-size
+        # truncation cannot cut the warning out of what the model reads
+        keys = list(result)
+        assert keys.index("artifacts_warning") < keys.index("output")
+
+    async def test_no_warning_when_the_run_collected_something(self, executor):
+        """Scratch left beside a real artifact is just scratch; saying otherwise would train
+        the model to ignore the warning."""
+        body = _result_body(
+            artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}],
+            stray_writes=[],
+        )
+        sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        result = await _run(executor, sandbox)
+        assert "artifacts_warning" not in result
 
     async def test_an_oversize_image_is_not_even_requested(self, executor):
         from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES

@@ -745,3 +745,125 @@ async def test_a_sticky_fallback_turn_is_announced_after_the_answer():
     text = "".join(c.content for c in chunks if c.type == "text")
     assert text.startswith("Answer")
     assert "[Answered by Claude Opus 5]" in text
+
+
+# The output cap can land inside a tool call's streamed arguments, not only after the
+# text. The turn then carries a tool_use whose input never finished arriving — commonly
+# {} — and the earlier guard, which resumed only when NO tool_use was present, let that
+# call through to dispatch. Staging session ff82f2a0 (2026-09-10) ran that loop seven
+# times at the full output cap: each dispatch raised "missing 1 required positional
+# argument: 'code'", which reads as a server fault, so the model reissued the same
+# oversized call. $12.73 of a $19.68 turn bought nothing.
+
+
+def _truncated_tool_call_turn(text="Here is the run properly", tool_input=None):
+    """A max_tokens turn whose tool_use arguments were cut off mid-stream."""
+    blocks = [
+        _Block("text", text=text),
+        _Block("tool_use", id="ra-cut", name="run_analysis", input=tool_input or {}),
+    ]
+    return ([_delta_event("text_delta", text)], _FakeMessage(blocks, "max_tokens"))
+
+
+@pytest.mark.asyncio
+async def test_tool_call_truncated_by_max_tokens_is_never_dispatched():
+    """The half-written call is dropped, not run with whatever arguments arrived."""
+    turns = [_truncated_tool_call_turn(), _text_turn("answer")]
+    svc = _service(turns, executor=SimpleNamespace())
+
+    dispatched = []
+
+    async def _execute_tool(name, tool_input, *args, **kwargs):
+        dispatched.append((name, tool_input))
+        return {"success": True, "status": "ok", "output": "1"}
+
+    svc._execute_tool = _execute_tool
+    chunks = await _collect(svc)
+
+    assert dispatched == [], "a truncated tool call must not reach the executor"
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.endswith("answer")
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_is_dropped_from_the_replay():
+    """A replayed tool_use with no matching tool_result is rejected by the API."""
+    turns = [_truncated_tool_call_turn(), _text_turn("answer")]
+    svc = _service(turns, executor=SimpleNamespace())
+    svc._execute_tool = lambda *a, **k: None
+    await _collect(svc)
+
+    resume = svc.anthropic_client.messages.calls[1]["messages"]
+    assert resume[-1]["role"] == "user"
+    assistant = resume[-2]
+    assert assistant["role"] == "assistant"
+    assert all(b["type"] != "tool_use" for b in assistant["content"])
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_prompt_names_truncation_not_a_missing_argument():
+    """The message the model gets is the whole reason the loop broke or repeated."""
+    turns = [_truncated_tool_call_turn(), _text_turn("answer")]
+    svc = _service(turns, executor=SimpleNamespace())
+    svc._execute_tool = lambda *a, **k: None
+    await _collect(svc)
+
+    sent = svc.anthropic_client.messages.calls[1]["messages"][-1]["content"]
+    assert "output token limit" in sent
+    assert "was not run" in sent
+    assert "smaller" in sent
+
+
+@pytest.mark.asyncio
+async def test_truncated_tool_call_with_no_other_content_still_replays():
+    """A turn that spent its whole budget inside the arguments leaves nothing to echo."""
+    blocks = [_Block("tool_use", id="ra-cut", name="run_analysis", input={})]
+    turns = [([], _FakeMessage(blocks, "max_tokens")), _text_turn("answer")]
+    svc = _service(turns, executor=SimpleNamespace())
+    svc._execute_tool = lambda *a, **k: None
+    await _collect(svc)
+
+    assistant = svc.anthropic_client.messages.calls[1]["messages"][-2]
+    assert assistant["content"], "an empty assistant message is rejected by the API"
+
+
+@pytest.mark.asyncio
+async def test_turn_stops_when_it_reaches_the_cost_cap(monkeypatch):
+    """Bounds the bill for failure shapes no specific guard anticipated."""
+    from dataclasses import replace
+
+    from genetics_mcp_server.config import get_settings
+
+    # estimate_cost of the fake usage is tiny, so any positive cap trips on iteration 1
+    capped = replace(get_settings(), max_turn_cost_usd=1e-9)
+    monkeypatch.setattr(
+        "genetics_mcp_server.llm_service.get_settings", lambda: capped
+    )
+
+    turns = [_run_analysis_turn(), _text_turn("never reached")]
+    svc = _service(turns, executor=SimpleNamespace())
+    svc._execute_tool = lambda *a, **k: None
+    chunks = await _collect(svc)
+
+    assert len(svc.anthropic_client.messages.calls) == 1, "must not call the model again"
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "cost limit" in text
+    done = next(c for c in chunks if c.type == "done")
+    assert any("cost limit" in b.get("text", "") for b in done.message_content)
+
+
+@pytest.mark.asyncio
+async def test_cost_cap_of_zero_is_disabled(monkeypatch):
+    """0 means no cap, so a normal turn is untouched by it."""
+    from dataclasses import replace
+
+    from genetics_mcp_server.config import get_settings
+
+    capped = replace(get_settings(), max_turn_cost_usd=0.0)
+    monkeypatch.setattr(
+        "genetics_mcp_server.llm_service.get_settings", lambda: capped
+    )
+
+    chunks = await _collect(_service([_text_turn("answer")]))
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "cost limit" not in text

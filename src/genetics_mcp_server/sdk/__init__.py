@@ -40,6 +40,28 @@ result.
 
 Every function is also available as an awaitable method on `GeneticsClient` for callers
 that already have an event loop.
+
+CONCURRENCY IS CAPPED AT 4 IN-FLIGHT REQUESTS per execution, and the cap is enforced by the
+server: the 5th concurrent call is refused with 429, not queued. The synchronous functions
+here are one-at-a-time, so fanning out means `get_client()` plus `asyncio.gather` — batch it
+in fours, and pass `return_exceptions=True`, because one refusal in a bare `gather` discards
+the results of every sibling that had already succeeded.
+
+    c = get_client()
+    async def main():
+        out = []
+        for i in range(0, len(chunks), 4):
+            out += await asyncio.gather(
+                *(c.summary_stats(phenotypes=ch, variants=vs, resource="finngen")
+                  for ch in chunks[i:i + 4]),
+                return_exceptions=True,
+            )
+        return out
+    results = asyncio.run(main())
+
+SAVE FILES INTO `os.environ["SANDBOX_ARTIFACTS_DIR"]`. The working directory is scratch and is
+discarded when the run ends, so a relative `write_csv("x.csv")` is lost with it and reported as
+no artifact. `genetics.plots` helpers already resolve a relative path there.
 """
 
 import functools

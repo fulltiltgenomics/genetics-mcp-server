@@ -638,6 +638,7 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
     # edit here (genetics-results-suite-4h6.56)
     _Block("""
 - **Write one script with run_analysis when an answer needs several retrievals combined.** One script can query, join, filter and summarise in a single call, and its intermediate rows never enter this conversation — so prefer it when the work is a chain (fetch, then fetch again keyed on the first result, then aggregate) or when the intermediate data is large and only the summary matters. Call list_capabilities first for the exact SDK signatures rather than guessing them, print what you want to see, and print a SUMMARY — counts, top rows, the statistic asked for — rather than dumping raw rows.
+- **One script means one chain of work, not everything at once.** A run is bounded by its wall clock and returns NOTHING when it overruns — a script that bundles five independent sections loses all five to the slowest one. So independent retrievals go in separate calls; only a genuine chain belongs in one script. Your own reply is bounded too, and a script long enough to exhaust it is discarded before it ever runs. If you are writing numbered section headers into a script, split it.
 - For a question a single tool answers, call the tool. A script is not cheaper than one call.
 """),
     _Block(
@@ -969,6 +970,20 @@ CONTINUE_TRUNCATED_PROMPT = (
     "Your previous message was cut off because it reached the output token limit. "
     "Continue from exactly where it stopped. Do not repeat text you already wrote, "
     "do not restart the response, and do not mention the interruption."
+)
+
+# Sent instead of CONTINUE_TRUNCATED_PROMPT when the output cap landed inside a tool
+# call's arguments. Continuing from where it stopped is the wrong instruction there:
+# the call was dropped rather than answered, so the model has to reissue it, and it
+# has to come back smaller or the next attempt truncates at the same place. Naming the
+# cause is what breaks the loop — a model told only that an argument was missing reads
+# it as a server fault and retries the same oversized call.
+CONTINUE_TRUNCATED_TOOL_CALL_PROMPT = (
+    "Your previous message reached the output token limit while it was still writing "
+    "the arguments to a tool call, so the call was incomplete and was not run. Nothing "
+    "was executed. Reissue it, but make it substantially smaller: split the work into "
+    "several focused run_analysis calls that each retrieve one thing, rather than one "
+    "script that does everything. Do not apologize and do not mention this message."
 )
 
 # Sent as a user turn after a turn that laid out empty or placeholder-filled results
