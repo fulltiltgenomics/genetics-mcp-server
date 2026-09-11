@@ -9,6 +9,8 @@ import httpx
 from genetics_mcp_server.tools import ToolExecutor
 from genetics_mcp_server.tools.executor import (
     _UNREACHABLE_HEADER,
+    INTERNAL_ERROR_MSG,
+    MOUSEMINE_UNAVAILABLE_MSG,
     UPSTREAM_UNREACHABLE_MSG,
     _ResilientAsyncClient,
 )
@@ -47,5 +49,29 @@ async def test_get_database_schema_flags_unreachable():
         assert result["success"] is False
         assert result.get("unreachable") is True
         assert result["error"] == UPSTREAM_UNREACHABLE_MSG
+    finally:
+        await executor.close()
+
+
+async def test_search_mgi_reports_mousemine_read_timeout_as_unavailable():
+    """MouseMine's characteristic failure is to accept the connection and then never
+    answer. _ResilientAsyncClient deliberately rewrites only connect-level failures, so
+    the read timeout has to be caught in _mousemine_query — otherwise it reaches
+    search_mgi's generic handler as an opaque internal error plus a logged traceback."""
+
+    def hang(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    executor = ToolExecutor()
+    try:
+        await executor.external_client.aclose()
+        executor.external_client = _ResilientAsyncClient(
+            timeout=2.0, transport=httpx.MockTransport(hang)
+        )
+        for query_type in ("gene_phenotypes", "phenotype_genes", "allele", "ortholog"):
+            result = await executor.search_mgi("Trim28", query_type=query_type)
+            assert result["success"] is False, query_type
+            assert result["error"] == MOUSEMINE_UNAVAILABLE_MSG, query_type
+            assert result["error"] != INTERNAL_ERROR_MSG, query_type
     finally:
         await executor.close()
