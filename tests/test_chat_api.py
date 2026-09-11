@@ -1585,6 +1585,36 @@ class TestStripImageMarkers:
 
         assert chat_api._strip_image_markers(content) == content
 
+    def test_file_marker_payload_is_replaced(self):
+        """Sharper than the image case: a CSV is base64 the model CAN decode, so left in the
+        replay it is both a token bill every turn and an invitation to answer from a stale
+        copy of the data instead of re-querying."""
+        from genetics_mcp_server import chat_api
+
+        content = "saved\n\n[FILE:text/csv:phewas_long.csv:" + "D" * 200_000 + "]\n\ndone"
+
+        stripped = chat_api._strip_image_markers(content)
+
+        assert "D" * 100 not in stripped
+        assert "[file offered to the user as a download: phewas_long.csv]" in stripped
+        assert stripped.startswith("saved")
+        assert stripped.endswith("done")
+
+    def test_a_turn_carrying_both_markers_loses_both_payloads(self):
+        from genetics_mcp_server import chat_api
+
+        content = (
+            "[IMAGE:png:plot:" + "E" * 5_000 + "]"
+            " and "
+            "[FILE:text/csv:t.csv:" + "F" * 5_000 + "]"
+        )
+
+        stripped = chat_api._strip_image_markers(content)
+
+        assert "E" * 50 not in stripped and "F" * 50 not in stripped
+        assert "[image shown to the user: plot]" in stripped
+        assert "[file offered to the user as a download: t.csv]" in stripped
+
 
 class TestClassifyErrorSubclasses:
     """`_classify_error` used to compare exception class names by exact string, so a

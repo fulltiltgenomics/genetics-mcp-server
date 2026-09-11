@@ -129,6 +129,12 @@ _FILE_BLOCK_PREFIX = "[File: "
 # contain "]" because it is base64.
 _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:([^:\]]+):([^:\]]+):[^\]]+\]")
 
+# the same carriage for a downloadable artifact: [FILE:<mime>:<name>:<base64>]. It has to be
+# stripped for the reason images are, and the reason is sharper here — a CSV is base64 the
+# model can nominally READ, so left in the replay it is both a large token bill every turn and
+# an invitation to answer from a stale copy of the data instead of re-querying.
+_FILE_MARKER_RE = re.compile(r"\[FILE:([^:\]]+):([^:\]]+):[^\]]+\]")
+
 
 def _strip_image_markers(content: Any) -> Any:
     """Replace inline [IMAGE:...] payloads with a short note.
@@ -144,7 +150,10 @@ def _strip_image_markers(content: Any) -> Any:
     """
 
     def sub(text: str) -> str:
-        return _IMAGE_MARKER_RE.sub(lambda m: f"[image shown to the user: {m.group(2)}]", text)
+        text = _IMAGE_MARKER_RE.sub(lambda m: f"[image shown to the user: {m.group(2)}]", text)
+        return _FILE_MARKER_RE.sub(
+            lambda m: f"[file offered to the user as a download: {m.group(2)}]", text
+        )
 
     if isinstance(content, str):
         return sub(content)
@@ -933,6 +942,16 @@ async def stream_chat(
                             "image_data": chunk.content,
                             "image_format": chunk.image_format or "png",
                             "image_alt": chunk.image_alt or "Generated image",
+                        }),
+                    }
+                elif chunk.type == "file":
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "type": "file",
+                            "file_data": chunk.content,
+                            "file_mime": chunk.file_mime or "application/octet-stream",
+                            "file_name": chunk.file_name or "artifact",
                         }),
                     }
                 elif chunk.type == "tool_use":

@@ -376,7 +376,7 @@ def _loggable_tool_input(tool_input: dict[str, Any]) -> dict[str, Any]:
 class StreamChunk:
     """A chunk from the LLM stream."""
 
-    type: str  # "text", "thinking", "thinking_summary", "done", "image", "usage",
+    type: str  # "text", "thinking", "thinking_summary", "done", "image", "file", "usage",
     # "script_result", "tool_use"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
@@ -386,6 +386,9 @@ class StreamChunk:
     # image fields (only set when type="image")
     image_format: str | None = None
     image_alt: str | None = None
+    # file fields (only set when type="file")
+    file_name: str | None = None
+    file_mime: str | None = None
 
 
 class DownloadShapeError(TypeError):
@@ -1793,6 +1796,39 @@ class LLMService:
                                 "not output any image placeholder or markdown - just describe "
                                 "what the plot shows."
                             )
+
+                    # the non-image artifacts, offered to the user as downloads. Same strip as
+                    # images: the base64 is for the browser and would otherwise be tokens in the
+                    # tool_result that the model pays for and cannot use.
+                    if isinstance(result, dict) and isinstance(result.get("files"), list):
+                        offered = []
+                        for f in result["files"]:
+                            if not isinstance(f, dict):
+                                continue
+                            data = f.get("content_base64")
+                            name = f.get("name")
+                            if not isinstance(data, str) or not data or not isinstance(name, str):
+                                continue
+                            mime = f.get("content_type") or "application/octet-stream"
+                            logger.info(
+                                "Streaming artifact file: name=%s type=%s size=%d chars",
+                                name, mime, len(data),
+                            )
+                            yield StreamChunk(
+                                type="file",
+                                content=data,
+                                file_name=str(name),
+                                file_mime=str(mime),
+                            )
+                            offered.append(str(name))
+                        result = {k: v for k, v in result.items() if k != "files"}
+                        if offered:
+                            result["note"] = (
+                                (result.get("note", "") + " ").strip() + " "
+                                + "These files are already offered to the user as download "
+                                + f"links above: {', '.join(offered)}. Refer to them by name; "
+                                + "do not paste their contents or invent a URL for them."
+                            ).strip()
 
                     if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
                         image_data = result["image_base64"]

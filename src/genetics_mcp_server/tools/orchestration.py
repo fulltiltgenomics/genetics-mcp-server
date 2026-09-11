@@ -1428,7 +1428,11 @@ class ServerToolExecutor(ToolExecutor):
             }
 
         self._record_artifact_manifest(result, user, session_id)
-        return self._render_analysis(result, images=await self._fetch_analysis_images(result))
+        return self._render_analysis(
+            result,
+            images=await self._fetch_analysis_images(result),
+            files=await self._fetch_analysis_files(result),
+        )
 
     @staticmethod
     def _record_artifact_manifest(
@@ -1531,6 +1535,56 @@ class ServerToolExecutor(ToolExecutor):
                 images.append(fetched)
         return images
 
+    # How many non-image artifacts one script may offer the user. A script that writes a file
+    # per locus is not asking for 255 download buttons, and each one is a fetch plus base64
+    # the transcript carries for the life of the conversation.
+    _MAX_ANALYSIS_FILES = 4
+
+    async def _fetch_analysis_files(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        """Pull the NON-image artifacts back out so the user can download them.
+
+        The mirror of `_fetch_analysis_images`, and separate from it for the same reason it is
+        automatic: a table the script wrote is for the user to keep, and `read_artifact` only
+        ever hands it to the MODEL. Before this, a CSV an analysis produced had no route to
+        the person who asked for it — the manifest named it and nothing could deliver it.
+        """
+        entries = result.get("artifacts")
+        execution_id = result.get("execution_id")
+        if not isinstance(entries, list) or not isinstance(execution_id, str):
+            return []
+        if self._sandbox is None:
+            return []
+
+        wanted = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            content_type = entry.get("content_type")
+            size = entry.get("size")
+            if not isinstance(name, str) or not name:
+                continue
+            # images already have a route; everything else is what this is for
+            if isinstance(content_type, str) and content_type.startswith("image/"):
+                continue
+            if isinstance(size, int) and not isinstance(size, bool) and size > ARTIFACT_READ_MAX_BYTES:
+                logger.info("skipping oversize file artifact %s (%d bytes)", name, size)
+                continue
+            wanted.append((name, content_type))
+            if len(wanted) >= self._MAX_ANALYSIS_FILES:
+                break
+
+        files = []
+        for name, content_type in wanted:
+            fetched = await self._sandbox.fetch_artifact(execution_id, name)
+            if fetched:
+                # the manifest's type is the sandbox's own sniff; keep it when the fetch has
+                # none, so the browser gets something better than octet-stream to save by
+                if not fetched.get("content_type") and isinstance(content_type, str):
+                    fetched["content_type"] = content_type
+                files.append(fetched)
+        return files
+
     @staticmethod
     def _capability_unavailable_error(capability: str, module: str) -> dict[str, Any]:
         """The shaped failure for a capability whose code this environment does not contain.
@@ -1561,7 +1615,10 @@ class ServerToolExecutor(ToolExecutor):
         }
 
     def _render_analysis(
-        self, result: dict[str, Any], images: list[dict[str, Any]] | None = None
+        self,
+        result: dict[str, Any],
+        images: list[dict[str, Any]] | None = None,
+        files: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Turn the supervisor's 200 body into the tool result the model reads.
 
@@ -1593,6 +1650,21 @@ class ServerToolExecutor(ToolExecutor):
                 )
 
         rendered: dict[str, Any] = {"success": ok, "status": status_text}
+        # BEFORE `output`, for the reason the retained-in-clear flag below is: a script that
+        # prints enough to trip the result-size truncation would otherwise push this out of
+        # what the model reads, and this is the field that stops it telling the user about a
+        # file that does not exist.
+        stray = result.get("stray_writes")
+        if isinstance(stray, list) and stray:
+            names = ", ".join(str(n) for n in stray[:8])
+            rendered["artifacts_warning"] = (
+                f"This run collected NO artifacts, but wrote {names} to the working "
+                "directory, which is not collected and has been discarded. Files are only "
+                "kept when written into the artifacts directory: use the path in "
+                "os.environ['SANDBOX_ARTIFACTS_DIR'], or a genetics.plots helper, which "
+                "resolves a relative path there for you. Do not tell the user these files "
+                "exist — rerun the save if they are wanted."
+            )
         if result.get("artifacts_retained_in_clear") is True:
             # BEFORE `output`, DELIBERATELY, and this is a security ordering rather than a
             # cosmetic one (genetics-results-suite-4h6.97). llm_service truncates a serialised
@@ -1639,6 +1711,11 @@ class ServerToolExecutor(ToolExecutor):
             # tool_result — they are for the browser, and the model cannot see an image it is
             # handed as base64 anyway. The note that replaces them is set there too.
             rendered["images"] = images
+        if files:
+            # same contract as `images`: base64 for the browser, stripped by llm_service before
+            # the tool_result is serialised, so the model never pays tokens for bytes it cannot
+            # read. The note that replaces them is set there too.
+            rendered["files"] = files
 
         if artifacts:
             # said once, here, rather than left to the model to infer from the manifest.
