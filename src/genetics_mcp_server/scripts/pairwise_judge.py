@@ -618,25 +618,6 @@ def summarize_verdicts(
     return {
         "model": model,
         "arms": list(arms),
-        # the per-pair outcomes behind every aggregate below. Persisted because the
-        # aggregates answer "which arm won" and cannot answer "on WHICH questions", which is
-        # the actionable half: an arm that loses four of twenty is a different problem from
-        # one that loses uniformly, and only this list distinguishes them. Kept deliberately
-        # narrow — the judge's prose `reason` and the raw passes stay out, since this rides
-        # inside every saved report.
-        "pairs": [
-            {
-                "case_id": v.case_id,
-                "turn_index": v.turn_index,
-                "outcome": v.outcome,
-                "winner": v.winner,
-                "margin": v.margin,
-                # a verdict the blinding failed on is still reported, flagged rather than
-                # dropped, so a scorecard cannot present it as clean
-                "arm_identifiable": v.arm_identifiable,
-            }
-            for v in verdicts
-        ],
         "pairs_offered": len(verdicts),
         "pairs_judged": len(judged),
         "pairs_unresolved": len(verdicts) - len(judged),
@@ -738,6 +719,14 @@ def summarize_verdicts(
         # measures the harness. Reported the way provenance is: the whole table again over
         # the pairs where both arms actually produced text.
         "restricted_to_pairs_with_both_answers": _subset_table(nonempty, arms),
+        # the per-pair outcomes behind every aggregate above. Persisted because the
+        # aggregates answer "which arm won" and cannot answer "on WHICH questions", which is
+        # the actionable half: an arm that loses four of twenty is a different problem from
+        # one that loses uniformly, and only this list distinguishes them. The whole verdict
+        # goes in — prose `reason` and raw passes included — because the scorecard readers
+        # index into `pair["passes"]`; narrowing it again means changing them first. A verdict
+        # the blinding failed on carries `arm_identifiable` rather than being dropped, so a
+        # scorecard cannot present it as clean.
         "pairs": [asdict(v) for v in verdicts],
     }
 

@@ -548,10 +548,6 @@ def load_sdk_log(paths: list[str] | None) -> tuple[list[dict], dict]:
     return calls, notices
 
 
-def load_sdk_calls(paths: list[str] | None) -> list[dict]:
-    return load_sdk_log(paths)[0]
-
-
 _EMPTY_SDK_STATS = pl.DataFrame({
     "session_id": pl.Series([], dtype=pl.Utf8),
     "total_sdk_calls": pl.Series([], dtype=pl.Int64),

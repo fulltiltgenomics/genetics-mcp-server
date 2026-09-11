@@ -32,8 +32,9 @@ ENV/
 *.swo
 
 # Environment
-.env
-.env.local
+# every .env variant holds real credentials; the committed example does not
+.env*
+!.env.example
 
 # Testing
 .pytest_cache/

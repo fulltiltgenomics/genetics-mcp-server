@@ -110,9 +110,6 @@ class Settings:
     perplexity_api_key: str | None = field(
         default_factory=lambda: os.environ.get("PERPLEXITY_API_KEY")
     )
-    literature_search_backend: str = field(
-        default_factory=lambda: os.environ.get("LITERATURE_SEARCH_BACKEND", "perplexity")
-    )
 
     # branding
     app_name: str = field(
@@ -253,11 +250,6 @@ class Settings:
     # ChEMBL releases quarterly, so a day is safe
     chembl_cache_ttl: int = field(
         default_factory=lambda: int(os.environ.get("CHEMBL_CACHE_TTL", "86400"))
-    )
-
-    # RAG MCP server (separate from always-on external servers)
-    rag_mcp_server: str | None = field(
-        default_factory=lambda: os.environ.get("RAG_MCP_SERVER")
     )
 
     # database paths
@@ -425,8 +417,6 @@ class Settings:
     subagent_model: str = field(
         default_factory=lambda: os.environ.get("SUBAGENT_MODEL", "")
     )
-    subagent_max_tokens: int = 4096
-    subagent_max_iterations: int = 10
     subagent_timeout: int = field(
         default_factory=lambda: int(os.environ.get("SUBAGENT_TIMEOUT", "120"))
     )

@@ -1968,7 +1968,7 @@ src/genetics_mcp_server/
 ├── skills/
 │   ├── __init__.py
 │   ├── definitions.py      # skill definitions and registry
-│   ├── sandbox_tools.py    # file read and script execution tools
+│   ├── sandbox_tools.py    # file read and directory listing tools for subagents
 │   └── instructions/       # markdown instruction files per skill
 ├── auth/
 │   ├── __init__.py

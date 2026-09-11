@@ -484,19 +484,6 @@ def get_rag_anthropic_tools() -> list[dict[str, Any]]:
     return anthropic_tools
 
 
-def get_proxy_client_for_tool(tool_name: str) -> MCPProxyClient | None:
-    """
-    Get the proxy client that can execute the given tool.
-
-    Args:
-        tool_name: Name of the tool
-
-    Returns:
-        MCPProxyClient if tool is external, None if local
-    """
-    return _proxy_clients.get(tool_name) or _rag_proxy_clients.get(tool_name)
-
-
 async def execute_external_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """
     Execute a tool on an external MCP server.
