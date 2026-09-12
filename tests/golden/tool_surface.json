@@ -1,6 +1,8 @@
 {
   "chat_backend": {
     "deployed_flags_set": {
+      "ALPHAGENOME_API_KEY": "configured",
+      "ALPHAGENOME_ENABLED": "true",
       "ENABLE_SUBAGENTS": "false",
       "SANDBOX_ENABLED": "true"
     },
@@ -17,9 +19,11 @@
     "profiles": {
       "api": {
         "local": {
-          "count": 66,
+          "count": 68,
           "tools": [
             "analyze_variant_list",
+            "compare_alphagenome_with_measured",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -90,9 +94,11 @@
       },
       "bigquery": {
         "local": {
-          "count": 66,
+          "count": 68,
           "tools": [
             "analyze_variant_list",
+            "compare_alphagenome_with_measured",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -163,8 +169,10 @@
       },
       "code": {
         "local": {
-          "count": 20,
+          "count": 22,
           "tools": [
+            "compare_alphagenome_with_measured",
+            "get_alphagenome_variant_predictions",
             "get_drug_profile",
             "get_drug_targets_for_gene",
             "get_myvariant_annotations",
@@ -190,9 +198,11 @@
       },
       "nocode": {
         "local": {
-          "count": 66,
+          "count": 68,
           "tools": [
             "analyze_variant_list",
+            "compare_alphagenome_with_measured",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -263,9 +273,11 @@
       },
       "null": {
         "local": {
-          "count": 66,
+          "count": 68,
           "tools": [
             "analyze_variant_list",
+            "compare_alphagenome_with_measured",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -336,9 +348,11 @@
       },
       "rag": {
         "local": {
-          "count": 66,
+          "count": 68,
           "tools": [
             "analyze_variant_list",
+            "compare_alphagenome_with_measured",
+            "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
             "get_colocalization",
@@ -474,8 +488,10 @@
         ]
       },
       "general": {
-        "count": 20,
+        "count": 22,
         "tools": [
+          "compare_alphagenome_with_measured",
+          "get_alphagenome_variant_predictions",
           "get_dataset_display_names",
           "get_drug_profile",
           "get_drug_targets_for_gene",
@@ -508,19 +524,23 @@
         ]
       }
     },
-    "count": 72
+    "count": 74
   },
   "mcp_server": {
     "deployed_flags_set": {
       "ENABLE_SUBAGENTS": "false"
     },
     "deployed_flags_unset": [
+      "ALPHAGENOME_API_KEY",
+      "ALPHAGENOME_ENABLED",
       "ENABLE_CREDIBLE_SETS_STATS",
       "ENABLE_LITERATURE_SEARCH",
       "ENABLE_PHENOTYPE_REPORT",
       "SANDBOX_ENABLED"
     ],
     "hardcoded_exclusions": [
+      "compare_alphagenome_with_measured",
+      "get_alphagenome_variant_predictions",
       "get_drug_profile",
       "get_drug_targets_for_gene",
       "get_myvariant_annotations",
@@ -597,6 +617,8 @@
       ]
     },
     "settings_disabled_tools": [
+      "compare_alphagenome_with_measured",
+      "get_alphagenome_variant_predictions",
       "get_credible_sets_stats",
       "get_phenotype_report",
       "launch_subagents",

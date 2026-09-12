@@ -264,6 +264,11 @@ class TestMCPDisabledTools:
             "get_drug_targets_for_gene",
             "get_drug_profile",
             "get_target_bioactivity",
+            # a rate-limited free non-commercial key, shared by the whole deployment, on a
+            # surface any Google-account holder can reach: the same product decision the
+            # UniProt and ChEMBL entries record, not a technical limit
+            "get_alphagenome_variant_predictions",
+            "compare_alphagenome_with_measured",
         ):
             assert tool_name in names, f"Expected tool '{tool_name}' not found in TOOL_DEFINITIONS"
             assert tool_name in mcp_server._mcp_disabled, (
@@ -303,6 +308,22 @@ class TestMCPDisabledTools:
 
         registered = self._registered_names(mcp)
         assert not (uniprot_tools & registered)
+
+    def test_alphagenome_tool_excluded_from_mcp_when_disabled(self):
+        # mirror pattern for the chat-backend-only AlphaGenome tools
+        from mcp.server.fastmcp import FastMCP
+
+        from genetics_mcp_server.tools.definitions import register_mcp_tools
+
+        alphagenome_tools = {
+            "get_alphagenome_variant_predictions",
+            "compare_alphagenome_with_measured",
+        }
+        mcp = FastMCP("Test Server")
+        executor = ToolExecutor()
+        register_mcp_tools(mcp, executor, disabled_tools=alphagenome_tools)
+
+        assert not (alphagenome_tools & self._registered_names(mcp))
 
     def test_code_execution_tools_absent_from_the_registered_tool_list(self):
         """Assert on the tool list, not on the constant.

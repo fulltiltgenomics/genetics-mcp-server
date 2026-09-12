@@ -253,6 +253,30 @@ class Settings:
         default_factory=lambda: int(os.environ.get("UNIPROT_CACHE_TTL", "86400"))
     )
 
+    # AlphaGenome Atlas (Google DeepMind) regulatory-track variant predictions. No default:
+    # the key is per-deployment and there is nothing sensible to fall back to. Its absence is
+    # a deployment fact, not a preference — see `disabled_tools`, which withdraws the tool
+    # rather than letting every call fail at the transport.
+    alphagenome_api_key: str | None = field(
+        default_factory=lambda: os.environ.get("ALPHAGENOME_API_KEY")
+    )
+    # whether this deployment offers AlphaGenome at all — the deployment's intent, reviewable
+    # independently of whether a key happens to be present. `disabled_tools` withdraws both
+    # tools when this is false OR the key is absent, so a key reaching the wrong deployment
+    # does not turn the feature on.
+    alphagenome_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "ALPHAGENOME_ENABLED", "false"
+        ).lower() in ("1", "true", "yes")
+    )
+    # predictions are a deterministic function of the variant and the model, and the Atlas
+    # response carries no version identifier, so nothing can detect a model update. A bounded
+    # ttl is the only staleness control available; an hour absorbs the repeats inside a chat
+    # turn without holding a prediction across a working day.
+    alphagenome_cache_ttl: int = field(
+        default_factory=lambda: int(os.environ.get("ALPHAGENOME_CACHE_TTL", "3600"))
+    )
+
     # ChEMBL REST API (drug/target mechanisms, indications, bioactivity)
     chembl_api_url: str = field(
         default_factory=lambda: os.environ.get(
@@ -460,6 +484,15 @@ class Settings:
             disabled.add("launch_subagents")
         if not self.enable_literature_search:
             disabled.add("search_scientific_literature")
+        if not self.alphagenome_enabled or not self.alphagenome_api_key:
+            # the flag is the deployment's intent (off means "do not offer this here" even if
+            # a key is ever seeded); the key is a second, independent guard, because a
+            # deployment with no key must not ADVERTISE the tool: every call would return
+            # "ALPHAGENOME_API_KEY is not set", and the opt-in prompt block would still be
+            # telling the model when to use it. Withdrawing the name takes the block with it,
+            # because default_system_prompt is assembled from the resolved tool names.
+            disabled.add("get_alphagenome_variant_predictions")
+            disabled.add("compare_alphagenome_with_measured")
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a
             # sandbox rather than broken by it, and neither is a tool the prompt prefers

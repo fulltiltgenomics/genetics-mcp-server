@@ -58,6 +58,35 @@ logger = logging.getLogger(__name__)
 #     read_artifact.name) are validated AFTER a normalization step that widens what is
 #     accepted, so a regex matching the validator would reject inputs the server handles.
 
+# THE OPT-IN, WRITTEN ONCE AND SHARED BY BOTH AlphaGenome TOOLS. The user ruled that this
+# wording plus the system-prompt block is the ENTIRE enforcement -- there is no setting and
+# no gate behind it -- so two capabilities under two names must not carry two drifting
+# copies of it. Sharing the literal is what makes "covered identically" checkable rather
+# than a promise; tests/test_alphagenome_comparison.py asserts both descriptions contain it.
+_ALPHAGENOME_OPT_IN = """CALL THIS ONLY WHEN THE USER HAS ASKED FOR IT. Exactly three things count as asking:
+1. the user names AlphaGenome;
+2. the user asks for a model prediction of a variant's regulatory effect;
+3. the user asks how a measured value in this suite compares with what a model predicts for the same variant — that comparison is a first-class use of this tool, not a workaround.
+
+Nothing else is. In particular:
+- Do NOT call it as background enrichment, and do not add a prediction to an answer nobody asked one for.
+- "What does this variant do?", "tell me about rs...", "is this variant causal?", "why is this locus associated?" are NOT requests for AlphaGenome. Answer them from this suite's own measured and fine-mapped data.
+- This suite having nothing to say about a variant is NOT a reason to call it. Say the data is silent; you may OFFER a prediction in one line and then wait to be asked.
+- It is an ADDITIONAL source of evidence, not a fallback for gaps — and having it available is not a reason to use it. It is a rate-limited external model under a non-commercial licence."""
+
+# The reading rules for the per-modality `validation` block, likewise shared: it is the same
+# block on both tools' results, and a rule stated on one surface only is a rule the model
+# will follow on one surface only.
+_ALPHAGENOME_VALIDATION_RULES = """READ THE `validation` BLOCK BEFORE QUOTING A NUMBER. Every modality in the result carries its own — `tier`, `status`, `quantity`, `calibrated_against`, `population_rho`, `rho_scope`:
+- `tier` is how deeply the MODALITY was calibrated here — 1-3 against this suite's own measurements, 4 against nothing. It is a property of the modality and says nothing about how good this variant's prediction is; it is not a score, a rank or a confidence.
+- `quantity: "signed"` — the sign is meaningful (negative is a predicted decrease). `quantity: "magnitude"` — the direction is NOT reported and you must not state or infer one.
+- `population_rho` with `rho_scope: "population"` is a cohort-level Spearman correlation between this MODALITY and `calibrated_against`, across many variants. It is a property of the modality. It is NOT a confidence for the variant in hand and must never be quoted as one.
+- `status: "unvalidated"` (no `population_rho`) means the modality was never checked against anything measured in this suite. Say so whenever you report one.
+- `quantile` ranks the score against a genome-wide background and usually says more than the raw value."""
+
+_ALPHAGENOME_SIDE_BY_SIDE = """SIDE BY SIDE WITH MEASURED DATA the labelling matters MORE, not less: label every number from this tool as predicted, name the source of every measured number, never merge or average the two into one figure, and where they disagree say that they disagree."""
+
+
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     # The three entity lookups that open this list — search_phenotypes, search_genes,
     # lookup_variants_by_rsid — are the exception to what `sdk_replaceable` otherwise means.
@@ -1395,6 +1424,115 @@ NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they mus
                 # chembl.get_target_bioactivity: result_cap = max(1, min(int(max_results), 100))
                 "minimum": 1,
                 "maximum": 100,
+            },
+        },
+    },
+    {
+        "name": "get_alphagenome_variant_predictions",
+        "category": "general",
+        # False for the same reason search_uniprot is: this is an OUTSIDE resource, not
+        # internal genetics data the SDK can fetch, so it belongs on both surfaces by
+        # `resolve_tools`' own rule. The consequence is deliberate for this phase: the
+        # tool is advertised to the code-execution surface, but a SCRIPT cannot call it —
+        # the sandbox egress allow-list names db-api and results-api only, and the image
+        # has no `alphagenome`. The model calls the tool; the script does not.
+        "sdk_replaceable": False,
+        "description": f"""MODEL PREDICTIONS from AlphaGenome (Google DeepMind) — what a deep-learning model predicts one variant does to regulatory activity: chromatin accessibility, histone and TF binding, transcription, splicing, optionally in a named cell type or tissue. NOTHING HERE WAS MEASURED IN ANYONE. It is not a FinnGen result and not an assay; never present a number from this tool as either.
+
+{_ALPHAGENOME_OPT_IN}
+
+{_ALPHAGENOME_VALIDATION_RULES}
+
+{_ALPHAGENOME_SIDE_BY_SIDE}""",
+        "parameters": {
+            "variants": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 25 per call, and one call per variant is the expensive mistake here. A variant the model cannot score comes back as its own failed row, leaving the rest of the batch intact.",
+                "required": True,
+            },
+            "cell_type": {
+                "type": "string",
+                "description": "Cell type or tissue to score in, matched against AlphaGenome's own biosample names (e.g. 'liver', 'K562'). Omit to take the strongest effect across all tracks. A request that matches nothing falls back to all tracks and says so in `cell_type_match`.",
+            },
+            "modalities": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "DNASE",
+                        "ATAC",
+                        "CHIP_HISTONE",
+                        "CHIP_TF",
+                        "CAGE",
+                        "PROCAP",
+                        "RNA_SEQ",
+                        "SPLICE_SITES",
+                        "SPLICE_SITE_USAGE",
+                        "SPLICE_JUNCTIONS",
+                        "POLYADENYLATION",
+                        "CONTACT_MAPS",
+                    ],
+                },
+                "description": "Modalities to score. Omit for the default set, which is exactly the modalities calibrated against this suite's own measurements. Any modality NOT in that default is uncalibrated and has to be asked for by name; its result says so in `validation`.",
+            },
+        },
+    },
+    {
+        "name": "compare_alphagenome_with_measured",
+        "category": "general",
+        # False for the same reason the prediction tool is: it reaches an outside model. It
+        # also reads db-api, which a script CAN reach, but the AlphaGenome half it exists to
+        # pair that with is unreachable from the sandbox, so half a comparison is the only
+        # thing a script could build.
+        "sdk_replaceable": False,
+        "description": f"""MEASURED RESULTS FROM THIS SUITE PLACED BESIDE ALPHAGENOME'S PREDICTION for the same variant, per modality, with their concordance. The measured side is this suite's own data — caQTL, eQTL and sQTL effect sizes from `credible_sets_v`, MPRA allelic skew from `mpra_v` — and the predicted side is the same model output `get_alphagenome_variant_predictions` returns. Use this when someone wants to know how a prediction stands up against what was actually measured.
+
+This is NOT for variants the suite is silent about: a comparison needs both halves, and it is worth most exactly where the measured data already exists.
+
+{_ALPHAGENOME_OPT_IN}
+
+HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no single `measured` flag — every value inside carries its own:
+- A `measured: true` value names its `source`: the view, the column, the assay, the resource, and the gene or accessibility peak that was measured. A `measured: false` value names AlphaGenome. Never merge, average or reconcile the two into one number, and never report a predicted value as a result from this suite.
+- `concordance.direction` is `"agrees"` or `"disagrees"` — the two signs match, or they do not. That is the whole claim. Do NOT compute a correlation, an error or an agreement score: with one variant there is nothing to correlate, and any such number would be fiction.
+- A modality whose `quantity` is `"magnitude"` has NO `direction` key at all, and both sides are reported unsigned. The absence IS the statement: a measured sQTL beta orients to a leafcutter intron cluster and the predicted splice delta has no corresponding orientation, so no direction agreement exists to report. Do not infer one, and do not describe such a pair as consistent or inconsistent in direction.
+- `measured_substrates[].population_rho`, with `rho_scope: "population"`, is how well that MODALITY tracked that substrate across a cohort of variants. It is a property of the pairing and NEVER this variant's confidence.
+- `context_match: "cross_tissue"` means the measurement is in a different cell type or tissue than the prediction was asked for. Say so — cell-type-matched comparisons are the stronger evidence.
+- The prediction's `cell_type_match` carries two independent flags: `matched` says whether the requested cell type resolved to tracks, and `resolution_failed` says the lookup itself failed. A failed lookup is "could not be checked", not "no match" — report them differently.
+- Empty `measurements` means one of three different things and the `note` says which: this suite has measured nothing for this variant; the modality has no measured substrate here at all (the unvalidated tier-4 modalities); or the measured lookup FAILED, so nothing is known either way. Never invent a comparison for the second — "nothing measured to compare against" is the answer — and never render the third as "nothing measured": it is "could not be checked", and `measured_substrates[].lookup: "failed"` names which substrate.
+
+{_ALPHAGENOME_VALIDATION_RULES}""",
+        "parameters": {
+            "variants": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 25 per call.",
+                "required": True,
+            },
+            "cell_type": {
+                "type": "string",
+                "description": "Cell type or tissue to compare in. It matches BOTH sides — AlphaGenome's biosample names and the measured assay's cell type or MPRA cell line (K562, HEPG2, SKNSH, HCT116, A549) — so passing it is what makes a matched comparison possible. Omit and every measurement comes back as `context_match: \"not_requested\"`.",
+            },
+            "modalities": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "DNASE",
+                        "ATAC",
+                        "CHIP_HISTONE",
+                        "CHIP_TF",
+                        "CAGE",
+                        "PROCAP",
+                        "RNA_SEQ",
+                        "SPLICE_SITES",
+                        "SPLICE_SITE_USAGE",
+                        "SPLICE_JUNCTIONS",
+                        "POLYADENYLATION",
+                        "CONTACT_MAPS",
+                    ],
+                },
+                "description": "Modalities to compare. Omit for the default set, which is exactly the modalities that HAVE a measured substrate here. A modality outside it has nothing to compare against and comes back saying so.",
             },
         },
     },
@@ -2831,6 +2969,24 @@ def register_mcp_tools(
         return await executor.search_uniprot(
             query, keyword, organism_id, reviewed_only, fields, size, count_only
         )
+
+    @_tool()
+    async def get_alphagenome_variant_predictions(
+        variants: list[str],
+        cell_type: str | None = None,
+        modalities: list[str] | None = None,
+    ) -> dict:
+        """AlphaGenome's PREDICTED regulatory effect of one or more variants — a model's output, never a measurement."""
+        return await executor.get_alphagenome_variant_predictions(variants, cell_type, modalities)
+
+    @_tool()
+    async def compare_alphagenome_with_measured(
+        variants: list[str],
+        cell_type: str | None = None,
+        modalities: list[str] | None = None,
+    ) -> dict:
+        """This suite's MEASURED effect sizes beside AlphaGenome's PREDICTION for the same variant."""
+        return await executor.compare_alphagenome_with_measured(variants, cell_type, modalities)
 
     @_tool()
     async def get_drug_targets_for_gene(

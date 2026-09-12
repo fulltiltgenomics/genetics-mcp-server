@@ -47,24 +47,36 @@ def tool_names_mentioned(text: str) -> set[str]:
     return tokens & ALL_TOOL_NAMES
 
 
-def flag_disabled_tools(*, subagents: bool, sandbox: bool = True) -> set[str]:
+def flag_disabled_tools(
+    *, subagents: bool, sandbox: bool = True, alphagenome: bool = True
+) -> set[str]:
     """The disabled set the deployment flags actually produce.
 
     Derived from Settings rather than hard-coded, so a flag added in front of another
-    tool is picked up here without editing this file. `sandbox` defaults to True — the
-    opposite of the deployed default — because everything below is about what the prompt
-    says when a tool IS present; the flag-off direction is asserted explicitly instead
-    (genetics-results-suite-4h6.56).
+    tool is picked up here without editing this file. `sandbox` and `alphagenome` default
+    to True — for the sandbox the opposite of the deployed default, for the key the
+    opposite of a bare test environment — because everything below is about what the
+    prompt says when a tool IS present; each flag-off direction is asserted explicitly
+    instead (genetics-results-suite-4h6.56).
     """
-    return Settings(enable_subagents=subagents, sandbox_enabled=sandbox).disabled_tools
+    return Settings(
+        enable_subagents=subagents,
+        sandbox_enabled=sandbox,
+        alphagenome_enabled=alphagenome,
+        alphagenome_api_key="test-key" if alphagenome else None,
+    ).disabled_tools
 
 
-def resolve(profile: str | None, *, subagents: bool, sandbox: bool = True) -> set[str]:
+def resolve(
+    profile: str | None, *, subagents: bool, sandbox: bool = True, alphagenome: bool = True
+) -> set[str]:
     return {
         t["name"]
         for t in get_anthropic_tools(
             code_execution=code_execution_requested(profile),
-            disabled_tools=flag_disabled_tools(subagents=subagents, sandbox=sandbox),
+            disabled_tools=flag_disabled_tools(
+                subagents=subagents, sandbox=sandbox, alphagenome=alphagenome
+            ),
         )
     }
 
@@ -437,6 +449,7 @@ _DOMAIN_SECTIONS = [
     "## Data Domains and Outside Resources",
     "### Variant Annotation Sources",
     "### Functional / Regulatory Readouts",
+    "### AlphaGenome variant predictions (opt-in)",
     "### HLA / the MHC region",
     "### Dosage sensitivity / rare CNVs",
     "### Protein Annotation (UniProt)",
@@ -944,6 +957,7 @@ class TestPromptVariants:
 # ---------------------------------------------------------------------------
 
 _OTHER_VARIANTS = sorted(set(PROMPT_VARIANTS) - {DEFAULT_PROMPT_VARIANT})
+_ALL_VARIANTS = sorted(PROMPT_VARIANTS)
 
 
 @pytest.mark.skipif(not _OTHER_VARIANTS, reason="only the default variant is registered")
@@ -1004,3 +1018,103 @@ class TestEveryVariantHoldsTheStructuralInvariants:
             assert len(served) <= len(other), (
                 f"the served prompt is larger than {variant!r} on the {surface} surface"
             )
+
+
+class TestAlphaGenomeOptIn:
+    """The opt-in is prompt guidance and nothing else, so the guidance is the feature.
+
+    There is no per-user setting, no per-conversation column and no UI toggle behind it:
+    the user was told this is persuasion rather than enforcement and chose it. Each rule
+    below is pinned because losing one silently turns an opt-in tool into a reflex.
+    """
+
+    TOOL = "get_alphagenome_variant_predictions"
+
+    # what the block must say, in the order it says it
+    RULES = [
+        "Call it only when the user has asked for it",
+        "the user names AlphaGenome",
+        "first-class use of the tool",
+        "Do NOT call it as background enrichment",
+        "are NOT requests for AlphaGenome",
+        "not a fallback for gaps",
+        "never a confidence for the variant in hand",
+        "the labelling matters MORE, not less",
+    ]
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_block_reaches_every_surface_that_has_the_tool(self, profile, variant):
+        """Every registered variant, not only the served one.
+
+        The block was first written into `legacy` while `condensed` was already the
+        default, so the feature's only guard reached no deployment at all. The guidance IS
+        the feature: a variant that carries the tools without it is broken however good
+        its prose is, and either block tuple can drift from the other silently.
+        """
+        available = resolve(profile, subagents=False)
+        assert self.TOOL in available, "sdk_replaceable False puts it on both surfaces"
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        for rule in self.RULES:
+            assert rule in prompt, f"{variant}/{profile} lost: {rule!r}"
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_block_goes_when_the_key_is_unset(self, variant):
+        """Both halves of the gate, exercised end to end.
+
+        The block self-gates on the tool NAME, and `Settings.disabled_tools` withdraws the
+        name when no ALPHAGENOME_API_KEY is configured — so a key-less deployment ships
+        neither the tool nor the ~1 KB of prompt telling the model when to reach for it.
+        Asserting only the hand-subtracted direction would leave the deployment-level half
+        untested, which is the half that repeats the run_analysis failure.
+        """
+        with_key = resolve(None, subagents=False, alphagenome=True)
+        assert self.TOOL in with_key
+        assert "AlphaGenome" in default_system_prompt(
+            "FinnGenie", tool_names=with_key, variant=variant
+        )
+
+        without_key = resolve(None, subagents=False, alphagenome=False)
+        assert self.TOOL not in without_key
+        assert "AlphaGenome" not in default_system_prompt(
+            "FinnGenie", tool_names=without_key, variant=variant
+        )
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_block_goes_when_the_flag_is_off_even_with_a_key(self, variant):
+        """The flag is the deployment's intent and gates independently of the key: a
+        deployment that leaves ALPHAGENOME_ENABLED off must not advertise the tool or its
+        prompt block even if a key was ever seeded there."""
+        disabled = Settings(alphagenome_enabled=False, alphagenome_api_key="test-key").disabled_tools
+        available = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
+        assert self.TOOL not in available
+        assert "AlphaGenome" not in default_system_prompt(
+            "FinnGenie", tool_names=available, variant=variant
+        )
+
+    def test_the_gate_reads_both_the_flag_and_the_key(self):
+        """Three of the four combinations withhold the tool; only flag-on with a
+        configured key advertises it. An empty string is as unconfigured as an unset
+        variable — os.environ.get returns "" for `ALPHAGENOME_API_KEY=` in a manifest,
+        which is exactly what an optional secret key renders to when the deployment has
+        no key."""
+        assert self.TOOL not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
+
+    def test_the_tool_description_carries_the_same_rules(self):
+        """The strongest wording lives in the description, which the model follows more
+        reliably than prose this far up the prompt — so the two must not drift apart."""
+        [tool] = [t for t in all_local_tool_definitions() if t["name"] == self.TOOL]
+        text = tool["description"]
+        for phrase in (
+            "CALL THIS ONLY WHEN THE USER HAS ASKED FOR IT",
+            "Do NOT call it as background enrichment",
+            "are NOT requests for AlphaGenome",
+            "NOT a reason to call it",
+            "first-class use of this tool",
+            "never be quoted as one",
+            "the labelling matters MORE, not less",
+        ):
+            assert phrase in text, f"tool description lost: {phrase!r}"

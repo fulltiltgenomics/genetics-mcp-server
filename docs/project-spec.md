@@ -260,8 +260,12 @@ implementation, but constructs its own cache instance.
 **`query` takes one entity or a list, and the list is the point.** All three ChEMBL tools
 plus `get_protein_annotations` declare `"type": ["string", "array"]`, and the executor fans a
 list out with `_fan_out` — `asyncio.gather` under a semaphore of `_BATCH_CONCURRENCY` (5),
-capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **The HTTP is not what
-this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
+capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **That cap is not in the
+schema, and cannot be.** `_to_anthropic_format` forwards `minimum`, `maximum` and `pattern`
+only, so no `maxItems` ever reaches the model; every array bound in this server — this one,
+the variant cap on `get_alphagenome_variant_predictions` — is stated in the parameter's
+description and enforced by the executor, and any future tool wanting one is in the same
+position. **The HTTP is not what this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
 `get_drug_targets_for_gene` about 25 genes one at a time, because the schema offered no way to
 ask about more than one; what a list removes is the ~8s model iteration and full context
 re-read between each call. Verified end to end: the same five-gene question now resolves in one
@@ -335,6 +339,58 @@ for a gene now names `get_drug_targets_for_gene` instead of leaving it to memory
 closure and ships in the sandbox image. It is unreachable from `run_analysis` all the same:
 the sandbox's egress allow-list names db-api and results-api only, and nothing there serves
 `www.ebi.ac.uk`.
+
+#### AlphaGenome (native tool, chat-backend only, opt-in)
+
+Two tools, one client. `get_alphagenome_variant_predictions` returns AlphaGenome Atlas (Google DeepMind) predictions of a variant's regulatory effect — accessibility, binding, transcription, splicing — per modality, optionally in a named cell type or tissue. `compare_alphagenome_with_measured` puts that same prediction beside this suite's own MEASURED effect sizes for the same variant. They are the only tools here whose output is a MODEL'S OUTPUT rather than a retrieved measurement, and the rest of their shape follows from that:
+
+- **A deployment with the flag off, or no key, does not advertise it.** `Settings.disabled_tools` withdraws both tool names when `ALPHAGENOME_ENABLED` is false or `ALPHAGENOME_API_KEY` is unset, the way it withdraws `run_analysis` without a sandbox — so the flag makes the deployment's intent reviewable independent of the key, and a key-less or flag-off deployment offers no tool whose every call would return "ALPHAGENOME_API_KEY is not set"; the opt-in prompt block disappears with the name rather than telling the model about a tool it does not hold. `k8s/deployments/chat-backend.yaml` carries `ALPHAGENOME_ENABLED` as a plain env var and mounts the key as an *optional* secret key, and chat-backend is its only holder.
+- **Predictions are cached in process and nowhere else.** A `_TTLCache` — uniprot.py's, imported rather than copied — keyed on the parsed variant, the requested cell type and the requested modality set, `ALPHAGENOME_CACHE_TTL` seconds (default 1 h). The cell type is in the key because tracks are resolved per cell type: a key without it would answer a question about one tissue with another tissue's prediction under the caller's own label. The measured quota (~1320 requests/minute) is far above the expected load, so this exists to stop one turn paying twice, not to make the load fit — and keeping it in memory means no prediction is ever written down, which sidesteps rather than answers the open question of whether DeepMind's terms permit storing outputs. It inherits `_TTLCache`'s entry bound, which is a count and not a byte budget: a prediction entry is an order of magnitude larger than the small JSON that bound was sized for, so the cache cannot grow without limit but its footprint is not what the number was chosen against. If memory ever matters, that bound is where to look.
+- **The opt-in is prompt guidance and nothing else.** No per-user setting, no per-conversation column, no UI toggle: the user was told plainly that this is persuasion rather than enforcement, that the model holds the tool either way, and chose it. So the rules live in the two places the model actually reads — the tool description in `tools/definitions.py`, and the `### AlphaGenome variant predictions (opt-in)` block, which self-gates on both tool names like every other block and therefore has to exist in **every** entry of `PROMPT_VARIANTS` — `_PROMPT_BLOCKS` in `config/defaults.py` and `CONDENSED_PROMPT_BLOCKS` in `config/prompt_condensed.py`, the latter written in the condensed register rather than copied, since `legacy`'s wording is the measured baseline. `tests/test_system_prompt.py::TestAlphaGenomeOptIn` pins description and block against each other and runs the block assertions over every registered variant: a variant that advertises the tools without the guidance ships the feature with its only guard missing.
+- **Labelling is structural rather than prose.** The envelope carries `data_kind: "model_prediction"` and `measured: false`; each modality carries its own `validation` block — tier, whether the exposed quantity is signed or magnitude-only, the substrate it was calibrated against, and a population-level Spearman rho whose `rho_scope` says the number describes the MODALITY and not the variant in hand. The tiers live in `tools/alphagenome.py`'s `MODALITIES` and are not restated anywhere; the delegate passes the client's result through and adds the envelope label, because reshaping is where a prediction starts to read like a measurement.
+- **The client is reached from `ServerToolExecutor` only.** `tools/alphagenome.py` is not on the suite's `sandbox/prune_venv.py` SDK_ALLOWLIST and the sandbox image has no `alphagenome` package, so an import of it from `tools/executor.py` — at any depth, `TYPE_CHECKING` or deferred inside a method — would satisfy every build gate and then raise `ModuleNotFoundError` at call time in a container with no shell. The `alphagenome` cached_property lives in `tools/orchestration.py`, and `tests/test_alphagenome.py` asserts by AST that the shipped file imports nothing of the sort.
+- `sdk_replaceable: False`, for the reason the UniProt and ChEMBL tools are: an outside resource, not internal genetics data a script fetches through the SDK. It is therefore advertised on the code-execution surface too, where a SCRIPT still cannot call it — the sandbox egress allow-list names db-api and results-api only. That is intended for this phase.
+- In `_mcp_disabled`, by product decision rather than technical limit: a free non-commercial key with a per-minute quota shared by the whole deployment, on a surface any Google-account holder can reach.
+
+##### The comparison capability
+
+`compare_alphagenome_with_measured` is the second capability, not a mode of the first. It is
+a separate tool because the reading rules it needs are its own and are long: loading them
+onto the prediction tool would have diluted the opt-in wording, which is the only enforcement
+the opt-in has. The two descriptions share `_ALPHAGENOME_OPT_IN` as one literal in
+`tools/definitions.py`, so "the opt-in covers both identically" is checkable rather than
+promised, and `tests/test_alphagenome_comparison.py` checks it.
+
+Nothing about it is gated on the suite's data being absent: the comparison is worth most
+exactly where a measurement already exists.
+
+- **The measured half is db-api, not BigQuery.** The pairings live in
+  `tools/alphagenome_comparison.py` and reach `credible_sets_v` (caQTL, eQTL and sQTL `beta`)
+  and `mpra_v` (`log2Skew`) through `ToolExecutor.query_database`, the same path every other
+  view takes. A modality with no calibrated substrate here — the tier-4 five — issues no
+  query at all and answers "nothing measured to compare against".
+- **The quantity rule from `MODALITIES` holds for the comparison.** Where the sign is
+  commensurable, both sides are signed and a `direction` of `agrees`/`disagrees` is reported.
+  Where it is not — all three splicing modalities, whose measured beta orients to a
+  leafcutter intron cluster the predicted delta knows nothing about — BOTH sides are reduced
+  to magnitude and the concordance carries **no `direction` key at all**, not a null one.
+  The absence is the statement.
+- **`population_rho` is per pairing, not per modality.** DNASE was calibrated against two
+  substrates and correlates differently with each (+0.478 caQTL, +0.503 MPRA), so each
+  substrate carries its own number with `rho_scope: "population"`. Nothing computes a
+  per-variant statistic from a single pair.
+- **The envelope carries no `measured` flag.** A payload holding both kinds of number has no
+  true value for one, so every leaf carries its own instead: `measured: true` values name
+  their view, column, assay, resource and the gene or peak measured; `measured: false` values
+  name AlphaGenome. `data_kind` is `prediction_vs_measurement`.
+- **A measurement from another tissue is labelled `cross_tissue`** rather than quietly
+  compared — cell-type matching is worth about 0.06 rho — and an empty `measurements` list
+  distinguishes "this suite measured nothing here", "this modality has no substrate" and
+  "the db-api lookup failed" in its `note`.
+- `variant_effect_v` is deliberately NOT a substrate: it holds ChromBPNet and FLARE output,
+  which is another model's prediction, so a row from it belongs on the `measured: false`
+  side. `tools/alphagenome_comparison.py` records why at the site, along with the fact that
+  `chrombpnet_abs_logfc` is unsigned and could only ever support a magnitude comparison.
 
 ### Code execution tools
 
@@ -771,7 +827,7 @@ by it, via `tool_category()`). **No surface decision reads it.**
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, compare_alphagenome_with_measured, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |
@@ -2442,6 +2498,14 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|---------|
 | `CHEMBL_API_URL` | ChEMBL REST API base URL (targets, mechanisms, molecules, indications, activities) | `https://www.ebi.ac.uk/chembl/api/data` |
 | `CHEMBL_CACHE_TTL` | TTL in seconds for cached ChEMBL responses; `0` disables caching | `86400` (24 h) |
+
+### AlphaGenome (optional, chat-backend only)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ALPHAGENOME_ENABLED` | Whether this deployment offers AlphaGenome at all — the deployment's intent, independent of whether a key happens to be configured. Same truthy parsing as `SANDBOX_ENABLED` | `false` |
+| `ALPHAGENOME_API_KEY` | AlphaGenome Atlas API key. Either this unset or `ALPHAGENOME_ENABLED` false is a supported deployment: `Settings.disabled_tools` then withdraws `get_alphagenome_variant_predictions` and `compare_alphagenome_with_measured`, so neither tool is advertised and their shared opt-in prompt block is never assembled | _(unset)_ |
+| `ALPHAGENOME_CACHE_TTL` | TTL in seconds for the in-process prediction cache; `0` disables caching. Nothing is written to disk | `3600` (1 h) |
 
 ### Search tools (optional)
 
