@@ -756,6 +756,67 @@ class TestUniProtToolMethods:
         assert '"agrees": false' in payload
         assert "1433466" in payload
 
+    async def test_an_inactive_accession_reports_itself_rather_than_raising(self):
+        """UniProt answers 200 for a withdrawn entry, and that path had no test.
+
+        `_inactive_result` gained a third parameter the only call site never passed, so
+        every DEMERGED or DELETED accession raised TypeError inside the executor and came
+        back as a tool error naming nothing the user could act on.
+        """
+
+        def resolver(url):
+            if "Q6UWB5" in url:
+                return _resp(
+                    {
+                        "entryType": "Inactive",
+                        "primaryAccession": "Q6UWB5",
+                        "inactiveReason": {
+                            "inactiveReasonType": "DEMERGED",
+                            "mergeDemergeTo": ["P12345", "P67890"],
+                        },
+                    }
+                )
+            # the symbol retry finds nothing, so the inactive result is what survives
+            if "/uniprotkb/search" in url:
+                return _resp(_search_body())
+            return None
+
+        patcher, _calls = self._patch_get(resolver)
+        with patcher:
+            result = await self.executor.uniprot.resolve("Q6UWB5")
+
+        assert result["inactive"] is True
+        assert result["inactive_reason"] == "DEMERGED"
+        assert result["replaced_by"] == ["P12345", "P67890"]
+        # never the dead identifier: nothing downstream may go on to annotate it
+        assert result["accession"] is None
+        assert "P12345" in result["warning"]
+        # the shared result shape resolve() documents, which is what the third parameter
+        # exists to fill
+        assert result["reviewed_only"] is True
+
+    async def test_an_inactive_accession_echoes_reviewed_only_false(self):
+        def resolver(url):
+            if "Q6UWB5" in url:
+                return _resp(
+                    {
+                        "entryType": "Inactive",
+                        "primaryAccession": "Q6UWB5",
+                        "inactiveReason": {"inactiveReasonType": "DELETED"},
+                    }
+                )
+            if "/uniprotkb/search" in url:
+                return _resp(_search_body())
+            return None
+
+        patcher, _calls = self._patch_get(resolver)
+        with patcher:
+            result = await self.executor.uniprot.resolve("Q6UWB5", reviewed_only=False)
+
+        assert result["reviewed_only"] is False
+        assert result["replaced_by"] == []
+        assert "no replacement" in result["warning"]
+
     async def test_wrong_accession_surfaces_the_protein_it_actually_names(self):
         # Q92626 supplied where TPO was meant: the result must say it is PXDN_HUMAN
         pxdn = _summary("Q92626", "PXDN_HUMAN", "Peroxidasin homolog", "PXDN")
