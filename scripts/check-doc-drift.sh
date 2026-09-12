@@ -60,6 +60,9 @@ check '^src/genetics_mcp_server/scripts/(replay_benchmark|pairwise_judge)\.py$' 
     '^docs/project-spec\.md$' \
     'scripts/replay_benchmark.py, pairwise_judge.py -> docs/project-spec.md (Replay Benchmark + Paired Quality Judging: what the report enumerates, MIN_DECISIVE_PAIRS=6, the 12,000-char elision limit, the sha256 seed, the test-file table row)'
 
+check '^(scripts/(lint-staged|install-git-hooks)\.sh|pyproject\.toml)$' "$DOCS_SPEC" \
+    'lint gate (scripts/lint-staged.sh, install-git-hooks.sh, pyproject.toml) -> README.md + docs/project-spec.md (which commits it blocks, the ruff rule set and pinned version, how ruff is resolved in a worktree)'
+
 if [ "$found" -eq 1 ]; then
     printf '\n  Update the doc in this commit, or note why it does not apply.\n' >&2
     printf '  Not blocking. Mappings live in CLAUDE.md > Documentation ownership.\n\n' >&2

@@ -3544,6 +3544,31 @@ already written) — a run produces cost and latency numbers with no judge call 
 - **Feature planning**: new features go through architecture exploration (`~/.claude/agents/architecture-explorer.md` — a user-level agent, not checked into any repo) which proposes 3 alternatives, then the selected approach is broken into ultrafocused subtasks in beads
 - **Task execution**: work through subtasks via `bd ready`, updating status as you go
 
+## Lint gate
+
+`scripts/lint-staged.sh` runs ruff over the **staged** Python files from the `pre-commit`
+hook and **fails the commit** when anything is reported. `git commit --no-verify` is the
+bypass. It is the one pre-commit check that blocks; `scripts/check-doc-drift.sh` only warns.
+
+- **Staged, not repo-wide.** A finding in a file the commit does not touch never blocks it.
+  The other side of that coin is that a pre-existing finding is only ever cleared by
+  touching its file; `scripts/lint-staged.sh --all` runs the repo-wide check.
+- **The working tree, not the index.** It lints the working-tree copy of each staged path,
+  because doing it properly means materialising the index somewhere and a hook that stashes
+  can lose work if interrupted. The difference shows only when a file is partially staged,
+  and that case is detected and printed rather than left to be found later.
+- **Resolving ruff:** this checkout's `.venv`, then the **main checkout's** (a worktree has
+  none of its own), then `PATH`, then `uvx ruff@<pin>`. With none of those it **fails the
+  commit** rather than passing it unchecked — a gate that skips when its linter is missing
+  is indistinguishable from a clean commit. A resolved ruff that is not the pinned version
+  warns and proceeds.
+
+The rule set matches the sibling repos, because the same gate runs in all five and a
+per-repo rule set means the same file passes in one and fails in the next. Neither hook
+runs until `scripts/install-git-hooks.sh` has been run once in the clone; `core.hooksPath`
+is local git config that no clone carries, and it is shared across worktrees, so that one
+run covers every worktree too.
+
 ## Documentation
 
 - `README.md`: Installation, quick start, tool reference

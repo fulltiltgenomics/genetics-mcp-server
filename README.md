@@ -71,9 +71,16 @@ uv sync --extra dev
 # tests
 uv run pytest
 
-# lint
-uv run ruff check src/
+# lint (the whole repo, as the pre-commit gate's --all mode does)
+uv run ruff check
 ```
+
+`scripts/install-git-hooks.sh`, run once per clone, wires `core.hooksPath` so the
+`pre-commit` hook runs: `scripts/check-doc-drift.sh` warns, and `scripts/lint-staged.sh`
+lints the staged Python files and **blocks the commit** on a finding. The setting is
+shared across worktrees, so one run covers every worktree too. In a worktree with no
+`.venv`, the gate falls back to the main checkout's ruff, then `PATH`, then `uvx` — and
+fails the commit if it finds none, rather than passing it unchecked.
 
 In a **git worktree**, run `uv sync --extra dev` in the worktree before testing: otherwise
 `uv run pytest` resolves to a global interpreter that has the main checkout installed

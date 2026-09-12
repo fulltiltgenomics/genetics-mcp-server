@@ -33,6 +33,12 @@ Changing a path on the left makes the doc on the right wrong until it is updated
 the same commit. `scripts/check-doc-drift.sh` warns (never blocks) on commits that
 violate this; it runs from the `pre-commit` hook.
 
+The same hook also runs `scripts/lint-staged.sh`, which **does** block: a commit whose
+staged files the linter rejects is refused. Neither hook runs until
+`scripts/install-git-hooks.sh` has been run once in the clone — `core.hooksPath` is
+local git config that no clone carries — and because that setting is shared across
+worktrees, one run also covers every worktree, existing and future.
+
 | changed path | doc to update | what to check |
 |---|---|---|
 | `src/genetics_mcp_server/tools/definitions.py` | `docs/project-spec.md` | the "Available tools" tables, tool profile categories |
@@ -43,6 +49,7 @@ violate this; it runs from the `pre-commit` hook.
 | `src/genetics_mcp_server/auth/**`, `mcp_server.py`, `mcp_proxy.py` | `docs/project-spec.md`, `README.md` | bearer auth branches, `MCP_API_KEY` being mandatory on remote transports, `MCP_ALLOW_QUERY_TOKEN` gating, external MCP proxying |
 | `src/genetics_mcp_server/scripts/analyze_variants.py` | `docs/variant-list-analysis.md` | CLI flags, input format, output JSON shape |
 | `src/genetics_mcp_server/scripts/replay_benchmark.py`, `pairwise_judge.py` | `docs/project-spec.md` | the Replay Benchmark and Paired Quality Judging sections: what the report enumerates and every hard-coded number quoted there (`MIN_DECISIVE_PAIRS` = 6, the 12,000-character elision limit, the sha256 presentation seed), plus the per-test-file table row for `test_pairwise_judge.py` |
+| `scripts/lint-staged.sh`, `scripts/install-git-hooks.sh`, `pyproject.toml` | `README.md`, `docs/project-spec.md` | the lint gate: which commits it blocks, the ruff rule set and its pinned version, how ruff is resolved when a worktree has no `.venv` |
 
 A doc is stale the moment it *enumerates* something the code no longer matches.
 Counts and lists rot silently — tool tables, endpoint lists, env-var tables — so
@@ -77,7 +84,12 @@ requires updating that repo's `docs/project-spec.md`, not just the docs here.
    - Tool executor methods are async
    - MCP and LLM service handlers are async
 4. Private fields and methods should be prefixed with underscore
-5. Code should pass linting at all times (`ruff check src/`)
+5. Code should pass linting at all times (`ruff check`, or `scripts/lint-staged.sh --all`).
+   The `pre-commit` hook runs `scripts/lint-staged.sh`, which lints the **staged** Python
+   files and **blocks the commit** on a finding; `git commit --no-verify` is the bypass.
+   The rule set is `[tool.ruff.lint]` in `pyproject.toml` and matches the sibling repos,
+   because the same gate runs in all five and a per-repo rule set means the same file
+   passes in one and fails in the next
 
 
 # Project-specific conventions
