@@ -816,7 +816,7 @@ class GeneticsClient:
         return self._rows(await self._executor.get_gene_expression(gene))
 
     async def gene_disease(self, gene: str) -> pl.DataFrame:
-        """Mendelian gene-disease associations."""
+        """Mendelian gene-disease associations, from GenCC and the Monarch Initiative."""
         return self._rows(await self._executor.get_gene_disease_associations(gene))
 
     # ------------------------------------------------------------------ sumstats / LD

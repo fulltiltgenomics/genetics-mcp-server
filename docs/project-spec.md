@@ -73,7 +73,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | Tool | Description |
 |------|-------------|
 | `get_gene_expression` | Get tissue-specific gene expression levels |
-| `get_gene_disease_associations` | Get Mendelian disease relationships from ClinGen/GENCC |
+| `get_gene_disease_associations` | Get Mendelian disease relationships from GenCC curation submissions and the Monarch Initiative KG |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
 | `get_exome_results_by_variant` | Exome results for one specific variant across exome resources — the rare-variant counterpart to `get_credible_sets_by_variant` |
 | `get_exome_results_by_region` | Exome results overlapping a `chr:start-end` region; rows capped at 500 inline with `truncated` set |
