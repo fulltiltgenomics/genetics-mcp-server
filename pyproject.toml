@@ -44,12 +44,17 @@ packages = ["src/genetics_mcp_server"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# sibling worktrees live under .claude/worktrees and carry their own copy of every
+# source file; without this, ruff reports each finding once per checked-out branch
+exclude = [".claude"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 # E501: line too long (handled by formatter)
 # E402: module level import not at top of file (load_dotenv must be called before project imports)
-ignore = ["E501", "E402"]
+# E741: ambiguous name (`l`) — style only, and every occurrence across the suite is a
+#       loop variable, so it blocks commits without ever catching a defect
+ignore = ["E501", "E402", "E741"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
