@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from conftest import settings_env
 
+from genetics_mcp_server import llm_service as llm_service_module
 from genetics_mcp_server import rate_limit
 from genetics_mcp_server.llm_service import StreamChunk
 
@@ -24,6 +25,37 @@ def _fresh_rate_limit_window():
     rate_limit._requests.clear()
     yield
     rate_limit._requests.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_provider():
+    """No test in this file reaches a real provider.
+
+    The assertions here are written for an environment with no ANTHROPIC_API_KEY — "may
+    fail if no API key", "may be 200/400 depending on provider availability" — so where a
+    key IS configured they quietly became live, billed API calls, at 6-8s each and failing
+    whenever the network did. Closing that by default rather than per test is what stops it
+    coming back: a test added later inherits it.
+
+    Only `stream_chat` and the two client handles are replaced, on the real singleton.
+    Substituting the whole service instead breaks /chat/v1/tools, which asks the same
+    object to describe the resolved tool surface and must get the real answer. A test
+    needing different provider behaviour still patches `get_llm_service` itself, and that
+    patch wins over this one.
+    """
+
+    async def stream(**kwargs):
+        yield StreamChunk(
+            type="done", content="", message_content=[{"type": "text", "text": "Hello!"}]
+        )
+
+    service = llm_service_module.get_llm_service()
+    with (
+        patch.object(service, "stream_chat", stream),
+        patch.object(service, "anthropic_client", True),
+        patch.object(service, "openai_client", None),
+    ):
+        yield service
 
 
 class TestStatusEndpoint:

@@ -306,6 +306,19 @@ def _tool_sets_to_probe() -> dict[str, set[str]]:
     return sets
 
 
+@pytest.fixture(scope="module")
+def probed_prompts() -> dict[str, tuple[frozenset[str], str]]:
+    """Every probe tool set paired with the prompt it produces, built once for the module.
+
+    The second test below exists to prove the first one's sweep is interesting, so the two
+    have to be reading the same prompts rather than two independently assembled copies.
+    """
+    return {
+        label: (frozenset(tools), default_system_prompt("FinnGenie", tool_names=tools))
+        for label, tools in _tool_sets_to_probe().items()
+    }
+
+
 class TestEverySurfaceWithADataPathIsRouted:
     """One arm-routing sentence, never zero and never two, on any tool set.
 
@@ -316,29 +329,27 @@ class TestEverySurfaceWithADataPathIsRouted:
     see, because the heading survives and every pinned string is elsewhere.
     """
 
-    def test_exactly_one_arm_routing_sentence_per_surface(self):
+    def test_exactly_one_arm_routing_sentence_per_surface(self, probed_prompts):
         wrong = {}
-        for label, tools in _tool_sets_to_probe().items():
-            prompt = default_system_prompt("FinnGenie", tool_names=tools)
+        for label, (tools, prompt) in probed_prompts.items():
             hits = [s for s in _ARM_ROUTING_SENTENCES if s in prompt]
             if len(hits) != (1 if tools & _DATA_PATH_TOOLS else 0):
                 wrong[label] = hits
         assert wrong == {}
 
-    def test_the_probe_reaches_beyond_the_current_profiles(self):
+    def test_the_probe_reaches_beyond_the_current_profiles(self, probed_prompts):
         """Guards the test above from passing because it probes nothing interesting."""
-        sets = _tool_sets_to_probe()
-        assert "-get_gene_based_results" in sets
-        assert "-get_exome_results_by_gene" in sets
-        assert len(sets) > 50
+        assert "-get_gene_based_results" in probed_prompts
+        assert "-get_exome_results_by_gene" in probed_prompts
+        assert len(probed_prompts) > 50
         profiles = [frozenset(resolve(p, subagents=s)) for p in PROFILES for s in (True, False)]
-        assert sum(frozenset(t) not in profiles for t in sets.values()) > 40
+        assert sum(tools not in profiles for tools, _ in probed_prompts.values()) > 40
         # and each arm-routing variant is actually exercised somewhere in the probe
         emitted = {
             s
-            for tools in sets.values()
+            for _, prompt in probed_prompts.values()
             for s in _ARM_ROUTING_SENTENCES
-            if s in default_system_prompt("FinnGenie", tool_names=tools)
+            if s in prompt
         }
         assert emitted == set(_ARM_ROUTING_SENTENCES)
 

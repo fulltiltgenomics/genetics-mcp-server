@@ -30,6 +30,7 @@ dev = [
     # pinned exactly: the seed -> order mapping is not stable across versions, so an
     # unpinned dep would make a seed quoted in a bug report unreproducible
     "pytest-randomly==4.1.0",
+    "pytest-xdist==3.8.0",
     "ruff==0.15.12",
     "xlsxwriter==3.2.9",
 ]
@@ -59,7 +60,12 @@ ignore = ["E501", "E402", "E741"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-m 'not integration'"
+# --dist loadfile, not the default loadscope: several files share process-global state
+# (rate_limit._requests, the settings lru_cache) and are written to be ordered within a file.
+# -n 2 rather than -n auto because each worker holds a full app import: four of them
+# exhausted a 16 GB host mid-run. Raising it needs the memory checked, not just the cores.
+# `-n 0` turns it off for a debugging run.
+addopts = "-m 'not integration' -n 2 --dist loadfile"
 markers = [
     "integration: tests requiring a running genetics API server",
 ]

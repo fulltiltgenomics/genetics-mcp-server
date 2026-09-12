@@ -52,6 +52,23 @@ def frame_of(n=25, with_mlog10p=True):
     return sumstats(rows)
 
 
+@pytest.fixture(autouse=True)
+def _offline_lookups(monkeypatch):
+    """Answer the two fetches locuszoom makes on its own, without a service.
+
+    `ld=False, genes=False` turns off the fetches a caller asks for, but the title still
+    resolves the phenotype name and the coding annotation is a second fetch, so every render
+    went out over the network anyway — succeeding against a dev API on :2000 where one is up
+    and timing out where it is not, at ~3s a render either way. Both answers here mean
+    "nothing to add", which is the shape the drawing tests already assume; a test that cares
+    what either lookup returns sets its own over this one.
+    """
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(sdk, "lookup_phenotype_names", lambda *a, **k: pl.DataFrame())
+    monkeypatch.setattr(sdk, "variant_annotation", lambda *a, **k: pl.DataFrame())
+
+
 def test_locuszoom_writes_a_figure_and_reports_what_it_drew(tmp_path):
     out = tmp_path / "lz.png"
     result = plots.locuszoom(

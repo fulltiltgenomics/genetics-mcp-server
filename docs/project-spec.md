@@ -2773,7 +2773,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | Test file | Coverage |
 |-----------|----------|
 | `test_mcp_server.py` | MCP server initialization and tool registration |
-| `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration |
+| `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration. Every test in the file runs against a stubbed `stream_chat` on the real service singleton, so none reaches a provider even where an API key is configured; the two client handles are stubbed with it, and the tool-introspection endpoints still get the real object |
 | `test_tools.py` | Tool executor methods |
 | `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still coerces to the no-code surface but logs a WARNING naming the value, what it resolved to and the recognised set, once per distinct value and bounded; `KNOWN_TOOL_PROFILES` is pinned against a literal so changing the accepted set forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts`, and the collapse of the legacy names onto the no-code surface is asserted rather than assumed |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
@@ -2817,7 +2817,14 @@ Run tests:
 ```bash
 pytest
 pytest --cov=src/genetics_mcp_server  # with coverage
+pytest -n 0                           # single process, for a readable failure
 ```
+
+The suite runs on two xdist workers by default (`addopts` in `pyproject.toml`). The split is
+`--dist loadfile` rather than the default `loadscope` because several files share
+process-global state — `rate_limit._requests`, the `get_settings` cache — and are written to
+be ordered within a file, so a whole file has to land on one worker. Two rather than `auto`
+because each worker holds a full app import: four exhausted a 16 GB host mid-run.
 
 `pytest-randomly` (pinned to 4.1.0 in the `dev` extra) shuffles test order on every run, so
 order-dependent state leaking between tests fails visibly instead of hiding behind the
