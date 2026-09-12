@@ -957,6 +957,7 @@ class TestPromptVariants:
 # ---------------------------------------------------------------------------
 
 _OTHER_VARIANTS = sorted(set(PROMPT_VARIANTS) - {DEFAULT_PROMPT_VARIANT})
+_ALL_VARIANTS = sorted(PROMPT_VARIANTS)
 
 
 @pytest.mark.skipif(not _OTHER_VARIANTS, reason="only the default variant is registered")
@@ -1029,7 +1030,7 @@ class TestAlphaGenomeOptIn:
 
     TOOL = "get_alphagenome_variant_predictions"
 
-    # the four things the block must say, in the order it says them
+    # what the block must say, in the order it says it
     RULES = [
         "Call it only when the user has asked for it",
         "the user names AlphaGenome",
@@ -1041,15 +1042,24 @@ class TestAlphaGenomeOptIn:
         "the labelling matters MORE, not less",
     ]
 
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
     @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
-    def test_the_block_reaches_every_surface_that_has_the_tool(self, profile):
+    def test_the_block_reaches_every_surface_that_has_the_tool(self, profile, variant):
+        """Every registered variant, not only the served one.
+
+        The block was first written into `legacy` while `condensed` was already the
+        default, so the feature's only guard reached no deployment at all. The guidance IS
+        the feature: a variant that carries the tools without it is broken however good
+        its prose is, and either block tuple can drift from the other silently.
+        """
         available = resolve(profile, subagents=False)
         assert self.TOOL in available, "sdk_replaceable False puts it on both surfaces"
-        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
         for rule in self.RULES:
-            assert rule in prompt, f"{profile} lost: {rule!r}"
+            assert rule in prompt, f"{variant}/{profile} lost: {rule!r}"
 
-    def test_the_block_goes_when_the_key_is_unset(self):
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_block_goes_when_the_key_is_unset(self, variant):
         """Both halves of the gate, exercised end to end.
 
         The block self-gates on the tool NAME, and `Settings.disabled_tools` withdraws the
@@ -1060,20 +1070,27 @@ class TestAlphaGenomeOptIn:
         """
         with_key = resolve(None, subagents=False, alphagenome=True)
         assert self.TOOL in with_key
-        assert "AlphaGenome" in default_system_prompt("FinnGenie", tool_names=with_key)
+        assert "AlphaGenome" in default_system_prompt(
+            "FinnGenie", tool_names=with_key, variant=variant
+        )
 
         without_key = resolve(None, subagents=False, alphagenome=False)
         assert self.TOOL not in without_key
-        assert "AlphaGenome" not in default_system_prompt("FinnGenie", tool_names=without_key)
+        assert "AlphaGenome" not in default_system_prompt(
+            "FinnGenie", tool_names=without_key, variant=variant
+        )
 
-    def test_the_block_goes_when_the_flag_is_off_even_with_a_key(self):
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_block_goes_when_the_flag_is_off_even_with_a_key(self, variant):
         """The flag is the deployment's intent and gates independently of the key: a
         deployment that leaves ALPHAGENOME_ENABLED off must not advertise the tool or its
         prompt block even if a key was ever seeded there."""
         disabled = Settings(alphagenome_enabled=False, alphagenome_api_key="test-key").disabled_tools
         available = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
         assert self.TOOL not in available
-        assert "AlphaGenome" not in default_system_prompt("FinnGenie", tool_names=available)
+        assert "AlphaGenome" not in default_system_prompt(
+            "FinnGenie", tool_names=available, variant=variant
+        )
 
     def test_the_gate_reads_both_the_flag_and_the_key(self):
         """Three of the four combinations withhold the tool; only flag-on with a

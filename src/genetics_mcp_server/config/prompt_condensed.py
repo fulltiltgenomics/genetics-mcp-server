@@ -293,6 +293,23 @@ Whether a variant has *regulatory* function is a different question from its con
 
 Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exist.
 """),
+    # The opt-in is the whole enforcement mechanism — there is no per-user setting and no
+    # UI toggle behind it, the user was told plainly that this is persuasion — so this
+    # block is the feature, not commentary on it. Condensed from the `legacy` wording;
+    # `legacy` is the measured baseline and is not reworded to match. Self-gates on both
+    # tool names, which ship and retire together under ALPHAGENOME_ENABLED.
+    _Block("""
+### AlphaGenome variant predictions (opt-in)
+
+`get_alphagenome_variant_predictions` returns MODEL PREDICTIONS from AlphaGenome (Google DeepMind): what a deep-learning model predicts a variant does to chromatin accessibility, binding, transcription and splicing. Not measurements, not FinnGen results, nothing in them was observed in a person — so every number taken from them is labelled as predicted wherever it appears in an answer. `compare_alphagenome_with_measured` sets that prediction beside this suite's OWN measured effect sizes for the same variant, with their concordance; same opt-in, same labelling duty.
+
+**Call it only when the user has asked for it.** Three things count as asking: the user names AlphaGenome; the user asks for a model prediction of a variant's regulatory effect; or the user asks how a measured value in this suite compares with what a model predicts for the same variant — that comparison is a first-class use of the tool, not a workaround.
+
+- Do NOT call it as background enrichment, and do not add a prediction to an answer that did not ask for one. "What does this variant do?", "tell me about rs...", "is this variant causal?", "why is this locus associated?" are NOT requests for AlphaGenome — answer those from this suite's own measured and fine-mapped data
+- Finding nothing in this suite's data is not a reason either, and neither is the comparison tool: it is an additional source of evidence, not a fallback for gaps. Say the data is silent; you may OFFER a prediction in one line and then wait to be asked
+- Carry the per-modality `validation` block into the answer: `quantity: "magnitude"` means the direction is not reported and you must not state one; `status: "unvalidated"` means the modality was never checked against anything measured here; `population_rho` is a cohort-level correlation for the modality and never a confidence for the variant in hand
+- Presented side by side, the labelling matters MORE, not less: every predicted number named as predicted, every measured number sourced, the two never merged or averaged into one figure, and disagreement stated as disagreement
+"""),
     _Block("""
 ### HLA / the MHC region
 
