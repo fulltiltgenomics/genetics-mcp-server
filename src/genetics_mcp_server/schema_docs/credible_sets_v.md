@@ -4,14 +4,20 @@
 # credible_sets_v
 
 Fine-mapped credible sets with variant-level posterior inclusion probabilities (PIP).
-Contains GWAS, eQTL, pQTL, sQTL, caQTL results across multiple resources. NOTE ON caQTL: for
-data_type = 'caQTL' the trait is a chromatin ACCESSIBILITY PEAK (e.g.
-chr5-35863122-35863905), never a gene symbol, so a gene-based caQTL question is NOT
-answerable from this table alone. Join peak_to_gene_v on peak_id = trait (and cell_type =
-cell_type for the cell-type-matched answer) to get the genes each peak is linked to — see
-the peak_to_gene_v examples. Do NOT approximate the link by comparing peak and gene
-coordinates: linked peaks sit up to ~1 Mb from the gene and most peaks near a gene are not
-linked to it.
+Contains GWAS, eQTL, pQTL, sQTL, caQTL and metaboQTL results across multiple resources. NOTE
+ON metaboQTL: the trait is a Nightingale NMR biomarker code (Total_C, XXL_VLDL_P, S_HDL_TG,
+bOHbutyrate), not a gene and not a disease endpoint; resolve a code to its name through
+phenotypes_v rather than reading it. beta is in trait standard deviations because the
+biomarkers are inverse-normal transformed, so it is not comparable with a GWAS log-odds, and
+for the nmr_meta resource beta, se and mlog10p are NULL on 5,004 rows whose z-score
+overflowed in the source — among them strong lipid signals such as APOE, so a MAX(mlog10p)
+ranking silently drops some of the top hits; rank by pip. NOTE ON caQTL: for data_type =
+'caQTL' the trait is a chromatin ACCESSIBILITY PEAK (e.g. chr5-35863122-35863905), never a
+gene symbol, so a gene-based caQTL question is NOT answerable from this table alone. Join
+peak_to_gene_v on peak_id = trait (and cell_type = cell_type for the cell-type-matched
+answer) to get the genes each peak is linked to — see the peak_to_gene_v examples. Do NOT
+approximate the link by comparing peak and gene coordinates: linked peaks sit up to ~1 Mb
+from the gene and most peaks near a gene are not linked to it.
 
 ## Columns
 
@@ -19,7 +25,7 @@ linked to it.
 | --- | --- | --- |
 | `dataset` | `STRING` | Specific study/release name within a resource (e.g. FinnGen_R13, BipEx2) |
 | `data_type` | `STRING` | Type of association: GWAS, eQTL, pQTL, sQTL, caQTL, or metaboQTL |
-| `trait` | `STRING` | Trait/phenotype name. For caQTL this is the peak id (chr-start-end), not a gene — join peak_to_gene_v to reach genes |
+| `trait` | `STRING` | Trait/phenotype name. For caQTL this is the peak id (chr-start-end), not a gene — join peak_to_gene_v to reach genes. For metaboQTL it is a Nightingale NMR biomarker code (Total_C, XXL_VLDL_P), not a gene |
 | `trait_original` | `STRING` | Original trait name in the respective dataset, e.g. phenotype code |
 | `cell_type` | `STRING` | Cell type or tissue context (for QTL data) |
 | `chr` | `INT64` | Chromosome number |
