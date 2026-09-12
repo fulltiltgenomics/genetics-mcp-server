@@ -27,6 +27,7 @@ their own block (see the routing arbitration below).
 import re
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 from genetics_mcp_server import schema_docs
 
@@ -796,11 +797,18 @@ def known_tool_names() -> frozenset[str]:
     return _known_tool_names_cache
 
 
+@lru_cache(maxsize=None)
 def tools_named_in(text: str) -> frozenset[str]:
     """Tool names mentioned in a piece of prompt text.
 
     Word-boundary matching, so `get_credible_sets_by_gene` does not also count as a
     mention of a hypothetical `get_credible_sets`.
+
+    Cached because this is one regex pass per known tool name over the block, and
+    `_assemble` re-runs it for every block on every prompt build — uncached that was 0.32s
+    of every chat request. The key is the text, so the cache holds one entry per prompt
+    block; it goes wrong only if the tool set can change within a process, which is the
+    same assumption `known_tool_names` already makes by caching in a module global.
     """
     return frozenset(n for n in known_tool_names() if re.search(rf"(?<![\w]){re.escape(n)}\b", text))
 
