@@ -32,14 +32,7 @@ filter by resource, not dataset.
 | `version` | `STRING` | Data release version |
 | `resource` | `STRING` | Data source identifier (lowercase). Always filter by this column, not dataset |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -50,8 +43,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against variant_effect_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against variant_effect_v as written.
 
 ### Predicted accessibility effect of a variant per cell type
 

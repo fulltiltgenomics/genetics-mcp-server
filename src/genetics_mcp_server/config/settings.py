@@ -119,6 +119,15 @@ class Settings:
         default_factory=lambda: os.environ.get("APP_NAME", "FinnGenie")
     )
 
+    # which named system-prompt variant this deployment serves (config.defaults
+    # PROMPT_VARIANTS). Deployment-side and never per-request, so a prompt A/B runs as two
+    # processes of ONE build that differ only in this value — nothing else can confound the
+    # comparison. Empty, or a name this build does not define, serves the default variant
+    # and logs a warning; /chat/v1/tools/resolved reports what was actually resolved.
+    prompt_variant: str = field(
+        default_factory=lambda: os.environ.get("PROMPT_VARIANT", "").strip()
+    )
+
     # LLM defaults
     default_provider: str = "anthropic"
     default_model: str = field(

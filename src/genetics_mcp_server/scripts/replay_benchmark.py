@@ -48,8 +48,10 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
+import urllib.parse
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -83,6 +85,58 @@ CODE_EXECUTION_TOOL = "run_analysis"
 # surface like every value except "code", so pairing it with `nocode` is two names for one
 # surface and the identical-surface guard below refuses the run.
 ALL_TOOLS_ARM = "all"
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One side of the comparison: a tool surface, on a server, under a prompt.
+
+    Two arms used to differ only in `profile`, because one server served one prompt and
+    the surface was the only thing an arm could move. A prompt rewrite is not measurable
+    that way: the prompt is assembled server-side and a request may not supply one, so the
+    candidate prompt has to come from a second PROCESS — same build, same dataset, same
+    tool resolution, PROMPT_VARIANT set to the candidate.
+
+    `label` is what the reports, the pairing and the judge key on, and it stays the bare
+    profile name when no URL is given, so every existing invocation reports exactly as it
+    did. `variant` is filled in by the preflight from the server's own answer, never from
+    the command line: what a caller MEANT to point at is not evidence of what it got.
+    """
+
+    label: str
+    profile: str
+    base_url: str
+    variant: str | None = None
+
+    @property
+    def tool_profile(self) -> str | None:
+        """The wire value. `all` is how a caller spells `tool_profile: null`."""
+        return None if self.profile == ALL_TOOLS_ARM else self.profile
+
+
+def parse_arm(spec: str, default_base_url: str) -> Arm:
+    """Parse `[LABEL=]PROFILE[@URL]`.
+
+    The label is optional because the common case has one server and needs no
+    disambiguation. It becomes necessary the moment two arms share a profile — which is
+    exactly the prompt A/B — so when a URL is given without a label, the label carries the
+    host:port rather than colliding with the other arm's.
+    """
+    label = None
+    head, eq, tail = spec.partition("=")
+    if eq and "@" not in head:
+        # an "=" inside the URL (a query string) is not a label separator
+        label, spec = head, tail
+    profile, sep, url = spec.partition("@")
+    profile = profile.strip()
+    base_url = (url.strip() if sep else default_base_url).rstrip("/")
+    if not profile:
+        raise ValueError(f"arm spec {spec!r} names no tool profile")
+    if not label:
+        # a URL with no label means two arms could both be called "code"; the netloc is
+        # the only thing that distinguishes them without asking the servers first
+        label = profile if not sep else f"{profile}@{urllib.parse.urlsplit(base_url).netloc}"
+    return Arm(label=label.strip(), profile=profile, base_url=base_url)
 
 REPORTED_PERCENTILES = (25, 50, 75, 90, 95)
 
@@ -647,10 +701,9 @@ def _derive_iteration_timing(
 
 async def replay_turn(
     client: httpx.AsyncClient,
-    base_url: str,
     messages: list[dict[str, Any]],
     options: dict[str, Any],
-    arm: str,
+    arm: Arm,
     case_id: str,
     arm_position: int,
     turn_index: int,
@@ -677,7 +730,7 @@ async def replay_turn(
 
     record = TurnRecord(
         case_id=case_id,
-        arm=arm,
+        arm=arm.label,
         arm_position=arm_position,
         turn_index=turn_index,
         status="incomplete",
@@ -690,8 +743,10 @@ async def replay_turn(
         "secret": True,
         "session_id": session_id,
         "enable_tools": True,
-        # the arm IS the tool_profile; the recorded value is deliberately discarded
-        "tool_profile": None if arm == ALL_TOOLS_ARM else arm,
+        # the arm CARRIES the tool_profile; the dataset's recorded value is deliberately
+        # discarded. Two arms may now share a profile and differ only in which server —
+        # and so which prompt variant — they run against.
+        "tool_profile": arm.tool_profile,
         "verbosity": options.get("verbosity"),
         "instruction_set_id": options.get("instruction_set_id"),
         "literature_backend": options.get("literature_backend"),
@@ -729,7 +784,7 @@ async def replay_turn(
         # is the wall-clock deadline the --timeout flag actually promises.
         async with asyncio.timeout(timeout):
             async with client.stream(
-                "POST", f"{base_url}{CHAT_PATH}", json=body, timeout=timeout
+                "POST", f"{arm.base_url}{CHAT_PATH}", json=body, timeout=timeout
             ) as response:
                 if response.status_code != 200:
                     await response.aread()
@@ -986,9 +1041,8 @@ async def replay_turn(
 
 async def replay_case_arm(
     client: httpx.AsyncClient,
-    base_url: str,
     case: dict[str, Any],
-    arm: str,
+    arm: Arm,
     arm_position: int,
     run_id: str,
     model: str | None,
@@ -1003,7 +1057,10 @@ async def replay_case_arm(
     if max_turns is not None:
         user_turns = user_turns[:max_turns]
 
-    session_id = f"replay-{run_id}-{case_id[:8]}-{arm}"
+    # a label may carry a host:port when two arms share a profile, and a session id is a
+    # path-ish identifier the server stores — keep it to the characters it always had
+    safe_label = re.sub(r"[^A-Za-z0-9_-]", "-", arm.label)
+    session_id = f"replay-{run_id}-{case_id[:8]}-{safe_label}"
     history: list[dict[str, Any]] = []
     records: list[TurnRecord] = []
     aborted = False
@@ -1015,7 +1072,7 @@ async def replay_case_arm(
             records.append(
                 TurnRecord(
                     case_id=case_id,
-                    arm=arm,
+                    arm=arm.label,
                     arm_position=arm_position,
                     turn_index=turn_index,
                     status="not_attempted",
@@ -1027,7 +1084,6 @@ async def replay_case_arm(
         history.append({"role": "user", "content": turn["content"]})
         record, message_content, tool_results = await replay_turn(
             client=client,
-            base_url=base_url,
             messages=history,
             options=turn.get("options") or {},
             arm=arm,
@@ -1056,17 +1112,16 @@ async def replay_case_arm(
     return records
 
 
-def arm_order_for_case(arms: tuple[str, ...], case_index: int) -> list[str]:
+def arm_order_for_case(arms: tuple[Arm, ...], case_index: int) -> list[Arm]:
     """The alternating arm order for case i: (a, b) when even, (b, a) when odd."""
     return list(arms) if case_index % 2 == 0 else list(reversed(arms))
 
 
 async def replay_case(
     client: httpx.AsyncClient,
-    base_url: str,
     case: dict[str, Any],
     case_index: int,
-    arms: tuple[str, ...],
+    arms: tuple[Arm, ...],
     run_id: str,
     model: str | None,
     provider: str | None,
@@ -1079,13 +1134,12 @@ async def replay_case(
     result = CaseResult(
         case_id=str(case.get("session_id") or "unknown"),
         topic=case.get("topic"),
-        arm_order=order,
+        arm_order=[a.label for a in order],
     )
     for position, arm in enumerate(order):
         result.turns.extend(
             await replay_case_arm(
                 client=client,
-                base_url=base_url,
                 case=case,
                 arm=arm,
                 arm_position=position,
@@ -1307,11 +1361,11 @@ class RateLimitedError(RuntimeError):
 
 
 async def resolve_arm_tools(
-    client: httpx.AsyncClient, base_url: str, arms: tuple[str, ...]
+    client: httpx.AsyncClient, arms: tuple[Arm, ...]
 ) -> dict[str, Any]:
-    """Ask the SERVER what each arm actually resolves to, before spending anything.
+    """Ask each arm's OWN SERVER what that arm actually resolves to, before spending.
 
-    Three things this prevents, each of which produces a run that looks fine and means
+    Four things this prevents, each of which produces a run that looks fine and means
     nothing:
 
     1. A MISSPELLED ARM. `code_execution_requested` coerces an unrecognised profile to the
@@ -1330,15 +1384,23 @@ async def resolve_arm_tools(
        an iteration force-calling a tool it had not been given. The boolean makes the check
        exact in both directions: the `code` arm must resolve WITH the code-execution tool
        and any other arm WITHOUT it, and an arm on the wrong side of that is fatal.
-    3. TWO ARMS THAT ARE ONE SURFACE (paired runs only; a single-arm run has no pair). Since the profile names collapsed onto two surfaces,
-       every legacy value except `code` resolves to the same tools, so a pair like
-       `all`/`bigquery` compares a surface against itself and reports a difference of zero
-       that reads as a real result. Identical resolved name sets are fatal for the same
-       reason a misspelling is.
+    3. TWO ARMS THAT ARE ONE SURFACE, on one server (paired runs only; a single-arm run has
+       no pair). Since the profile names collapsed onto two surfaces, every legacy value
+       except `code` resolves to the same tools, so a pair like `all`/`bigquery` compares a
+       surface against itself and reports a difference of zero that reads as a real result.
+    4. TWO ARMS THAT ARE ONE PROMPT, on two servers. When the arms sit on different base
+       URLs the comparison is a prompt A/B, and then identical tool sets are the POINT —
+       guard 3 would refuse the very run this supports. What must differ instead is the
+       resolved `prompt_variant`, and two processes both serving the default (the usual
+       cause: a typo in PROMPT_VARIANT, which coerces rather than raising) is exactly the
+       same failure as guard 3 wearing different clothes. A build too old to report the
+       field cannot be checked; that is a warning, because the run is still valid and the
+       alternative is refusing to work with any server that predates this.
 
-    The resolved counts and names are recorded in the report so a saved run PROVES what each
-    arm was given, rather than leaving it to be re-derived later from a tree that has since
-    moved. `count` is local tools only; external and RAG surfaces resolve separately.
+    The resolved counts, names and variant are recorded in the report so a saved run PROVES
+    what each arm was given, rather than leaving it to be re-derived later from a tree that
+    has since moved. `count` is local tools only; external and RAG surfaces resolve
+    separately.
 
     A server without the endpoint (older build) is a WARNING, not a failure — the run is
     still valid, it just cannot carry the proof. Silence would be the wrong trade in the
@@ -1347,47 +1409,71 @@ async def resolve_arm_tools(
     out: dict[str, Any] = {}
     unknown: list[str] = []
     for arm in arms:
-        params = {} if arm == ALL_TOOLS_ARM else {"tool_profile": arm}
+        params = {} if arm.tool_profile is None else {"tool_profile": arm.tool_profile}
         try:
-            resp = await client.get(f"{base_url}{RESOLVED_TOOLS_PATH}", params=params)
+            resp = await client.get(
+                f"{arm.base_url}{RESOLVED_TOOLS_PATH}", params=params
+            )
         except httpx.HTTPError as exc:
-            logger.warning("could not resolve arm %r against %s: %s", arm, base_url, exc)
-            out[arm] = {"error": str(exc)}
+            logger.warning(
+                "could not resolve arm %r against %s: %s", arm.label, arm.base_url, exc
+            )
+            out[arm.label] = {"base_url": arm.base_url, "error": str(exc)}
             continue
         if resp.status_code == 404:
+            # per-arm, not a whole-run abort: with two base URLs, one old server must not
+            # discard the proof the other one can still give
             logger.warning(
-                "%s has no %s endpoint, so this report cannot record what each arm was "
-                "given. The run is still valid; verify the arms by hand.",
-                base_url,
+                "%s has no %s endpoint, so this report cannot record what arm %r was "
+                "given. The run is still valid; verify the arm by hand.",
+                arm.base_url,
                 RESOLVED_TOOLS_PATH,
+                arm.label,
             )
-            return {"unavailable": f"{base_url} has no {RESOLVED_TOOLS_PATH}"}
+            out[arm.label] = {
+                "base_url": arm.base_url,
+                "unavailable": f"{arm.base_url} has no {RESOLVED_TOOLS_PATH}",
+            }
+            continue
         if resp.status_code != 200:
-            logger.warning("resolving arm %r returned HTTP %s", arm, resp.status_code)
-            out[arm] = {"error": f"HTTP {resp.status_code}"}
+            logger.warning("resolving arm %r returned HTTP %s", arm.label, resp.status_code)
+            out[arm.label] = {"base_url": arm.base_url, "error": f"HTTP {resp.status_code}"}
             continue
         data = resp.json()
-        out[arm] = {
+        out[arm.label] = {
+            "base_url": arm.base_url,
+            "tool_profile": arm.tool_profile,
             "count": data.get("count"),
             "known_profile": data.get("known_profile"),
             "names": data.get("names"),
+            # None from a build that predates the field, which guard 4 reports as
+            # unprovable rather than treating as a match
+            "prompt_variant": data.get("prompt_variant"),
         }
         if data.get("known_profile") is False:
-            unknown.append(arm)
+            unknown.append(arm.label)
         else:
-            logger.info("arm %r resolves to %s local tools", arm, data.get("count"))
+            logger.info(
+                "arm %r resolves to %s local tools on %s, prompt variant %r",
+                arm.label,
+                data.get("count"),
+                arm.base_url,
+                data.get("prompt_variant"),
+            )
     if unknown:
         detail = ", ".join(
-            f"{arm} (resolved to {out[arm].get('count')} local tools)" for arm in unknown
+            f"{label} (resolved to {out[label].get('count')} local tools)"
+            for label in unknown
         )
         raise ArmResolutionError(
-            f"{base_url} does not recognise these arm profiles: {detail}. An unrecognised "
-            "profile silently resolves to the no-code surface rather than raising, so this "
-            "run would have measured a surface you did not intend. Check the spelling, and "
-            "check the server has been restarted since the profile was added."
+            f"these arm profiles are not recognised by the server they were sent to: "
+            f"{detail}. An unrecognised profile silently resolves to the no-code surface "
+            "rather than raising, so this run would have measured a surface you did not "
+            "intend. Check the spelling, and check the server has been restarted since the "
+            "profile was added."
         )
     for arm in arms:
-        names = out.get(arm, {}).get("names")
+        names = out.get(arm.label, {}).get("names")
         if not isinstance(names, list):
             # survivable — an unresolved arm does not invalidate the run — but it disables
             # BOTH guards for that arm silently, so say which ones stopped protecting it
@@ -1395,57 +1481,102 @@ async def resolve_arm_tools(
                 "arm %r did not resolve on %s, so neither the %s check nor the "
                 "identical-surface check ran for it. The run is still valid; verify the "
                 "arms by hand.",
-                arm,
-                base_url,
+                arm.label,
+                arm.base_url,
                 CODE_EXECUTION_TOOL,
             )
             continue
-        wants_code = arm == CODE_ARM
+        wants_code = arm.profile == CODE_ARM
         has_code = CODE_EXECUTION_TOOL in names
         if wants_code == has_code:
             continue
         if wants_code:
             raise ArmResolutionError(
-                f"arm {arm!r} resolved to {len(names)} local tools WITHOUT "
-                f"{CODE_EXECUTION_TOOL} on {base_url}, so this run would measure a "
+                f"arm {arm.label!r} resolved to {len(names)} local tools WITHOUT "
+                f"{CODE_EXECUTION_TOOL} on {arm.base_url}, so this run would measure a "
                 "degraded arm and report it as the code arm. The usual cause is the flag "
                 "subtraction, which runs after the surface resolves: SANDBOX_ENABLED must "
                 "be true for chat-api, db-api and results-api, and the sandbox itself has "
                 "to be reachable."
             )
         raise ArmResolutionError(
-            f"arm {arm!r} resolved to {len(names)} local tools INCLUDING "
-            f"{CODE_EXECUTION_TOOL} on {base_url}. Only 'code' selects the code-execution "
-            "surface, so this server predates that collapse and both arms would be able to "
-            "run scripts — which is not the comparison this benchmark makes."
+            f"arm {arm.label!r} resolved to {len(names)} local tools INCLUDING "
+            f"{CODE_EXECUTION_TOOL} on {arm.base_url}. Only 'code' selects the "
+            "code-execution surface, so this server predates that collapse and both arms "
+            "would be able to run scripts — which is not the comparison this benchmark "
+            "makes."
         )
     if len(arms) < 2:
-        # single-arm mode: there is no second surface to be identical to. The `none`
+        # single-arm mode: there is no second arm to be identical to. The `none`
         # sentinel is resolved to a one-arm tuple by main() and never reaches here, so an
         # arm name is always a name the server was asked about.
         return out
     arm_a, arm_b = arms
-    names_a = out.get(arm_a, {}).get("names")
-    names_b = out.get(arm_b, {}).get("names")
-    if (
+    info_a = out.get(arm_a.label, {})
+    info_b = out.get(arm_b.label, {})
+    names_a = info_a.get("names")
+    names_b = info_b.get("names")
+    same_tools = (
         isinstance(names_a, list)
         and isinstance(names_b, list)
         and set(names_a) == set(names_b)
-    ):
+    )
+    if arm_a.base_url == arm_b.base_url:
+        if same_tools:
+            raise ArmResolutionError(
+                f"arms {arm_a.label!r} and {arm_b.label!r} both resolve to the same "
+                f"{len(set(names_a))} local tools on {arm_a.base_url}, so this run would "
+                "compare a surface against itself and report a difference of zero that "
+                "reads as a real result. Every profile name except 'code' now selects the "
+                "no-code surface, so pick arms that straddle that line — or point one arm "
+                "at a second server to compare prompt variants instead."
+            )
+        return out
+    # two servers: the comparison is the PROMPT, so identical tools are expected and the
+    # variant is what has to differ
+    variant_a = info_a.get("prompt_variant")
+    variant_b = info_b.get("prompt_variant")
+    if variant_a is None or variant_b is None:
+        logger.warning(
+            "arm %r reports prompt variant %r and arm %r reports %r; a None is a server "
+            "too old to report the field, so this run CANNOT prove its two arms served "
+            "different prompts. Verify PROMPT_VARIANT on both by hand.",
+            arm_a.label,
+            variant_a,
+            arm_b.label,
+            variant_b,
+        )
+        return out
+    if variant_a == variant_b:
         raise ArmResolutionError(
-            f"arms {arm_a!r} and {arm_b!r} both resolve to the same {len(set(names_a))} "
-            f"local tools on {base_url}, so this run would compare a surface against "
-            "itself and report a difference of zero that reads as a real result. Every "
-            "profile name except 'code' now selects the no-code surface, so pick arms "
-            "that straddle that line."
+            f"arms {arm_a.label!r} ({arm_a.base_url}) and {arm_b.label!r} "
+            f"({arm_b.base_url}) are different servers both serving prompt variant "
+            f"{variant_a!r}, so this run would compare a prompt against itself and report "
+            "a difference of zero that reads as a real result. PROMPT_VARIANT coerces an "
+            "unknown name to the default rather than raising, so the usual cause is a typo "
+            "in it on one of the two processes — check each server's startup warnings."
+        )
+    if not same_tools:
+        # not fatal: comparing two prompts on two surfaces is a legitimate thing to ask
+        # for, but it is not the comparison the flags imply, and nothing else would say so
+        logger.warning(
+            "arms %r and %r differ in BOTH prompt variant (%r vs %r) and resolved tools "
+            "(%s vs %s), so a difference in the results cannot be attributed to the "
+            "prompt alone.",
+            arm_a.label,
+            arm_b.label,
+            variant_a,
+            variant_b,
+            len(set(names_a)) if isinstance(names_a, list) else "?",
+            len(set(names_b)) if isinstance(names_b, list) else "?",
         )
     return out
 
 
-async def _dry_run_resolve(base_url: str, arms: tuple[str, ...]) -> dict[str, Any]:
+async def _dry_run_resolve(arms: tuple[Arm, ...]) -> dict[str, Any]:
     """resolve_arm_tools with its own short-lived client, for the --dry-run path."""
     async with httpx.AsyncClient(timeout=30.0) as client:
-        return await resolve_arm_tools(client, base_url, arms)
+        return await resolve_arm_tools(client, arms)
 
 
 def build_report(
@@ -1615,6 +1746,13 @@ def format_summary(report: dict[str, Any]) -> str:
     lines.append("PAIRED REPLAY BENCHMARK")
     lines.append("=" * 78)
     lines.append(f"target      : {cfg['base_url']}")
+    for spec in cfg.get("arms") or []:
+        resolved = (cfg.get("arm_tools") or {}).get(spec["label"]) or {}
+        variant = resolved.get("prompt_variant")
+        lines.append(
+            f"  arm {spec['label']:<18} profile={spec['tool_profile']!r} "
+            f"variant={variant!r} {spec['base_url']}"
+        )
     lines.append(f"dataset     : {cfg['dataset']}")
     lines.append(f"model       : {cfg['model'] or 'server default (cost NOT priced)'}")
     lines.append(f"provider    : {cfg.get('provider') or 'server default'}")
@@ -1739,7 +1877,7 @@ def load_cases(dataset: Path, limit: int | None) -> list[dict[str, Any]]:
 async def run_benchmark(
     dataset: Path,
     base_url: str,
-    arms: tuple[str, ...],
+    arms: tuple[Arm | str, ...],
     limit: int | None,
     concurrency: int,
     model: str | None,
@@ -1749,20 +1887,24 @@ async def run_benchmark(
     provider: str | None = None,
     capture_thinking: bool = False,
 ) -> dict[str, Any]:
+    # a bare profile name means what it has always meant: that surface, on --base-url.
+    # Coercing here rather than demanding Arms keeps one definition of what a bare name
+    # resolves to, and keeps every caller that predates the prompt-variant dimension
+    # working unchanged.
+    arms = tuple(a if isinstance(a, Arm) else parse_arm(a, base_url) for a in arms)
     cases = load_cases(dataset, limit)
     run_id = uuid.uuid4().hex[:8]
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async with httpx.AsyncClient(headers=headers, timeout=timeout) as client:
-        arm_tools = await resolve_arm_tools(client, base_url, arms)
+        arm_tools = await resolve_arm_tools(client, arms)
 
         async def guarded(index: int, case: dict[str, Any]) -> CaseResult:
             # the semaphore is held for the WHOLE case so both arms stay adjacent in time
             async with semaphore:
                 return await replay_case(
                     client=client,
-                    base_url=base_url,
                     case=case,
                     case_index=index,
                     arms=arms,
@@ -1789,14 +1931,14 @@ async def run_benchmark(
                 CaseResult(
                     case_id=case_id,
                     topic=case.get("topic"),
-                    arm_order=order,
+                    arm_order=[a.label for a in order],
                     # one record per (arm, turn): collapsing a 6-turn case into two
                     # turn_index=0 records would under-report turns_attempted by 10 and
                     # hide the loss from the per-status table
                     turns=[
                         TurnRecord(
                             case_id=case_id,
-                            arm=arm,
+                            arm=arm.label,
                             arm_position=pos,
                             turn_index=turn_index,
                             status="error",
@@ -1812,10 +1954,16 @@ async def run_benchmark(
 
     return build_report(
         cases_out,
-        arms,
+        tuple(a.label for a in arms),
         {
             "dataset": str(dataset),
+            # the per-arm URL is in `arms` below; this stays the run's default target, which
+            # is what every single-server run has always reported here
             "base_url": base_url,
+            "arms": [
+                {"label": a.label, "tool_profile": a.tool_profile, "base_url": a.base_url}
+                for a in arms
+            ],
             "run_id": run_id,
             "model": model,
             "provider": provider,
@@ -1851,15 +1999,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arm-a",
         default=NOCODE_ARM,
-        help=f"tool_profile for arm A, the baseline (default {NOCODE_ARM!r}; "
-        f"'{ALL_TOOLS_ARM}' spells tool_profile: null, which is the same surface)",
+        help=f"arm A, the baseline, as [LABEL=]PROFILE[@URL] (default {NOCODE_ARM!r}; "
+        f"'{ALL_TOOLS_ARM}' spells tool_profile: null, which is the same surface). With no "
+        "@URL the arm runs against --base-url, which is every single-server run",
     )
     parser.add_argument(
         "--arm-b",
         default=CODE_ARM,
-        help=f"tool_profile for arm B, the candidate (default {CODE_ARM!r}; it is the only "
+        help=f"arm B, the candidate, same syntax (default {CODE_ARM!r}; it is the only "
         "value that selects the code-execution surface), or 'none' to run arm A alone "
-        "(no pairing, no judging)",
+        "(no pairing, no judging). To compare two SYSTEM PROMPTS rather than two tool "
+        "surfaces, give both arms the same profile on different servers started with "
+        "different PROMPT_VARIANT values — e.g. --arm-a "
+        "'legacy=code@http://localhost:8000' --arm-b 'condensed=code@http://localhost:8001'. "
+        "The preflight refuses the run if the two servers report the same variant",
     )
     parser.add_argument("--limit", type=int, default=None, help="max cases to replay")
     parser.add_argument("--max-turns", type=int, default=None, help="max user turns per case")
@@ -1923,14 +2076,28 @@ def main(argv: list[str] | None = None) -> int:
     # nothing to compare, so QUALITY IS NOT MEASURED AT ALL. Use it to see whether a change
     # moved the mechanics; use the paired run to decide a rollout.
     single_arm = str(args.arm_b).lower() in ("", "none")
-    if not single_arm and args.arm_a == args.arm_b:
-        print("arm-a and arm-b must differ (use --arm-b none to run one arm)", file=sys.stderr)
+    default_base_url = args.base_url.rstrip("/")
+    try:
+        arm_a = parse_arm(args.arm_a, default_base_url)
+        arm_b = None if single_arm else parse_arm(args.arm_b, default_base_url)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if arm_b is not None and arm_a.label == arm_b.label:
+        # two arms that differ only in URL get host:port labels from `parse_arm`, so an
+        # equal label here means the specs really are the same arm
+        print(
+            "arm-a and arm-b must differ (use --arm-b none to run one arm). To compare two "
+            "prompt variants, give each arm its own server: "
+            "--arm-a 'code@http://localhost:8000' --arm-b 'code@http://localhost:8001'",
+            file=sys.stderr,
+        )
         return 2
     if not args.dataset.exists():
         print(f"dataset not found: {args.dataset}", file=sys.stderr)
         return 2
 
-    arms = (args.arm_a,) if single_arm else (args.arm_a, args.arm_b)
+    arms = (arm_a,) if arm_b is None else (arm_a, arm_b)
 
     if args.model and not has_pricing(args.model):
         print(
@@ -1949,21 +2116,29 @@ def main(argv: list[str] | None = None) -> int:
             len((c.get("user_turns") or [])[: args.max_turns]) for c in cases
         )
         print(f"{len(cases)} cases, {turns} turns per arm, {turns * len(arms)} model turns total")
-        print(f"arms: {' vs '.join(arms)}   target: {args.base_url}")
+        print(f"arms: {' vs '.join(a.label for a in arms)}")
+        for a in arms:
+            print(f"  {a.label:>20}  tool_profile={a.tool_profile!r}  {a.base_url}")
         # the cheapest place a misspelled arm can possibly be caught, so catch it here too
         # rather than only in the paid path. Reaches the server but spends nothing.
         try:
-            resolved = asyncio.run(_dry_run_resolve(args.base_url.rstrip("/"), arms))
+            resolved = asyncio.run(_dry_run_resolve(arms))
         except ArmResolutionError as exc:
             print(f"\nERROR: {exc}", file=sys.stderr)
             return 2
         for arm in arms:
-            info = resolved.get(arm) or {}
+            info = resolved.get(arm.label) or {}
             if "count" in info:
-                print(f"  {arm:>8} resolves to {info['count']} local tools")
+                print(
+                    f"  {arm.label:>20} resolves to {info['count']} local tools, "
+                    f"prompt variant {info.get('prompt_variant')!r}"
+                )
         for i, c in enumerate(cases):
             order = arm_order_for_case(arms, i)
-            print(f"  {i:>3} {c.get('session_id')} order={','.join(order)}")
+            print(
+                f"  {i:>3} {c.get('session_id')} "
+                f"order={','.join(a.label for a in order)}"
+            )
         if args.judge:
             # the ceiling: every turn matching on both arms. Turns that fail on one arm are
             # not judged, so the real pair count can only be lower — an over-estimate is the
@@ -1978,7 +2153,7 @@ def main(argv: list[str] | None = None) -> int:
         report = asyncio.run(
             run_benchmark(
                 dataset=args.dataset,
-                base_url=args.base_url.rstrip("/"),
+                base_url=default_base_url,
                 arms=arms,
                 limit=args.limit,
                 concurrency=args.concurrency,

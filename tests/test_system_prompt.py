@@ -19,6 +19,8 @@ import pytest
 
 from genetics_mcp_server.config.defaults import (
     _SUMMARIZE_PARAM_TOOLS,
+    DEFAULT_PROMPT_VARIANT,
+    PROMPT_VARIANTS,
     _assemble,
     _Block,
     default_system_prompt,
@@ -420,20 +422,26 @@ _SHARED_TAIL = [
 # The no-code surface, which is what every profile value except "code" resolves to since
 # the collapse — so the four legacy names and None are pinned to the same list, and that
 # sameness is the collapse itself rather than a coincidence to tidy away.
-_NOCODE_HEADINGS = [
-    "## Core Principles",
-    "## Analyzing data",
-    "## Tool Usage Guidelines",
-    "### Mouse Model Evidence (search_mgi)",
-    "## Variant Annotation Sources",
+_DOMAIN_SECTIONS = [
+    "## Data Domains and Outside Resources",
+    "### Variant Annotation Sources",
     "### Functional / Regulatory Readouts",
     "### HLA / the MHC region",
     "### Dosage sensitivity / rare CNVs",
     "### Protein Annotation (UniProt)",
     "### Drug and Target Evidence (ChEMBL)",
+    "### Mouse Model Evidence (search_mgi)",
+]
+_NOCODE_HEADINGS = [
+    "## Core Principles",
+    "## Analyzing data",
+    "## Tool Usage Guidelines",
+    "## Choosing How to Get Data",
+    "## The Database",
     "## Data Sources and Resource Names",
     "### Pseudo Credible Sets",
-    "## Choosing How to Get Data",
+    "### Credible Set Membership",
+    *_DOMAIN_SECTIONS,
     *_SHARED_TAIL,
 ]
 _EXPECTED_HEADINGS = {
@@ -443,22 +451,11 @@ _EXPECTED_HEADINGS = {
     "rag": _NOCODE_HEADINGS,
     "nocode": _NOCODE_HEADINGS,
     # the code surface keeps every outside-resource section — those are the tools a script
-    # cannot reach — and loses "## Variant Annotation Sources", whose internal annotation
-    # tools the SDK stands in for.
+    # cannot reach — and loses "### Variant Annotation Sources", whose internal annotation
+    # tools the SDK stands in for. That section is an H3 under an H2 that survives, which is
+    # the point of the reorganisation: as an H2 it took five H3s with it when it dropped.
     "code": [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
-        "### Mouse Model Evidence (search_mgi)",
-        "### Functional / Regulatory Readouts",
-        "### HLA / the MHC region",
-        "### Dosage sensitivity / rare CNVs",
-        "### Protein Annotation (UniProt)",
-        "### Drug and Target Evidence (ChEMBL)",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        "## Choosing How to Get Data",
-        *_SHARED_TAIL,
+        *[h for h in _NOCODE_HEADINGS if h != "### Variant Annotation Sources"],
     ],
 }
 
@@ -475,14 +472,14 @@ _REQUIRED_EVERYWHERE = [
     "PIPs from pseudo credible sets should be interpreted with more caution",
 ]
 # these presuppose a path to credible-set / MHC rows, which `rag` does not have; the
-# narrowing bullet rides the same data-path gate and cites the re-query rule by position,
+# narrowing bullet rides the same data-path gate and reconciles itself with the re-query rule,
 # so the two have to survive together
 _REQUIRED_WITH_A_DATA_PATH = [
     "**Membership is NOT the same as LD.**",
     "in partial LD with the lead",
     "**Re-query; do not answer from memory.**",
     "**A follow-up that narrows an earlier result re-runs that retrieval with the filter added.**",
-    "IS the fresh authoritative call the rule above asks for",
+    "IS the fresh authoritative call",
     "### HLA / the MHC region",
     "LD across the MHC is so extensive",
     "`pval` underflows to 0",
@@ -827,3 +824,172 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert _ANNOTATION_NO_ROUTE in prompt
         assert _ANNOTATION_DB_PROTEIN_ROUTE not in prompt
         assert _ANNOTATION_SDK_ONLY not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Named prompt variants. A variant selects a block tuple; the per-request tool gate
+# then runs inside it, so a variant changes the text and nothing else.
+# ---------------------------------------------------------------------------
+
+
+class TestPromptVariants:
+    def test_every_variant_is_a_live_tuple_not_a_copy(self):
+        """Registering a copy is how a variant starts drifting from the module it is
+        edited in — the registry has to hold the tuples themselves."""
+        from genetics_mcp_server.config import defaults
+
+        assert defaults.PROMPT_VARIANTS["condensed"] is defaults._CONDENSED_PROMPT_BLOCKS
+        assert defaults.PROMPT_VARIANTS["legacy"] is defaults._PROMPT_BLOCKS
+        assert defaults.DEFAULT_PROMPT_VARIANT == "condensed"
+
+    @pytest.mark.parametrize("configured", [None, "", "   "])
+    def test_an_unset_variant_resolves_to_the_default(self, configured):
+        from genetics_mcp_server.config.defaults import (
+            DEFAULT_PROMPT_VARIANT,
+            resolve_prompt_variant,
+        )
+
+        assert resolve_prompt_variant(configured) == DEFAULT_PROMPT_VARIANT
+
+    def test_an_unknown_variant_coerces_and_warns_rather_than_raising(self, caplog):
+        """A typo in a deployment env var must not take chat down for everyone.
+
+        The cost of coercing is that a benchmark could measure the default twice, which is
+        why replay_benchmark reads the RESOLVED name back off /chat/v1/tools/resolved and
+        refuses a paired run whose arms agree on it.
+        """
+        from genetics_mcp_server.config import defaults
+
+        defaults._warned_unknown_variants.clear()
+        with caplog.at_level("WARNING"):
+            resolved = defaults.resolve_prompt_variant("candidat")
+
+        assert resolved == defaults.DEFAULT_PROMPT_VARIANT
+        assert "candidat" in caplog.text and "tools/resolved" in caplog.text
+
+    def test_the_warning_is_once_per_name_not_once_per_request(self, caplog):
+        from genetics_mcp_server.config import defaults
+
+        defaults._warned_unknown_variants.clear()
+        with caplog.at_level("WARNING"):
+            for _ in range(3):
+                defaults.resolve_prompt_variant("nope")
+
+        assert caplog.text.count("Unrecognised PROMPT_VARIANT") == 1
+
+    def test_a_registered_variant_supplies_the_text(self, monkeypatch):
+        from genetics_mcp_server.config import defaults
+
+        marker = "SENTINEL-BLOCK-TEXT"
+        monkeypatch.setitem(
+            defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block(marker),)
+        )
+
+        assert marker in defaults.default_system_prompt(variant="sentinel")
+        assert marker not in defaults.default_system_prompt()
+
+    def test_the_gate_still_runs_inside_the_selected_variant(self, monkeypatch):
+        """A variant is not an escape hatch from the tool gate — that invariant is what
+        stops the prompt describing a tool the model was not given, and it has to hold in
+        every registered variant, not only the one being served."""
+        from genetics_mcp_server.config import defaults
+
+        monkeypatch.setitem(
+            defaults.PROMPT_VARIANTS,
+            "sentinel",
+            (
+                defaults._Block("ungated text\n"),
+                defaults._Block("call run_analysis for this\n"),
+            ),
+        )
+
+        with_tool = defaults.default_system_prompt(
+            tool_names={"run_analysis"}, variant="sentinel"
+        )
+        without = defaults.default_system_prompt(tool_names=set(), variant="sentinel")
+
+        assert "run_analysis" in with_tool
+        assert "run_analysis" not in without
+        assert "ungated text" in without
+
+    def test_the_persona_substitution_applies_to_every_variant(self, monkeypatch):
+        from genetics_mcp_server.config import defaults
+
+        monkeypatch.setitem(
+            defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block("I am FinnGenie.\n"),)
+        )
+
+        out = defaults.default_system_prompt("Genie", variant="sentinel")
+        assert "I am Genie." in out
+
+
+# ---------------------------------------------------------------------------
+# Whatever else a variant changes, it does not get to change these three. The
+# content pins above are about the prompt actually SERVED; another variant is free
+# to reword any of them. It is not free to name a tool the model was not given, to
+# let a dropped heading reparent the body that followed it, or to emit a heading with
+# nothing under it — those are properties of the assembly, and a variant that
+# breaks one is broken however good its prose is.
+# ---------------------------------------------------------------------------
+
+_OTHER_VARIANTS = sorted(set(PROMPT_VARIANTS) - {DEFAULT_PROMPT_VARIANT})
+
+
+@pytest.mark.skipif(not _OTHER_VARIANTS, reason="only the default variant is registered")
+@pytest.mark.parametrize("variant", _OTHER_VARIANTS)
+class TestEveryVariantHoldsTheStructuralInvariants:
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    @pytest.mark.parametrize("subagents", [True, False], ids=["subagents_on", "subagents_off"])
+    def test_every_tool_named_is_in_the_tool_list(self, variant, profile, subagents):
+        available = resolve(profile, subagents=subagents)
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        assert tool_names_mentioned(prompt) - available == set()
+
+    def test_the_scan_finds_tool_names_at_all(self, variant):
+        """Guards the test above from passing because it detects nothing."""
+        mentioned = tool_names_mentioned(
+            default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL, variant=variant)
+        )
+        assert len(mentioned) > 20
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    @pytest.mark.parametrize("subagents", [True, False], ids=["subagents_on", "subagents_off"])
+    def test_no_body_line_lands_under_a_different_heading(self, variant, profile, subagents):
+        full = _heading_of_each_line(default_system_prompt("FinnGenie", variant=variant))
+        filtered = _heading_of_each_line(
+            default_system_prompt(
+                "FinnGenie", tool_names=resolve(profile, subagents=subagents), variant=variant
+            )
+        )
+        reparented = {
+            line: (heads, full[line])
+            for line, heads in filtered.items()
+            if line in full and not heads <= full[line]
+        }
+        assert reparented == {}
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_no_heading_is_emitted_empty(self, variant, profile):
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve(profile, subagents=False), variant=variant
+        )
+        lines = prompt.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("#"):
+                continue
+            body = [x for x in lines[i + 1 :] if x.strip()]
+            assert body and not body[0].startswith("#"), f"{variant}: empty heading {line!r}"
+
+    def test_the_served_prompt_is_no_larger_than_any_variant_it_replaced(self, variant):
+        """Not a correctness property — a tripwire. Every variant registered so far exists
+        to shrink the prompt, so serving one larger than a variant it replaced is either
+        mislabelled or a mistake. If a deliberately larger prompt is ever the right answer,
+        this is the place to say why."""
+        for ce in (True, False):
+            available = resolve("code" if ce else "nocode", subagents=False)
+            served = default_system_prompt("FinnGenie", tool_names=available)
+            other = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+            surface = "code" if ce else "nocode"
+            assert len(served) <= len(other), (
+                f"the served prompt is larger than {variant!r} on the {surface} surface"
+            )

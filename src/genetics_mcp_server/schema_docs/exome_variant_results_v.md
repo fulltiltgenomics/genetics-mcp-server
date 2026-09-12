@@ -33,14 +33,7 @@ contains variants filtered to mlog10p > 4.
 | `variant` | `STRING` | Variant identifier as chr:pos:ref:alt |
 | `resource` | `STRING` | Data source identifier (lowercase) |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -50,8 +43,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against exome_variant_results_v as written. Copy the shape rather than
-inventing one — each shows the filters this view expects.
+Queries that run against exome_variant_results_v as written.
 
 ### Predicted loss-of-function variant associations in a gene. annotation values differ per resource: genebass uses pLoF/missense/LC, ibd_exome_2026 uses VEP terms such as frameshift_variant.
 

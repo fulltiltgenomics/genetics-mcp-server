@@ -92,14 +92,7 @@ ARE ON THE LOG SCALE: `beta` is ln(odds ratio), so OR = EXP(beta).
 | `mlog10_fdr_q_secondary` | `FLOAT64` | -log10 FDR q-value from the leave-top-cohort-out re-analysis |
 | `resource` | `STRING` | Data source identifier, constant 'rcnv' — the same resource dosage_sensitivity_v, rcnv_gene_associations_v and rcnv_segments_v carry |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -110,8 +103,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against rcnv_window_associations_v as written. Copy the shape rather than
-inventing one — each shows the filters this view expects.
+Queries that run against rcnv_window_associations_v as written.
 
 ### Is there a rare-CNV signal at a fine-mapped GWAS locus? Takes the high-PIP credible-set variants of one FinnGen quantitative trait on one chromosome and reports the deletion windows covering each lead position — chosen because its lead variant sits inside 16p11.2, a well-known recurrent-CNV region, and the join lands on genome-wide-significant deletion windows there. The literal `chr = 16` appears on BOTH sides — in the CTE it prunes credible_sets_v's partitions, on the window view it prunes this table's, and the join's `cs.chr = w.chr` alone would prune neither. Windows overlap, so one position falls in ~20 of them with near-identical statistics.
 

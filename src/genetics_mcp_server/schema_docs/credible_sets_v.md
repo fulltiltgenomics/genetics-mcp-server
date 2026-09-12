@@ -40,14 +40,7 @@ linked to it.
 | `maf` | `FLOAT64` | Minor allele frequency = LEAST(aaf, 1-aaf). Use directly instead of computing from aaf |
 | `resource` | `STRING` | Data source identifier (lowercase). Always filter by this column, not dataset |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -58,8 +51,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against credible_sets_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against credible_sets_v as written.
 
 ### Everything a variant is fine-mapped for, across all resources and data types. Always add the chr filter next to variant — the table is partitioned by chr and without it the same query scans ~20x more data and can hit the bytes-billed limit.
 

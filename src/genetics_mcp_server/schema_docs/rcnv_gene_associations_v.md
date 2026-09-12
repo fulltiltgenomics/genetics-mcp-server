@@ -74,14 +74,7 @@ coordinates.
 | `triplosensitive` | `BOOL` | ptriplo >= 0.94, the paper's triplosensitivity cutoff |
 | `resource` | `STRING` | Data source identifier, constant 'rcnv' — the same resource dosage_sensitivity_v carries |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -92,8 +85,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against rcnv_gene_associations_v as written. Copy the shape rather than
-inventing one — each shows the filters this view expects.
+Queries that run against rcnv_gene_associations_v as written.
 
 ### PheWAS for one gene across the 54 HPO groups: which phenotypes a deletion or duplication of it is associated with, strongest FDR first. The phenotype name comes from phenotypes_v, joined on trait_original = phenotype.
 

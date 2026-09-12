@@ -1663,8 +1663,62 @@ out-of-scope rule, bypassing all of the care above with a field two lines away f
 was removed rather than gated; nothing in the suite ever sent it. Pydantic ignores unknown keys, so
 a caller still sending one is silently ignored rather than 422'd. The prompt handed to
 `llm_service.stream_chat(system_prompt=...)` is always
-`default_system_prompt(app_name, tool_names=...)` plus the verbosity fragment — that parameter is
-the internal channel `chat_api` assembles, not an override.
+`default_system_prompt(app_name, tool_names=..., variant=...)` plus the verbosity fragment — that
+parameter is the internal channel `chat_api` assembles, not an override.
+
+**Prompt variants.** `config/defaults.py` `PROMPT_VARIANTS` maps a name to a block tuple, and
+`settings.prompt_variant` (env `PROMPT_VARIANT`, read at the same edge as `app_name`) picks which
+one this deployment serves. A variant changes the TEXT and nothing else: `_assemble` still runs the
+per-request tool gate inside whichever tuple was selected, so a variant cannot describe a
+tool the model was not given either. `_Block` and `_fs` live in `config/prompt_blocks.py` so a
+variant module can import the type without importing the registry it is registered in.
+
+Two variants are registered. **`condensed` (`config/prompt_condensed.py`) is the default and what
+every deployment serves**; `legacy` is `_PROMPT_BLOCKS`, the prompt it replaced. The condensed one
+is the same gate and the same generated `# BigQuery view reference` object, reordered into *how to
+work -> how to get data -> what the data is -> how to answer*, with the text that already ships in
+the `tools` parameter deleted rather than shortened — that is two thirds of the reduction, and the
+UniProt and ChEMBL sections are most of it. Measured on `claude-opus-5`: the `code` surface
+61,443 -> 58,083 tokens (-5.5%), the `nocode` surface 12,262 -> 8,514 (-30.6%); the code surface
+moves less because the view reference, which both variants share, is 86% of the condensed prompt.
+`## Analyzing data` is deliberately not condensed — its three PASS blocks are byte-identical to
+`legacy`'s, because both verbosity fragments name the passes and `tests/test_chat_api.py` pins
+that every registered variant carries them.
+
+It also resolved two self-contradictions the old prompt carried on the `code` surface: a
+gene-window SQL example that cast `chr` to STRING where the generated view docs say it is INT64
+and needs no cast, and a bullet telling the script surface to read the schema file before writing
+SQL fifteen lines after another said the schema is already in the prompt and not to spend a call
+discovering it.
+
+**The paired run found no quality difference, and that is why `condensed` ships.** 2026-09-12, the
+local set as it then stood at 23 cases (since trimmed to 9), 56 paired turns, both orders: 9 wins to 8 with 35 ties, sign test
+p=1.000 over 17 decisive pairs, and cost a wash inside per-case variance (one case carried 81% of
+the $3.79 spread). Read the ties as the instrument's limit rather than as a result — the judge
+preferred the longer answer in 14 of 17 decisive pairs and four pairs flipped on presentation order
+alone, so a small regression could not have been detected. It was adopted for the context saving.
+The judged arm had `## Analyzing data` compressed to one sentence; the PASS blocks were restored
+after the run, so what is served is 166 tokens larger than what was measured and differs in
+nothing else. `legacy` stays registered as the only baseline that saving can be re-measured
+against, and it is
+not free: both tuples have to learn about every tool added after this, and only the structural
+invariants are enforced across both. The structural invariants are not up for measurement:
+`tests/test_system_prompt.py` runs the tool-gate, heading-reparenting and empty-heading checks
+against **every** registered variant, so a variant is free to reword any content pin and not free
+to break the assembly.
+
+Selection is deployment-side and never per-request, which is the same invariant as the removed
+`system_prompt` field above: a request may not choose its own prompt. A wire field would hand every
+caller a menu of prompts including whatever experimental one a benchmark left in the registry, so
+the registry is reached by starting a second PROCESS instead — which is also what makes a prompt
+A/B honest, since both arms then run one build and differ in one env var.
+
+An unknown name coerces to `DEFAULT_PROMPT_VARIANT` and logs a WARNING once per distinct value
+rather than raising: it is a deployment env var, and a typo must not take chat down. That coercion
+has a cost `DEFAULT_TOOL_PROFILE`'s does not — two benchmark arms could both land on the default
+and report the difference between a prompt and itself as a result — so `GET /chat/v1/tools/resolved`
+reports the **resolved** `prompt_variant`, and `replay_benchmark`'s preflight refuses a paired run
+whose two servers agree on it (§ Replay benchmark).
 
 **The prompt is assembled from the tool list in force** (`genetics-results-suite-4h6.69`).
 `config/defaults.py` holds `_PROMPT_BLOCKS`, a tuple of `_Block`s rather than one string; a block
@@ -3004,7 +3058,7 @@ read this DB.
 ## Replay Benchmark
 
 `scripts/replay_benchmark.py` replays the `user_turns` sequences from
-`eval_dataset.json` through `POST /chat/v1/chat` under two `tool_profile` arms and
+`eval_dataset.json` through `POST /chat/v1/chat` under two arms and
 reports per-arm distributions. It is the measurement gate for the code-execution
 epic (`genetics-results-suite-4h6`): a candidate arm has to beat the recorded
 baseline before it is defaulted on.
@@ -3014,18 +3068,40 @@ harness issues two arms per case. `--base-url` therefore defaults to
 `http://localhost:8000`, never a deployment, and `--dry-run` resolves the whole plan
 (case order, arm order, turn count) without issuing a single request.
 
-- **The arms are the boolean.** `--arm-a` defaults to `nocode` and `--arm-b` to `code`,
-  the only two wire values that straddle the surface split; `--arm-a all` still spells
+- **An arm is a surface on a server.** The spec is `[LABEL=]PROFILE[@URL]`; with no
+  `@URL` the arm runs against `--base-url`, which is every single-server run and reports
+  exactly as it always did. `--arm-a` defaults to `nocode` and `--arm-b` to `code`, the two
+  wire values that straddle the surface split; `--arm-a all` still spells
   `tool_profile: null`, which resolves to the same surface as `nocode`. The preflight asks
-  the server what each arm resolved to before anything is spent and refuses three shapes,
-  each of which otherwise produces a plausible report about something else: an arm the
-  server reports `known_profile: false` for; an arm that is not the surface it names — the
-  `code` arm resolving *without* `run_analysis`, which is what a chat service running with
-  `SANDBOX_ENABLED=false` serves, or any other arm resolving *with* it, which is a server
-  predating the collapse; and two arms whose resolved name sets are equal. An arm the
-  server did not resolve at all (transport error, non-200, or a 200 carrying no names) is
-  survivable rather than fatal, but both the `run_analysis` check and the identical-surface
-  check are skipped for it, and the harness warns saying so.
+  **each arm's own server** what that arm resolved to before anything is spent, and refuses
+  four shapes, each of which otherwise produces a plausible report about something else: an
+  arm the server reports `known_profile: false` for; an arm that is not the surface it
+  names — the `code` arm resolving *without* `run_analysis`, which is what a chat service
+  running with `SANDBOX_ENABLED=false` serves, or any other arm resolving *with* it, which
+  is a server predating the collapse; two arms **on one server** whose resolved name sets
+  are equal; and two arms **on different servers** whose resolved `prompt_variant` is the
+  same. An arm the server did not resolve at all (transport error, non-200, or a 200
+  carrying no names) is survivable rather than fatal, but both the `run_analysis` check and
+  the identical-surface check are skipped for it, and the harness warns saying so. A server
+  too old to report `prompt_variant` is likewise a warning: unprovable is not the same as
+  equal, and refusing would mean refusing to work with any build that predates the field.
+- **The prompt-variant dimension.** To compare two SYSTEM PROMPTS rather than two tool
+  surfaces, point the arms at two processes of the same build that differ only in
+  `PROMPT_VARIANT` (`config/defaults.py` `PROMPT_VARIANTS`; see § Prompt variants):
+
+      --arm-a 'legacy=code@http://localhost:8000' \
+      --arm-b 'condensed=code@http://localhost:8001'
+
+  Identical tool sets are then the point rather than a fault, which is why the
+  identical-surface guard applies only within one server. What must differ is the variant,
+  and the harness reads that back off `/chat/v1/tools/resolved` rather than trusting what
+  the command line asked for — `PROMPT_VARIANT` coerces an unknown name to the default, so
+  a typo on one process leaves both arms on the default prompt, which is the identical-
+  surface failure wearing different clothes. Two arms that differ in *both* variant and
+  resolved tools are allowed and warned about: it is a legitimate thing to measure, but a
+  difference in the results cannot be attributed to the prompt alone. The report's `config`
+  carries each arm's label, profile, base URL and resolved variant, so a saved run says
+  what it compared.
 - **Single-arm mode.** `--arm-b none` runs arm A alone. It exists because the counters that
   decide a prompt or image change are per-arm, and paying for a second arm that has not
   changed buys nothing. What it gives up is everything the pairing defends: a model swap or

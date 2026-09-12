@@ -73,14 +73,7 @@ likewise the pooled ln(odds ratio), so OR = EXP(beta), with `beta_lower`/`beta_u
 | `gene_ensembl_ids` | `ARRAY<STRING>` | ARRAY of Ensembl gene IDs (unversioned), aligned with genes. The join key to gene_annotations_v and dosage_sensitivity_v |
 | `resource` | `STRING` | Data source identifier, constant 'rcnv' — the same resource dosage_sensitivity_v and rcnv_gene_associations_v carry |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -91,8 +84,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against rcnv_segments_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against rcnv_segments_v as written.
 
 ### Fine-mapped GWAS variants that fall inside a disease-associated CNV segment: is the common-variant signal in the same interval as the rare-CNV one? The BETWEEN is on the GRCh38 pair, which is why `AND s.segment_start IS NOT NULL` is spelled out — the handful of segments with no GRCh38 lift, the 22q11.21 duplication among them, cannot match and would otherwise disappear without a trace.
 

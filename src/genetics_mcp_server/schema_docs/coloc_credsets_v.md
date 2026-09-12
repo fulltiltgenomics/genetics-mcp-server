@@ -53,14 +53,7 @@ inflates up to 4x.
 | `variant` | `STRING` | Variant identifier as chr:pos:ref:alt |
 | `resource` | `STRING` | Data source identifier (lowercase) |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -70,8 +63,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against coloc_credsets_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against coloc_credsets_v as written.
 
 ### Both credible sets behind a colocalization. Carry trait_original and cell_type through the CTE and into the join — (dataset, cs_id) alone matches every other trait fine-mapped in the same region: on the pair this query picks it returns 18 credible sets and 18 rows instead of the 2 and 2 below. SELECT DISTINCT because this view repeats rows. PP_H4_abf ties (many pairs sit at exactly 1.0), so the ORDER BY names further columns to make the pick reproducible.
 

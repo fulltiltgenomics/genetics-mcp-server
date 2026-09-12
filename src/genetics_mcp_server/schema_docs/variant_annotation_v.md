@@ -31,14 +31,7 @@ for those.
 | `index` | `INT64` | Row index in the source annotation file, not a genetic quantity |
 | `resource` | `STRING` | Data source identifier, constant 'finngen' (FinnGen R14) |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -46,8 +39,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against variant_annotation_v as written. Copy the shape rather than
-inventing one — each shows the filters this view expects.
+Queries that run against variant_annotation_v as written.
 
 ### Translate an rsID to the chr:pos:ref:alt identifier the association views use. rsid is neither partitioned nor clustered, so this scans the whole table — add a chr filter whenever the chromosome is already known.
 

@@ -24,74 +24,17 @@ outlive its examples, state the precondition as `requires_all` and put the examp
 their own block (see the routing arbitration below).
 """
 
+import logging
 import re
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass, field
 
 from genetics_mcp_server import schema_docs
+from genetics_mcp_server.config.prompt_blocks import _Block, _fs
+from genetics_mcp_server.config.prompt_condensed import (
+    CONDENSED_PROMPT_BLOCKS as _CONDENSED_PROMPT_BLOCKS,
+)
 
-
-@dataclass(frozen=True)
-class _Block:
-    r"""One fragment of the system prompt, with the conditions for emitting it.
-
-    `text` owns its surrounding newlines so that concatenating the emitted blocks
-    reproduces the document structure with no re-joining.
-
-    Three rules for writing the text, none of which the gate can enforce for you:
-
-    1. NAME TOOLS EXACTLY. The gate matches `(?<!\w)NAME\b` (see `tools_named_in`), so a
-       plural or suffixed mention — `get_hla_by_alleles` where the tool is
-       `get_hla_by_allele` — is not seen as a mention at all, and the block is then
-       emitted on surfaces that do not have the tool. No test catches that:
-       tests/test_system_prompt.py's scan is independent of the gate on the ALGORITHM
-       (tokenise-then-intersect vs per-name regex) but shares its NORMALISATION, so the
-       two agree with each other while both being wrong. There is no live instance today
-       (genetics-results-suite-4h6.78); keep it that way by naming tools verbatim and
-       rephrasing the sentence around the exact name.
-
-    2. A PROHIBITION GATES POSITIVELY. `_assemble` asks only WHICH names appear in the
-       text, never with what polarity, so a block written to warn AGAINST a tool requires
-       that tool to be available. Remove the tool from a surface and the warning
-       disappears — along with everything else that block carries. The
-       genetics-results-suite-4h6.17/.69 cycle fixed the live instance (the HLA block,
-       where `get_summary_stats` appeared only inside a negation); the property remains.
-       If a rule has to outlive the tool it warns about, put the warning in its own block.
-
-    3. GATE ON WHAT A RULE NEEDS, NOT ON WHAT IT IS ABOUT. Science and grounding belong in
-       blocks that name no tool; only the "which tool" clause is gated. The line between
-       the two is whether the rule can be OBEYED without rows:
-       - An obligation that attaches when the model PRESENTS data holds on every surface,
-         because a surface with no data path can still present data it retrieved from a
-         document. So the pseudo-credible-set labelling duty ("not statistically
-         fine-mapped", "always tell the user explicitly") and the construction facts
-         needed to read such a result (the r² membership criteria, the PIP caution) are
-         ungated, and reach `rag`.
-       - A rule that can only be carried out by FETCHING rows — membership is whatever
-         `credible_sets_v` returns, re-query rather than answer from memory — is gated on
-         having a path to those rows: on a surface without one it names an action the
-         model cannot take, and "verify it" with nothing to verify against is worse than
-         silence (genetics-results-suite-4h6.79).
-    """
-
-    text: str
-    # emitted only if at least one of these is available; use for a section whose own text
-    # names no tool but which presupposes a capability (e.g. SQL guidance, reachable either
-    # through query_database or through the SDK's sql() inside run_analysis)
-    requires_any: frozenset[str] = field(default_factory=frozenset)
-    # suppressed if any of these is available; use to pick between mutually exclusive
-    # wordings of the same guidance for different tool surfaces
-    excludes: frozenset[str] = field(default_factory=frozenset)
-    # emitted only if ALL of these are available. The text-derived name gate is itself an
-    # implicit requires_all, so guidance whose emission is a real precondition on a tool
-    # used to be expressed by happening to name that tool — which made it hostage to every
-    # OTHER name in the same text, including illustrative "e.g." asides. State the
-    # precondition here and keep the asides in their own blocks instead.
-    requires_all: frozenset[str] = field(default_factory=frozenset)
-
-
-def _fs(*names: str) -> frozenset[str]:
-    return frozenset(names)
+logger = logging.getLogger(__name__)
 
 
 # Tools whose input_schema actually carries `summarize`. The gate matches TOOL NAMES, so
@@ -825,8 +768,69 @@ def _assemble(
     return "".join(parts)
 
 
+# The variant a deployment serves when PROMPT_VARIANT is unset or names nothing.
+DEFAULT_PROMPT_VARIANT = "condensed"
+
+# Named whole-prompt variants. A name selects a block tuple; `_assemble` then does the
+# same per-request tool gating inside whichever tuple was selected, so a variant changes
+# the text and nothing else about how a request is resolved.
+#
+# This exists to make a prompt rewrite MEASURABLE. `scripts/replay_benchmark.py` compares
+# two arms turn for turn, and an arm reaches a variant by pointing at a process started
+# with PROMPT_VARIANT set to it. Both arms then run the same build, the same tool
+# resolution and the same dataset, so the prompt is the only thing that differs — which a
+# second deployment built from a branch could not promise.
+#
+# Selection is deployment-side and never per-request. That is the same invariant chat_api
+# states over the assembled prompt itself: a request may not choose its own system prompt,
+# which carries the grounding, citation and out-of-scope rules. A wire field would hand
+# every caller a menu of prompts, including whatever experimental one a benchmark left
+# here.
+# `legacy` is kept as the only regression baseline the condensed prompt can be measured
+# against, and it is NOT free: two block tuples both have to learn about every tool added
+# after this, and only the structural invariants in tests/test_system_prompt.py are
+# enforced across both. Delete it once the condensed prompt has soaked, rather than
+# carrying a second prose surface indefinitely.
+PROMPT_VARIANTS: dict[str, tuple[_Block, ...]] = {
+    DEFAULT_PROMPT_VARIANT: _CONDENSED_PROMPT_BLOCKS,
+    "legacy": _PROMPT_BLOCKS,
+}
+
+_warned_unknown_variants: set[str] = set()
+
+
+def resolve_prompt_variant(variant: str | None) -> str:
+    """The variant name this deployment actually serves.
+
+    An unknown name coerces to the default and logs a WARNING rather than raising: the
+    value is a deployment env var, and a typo in it must not take chat down for everyone.
+
+    Coercing has a cost the tool_profile coercion does not: two benchmark arms could both
+    land on the default and report the difference between a prompt and itself as a result.
+    That is why the RESOLVED name is reported on /chat/v1/tools/resolved — the harness
+    reads it back and refuses a paired run whose arms resolve to one variant, which is the
+    same shape as the identical-surface guard it already applies to tool profiles.
+    """
+    name = (variant or "").strip() or DEFAULT_PROMPT_VARIANT
+    if name in PROMPT_VARIANTS:
+        return name
+    if name not in _warned_unknown_variants:
+        _warned_unknown_variants.add(name)
+        logger.warning(
+            "Unrecognised PROMPT_VARIANT %r - serving %r instead. Known variants: %s. A "
+            "benchmark arm pointed at this process is measuring the default prompt, not "
+            "the one it named; GET /chat/v1/tools/resolved reports the resolved name.",
+            name,
+            DEFAULT_PROMPT_VARIANT,
+            ", ".join(sorted(PROMPT_VARIANTS)),
+        )
+    return DEFAULT_PROMPT_VARIANT
+
+
 def default_system_prompt(
-    app_name: str = "FinnGenie", tool_names: Iterable[str] | None = None
+    app_name: str = "FinnGenie",
+    tool_names: Iterable[str] | None = None,
+    variant: str | None = None,
 ) -> str:
     """Default system prompt with the assistant persona name substituted.
 
@@ -838,13 +842,18 @@ def default_system_prompt(
             the model was given. `None` disables the filtering entirely and emits every
             block — the pre-4h6.69 behaviour, kept for callers that have no tool list
             (and for tests that want the full text).
+        variant: which entry of `PROMPT_VARIANTS` to assemble. `None` and any unknown
+            name resolve to `DEFAULT_PROMPT_VARIANT`; see `resolve_prompt_variant`.
     """
-    return _assemble(tool_names).replace("FinnGenie", app_name)
+    blocks = PROMPT_VARIANTS[resolve_prompt_variant(variant)]
+    return _assemble(tool_names, blocks).replace("FinnGenie", app_name)
 
 
-# Appended to the system prompt per the user's response-length setting. Both variants
-# scope the *write-up* only — the three-pass analysis in "Analyzing data" is how the
-# answer is derived either way, and neither fragment relaxes a grounding rule.
+# Appended to the system prompt per the user's response-length setting, whichever prompt
+# variant is in force — so the three passes these name have to stay in every variant's
+# "Analyzing data" section, and tests/test_chat_api.py pins that they do. Both scope the
+# *write-up* only: the analysis is derived the same way either way, and neither fragment
+# relaxes a grounding rule.
 _VERBOSITY_PROMPTS = {
     "brief": """
 ## Response Length: BRIEF (user setting)

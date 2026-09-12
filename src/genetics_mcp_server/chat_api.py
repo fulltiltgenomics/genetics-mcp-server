@@ -44,6 +44,7 @@ from genetics_mcp_server.config import (
 from genetics_mcp_server.config.defaults import (
     default_system_prompt,
     instruction_envelope,
+    resolve_prompt_variant,
     verbosity_prompt,
 )
 from genetics_mcp_server.db import get_chat_history_db, get_llm_config_db
@@ -381,7 +382,7 @@ class ChatRequest(BaseModel):
     verbosity: str | None = Field(
         None,
         description="Response length: 'brief' (default) reports the analysis as its "
-        "conclusions, 'detailed' lays out the full three-pass write-up. Unknown "
+        "conclusions, 'detailed' lays out the full write-up. Unknown "
         "values fall back to 'brief'.",
     )
     instruction_set_id: str | None = Field(
@@ -557,6 +558,12 @@ async def list_resolved_tools(
     separately and are not included; they are also the same for every profile, so this
     endpoint's answer is the only half a profile name still moves (see
     docs/chat-tool-reference.md § 3).
+
+    `prompt_variant` is the RESOLVED name, not the configured string, for the same reason
+    `known_profile` exists: PROMPT_VARIANT coerces an unknown name to the default rather
+    than raising, so the configured value cannot tell a caller what the model was given.
+    A prompt A/B runs two processes that differ only in that env var, and this is where the
+    harness reads back that they really do differ.
     """
     service = get_llm_service()
     names = sorted(
@@ -571,6 +578,7 @@ async def list_resolved_tools(
         "known_profile": known,
         "count": len(names),
         "names": names,
+        "prompt_variant": resolve_prompt_variant(get_settings().prompt_variant),
     }
 
 
@@ -879,6 +887,7 @@ async def stream_chat(
     system_prompt = default_system_prompt(
         settings.app_name,
         tool_names=local_tools.names,
+        variant=settings.prompt_variant,
     )
     system_prompt += verbosity_prompt(request.verbosity)
     user_instructions = _resolve_user_instructions(

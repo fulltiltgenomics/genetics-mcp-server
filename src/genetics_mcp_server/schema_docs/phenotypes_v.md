@@ -43,14 +43,7 @@ table (~33k rows), so an unfiltered scan is cheap.
 | `version` | `STRING` | Dataset version label (R14, R12, 26.06, ...) |
 | `coloc_partner_only` | `BOOL` | TRUE for traits whose dataset exists only as a colocalization partner (FinnGen R12 core and R12 Kanta). They appear in colocalization_v but not credible_sets_v; add `AND NOT coloc_partner_only` to mirror what phenotype search returns |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -60,8 +53,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against phenotypes_v as written. Copy the shape rather than inventing one —
-each shows the filters this view expects.
+Queries that run against phenotypes_v as written.
 
 ### Name the traits behind credible sets at a locus, in one query
 
