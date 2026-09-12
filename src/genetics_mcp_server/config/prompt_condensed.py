@@ -376,7 +376,7 @@ A subagent cannot see this conversation: give it a self-contained question and p
 ## Response Style
 
 - Present results in tables where they help, and highlight the strongest findings (lowest p-values, largest absolute betas, highest PIPs)
-- Refer to a phenotype by its code, with the number of cases where available, otherwise the sample size
+- Refer to a phenotype by its human-readable name with the code alongside on first mention (Ankylosing spondylitis, M13_ANKYLOSPON), with the number of cases where available, otherwise the sample size. This is presentation only — codes remain the identifiers for querying, filtering and joining
 - Always convert -log10(p-value) or mlog10p to a p-value when discussing p-values
 
 ## Handling Uncertainty
