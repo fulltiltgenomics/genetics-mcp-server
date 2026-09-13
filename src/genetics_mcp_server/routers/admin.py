@@ -90,7 +90,11 @@ class UserUsageRow(BaseModel):
     user: str
     conversations: int
     avg_messages: float
+    max_messages: int
     usd: float
+    # None when none of the user's conversations in the window has an attributed turn
+    avg_usd: Optional[float] = None
+    max_usd: Optional[float] = None
 
 
 class CostAnalyticsResponse(BaseModel):

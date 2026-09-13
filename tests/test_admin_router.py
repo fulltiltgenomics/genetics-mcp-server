@@ -310,14 +310,20 @@ class TestAdminCostAnalytics:
         assert [u["user"] for u in data["users"]] == [
             "alice@example.com", "carol@example.com", "bob@example.com",
         ], "sorted by spend, then name"
+        # both turns sit on one of alice's two sessions: the other has no attributed turn and
+        # does not enter the per-conversation USD figures
         assert by_user["alice@example.com"] == {
             "user": "alice@example.com", "conversations": 2, "avg_messages": 2.0,
-            "usd": pytest.approx(1.75),
+            "max_messages": 2, "usd": pytest.approx(1.75), "avg_usd": pytest.approx(1.75),
+            "max_usd": pytest.approx(1.75),
         }
         assert by_user["bob@example.com"]["usd"] == 0.0
         assert by_user["bob@example.com"]["conversations"] == 1
+        assert by_user["bob@example.com"]["avg_usd"] is None
         assert by_user["carol@example.com"]["conversations"] == 0
+        assert by_user["carol@example.com"]["max_messages"] == 0
         assert by_user["carol@example.com"]["usd"] == pytest.approx(0.05)
+        assert by_user["carol@example.com"]["max_usd"] is None
 
     def test_cost_periods(self, costed_client):
         for period in ("month", "year"):

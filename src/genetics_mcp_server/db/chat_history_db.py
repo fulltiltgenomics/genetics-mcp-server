@@ -1564,23 +1564,45 @@ class ChatHistoryDB(object, metaclass=Singleton):
         def entry(user_id: str | None) -> dict:
             key = user_id or "(unknown)"
             return users.setdefault(
-                key, {"user": key, "conversations": 0, "avg_messages": 0.0, "usd": 0.0}
+                key,
+                {
+                    "user": key, "conversations": 0, "avg_messages": 0.0, "max_messages": 0,
+                    "usd": 0.0, "avg_usd": None, "max_usd": None,
+                },
             )
 
+        # one row per session opened in the window: its message count and the cost of every
+        # turn attributed to it, whenever that turn ran — a conversation's cost is the whole
+        # conversation's. The per-conversation USD figures average over sessions that have at
+        # least one attributed turn, and are None for a user with none: a session whose turns
+        # were recovered from log lines that carried no session id would otherwise count as a
+        # free conversation and drag the mean down.
         cursor.execute(
             """
-            SELECT s.user_id, COUNT(DISTINCT s.id) AS conversations, COUNT(m.id) AS messages
+            SELECT s.user_id,
+                   (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id) AS messages,
+                   (SELECT SUM(cost_usd) FROM chat_turn_metrics t WHERE t.session_id = s.id) AS usd
             FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
             WHERE s.created_at >= date('now', ?)
-            GROUP BY s.user_id
             """,
             since,
         )
+        messages_by_user: dict[str, list[int]] = {}
+        usd_by_user: dict[str, list[float]] = {}
         for row in cursor.fetchall():
-            e = entry(row["user_id"])
-            e["conversations"] = row["conversations"]
-            e["avg_messages"] = row["messages"] / row["conversations"]
+            key = entry(row["user_id"])["user"]
+            messages_by_user.setdefault(key, []).append(row["messages"])
+            if row["usd"] is not None:
+                usd_by_user.setdefault(key, []).append(row["usd"])
+        for key, counts in messages_by_user.items():
+            e = users[key]
+            e["conversations"] = len(counts)
+            e["avg_messages"] = sum(counts) / len(counts)
+            e["max_messages"] = max(counts)
+        for key, costs in usd_by_user.items():
+            e = users[key]
+            e["avg_usd"] = sum(costs) / len(costs)
+            e["max_usd"] = max(costs)
 
         cursor.execute(
             """

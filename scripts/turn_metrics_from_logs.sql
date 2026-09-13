@@ -10,6 +10,11 @@
 -- entry across them. `[session=unknown]` and lines from before the session prefix existed
 -- yield a NULL session_id — the turn is still attributable to its user. The rows carry user
 -- emails: pipe them into the backfill, never into a file that is kept.
+--
+-- Secret chat is left out, as the live table leaves it out: a session that ever logged a
+-- "Streaming Anthropic secret chat" line is dropped whole. That only reaches lines that carry a
+-- session id — a turn from before the session prefix existed, or one logged as
+-- `[session=unknown]`, cannot be told apart and is kept.
 WITH lines AS (
   SELECT insertId, timestamp, resource.labels.cluster_name AS cluster,
          COALESCE(textPayload, JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.message')) AS line
@@ -18,6 +23,11 @@ WITH lines AS (
   SELECT insertId, timestamp, resource.labels.cluster_name,
          COALESCE(textPayload, JSON_VALUE(TO_JSON_STRING(jsonPayload), '$.message'))
   FROM `daly-finngenie.genetics_chat_logs_staging.stdout`
+),
+secret_sessions AS (
+  SELECT DISTINCT REGEXP_EXTRACT(line, r'\[session=([^\]]+)\]') AS session_id
+  FROM lines
+  WHERE cluster = @cluster AND line LIKE '%Streaming Anthropic secret chat%'
 )
 SELECT
   insertId AS log_id,
@@ -31,5 +41,8 @@ SELECT
   CAST(REGEXP_EXTRACT(line, r'total_cost=\$([0-9.]+)') AS FLOAT64) AS cost_usd
 FROM lines
 WHERE cluster = @cluster AND line LIKE '%Chat complete:%'
+  AND COALESCE(REGEXP_EXTRACT(line, r'\[session=([^\]]+)\]'), 'unknown') NOT IN (
+    SELECT session_id FROM secret_sessions WHERE session_id IS NOT NULL AND session_id != 'unknown'
+  )
 QUALIFY ROW_NUMBER() OVER (PARTITION BY insertId ORDER BY timestamp) = 1
 ORDER BY timestamp
