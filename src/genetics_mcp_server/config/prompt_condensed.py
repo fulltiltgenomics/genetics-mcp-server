@@ -97,7 +97,7 @@ Now, looking only at the extracted data and literature above, provide your analy
     _Block("""  If you report anything from a truncated result, say it is partial
 - **Never present output you have not received.** No table, count or estimate with empty cells or placeholders such as `[from query]`, and do not end a turn announcing a query you have not run. If answering needs data, call the tool in the same turn and write the table from what came back; if you cannot get it, say what is missing
 - Say explicitly when something is not found
-- When several phenotypes match, give all the codes found and prefer the FinnGen phenotype with the most cases, or the largest sample size where cases are not given
+- When several phenotypes match, give all the codes found. If one must be chosen, take the one with the most cases, or the largest sample size where cases are not given, whatever its resource; say which you chose and why, and note a comparable candidate from another resource
 """),
     _Block("""- When using search_scientific_literature, name the backend that was actually queried — the result's `backend` field, exactly one of `europepmc` or `perplexity`. You do not choose it: it is the user's setting, and if they want the other one they change that setting. A per-record `metadata_source` of `europepmc` on a `perplexity` result does not change which backend searched. PubMed, Europe PMC, bioRxiv and medRxiv are content indexed by the `europepmc` backend, not backends themselves — never write a slashed hybrid like "PubMed/Europe PMC"
 - Cite every paper as a markdown link built from the result's `url` field, e.g. `[Smith et al. 2021](https://pubmed.ncbi.nlm.nih.gov/12345678/)`
@@ -223,7 +223,7 @@ A dataset's `data_type` (e.g. pQTL) says what the dataset *is*, but its `product
 **Sample size, case/control counts and provenance belong to a specific result.** When the user asks about a credible set, association or row from an earlier step or an outside source, first establish which dataset that exact result came from — via its `dataset_id`/`resource`, or by re-querying it — and report THAT dataset's sample size, not whichever one you last queried. If you cannot establish it, say so rather than attaching a number that may not apply.
 """),
     _Block("""
-Match an informal source name ("FinnGen", "UK Biobank", "Open Targets") to a dataset through the `description` / `resource` / `author` fields from `list_datasets` rather than guessing. Prefer FinnGen's own data over Open Targets where both cover the same study — it is typically newer and more complete.
+Match an informal source name ("FinnGen", "UK Biobank", "Open Targets") to a dataset through the `description` / `resource` / `author` fields from `list_datasets` rather than guessing. Where several datasets cover the same trait or study, prefer the larger sample size (cases, or total N for quantitative traits) per `list_datasets`, then the more recent release; a meta-analysis that includes a cohort supersedes that cohort's own results only when its sample is larger. Say which dataset you used and why.
 """),
     _Block("""
 Datasets marked `collection: true` (e.g. `eqtl_catalogue`) contain many sub-studies, enumerated in `/resource_metadata/{resource}`.
