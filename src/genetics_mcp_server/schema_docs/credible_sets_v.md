@@ -9,7 +9,7 @@ ON metaboQTL: the trait is a Nightingale NMR biomarker code (Total_C, XXL_VLDL_P
 bOHbutyrate), not a gene and not a disease endpoint; resolve a code to its name through
 phenotypes_v rather than reading it. beta is in trait standard deviations because the
 biomarkers are inverse-normal transformed, so it is not comparable with a GWAS log-odds, and
-for the nmr_meta resource beta, se and mlog10p are NULL on 5,004 rows whose z-score
+for the nmr_ukbb_est resource beta, se and mlog10p are NULL on 5,004 rows whose z-score
 overflowed in the source — among them strong lipid signals such as APOE, so a MAX(mlog10p)
 ranking silently drops some of the top hits; rank by pip. NOTE ON caQTL: for data_type =
 'caQTL' the trait is a chromatin ACCESSIBILITY PEAK (e.g. chr5-35863122-35863905), never a
@@ -59,7 +59,7 @@ from the gene and most peaks near a gene are not linked to it.
 
 Queries that run against credible_sets_v as written.
 
-### Everything a variant is fine-mapped for, across all resources and data types. Always add the chr filter next to variant — the table is partitioned by chr and without it the same query scans ~20x more data and can hit the bytes-billed limit.
+### Everything a variant is fine-mapped for, across all resources and data types. The chr filter is optional here: variant is a clustering key on the base table, so filtering on it alone already prunes, and adding chr measured ~13.6% worse. Keep chr where the query also scans a range rather than a single variant.
 
 ```sql
 SELECT resource, dataset, data_type, trait, trait_original, cell_type,
