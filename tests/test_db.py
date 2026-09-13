@@ -2936,8 +2936,14 @@ class TestChatTurnMetricsRelaxAndBackfill:
         )
         data = chat_history_db.get_cost_analytics("week")
         assert [d["usd"] for d in data["daily"]] == [pytest.approx(0.6), pytest.approx(0.4)]
+        # the log row carries session "s1", which is no chat_sessions row, so only the live
+        # turn's 0.4 is a conversation's cost; the total still counts both
         assert data["users"] == [
-            {"user": USER, "conversations": 1, "avg_messages": 3.0, "usd": pytest.approx(1.0)}
+            {
+                "user": USER, "conversations": 1, "avg_messages": 3.0, "max_messages": 3,
+                "usd": pytest.approx(1.0), "avg_usd": pytest.approx(0.4),
+                "max_usd": pytest.approx(0.4),
+            }
         ]
         year = chat_history_db.get_cost_analytics("year")
         assert sum(d["usd"] for d in year["daily"]) == pytest.approx(1.0)
