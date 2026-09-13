@@ -5,10 +5,11 @@
 
 Per-variant functional annotation and FinnGen (R14) allele frequencies — one row per
 variant, covering all imputed variants, not only fine-mapped ones. This is the only view
-with rsIDs and genotype counts: join to it whenever a question needs an rsID, an allele
-frequency, imputation quality, or Finnish enrichment for variants found in the association
-views. Association results are not here — use credible_sets_v, exome_variant_results_v etc.
-for those.
+with genotype counts, and the rsID source for the credible-set, colocalization and exome
+views (asm_qtl_v and variant_effect_v carry their own rsid): join to it whenever a question
+needs an rsID, an allele frequency, imputation quality, or Finnish enrichment for variants
+found in those views. Association results are not here — use credible_sets_v,
+exome_variant_results_v etc. for those.
 
 ## Columns
 
@@ -25,7 +26,7 @@ for those.
 | `AC_Hom` | `INT64` | Number of homozygous (alt/alt) genotypes in FinnGen |
 | `most_severe` | `STRING` | Most severe VEP-predicted variant consequence |
 | `gene_most_severe` | `STRING` | Gene symbol associated with the most severe consequence |
-| `rsid` | `STRING` | dbSNP rsID when available. The only place rsIDs are stored — the association views have none |
+| `rsid` | `STRING` | dbSNP rsID when available. The rsID source for the credible-set, colocalization and exome views, which have none of their own; asm_qtl_v and variant_effect_v carry their own rsid |
 | `EXOME_enrichment_nfe` | `FLOAT64` | Finnish vs non-Finnish European allele-frequency ratio from gnomAD exomes. Values above ~2 mark Finnish-enriched variants |
 | `GENOME_enrichment_nfe` | `FLOAT64` | Finnish vs non-Finnish European allele-frequency ratio from gnomAD genomes |
 | `index` | `INT64` | Row index in the source annotation file, not a genetic quantity |

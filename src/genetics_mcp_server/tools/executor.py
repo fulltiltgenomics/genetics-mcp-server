@@ -2172,7 +2172,7 @@ class ToolExecutor:
         `phenotypes_v` row this query already joins for the display name.
 
         Rows where the gene was tested but the meta-analysis produced no estimate carry
-        NULL from `beta` onward and are 65% of the view; they are excluded unless
+        NULL in every statistic column (`beta` through `mlog10_fdr_q_secondary`) and are 65% of the view; they are excluded unless
         `include_no_estimate` is set, because a page of NULLs answers nothing.
         """
         if gene is None and phenotype is None:
@@ -3168,7 +3168,8 @@ class ToolExecutor:
                 if vid and vid not in nearest_by_variant:
                     nearest_by_variant[vid] = {
                         "variant": vid,
-                        "gene": g.get("name") or g.get("hgnc_symbol", ""),
+                        # hgnc_symbol is empty for a GENCODE-only gene, so the GENCODE name leads
+                        "gene": g.get("gene_name") or g.get("hgnc_symbol") or "",
                         "distance": g.get("distance", 0),
                     }
             gene_results = [

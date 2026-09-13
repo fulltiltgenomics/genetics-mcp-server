@@ -22,7 +22,7 @@ against peak_start/peak_end. Always filter by resource, not dataset.
 | `life_stage` | `STRING` | Developmental stage (fetal, adult, unknown) |
 | `condition` | `STRING` | Experimental condition (resting, stimulated, AD, control, unknown) |
 | `assay` | `STRING` | Assay type (scATAC, snATAC, bulk_ATAC, chromHMM) |
-| `score` | `FLOAT64` | Peak signal strength (NA for presence/ChromHMM data) |
+| `score` | `FLOAT64` | Peak signal strength (NULL for presence/ChromHMM data) |
 | `score_type` | `STRING` | Meaning of score (e.g. signal, cpm, presence, chromhmm:<State>) |
 | `n_cells` | `INT64` | Number of cells supporting the peak (single-cell assays) |
 | `cell_ontology_id` | `STRING` | Cell Ontology (CL) identifier where available |

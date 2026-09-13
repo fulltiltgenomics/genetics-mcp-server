@@ -533,8 +533,9 @@ class GeneticsClient:
         `beta` is ln(odds ratio): OR = exp(beta), and `beta_lower`/`beta_upper` are the 95%
         CI on the same scale. Every gene is present for every phenotype and CNV type,
         including the 65% of rows where the gene was tested but no estimate came out (NULL
-        from `beta` onward); those are dropped unless `include_no_estimate=True`, so the
-        frame is never mostly nulls by accident. Do not use `n_nominal_cohorts` as a proxy
+        in every statistic column, `beta` through `mlog10_fdr_q_secondary`); those are
+        dropped unless `include_no_estimate=True`, so the frame is never mostly nulls by
+        accident. Do not use `n_nominal_cohorts` as a proxy
         for that filter — the null rows are not the n_nominal_cohorts=0 rows.
 
         `significant_only=True` applies the paper's own rule, both tiers with the
@@ -571,9 +572,10 @@ class GeneticsClient:
     ) -> pl.DataFrame:
         """Allele-specific methylation QTL results.
 
-        `limit` is a DISPLAY bound, not a work bound: db-api strips the trailing LIMIT so
-        the full join and ORDER BY still run server-side. Lowering it makes the query no
-        cheaper, and a truncated result raises rather than returning a prefix.
+        `limit` is a DISPLAY bound, not a work bound: the executor strips the trailing LIMIT
+        before calling db-api, so the full join and ORDER BY still run server-side.
+        Lowering it makes the query no cheaper, and a truncated result raises rather than
+        returning a prefix.
         """
         key, value = _one_of(variant=variant, gene=gene)
         if key == "variant":
@@ -601,9 +603,10 @@ class GeneticsClient:
     ) -> pl.DataFrame:
         """Open-chromatin atlas peaks.
 
-        `limit` is a DISPLAY bound, not a work bound: db-api strips the trailing LIMIT so
-        the full join and ORDER BY still run server-side. Lowering it makes the query no
-        cheaper, and a truncated result raises rather than returning a prefix.
+        `limit` is a DISPLAY bound, not a work bound: the executor strips the trailing LIMIT
+        before calling db-api, so the full join and ORDER BY still run server-side.
+        Lowering it makes the query no cheaper, and a truncated result raises rather than
+        returning a prefix.
         """
         key, value = _one_of(variant=variant, region=region, peak=peak, gene=gene)
         if key == "variant":
@@ -657,9 +660,10 @@ class GeneticsClient:
     ) -> pl.DataFrame:
         """In-silico predicted variant effects on chromatin accessibility.
 
-        `limit` is a DISPLAY bound, not a work bound: db-api strips the trailing LIMIT so
-        the full join and ORDER BY still run server-side. Lowering it makes the query no
-        cheaper, and a truncated result raises rather than returning a prefix.
+        `limit` is a DISPLAY bound, not a work bound: the executor strips the trailing LIMIT
+        before calling db-api, so the full join and ORDER BY still run server-side.
+        Lowering it makes the query no cheaper, and a truncated result raises rather than
+        returning a prefix.
         """
         key, value = _one_of(variant=variant, gene=gene)
         if key == "variant":
@@ -688,9 +692,10 @@ class GeneticsClient:
     ) -> pl.DataFrame:
         """Measured MPRA cis-regulatory allelic activity (long: one row per cell line).
 
-        `limit` is a DISPLAY bound, not a work bound: db-api strips the trailing LIMIT so
-        the full join and ORDER BY still run server-side. Lowering it makes the query no
-        cheaper, and a truncated result raises rather than returning a prefix.
+        `limit` is a DISPLAY bound, not a work bound: the executor strips the trailing LIMIT
+        before calling db-api, so the full join and ORDER BY still run server-side.
+        Lowering it makes the query no cheaper, and a truncated result raises rather than
+        returning a prefix.
         """
         key, value = _one_of(variant=variant, region=region, gene=gene)
         if key == "variant":
@@ -724,9 +729,10 @@ class GeneticsClient:
         Separate from `mpra()` rather than a keyword on it: this is a join of two views and
         returns credible-set columns alongside MPRA columns, so the row shape differs.
 
-        `limit` is a DISPLAY bound, not a work bound: db-api strips the trailing LIMIT so
-        the full join and ORDER BY still run server-side. Lowering it makes the query no
-        cheaper, and a truncated result raises rather than returning a prefix.
+        `limit` is a DISPLAY bound, not a work bound: the executor strips the trailing LIMIT
+        before calling db-api, so the full join and ORDER BY still run server-side.
+        Lowering it makes the query no cheaper, and a truncated result raises rather than
+        returning a prefix.
         """
         return self._rows(
             await self._executor.get_mpra_pip_concordance_by_gene(
@@ -750,7 +756,14 @@ class GeneticsClient:
         variants: list[str] | None = None,
         source: str = "finngen",
     ) -> pl.DataFrame:
-        """Variant annotations (consequence, AF, gene) for one variant, a region, a gene or a batch."""
+        """Variant annotations (consequence, AF, gene) for one variant, a region, a gene or a batch.
+
+        The columns depend on `source`: finngen rows carry AF, AC_Het/AC_Hom, rsid and the
+        exome/genome enrichment values; gnomad rows carry per-population AF_* columns,
+        AN, filters, rsids and consequences, and no counts or enrichment. Every value is
+        a string on both sources (pos, AF included), so cast before comparing or doing
+        arithmetic.
+        """
         _one_of(variant=variant, region=region, gene=gene, variants=variants)
         return self._rows(
             await self._executor.get_variant_annotations(
@@ -1055,6 +1068,10 @@ class GeneticsClient:
                          "examples": [{"description": str, "sql": str}]}],
              "resources": {...},
              "warnings": [{"view": str, "error": str}]}
+
+        A column whose allowed values depend on another column carries
+        `allowed_values_by_<column>` (a dict keyed by that column's value, e.g.
+        `allowed_values_by_resource`) in place of `allowed_values`.
 
         Columns are therefore `schema(table)["tables"][0]["columns"]`, and every table is
         `{t["name"]: t for t in schema()["tables"]}`.
