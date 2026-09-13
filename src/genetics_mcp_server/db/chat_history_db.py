@@ -22,6 +22,30 @@ logger = logging.getLogger(__name__)
 # as good as the filing
 PROJECTS_MAX_PER_USER = 20
 
+# shared by the CREATE TABLE and the one-time rebuild in _relax_turn_metrics_columns, so the
+# two cannot describe different tables
+_TURN_METRICS_COLUMNS = """
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    message_id TEXT,
+    user_id TEXT,
+    iterations INTEGER NOT NULL,
+    tool_call_count INTEGER,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER,
+    cache_create_tokens INTEGER,
+    cost_usd REAL NOT NULL,
+    wall_ms INTEGER,
+    tool_profile TEXT,
+    model TEXT,
+    source TEXT NOT NULL DEFAULT 'live',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+"""
+
+# how far back each admin analytics period reaches; shared by the usage and cost queries
+_ANALYTICS_PERIOD_DAYS = {"week": 7, "month": 30, "year": 365}
+
 
 @dataclass
 class ChatProject:
@@ -327,25 +351,17 @@ class ChatHistoryDB(object, metaclass=Singleton):
         # is globally unique on its own, so it needs no session_id to disambiguate; the
         # partial unique index gives the "one row per assistant turn" guarantee without
         # forcing a key onto rows that have no message id yet.
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chat_turn_metrics (
-                id TEXT PRIMARY KEY,
-                session_id TEXT,
-                message_id TEXT,
-                user_id TEXT,
-                iterations INTEGER NOT NULL,
-                tool_call_count INTEGER NOT NULL,
-                input_tokens INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                cache_read_tokens INTEGER NOT NULL,
-                cache_create_tokens INTEGER NOT NULL,
-                cost_usd REAL NOT NULL,
-                wall_ms INTEGER NOT NULL,
-                tool_profile TEXT,
-                model TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        #
+        # source is 'live' for rows written by the stream as the turn completes and 'log'
+        # for rows recovered from the "Chat complete:" log line of turns that ran before
+        # this table existed. The log line carries only iterations, the two token totals
+        # and the cost, so a 'log' row holds NULL — not 0 — in tool_call_count, the cache
+        # token counts and wall_ms; a consumer that averages those must skip NULL rather
+        # than read a backfilled turn as instantaneous and uncached.
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS chat_turn_metrics ({_TURN_METRICS_COLUMNS})"
+        )
+        self._relax_turn_metrics_columns(cursor)
 
         cursor.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_turn_metrics_message
@@ -375,6 +391,47 @@ class ChatHistoryDB(object, metaclass=Singleton):
         """)
 
         self._conn.commit()
+
+    @staticmethod
+    def _relax_turn_metrics_columns(cursor: sqlite3.Cursor) -> None:
+        """Rebuild chat_turn_metrics once so the columns a log-recovered turn cannot know
+        accept NULL, and so the row carries its `source`.
+
+        SQLite cannot drop a NOT NULL constraint in place. The rebuild is keyed on wall_ms
+        still being NOT NULL, copies whichever of the current columns the old table has (a
+        database predating user_id is rebuilt too, its rows keeping NULL there), and runs as
+        one explicit transaction so a crash mid-way leaves the old table untouched. The
+        indexes are recreated by the IF NOT EXISTS statements that follow in _init_db,
+        which is why this runs before them.
+        """
+        cursor.execute("PRAGMA table_info(chat_turn_metrics)")
+        info = cursor.fetchall()
+        if not any(row[1] == "wall_ms" and row[3] for row in info):
+            return
+        present = {row[1] for row in info}
+        wanted = [
+            "id", "session_id", "message_id", "user_id", "iterations", "tool_call_count",
+            "input_tokens", "output_tokens", "cache_read_tokens", "cache_create_tokens",
+            "cost_usd", "wall_ms", "tool_profile", "model", "created_at",
+        ]
+        columns = ", ".join(c for c in wanted if c in present)
+        cursor.execute("BEGIN")
+        try:
+            cursor.execute("DROP TABLE IF EXISTS chat_turn_metrics_relaxed")
+            cursor.execute(
+                f"CREATE TABLE chat_turn_metrics_relaxed ({_TURN_METRICS_COLUMNS})"
+            )
+            cursor.execute(
+                f"INSERT INTO chat_turn_metrics_relaxed ({columns}) "
+                f"SELECT {columns} FROM chat_turn_metrics"
+            )
+            cursor.execute("DROP TABLE chat_turn_metrics")
+            cursor.execute("ALTER TABLE chat_turn_metrics_relaxed RENAME TO chat_turn_metrics")
+            cursor.execute("COMMIT")
+        except BaseException:
+            cursor.execute("ROLLBACK")
+            raise
+        logger.info("chat_turn_metrics rebuilt with nullable telemetry columns and source")
 
     def create_session(
         self,
@@ -1448,7 +1505,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         period: 'week' (7 days), 'month' (30 days), or 'year' (365 days)
         """
-        days = {"week": 7, "month": 30, "year": 365}.get(period, 7)
+        days = _ANALYTICS_PERIOD_DAYS.get(period, 7)
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
@@ -1468,6 +1525,79 @@ class ChatHistoryDB(object, metaclass=Singleton):
             {"date": row["day"], "unique_users": row["unique_users"], "conversations": row["conversations"]}
             for row in cursor.fetchall()
         ]
+
+    def get_cost_analytics(self, period: str = "week") -> dict:
+        """LLM spend over the period: per day, and per user next to that user's conversations.
+
+        Both halves use the same window, `created_at >= date('now', -N days)`, as
+        get_usage_analytics, so the Usage tab's plot and table agree with the Conversations
+        tab's plot about which days are in. The two halves count different things on
+        purpose: `usd` sums every turn recorded in the window, while `conversations` and
+        `avg_messages` describe the sessions *created* in it — a turn taken this week in a
+        conversation opened last month is this week's spend but not this week's
+        conversation. A user therefore appears with spend and no conversations, or the
+        reverse, and both are correct.
+
+        Rows of chat_turn_metrics predating the user_id column carry NULL there; they are
+        grouped under "(unknown)" rather than dropped, so the table's total matches the plot.
+        """
+        days = _ANALYTICS_PERIOD_DAYS.get(period, 7)
+        since = (f"-{days} days",)
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT date(created_at) AS day, SUM(cost_usd) AS usd
+            FROM chat_turn_metrics
+            WHERE created_at >= date('now', ?)
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            since,
+        )
+        daily = [{"date": row["day"], "usd": row["usd"]} for row in cursor.fetchall()]
+
+        users: dict[str, dict] = {}
+
+        def entry(user_id: str | None) -> dict:
+            key = user_id or "(unknown)"
+            return users.setdefault(
+                key, {"user": key, "conversations": 0, "avg_messages": 0.0, "usd": 0.0}
+            )
+
+        cursor.execute(
+            """
+            SELECT s.user_id, COUNT(DISTINCT s.id) AS conversations, COUNT(m.id) AS messages
+            FROM chat_sessions s
+            LEFT JOIN chat_messages m ON m.session_id = s.id
+            WHERE s.created_at >= date('now', ?)
+            GROUP BY s.user_id
+            """,
+            since,
+        )
+        for row in cursor.fetchall():
+            e = entry(row["user_id"])
+            e["conversations"] = row["conversations"]
+            e["avg_messages"] = row["messages"] / row["conversations"]
+
+        cursor.execute(
+            """
+            SELECT user_id, SUM(cost_usd) AS usd
+            FROM chat_turn_metrics
+            WHERE created_at >= date('now', ?)
+            GROUP BY user_id
+            """,
+            since,
+        )
+        for row in cursor.fetchall():
+            entry(row["user_id"])["usd"] = row["usd"]
+
+        return {
+            "daily": daily,
+            "users": sorted(users.values(), key=lambda u: (-u["usd"], u["user"])),
+        }
 
     def list_sessions_with_comments(self) -> list[dict]:
         """List sessions with non-empty comments, ordered by created_at DESC.
@@ -1634,7 +1764,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             """
             SELECT id, session_id, message_id, user_id, iterations, tool_call_count,
                    input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                   cost_usd, wall_ms, tool_profile, model, created_at
+                   cost_usd, wall_ms, tool_profile, model, source, created_at
             FROM chat_turn_metrics
             WHERE session_id = ?
             ORDER BY created_at ASC
@@ -1642,6 +1772,64 @@ class ChatHistoryDB(object, metaclass=Singleton):
             (session_id,),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def backfill_turn_metrics_from_log(self, turns: list[dict]) -> dict[str, int]:
+        """Insert turns recovered from "Chat complete:" log lines as source='log' rows.
+
+        Each turn is a dict with `log_id` (the log entry's insertId), `created_at` (the log
+        timestamp, "YYYY-MM-DD HH:MM:SS" UTC like CURRENT_TIMESTAMP writes), `user_id`,
+        `session_id` (None when the line predates the session prefix or says "unknown"),
+        `model`, `iterations`, `input_tokens`, `output_tokens` and `cost_usd`.
+
+        Idempotent two ways. The row id is derived from the log entry's insertId, so the
+        same export run twice inserts nothing the second time (INSERT OR IGNORE on the
+        primary key). And no line at or after the earliest live row is taken: one live row
+        exists exactly when one "Chat complete:" line does, so from that instant on the
+        table is already complete and a log row would double-count the turn. A database
+        with no live rows yet takes every line.
+
+        The unknowable columns — tool_call_count, the cache token counts, wall_ms — are
+        left NULL rather than written as 0; see the table comment in _init_db.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MIN(created_at) FROM chat_turn_metrics WHERE source = 'live'")
+        live_from = cursor.fetchone()[0]
+
+        inserted = existing = after_live = 0
+        try:
+            for t in turns:
+                if live_from is not None and t["created_at"] >= live_from:
+                    after_live += 1
+                    continue
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO chat_turn_metrics (
+                        id, session_id, message_id, user_id, iterations, input_tokens,
+                        output_tokens, cost_usd, model, source, created_at
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'log', ?)
+                    """,
+                    (
+                        f"log:{t['log_id']}", t.get("session_id"), t["user_id"],
+                        t["iterations"], t["input_tokens"], t["output_tokens"],
+                        t["cost_usd"], t.get("model"), t["created_at"],
+                    ),
+                )
+                if cursor.rowcount > 0:
+                    inserted += 1
+                else:
+                    existing += 1
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return {
+            "inserted": inserted,
+            "already_present": existing,
+            "skipped_after_live": after_live,
+            "live_from": live_from,
+        }
 
     def upsert_analysis(
         self,

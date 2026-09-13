@@ -1595,11 +1595,31 @@ deployment that also served OpenAI. Since `genetics-results-suite-c4s` refuses
 `provider="openai"` at the request boundary, no such deployment can exist and the gap is
 latent rather than live. It holds
 `iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
-`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model` and `created_at`. Before it,
-these numbers existed only in Cloud Logging and had to be recovered from the BigQuery log sink;
-`chat_messages.content_json` is not a substitute, because it flattens a whole turn's blocks into
-one assistant record, leaving parallel and sequential tool calls indistinguishable and roundtrips
-per turn underivable.
+`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model`, `source` and `created_at`.
+Before it, these numbers existed only in Cloud Logging and had to be recovered from the BigQuery
+log sink; `chat_messages.content_json` is not a substitute, because it flattens a whole turn's
+blocks into one assistant record, leaving parallel and sequential tool calls indistinguishable and
+roundtrips per turn underivable.
+
+- **`source` and the log backfill.** `source` is `live` for rows the stream writes and `log` for
+  turns recovered from the `Chat complete:` line in the BigQuery sink, for the months before the
+  table existed. The log line carries only the iteration count, the two token totals and the cost,
+  so `tool_call_count`, both cache token counts and `wall_ms` are nullable and a `log` row holds
+  NULL there — never 0, which would read as an instantaneous, uncached turn to anything averaging
+  the column (`memory_premise_stats` already skips NULL). A database created before this rebuilds
+  the table once at startup (`_relax_turn_metrics_columns`, keyed on `wall_ms` still being NOT
+  NULL, one explicit transaction). The backfill is `scripts/turn_metrics_from_logs.sql` — one row
+  per log line of the cluster named by its `@cluster` parameter, both datasets read and
+  de-duplicated on `insertId`, because the staging cluster's lines reached the production dataset
+  before the staging sink existed — piped into `python -m
+  genetics_mcp_server.scripts.backfill_turn_metrics` inside the chat-backend pod, which calls
+  `ChatHistoryDB.backfill_turn_metrics_from_log`. Two rules make a re-run harmless: the row id is
+  `log:<insertId>` under `INSERT OR IGNORE`, and no line at or after the earliest `live` row is
+  taken, since one live row exists exactly when one log line does and the table is complete from
+  that instant. A `[session=unknown]` line, or one predating the session prefix, yields a row with
+  `session_id` NULL that is still attributed to its user; `message_id` is always NULL on a `log`
+  row. The cost written is whatever `cost.py` priced the turn at when it ran, at Anthropic list
+  price — no discount is applied anywhere in the suite.
 
 - **Keying.** A surrogate `id`, plus `session_id` and `message_id` columns and a *partial* unique
   index on `message_id WHERE message_id IS NOT NULL`. `message_id` is the client-generated
@@ -2071,6 +2091,7 @@ src/genetics_mcp_server/
 │   ├── analysis_timeseries.py  # shared rolling-window aggregation used by both renderers
 │   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
+│   ├── backfill_turn_metrics.py # chat_turn_metrics rows from the log sink, for turns before the table existed
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
 │   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
 │   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
@@ -2767,6 +2788,7 @@ Admin endpoints:
 - `GET /chat/v1/admin/sessions` — list all sessions with filters and pagination. Each session item carries conversation-analysis fields (LEFT JOINed from `conversation_analysis`): `disposition`, `issue_count`, `issue_categories` (list of strings), `llm_rating` (the `llm_quality_score`, 1-5 or null), `success_label`. Filters: `user`, `date_from`, `date_to`, `session_id`, plus analysis filters `disposition` (exact), `success_label` (exact), `min_issues` (keep sessions with `issue_count >= N`), and `rating`. The `rating` param is a **string**: `"1"`..`"5"` filter the exact LLM rating, and the sentinel `"NA"` filters to unrated sessions (no `llm_quality_score`, i.e. unanalyzed sessions or rows with a NULL score). NA is implemented via the `unrated: bool` param on `ChatHistoryDB.list_all_sessions` (`a.llm_quality_score IS NULL`). The paginated `total` reflects all active filters.
 - `GET /chat/v1/admin/sessions/{id}` — session detail with all messages
 - `GET /chat/v1/admin/analytics/usage?period=week|month|year` — daily usage stats (unique users, conversations)
+- `GET /chat/v1/admin/analytics/cost?period=week|month|year` — the Usage tab: `daily` (`date`, `usd` summed from `chat_turn_metrics`) and `users` (`user`, `conversations`, `avg_messages`, `usd`), both over the same `created_at >= date('now', -N days)` window the usage endpoint uses. `conversations` and `avg_messages` (all roles, unrounded — the tab rounds) describe the sessions *created* in the window; `usd` sums every turn *recorded* in it, so a user can show spend with no conversations or the reverse, and rows whose `user_id` is NULL group under `(unknown)`. Sorted by spend, then name. Sourced from `ChatHistoryDB.get_cost_analytics`.
 - `GET /chat/v1/admin/analytics/quality` — raw per-conversation analysis rows for the Quality plots tab (`rows` of `session_id`, `created_at`, `llm_quality_score`, `llm_disposition`, `success_label`, `issue_categories`). Returned unaggregated (ordered by `created_at`); the frontend does the rolling-window aggregation client-side. Sourced from `ChatHistoryDB.list_all_analysis_rows`.
 - `GET /chat/v1/admin/feedback` — unified, paginated feed of all user feedback sorted by `created_at` DESC. Merges two sources: standalone feedback from the `user_comments` table (submitted via the Feedback dialog) and per-session comments from `chat_sessions.comment`. Response includes `items` (each with `user`, `comment`, `preview`, `created_at`, `source`, and optional `session_id`), `total` count, `latest_at` timestamp, and pagination parameters (`offset`, `limit`). The merge is ordered by `(created_at, source, id)`, not `created_at` alone: `created_at` is `CURRENT_TIMESTAMP` in both tables and has one-second resolution, so submissions inside one second tie and neither query orders them, and a page is a slice of that order — a boundary inside a tie would show an admin one item twice and hide another. The two sources have separate id spaces (an autoincrement int, a session uuid), which never meet because `source` is compared first
 

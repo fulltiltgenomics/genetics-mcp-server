@@ -81,6 +81,24 @@ class UsageAnalyticsResponse(BaseModel):
     data: list[UsageDataPoint]
 
 
+class CostDataPoint(BaseModel):
+    date: str
+    usd: float
+
+
+class UserUsageRow(BaseModel):
+    user: str
+    conversations: int
+    avg_messages: float
+    usd: float
+
+
+class CostAnalyticsResponse(BaseModel):
+    period: str
+    daily: list[CostDataPoint]
+    users: list[UserUsageRow]
+
+
 class QualityRow(BaseModel):
     session_id: str
     created_at: str
@@ -264,6 +282,24 @@ async def get_usage_analytics(
     return UsageAnalyticsResponse(
         period=period,
         data=[UsageDataPoint(**d) for d in data],
+    )
+
+
+@router.get("/admin/analytics/cost", response_model=CostAnalyticsResponse)
+async def get_cost_analytics(
+    period: str = "week",
+    admin_user: str = Depends(admin_required),
+):
+    """LLM spend for the Usage tab: USD per day, and per user beside that user's
+    conversation count and mean messages per conversation, all over the same window."""
+    if period not in ("week", "month", "year"):
+        raise HTTPException(status_code=400, detail="period must be 'week', 'month', or 'year'")
+
+    data = get_chat_history_db().get_cost_analytics(period)
+    return CostAnalyticsResponse(
+        period=period,
+        daily=[CostDataPoint(**d) for d in data["daily"]],
+        users=[UserUsageRow(**u) for u in data["users"]],
     )
 
 
