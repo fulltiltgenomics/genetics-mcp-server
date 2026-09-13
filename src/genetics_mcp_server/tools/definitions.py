@@ -817,7 +817,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "parameters": {
             "resource": {
                 "type": "string",
-                "description": "Gene-based data resource ('genebass', 'schema', 'bipex', 'ibd')",
+                "description": "Gene-based data resource ('genebass', 'schema2', 'bipex2', 'ibd_exome_2026')",
                 "required": True,
             },
             "phenotype": {
