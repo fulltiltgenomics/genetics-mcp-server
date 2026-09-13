@@ -163,6 +163,7 @@ def _inactive_result(accession: str, entry: dict[str, Any], reviewed_only: bool)
         "match_basis": "accession",
         "ambiguous": True,
         "alternatives": [],
+        "reviewed_only": reviewed_only,
         "inactive": True,
         "inactive_reason": reason_type,
         "replaced_by": replaced_by,
@@ -566,7 +567,7 @@ class UniProtClient:
             )
 
         if body.get("entryType") == "Inactive":
-            inactive = _inactive_result(accession, body)
+            inactive = _inactive_result(accession, body, reviewed_only)
             return await self._as_symbol(
                 accession,
                 organism_id,

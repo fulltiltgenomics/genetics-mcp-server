@@ -38,14 +38,7 @@ so match on `SPLIT(c.trait2, '.')[OFFSET(0)]` and also require `c.chr = a.chr`.
 | `download_date` | `DATE` | Date the source data was downloaded/built |
 | `resource` | `STRING` | Data source identifier, constant 'hgnc' |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -55,8 +48,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against gene_annotations_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against gene_annotations_v as written.
 
 ### Coordinates for a set of genes, to drive window queries against the result views. A symbol can have several rows, so aggregate to one interval per gene; chr is INT64 here and in the result views, so joins need no casting.
 

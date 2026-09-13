@@ -48,3 +48,7 @@ htmlcov/
 .dolt/
 *.db
 .beads-credential-key
+
+# per-session git worktrees, never part of the tree
+.claude/worktrees/
+*~

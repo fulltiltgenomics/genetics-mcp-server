@@ -52,14 +52,7 @@ the query scans every chromosome.
 | `resource1` | `STRING` | Data source for study 1 (lowercase) |
 | `resource2` | `STRING` | Data source for study 2 (lowercase) |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -72,8 +65,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against colocalization_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against colocalization_v as written.
 
 ### What molecular QTLs colocalize with a GWAS phenotype — the usual 'what is the likely mechanism' query
 

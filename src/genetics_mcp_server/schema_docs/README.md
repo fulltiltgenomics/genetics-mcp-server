@@ -18,24 +18,33 @@ GB scanned across one execution. Exceeding any of them raises GeneticsError — 
 answer is never returned as a short frame — so aggregate and filter in SQL rather than
 fetching every row, and add the partition predicate each view's section names.
 
+Every view's section below is laid out the same way. The `Columns` table's types are that
+view's own BigQuery types — match the literal to the type: a quoted string never compares
+equal to a numeric column, and an ARRAY column has to go through UNNEST (`<value> IN
+UNNEST(<column>)`), never a bare `=`. `SELECT DISTINCT` the columns listed under `Columns
+with a small, enumerable set of values` before filtering on them rather than guessing a
+value; a parent there means the values are scoped by that column, so enumerate the pair. The
+worked examples run as written — copy the shape rather than inventing one; each shows the
+filters that view expects.
+
 | view | summary |
 | --- | --- |
-| `credible_sets_v` | Fine-mapped credible sets with variant-level posterior inclusion probabilities (PIP). |
-| `colocalization_v` | Colocalization analysis results (coloc.susie) between pairs of studies. |
-| `coloc_credsets_v` | Individual credible set variants in colocalized credible sets. |
-| `exome_variant_results_v` | Single-variant exome association results from multiple resources with different significance thresholds. |
-| `gene_burden_results_v` | Gene-level burden test results from exome sequencing studies (e.g. |
-| `asm_qtl_v` | Allele-specific methylation QTL (ASM-QTL) results from deCODE Genetics (Stefansson et al. |
-| `open_chromatin_v` | Atlas of accessible/active chromatin regions (peaks) labeled by cell type, tissue, and condition. |
-| `variant_effect_v` | In-silico PREDICTED effects of variants on chromatin accessibility from deep-learning models (ChromBPNet and FLARE). |
-| `mpra_v` | MEASURED cis-regulatory allelic activity from a massively parallel reporter assay (Siraj et al. |
-| `hla_associations_v` | Classical HLA allele associations from FinnGen R14 — every imputed HLA allele tested against every core R14 endpoint (~2,712 phenotypes x 187 alleles across 10 genes). |
-| `gene_annotations_v` | Whole-universe gene annotations, one row per gene: HGNC core fields joined to GENCODE GRCh38 coordinates, with full-lineage HGNC gene-group arrays (gene_group_ids / gene_group_names contain the leaf group plus all of its ancestor groups, so any group can be matched with `<id> IN UNNEST(gene_group_ids)`). |
-| `dosage_sensitivity_v` | Rare-CNV dosage sensitivity scores from Collins et al. |
-| `rcnv_gene_associations_v` | Gene-level rare-CNV association statistics from Collins et al. |
-| `rcnv_segments_v` | The 163 disease-associated rare-CNV segments of Collins et al. |
-| `rcnv_window_associations_v` | Sliding-window rare-CNV association statistics from Collins et al. |
-| `variant_annotation_v` | Per-variant functional annotation and FinnGen (R14) allele frequencies — one row per variant, covering all imputed variants, not only fine-mapped ones. |
-| `peak_to_gene_v` | Open4Gene peak-to-gene links from FinnGen ATAC-seq: which genes a chromatin peak's accessibility is associated with, in which cell type. |
-| `phenotypes_v` | Trait/phenotype metadata: the human-readable name, trait type, category and sample sizes behind the opaque phenotype codes the results tables store. |
-| `datasets_v` | Dataset registry: what every `dataset` value appearing in the results views actually is — its resource, version, provenance, description and credible-set caveats. |
+| `credible_sets_v` | Fine-mapped credible sets, variant PIPs |
+| `colocalization_v` | Colocalization between study pairs (coloc.susie) |
+| `coloc_credsets_v` | Variants inside colocalized credible sets |
+| `exome_variant_results_v` | Single-variant exome association results |
+| `gene_burden_results_v` | Gene-level exome burden tests |
+| `asm_qtl_v` | Allele-specific methylation QTLs (deCODE) |
+| `open_chromatin_v` | Accessible-chromatin peak atlas by cell type |
+| `variant_effect_v` | Predicted variant effects on chromatin accessibility |
+| `mpra_v` | Measured MPRA allelic regulatory activity |
+| `hla_associations_v` | Classical HLA allele associations (FinnGen R14) |
+| `gene_annotations_v` | Gene reference: HGNC, coordinates, gene groups |
+| `dosage_sensitivity_v` | Per-gene dosage sensitivity (pHaplo/pTriplo) |
+| `rcnv_gene_associations_v` | Gene-level rare-CNV associations |
+| `rcnv_segments_v` | Disease-associated rare-CNV segments |
+| `rcnv_window_associations_v` | Sliding-window rare-CNV associations |
+| `variant_annotation_v` | Per-variant annotation, rsIDs, FinnGen frequencies |
+| `peak_to_gene_v` | Peak-to-gene links (makes caQTL gene-based) |
+| `phenotypes_v` | Phenotype metadata behind trait codes |
+| `datasets_v` | Dataset registry: resource, version, caveats |

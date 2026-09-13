@@ -2770,3 +2770,180 @@ class TestChatTurnMetrics:
         # the rollback released the write lock, so the next writer succeeds
         self._record(chat_history_db, message_id="msg2")
         assert [r["message_id"] for r in chat_history_db.get_turn_metrics("sess1")] == ["msg2"]
+
+
+class TestChatTurnMetricsRelaxAndBackfill:
+    """The one-time column rebuild, and the log backfill that needs it."""
+
+    LEGACY_COLUMNS = """
+        id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, user_id TEXT,
+        iterations INTEGER NOT NULL, tool_call_count INTEGER NOT NULL,
+        input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+        cache_read_tokens INTEGER NOT NULL, cache_create_tokens INTEGER NOT NULL,
+        cost_usd REAL NOT NULL, wall_ms INTEGER NOT NULL, tool_profile TEXT, model TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    """
+
+    def _legacy_db(self, tmp_path, with_user_id=True):
+        """A database file whose chat_turn_metrics still has the NOT NULL telemetry columns."""
+        from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+
+        path = str(tmp_path / "legacy.db")
+        columns = self.LEGACY_COLUMNS if with_user_id else self.LEGACY_COLUMNS.replace(
+            "user_id TEXT,", ""
+        )
+        con = sqlite3.connect(path)
+        con.execute(f"CREATE TABLE chat_turn_metrics ({columns})")
+        con.execute(
+            "INSERT INTO chat_turn_metrics (id, session_id, iterations, tool_call_count, "
+            "input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd, "
+            "wall_ms, model, created_at) VALUES ('old', 's1', 2, 3, 100, 10, 50, 5, 0.75, "
+            "1200, 'claude-opus-5', '2026-08-26 10:17:10')"
+        )
+        con.commit()
+        con.close()
+        Singleton._instances.pop(ChatHistoryDB, None)
+        db = ChatHistoryDB(path)
+        return db
+
+    def _columns(self, db):
+        return {
+            row[1]: bool(row[3])
+            for row in db._conn.execute("PRAGMA table_info(chat_turn_metrics)").fetchall()
+        }
+
+    def test_rebuild_keeps_rows_and_drops_the_not_null(self, tmp_path):
+        db = self._legacy_db(tmp_path)
+        cols = self._columns(db)
+        assert cols["source"] is True
+        for c in ("tool_call_count", "cache_read_tokens", "cache_create_tokens", "wall_ms"):
+            assert cols[c] is False, c
+        for c in ("iterations", "input_tokens", "output_tokens", "cost_usd"):
+            assert cols[c] is True, c
+        rows = db.get_turn_metrics("s1")
+        assert len(rows) == 1
+        assert rows[0]["id"] == "old"
+        assert rows[0]["wall_ms"] == 1200
+        assert rows[0]["source"] == "live"
+        assert rows[0]["created_at"] == "2026-08-26 10:17:10"
+        # the indexes are recreated after the rebuild
+        names = {
+            r[0] for r in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='chat_turn_metrics'"
+            )
+        }
+        assert {"idx_chat_turn_metrics_message", "idx_chat_turn_metrics_session",
+                "idx_chat_turn_metrics_created_at", "idx_chat_turn_metrics_user"} <= names
+        assert not db._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='chat_turn_metrics_relaxed'"
+        ).fetchall()
+
+    def test_rebuild_survives_a_table_predating_user_id(self, tmp_path):
+        db = self._legacy_db(tmp_path, with_user_id=False)
+        rows = db.get_turn_metrics("s1")
+        assert rows[0]["user_id"] is None
+        assert rows[0]["cost_usd"] == 0.75
+
+    def test_rebuild_runs_once(self, tmp_path):
+        from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+
+        db = self._legacy_db(tmp_path)
+        db._conn.execute("INSERT INTO chat_turn_metrics (id, iterations, input_tokens, "
+                         "output_tokens, cost_usd, source) VALUES ('log:x', 1, 1, 1, 0.1, 'log')")
+        db._conn.commit()
+        Singleton._instances.pop(ChatHistoryDB, None)
+        again = ChatHistoryDB(db.db_path)
+        assert again._conn.execute(
+            "SELECT source FROM chat_turn_metrics WHERE id='log:x'"
+        ).fetchone()[0] == "log"
+
+    def _turn(self, **overrides):
+        t = dict(
+            log_id="abc", created_at="2026-05-01 12:00:00", user_id=USER, session_id="s1",
+            model="claude-opus-4-7", iterations=3, input_tokens=5000, output_tokens=400,
+            cost_usd=1.5,
+        )
+        t.update(overrides)
+        return t
+
+    def test_backfill_inserts_log_rows_with_unknowns_null(self, chat_history_db):
+        result = chat_history_db.backfill_turn_metrics_from_log(
+            [self._turn(), self._turn(log_id="def", session_id=None)]
+        )
+        assert result == {
+            "inserted": 2, "already_present": 0, "skipped_after_live": 0, "live_from": None,
+        }
+        rows = chat_history_db.get_turn_metrics("s1")
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["id"] == "log:abc"
+        assert row["source"] == "log"
+        assert row["message_id"] is None
+        assert (row["tool_call_count"], row["cache_read_tokens"],
+                row["cache_create_tokens"], row["wall_ms"]) == (None, None, None, None)
+        assert (row["iterations"], row["input_tokens"], row["output_tokens"]) == (3, 5000, 400)
+        assert row["cost_usd"] == 1.5
+        assert row["created_at"] == "2026-05-01 12:00:00"
+        assert row["model"] == "claude-opus-4-7"
+        unattributed = chat_history_db._conn.execute(
+            "SELECT user_id, session_id FROM chat_turn_metrics WHERE id='log:def'"
+        ).fetchone()
+        assert tuple(unattributed) == (USER, None)
+
+    def test_backfill_is_idempotent_on_the_log_id(self, chat_history_db):
+        chat_history_db.backfill_turn_metrics_from_log([self._turn()])
+        result = chat_history_db.backfill_turn_metrics_from_log(
+            [self._turn(cost_usd=99.0), self._turn(log_id="new")]
+        )
+        assert (result["inserted"], result["already_present"]) == (1, 1)
+        assert chat_history_db.get_turn_metrics("s1")[0]["cost_usd"] == 1.5
+
+    def test_backfill_stops_at_the_first_live_row(self, chat_history_db):
+        chat_history_db.record_turn_metrics(
+            session_id="live", message_id="m1", user_id=USER, iterations=1,
+            tool_call_count=0, input_tokens=1, output_tokens=1, cache_read_tokens=0,
+            cache_create_tokens=0, cost_usd=0.01, wall_ms=1,
+        )
+        live_from = chat_history_db.get_turn_metrics("live")[0]["created_at"]
+        before = self._turn(log_id="before", created_at="2020-01-01 00:00:00")
+        same_instant = self._turn(log_id="same", created_at=live_from)
+        after = self._turn(log_id="after", created_at="2999-01-01 00:00:00")
+        result = chat_history_db.backfill_turn_metrics_from_log([before, same_instant, after])
+        assert result["live_from"] == live_from
+        assert (result["inserted"], result["skipped_after_live"]) == (1, 2)
+        assert [r["id"] for r in chat_history_db.get_turn_metrics("s1")] == ["log:before"]
+
+    def test_cost_analytics_counts_log_and_live_rows_alike(self, chat_history_db):
+        session = chat_history_db.create_session(USER)
+        chat_history_db.add_message(session.id, "u1", "user", "hi")
+        chat_history_db.add_message(session.id, "a1", "assistant", "hello")
+        chat_history_db.add_message(session.id, "u2", "user", "more")
+        chat_history_db.record_turn_metrics(
+            session_id=session.id, message_id="a1", user_id=USER, iterations=1,
+            tool_call_count=0, input_tokens=1, output_tokens=1, cache_read_tokens=0,
+            cache_create_tokens=0, cost_usd=0.4, wall_ms=1,
+        )
+        yesterday = chat_history_db._conn.execute("SELECT datetime('now', '-1 day')").fetchone()[0]
+        chat_history_db.backfill_turn_metrics_from_log(
+            [self._turn(log_id="recent", created_at=yesterday, cost_usd=0.6)]
+        )
+        # the recent log row predates the live row (the cutoff) and sits inside the week; the
+        # ancient one is taken but outside every period
+        chat_history_db.backfill_turn_metrics_from_log(
+            [self._turn(log_id="ancient", created_at="2020-01-01 00:00:00", cost_usd=100)]
+        )
+        data = chat_history_db.get_cost_analytics("week")
+        assert [d["usd"] for d in data["daily"]] == [pytest.approx(0.6), pytest.approx(0.4)]
+        # the log row carries session "s1", which is no chat_sessions row, so only the live
+        # turn's 0.4 is a conversation's cost; the total still counts both
+        assert data["users"] == [
+            {
+                "user": USER, "conversations": 1, "avg_messages": 3.0, "max_messages": 3,
+                "usd": pytest.approx(1.0), "avg_usd": pytest.approx(0.4),
+                "max_usd": pytest.approx(0.4),
+            }
+        ]
+        year = chat_history_db.get_cost_analytics("year")
+        assert sum(d["usd"] for d in year["daily"]) == pytest.approx(1.0)

@@ -173,8 +173,9 @@ class TestAnalyzeVariantList:
         }
 
         gene_responses = {
-            v1: [{"name": "IL6R", "distance": 0}],
-            v2: [{"name": "APOE", "distance": 5000}],
+            v1: [{"gene_name": "IL6R", "hgnc_symbol": "IL6R", "distance": 0}],
+            # a GENCODE-only gene: the API leaves hgnc_symbol empty
+            v2: [{"gene_name": "AC010642.1", "hgnc_symbol": "", "distance": 5000}],
         }
 
         def _vid_to_fields(vid: str) -> dict:
@@ -240,7 +241,7 @@ class TestAnalyzeVariantList:
         # nearest genes
         genes = {g["variant"]: g for g in result["variant_genes"]}
         assert genes[v1]["nearest_gene"] == "IL6R"
-        assert genes[v2]["nearest_gene"] == "APOE"
+        assert genes[v2]["nearest_gene"] == "AC010642.1"
 
     @pytest.mark.asyncio
     async def test_direction_consistency(self):
@@ -259,7 +260,7 @@ class TestAnalyzeVariantList:
                     {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None, "resource": "FG", "dataset": "FG_R13", "chr": 1, "pos": 100, "ref": "A", "alt": "G"},
                 ]
             elif "nearest_genes" in url:
-                mock_resp.json.return_value = [{"name": "G1", "distance": 0, "variant": "1-100-A-G"}]
+                mock_resp.json.return_value = [{"gene_name": "G1", "hgnc_symbol": "G1", "distance": 0, "variant": "1-100-A-G"}]
             return mock_resp
 
         mock_client.post = mock_post

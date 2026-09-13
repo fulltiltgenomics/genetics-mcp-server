@@ -27,6 +27,7 @@ EXPECTED_BOUNDS = [
     ("get_mpra_pip_concordance_by_gene", "window", {"minimum": 0, "maximum": 10_000_000}),
     ("get_mpra_pip_concordance_by_gene", "min_pip", {"minimum": 0.0, "maximum": 1.0}),
     ("get_hla_by_allele", "max_rows", {"minimum": 1, "maximum": 100_000}),
+    ("query_database", "max_rows", {"maximum": 100_000}),
     ("run_analysis", "timeout_s", {"minimum": 1, "maximum": 120}),
     ("web_search", "max_results", {"maximum": 10}),
     ("search_mgi", "max_results", {"minimum": 1, "maximum": 100}),
@@ -86,14 +87,13 @@ def test_no_declared_bound_contradicts_its_own_default():
 def test_a_parameter_without_bounds_emits_an_unchanged_schema():
     """The builder must add nothing to a parameter that declares nothing.
 
-    `query_database.max_rows` is the deliberate abstainer: its cap lives downstream in
-    db-api, not here, so it carries no bound and its schema is exactly the four keys the
-    pre-4h6.70 builder produced.
+    `search_phenotypes.limit` declares no bound, so its schema is exactly the three keys
+    the builder emitted before it learned to forward bounds.
     """
-    prop = _schemas()["query_database"]["properties"]["max_rows"]
+    prop = _schemas()["search_phenotypes"]["properties"]["limit"]
     assert set(prop) == {"type", "description", "default"}
     assert prop["type"] == "integer"
-    assert prop["default"] == 1000
+    assert prop["default"] == 100
 
 
 def test_search_scientific_literature_max_results_stays_unbounded():

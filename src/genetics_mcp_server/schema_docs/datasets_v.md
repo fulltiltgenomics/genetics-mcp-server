@@ -37,14 +37,7 @@ credible_sets_v. Small table, so an unfiltered scan is cheap.
 | `collection` | `BOOL` | TRUE for a collection whose sub-studies carry subdataset_of = its dataset_id (eQTL Catalogue). A collection row never appears as a dataset value itself |
 | `subdataset_of` | `STRING` | Parent collection's dataset_id for sub-studies (QTD ids under eqtl_catalogue); NULL otherwise |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -54,8 +47,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against datasets_v as written. Copy the shape rather than inventing one —
-each shows the filters this view expects.
+Queries that run against datasets_v as written.
 
 ### Flag pseudo credible sets in the same result set, not after the fact
 

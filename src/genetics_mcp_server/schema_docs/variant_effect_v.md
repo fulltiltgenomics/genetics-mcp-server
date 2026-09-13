@@ -25,21 +25,14 @@ filter by resource, not dataset.
 | `life_stage` | `STRING` | Developmental stage (fetal, adult, unknown) |
 | `score` | `FLOAT64` | Predicted effect magnitude on accessibility |
 | `score_type` | `STRING` | Meaning of score (chrombpnet_abs_logfc, flare_score) |
-| `mlog10p` | `FLOAT64` | -log10(p) per-context significance (ChromBPNet; NA for FLARE) |
+| `mlog10p` | `FLOAT64` | -log10(p) per-context significance (ChromBPNet; NULL for FLARE) |
 | `predicted_direction` | `STRING` | Predicted direction of the accessibility effect |
 | `quantile_rank` | `FLOAT64` | Effect-strength rank (how strongly the variant is predicted to act) |
 | `is_significant` | `BOOL` | Whether the predicted effect passes the model's significance threshold |
 | `version` | `STRING` | Data release version |
 | `resource` | `STRING` | Data source identifier (lowercase). Always filter by this column, not dataset |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -50,8 +43,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against variant_effect_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against variant_effect_v as written.
 
 ### Predicted accessibility effect of a variant per cell type
 

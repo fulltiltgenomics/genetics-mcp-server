@@ -63,14 +63,27 @@ _DISABLED_TOOLS_ENV_VARS = (
     "ENABLE_SUBAGENTS",
     "ENABLE_LITERATURE_SEARCH",
     "SANDBOX_ENABLED",
+    "ALPHAGENOME_ENABLED",
+    "ALPHAGENOME_API_KEY",
 )
 
 # read off k8s/deployments/chat-backend.yaml and mcp-server.yaml in genetics-results-suite.
 # "unset" is the operative half: those manifests name neither ENABLE_CREDIBLE_SETS_STATS,
 # ENABLE_PHENOTYPE_REPORT nor ENABLE_LITERATURE_SEARCH, and mcp-server does not name
 # SANDBOX_ENABLED either, so each takes its settings.py default in the cluster.
+# ALPHAGENOME_ENABLED and ALPHAGENOME_API_KEY together gate the AlphaGenome tools:
+# ALPHAGENOME_ENABLED is the deployment's own switch (envsubst'd from terraform at deploy
+# time), and ALPHAGENOME_API_KEY is an OPTIONAL secret key on top of it. The baseline
+# records the deployment with both set, since the withdrawn direction is the trivial one;
+# mcp-server is never given either, and the tool is withheld from /mcp by `_mcp_disabled`
+# besides.
 DEPLOYED_FLAGS: dict[str, dict[str, str]] = {
-    "chat_backend": {"SANDBOX_ENABLED": "true", "ENABLE_SUBAGENTS": "false"},
+    "chat_backend": {
+        "SANDBOX_ENABLED": "true",
+        "ENABLE_SUBAGENTS": "false",
+        "ALPHAGENOME_ENABLED": "true",
+        "ALPHAGENOME_API_KEY": "configured",
+    },
     "mcp_server": {"ENABLE_SUBAGENTS": "false"},
 }
 

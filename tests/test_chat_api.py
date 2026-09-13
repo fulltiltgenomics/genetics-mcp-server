@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from conftest import settings_env
 
+from genetics_mcp_server import llm_service as llm_service_module
 from genetics_mcp_server import rate_limit
 from genetics_mcp_server.llm_service import StreamChunk
 
@@ -24,6 +25,37 @@ def _fresh_rate_limit_window():
     rate_limit._requests.clear()
     yield
     rate_limit._requests.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_provider():
+    """No test in this file reaches a real provider.
+
+    The assertions here are written for an environment with no ANTHROPIC_API_KEY — "may
+    fail if no API key", "may be 200/400 depending on provider availability" — so where a
+    key IS configured they quietly became live, billed API calls, at 6-8s each and failing
+    whenever the network did. Closing that by default rather than per test is what stops it
+    coming back: a test added later inherits it.
+
+    Only `stream_chat` and the two client handles are replaced, on the real singleton.
+    Substituting the whole service instead breaks /chat/v1/tools, which asks the same
+    object to describe the resolved tool surface and must get the real answer. A test
+    needing different provider behaviour still patches `get_llm_service` itself, and that
+    patch wins over this one.
+    """
+
+    async def stream(**kwargs):
+        yield StreamChunk(
+            type="done", content="", message_content=[{"type": "text", "text": "Hello!"}]
+        )
+
+    service = llm_service_module.get_llm_service()
+    with (
+        patch.object(service, "stream_chat", stream),
+        patch.object(service, "anthropic_client", True),
+        patch.object(service, "openai_client", None),
+    ):
+        yield service
 
 
 class TestStatusEndpoint:
@@ -726,17 +758,27 @@ class TestVerbosityPrompt:
         assert "DETAILED" in verbosity_prompt("detailed")
 
     def test_three_pass_analysis_survives_both_settings(self):
-        """Verbosity scopes the write-up; it must not drop the analysis method."""
+        """Verbosity scopes the write-up; it must not drop the analysis method.
+
+        Pinned against the prompt actually served, and the three passes are deliberately
+        the SAME bytes in every registered variant — both verbosity fragments name them,
+        so a variant that reworded them would leave the fragment describing a structure
+        its own prompt does not have.
+        """
         from genetics_mcp_server.config.defaults import (
+            PROMPT_VARIANTS,
             default_system_prompt,
             verbosity_prompt,
         )
 
-        for setting in ("brief", "detailed"):
-            prompt = default_system_prompt("FinnGenie") + verbosity_prompt(setting)
-            assert "PASS 1 - DATA EXTRACTION" in prompt
-            assert "PASS 2 - LITERATURE SEARCH" in prompt
-            assert "PASS 3 - DATA ANALYSIS" in prompt
+        for variant in PROMPT_VARIANTS:
+            for setting in ("brief", "detailed"):
+                prompt = default_system_prompt("FinnGenie", variant=variant) + verbosity_prompt(
+                    setting
+                )
+                assert "PASS 1 - DATA EXTRACTION" in prompt, variant
+                assert "PASS 2 - LITERATURE SEARCH" in prompt, variant
+                assert "PASS 3 - DATA ANALYSIS" in prompt, variant
 
 
 def _unfenced(fragment: str) -> str:
@@ -2233,3 +2275,34 @@ class TestMemorySSEEvent:
         assert not [e for e in events if e.get("type") == "memory"]
         assert not [e for e in events if e.get("type") == "error"]
         assert service.kwargs["user_memory"] is None
+
+
+class TestResolvedPromptVariant:
+    """The endpoint reports the RESOLVED variant, which is the half a caller cannot
+    compute: PROMPT_VARIANT coerces an unknown name to the default rather than raising,
+    so the configured string does not say what the model was given. A prompt A/B is two
+    processes differing only in that env var, and this is where the harness proves it."""
+
+    def test_the_endpoint_reports_the_variant_in_force(self, test_client):
+        from genetics_mcp_server.config.defaults import DEFAULT_PROMPT_VARIANT
+
+        body = test_client.get("/chat/v1/tools/resolved").json()
+
+        assert body["prompt_variant"] == DEFAULT_PROMPT_VARIANT
+
+    def test_an_unknown_configured_variant_is_reported_as_the_one_served(
+        self, test_client, monkeypatch
+    ):
+        """The whole reason the field is the resolved name and not the configured one."""
+        from genetics_mcp_server.config import defaults, get_settings
+
+        get_settings.cache_clear()
+        monkeypatch.setenv("PROMPT_VARIANT", "candidat")
+        try:
+            body = test_client.get("/chat/v1/tools/resolved").json()
+        finally:
+            get_settings.cache_clear()
+
+        assert body["prompt_variant"] == defaults.DEFAULT_PROMPT_VARIANT, (
+            "a benchmark arm pointed here is measuring the default, and must be told so"
+        )

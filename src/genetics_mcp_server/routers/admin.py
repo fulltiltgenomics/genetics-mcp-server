@@ -38,6 +38,8 @@ class AdminSessionItem(BaseModel):
     issue_categories: list[str] = []
     llm_rating: Optional[int] = None
     success_label: Optional[str] = None
+    # recorded LLM cost of the conversation at list price; None when no turn is attributed to it
+    usd: Optional[float] = None
     # name of the instruction set in force on the session's latest message that recorded one.
     # None when no message carried a set, or when the id no longer resolves for that user
     instruction_set_name: Optional[str] = None
@@ -79,6 +81,28 @@ class UsageDataPoint(BaseModel):
 class UsageAnalyticsResponse(BaseModel):
     period: str
     data: list[UsageDataPoint]
+
+
+class CostDataPoint(BaseModel):
+    date: str
+    usd: float
+
+
+class UserUsageRow(BaseModel):
+    user: str
+    conversations: int
+    avg_messages: float
+    max_messages: int
+    usd: float
+    # None when none of the user's conversations in the window has an attributed turn
+    avg_usd: Optional[float] = None
+    max_usd: Optional[float] = None
+
+
+class CostAnalyticsResponse(BaseModel):
+    period: str
+    daily: list[CostDataPoint]
+    users: list[UserUsageRow]
 
 
 class QualityRow(BaseModel):
@@ -185,11 +209,13 @@ async def list_all_sessions(
             set_names[key] = found.name if found else None
         return set_names[key]
 
+    costs = db.get_session_costs()
     items = []
     for s in sessions:
         preview = db.get_first_user_message(s.id)
         messages = db.get_messages(s.id)
         items.append(AdminSessionItem(
+            usd=costs.get(s.id),
             instruction_set_name=resolve_instruction_set_name(s.user_id, messages),
             id=s.id,
             user_id=s.user_id,
@@ -264,6 +290,24 @@ async def get_usage_analytics(
     return UsageAnalyticsResponse(
         period=period,
         data=[UsageDataPoint(**d) for d in data],
+    )
+
+
+@router.get("/admin/analytics/cost", response_model=CostAnalyticsResponse)
+async def get_cost_analytics(
+    period: str = "week",
+    admin_user: str = Depends(admin_required),
+):
+    """LLM spend for the Usage tab: USD per day, and per user beside that user's
+    conversation count and mean messages per conversation, all over the same window."""
+    if period not in ("week", "month", "year"):
+        raise HTTPException(status_code=400, detail="period must be 'week', 'month', or 'year'")
+
+    data = get_chat_history_db().get_cost_analytics(period)
+    return CostAnalyticsResponse(
+        period=period,
+        daily=[CostDataPoint(**d) for d in data["daily"]],
+        users=[UserUsageRow(**u) for u in data["users"]],
     )
 
 

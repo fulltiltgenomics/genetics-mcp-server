@@ -19,6 +19,8 @@ import pytest
 
 from genetics_mcp_server.config.defaults import (
     _SUMMARIZE_PARAM_TOOLS,
+    DEFAULT_PROMPT_VARIANT,
+    PROMPT_VARIANTS,
     _assemble,
     _Block,
     default_system_prompt,
@@ -45,24 +47,36 @@ def tool_names_mentioned(text: str) -> set[str]:
     return tokens & ALL_TOOL_NAMES
 
 
-def flag_disabled_tools(*, subagents: bool, sandbox: bool = True) -> set[str]:
+def flag_disabled_tools(
+    *, subagents: bool, sandbox: bool = True, alphagenome: bool = True
+) -> set[str]:
     """The disabled set the deployment flags actually produce.
 
     Derived from Settings rather than hard-coded, so a flag added in front of another
-    tool is picked up here without editing this file. `sandbox` defaults to True — the
-    opposite of the deployed default — because everything below is about what the prompt
-    says when a tool IS present; the flag-off direction is asserted explicitly instead
-    (genetics-results-suite-4h6.56).
+    tool is picked up here without editing this file. `sandbox` and `alphagenome` default
+    to True — for the sandbox the opposite of the deployed default, for the key the
+    opposite of a bare test environment — because everything below is about what the
+    prompt says when a tool IS present; each flag-off direction is asserted explicitly
+    instead (genetics-results-suite-4h6.56).
     """
-    return Settings(enable_subagents=subagents, sandbox_enabled=sandbox).disabled_tools
+    return Settings(
+        enable_subagents=subagents,
+        sandbox_enabled=sandbox,
+        alphagenome_enabled=alphagenome,
+        alphagenome_api_key="test-key" if alphagenome else None,
+    ).disabled_tools
 
 
-def resolve(profile: str | None, *, subagents: bool, sandbox: bool = True) -> set[str]:
+def resolve(
+    profile: str | None, *, subagents: bool, sandbox: bool = True, alphagenome: bool = True
+) -> set[str]:
     return {
         t["name"]
         for t in get_anthropic_tools(
             code_execution=code_execution_requested(profile),
-            disabled_tools=flag_disabled_tools(subagents=subagents, sandbox=sandbox),
+            disabled_tools=flag_disabled_tools(
+                subagents=subagents, sandbox=sandbox, alphagenome=alphagenome
+            ),
         )
     }
 
@@ -304,6 +318,19 @@ def _tool_sets_to_probe() -> dict[str, set[str]]:
     return sets
 
 
+@pytest.fixture(scope="module")
+def probed_prompts() -> dict[str, tuple[frozenset[str], str]]:
+    """Every probe tool set paired with the prompt it produces, built once for the module.
+
+    The second test below exists to prove the first one's sweep is interesting, so the two
+    have to be reading the same prompts rather than two independently assembled copies.
+    """
+    return {
+        label: (frozenset(tools), default_system_prompt("FinnGenie", tool_names=tools))
+        for label, tools in _tool_sets_to_probe().items()
+    }
+
+
 class TestEverySurfaceWithADataPathIsRouted:
     """One arm-routing sentence, never zero and never two, on any tool set.
 
@@ -314,29 +341,27 @@ class TestEverySurfaceWithADataPathIsRouted:
     see, because the heading survives and every pinned string is elsewhere.
     """
 
-    def test_exactly_one_arm_routing_sentence_per_surface(self):
+    def test_exactly_one_arm_routing_sentence_per_surface(self, probed_prompts):
         wrong = {}
-        for label, tools in _tool_sets_to_probe().items():
-            prompt = default_system_prompt("FinnGenie", tool_names=tools)
+        for label, (tools, prompt) in probed_prompts.items():
             hits = [s for s in _ARM_ROUTING_SENTENCES if s in prompt]
             if len(hits) != (1 if tools & _DATA_PATH_TOOLS else 0):
                 wrong[label] = hits
         assert wrong == {}
 
-    def test_the_probe_reaches_beyond_the_current_profiles(self):
+    def test_the_probe_reaches_beyond_the_current_profiles(self, probed_prompts):
         """Guards the test above from passing because it probes nothing interesting."""
-        sets = _tool_sets_to_probe()
-        assert "-get_gene_based_results" in sets
-        assert "-get_exome_results_by_gene" in sets
-        assert len(sets) > 50
+        assert "-get_gene_based_results" in probed_prompts
+        assert "-get_exome_results_by_gene" in probed_prompts
+        assert len(probed_prompts) > 50
         profiles = [frozenset(resolve(p, subagents=s)) for p in PROFILES for s in (True, False)]
-        assert sum(frozenset(t) not in profiles for t in sets.values()) > 40
+        assert sum(tools not in profiles for tools, _ in probed_prompts.values()) > 40
         # and each arm-routing variant is actually exercised somewhere in the probe
         emitted = {
             s
-            for tools in sets.values()
+            for _, prompt in probed_prompts.values()
             for s in _ARM_ROUTING_SENTENCES
-            if s in default_system_prompt("FinnGenie", tool_names=tools)
+            if s in prompt
         }
         assert emitted == set(_ARM_ROUTING_SENTENCES)
 
@@ -420,20 +445,27 @@ _SHARED_TAIL = [
 # The no-code surface, which is what every profile value except "code" resolves to since
 # the collapse — so the four legacy names and None are pinned to the same list, and that
 # sameness is the collapse itself rather than a coincidence to tidy away.
-_NOCODE_HEADINGS = [
-    "## Core Principles",
-    "## Analyzing data",
-    "## Tool Usage Guidelines",
-    "### Mouse Model Evidence (search_mgi)",
-    "## Variant Annotation Sources",
+_DOMAIN_SECTIONS = [
+    "## Data Domains and Outside Resources",
+    "### Variant Annotation Sources",
     "### Functional / Regulatory Readouts",
+    "### AlphaGenome variant predictions (opt-in)",
     "### HLA / the MHC region",
     "### Dosage sensitivity / rare CNVs",
     "### Protein Annotation (UniProt)",
     "### Drug and Target Evidence (ChEMBL)",
+    "### Mouse Model Evidence (search_mgi)",
+]
+_NOCODE_HEADINGS = [
+    "## Core Principles",
+    "## Analyzing data",
+    "## Tool Usage Guidelines",
+    "## Choosing How to Get Data",
+    "## The Database",
     "## Data Sources and Resource Names",
     "### Pseudo Credible Sets",
-    "## Choosing How to Get Data",
+    "### Credible Set Membership",
+    *_DOMAIN_SECTIONS,
     *_SHARED_TAIL,
 ]
 _EXPECTED_HEADINGS = {
@@ -443,22 +475,11 @@ _EXPECTED_HEADINGS = {
     "rag": _NOCODE_HEADINGS,
     "nocode": _NOCODE_HEADINGS,
     # the code surface keeps every outside-resource section — those are the tools a script
-    # cannot reach — and loses "## Variant Annotation Sources", whose internal annotation
-    # tools the SDK stands in for.
+    # cannot reach — and loses "### Variant Annotation Sources", whose internal annotation
+    # tools the SDK stands in for. That section is an H3 under an H2 that survives, which is
+    # the point of the reorganisation: as an H2 it took five H3s with it when it dropped.
     "code": [
-        "## Core Principles",
-        "## Analyzing data",
-        "## Tool Usage Guidelines",
-        "### Mouse Model Evidence (search_mgi)",
-        "### Functional / Regulatory Readouts",
-        "### HLA / the MHC region",
-        "### Dosage sensitivity / rare CNVs",
-        "### Protein Annotation (UniProt)",
-        "### Drug and Target Evidence (ChEMBL)",
-        "## Data Sources and Resource Names",
-        "### Pseudo Credible Sets",
-        "## Choosing How to Get Data",
-        *_SHARED_TAIL,
+        *[h for h in _NOCODE_HEADINGS if h != "### Variant Annotation Sources"],
     ],
 }
 
@@ -475,14 +496,14 @@ _REQUIRED_EVERYWHERE = [
     "PIPs from pseudo credible sets should be interpreted with more caution",
 ]
 # these presuppose a path to credible-set / MHC rows, which `rag` does not have; the
-# narrowing bullet rides the same data-path gate and cites the re-query rule by position,
+# narrowing bullet rides the same data-path gate and reconciles itself with the re-query rule,
 # so the two have to survive together
 _REQUIRED_WITH_A_DATA_PATH = [
     "**Membership is NOT the same as LD.**",
     "in partial LD with the lead",
     "**Re-query; do not answer from memory.**",
     "**A follow-up that narrows an earlier result re-runs that retrieval with the filter added.**",
-    "IS the fresh authoritative call the rule above asks for",
+    "IS the fresh authoritative call",
     "### HLA / the MHC region",
     "LD across the MHC is so extensive",
     "`pval` underflows to 0",
@@ -827,3 +848,273 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert _ANNOTATION_NO_ROUTE in prompt
         assert _ANNOTATION_DB_PROTEIN_ROUTE not in prompt
         assert _ANNOTATION_SDK_ONLY not in prompt
+
+
+# ---------------------------------------------------------------------------
+# Named prompt variants. A variant selects a block tuple; the per-request tool gate
+# then runs inside it, so a variant changes the text and nothing else.
+# ---------------------------------------------------------------------------
+
+
+class TestPromptVariants:
+    def test_every_variant_is_a_live_tuple_not_a_copy(self):
+        """Registering a copy is how a variant starts drifting from the module it is
+        edited in — the registry has to hold the tuples themselves."""
+        from genetics_mcp_server.config import defaults
+
+        assert defaults.PROMPT_VARIANTS["condensed"] is defaults._CONDENSED_PROMPT_BLOCKS
+        assert defaults.PROMPT_VARIANTS["legacy"] is defaults._PROMPT_BLOCKS
+        assert defaults.DEFAULT_PROMPT_VARIANT == "condensed"
+
+    @pytest.mark.parametrize("configured", [None, "", "   "])
+    def test_an_unset_variant_resolves_to_the_default(self, configured):
+        from genetics_mcp_server.config.defaults import (
+            DEFAULT_PROMPT_VARIANT,
+            resolve_prompt_variant,
+        )
+
+        assert resolve_prompt_variant(configured) == DEFAULT_PROMPT_VARIANT
+
+    def test_an_unknown_variant_coerces_and_warns_rather_than_raising(self, caplog):
+        """A typo in a deployment env var must not take chat down for everyone.
+
+        The cost of coercing is that a benchmark could measure the default twice, which is
+        why replay_benchmark reads the RESOLVED name back off /chat/v1/tools/resolved and
+        refuses a paired run whose arms agree on it.
+        """
+        from genetics_mcp_server.config import defaults
+
+        defaults._warned_unknown_variants.clear()
+        with caplog.at_level("WARNING"):
+            resolved = defaults.resolve_prompt_variant("candidat")
+
+        assert resolved == defaults.DEFAULT_PROMPT_VARIANT
+        assert "candidat" in caplog.text and "tools/resolved" in caplog.text
+
+    def test_the_warning_is_once_per_name_not_once_per_request(self, caplog):
+        from genetics_mcp_server.config import defaults
+
+        defaults._warned_unknown_variants.clear()
+        with caplog.at_level("WARNING"):
+            for _ in range(3):
+                defaults.resolve_prompt_variant("nope")
+
+        assert caplog.text.count("Unrecognised PROMPT_VARIANT") == 1
+
+    def test_a_registered_variant_supplies_the_text(self, monkeypatch):
+        from genetics_mcp_server.config import defaults
+
+        marker = "SENTINEL-BLOCK-TEXT"
+        monkeypatch.setitem(
+            defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block(marker),)
+        )
+
+        assert marker in defaults.default_system_prompt(variant="sentinel")
+        assert marker not in defaults.default_system_prompt()
+
+    def test_the_gate_still_runs_inside_the_selected_variant(self, monkeypatch):
+        """A variant is not an escape hatch from the tool gate — that invariant is what
+        stops the prompt describing a tool the model was not given, and it has to hold in
+        every registered variant, not only the one being served."""
+        from genetics_mcp_server.config import defaults
+
+        monkeypatch.setitem(
+            defaults.PROMPT_VARIANTS,
+            "sentinel",
+            (
+                defaults._Block("ungated text\n"),
+                defaults._Block("call run_analysis for this\n"),
+            ),
+        )
+
+        with_tool = defaults.default_system_prompt(
+            tool_names={"run_analysis"}, variant="sentinel"
+        )
+        without = defaults.default_system_prompt(tool_names=set(), variant="sentinel")
+
+        assert "run_analysis" in with_tool
+        assert "run_analysis" not in without
+        assert "ungated text" in without
+
+    def test_the_persona_substitution_applies_to_every_variant(self, monkeypatch):
+        from genetics_mcp_server.config import defaults
+
+        monkeypatch.setitem(
+            defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block("I am FinnGenie.\n"),)
+        )
+
+        out = defaults.default_system_prompt("Genie", variant="sentinel")
+        assert "I am Genie." in out
+
+
+# ---------------------------------------------------------------------------
+# Whatever else a variant changes, it does not get to change these three. The
+# content pins above are about the prompt actually SERVED; another variant is free
+# to reword any of them. It is not free to name a tool the model was not given, to
+# let a dropped heading reparent the body that followed it, or to emit a heading with
+# nothing under it — those are properties of the assembly, and a variant that
+# breaks one is broken however good its prose is.
+# ---------------------------------------------------------------------------
+
+_OTHER_VARIANTS = sorted(set(PROMPT_VARIANTS) - {DEFAULT_PROMPT_VARIANT})
+_ALL_VARIANTS = sorted(PROMPT_VARIANTS)
+
+
+@pytest.mark.skipif(not _OTHER_VARIANTS, reason="only the default variant is registered")
+@pytest.mark.parametrize("variant", _OTHER_VARIANTS)
+class TestEveryVariantHoldsTheStructuralInvariants:
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    @pytest.mark.parametrize("subagents", [True, False], ids=["subagents_on", "subagents_off"])
+    def test_every_tool_named_is_in_the_tool_list(self, variant, profile, subagents):
+        available = resolve(profile, subagents=subagents)
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        assert tool_names_mentioned(prompt) - available == set()
+
+    def test_the_scan_finds_tool_names_at_all(self, variant):
+        """Guards the test above from passing because it detects nothing."""
+        mentioned = tool_names_mentioned(
+            default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL, variant=variant)
+        )
+        assert len(mentioned) > 20
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    @pytest.mark.parametrize("subagents", [True, False], ids=["subagents_on", "subagents_off"])
+    def test_no_body_line_lands_under_a_different_heading(self, variant, profile, subagents):
+        full = _heading_of_each_line(default_system_prompt("FinnGenie", variant=variant))
+        filtered = _heading_of_each_line(
+            default_system_prompt(
+                "FinnGenie", tool_names=resolve(profile, subagents=subagents), variant=variant
+            )
+        )
+        reparented = {
+            line: (heads, full[line])
+            for line, heads in filtered.items()
+            if line in full and not heads <= full[line]
+        }
+        assert reparented == {}
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_no_heading_is_emitted_empty(self, variant, profile):
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve(profile, subagents=False), variant=variant
+        )
+        lines = prompt.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("#"):
+                continue
+            body = [x for x in lines[i + 1 :] if x.strip()]
+            assert body and not body[0].startswith("#"), f"{variant}: empty heading {line!r}"
+
+    def test_the_served_prompt_is_no_larger_than_any_variant_it_replaced(self, variant):
+        """Not a correctness property — a tripwire. Every variant registered so far exists
+        to shrink the prompt, so serving one larger than a variant it replaced is either
+        mislabelled or a mistake. If a deliberately larger prompt is ever the right answer,
+        this is the place to say why."""
+        for ce in (True, False):
+            available = resolve("code" if ce else "nocode", subagents=False)
+            served = default_system_prompt("FinnGenie", tool_names=available)
+            other = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+            surface = "code" if ce else "nocode"
+            assert len(served) <= len(other), (
+                f"the served prompt is larger than {variant!r} on the {surface} surface"
+            )
+
+
+class TestAlphaGenomeOptIn:
+    """The opt-in is prompt guidance and nothing else, so the guidance is the feature.
+
+    There is no per-user setting, no per-conversation column and no UI toggle behind it:
+    the user was told this is persuasion rather than enforcement and chose it. Each rule
+    below is pinned because losing one silently turns an opt-in tool into a reflex.
+    """
+
+    TOOL = "get_alphagenome_variant_predictions"
+
+    # what the block must say, in the order it says it
+    RULES = [
+        "Call it only when the user has asked for it",
+        "the user names AlphaGenome",
+        "first-class use of the tool",
+        "Do NOT call it as background enrichment",
+        "are NOT requests for AlphaGenome",
+        "not a fallback for gaps",
+        "never a confidence for the variant in hand",
+        "the labelling matters MORE, not less",
+    ]
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_block_reaches_every_surface_that_has_the_tool(self, profile, variant):
+        """Every registered variant, not only the served one.
+
+        The block was first written into `legacy` while `condensed` was already the
+        default, so the feature's only guard reached no deployment at all. The guidance IS
+        the feature: a variant that carries the tools without it is broken however good
+        its prose is, and either block tuple can drift from the other silently.
+        """
+        available = resolve(profile, subagents=False)
+        assert self.TOOL in available, "sdk_replaceable False puts it on both surfaces"
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        for rule in self.RULES:
+            assert rule in prompt, f"{variant}/{profile} lost: {rule!r}"
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_block_goes_when_the_key_is_unset(self, variant):
+        """Both halves of the gate, exercised end to end.
+
+        The block self-gates on the tool NAME, and `Settings.disabled_tools` withdraws the
+        name when no ALPHAGENOME_API_KEY is configured — so a key-less deployment ships
+        neither the tool nor the ~1 KB of prompt telling the model when to reach for it.
+        Asserting only the hand-subtracted direction would leave the deployment-level half
+        untested, which is the half that repeats the run_analysis failure.
+        """
+        with_key = resolve(None, subagents=False, alphagenome=True)
+        assert self.TOOL in with_key
+        assert "AlphaGenome" in default_system_prompt(
+            "FinnGenie", tool_names=with_key, variant=variant
+        )
+
+        without_key = resolve(None, subagents=False, alphagenome=False)
+        assert self.TOOL not in without_key
+        assert "AlphaGenome" not in default_system_prompt(
+            "FinnGenie", tool_names=without_key, variant=variant
+        )
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_block_goes_when_the_flag_is_off_even_with_a_key(self, variant):
+        """The flag is the deployment's intent and gates independently of the key: a
+        deployment that leaves ALPHAGENOME_ENABLED off must not advertise the tool or its
+        prompt block even if a key was ever seeded there."""
+        disabled = Settings(alphagenome_enabled=False, alphagenome_api_key="test-key").disabled_tools
+        available = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
+        assert self.TOOL not in available
+        assert "AlphaGenome" not in default_system_prompt(
+            "FinnGenie", tool_names=available, variant=variant
+        )
+
+    def test_the_gate_reads_both_the_flag_and_the_key(self):
+        """Three of the four combinations withhold the tool; only flag-on with a
+        configured key advertises it. An empty string is as unconfigured as an unset
+        variable — os.environ.get returns "" for `ALPHAGENOME_API_KEY=` in a manifest,
+        which is exactly what an optional secret key renders to when the deployment has
+        no key."""
+        assert self.TOOL not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
+        assert self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
+
+    def test_the_tool_description_carries_the_same_rules(self):
+        """The strongest wording lives in the description, which the model follows more
+        reliably than prose this far up the prompt — so the two must not drift apart."""
+        [tool] = [t for t in all_local_tool_definitions() if t["name"] == self.TOOL]
+        text = tool["description"]
+        for phrase in (
+            "CALL THIS ONLY WHEN THE USER HAS ASKED FOR IT",
+            "Do NOT call it as background enrichment",
+            "are NOT requests for AlphaGenome",
+            "NOT a reason to call it",
+            "first-class use of this tool",
+            "never be quoted as one",
+            "the labelling matters MORE, not less",
+        ):
+            assert phrase in text, f"tool description lost: {phrase!r}"

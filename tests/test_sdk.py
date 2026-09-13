@@ -581,7 +581,7 @@ async def test_rcnv_forwards_every_filter_untouched():
 
 
 async def test_rcnv_defaults_keep_the_no_estimate_rows_out():
-    """65% of the view is NULL from `beta` onward; a default that let them through would
+    """65% of the view is NULL in every statistic column; a default that let them through would
     give a script a frame that is mostly nulls."""
     client, executor = make_client()
     await client.rcnv(gene="SHANK3")

@@ -124,6 +124,9 @@ class MemoryResponse(BaseModel):
     digest: str
     sessions: list[MemorySessionItem]
     char_cap: int
+    # how many of the project's most recently active sessions the digest looks at; the
+    # dialog quotes it, so it travels with the payload rather than being copied into the UI
+    session_cap: int
 
 
 class ProjectCreateRequest(BaseModel):
@@ -745,6 +748,7 @@ async def get_project_memory(
             for row in sessions
         ],
         char_cap=MAX_DIGEST_CHARS,
+        session_cap=MEMORY_PROJECT_SESSION_CAP,
     )
 
 

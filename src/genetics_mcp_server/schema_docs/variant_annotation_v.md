@@ -5,10 +5,11 @@
 
 Per-variant functional annotation and FinnGen (R14) allele frequencies — one row per
 variant, covering all imputed variants, not only fine-mapped ones. This is the only view
-with rsIDs and genotype counts: join to it whenever a question needs an rsID, an allele
-frequency, imputation quality, or Finnish enrichment for variants found in the association
-views. Association results are not here — use credible_sets_v, exome_variant_results_v etc.
-for those.
+with genotype counts, and the rsID source for the credible-set, colocalization and exome
+views (asm_qtl_v and variant_effect_v carry their own rsid): join to it whenever a question
+needs an rsID, an allele frequency, imputation quality, or Finnish enrichment for variants
+found in those views. Association results are not here — use credible_sets_v,
+exome_variant_results_v etc. for those.
 
 ## Columns
 
@@ -25,20 +26,13 @@ for those.
 | `AC_Hom` | `INT64` | Number of homozygous (alt/alt) genotypes in FinnGen |
 | `most_severe` | `STRING` | Most severe VEP-predicted variant consequence |
 | `gene_most_severe` | `STRING` | Gene symbol associated with the most severe consequence |
-| `rsid` | `STRING` | dbSNP rsID when available. The only place rsIDs are stored — the association views have none |
+| `rsid` | `STRING` | dbSNP rsID when available. The rsID source for the credible-set, colocalization and exome views, which have none of their own; asm_qtl_v and variant_effect_v carry their own rsid |
 | `EXOME_enrichment_nfe` | `FLOAT64` | Finnish vs non-Finnish European allele-frequency ratio from gnomAD exomes. Values above ~2 mark Finnish-enriched variants |
 | `GENOME_enrichment_nfe` | `FLOAT64` | Finnish vs non-Finnish European allele-frequency ratio from gnomAD genomes |
 | `index` | `INT64` | Row index in the source annotation file, not a genetic quantity |
 | `resource` | `STRING` | Data source identifier, constant 'finngen' (FinnGen R14) |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -46,8 +40,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against variant_annotation_v as written. Copy the shape rather than
-inventing one — each shows the filters this view expects.
+Queries that run against variant_annotation_v as written.
 
 ### Translate an rsID to the chr:pos:ref:alt identifier the association views use. rsid is neither partitioned nor clustered, so this scans the whole table — add a chr filter whenever the chromosome is already known.
 

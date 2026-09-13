@@ -28,3 +28,10 @@ fi
 if [ -x ./scripts/check-doc-drift.sh ]; then
   ./scripts/check-doc-drift.sh || true
 fi
+
+# --- lint gate (not managed by beads) ---
+# blocks, unlike the doc-drift check above: a gate that only warns is one nobody reads.
+# `git commit --no-verify` is the deliberate bypass.
+if [ -x ./scripts/lint-staged.sh ]; then
+  ./scripts/lint-staged.sh || exit 1
+fi

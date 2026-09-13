@@ -10,27 +10,27 @@ credible_sets_v / variant_annotation_v on chr/pos/ref/alt; every allele of a gen
 that gene's single anchor position. This is the only place the cross-phenotype question is
 answerable ("which traits is an allele associated with?") — the results-api /hla endpoint
 reads per-phenotype files and can only go the other way. JOIN KEY WARNING — this view is the
-THIRD spelling of the trait column in this schema. credible_sets_v / colocalization_v /
-coloc_credsets_v / exome_variant_results_v / gene_burden_results_v carry both
-`trait_original` (the phenocode, the join key) and `trait` (a display string);
-hla_associations_v carries NEITHER and calls its phenocode `phenotype`. Joining phenotypes_v
-on h.trait or h.trait_original is a query error; joining on p.trait is a SILENT ZERO-ROW
-join. The only correct join is phenotypes_v p ON p.dataset = h.dataset AND p.trait_original
-= h.phenotype (`USING (dataset, trait_original)` does not work here — only the TRAIT column
-differs; `dataset` is present on both sides, so it must be matched explicitly against
-`phenotype`). Without SOME dataset predicate the join fans out across every FinnGen release
-sharing the code space. Background, not an alternative: all 2,712 HLA phenotype codes are
-also FinnGen R14 endpoint codes, so h.dataset is always 'finngen_hla' and the join above is
-the one to write. COLUMN NAMES: the view emits the suite's house spelling — `mlog10p`, `se`,
-`af`, `af_cases`, `af_controls` — which is also what the results-api /v1/hla endpoint
-returns, so per-column access is uniform across the by-phenotype and by-allele directions
-and no renaming is ever needed. Their column SETS still differ, so concatenating them is not
-free: results-api additionally returns `resource`, `version`, `chr` and `pos`, which this
-view's by-allele reads need not select. Select the shared columns explicitly on both sides
-rather than concatenating whole frames. The staged file and the underlying
-`hla_associations` table keep FinnGen's native
-`mlogp`/`sebeta`/`af_alt`/`af_alt_cases`/`af_alt_controls`; the view renames them 1:1, the
-values are unchanged.
+THIRD spelling of the trait column in this schema. credible_sets_v / coloc_credsets_v /
+exome_variant_results_v / gene_burden_results_v carry both `trait_original` (the phenocode,
+the join key) and `trait` (a display string), and colocalization_v carries the same pair per
+side as trait1/trait2 and trait1_original/trait2_original; hla_associations_v carries
+NEITHER and calls its phenocode `phenotype`. Joining phenotypes_v on h.trait or
+h.trait_original is a query error; joining on p.trait is a SILENT ZERO-ROW join. The only
+correct join is phenotypes_v p ON p.dataset = h.dataset AND p.trait_original = h.phenotype
+(`USING (dataset, trait_original)` does not work here — only the TRAIT column differs;
+`dataset` is present on both sides, so it must be matched explicitly against `phenotype`).
+Without SOME dataset predicate the join fans out across every FinnGen release sharing the
+code space. Background, not an alternative: all 2,712 HLA phenotype codes are also FinnGen
+R14 endpoint codes, so h.dataset is always 'finngen_hla' and the join above is the one to
+write. COLUMN NAMES: the view emits the suite's house spelling — `mlog10p`, `se`, `af`,
+`af_cases`, `af_controls` — which is also what the results-api /v1/hla endpoint returns, so
+per-column access is uniform across the by-phenotype and by-allele directions and no
+renaming is ever needed. Their column SETS still differ, so concatenating them is not free:
+results-api additionally returns `resource`, `version`, `chr` and `pos`, which this view's
+by-allele reads need not select. Select the shared columns explicitly on both sides rather
+than concatenating whole frames. The staged file and the underlying `hla_associations` table
+keep FinnGen's native `mlogp`/`sebeta`/`af_alt`/`af_alt_cases`/`af_alt_controls`; the view
+renames them 1:1, the values are unchanged.
 
 ## Columns
 
@@ -52,14 +52,7 @@ values are unchanged.
 | `dataset` | `STRING` | Source dataset identifier (constant 'finngen_hla') |
 | `resource` | `STRING` | Data source identifier (lowercase, 'finngen'). Always filter by this column, not dataset |
 
-Types are the view's own BigQuery types. Match the literal to the type: a quoted string
-never compares equal to a numeric column, and an ARRAY column has to go through UNNEST
-(`<value> IN UNNEST(<column>)`), never a bare `=`.
-
 ## Columns with a small, enumerable set of values
-
-`SELECT DISTINCT` these before filtering on them rather than guessing a value.
-A parent means the values are scoped by that column, so enumerate the pair.
 
 | column | scoped by |
 | --- | --- |
@@ -69,8 +62,7 @@ A parent means the values are scoped by that column, so enumerate the pair.
 
 ## Worked examples
 
-Queries that run against hla_associations_v as written. Copy the shape rather than inventing
-one — each shows the filters this view expects.
+Queries that run against hla_associations_v as written.
 
 ### The HLA profile of one phenotype, strongest allele first
 

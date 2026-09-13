@@ -73,7 +73,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | Tool | Description |
 |------|-------------|
 | `get_gene_expression` | Get tissue-specific gene expression levels |
-| `get_gene_disease_associations` | Get Mendelian disease relationships from ClinGen/GENCC |
+| `get_gene_disease_associations` | Get Mendelian disease relationships from GenCC curation submissions and the Monarch Initiative KG |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
 | `get_exome_results_by_variant` | Exome results for one specific variant across exome resources — the rare-variant counterpart to `get_credible_sets_by_variant` |
 | `get_exome_results_by_region` | Exome results overlapping a `chr:start-end` region; rows capped at 500 inline with `truncated` set |
@@ -113,7 +113,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlog10p`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
 | `get_dosage_sensitivity` | pHaplo / pTriplo dosage-sensitivity scores for a list of genes (Collins et al. 2022, 18,641 autosomal protein-coding genes from rare CNVs in 950,278 individuals). Executor-side SQL over BigQuery `dosage_sensitivity_v`. Symbols are matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published and the Ensembl ID in one pass, so a gene renamed since 2013 still resolves. `haploinsufficient`/`triplosensitive` are the paper's own cutoffs (0.86 / 0.94) returned as columns |
-| `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL from `beta` onward) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
+| `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL in every statistic column, `beta` through `mlog10_fdr_q_secondary`) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
@@ -260,8 +260,12 @@ implementation, but constructs its own cache instance.
 **`query` takes one entity or a list, and the list is the point.** All three ChEMBL tools
 plus `get_protein_annotations` declare `"type": ["string", "array"]`, and the executor fans a
 list out with `_fan_out` — `asyncio.gather` under a semaphore of `_BATCH_CONCURRENCY` (5),
-capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **The HTTP is not what
-this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
+capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **That cap is not in the
+schema, and cannot be.** `_to_anthropic_format` forwards `minimum`, `maximum` and `pattern`
+only, so no `maxItems` ever reaches the model; every array bound in this server — this one,
+the variant cap on `get_alphagenome_variant_predictions` — is stated in the parameter's
+description and enforced by the executor, and any future tool wanting one is in the same
+position. **The HTTP is not what this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
 `get_drug_targets_for_gene` about 25 genes one at a time, because the schema offered no way to
 ask about more than one; what a list removes is the ~8s model iteration and full context
 re-read between each call. Verified end to end: the same five-gene question now resolves in one
@@ -335,6 +339,58 @@ for a gene now names `get_drug_targets_for_gene` instead of leaving it to memory
 closure and ships in the sandbox image. It is unreachable from `run_analysis` all the same:
 the sandbox's egress allow-list names db-api and results-api only, and nothing there serves
 `www.ebi.ac.uk`.
+
+#### AlphaGenome (native tool, chat-backend only, opt-in)
+
+Two tools, one client. `get_alphagenome_variant_predictions` returns AlphaGenome Atlas (Google DeepMind) predictions of a variant's regulatory effect — accessibility, binding, transcription, splicing — per modality, optionally in a named cell type or tissue. `compare_alphagenome_with_measured` puts that same prediction beside this suite's own MEASURED effect sizes for the same variant. They are the only tools here whose output is a MODEL'S OUTPUT rather than a retrieved measurement, and the rest of their shape follows from that:
+
+- **A deployment with the flag off, or no key, does not advertise it.** `Settings.disabled_tools` withdraws both tool names when `ALPHAGENOME_ENABLED` is false or `ALPHAGENOME_API_KEY` is unset, the way it withdraws `run_analysis` without a sandbox — so the flag makes the deployment's intent reviewable independent of the key, and a key-less or flag-off deployment offers no tool whose every call would return "ALPHAGENOME_API_KEY is not set"; the opt-in prompt block disappears with the name rather than telling the model about a tool it does not hold. `k8s/deployments/chat-backend.yaml` carries `ALPHAGENOME_ENABLED` as a plain env var and mounts the key as an *optional* secret key, and chat-backend is its only holder.
+- **Predictions are cached in process and nowhere else.** A `_TTLCache` — uniprot.py's, imported rather than copied — keyed on the parsed variant, the requested cell type and the requested modality set, `ALPHAGENOME_CACHE_TTL` seconds (default 1 h). The cell type is in the key because tracks are resolved per cell type: a key without it would answer a question about one tissue with another tissue's prediction under the caller's own label. The measured quota (~1320 requests/minute) is far above the expected load, so this exists to stop one turn paying twice, not to make the load fit — and keeping it in memory means no prediction is ever written down, which sidesteps rather than answers the open question of whether DeepMind's terms permit storing outputs. It inherits `_TTLCache`'s entry bound, which is a count and not a byte budget: a prediction entry is an order of magnitude larger than the small JSON that bound was sized for, so the cache cannot grow without limit but its footprint is not what the number was chosen against. If memory ever matters, that bound is where to look.
+- **The opt-in is prompt guidance and nothing else.** No per-user setting, no per-conversation column, no UI toggle: the user was told plainly that this is persuasion rather than enforcement, that the model holds the tool either way, and chose it. So the rules live in the two places the model actually reads — the tool description in `tools/definitions.py`, and the `### AlphaGenome variant predictions (opt-in)` block, which self-gates on both tool names like every other block and therefore has to exist in **every** entry of `PROMPT_VARIANTS` — `_PROMPT_BLOCKS` in `config/defaults.py` and `CONDENSED_PROMPT_BLOCKS` in `config/prompt_condensed.py`, the latter written in the condensed register rather than copied, since `legacy`'s wording is the measured baseline. `tests/test_system_prompt.py::TestAlphaGenomeOptIn` pins description and block against each other and runs the block assertions over every registered variant: a variant that advertises the tools without the guidance ships the feature with its only guard missing.
+- **Labelling is structural rather than prose.** The envelope carries `data_kind: "model_prediction"` and `measured: false`; each modality carries its own `validation` block — tier, whether the exposed quantity is signed or magnitude-only, the substrate it was calibrated against, and a population-level Spearman rho whose `rho_scope` says the number describes the MODALITY and not the variant in hand. The tiers live in `tools/alphagenome.py`'s `MODALITIES` and are not restated anywhere; the delegate passes the client's result through and adds the envelope label, because reshaping is where a prediction starts to read like a measurement.
+- **The client is reached from `ServerToolExecutor` only.** `tools/alphagenome.py` is not on the suite's `sandbox/prune_venv.py` SDK_ALLOWLIST and the sandbox image has no `alphagenome` package, so an import of it from `tools/executor.py` — at any depth, `TYPE_CHECKING` or deferred inside a method — would satisfy every build gate and then raise `ModuleNotFoundError` at call time in a container with no shell. The `alphagenome` cached_property lives in `tools/orchestration.py`, and `tests/test_alphagenome.py` asserts by AST that the shipped file imports nothing of the sort.
+- `sdk_replaceable: False`, for the reason the UniProt and ChEMBL tools are: an outside resource, not internal genetics data a script fetches through the SDK. It is therefore advertised on the code-execution surface too, where a SCRIPT still cannot call it — the sandbox egress allow-list names db-api and results-api only. That is intended for this phase.
+- In `_mcp_disabled`, by product decision rather than technical limit: a free non-commercial key with a per-minute quota shared by the whole deployment, on a surface any Google-account holder can reach.
+
+##### The comparison capability
+
+`compare_alphagenome_with_measured` is the second capability, not a mode of the first. It is
+a separate tool because the reading rules it needs are its own and are long: loading them
+onto the prediction tool would have diluted the opt-in wording, which is the only enforcement
+the opt-in has. The two descriptions share `_ALPHAGENOME_OPT_IN` as one literal in
+`tools/definitions.py`, so "the opt-in covers both identically" is checkable rather than
+promised, and `tests/test_alphagenome_comparison.py` checks it.
+
+Nothing about it is gated on the suite's data being absent: the comparison is worth most
+exactly where a measurement already exists.
+
+- **The measured half is db-api, not BigQuery.** The pairings live in
+  `tools/alphagenome_comparison.py` and reach `credible_sets_v` (caQTL, eQTL and sQTL `beta`)
+  and `mpra_v` (`log2Skew`) through `ToolExecutor.query_database`, the same path every other
+  view takes. A modality with no calibrated substrate here — the tier-4 five — issues no
+  query at all and answers "nothing measured to compare against".
+- **The quantity rule from `MODALITIES` holds for the comparison.** Where the sign is
+  commensurable, both sides are signed and a `direction` of `agrees`/`disagrees` is reported.
+  Where it is not — all three splicing modalities, whose measured beta orients to a
+  leafcutter intron cluster the predicted delta knows nothing about — BOTH sides are reduced
+  to magnitude and the concordance carries **no `direction` key at all**, not a null one.
+  The absence is the statement.
+- **`population_rho` is per pairing, not per modality.** DNASE was calibrated against two
+  substrates and correlates differently with each (+0.478 caQTL, +0.503 MPRA), so each
+  substrate carries its own number with `rho_scope: "population"`. Nothing computes a
+  per-variant statistic from a single pair.
+- **The envelope carries no `measured` flag.** A payload holding both kinds of number has no
+  true value for one, so every leaf carries its own instead: `measured: true` values name
+  their view, column, assay, resource and the gene or peak measured; `measured: false` values
+  name AlphaGenome. `data_kind` is `prediction_vs_measurement`.
+- **A measurement from another tissue is labelled `cross_tissue`** rather than quietly
+  compared — cell-type matching is worth about 0.06 rho — and an empty `measurements` list
+  distinguishes "this suite measured nothing here", "this modality has no substrate" and
+  "the db-api lookup failed" in its `note`.
+- `variant_effect_v` is deliberately NOT a substrate: it holds ChromBPNet and FLARE output,
+  which is another model's prediction, so a row from it belongs on the `measured: false`
+  side. `tools/alphagenome_comparison.py` records why at the site, along with the fact that
+  `chrombpnet_abs_logfc` is unsigned and could only ever support a magnitude comparison.
 
 ### Code execution tools
 
@@ -771,7 +827,7 @@ by it, via `tool_category()`). **No surface decision reads it.**
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_gene_group_members, normalize_gene_symbols |
+| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, compare_alphagenome_with_measured, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |
@@ -795,13 +851,13 @@ anything a request chooses. The resolved sets themselves are frozen in
 
 The fallback row is deliberate — the value is read back from `chat_messages` rows written by older clients, so an unrecognised name must not raise — but it is no longer invisible (genetics-results-suite-4h6.74). Two things report it, neither of which changes the resolution: `code_execution_requested` logs a WARNING naming the value, what it resolved to (the no-code surface) and the recognised set, the first time it sees it, **once per distinct value** (not per request — a stored bad value arrives on every turn of its session, and a per-request warning would bury itself); and `GET /chat/v1/tools/resolved?tool_profile=<value>` returns `known_profile: false` alongside the resolved `count`/`names`. The browser calls that endpoint whenever a profile is picked or restored from the user's settings and warns next to the Tools control when the answer is false.
 
-That covers one of the two drift directions. The other is a profile added HERE that the browser predates: its `TOOL_PROFILES` (`genetics-results-browser/src/features/chat/chat.types.ts`) narrows an unrecognised stored value to `null`, which resolves to the no-code surface — so a user whose stored `chat_tool_profile` is a server-only name silently gets the no-code surface instead of the one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Since the collapse that direction can only cost a user the `code` surface: every other value
+That covers one of the two drift directions. The other is a profile added HERE that the browser predates: the browser's `ToolProfile` (`genetics-results-browser/src/features/chat/chat.types.ts`) is `"code" | "nocode"` and its coercion (`chatOptionsApi.ts`) is `value === "code" ? "code" : "nocode"` with nothing enumerated, so an unrecognised stored value narrows to `nocode` — so a user whose stored `chat_tool_profile` is a server-only name silently gets the no-code surface instead of the one they chose, and neither signal above can see it (the value never reaches this server). The browser therefore asks `/chat/v1/tools/resolved` about an unrecognised stored value too and keeps it when `known_profile` is true. Since the collapse that direction can only cost a user the `code` surface: every other value
 resolves the same way whichever side invented it. Changing the accepted set here still
 requires editing that file: `tests/test_unknown_profile_warning.py::test_the_profile_key_set_is_pinned_against_the_browsers_copy` pins `KNOWN_TOOL_PROFILES` against a literal so the decision is deliberate, mirroring the browser's own pin in `useChatOptions.test.ts`.
 
 `GET /chat/v1/tools?resolved=true[&tool_profile=<value>][&enable_tools=false]` answers this table for a caller: a list of `{name, description, category, source}`, where `source` is `local`, `external` or `rag` and `category` is null for the two proxied sources. Bare (`resolved` omitted) the endpoint keeps its older answer — `TOOL_DEFINITIONS` verbatim, with each tool's full `parameters`, but no profile filter, no `disabled_tools`, and neither the BigQuery nor the subagent list — which is the raw catalogue, not a surface anyone is ever handed. The browser's Tools panel (`genetics-results-browser/src/features/chat/ToolsDialog.tsx`) shows a user what the assistant on screen can do, so it asks with `resolved=true` and the conversation's own profile. Both halves resolve through the same functions a chat request does — `LLMService.resolve_local_tools` and `resolve_proxied_tools`, the latter extracted from `stream_chat` for exactly this reason — so the panel cannot name a tool the model was not given, or miss one it was.
 
-Always-on external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) are included for every profile value except `"rag"` and `"code"` — a code surface that names its tools exactly would not mean much with ~20 proxied tools appended. The RAG server (`RAG_MCP_SERVER`) is only included when `tool_profile` is `"rag"` or unset.
+The two proxied sources that endpoint reports — the external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) and the RAG server (`RAG_MCP_SERVER`) — are the same for every profile value, so a `source` of `external` or `rag` tells a caller where a tool came from and never which profile earned it.
 
 `code` is **opt-in**: the server-side default for a request remains `null`, and the profile is selected per request (persisted in `chat_messages.tool_profile`, defaulted per user via the `chat_tool_profile` user setting). It omits `launch_subagents`, as every surface now does. `nocode` was added by `genetics-results-suite-4h6.78`/`.79` as the code arm's comparator — an honest baseline `null` could not then provide, because `null` contained `run_analysis` — and after the collapse it is what `null` resolves to, so the two are the same surface. The browser's Tools control does not list `nocode` as an option, though a user whose stored setting is already `nocode` keeps it (see the drift note above). A deployment can still start its users on `code` without moving the request default, and staging does: `DEFAULT_TOOL_PROFILE=code` in the suite's `.env.daly-staging`. Other environments leave the variable unset, so their users start on `null`, which resolves to the no-code surface. See `genetics-results-suite/docs/chat-tool-reference.md` § 3 for the resolved counts.
 
@@ -1539,11 +1595,34 @@ deployment that also served OpenAI. Since `genetics-results-suite-c4s` refuses
 `provider="openai"` at the request boundary, no such deployment can exist and the gap is
 latent rather than live. It holds
 `iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
-`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model` and `created_at`. Before it,
-these numbers existed only in Cloud Logging and had to be recovered from the BigQuery log sink;
-`chat_messages.content_json` is not a substitute, because it flattens a whole turn's blocks into
-one assistant record, leaving parallel and sequential tool calls indistinguishable and roundtrips
-per turn underivable.
+`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model`, `source` and `created_at`.
+Before it, these numbers existed only in Cloud Logging and had to be recovered from the BigQuery
+log sink; `chat_messages.content_json` is not a substitute, because it flattens a whole turn's
+blocks into one assistant record, leaving parallel and sequential tool calls indistinguishable and
+roundtrips per turn underivable.
+
+- **`source` and the log backfill.** `source` is `live` for rows the stream writes and `log` for
+  turns recovered from the `Chat complete:` line in the BigQuery sink, for the months before the
+  table existed. The log line carries only the iteration count, the two token totals and the cost,
+  so `tool_call_count`, both cache token counts and `wall_ms` are nullable and a `log` row holds
+  NULL there — never 0, which would read as an instantaneous, uncached turn to anything averaging
+  the column (`memory_premise_stats` already skips NULL). A database created before this rebuilds
+  the table once at startup (`_relax_turn_metrics_columns`, keyed on `wall_ms` still being NOT
+  NULL, one explicit transaction). The backfill is `scripts/turn_metrics_from_logs.sql` — one row
+  per log line of the cluster named by its `@cluster` parameter, both datasets read and
+  de-duplicated on `insertId`, because the staging cluster's lines reached the production dataset
+  before the staging sink existed — piped into `python -m
+  genetics_mcp_server.scripts.backfill_turn_metrics` inside the chat-backend pod, which calls
+  `ChatHistoryDB.backfill_turn_metrics_from_log`. Two rules make a re-run harmless: the row id is
+  `log:<insertId>` under `INSERT OR IGNORE`, and no line at or after the earliest `live` row is
+  taken, since one live row exists exactly when one log line does and the table is complete from
+  that instant. A `[session=unknown]` line, or one predating the session prefix, yields a row with
+  `session_id` NULL that is still attributed to its user; `message_id` is always NULL on a `log`
+  row. Secret chat is dropped as the live path drops it — any session that logged a `Streaming
+  Anthropic secret chat` line is excluded whole — but only where the line carries a session id;
+  a `[session=unknown]` line or one predating the prefix cannot be classified and is kept. The
+  cost written is whatever `cost.py` priced the turn at when it ran, at Anthropic list price —
+  no discount is applied anywhere in the suite.
 
 - **Keying.** A surrogate `id`, plus `session_id` and `message_id` columns and a *partial* unique
   index on `message_id WHERE message_id IS NOT NULL`. `message_id` is the client-generated
@@ -1663,8 +1742,62 @@ out-of-scope rule, bypassing all of the care above with a field two lines away f
 was removed rather than gated; nothing in the suite ever sent it. Pydantic ignores unknown keys, so
 a caller still sending one is silently ignored rather than 422'd. The prompt handed to
 `llm_service.stream_chat(system_prompt=...)` is always
-`default_system_prompt(app_name, tool_names=...)` plus the verbosity fragment — that parameter is
-the internal channel `chat_api` assembles, not an override.
+`default_system_prompt(app_name, tool_names=..., variant=...)` plus the verbosity fragment — that
+parameter is the internal channel `chat_api` assembles, not an override.
+
+**Prompt variants.** `config/defaults.py` `PROMPT_VARIANTS` maps a name to a block tuple, and
+`settings.prompt_variant` (env `PROMPT_VARIANT`, read at the same edge as `app_name`) picks which
+one this deployment serves. A variant changes the TEXT and nothing else: `_assemble` still runs the
+per-request tool gate inside whichever tuple was selected, so a variant cannot describe a
+tool the model was not given either. `_Block` and `_fs` live in `config/prompt_blocks.py` so a
+variant module can import the type without importing the registry it is registered in.
+
+Two variants are registered. **`condensed` (`config/prompt_condensed.py`) is the default and what
+every deployment serves**; `legacy` is `_PROMPT_BLOCKS`, the prompt it replaced. The condensed one
+is the same gate and the same generated `# BigQuery view reference` object, reordered into *how to
+work -> how to get data -> what the data is -> how to answer*, with the text that already ships in
+the `tools` parameter deleted rather than shortened — that is two thirds of the reduction, and the
+UniProt and ChEMBL sections are most of it. Measured on `claude-opus-5`: the `code` surface
+61,443 -> 58,083 tokens (-5.5%), the `nocode` surface 12,262 -> 8,514 (-30.6%); the code surface
+moves less because the view reference, which both variants share, is 86% of the condensed prompt.
+`## Analyzing data` is deliberately not condensed — its three PASS blocks are byte-identical to
+`legacy`'s, because both verbosity fragments name the passes and `tests/test_chat_api.py` pins
+that every registered variant carries them.
+
+It also resolved two self-contradictions the old prompt carried on the `code` surface: a
+gene-window SQL example that cast `chr` to STRING where the generated view docs say it is INT64
+and needs no cast, and a bullet telling the script surface to read the schema file before writing
+SQL fifteen lines after another said the schema is already in the prompt and not to spend a call
+discovering it.
+
+**The paired run found no quality difference, and that is why `condensed` ships.** 2026-09-12, the
+local set as it then stood at 23 cases (since trimmed to 9), 56 paired turns, both orders: 9 wins to 8 with 35 ties, sign test
+p=1.000 over 17 decisive pairs, and cost a wash inside per-case variance (one case carried 81% of
+the $3.79 spread). Read the ties as the instrument's limit rather than as a result — the judge
+preferred the longer answer in 14 of 17 decisive pairs and four pairs flipped on presentation order
+alone, so a small regression could not have been detected. It was adopted for the context saving.
+The judged arm had `## Analyzing data` compressed to one sentence; the PASS blocks were restored
+after the run, so what is served is 166 tokens larger than what was measured and differs in
+nothing else. `legacy` stays registered as the only baseline that saving can be re-measured
+against, and it is
+not free: both tuples have to learn about every tool added after this, and only the structural
+invariants are enforced across both. The structural invariants are not up for measurement:
+`tests/test_system_prompt.py` runs the tool-gate, heading-reparenting and empty-heading checks
+against **every** registered variant, so a variant is free to reword any content pin and not free
+to break the assembly.
+
+Selection is deployment-side and never per-request, which is the same invariant as the removed
+`system_prompt` field above: a request may not choose its own prompt. A wire field would hand every
+caller a menu of prompts including whatever experimental one a benchmark left in the registry, so
+the registry is reached by starting a second PROCESS instead — which is also what makes a prompt
+A/B honest, since both arms then run one build and differ in one env var.
+
+An unknown name coerces to `DEFAULT_PROMPT_VARIANT` and logs a WARNING once per distinct value
+rather than raising: it is a deployment env var, and a typo must not take chat down. That coercion
+has a cost `DEFAULT_TOOL_PROFILE`'s does not — two benchmark arms could both land on the default
+and report the difference between a prompt and itself as a result — so `GET /chat/v1/tools/resolved`
+reports the **resolved** `prompt_variant`, and `replay_benchmark`'s preflight refuses a paired run
+whose two servers agree on it (§ Replay benchmark).
 
 **The prompt is assembled from the tool list in force** (`genetics-results-suite-4h6.69`).
 `config/defaults.py` holds `_PROMPT_BLOCKS`, a tuple of `_Block`s rather than one string; a block
@@ -1802,8 +1935,8 @@ gated identically to the block above (`requires_any=run_analysis`, `excludes=que
 — the surface that was paying. It is **last** because a block that never varies belongs at
 the end of the cacheable prefix and because the instructions should sit closer to the
 conversation than the reference they are about. `schema_docs.schema_reference()` demotes every
-heading one level on the way in, so fifteen view files that each start at `#` become `##`
-sections of one reference rather than fifteen top-level sections competing with "Prohibited";
+heading one level on the way in, so the one file per view, each starting at `#`, becomes a `##`
+section of one reference rather than a top-level section competing with "Prohibited";
 `tests/test_system_prompt.py` pins the hand-written headings only, stopping at that boundary,
 because pinning the generated ones would mean re-listing every view's columns on every dataset
 change.
@@ -1961,6 +2094,7 @@ src/genetics_mcp_server/
 │   ├── analysis_timeseries.py  # shared rolling-window aggregation used by both renderers
 │   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
 │   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
+│   ├── backfill_turn_metrics.py # chat_turn_metrics rows from the log sink, for turns before the table existed
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
 │   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
 │   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
@@ -2389,6 +2523,14 @@ All configuration is via environment variables (`.env` file supported):
 | `CHEMBL_API_URL` | ChEMBL REST API base URL (targets, mechanisms, molecules, indications, activities) | `https://www.ebi.ac.uk/chembl/api/data` |
 | `CHEMBL_CACHE_TTL` | TTL in seconds for cached ChEMBL responses; `0` disables caching | `86400` (24 h) |
 
+### AlphaGenome (optional, chat-backend only)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ALPHAGENOME_ENABLED` | Whether this deployment offers AlphaGenome at all — the deployment's intent, independent of whether a key happens to be configured. Same truthy parsing as `SANDBOX_ENABLED` | `false` |
+| `ALPHAGENOME_API_KEY` | AlphaGenome Atlas API key. Either this unset or `ALPHAGENOME_ENABLED` false is a supported deployment: `Settings.disabled_tools` then withdraws `get_alphagenome_variant_predictions` and `compare_alphagenome_with_measured`, so neither tool is advertised and their shared opt-in prompt block is never assembled | _(unset)_ |
+| `ALPHAGENOME_CACHE_TTL` | TTL in seconds for the in-process prediction cache; `0` disables caching. Nothing is written to disk | `3600` (1 h) |
+
 ### Search tools (optional)
 
 | Variable | Description |
@@ -2646,9 +2788,10 @@ comparison, on `str`, and drifted) and additionally rejects any request carrying
 since its genuine callers never assert one.
 
 Admin endpoints:
-- `GET /chat/v1/admin/sessions` — list all sessions with filters and pagination. Each session item carries conversation-analysis fields (LEFT JOINed from `conversation_analysis`): `disposition`, `issue_count`, `issue_categories` (list of strings), `llm_rating` (the `llm_quality_score`, 1-5 or null), `success_label`. Filters: `user`, `date_from`, `date_to`, `session_id`, plus analysis filters `disposition` (exact), `success_label` (exact), `min_issues` (keep sessions with `issue_count >= N`), and `rating`. The `rating` param is a **string**: `"1"`..`"5"` filter the exact LLM rating, and the sentinel `"NA"` filters to unrated sessions (no `llm_quality_score`, i.e. unanalyzed sessions or rows with a NULL score). NA is implemented via the `unrated: bool` param on `ChatHistoryDB.list_all_sessions` (`a.llm_quality_score IS NULL`). The paginated `total` reflects all active filters.
+- `GET /chat/v1/admin/sessions` — list all sessions with filters and pagination. Each session item carries conversation-analysis fields (LEFT JOINed from `conversation_analysis`): `disposition`, `issue_count`, `issue_categories` (list of strings), `llm_rating` (the `llm_quality_score`, 1-5 or null), `success_label`; and `usd`, the conversation's recorded list-price cost summed from `chat_turn_metrics` rows carrying its id (`ChatHistoryDB.get_session_costs`, one query for the whole table), `null` when no turn is attributed to it — which a turn recovered from a log line without a session id cannot be. Filters: `user`, `date_from`, `date_to`, `session_id`, plus analysis filters `disposition` (exact), `success_label` (exact), `min_issues` (keep sessions with `issue_count >= N`), and `rating`. The `rating` param is a **string**: `"1"`..`"5"` filter the exact LLM rating, and the sentinel `"NA"` filters to unrated sessions (no `llm_quality_score`, i.e. unanalyzed sessions or rows with a NULL score). NA is implemented via the `unrated: bool` param on `ChatHistoryDB.list_all_sessions` (`a.llm_quality_score IS NULL`). The paginated `total` reflects all active filters.
 - `GET /chat/v1/admin/sessions/{id}` — session detail with all messages
 - `GET /chat/v1/admin/analytics/usage?period=week|month|year` — daily usage stats (unique users, conversations)
+- `GET /chat/v1/admin/analytics/cost?period=week|month|year` — the Usage tab: `daily` (`date`, `usd` summed from `chat_turn_metrics`) and `users` (`user`, `conversations`, `avg_messages`, `max_messages`, `usd`, `avg_usd`, `max_usd`), both over the same `created_at >= date('now', -N days)` window the usage endpoint uses. `conversations` and the message figures (all roles, unrounded — the tab rounds) describe the sessions *created* in the window; `usd` sums every turn *recorded* in it, so a user can show spend with no conversations or the reverse, and rows whose `user_id` is NULL group under `(unknown)`. `avg_usd` / `max_usd` are over a conversation's whole attributed cost (every turn carrying its `session_id`, whenever it ran), averaged across the window's sessions that have at least one such turn, and `null` when none does — a session whose turns were recovered from log lines without a session id would otherwise read as free. Sorted by spend, then name. Sourced from `ChatHistoryDB.get_cost_analytics`.
 - `GET /chat/v1/admin/analytics/quality` — raw per-conversation analysis rows for the Quality plots tab (`rows` of `session_id`, `created_at`, `llm_quality_score`, `llm_disposition`, `success_label`, `issue_categories`). Returned unaggregated (ordered by `created_at`); the frontend does the rolling-window aggregation client-side. Sourced from `ChatHistoryDB.list_all_analysis_rows`.
 - `GET /chat/v1/admin/feedback` — unified, paginated feed of all user feedback sorted by `created_at` DESC. Merges two sources: standalone feedback from the `user_comments` table (submitted via the Feedback dialog) and per-session comments from `chat_sessions.comment`. Response includes `items` (each with `user`, `comment`, `preview`, `created_at`, `source`, and optional `session_id`), `total` count, `latest_at` timestamp, and pagination parameters (`offset`, `limit`). The merge is ordered by `(created_at, source, id)`, not `created_at` alone: `created_at` is `CURRENT_TIMESTAMP` in both tables and has one-second resolution, so submissions inside one second tie and neither query orders them, and a page is a slice of that order — a boundary inside a tie would show an admin one item twice and hide another. The two sources have separate id spaces (an autoincrement int, a session uuid), which never meet because `source` is compared first
 
@@ -2676,7 +2819,7 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `ENABLE_PHENOTYPE_REPORT` | Enable `get_phenotype_report` tool (default `false`) |
 | `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
-| `RAG_MCP_SERVER` | URL of the RAG MCP server (only included when `tool_profile` is `"rag"` or unset) |
+| `RAG_MCP_SERVER` | URL of the always-on RAG MCP server |
 | `DEFAULT_TOOL_PROFILE` | Profile served as `chat_tool_profile` to users who have not chosen one (see "Profile behavior"); empty = the browser's own default, which resolves to the no-code surface (default empty) |
 
 These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which the MCP server, the chat API and the subagents all read, so a disabled tool is invisible on every surface rather than only unregistered on one.
@@ -2719,7 +2862,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | Test file | Coverage |
 |-----------|----------|
 | `test_mcp_server.py` | MCP server initialization and tool registration |
-| `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration |
+| `test_chat_api.py` | FastAPI endpoints (status, tools, chat), including the reasoning opt-in: a default request does not set `capture_thinking` (the UI path is unchanged) and a request that does gets `thinking_summary` events with their iteration. Every test in the file runs against a stubbed `stream_chat` on the real service singleton, so none reaches a provider even where an API key is configured; the two client handles are stubbed with it, and the tool-introspection endpoints still get the real object |
 | `test_tools.py` | Tool executor methods |
 | `test_unknown_profile_warning.py` | Tool-profile drift between this server and the browser: an unrecognised `tool_profile` still coerces to the no-code surface but logs a WARNING naming the value, what it resolved to and the recognised set, once per distinct value and bounded; `KNOWN_TOOL_PROFILES` is pinned against a literal so changing the accepted set forces a decision about `genetics-results-browser/src/features/chat/chat.types.ts`, and the collapse of the legacy names onto the no-code surface is asserted rather than assumed |
 | `test_executor_resilience.py` | Upstream-unreachable handling in `_ResilientAsyncClient` |
@@ -2763,7 +2906,14 @@ Run tests:
 ```bash
 pytest
 pytest --cov=src/genetics_mcp_server  # with coverage
+pytest -n 0                           # single process, for a readable failure
 ```
+
+The suite runs on two xdist workers by default (`addopts` in `pyproject.toml`). The split is
+`--dist loadfile` rather than the default `loadscope` because several files share
+process-global state — `rate_limit._requests`, the `get_settings` cache — and are written to
+be ordered within a file, so a whole file has to land on one worker. Two rather than `auto`
+because each worker holds a full app import: four exhausted a 16 GB host mid-run.
 
 `pytest-randomly` (pinned to 4.1.0 in the `dev` extra) shuffles test order on every run, so
 order-dependent state leaking between tests fails visibly instead of hiding behind the
@@ -3004,7 +3154,7 @@ read this DB.
 ## Replay Benchmark
 
 `scripts/replay_benchmark.py` replays the `user_turns` sequences from
-`eval_dataset.json` through `POST /chat/v1/chat` under two `tool_profile` arms and
+`eval_dataset.json` through `POST /chat/v1/chat` under two arms and
 reports per-arm distributions. It is the measurement gate for the code-execution
 epic (`genetics-results-suite-4h6`): a candidate arm has to beat the recorded
 baseline before it is defaulted on.
@@ -3014,18 +3164,40 @@ harness issues two arms per case. `--base-url` therefore defaults to
 `http://localhost:8000`, never a deployment, and `--dry-run` resolves the whole plan
 (case order, arm order, turn count) without issuing a single request.
 
-- **The arms are the boolean.** `--arm-a` defaults to `nocode` and `--arm-b` to `code`,
-  the only two wire values that straddle the surface split; `--arm-a all` still spells
+- **An arm is a surface on a server.** The spec is `[LABEL=]PROFILE[@URL]`; with no
+  `@URL` the arm runs against `--base-url`, which is every single-server run and reports
+  exactly as it always did. `--arm-a` defaults to `nocode` and `--arm-b` to `code`, the two
+  wire values that straddle the surface split; `--arm-a all` still spells
   `tool_profile: null`, which resolves to the same surface as `nocode`. The preflight asks
-  the server what each arm resolved to before anything is spent and refuses three shapes,
-  each of which otherwise produces a plausible report about something else: an arm the
-  server reports `known_profile: false` for; an arm that is not the surface it names — the
-  `code` arm resolving *without* `run_analysis`, which is what a chat service running with
-  `SANDBOX_ENABLED=false` serves, or any other arm resolving *with* it, which is a server
-  predating the collapse; and two arms whose resolved name sets are equal. An arm the
-  server did not resolve at all (transport error, non-200, or a 200 carrying no names) is
-  survivable rather than fatal, but both the `run_analysis` check and the identical-surface
-  check are skipped for it, and the harness warns saying so.
+  **each arm's own server** what that arm resolved to before anything is spent, and refuses
+  four shapes, each of which otherwise produces a plausible report about something else: an
+  arm the server reports `known_profile: false` for; an arm that is not the surface it
+  names — the `code` arm resolving *without* `run_analysis`, which is what a chat service
+  running with `SANDBOX_ENABLED=false` serves, or any other arm resolving *with* it, which
+  is a server predating the collapse; two arms **on one server** whose resolved name sets
+  are equal; and two arms **on different servers** whose resolved `prompt_variant` is the
+  same. An arm the server did not resolve at all (transport error, non-200, or a 200
+  carrying no names) is survivable rather than fatal, but both the `run_analysis` check and
+  the identical-surface check are skipped for it, and the harness warns saying so. A server
+  too old to report `prompt_variant` is likewise a warning: unprovable is not the same as
+  equal, and refusing would mean refusing to work with any build that predates the field.
+- **The prompt-variant dimension.** To compare two SYSTEM PROMPTS rather than two tool
+  surfaces, point the arms at two processes of the same build that differ only in
+  `PROMPT_VARIANT` (`config/defaults.py` `PROMPT_VARIANTS`; see § Prompt variants):
+
+      --arm-a 'legacy=code@http://localhost:8000' \
+      --arm-b 'condensed=code@http://localhost:8001'
+
+  Identical tool sets are then the point rather than a fault, which is why the
+  identical-surface guard applies only within one server. What must differ is the variant,
+  and the harness reads that back off `/chat/v1/tools/resolved` rather than trusting what
+  the command line asked for — `PROMPT_VARIANT` coerces an unknown name to the default, so
+  a typo on one process leaves both arms on the default prompt, which is the identical-
+  surface failure wearing different clothes. Two arms that differ in *both* variant and
+  resolved tools are allowed and warned about: it is a legitimate thing to measure, but a
+  difference in the results cannot be attributed to the prompt alone. The report's `config`
+  carries each arm's label, profile, base URL and resolved variant, so a saved run says
+  what it compared.
 - **Single-arm mode.** `--arm-b none` runs arm A alone. It exists because the counters that
   decide a prompt or image change are per-arm, and paying for a second arm that has not
   changed buys nothing. What it gives up is everything the pairing defends: a model swap or
@@ -3543,6 +3715,31 @@ already written) — a run produces cost and latency numbers with no judge call 
 - **Issue tracking**: beads (`bd`) tracks epics and tasks in `.beads/`, synced with git
 - **Feature planning**: new features go through architecture exploration (`~/.claude/agents/architecture-explorer.md` — a user-level agent, not checked into any repo) which proposes 3 alternatives, then the selected approach is broken into ultrafocused subtasks in beads
 - **Task execution**: work through subtasks via `bd ready`, updating status as you go
+
+## Lint gate
+
+`scripts/lint-staged.sh` runs ruff over the **staged** Python files from the `pre-commit`
+hook and **fails the commit** when anything is reported. `git commit --no-verify` is the
+bypass. It is the one pre-commit check that blocks; `scripts/check-doc-drift.sh` only warns.
+
+- **Staged, not repo-wide.** A finding in a file the commit does not touch never blocks it.
+  The other side of that coin is that a pre-existing finding is only ever cleared by
+  touching its file; `scripts/lint-staged.sh --all` runs the repo-wide check.
+- **The working tree, not the index.** It lints the working-tree copy of each staged path,
+  because doing it properly means materialising the index somewhere and a hook that stashes
+  can lose work if interrupted. The difference shows only when a file is partially staged,
+  and that case is detected and printed rather than left to be found later.
+- **Resolving ruff:** this checkout's `.venv`, then the **main checkout's** (a worktree has
+  none of its own), then `PATH`, then `uvx ruff@<pin>`. With none of those it **fails the
+  commit** rather than passing it unchecked — a gate that skips when its linter is missing
+  is indistinguishable from a clean commit. A resolved ruff that is not the pinned version
+  warns and proceeds.
+
+The rule set matches the sibling repos, because the same gate runs in all five and a
+per-repo rule set means the same file passes in one and fails in the next. Neither hook
+runs until `scripts/install-git-hooks.sh` has been run once in the clone; `core.hooksPath`
+is local git config that no clone carries, and it is shared across worktrees, so that one
+run covers every worktree too.
 
 ## Documentation
 

@@ -20,6 +20,17 @@ dependencies = [
     "google-auth[requests]==2.49.0",
     "fastexcel==0.20.2",
     "pyjwt[crypto]==2.11.0",
+    "alphagenome==0.9.0",
+    # alphagenome pulls anndata in; held one minor back. 0.13's module-level settings
+    # object is a pydantic-settings model that searches upward for a .env with extras
+    # forbidden, and the `dotenv_filtering` opt-out that would spare unrelated keys is
+    # silently ignored before pydantic-settings 2.14.0, which is what our lock holds -- so
+    # `import anndata` fails and the ValidationError echoes the values it read, secrets
+    # included, wherever a .env sits at or above the cwd (dev and CI; images carry none).
+    # Bumping pydantic-settings to >=2.14.0 activates the filtering and retires that half
+    # of the reason; 0.13's numpy>=2.1 / pandas>=2.3 / zarr>=3.1 floors are the other half
+    # and are unconditional. Price of staying: 0.12.19 needs pandas<3, capping it at 2.3.3.
+    "anndata==0.12.19",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +41,7 @@ dev = [
     # pinned exactly: the seed -> order mapping is not stable across versions, so an
     # unpinned dep would make a seed quoted in a bug report unreproducible
     "pytest-randomly==4.1.0",
+    "pytest-xdist==3.8.0",
     "ruff==0.15.12",
     "xlsxwriter==3.2.9",
 ]
@@ -44,17 +56,27 @@ packages = ["src/genetics_mcp_server"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# sibling worktrees live under .claude/worktrees and carry their own copy of every
+# source file; without this, ruff reports each finding once per checked-out branch
+exclude = [".claude"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
 # E501: line too long (handled by formatter)
 # E402: module level import not at top of file (load_dotenv must be called before project imports)
-ignore = ["E501", "E402"]
+# E741: ambiguous name (`l`) — style only, and every occurrence across the suite is a
+#       loop variable, so it blocks commits without ever catching a defect
+ignore = ["E501", "E402", "E741"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-m 'not integration'"
+# --dist loadfile, not the default loadscope: several files share process-global state
+# (rate_limit._requests, the settings lru_cache) and are written to be ordered within a file.
+# -n 2 rather than -n auto because each worker holds a full app import: four of them
+# exhausted a 16 GB host mid-run. Raising it needs the memory checked, not just the cores.
+# `-n 0` turns it off for a debugging run.
+addopts = "-m 'not integration' -n 2 --dist loadfile"
 markers = [
     "integration: tests requiring a running genetics API server",
 ]

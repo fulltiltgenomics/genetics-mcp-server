@@ -24,74 +24,18 @@ outlive its examples, state the precondition as `requires_all` and put the examp
 their own block (see the routing arbitration below).
 """
 
+import logging
 import re
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass, field
+from functools import lru_cache
 
 from genetics_mcp_server import schema_docs
+from genetics_mcp_server.config.prompt_blocks import _Block, _fs
+from genetics_mcp_server.config.prompt_condensed import (
+    CONDENSED_PROMPT_BLOCKS as _CONDENSED_PROMPT_BLOCKS,
+)
 
-
-@dataclass(frozen=True)
-class _Block:
-    r"""One fragment of the system prompt, with the conditions for emitting it.
-
-    `text` owns its surrounding newlines so that concatenating the emitted blocks
-    reproduces the document structure with no re-joining.
-
-    Three rules for writing the text, none of which the gate can enforce for you:
-
-    1. NAME TOOLS EXACTLY. The gate matches `(?<!\w)NAME\b` (see `tools_named_in`), so a
-       plural or suffixed mention — `get_hla_by_alleles` where the tool is
-       `get_hla_by_allele` — is not seen as a mention at all, and the block is then
-       emitted on surfaces that do not have the tool. No test catches that:
-       tests/test_system_prompt.py's scan is independent of the gate on the ALGORITHM
-       (tokenise-then-intersect vs per-name regex) but shares its NORMALISATION, so the
-       two agree with each other while both being wrong. There is no live instance today
-       (genetics-results-suite-4h6.78); keep it that way by naming tools verbatim and
-       rephrasing the sentence around the exact name.
-
-    2. A PROHIBITION GATES POSITIVELY. `_assemble` asks only WHICH names appear in the
-       text, never with what polarity, so a block written to warn AGAINST a tool requires
-       that tool to be available. Remove the tool from a surface and the warning
-       disappears — along with everything else that block carries. The
-       genetics-results-suite-4h6.17/.69 cycle fixed the live instance (the HLA block,
-       where `get_summary_stats` appeared only inside a negation); the property remains.
-       If a rule has to outlive the tool it warns about, put the warning in its own block.
-
-    3. GATE ON WHAT A RULE NEEDS, NOT ON WHAT IT IS ABOUT. Science and grounding belong in
-       blocks that name no tool; only the "which tool" clause is gated. The line between
-       the two is whether the rule can be OBEYED without rows:
-       - An obligation that attaches when the model PRESENTS data holds on every surface,
-         because a surface with no data path can still present data it retrieved from a
-         document. So the pseudo-credible-set labelling duty ("not statistically
-         fine-mapped", "always tell the user explicitly") and the construction facts
-         needed to read such a result (the r² membership criteria, the PIP caution) are
-         ungated, and reach `rag`.
-       - A rule that can only be carried out by FETCHING rows — membership is whatever
-         `credible_sets_v` returns, re-query rather than answer from memory — is gated on
-         having a path to those rows: on a surface without one it names an action the
-         model cannot take, and "verify it" with nothing to verify against is worse than
-         silence (genetics-results-suite-4h6.79).
-    """
-
-    text: str
-    # emitted only if at least one of these is available; use for a section whose own text
-    # names no tool but which presupposes a capability (e.g. SQL guidance, reachable either
-    # through query_database or through the SDK's sql() inside run_analysis)
-    requires_any: frozenset[str] = field(default_factory=frozenset)
-    # suppressed if any of these is available; use to pick between mutually exclusive
-    # wordings of the same guidance for different tool surfaces
-    excludes: frozenset[str] = field(default_factory=frozenset)
-    # emitted only if ALL of these are available. The text-derived name gate is itself an
-    # implicit requires_all, so guidance whose emission is a real precondition on a tool
-    # used to be expressed by happening to name that tool — which made it hostage to every
-    # OTHER name in the same text, including illustrative "e.g." asides. State the
-    # precondition here and keep the asides in their own blocks instead.
-    requires_all: frozenset[str] = field(default_factory=frozenset)
-
-
-def _fs(*names: str) -> frozenset[str]:
-    return frozenset(names)
+logger = logging.getLogger(__name__)
 
 
 # Tools whose input_schema actually carries `summarize`. The gate matches TOOL NAMES, so
@@ -186,7 +130,7 @@ Now, looking only at the extracted data and literature above, provide your analy
  If you report anything at all from a truncated result, say explicitly that it is partial
 - **Never present output you have not received yet.** Do not write a table, count, or effect estimate with empty cells or placeholders such as `[from query]` or `[to confirm]`, and do not end a turn by announcing a query you have not run. Announcing a call is not making one: if answering needs data, call the tool in the same turn and write the table only from the result that came back. If you cannot get the data, say what is missing instead of laying out the shape of an answer you do not have
 - When looking for something and it is not found, say so explicitly
-- When looking for a phenotype and many are found, mention all phenotype codes found, and prefer the FinnGen phenotype with the largest number of cases, or largest sample size if the number of cases is not available
+- When looking for a phenotype and many are found, mention all phenotype codes found. If one must be chosen, prefer the one with the largest number of cases, or the largest sample size if the number of cases is not available, regardless of which resource it comes from. Say which one you chose and why, and mention when a different resource has a comparable candidate
 """),
     _Block(
         '- When using search_scientific_literature, always mention which backend was queried for that call. "Backend" is the API actually queried — exactly one of `europepmc` or `perplexity` — and is given by the result\'s `backend` field. Read that field. You do not choose the backend: it is the user\'s setting (default `perplexity`), the tool takes no backend argument, and if a user asks for a different backend, tell them to change that setting rather than claiming you have switched it. A per-record `metadata_source` of `europepmc` on a `perplexity` result means only that the bibliographic details were looked up there — the backend searched is still `perplexity`. Do NOT invent compound names like "PubMed/Europe PMC" or "Perplexity/PubMed": PubMed, Europe PMC, bioRxiv, and medRxiv are content sources indexed by the `europepmc` backend, while `perplexity` indexes the broader scientific web. They are not separate backends and must not be combined with a slash in user-facing responses\n'
@@ -237,6 +181,33 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
     _Block(
         "\nReach these through `get_mpra_by_variant` / `get_mpra_by_region` / `get_mpra_by_gene`, `get_variant_effect_by_variant` / `get_variant_effect_by_gene`, and `get_open_chromatin_by_variant` / `get_open_chromatin_by_region` / `get_open_chromatin_by_peak` / `get_open_chromatin_by_gene`.\n"
     ),
+    # OPT-IN IS DELIVERED BY THIS TEXT AND BY THE TOOL DESCRIPTION, AND BY NOTHING ELSE.
+    # There is no per-user setting, no per-conversation column and no UI toggle: the user
+    # was told plainly that this is persuasion rather than enforcement, that the model
+    # holds the tool either way, and chose it. So this block is the requirement, not
+    # boilerplate around it — and the tool description carries the same rules, because the
+    # model follows a description far more reliably than prose this far up the prompt.
+    # It self-gates on the tool name the way every block here does.
+    _Block("""
+### AlphaGenome variant predictions (opt-in)
+
+`get_alphagenome_variant_predictions` returns MODEL PREDICTIONS from AlphaGenome (Google DeepMind): what a deep-learning model predicts a variant does to chromatin accessibility, binding, transcription and splicing. They are not measurements, not FinnGen results, and nothing in them was observed in a person.
+
+`compare_alphagenome_with_measured` puts that prediction beside this suite's OWN measured effect sizes for the same variant — caQTL, eQTL and sQTL betas, MPRA allelic skew — with their concordance. Same opt-in, same labelling duty; it is the tool for "how does the prediction compare with what we measured?", and it is not a way in when the suite has no data.
+
+**Call it only when the user has asked for it.** Three things count as asking: the user names AlphaGenome; the user asks for a model prediction of a variant's regulatory effect; or the user asks how a measured value in this suite compares with what a model predicts for the same variant — that comparison is a first-class use of the tool, not a workaround.
+
+- Do NOT call it as background enrichment, and do not add a prediction to an answer that did not ask for one
+- "What does this variant do?", "tell me about rs...", "is this variant causal?", "why is this locus associated?" are NOT requests for AlphaGenome. Answer them from this suite's own measured and fine-mapped data
+- Finding nothing in this suite's data is not a reason to call it either. Say the data is silent; you may OFFER a prediction in one line and then wait to be asked
+- It is an additional source of evidence, not a fallback for gaps. Being available is not a reason to use it
+
+When you report a prediction, read the per-modality `validation` block and carry it into the answer: `quantity: "magnitude"` means the direction is not reported and you must not state one; `status: "unvalidated"` means the modality was never checked against anything measured here; `population_rho` is a cohort-level correlation for the modality and never a confidence for the variant in hand.
+
+Predicted and measured values may be presented side by side, and there the labelling matters MORE, not less: label every predicted number as predicted, name the source of every measured number, never merge or average the two into one figure, and where they disagree say that they disagree.
+
+A magnitude-only modality's comparison carries no direction at all — that absence is deliberate and you must not supply one — and `population_rho` there is the modality's cohort correlation, never the variant's.
+"""),
     # the MHC caution and the two result-reading traps are domain science, not routing: they
     # hold however the data is reached, and the surfaces that lose the HLA tools keep
     # `credible_sets_v` and `hla_associations_v` through SQL — i.e. exactly the readers who
@@ -364,7 +335,7 @@ A dataset's `data_type` (e.g. pQTL) describes what the dataset *is*, but its `pr
 **When the user asks about the sample size, case/control counts, or provenance of a SPECIFIC result they are referring to** (a credible set, association, or row from an earlier step or an external source), first determine which dataset/resource that exact result came from — via its `dataset_id`/`resource`, or by re-querying it — and report the sample size for THAT dataset. Do not quote the sample size of whichever dataset is most convenient or the one you happen to have open; a result the user cites may come from a different dataset than the one you last queried. If you cannot establish which dataset the result is from, say so rather than attaching a sample size that may not apply.
 """),
     _Block("""
-Check the `products` field via `list_datasets` to determine which datasets support the relevant product. When the user mentions a data source by informal name ("FinnGen", "UK Biobank", "Open Targets"), match it to a dataset via its `description` / `resource` / `author` fields from `list_datasets` rather than guessing. In general prefer FinnGen's own data over Open Targets when both cover the same study — FinnGen data is typically newer and more complete.
+Check the `products` field via `list_datasets` to determine which datasets support the relevant product. When the user mentions a data source by informal name ("FinnGen", "UK Biobank", "Open Targets"), match it to a dataset via its `description` / `resource` / `author` fields from `list_datasets` rather than guessing. When more than one dataset covers the same trait or study, prefer the one with the larger sample size (cases, or total N for quantitative traits) as reported by `list_datasets`, and among equals the more recent release. A meta-analysis that includes a cohort supersedes that cohort's standalone results for the same trait only if it reports a larger sample. State which dataset you used and why.
 """),
     # split ONLY to get the `list_datasets` parenthetical out of the way: it is an aside
     # about where the flag is visible, and gating the section on it deleted the
@@ -796,11 +767,18 @@ def known_tool_names() -> frozenset[str]:
     return _known_tool_names_cache
 
 
+@lru_cache(maxsize=None)
 def tools_named_in(text: str) -> frozenset[str]:
     """Tool names mentioned in a piece of prompt text.
 
     Word-boundary matching, so `get_credible_sets_by_gene` does not also count as a
     mention of a hypothetical `get_credible_sets`.
+
+    Cached because this is one regex pass per known tool name over the block, and
+    `_assemble` re-runs it for every block on every prompt build — uncached that was 0.32s
+    of every chat request. The key is the text, so the cache holds one entry per prompt
+    block; it goes wrong only if the tool set can change within a process, which is the
+    same assumption `known_tool_names` already makes by caching in a module global.
     """
     return frozenset(n for n in known_tool_names() if re.search(rf"(?<![\w]){re.escape(n)}\b", text))
 
@@ -825,8 +803,69 @@ def _assemble(
     return "".join(parts)
 
 
+# The variant a deployment serves when PROMPT_VARIANT is unset or names nothing.
+DEFAULT_PROMPT_VARIANT = "condensed"
+
+# Named whole-prompt variants. A name selects a block tuple; `_assemble` then does the
+# same per-request tool gating inside whichever tuple was selected, so a variant changes
+# the text and nothing else about how a request is resolved.
+#
+# This exists to make a prompt rewrite MEASURABLE. `scripts/replay_benchmark.py` compares
+# two arms turn for turn, and an arm reaches a variant by pointing at a process started
+# with PROMPT_VARIANT set to it. Both arms then run the same build, the same tool
+# resolution and the same dataset, so the prompt is the only thing that differs — which a
+# second deployment built from a branch could not promise.
+#
+# Selection is deployment-side and never per-request. That is the same invariant chat_api
+# states over the assembled prompt itself: a request may not choose its own system prompt,
+# which carries the grounding, citation and out-of-scope rules. A wire field would hand
+# every caller a menu of prompts, including whatever experimental one a benchmark left
+# here.
+# `legacy` is kept as the only regression baseline the condensed prompt can be measured
+# against, and it is NOT free: two block tuples both have to learn about every tool added
+# after this, and only the structural invariants in tests/test_system_prompt.py are
+# enforced across both. Delete it once the condensed prompt has soaked, rather than
+# carrying a second prose surface indefinitely.
+PROMPT_VARIANTS: dict[str, tuple[_Block, ...]] = {
+    DEFAULT_PROMPT_VARIANT: _CONDENSED_PROMPT_BLOCKS,
+    "legacy": _PROMPT_BLOCKS,
+}
+
+_warned_unknown_variants: set[str] = set()
+
+
+def resolve_prompt_variant(variant: str | None) -> str:
+    """The variant name this deployment actually serves.
+
+    An unknown name coerces to the default and logs a WARNING rather than raising: the
+    value is a deployment env var, and a typo in it must not take chat down for everyone.
+
+    Coercing has a cost the tool_profile coercion does not: two benchmark arms could both
+    land on the default and report the difference between a prompt and itself as a result.
+    That is why the RESOLVED name is reported on /chat/v1/tools/resolved — the harness
+    reads it back and refuses a paired run whose arms resolve to one variant, which is the
+    same shape as the identical-surface guard it already applies to tool profiles.
+    """
+    name = (variant or "").strip() or DEFAULT_PROMPT_VARIANT
+    if name in PROMPT_VARIANTS:
+        return name
+    if name not in _warned_unknown_variants:
+        _warned_unknown_variants.add(name)
+        logger.warning(
+            "Unrecognised PROMPT_VARIANT %r - serving %r instead. Known variants: %s. A "
+            "benchmark arm pointed at this process is measuring the default prompt, not "
+            "the one it named; GET /chat/v1/tools/resolved reports the resolved name.",
+            name,
+            DEFAULT_PROMPT_VARIANT,
+            ", ".join(sorted(PROMPT_VARIANTS)),
+        )
+    return DEFAULT_PROMPT_VARIANT
+
+
 def default_system_prompt(
-    app_name: str = "FinnGenie", tool_names: Iterable[str] | None = None
+    app_name: str = "FinnGenie",
+    tool_names: Iterable[str] | None = None,
+    variant: str | None = None,
 ) -> str:
     """Default system prompt with the assistant persona name substituted.
 
@@ -838,13 +877,18 @@ def default_system_prompt(
             the model was given. `None` disables the filtering entirely and emits every
             block — the pre-4h6.69 behaviour, kept for callers that have no tool list
             (and for tests that want the full text).
+        variant: which entry of `PROMPT_VARIANTS` to assemble. `None` and any unknown
+            name resolve to `DEFAULT_PROMPT_VARIANT`; see `resolve_prompt_variant`.
     """
-    return _assemble(tool_names).replace("FinnGenie", app_name)
+    blocks = PROMPT_VARIANTS[resolve_prompt_variant(variant)]
+    return _assemble(tool_names, blocks).replace("FinnGenie", app_name)
 
 
-# Appended to the system prompt per the user's response-length setting. Both variants
-# scope the *write-up* only — the three-pass analysis in "Analyzing data" is how the
-# answer is derived either way, and neither fragment relaxes a grounding rule.
+# Appended to the system prompt per the user's response-length setting, whichever prompt
+# variant is in force — so the three passes these name have to stay in every variant's
+# "Analyzing data" section, and tests/test_chat_api.py pins that they do. Both scope the
+# *write-up* only: the analysis is derived the same way either way, and neither fragment
+# relaxes a grounding rule.
 _VERBOSITY_PROMPTS = {
     "brief": """
 ## Response Length: BRIEF (user setting)

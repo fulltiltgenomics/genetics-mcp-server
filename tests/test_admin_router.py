@@ -278,6 +278,74 @@ class TestAdminAnalytics:
         assert response.status_code == 400
 
 
+class TestAdminCostAnalytics:
+
+    @pytest.fixture
+    def costed_client(self, admin_client, seeded_db):
+        sessions, _ = seeded_db.list_all_sessions()
+        alice = next(s for s in sessions if s.user_id == "alice@example.com")
+        for cost in (1.25, 0.5):
+            seeded_db.record_turn_metrics(
+                session_id=alice.id, message_id=None, user_id="alice@example.com",
+                iterations=2, tool_call_count=1, input_tokens=100, output_tokens=10,
+                cache_read_tokens=0, cache_create_tokens=0, cost_usd=cost, wall_ms=100,
+            )
+        # spend by someone who opened no conversation in the window is still a row
+        seeded_db.record_turn_metrics(
+            session_id=None, message_id=None, user_id="carol@example.com",
+            iterations=1, tool_call_count=0, input_tokens=10, output_tokens=1,
+            cache_read_tokens=0, cache_create_tokens=0, cost_usd=0.05, wall_ms=10,
+        )
+        return admin_client
+
+    def test_cost_week(self, costed_client):
+        response = costed_client.get("/chat/v1/admin/analytics/cost?period=week")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["period"] == "week"
+        assert len(data["daily"]) == 1
+        assert data["daily"][0]["usd"] == pytest.approx(1.8)
+
+        by_user = {u["user"]: u for u in data["users"]}
+        assert [u["user"] for u in data["users"]] == [
+            "alice@example.com", "carol@example.com", "bob@example.com",
+        ], "sorted by spend, then name"
+        # both turns sit on one of alice's two sessions: the other has no attributed turn and
+        # does not enter the per-conversation USD figures
+        assert by_user["alice@example.com"] == {
+            "user": "alice@example.com", "conversations": 2, "avg_messages": 2.0,
+            "max_messages": 2, "usd": pytest.approx(1.75), "avg_usd": pytest.approx(1.75),
+            "max_usd": pytest.approx(1.75),
+        }
+        assert by_user["bob@example.com"]["usd"] == 0.0
+        assert by_user["bob@example.com"]["conversations"] == 1
+        assert by_user["bob@example.com"]["avg_usd"] is None
+        assert by_user["carol@example.com"]["conversations"] == 0
+        assert by_user["carol@example.com"]["max_messages"] == 0
+        assert by_user["carol@example.com"]["usd"] == pytest.approx(0.05)
+        assert by_user["carol@example.com"]["max_usd"] is None
+
+    def test_cost_periods(self, costed_client):
+        for period in ("month", "year"):
+            assert costed_client.get(f"/chat/v1/admin/analytics/cost?period={period}").status_code == 200
+        assert costed_client.get("/chat/v1/admin/analytics/cost?period=day").status_code == 400
+
+    def test_session_list_carries_each_conversations_cost(self, costed_client):
+        sessions = costed_client.get("/chat/v1/admin/sessions").json()["sessions"]
+        by_user = {}
+        for s in sessions:
+            by_user.setdefault(s["user_id"], []).append(s["usd"])
+        # alice's two turns sit on one of her sessions; the other, and bob's, have no turn
+        assert sorted(by_user["alice@example.com"], key=lambda v: v or 0) == [None, pytest.approx(1.75)]
+        assert by_user["bob@example.com"] == [None]
+
+    def test_cost_empty_db_is_not_an_error(self, admin_client):
+        data = admin_client.get("/chat/v1/admin/analytics/cost").json()
+        assert data["daily"] == []
+        # sessions exist without any recorded turn: every user is listed at zero spend
+        assert {u["usd"] for u in data["users"]} == {0.0}
+
+
 class TestAdminAuthGuards:
 
     def test_non_admin_denied_when_auth_required(self, seeded_db):

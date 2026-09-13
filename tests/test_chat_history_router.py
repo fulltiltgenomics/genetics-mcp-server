@@ -1113,6 +1113,17 @@ class TestProjectMemoryEndpoint:
 
         assert data["char_cap"] == MAX_DIGEST_CHARS
 
+    def test_session_cap_is_the_gate_s_own_window(
+        self, client_with_auth, test_db, llm_config_db
+    ):
+        from genetics_mcp_server.memory_gate import MEMORY_PROJECT_SESSION_CAP
+
+        project = self._project(test_db)
+        with self._settings(llm_config_db):
+            data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
+
+        assert data["session_cap"] == MEMORY_PROJECT_SESSION_CAP
+
     def test_a_pinned_session_in_another_project_is_absent(
         self, client_with_auth, test_db, llm_config_db
     ):
