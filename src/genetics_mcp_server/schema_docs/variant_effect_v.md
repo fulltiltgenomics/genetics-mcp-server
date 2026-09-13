@@ -25,7 +25,7 @@ filter by resource, not dataset.
 | `life_stage` | `STRING` | Developmental stage (fetal, adult, unknown) |
 | `score` | `FLOAT64` | Predicted effect magnitude on accessibility |
 | `score_type` | `STRING` | Meaning of score (chrombpnet_abs_logfc, flare_score) |
-| `mlog10p` | `FLOAT64` | -log10(p) per-context significance (ChromBPNet; NA for FLARE) |
+| `mlog10p` | `FLOAT64` | -log10(p) per-context significance (ChromBPNet; NULL for FLARE) |
 | `predicted_direction` | `STRING` | Predicted direction of the accessibility effect |
 | `quantile_rank` | `FLOAT64` | Effect-strength rank (how strongly the variant is predicted to act) |
 | `is_significant` | `BOOL` | Whether the predicted effect passes the model's significance threshold |

@@ -26,8 +26,8 @@ contains variants filtered to mlog10p > 4.
 | `af_controls` | `FLOAT64` | Alternative allele frequency in controls |
 | `ac` | `INT64` | Alternative allele count |
 | `an` | `INT64` | Alternative allele number (total alleles genotyped) |
-| `n_cases` | `INT64` | Number of cases in the analysis (may be NA) |
-| `n_controls` | `INT64` | Number of controls in the analysis (may be NA) |
+| `n_cases` | `INT64` | Number of cases in the analysis (may be NULL) |
+| `n_controls` | `INT64` | Number of controls in the analysis (may be NULL) |
 | `trait` | `STRING` | Trait/phenotype name |
 | `trait_original` | `STRING` | Original trait name in the respective dataset |
 | `variant` | `STRING` | Variant identifier as chr:pos:ref:alt |

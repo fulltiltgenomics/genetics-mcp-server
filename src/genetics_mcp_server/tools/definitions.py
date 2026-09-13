@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
+from genetics_mcp_server import schema_docs
+
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
 
@@ -53,7 +55,6 @@ logger = logging.getLogger(__name__)
 #   - search_scientific_literature.max_results — the "max 25" clamp exists only on the
 #     europepmc path (executor.py `_search_europepmc_literature`); the DEFAULT backend is
 #     perplexity, which slices to max_results uncapped.
-#   - query_database.max_rows — capped downstream by db-api on bytes, not here.
 #   - `pattern` on any parameter. The plausible candidates (get_hla_by_allele.allele,
 #     read_artifact.name) are validated AFTER a normalization step that widens what is
 #     accepted, so a regex matching the validator would reject inputs the server handles.
@@ -816,7 +817,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "parameters": {
             "resource": {
                 "type": "string",
-                "description": "Gene-based data resource ('genebass', 'schema', 'bipex', 'ibd')",
+                "description": "Gene-based data resource ('genebass', 'schema2', 'bipex2', 'ibd_exome_2026')",
                 "required": True,
             },
             "phenotype": {
@@ -871,7 +872,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "List all datasets available in the API with descriptions, provenance "
             "(author, version, publication date), sample-size statistics (number of "
             "phenotypes, median sample size, case/control ranges), and which products "
-            "(credible sets / summary stats / colocalization) each dataset supports. "
+            "(one key per product config) each dataset supports. "
             "ALWAYS call this FIRST when the user asks about data availability, sample "
             "sizes, number of endpoints/phenotypes, dataset metadata, or mentions a "
             "data source by name. The returned `dataset_id` and `resource` are what "
@@ -1745,7 +1746,7 @@ Use this for the per-phenotype dosage question:
 
 At least one of `gene` or `phenotype` is required. `phenotype` takes an HPO id in either spelling ('HP:0012759' or 'HP0012759'), the literal 'UNKNOWN', or a substring of the phenotype's name ('intellectual disability') matched case-insensitively — search_phenotypes does NOT cover this dataset, so do not try to resolve the code with it first. 'HP0000118' is every case pooled, not a peer of the other 53 groups.
 
-`beta` is ln(odds ratio), so OR = EXP(beta). Every gene appears for every phenotype and CNV type, including the 65% of rows where the gene was TESTED BUT NO ESTIMATE was produced because no qualifying CNV was seen; those carry NULL from `beta` onward and are excluded unless you set include_no_estimate. Rank on `mlog10p`; for the paper's own gene lists set significant_only, which applies both significance tiers (FDR < 1% or P <= 2.90e-6) together with the secondary-evidence requirement (>= 2 nominal cohorts, or the leave-top-cohort-out p-value still nominally significant) — a bare threshold on mlog10p or mlog10_fdr_q does not reproduce the published results.""",
+`beta` is ln(odds ratio), so OR = EXP(beta). Every gene appears for every phenotype and CNV type, including the 65% of rows where the gene was TESTED BUT NO ESTIMATE was produced because no qualifying CNV was seen; those carry NULL in every statistic column (`beta` through `mlog10_fdr_q_secondary`) and are excluded unless you set include_no_estimate. Rank on `mlog10p`; for the paper's own gene lists set significant_only, which applies both significance tiers (FDR < 1% or P <= 2.90e-6) together with the secondary-evidence requirement (>= 2 nominal cohorts, or the leave-top-cohort-out p-value still nominally significant) — a bare threshold on mlog10p or mlog10_fdr_q does not reproduce the published results.""",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -1774,7 +1775,7 @@ At least one of `gene` or `phenotype` is required. `phenotype` takes an HPO id i
             },
             "include_no_estimate": {
                 "type": "boolean",
-                "description": "Keep the 'tested, no estimate' rows (NULL beta onward, 65% of the view). Off by default",
+                "description": "Keep the 'tested, no estimate' rows (NULL in every statistic column, beta through mlog10_fdr_q_secondary; 65% of the view). Off by default",
                 "default": False,
             },
             "limit": {
@@ -1865,7 +1866,7 @@ Use this tool when:
 Query by exactly ONE of: a single variant, a genomic region, or a gene name.
 For batch lookups of multiple specific variants, use the 'variants' parameter instead.
 
-Returns: variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), heterozygous/homozygous counts, most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values.""",
+Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), heterozygous/homozygous counts, most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values. source=gnomad returns a different row: per-population AF_* columns, AN, filters, rsids and consequences, with no counts or enrichment. Every value arrives as a string on both sources.""",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -2143,8 +2144,11 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
             },
             "max_rows": {
                 "type": "integer",
-                "description": "Maximum rows to return to the LLM (default 1000). The download file is not affected by this limit.",
+                "description": "Maximum rows to return to the LLM (default 1000, at most 100 000; larger values are rejected). The download file is not affected by this limit.",
                 "default": 1000,
+                # db-api QueryRequest.max_rows le=MAX_ROWS; executor.query_database forwards a
+                # value above it unchanged and the call fails 422
+                "maximum": 100_000,
             },
             "dry_run": {
                 "type": "boolean",
@@ -2161,7 +2165,8 @@ If the download hits the 100,000-row cap, tell the user to add filters to narrow
         "parameters": {
             "table": {
                 "type": "string",
-                "description": "Optional: return schema for just this table (e.g. 'gene_burden_results_v'). Omit for all tables. Available: credible_sets_v, colocalization_v, coloc_credsets_v, exome_variant_results_v, gene_burden_results_v",
+                "description": "Optional: return schema for just this table (e.g. 'gene_burden_results_v'). Omit for all tables. Available: "
+                + ", ".join(schema_docs.view_names()),
             },
         },
     },

@@ -23,23 +23,23 @@ Checked against dev: the full rule — `(mlog10_fdr_q > -LOG10(0.01) OR mlog10p 
 5,680 rows over 739 distinct genes, matching the paper's published totals. 65% OF ROWS ARE
 "TESTED, NO ESTIMATE". Every gene appears for every phenotype and CNV type, including those
 where the meta-analysis produced no estimate because no qualifying CNV was observed; those
-rows carry NULL from `beta` onward. Filter `beta IS NOT NULL` to get the estimated
-associations. Do NOT filter on `n_nominal_cohorts` for this — the NULL rows are not the rows
-with n_nominal_cohorts = 0, and using it as a proxy silently drops real estimates.
-PHENOTYPES ARE HPO GROUPS, WITH TWO SPECIAL CODES. `phenotype` is an HPO term id with the
-colon removed (HP0012759 = HP:0012759). HP0000118 ("Phenotypic abnormality") is not a peer
-of the other 53 codes — it is every case pooled (458,326 cases + 491,952 controls, the full
-950,278-individual cohort), so it overlaps all the others and must not be summed with them.
-UNKNOWN is the group of cases whose indication matched none of the listed HPO terms. For the
-human-readable name, join phenotypes_v on `p.dataset = r.dataset AND p.trait_original =
-r.phenotype` — this view calls its phenotype code `phenotype`, not `trait_original`. EFFECT
-SIZES ARE ON THE LOG SCALE. `beta` is ln(odds ratio), so OR = EXP(beta), and
-`beta_lower`/`beta_upper` are the 95% CI on the same scale. The `*_secondary` columns are a
-leave-top-cohort-out sensitivity re-analysis (the meta re-run without `top_cohort`), NULL
-for 86% of rows; use them to check that a signal is not carried by a single cohort, never as
-the primary result. NO COORDINATES: the published data is GRCh37 and gene-keyed, so nothing
-positional is stored here. Join gene_annotations_v on ensembl_gene_id for GRCh38
-coordinates.
+rows carry NULL in every statistic column (`beta` through `mlog10_fdr_q_secondary`). Filter
+`beta IS NOT NULL` to get the estimated associations. Do NOT filter on `n_nominal_cohorts`
+for this — the NULL rows are not the rows with n_nominal_cohorts = 0, and using it as a
+proxy silently drops real estimates. PHENOTYPES ARE HPO GROUPS, WITH TWO SPECIAL CODES.
+`phenotype` is an HPO term id with the colon removed (HP0012759 = HP:0012759). HP0000118
+("Phenotypic abnormality") is not a peer of the other 53 codes — it is every case pooled
+(458,326 cases + 491,952 controls, the full 950,278-individual cohort), so it overlaps all
+the others and must not be summed with them. UNKNOWN is the group of cases whose indication
+matched none of the listed HPO terms. For the human-readable name, join phenotypes_v on
+`p.dataset = r.dataset AND p.trait_original = r.phenotype` — this view calls its phenotype
+code `phenotype`, not `trait_original`. EFFECT SIZES ARE ON THE LOG SCALE. `beta` is ln(odds
+ratio), so OR = EXP(beta), and `beta_lower`/`beta_upper` are the 95% CI on the same scale.
+The `*_secondary` columns are a leave-top-cohort-out sensitivity re-analysis (the meta re-
+run without `top_cohort`), NULL for 86% of rows; use them to check that a signal is not
+carried by a single cohort, never as the primary result. NO COORDINATES: the published data
+is GRCh37 and gene-keyed, so nothing positional is stored here. Join gene_annotations_v on
+ensembl_gene_id for GRCh38 coordinates.
 
 ## Columns
 
