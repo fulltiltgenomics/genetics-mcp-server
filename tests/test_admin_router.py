@@ -330,6 +330,15 @@ class TestAdminCostAnalytics:
             assert costed_client.get(f"/chat/v1/admin/analytics/cost?period={period}").status_code == 200
         assert costed_client.get("/chat/v1/admin/analytics/cost?period=day").status_code == 400
 
+    def test_session_list_carries_each_conversations_cost(self, costed_client):
+        sessions = costed_client.get("/chat/v1/admin/sessions").json()["sessions"]
+        by_user = {}
+        for s in sessions:
+            by_user.setdefault(s["user_id"], []).append(s["usd"])
+        # alice's two turns sit on one of her sessions; the other, and bob's, have no turn
+        assert sorted(by_user["alice@example.com"], key=lambda v: v or 0) == [None, pytest.approx(1.75)]
+        assert by_user["bob@example.com"] == [None]
+
     def test_cost_empty_db_is_not_an_error(self, admin_client):
         data = admin_client.get("/chat/v1/admin/analytics/cost").json()
         assert data["daily"] == []

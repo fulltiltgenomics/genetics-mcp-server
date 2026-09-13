@@ -1144,6 +1144,27 @@ class ChatHistoryDB(object, metaclass=Singleton):
         )
         return [self._row_to_message(row) for row in cursor.fetchall()]
 
+    def get_session_costs(self) -> dict[str, float]:
+        """Recorded cost of every session that has an attributed turn, keyed by session id.
+
+        One query for the whole table rather than one per listed session: the admin list is
+        fetched unpaged. A session absent from the result has no turn carrying its id —
+        which for turns recovered from log lines without a session prefix is not the same
+        as having cost nothing, so callers show it as unknown rather than 0.
+        """
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT session_id, SUM(cost_usd) AS usd
+            FROM chat_turn_metrics
+            WHERE session_id IS NOT NULL
+            GROUP BY session_id
+            """
+        )
+        return {row["session_id"]: row["usd"] for row in cursor.fetchall()}
+
     def get_first_user_message(self, session_id: str) -> str | None:
         """Get the first user message content for preview."""
         conn = self._conn
