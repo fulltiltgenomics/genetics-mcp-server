@@ -484,10 +484,14 @@ that a declared tool still dispatches, and that a model-supplied `user` on a *de
 `sandbox_client.execute` returns the supervisor's 200 body **unchanged**; the handler
 rebuilds it field by field into `success` / `status` / `output` / `output_truncated` /
 `artifacts` / `artifacts_note`, and on a non-`ok` status adds `error`, `error_type`,
-`traceback`, `limit_exceeded` and a `hint`. Three fields are rendered **only when they say
+`traceback`, `limit_exceeded` and a `hint`. Four fields are rendered **only when they say
 something**: `duration_ms` when the supervisor reported one, `artifacts_omitted` when it is
-greater than zero, and `artifacts_retained_in_clear` (plus the note that goes with it) when
-it is `true`. Two reasons for the rebuild, and neither is that the contract's field set is
+greater than zero, `artifacts_retained_in_clear` (plus the note that goes with it) when
+it is `true`, and `artifacts_not_delivered` when the automatic fetch left something behind —
+each entry names the artifact and why (over the per-artifact read cap, past the per-run
+count of images or files, or unservable), and `artifacts_note` names the images that were
+shown so the model cannot describe one that was not. Like the clear-text flag it is placed
+before `output`, so a result truncated to a prefix still carries it. Two reasons for the rebuild, and neither is that the contract's field set is
 closed — it is not, an unknown `status` renders as itself and counts as not-ok, and an
 unrecognised `error.type` is a label to display rather than something switched on:
 

@@ -1605,10 +1605,13 @@ class ServerToolExecutor(ToolExecutor):
             }
 
         self._record_artifact_manifest(result, user, session_id)
+        images, images_not_delivered = await self._fetch_analysis_images(result)
+        files, files_not_delivered = await self._fetch_analysis_files(result)
         return self._render_analysis(
             result,
-            images=await self._fetch_analysis_images(result),
-            files=await self._fetch_analysis_files(result),
+            images=images,
+            files=files,
+            not_delivered=[*images_not_delivered, *files_not_delivered],
         )
 
     @staticmethod
@@ -1648,7 +1651,20 @@ class ServerToolExecutor(ToolExecutor):
     # user waits through after the analysis has already finished.
     _MAX_ANALYSIS_IMAGES = 4
 
-    async def _fetch_analysis_images(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _not_delivered(name: str, reason: str) -> dict[str, str]:
+        return {"name": name, "reason": reason}
+
+    @staticmethod
+    def _oversize_reason(size: int, what: str) -> str:
+        return (
+            f"{size} bytes is over the {ARTIFACT_READ_MAX_BYTES} byte delivery cap, so it was "
+            f"neither {what}; save it smaller (lower dpi, fewer rows, or split it) and rerun"
+        )
+
+    async def _fetch_analysis_images(
+        self, result: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         """Pull the image artifacts of a completed execution back out of the sandbox.
 
         Automatic rather than a tool the model calls: an image is for the USER to look at,
@@ -1661,13 +1677,13 @@ class ServerToolExecutor(ToolExecutor):
         nowhere else; `_render_analysis` still keeps it out of what the model reads.
         """
         if not isinstance(result, dict) or result.get("status") != "ok":
-            return []
+            return [], []
         execution_id = result.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id:
-            return []
+            return [], []
         entries = result.get("artifacts")
         if not isinstance(entries, list):
-            return []
+            return [], []
 
         try:
             from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
@@ -1683,9 +1699,13 @@ class ServerToolExecutor(ToolExecutor):
                 "cannot fetch analysis images: genetics_mcp_server.sandbox_client is not "
                 "installed in this image"
             )
-            return []
+            return [], []
 
+        # every image the script saved and the user did not get is named back to the model
+        # with its reason: a model told only "images have been displayed" described three
+        # heatmaps of which two had been skipped for size, and its answer claimed all three
         wanted = []
+        not_delivered = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -1700,24 +1720,40 @@ class ServerToolExecutor(ToolExecutor):
             # 413 and the round trip buys nothing
             if isinstance(size, int) and not isinstance(size, bool) and size > ARTIFACT_READ_MAX_BYTES:
                 logger.info("skipping oversize image artifact %s (%d bytes)", name, size)
+                not_delivered.append(
+                    self._not_delivered(name, self._oversize_reason(size, "shown nor readable"))
+                )
+                continue
+            if len(wanted) >= self._MAX_ANALYSIS_IMAGES:
+                not_delivered.append(
+                    self._not_delivered(
+                        name,
+                        f"only the first {self._MAX_ANALYSIS_IMAGES} images of a run are "
+                        "shown, in manifest (name) order",
+                    )
+                )
                 continue
             wanted.append(name)
-            if len(wanted) >= self._MAX_ANALYSIS_IMAGES:
-                break
 
         images = []
         for name in wanted:
             fetched = await self._sandbox.fetch_artifact(execution_id, name)
             if fetched:
                 images.append(fetched)
-        return images
+            else:
+                not_delivered.append(
+                    self._not_delivered(name, "the sandbox could not serve it; rerun the save")
+                )
+        return images, not_delivered
 
     # How many non-image artifacts one script may offer the user. A script that writes a file
     # per locus is not asking for 255 download buttons, and each one is a fetch plus base64
     # the transcript carries for the life of the conversation.
     _MAX_ANALYSIS_FILES = 4
 
-    async def _fetch_analysis_files(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _fetch_analysis_files(
+        self, result: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         """Pull the NON-image artifacts back out so the user can download them.
 
         The mirror of `_fetch_analysis_images`, and separate from it for the same reason it is
@@ -1728,11 +1764,12 @@ class ServerToolExecutor(ToolExecutor):
         entries = result.get("artifacts")
         execution_id = result.get("execution_id")
         if not isinstance(entries, list) or not isinstance(execution_id, str):
-            return []
+            return [], []
         if self._sandbox is None:
-            return []
+            return [], []
 
         wanted = []
+        not_delivered = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -1746,10 +1783,23 @@ class ServerToolExecutor(ToolExecutor):
                 continue
             if isinstance(size, int) and not isinstance(size, bool) and size > ARTIFACT_READ_MAX_BYTES:
                 logger.info("skipping oversize file artifact %s (%d bytes)", name, size)
+                not_delivered.append(
+                    self._not_delivered(
+                        name, self._oversize_reason(size, "offered for download nor readable")
+                    )
+                )
+                continue
+            if len(wanted) >= self._MAX_ANALYSIS_FILES:
+                not_delivered.append(
+                    self._not_delivered(
+                        name,
+                        f"only the first {self._MAX_ANALYSIS_FILES} non-image files of a run "
+                        "are offered for download, in manifest (name) order; it can still be "
+                        "read with read_artifact",
+                    )
+                )
                 continue
             wanted.append((name, content_type))
-            if len(wanted) >= self._MAX_ANALYSIS_FILES:
-                break
 
         files = []
         for name, content_type in wanted:
@@ -1760,7 +1810,11 @@ class ServerToolExecutor(ToolExecutor):
                 if not fetched.get("content_type") and isinstance(content_type, str):
                     fetched["content_type"] = content_type
                 files.append(fetched)
-        return files
+            else:
+                not_delivered.append(
+                    self._not_delivered(name, "the sandbox could not serve it; rerun the save")
+                )
+        return files, not_delivered
 
     @staticmethod
     def _capability_unavailable_error(capability: str, module: str) -> dict[str, Any]:
@@ -1796,6 +1850,7 @@ class ServerToolExecutor(ToolExecutor):
         result: dict[str, Any],
         images: list[dict[str, Any]] | None = None,
         files: list[dict[str, Any]] | None = None,
+        not_delivered: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Turn the supervisor's 200 body into the tool result the model reads.
 
@@ -1874,6 +1929,10 @@ class ServerToolExecutor(ToolExecutor):
             # which is the same condition `read_artifact`'s 409 exists to catch.
             rendered["artifacts_retained_in_clear"] = True
             rendered["artifacts_retained_in_clear_note"] = ARTIFACTS_RETAINED_IN_CLEAR_NOTE
+        if not_delivered:
+            # before `output` for the same reason `artifacts_retained_in_clear` is: a result
+            # truncated to a prefix must still carry the list of what the user did not get
+            rendered["artifacts_not_delivered"] = not_delivered
         rendered["output"] = result.get("output") if isinstance(result.get("output"), str) else ""
         rendered["output_truncated"] = bool(result.get("output_truncated"))
         rendered["artifacts"] = artifacts
@@ -1900,17 +1959,32 @@ class ServerToolExecutor(ToolExecutor):
             # is now readable with `read_artifact` by NAME, resolved against this session
             # (`genetics-results-suite-4h6.52`). The retention window is stated because it is
             # short and because the model cannot discover it any other way.
-            shown = {
+            shown = [
                 image["name"]
                 for image in images or []
                 if isinstance(image, dict) and isinstance(image.get("name"), str)
-            }
+            ]
+            missing = [
+                entry["name"]
+                for entry in not_delivered or []
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+            ]
             readable = [entry["name"] for entry in artifacts if entry["name"] not in shown]
             note = ""
             if shown:
+                # named, so a model that saved three figures and got one shown knows which
                 note = (
-                    "Image artifacts have been displayed to the user already; describe what "
-                    "the plot shows rather than emitting a placeholder or a markdown image."
+                    f"Image artifacts displayed to the user already: {', '.join(shown)}. "
+                    "Describe what each shows rather than emitting a placeholder or a "
+                    "markdown image."
+                )
+            if missing:
+                note += (
+                    f"{' ' if note else ''}NOT delivered to the user, see "
+                    f"artifacts_not_delivered for why: {', '.join(missing)}. Do not describe "
+                    "a plot that was not shown or name a file that was not offered as if "
+                    "the user has it; either fix the cause and rerun, or tell the user "
+                    "plainly what is missing."
                 )
             if readable:
                 note += (

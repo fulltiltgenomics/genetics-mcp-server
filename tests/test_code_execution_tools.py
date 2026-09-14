@@ -1421,6 +1421,69 @@ class TestRunAnalysisImages:
         assert len(result["images"]) == executor._MAX_ANALYSIS_IMAGES
         assert len(sandbox.fetched) == executor._MAX_ANALYSIS_IMAGES
 
+    async def test_an_oversize_image_is_named_back_with_its_reason(self, executor):
+        """Told only that images were displayed, the model described three heatmaps of
+        which two had been skipped for size. It has to know which and why."""
+        from genetics_mcp_server.sandbox_client import ARTIFACT_READ_MAX_BYTES
+
+        body = _result_body(
+            artifacts=[
+                {"name": "big.png", "size": ARTIFACT_READ_MAX_BYTES + 1, "content_type": "image/png"},
+                {"name": "small.png", "size": 11, "content_type": "image/png"},
+            ]
+        )
+        sandbox = _StubSandbox(result=body, artifacts={"small.png": _image(name="small.png")})
+        result = await _run(executor, sandbox)
+
+        assert [i["name"] for i in result["images"]] == ["small.png"]
+        assert [d["name"] for d in result["artifacts_not_delivered"]] == ["big.png"]
+        assert "delivery cap" in result["artifacts_not_delivered"][0]["reason"]
+        note = result["artifacts_note"]
+        assert "displayed to the user already: small.png" in note
+        assert "NOT delivered" in note and "big.png" in note
+        # survives a prefix truncation of the serialised result, like the clear-text flag
+        keys = list(result)
+        assert keys.index("artifacts_not_delivered") < keys.index("output")
+
+    async def test_images_past_the_cap_and_unservable_ones_are_named_back(self, executor):
+        names = [f"p{i}.png" for i in range(6)]
+        body = _result_body(
+            artifacts=[{"name": n, "size": 11, "content_type": "image/png"} for n in names]
+        )
+        served = {n: _image(name=n) for n in names[:3]}
+        sandbox = _StubSandbox(result=body, artifacts=served)
+        result = await _run(executor, sandbox)
+
+        assert [i["name"] for i in result["images"]] == names[:3]
+        missing = {d["name"]: d["reason"] for d in result["artifacts_not_delivered"]}
+        assert "could not serve" in missing["p3.png"]
+        assert all(f"first {executor._MAX_ANALYSIS_IMAGES}" in missing[n] for n in names[4:])
+        assert set(missing) == set(names[3:])
+
+    async def test_files_past_the_cap_are_named_back_as_still_readable(self, executor):
+        names = [f"t{i}.csv" for i in range(6)]
+        body = _result_body(
+            artifacts=[{"name": n, "size": 9, "content_type": "text/csv"} for n in names]
+        )
+        served = {
+            n: {"name": n, "content_type": "text/csv", "content_base64": "YSxiCg=="} for n in names
+        }
+        sandbox = _StubSandbox(result=body, artifacts=served)
+        result = await _run(executor, sandbox)
+
+        assert [f["name"] for f in result["files"]] == names[: executor._MAX_ANALYSIS_FILES]
+        missing = {d["name"]: d["reason"] for d in result["artifacts_not_delivered"]}
+        assert set(missing) == set(names[executor._MAX_ANALYSIS_FILES :])
+        assert all("read_artifact" in r for r in missing.values())
+        assert "artifacts_not_delivered" in result["artifacts_note"]
+
+    async def test_a_fully_delivered_run_carries_no_not_delivered_field(self, executor):
+        body = _result_body(artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}])
+        sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
+        result = await _run(executor, sandbox)
+        assert "artifacts_not_delivered" not in result
+        assert "NOT delivered" not in result["artifacts_note"]
+
     async def test_an_artifact_the_sandbox_will_not_serve_costs_only_the_picture(self, executor):
         """The reaper, the retained-size ceiling and a restart all answer None here."""
         body = _result_body(
