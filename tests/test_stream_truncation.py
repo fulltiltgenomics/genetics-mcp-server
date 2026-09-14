@@ -827,18 +827,21 @@ async def test_truncated_tool_call_with_no_other_content_still_replays():
     assert assistant["content"], "an empty assistant message is rejected by the API"
 
 
-@pytest.mark.asyncio
-async def test_turn_stops_when_it_reaches_the_cost_cap(monkeypatch):
-    """Bounds the bill for failure shapes no specific guard anticipated."""
+def _budgets(monkeypatch, finish, hard):
+    """Pin both turn budgets; estimate_cost of the fake usage is tiny but positive, so a
+    budget of 1e-9 trips on iteration 1 and 0 disables it."""
     from dataclasses import replace
 
     from genetics_mcp_server.config import get_settings
 
-    # estimate_cost of the fake usage is tiny, so any positive cap trips on iteration 1
-    capped = replace(get_settings(), max_turn_cost_usd=1e-9)
-    monkeypatch.setattr(
-        "genetics_mcp_server.llm_service.get_settings", lambda: capped
-    )
+    capped = replace(get_settings(), max_turn_cost_usd=finish, max_turn_cost_hard_usd=hard)
+    monkeypatch.setattr("genetics_mcp_server.llm_service.get_settings", lambda: capped)
+
+
+@pytest.mark.asyncio
+async def test_turn_stops_when_it_reaches_the_hard_cap(monkeypatch):
+    """Bounds the bill for failure shapes no specific guard anticipated."""
+    _budgets(monkeypatch, finish=0.0, hard=1e-9)
 
     turns = [_run_analysis_turn(), _text_turn("never reached")]
     svc = _service(turns, executor=SimpleNamespace())
@@ -853,17 +856,78 @@ async def test_turn_stops_when_it_reaches_the_cost_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cost_cap_of_zero_is_disabled(monkeypatch):
-    """0 means no cap, so a normal turn is untouched by it."""
-    from dataclasses import replace
+async def test_hard_cap_is_checked_before_the_finish_budget(monkeypatch):
+    """A hard cap at or below the finish budget is a stop, not a finish."""
+    _budgets(monkeypatch, finish=1e-9, hard=1e-9)
 
-    from genetics_mcp_server.config import get_settings
+    turns = [_run_analysis_turn(), _text_turn("never reached")]
+    svc = _service(turns, executor=SimpleNamespace())
+    svc._execute_tool = lambda *a, **k: None
+    chunks = await _collect(svc)
 
-    capped = replace(get_settings(), max_turn_cost_usd=0.0)
-    monkeypatch.setattr(
-        "genetics_mcp_server.llm_service.get_settings", lambda: capped
-    )
+    assert len(svc.anthropic_client.messages.calls) == 1
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "cost limit" in text and "cost budget" not in text
+
+
+@pytest.mark.asyncio
+async def test_hard_cap_crossed_by_the_final_call_reports_nothing(monkeypatch):
+    """The call that crossed the cap ended the turn on its own, so nothing was cut."""
+    _budgets(monkeypatch, finish=0.0, hard=1e-9)
 
     chunks = await _collect(_service([_text_turn("answer")]))
     text = "".join(c.content for c in chunks if c.type == "text")
-    assert "cost limit" not in text
+    assert text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_finish_budget_runs_the_pending_tools_then_asks_for_the_answer(monkeypatch):
+    """Crossing the finish budget does not drop the tools the model just asked for: their
+    results are what the answer is written from. The NEXT call carries them with
+    tool calling off and the finish instruction, and the notice comes after the answer."""
+    from genetics_mcp_server.config.defaults import FINISH_TURN_PROMPT
+
+    _budgets(monkeypatch, finish=1e-9, hard=0.0)
+
+    turns = [_run_analysis_turn(), _text_turn("final answer")]
+    svc = _tooled_service(turns, {"success": True, "status": "ok", "output": "1"})
+    chunks = await _collect_with_tool(svc)
+
+    calls = svc.anthropic_client.messages.calls
+    assert len(calls) == 2
+    assert "tool_choice" not in calls[0]
+    assert calls[1]["tool_choice"] == {"type": "none"}
+    last_user = calls[1]["messages"][-1]
+    assert last_user["role"] == "user"
+    assert last_user["content"][0]["type"] == "tool_result"
+    assert last_user["content"][-1] == {"type": "text", "text": FINISH_TURN_PROMPT}
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.startswith("final answer")
+    assert "cost budget" in text and "cost limit" not in text
+    done = next(c for c in chunks if c.type == "done")
+    assert any("cost budget" in b.get("text", "") for b in done.message_content)
+
+
+@pytest.mark.asyncio
+async def test_finish_budget_crossed_by_the_final_call_reports_nothing(monkeypatch):
+    """A turn that finished on its own is not told it was finished for it."""
+    _budgets(monkeypatch, finish=1e-9, hard=0.0)
+
+    chunks = await _collect(_service([_text_turn("answer")]))
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_cost_budgets_of_zero_are_disabled(monkeypatch):
+    """0 means no cap, so a normal turn is untouched by either."""
+    _budgets(monkeypatch, finish=0.0, hard=0.0)
+
+    turns = [_run_analysis_turn(), _text_turn("answer")]
+    svc = _tooled_service(turns, {"success": True, "status": "ok", "output": "1"})
+    chunks = await _collect_with_tool(svc)
+    assert len(svc.anthropic_client.messages.calls) == 2
+    assert "tool_choice" not in svc.anthropic_client.messages.calls[1]
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "cost" not in text

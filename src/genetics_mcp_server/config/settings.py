@@ -143,11 +143,20 @@ class Settings:
     max_continuations: int = field(
         default_factory=lambda: int(os.environ.get("MAX_CONTINUATIONS", "3"))
     )
-    # hard ceiling on what one user turn may spend before the loop stops and says so.
-    # Every other bound here limits a shape of failure that was known in advance;
-    # this one limits the bill for shapes that were not. Set to 0 to disable.
+    # what one user turn may spend before it is told to finish: once the spend crosses
+    # this line the tools the model just asked for still run, and the next model call
+    # is made with tool calling turned off and an instruction to write the final answer
+    # from the results in hand. The user is told afterwards. Set to 0 to disable.
     max_turn_cost_usd: float = field(
-        default_factory=lambda: float(os.environ.get("MAX_TURN_COST_USD", "10.0"))
+        default_factory=lambda: float(os.environ.get("MAX_TURN_COST_USD", "20.0"))
+    )
+    # the unconditional stop above that: the loop ends at the first model call that
+    # crosses it, whether or not the answer is finished. Every other bound here limits
+    # a shape of failure that was known in advance; this one limits the bill for shapes
+    # that were not. A value below the finish budget makes the stop the only guard,
+    # since it is checked first. Set to 0 to disable.
+    max_turn_cost_hard_usd: float = field(
+        default_factory=lambda: float(os.environ.get("MAX_TURN_COST_HARD_USD", "50.0"))
     )
     # which model answers when a safety classifier declines the request (Fable's cover
     # research biology, so a genetics question can trip one). "default" lets Anthropic

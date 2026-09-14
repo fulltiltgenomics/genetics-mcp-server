@@ -1030,6 +1030,18 @@ CONTINUE_TRUNCATED_TOOL_CALL_PROMPT = (
     "script that does everything. Do not apologize and do not mention this message."
 )
 
+# Appended to the tool results of the iteration on which the turn's spend crossed
+# `max_turn_cost_usd`. The request it rides on also sets `tool_choice: none`, so the
+# instruction is what tells the model WHY it cannot call anything: without it a model
+# whose plan needed one more fetch tends to describe the fetch it would have made
+# rather than answer from what it has.
+FINISH_TURN_PROMPT = (
+    "This turn has used its cost budget, so no further tool calls are available. Write "
+    "your final answer now from the results you already have. Say plainly which planned "
+    "steps were not done and what that leaves uncertain, then stop. Do not apologize and "
+    "do not mention this message."
+)
+
 # Sent as a user turn after a turn that laid out empty or placeholder-filled results
 # without calling any tool. Same user-turn constraint as CONTINUE_TRUNCATED_PROMPT.
 CONTINUE_UNFILLED_PROMPT = (

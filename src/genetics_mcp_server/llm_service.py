@@ -26,6 +26,7 @@ from genetics_mcp_server.config.defaults import (
     CONTINUE_TRUNCATED_PROMPT,
     CONTINUE_TRUNCATED_TOOL_CALL_PROMPT,
     CONTINUE_UNFILLED_PROMPT,
+    FINISH_TURN_PROMPT,
     memory_envelope,
 )
 from genetics_mcp_server.cost import estimate_cost, get_context_window
@@ -1256,6 +1257,7 @@ class LLMService:
             truncated = False
             unfilled = False
             over_budget = False
+            finish_requested = False
 
             while iteration < max_iterations:
                 iteration += 1
@@ -1378,17 +1380,38 @@ class LLMService:
                     f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
                 )
 
-                # checked after the spend is booked and before anything is dispatched, so
-                # the turn stops at the first iteration that crosses the line rather than
-                # running its tools and paying for one more model call to read them. The
-                # text this iteration already streamed stands; only the loop ends.
-                if 0 < settings.max_turn_cost_usd <= total_cost:
+                # both budgets are checked after the spend is booked and before anything
+                # is dispatched. The hard cap ends the loop at the first iteration that
+                # crosses it rather than running its tools and paying for one more model
+                # call to read them; the text this iteration already streamed stands. A
+                # call that crossed it while ending the turn is left to end it: nothing
+                # was cut, so nothing is reported.
+                if (
+                    0 < settings.max_turn_cost_hard_usd <= total_cost
+                    and message.stop_reason != "end_turn"
+                ):
                     over_budget = True
                     logger.warning(
                         f"{log_prefix}Turn stopped at iteration={iteration}: spend "
-                        f"${total_cost:.2f} reached the ${settings.max_turn_cost_usd:.2f} cap"
+                        f"${total_cost:.2f} reached the "
+                        f"${settings.max_turn_cost_hard_usd:.2f} hard cap"
                     )
                     break
+                # the finish budget does not end the loop: the tools this iteration asked
+                # for still run, because their results are what the final answer is
+                # written from, and the request that carries them is the one made
+                # without tools (see the tool-results append below).
+                if (
+                    not finish_requested
+                    and 0 < settings.max_turn_cost_usd <= total_cost
+                    and message.stop_reason != "end_turn"
+                ):
+                    finish_requested = True
+                    logger.warning(
+                        f"{log_prefix}Turn told to finish at iteration={iteration}: spend "
+                        f"${total_cost:.2f} reached the ${settings.max_turn_cost_usd:.2f} "
+                        "budget"
+                    )
 
                 # actual context size includes cached tokens (Anthropic's input_tokens excludes them)
                 context_tokens = input_tok + cache_read + cache_create
@@ -1861,7 +1884,16 @@ class LLMService:
 
                 all_tool_results.extend(tool_results)
 
-                # continue conversation with tool results
+                # continue conversation with tool results. Once the finish budget is
+                # spent the results go back with tool calling switched off and the
+                # instruction to answer from them; the instruction rides in the same user
+                # turn because a tool_result turn has to directly follow its tool_use.
+                # Anthropic documents a change of `tool_choice` as invalidating the cached
+                # messages, so this one call re-caches the conversation: the price of a
+                # stop the model cannot argue with.
+                if finish_requested:
+                    tool_results = [*tool_results, {"type": "text", "text": FINISH_TURN_PROMPT}]
+                    request_params["tool_choice"] = {"type": "none"}
                 request_params["messages"] = [
                     *request_params["messages"],
                     {"role": "assistant", "content": _replayable_content(message.content)},
@@ -1885,6 +1917,14 @@ class LLMService:
                 notice = (
                     "\n\n---\n*This turn reached its cost limit and was stopped before "
                     "it finished. Ask a narrower question to continue.*\n"
+                )
+                yield StreamChunk(type="text", content=notice)
+                all_content_blocks.append({"type": "text", "text": notice})
+            elif finish_requested:
+                notice = (
+                    "\n\n---\n*This turn reached its cost budget of "
+                    f"${settings.max_turn_cost_usd:.0f} and was finished from the results "
+                    "gathered up to that point. Ask a narrower question to go further.*\n"
                 )
                 yield StreamChunk(type="text", content=notice)
                 all_content_blocks.append({"type": "text", "text": notice})
