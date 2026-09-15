@@ -11,13 +11,21 @@ line is logged, driving the same `_stream_anthropic` harness test_stream_truncat
 uses.
 """
 
+import asyncio
 import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from test_stream_truncation import _Block, _delta_event, _FakeMessage, _service
+from test_stream_truncation import (
+    _Block,
+    _delta_event,
+    _FakeMessage,
+    _FakeMessages,
+    _FakeStream,
+    _service,
+)
 
 from genetics_mcp_server import mcp_proxy
 from genetics_mcp_server.cost import estimate_cost
@@ -478,8 +486,8 @@ class TestTurnMetrics:
 
     @pytest.mark.asyncio
     async def test_missing_client_ids_still_record(self, chat_history_db):
-        """The browser creates the session only after the first exchange, so a
-        conversation's opening turn streams with no session id at all."""
+        """A turn whose session could not be created streams with no session id at all
+        (the browser proceeds rather than refusing the turn), and still costs money."""
         turns = [_answer_turn(input_tokens=100, output_tokens=50)]
         svc = _service(turns)
 
@@ -487,11 +495,204 @@ class TestTurnMetrics:
             await _run(svc, session_id=None, message_id=None)
 
         row = chat_history_db._conn.execute(
-            "SELECT session_id, message_id, iterations FROM chat_turn_metrics"
+            "SELECT session_id, message_id, iterations, outcome FROM chat_turn_metrics"
         ).fetchone()
         assert row["session_id"] is None
         assert row["message_id"] is None
         assert row["iterations"] == 1
+        assert row["outcome"] == "complete"
+
+
+class _HangingStream(_FakeStream):
+    """A model call that never produces an event: where a turn is when the client goes away."""
+
+    def __init__(self, entered):
+        super().__init__([], None)
+        self._entered = entered
+
+    async def __aiter__(self):
+        self._entered.set()
+        await asyncio.Event().wait()
+        yield  # pragma: no cover - unreachable, makes this an async generator
+
+
+class _FailingStream(_FakeStream):
+    def __init__(self, exc):
+        super().__init__([], None)
+        self._exc = exc
+
+    async def __aiter__(self):
+        raise self._exc
+        yield  # pragma: no cover
+
+
+class _MessagesThen(_FakeMessages):
+    """The scripted turns, then one stream of the caller's choosing."""
+
+    def __init__(self, turns, last):
+        super().__init__(turns)
+        self._last = last
+
+    def stream(self, **params):
+        if not self._turns:
+            self.calls.append(params)
+            return self._last
+        return super().stream(**params)
+
+
+async def _settle_detached_writes():
+    from genetics_mcp_server import llm_service
+
+    pending = list(llm_service._DETACHED_METRIC_WRITES)
+    if pending:
+        await asyncio.gather(*pending)
+
+
+class TestAbandonedTurnMetrics:
+    """A turn that never reaches "Chat complete" still spent money on the model calls that
+    finished, and that spend is recorded with its outcome rather than lost."""
+
+    def _patch_db(self, db):
+        return patch(
+            "genetics_mcp_server.db.chat_history_db.get_chat_history_db",
+            return_value=db,
+        )
+
+    FIRST = dict(input_tokens=100, output_tokens=50, cache_read=900, cache_create=40)
+
+    def _service_dying_on_the_second_call(self, last):
+        svc = _with_tools(_service([]))
+        svc.anthropic_client = SimpleNamespace(
+            messages=_MessagesThen([_tool_turn("t1", **self.FIRST)], last)
+        )
+        return svc
+
+    def _assert_first_iteration_recorded(self, row, outcome):
+        assert row["outcome"] == outcome
+        assert row["iterations"] == 1
+        assert row["tool_call_count"] == 1
+        assert row["input_tokens"] == 100
+        assert row["output_tokens"] == 50
+        assert row["cache_read_tokens"] == 900
+        assert row["cache_create_tokens"] == 40
+        assert row["cost_usd"] == pytest.approx(estimate_cost(MODEL, 100, 50, 900, 40))
+        assert row["message_id"] == "msg1"
+        assert row["session_id"] == "sess1"
+        assert row["model"] == MODEL
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_turn_records_the_iterations_that_were_priced(self, chat_history_db):
+        """A client disconnect cancels the generator at whatever it is awaiting — here the
+        second model call. The row carries the first call's figures, not the in-flight one's,
+        and lands even though the cancelled scope would refuse an await."""
+        entered = asyncio.Event()
+        svc = self._service_dying_on_the_second_call(_HangingStream(entered))
+
+        async def consume():
+            await _run(svc, user="user@example.com")
+
+        with self._patch_db(chat_history_db):
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _settle_detached_writes()
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        self._assert_first_iteration_recorded(rows[0], "cancelled")
+
+    @pytest.mark.asyncio
+    async def test_a_generator_closed_by_its_consumer_is_recorded_too(self, chat_history_db):
+        """The other shape a disconnect takes: the consumer stops iterating and closes the
+        generator, which raises GeneratorExit at the yield — where awaiting is an error."""
+        svc = _with_tools(_service([
+            _tool_turn("t1", **self.FIRST),
+            _answer_turn(input_tokens=200, output_tokens=80),
+        ]))
+        agen = svc._stream_anthropic(
+            messages=[{"role": "user", "content": "hi"}],
+            model=MODEL,
+            system_prompt=None,
+            enable_tools=False,
+            code_execution=False,
+            session_id="sess1",
+            message_id="msg1",
+            user="user@example.com",
+        )
+        with self._patch_db(chat_history_db):
+            async for chunk in agen:
+                if chunk.type == "text":
+                    break
+            await agen.aclose()
+            await _settle_detached_writes()
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        # the second call's text was streaming, but its usage had not arrived
+        self._assert_first_iteration_recorded(rows[0], "cancelled")
+
+    @pytest.mark.asyncio
+    async def test_a_failing_model_call_is_recorded_as_an_error(self, chat_history_db, caplog):
+        svc = self._service_dying_on_the_second_call(_FailingStream(RuntimeError("boom")))
+
+        with self._patch_db(chat_history_db), caplog.at_level(logging.INFO):
+            with pytest.raises(RuntimeError, match="boom"):
+                await _run(svc, user="user@example.com")
+            await _settle_detached_writes()
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        self._assert_first_iteration_recorded(rows[0], "error")
+        # the log line mirrors "Chat complete" field for field, for a log backfill
+        aborted = [r.message for r in caplog.records if "Chat aborted:" in r.message]
+        assert len(aborted) == 1
+        assert "outcome=error" in aborted[0]
+        assert "iterations=1" in aborted[0]
+        assert f"total_cost=${estimate_cost(MODEL, 100, 50, 900, 40):.4f}" in aborted[0]
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_model_call_is_recorded_as_a_timeout(self, chat_history_db):
+        svc = self._service_dying_on_the_second_call(_FailingStream(asyncio.TimeoutError()))
+
+        with self._patch_db(chat_history_db):
+            with pytest.raises(asyncio.TimeoutError):
+                await _run(svc, user="user@example.com")
+            await _settle_detached_writes()
+
+        rows = chat_history_db.get_turn_metrics("sess1")
+        assert len(rows) == 1
+        self._assert_first_iteration_recorded(rows[0], "timeout")
+
+    @pytest.mark.asyncio
+    async def test_a_completed_turn_is_recorded_exactly_once(self, chat_history_db):
+        """The finally must not add a second row to a turn that reached Chat complete."""
+        svc = _service([_answer_turn(input_tokens=100, output_tokens=50)])
+
+        with self._patch_db(chat_history_db):
+            await _run(svc, user="user@example.com")
+            await _settle_detached_writes()
+
+        count = chat_history_db._conn.execute(
+            "SELECT COUNT(*) FROM chat_turn_metrics"
+        ).fetchone()[0]
+        assert count == 1
+        assert chat_history_db.get_turn_metrics("sess1")[0]["outcome"] == "complete"
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_secret_turn_records_nothing(self, chat_history_db):
+        svc = self._service_dying_on_the_second_call(_FailingStream(RuntimeError("boom")))
+
+        with self._patch_db(chat_history_db):
+            with pytest.raises(RuntimeError):
+                await _run(svc, user="user@example.com", secret=True)
+            await _settle_detached_writes()
+
+        count = chat_history_db._conn.execute(
+            "SELECT COUNT(*) FROM chat_turn_metrics"
+        ).fetchone()[0]
+        assert count == 0
 
 
 class TestUsageChunk:

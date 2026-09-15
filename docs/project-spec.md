@@ -1592,18 +1592,38 @@ conversation restores its options without changing what the next new chat starts
 
 ### Per-turn metrics (`chat_turn_metrics`)
 
-One row per **completed** assistant turn, written by `_stream_anthropic` in the same block that
-logs the `Chat complete:` line, so the log line and the row can never disagree. **The Anthropic
-path only** — `_stream_openai` records nothing, so any aggregate over this table would under-count a
+One row per assistant turn that ran, written by `_stream_anthropic`. A turn that finishes is
+recorded in the same block that logs the `Chat complete:` line, so the log line and the
+`outcome='complete'` row can never disagree; a turn that does not finish is recorded from the
+generator's `finally` with its failure kind as `outcome`. **The Anthropic path only** —
+`_stream_openai` records nothing, so any aggregate over this table would under-count a
 deployment that also served OpenAI. Since `genetics-results-suite-c4s` refuses
 `provider="openai"` at the request boundary, no such deployment can exist and the gap is
 latent rather than live. It holds
 `iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
-`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model`, `source` and `created_at`.
-Before it, these numbers existed only in Cloud Logging and had to be recovered from the BigQuery
-log sink; `chat_messages.content_json` is not a substitute, because it flattens a whole turn's
-blocks into one assistant record, leaving parallel and sequential tool calls indistinguishable and
-roundtrips per turn underivable.
+`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model`, `source`, `outcome` and
+`created_at`. Before it, these numbers existed only in Cloud Logging and had to be recovered from
+the BigQuery log sink; `chat_messages.content_json` is not a substitute, because it flattens a
+whole turn's blocks into one assistant record, leaving parallel and sequential tool calls
+indistinguishable and roundtrips per turn underivable.
+
+- **`outcome` and abandoned turns.** `complete` for a turn that reached `Chat complete:`;
+  `error`, `timeout` (the 300 s model-call timeout) or `cancelled` (the client went away, which
+  arrives as a cancellation or a `GeneratorExit` at whatever the generator was awaiting) for one
+  that did not. An abnormal row holds the figures of the model calls whose usage arrived before
+  the turn died — `iterations` counts those calls, not the one in flight — so it is a floor on
+  the turn's cost: Anthropic bills the interrupted call too, and nothing here can know what for.
+  The write cannot be awaited where it happens — a cancelled scope cancels the next await at
+  once, and awaiting under `GeneratorExit` is an error — so `_record_abandoned_turn` hands it
+  to a task the scope does not own and keeps a strong reference in `_DETACHED_METRIC_WRITES`
+  until it finishes; a process shutdown cancels those, an accepted loss. It logs a `Chat
+  aborted:` line carrying the same fields as `Chat complete:`, so a log backfill can recover
+  these turns the same way. Cost aggregates (`get_cost_analytics`, `get_session_costs`) take
+  every outcome, because the money was spent; anything reasoning about the cost *of a turn* —
+  the replay benchmark's gates, a per-turn distribution — filters on `complete`, or a cut-off
+  turn reads as a cheap one. Measured on one production's log sink before this existed, about
+  one turn in seventeen ended abnormally and the finished iterations of those turns were about
+  five percent of all spend. Secret chat writes no row of either kind, but does log both lines.
 
 - **`source` and the log backfill.** `source` is `live` for rows the stream writes and `log` for
   turns recovered from the `Chat complete:` line in the BigQuery sink, for the months before the
@@ -1619,8 +1639,9 @@ roundtrips per turn underivable.
   genetics_mcp_server.scripts.backfill_turn_metrics` inside the chat-backend pod, which calls
   `ChatHistoryDB.backfill_turn_metrics_from_log`. Two rules make a re-run harmless: the row id is
   `log:<insertId>` under `INSERT OR IGNORE`, and no line at or after the earliest `live` row is
-  taken, since one live row exists exactly when one log line does and the table is complete from
-  that instant. A `[session=unknown]` line, or one predating the session prefix, yields a row with
+  taken, since one live `complete` row exists exactly when one log line does and the table is
+  complete from that instant. A `log` row is always `outcome='complete'`; the `Chat aborted:`
+  lines of abandoned turns are not backfilled today. A `[session=unknown]` line, or one predating the session prefix, yields a row with
   `session_id` NULL that is still attributed to its user; `message_id` is always NULL on a `log`
   row. Secret chat is dropped as the live path drops it — any session that logged a `Streaming
   Anthropic secret chat` line is excluded whole — but only where the line carries a session id;
@@ -1631,12 +1652,15 @@ roundtrips per turn underivable.
 - **Keying.** A surrogate `id`, plus `session_id` and `message_id` columns and a *partial* unique
   index on `message_id WHERE message_id IS NOT NULL`. `message_id` is the client-generated
   `chat_messages` primary key and is globally unique on its own, so it needs no `session_id` to
-  disambiguate. Both ids are nullable and neither carries a foreign key — `PRAGMA foreign_keys` is
-  ON here, so one would abort the insert: the row is written while the stream is still open,
-  before the client POSTs the assistant message, and on a conversation's first turn before the
-  session row exists at all (the browser creates the session only after the first exchange
-  completes). `delete_session` therefore deletes these rows explicitly; the `chat_sessions`
-  cascade does not reach them.
+  disambiguate. The browser mints it before the request and sends it as `message_id`, and saves
+  a stopped or timed-out turn's partial content under the same id, so an abandoned turn's row
+  keys to the truncated answer it produced. Both ids are nullable and neither carries a foreign
+  key — `PRAGMA foreign_keys` is ON here, so one would abort the insert: the row is written while
+  the stream is still open, before the client POSTs the assistant message, and a session whose
+  creation failed before the request has no row at all. `delete_session` therefore deletes these
+  rows explicitly — the session's rows, and this user's rows carrying no session id, since
+  without a session no message was saved for them to join to; the `chat_sessions` cascade does
+  not reach them.
 - **`user_id` scopes the upsert.** `message_id` arrives from the client and is unique only by
   convention, so without an owner on the row any authenticated user could send another user's
   `message_id` and have their turn overwrite that user's row — cost zeroed, `session_id`

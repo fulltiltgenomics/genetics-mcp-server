@@ -40,6 +40,7 @@ _TURN_METRICS_COLUMNS = """
     tool_profile TEXT,
     model TEXT,
     source TEXT NOT NULL DEFAULT 'live',
+    outcome TEXT NOT NULL DEFAULT 'complete',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 """
 
@@ -337,27 +338,34 @@ class ChatHistoryDB(object, metaclass=Singleton):
             ON conversation_issue(category)
         """)
 
-        # per-turn cost/roundtrip telemetry, one row per completed assistant turn.
+        # per-turn cost/roundtrip telemetry, one row per assistant turn that ran.
         #
         # No foreign keys, deliberately, and PRAGMA foreign_keys is ON here so one would
         # abort the insert rather than be ignored: the row is written when the stream
         # finishes, but the assistant's chat_messages row is POSTed by the client only
-        # afterwards, and on the first turn of a new conversation the session row does
-        # not exist yet either (the client creates it after the first exchange). Both ids
-        # are therefore nullable — a turn whose ids are not yet known still contributes
-        # its iteration and cost numbers, which is what this table is for.
+        # afterwards, and a session whose creation failed or that was deleted mid-turn
+        # has no row at all. Both ids are therefore nullable — a turn whose ids cannot be
+        # resolved still contributes its iteration and cost numbers, which is what this
+        # table is for.
         #
         # message_id, when present, is the client-generated chat_messages primary key and
         # is globally unique on its own, so it needs no session_id to disambiguate; the
         # partial unique index gives the "one row per assistant turn" guarantee without
-        # forcing a key onto rows that have no message id yet.
+        # forcing a key onto rows that have no message id.
         #
-        # source is 'live' for rows written by the stream as the turn completes and 'log'
-        # for rows recovered from the "Chat complete:" log line of turns that ran before
-        # this table existed. The log line carries only iterations, the two token totals
-        # and the cost, so a 'log' row holds NULL — not 0 — in tool_call_count, the cache
-        # token counts and wall_ms; a consumer that averages those must skip NULL rather
-        # than read a backfilled turn as instantaneous and uncached.
+        # source is 'live' for rows written by the stream and 'log' for rows recovered
+        # from the "Chat complete:" log line of turns that ran before this table existed.
+        # The log line carries only iterations, the two token totals and the cost, so a
+        # 'log' row holds NULL — not 0 — in tool_call_count, the cache token counts and
+        # wall_ms; a consumer that averages those must skip NULL rather than read a
+        # backfilled turn as instantaneous and uncached.
+        #
+        # outcome is 'complete' for a turn that reached its "Chat complete" line and the
+        # failure kind — 'error', 'timeout', 'cancelled' (the client went away) — for one
+        # that did not. An abnormal row holds the figures of the model calls that finished
+        # before the turn died, a floor on what the turn cost. Spend is spend, so cost
+        # aggregates take every outcome; a per-turn distribution filters on 'complete',
+        # or a cut-off turn reads as a cheap one.
         cursor.execute(
             f"CREATE TABLE IF NOT EXISTS chat_turn_metrics ({_TURN_METRICS_COLUMNS})"
         )
@@ -382,6 +390,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
         metrics_columns = {row[1] for row in cursor.fetchall()}
         if "user_id" not in metrics_columns:
             cursor.execute("ALTER TABLE chat_turn_metrics ADD COLUMN user_id TEXT")
+        if "outcome" not in metrics_columns:
+            # every row written before the column existed was a completed turn: nothing
+            # else reached the write
+            cursor.execute(
+                "ALTER TABLE chat_turn_metrics ADD COLUMN outcome TEXT NOT NULL DEFAULT 'complete'"
+            )
 
         # delete_session has to reach this user's rows that carry no session id, and
         # per-user cost aggregation scans on user_id alone
@@ -603,21 +617,19 @@ class ChatHistoryDB(object, metaclass=Singleton):
             # deployment's (no ownership exists there) or predate the user_id column, and
             # in both cases nothing else will ever remove them.
             #
-            # The second clause covers this user's rows that carry neither id. Every
-            # conversation's first turn streams before the browser has created the session
-            # row, and the browser does not send message_id yet, so those rows can never be
-            # attributed to any session — keeping them would leave a permanent record that
-            # this user held a conversation and what it cost, which is exactly what
-            # "delete my conversation" is meant to remove. They are already invisible to
-            # per-session analysis, so deleting them costs no capability that existed;
-            # it does drop the opening turns of this user's other conversations, and
-            # privacy wins that trade until the browser sends the ids.
+            # The second clause covers this user's rows that carry no session id: a turn
+            # whose session could not be created before the request, or rows from before
+            # the browser sent the ids. Such a row can never be attributed to any session —
+            # keeping it would leave a permanent record that this user held a conversation
+            # and what it cost, which is exactly what "delete my conversation" is meant to
+            # remove. A message id on the row changes nothing: without a session the
+            # browser saved no message for it to join to.
             if deleted:
                 cursor.execute(
                     """
                     DELETE FROM chat_turn_metrics
                     WHERE (session_id = ? AND (user_id IS ? OR user_id IS NULL))
-                       OR (user_id = ? AND session_id IS NULL AND message_id IS NULL)
+                       OR (user_id = ? AND session_id IS NULL)
                     """,
                     (session_id, user_id, user_id),
                 )
@@ -1693,8 +1705,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
         wall_ms: int,
         tool_profile: str | None = None,
         model: str | None = None,
+        outcome: str = "complete",
     ) -> str | None:
-        """Record the cost and roundtrip profile of one completed assistant turn.
+        """Record the cost and roundtrip profile of one assistant turn.
+
+        `outcome` is 'complete' for a turn that finished and the failure kind for one that
+        did not; see the table comment in _init_db for what an abnormal row's figures mean.
 
         A single INSERT under its own commit: this runs while an SSE stream is open and
         the database file sits on a volume shared with the nightly analysis job, so the
@@ -1746,9 +1762,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 INSERT INTO chat_turn_metrics (
                     id, session_id, message_id, user_id, iterations, tool_call_count,
                     input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                    cost_usd, wall_ms, tool_profile, model
+                    cost_usd, wall_ms, tool_profile, model, outcome
                 )
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 WHERE NOT EXISTS (
                     SELECT 1 FROM chat_sessions
                     WHERE id = ? AND ? IS NOT NULL AND user_id IS NOT ?
@@ -1764,13 +1780,14 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     cost_usd = excluded.cost_usd,
                     wall_ms = excluded.wall_ms,
                     tool_profile = excluded.tool_profile,
-                    model = excluded.model
+                    model = excluded.model,
+                    outcome = excluded.outcome
                 WHERE chat_turn_metrics.user_id IS excluded.user_id
                 """,
                 (
                     row_id, session_id, message_id, user_id, iterations, tool_call_count,
                     input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                    cost_usd, wall_ms, tool_profile, model,
+                    cost_usd, wall_ms, tool_profile, model, outcome,
                     session_id, user_id, user_id,
                 ),
             )
@@ -1807,7 +1824,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             """
             SELECT id, session_id, message_id, user_id, iterations, tool_call_count,
                    input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                   cost_usd, wall_ms, tool_profile, model, source, created_at
+                   cost_usd, wall_ms, tool_profile, model, source, outcome, created_at
             FROM chat_turn_metrics
             WHERE session_id = ?
             ORDER BY created_at ASC
@@ -1826,10 +1843,10 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         Idempotent two ways. The row id is derived from the log entry's insertId, so the
         same export run twice inserts nothing the second time (INSERT OR IGNORE on the
-        primary key). And no line at or after the earliest live row is taken: one live row
-        exists exactly when one "Chat complete:" line does, so from that instant on the
-        table is already complete and a log row would double-count the turn. A database
-        with no live rows yet takes every line.
+        primary key). And no line at or after the earliest live row is taken: one live
+        'complete' row exists exactly when one "Chat complete:" line does, so from that
+        instant on the table is already complete and a log row would double-count the
+        turn. A database with no live rows yet takes every line.
 
         The unknowable columns — tool_call_count, the cache token counts, wall_ms — are
         left NULL rather than written as 0; see the table comment in _init_db.

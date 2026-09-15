@@ -2649,12 +2649,14 @@ class TestChatTurnMetrics:
         assert chat_history_db.get_turn_metrics("sess1")[0]["cost_usd"] == pytest.approx(2.0)
 
     def test_delete_session_reaches_this_users_unattributable_rows(self, chat_history_db):
-        """Every conversation's opening turn streams before the session row exists and
-        without a message id, so it can never be joined to anything. Leaving it behind
-        would keep a permanent record that this user held a conversation and its cost."""
+        """A turn whose session could not be created streams without a session id, so its
+        row can never be joined to a conversation — with or without a message id, since
+        no message was saved without a session either. Leaving it behind would keep a
+        permanent record that this user held a conversation and its cost."""
         session = chat_history_db.create_session(USER)
         self._record(chat_history_db, session_id=session.id, message_id="m-attributed")
         self._record(chat_history_db, session_id=None, message_id=None, user_id=USER)
+        self._record(chat_history_db, session_id=None, message_id="m-orphan", user_id=USER)
         self._record(
             chat_history_db, session_id=None, message_id=None, user_id="other@example.com"
         )
@@ -2665,6 +2667,19 @@ class TestChatTurnMetrics:
             "SELECT user_id FROM chat_turn_metrics"
         ).fetchall()
         assert [r["user_id"] for r in remaining] == ["other@example.com"]
+
+    def test_outcome_defaults_to_complete_and_is_stored(self, chat_history_db):
+        """Cost aggregates take every outcome, so an abandoned turn's row is an ordinary row
+        with a different label; re-recording a message id carries the new outcome."""
+        self._record(chat_history_db, message_id="done")
+        self._record(chat_history_db, message_id="cut", outcome="cancelled", iterations=1)
+        rows = {r["message_id"]: r for r in chat_history_db.get_turn_metrics("sess1")}
+        assert rows["done"]["outcome"] == "complete"
+        assert rows["cut"]["outcome"] == "cancelled"
+
+        self._record(chat_history_db, message_id="cut", outcome="complete", iterations=2)
+        rows = {r["message_id"]: r for r in chat_history_db.get_turn_metrics("sess1")}
+        assert (rows["cut"]["outcome"], rows["cut"]["iterations"]) == ("complete", 2)
 
     def test_delete_by_another_user_keeps_metrics(self, chat_history_db):
         session = chat_history_db.create_session(USER)
@@ -2817,6 +2832,7 @@ class TestChatTurnMetricsRelaxAndBackfill:
         db = self._legacy_db(tmp_path)
         cols = self._columns(db)
         assert cols["source"] is True
+        assert cols["outcome"] is True
         for c in ("tool_call_count", "cache_read_tokens", "cache_create_tokens", "wall_ms"):
             assert cols[c] is False, c
         for c in ("iterations", "input_tokens", "output_tokens", "cost_usd"):
@@ -2825,6 +2841,7 @@ class TestChatTurnMetricsRelaxAndBackfill:
         assert len(rows) == 1
         assert rows[0]["id"] == "old"
         assert rows[0]["wall_ms"] == 1200
+        assert rows[0]["outcome"] == "complete"
         assert rows[0]["source"] == "live"
         assert rows[0]["created_at"] == "2026-08-26 10:17:10"
         # the indexes are recreated after the rebuild
@@ -2838,6 +2855,32 @@ class TestChatTurnMetricsRelaxAndBackfill:
         assert not db._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='chat_turn_metrics_relaxed'"
         ).fetchall()
+
+    def test_an_already_relaxed_table_gains_the_outcome_column(self, tmp_path):
+        """Production's table was relaxed before outcome existed; every row it holds was a
+        completed turn, because nothing else reached the write."""
+        from genetics_mcp_server.db.chat_history_db import _TURN_METRICS_COLUMNS, ChatHistoryDB
+        from genetics_mcp_server.db.singleton import Singleton
+
+        columns = "\n".join(
+            line for line in _TURN_METRICS_COLUMNS.splitlines() if "outcome" not in line
+        )
+        path = str(tmp_path / "relaxed.db")
+        con = sqlite3.connect(path)
+        con.execute(f"CREATE TABLE chat_turn_metrics ({columns})")
+        con.execute(
+            "INSERT INTO chat_turn_metrics (id, session_id, iterations, input_tokens, "
+            "output_tokens, cost_usd) VALUES ('old', 's1', 2, 100, 10, 0.75)"
+        )
+        con.commit()
+        con.close()
+        Singleton._instances.pop(ChatHistoryDB, None)
+        db = ChatHistoryDB(path)
+
+        assert self._columns(db)["outcome"] is True
+        assert db.get_turn_metrics("s1")[0]["outcome"] == "complete"
+        Singleton._instances.pop(ChatHistoryDB, None)
+        assert ChatHistoryDB(path).get_turn_metrics("s1")[0]["outcome"] == "complete"
 
     def test_rebuild_survives_a_table_predating_user_id(self, tmp_path):
         db = self._legacy_db(tmp_path, with_user_id=False)
@@ -2880,6 +2923,7 @@ class TestChatTurnMetricsRelaxAndBackfill:
         row = rows[0]
         assert row["id"] == "log:abc"
         assert row["source"] == "log"
+        assert row["outcome"] == "complete"
         assert row["message_id"] is None
         assert (row["tool_call_count"], row["cache_read_tokens"],
                 row["cache_create_tokens"], row["wall_ms"]) == (None, None, None, None)

@@ -418,8 +418,10 @@ class ChatRequest(BaseModel):
         None,
         max_length=64,
         description="Client-generated id the assistant message of this turn will be saved "
-        "under. Used only to key the turn's recorded metrics to chat_messages; the metrics "
-        "row is written with or without it, and never for a secret chat. Bounded at 64 "
+        "under; the browser mints it before the request and saves partial content under "
+        "the same id when a turn is stopped or times out. Used only to key the turn's "
+        "recorded metrics to chat_messages; the metrics row is written with or without it, "
+        "and never for a secret chat. Bounded at 64 "
         "characters (uuid4 is 36): unlike session_id, which is only logged, this value is "
         "persisted, and the service has no request-body-size middleware.",
     )

@@ -275,6 +275,10 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
 # missed before a stalled stream is declared dead.
 _THINKING_KEEPALIVE_SECONDS = 10.0
 
+# strong references to the metrics writes spawned for abandoned turns; see
+# LLMService._record_abandoned_turn for why they cannot be awaited where they are spawned
+_DETACHED_METRIC_WRITES: set[asyncio.Task] = set()
+
 
 def _refusal_fallback_params(model: str, fallback: str) -> dict[str, Any]:
     """Request fields that re-run a classifier refusal on another model, server side.
@@ -1233,20 +1237,29 @@ class LLMService:
                     f"{len(external_tools)} external, {len(rag_tools)} RAG)"
                 )
 
+        log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
+        # initialised ahead of the try so the finally below can read them however early
+        # the turn dies. `priced_iterations` counts model calls whose usage arrived, which
+        # is what `total_cost` covers; `iteration` also counts the call in flight when a
+        # turn is cut off, so the two differ only on an abandoned turn.
+        iteration = 0
+        priced_iterations = 0
+        total_cost = 0.0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_cache_read = 0
+        total_cache_create = 0
+        tool_call_count = 0
+        # None until the turn ends: "complete" once the Chat complete line is logged, the
+        # failure kind when an exception escapes, and still None in the finally when the
+        # generator was cancelled or closed under us — a client disconnect arrives that way
+        outcome: str | None = None
         try:
-            log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
             if secret:
                 logger.info(f"{log_prefix}Streaming Anthropic secret chat with model {model}")
             else:
                 logger.info(f"{log_prefix}Streaming Anthropic chat with model {model}")
             max_iterations = settings.mcp_max_iterations
-            iteration = 0
-            total_cost = 0.0
-            total_input_tokens = 0
-            total_output_tokens = 0
-            total_cache_read = 0
-            total_cache_create = 0
-            tool_call_count = 0
 
             # collect all content blocks for persistence
             all_content_blocks: list[dict[str, Any]] = []
@@ -1369,6 +1382,7 @@ class LLMService:
                     served_model, input_tok, output_tok, cache_read, cache_create
                 )
                 total_cost += iter_cost
+                priced_iterations += 1
                 total_input_tokens += input_tok
                 total_output_tokens += output_tok
                 total_cache_read += cache_read
@@ -1938,6 +1952,10 @@ class LLMService:
                 f"total_input_tokens={total_input_tokens} total_output_tokens={total_output_tokens} "
                 f"total_cost=${total_cost:.4f}"
             )
+            # stamped before the write, not after: a disconnect landing on the write's own
+            # await would otherwise reach the finally with the turn looking abandoned, and
+            # a second row would be written for a turn whose first write may have landed
+            outcome = "complete"
 
             yield StreamChunk(
                 type="done",
@@ -1952,15 +1970,13 @@ class LLMService:
             # consumer in chat_api iterates this generator with a plain `async for` and no
             # `break`, so it is driven one step past this yield and the write still runs.
             #
-            # Otherwise deliberately here and nowhere else: one metrics row exists exactly
-            # when one "Chat complete" line exists, so the two can never disagree. A turn
-            # that ended abnormally (exception, timeout, client disconnect) reaches neither
-            # and is recorded by neither — its accumulators are partial and would bias the
-            # cost-per-turn figures the benchmark gates on. A turn stopped by max_iterations
-            # does reach both and is recorded: those are the expensive tail this exists to
-            # measure.
+            # One outcome='complete' row exists exactly when one "Chat complete" line
+            # exists, so the two can never disagree, and the log backfill can rely on it.
+            # A turn stopped by max_iterations does reach both and is recorded: those are
+            # the expensive tail this exists to measure.
             await self._record_turn_metrics(
                 secret=secret,
+                outcome=outcome,
                 session_id=session_id,
                 message_id=message_id,
                 user_id=user,
@@ -1977,14 +1993,77 @@ class LLMService:
             )
 
         except asyncio.TimeoutError:
+            outcome = "timeout"
             logger.error("Anthropic streaming timed out after 300s")
             raise
         except Exception as e:
+            outcome = "error"
             logger.error(f"Error streaming Anthropic chat: {e}")
             raise
+        finally:
+            # the spend of a turn that never reached "Chat complete" is real money too:
+            # measured on one production's log sink, about one turn in seventeen ended
+            # this way and their finished iterations were about five percent of all
+            # spend. Only the iterations whose usage arrived are recorded — the call in
+            # flight is billed by Anthropic and unknowable here — so the row is a floor.
+            if outcome != "complete":
+                self._record_abandoned_turn(
+                    outcome=outcome or "cancelled",
+                    secret=secret,
+                    log_prefix=log_prefix,
+                    session_id=session_id,
+                    message_id=message_id,
+                    user_id=user,
+                    iterations=priced_iterations,
+                    tool_call_count=tool_call_count,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cache_read_tokens=total_cache_read,
+                    cache_create_tokens=total_cache_create,
+                    cost_usd=total_cost,
+                    wall_ms=int((time.monotonic() - turn_started) * 1000),
+                    tool_profile=tool_profile,
+                    model=model,
+                )
+
+    def _record_abandoned_turn(
+        self, *, outcome: str, secret: bool, log_prefix: str, **fields: Any
+    ) -> None:
+        """Log and persist the partial figures of a turn that ended without "Chat complete".
+
+        Synchronous on purpose. This runs from the generator's finally, where an await is
+        not an option twice over: a client disconnect cancels the task's scope, so any
+        await here would be cancelled again at once; and a generator closed by its consumer
+        raises GeneratorExit, under which awaiting is an error. The write is handed to a
+        task the cancelled scope does not own and a strong reference is kept until it
+        finishes — the loop holds tasks weakly, and a forgotten task is a write that never
+        runs. A process shutdown cancels these too; that loss is accepted.
+
+        The "Chat aborted" line mirrors "Chat complete" field for field so a log backfill
+        can recover these turns the same way.
+        """
+        logger.info(
+            f"{log_prefix}Chat aborted: outcome={outcome} model={fields['model']} "
+            f"iterations={fields['iterations']} "
+            f"total_input_tokens={fields['input_tokens']} "
+            f"total_output_tokens={fields['output_tokens']} "
+            f"total_cost=${fields['cost_usd']:.4f}"
+        )
+        if secret:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop; abandoned turn metrics not recorded")
+            return
+        task = loop.create_task(
+            self._record_turn_metrics(secret=secret, outcome=outcome, **fields)
+        )
+        _DETACHED_METRIC_WRITES.add(task)
+        task.add_done_callback(_DETACHED_METRIC_WRITES.discard)
 
     async def _record_turn_metrics(self, *, secret: bool, **fields: Any) -> None:
-        """Persist one completed turn's cost and roundtrip profile, best effort.
+        """Persist one turn's cost and roundtrip profile, best effort.
 
         Secret chat is skipped outright, before the database is even reached. The promise
         attached to it is that the conversation leaves no trace, and the same rule that
