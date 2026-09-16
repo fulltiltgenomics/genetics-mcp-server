@@ -2498,12 +2498,22 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
-    async def get_gene_based_results(self, gene: str) -> dict[str, Any]:
-        """Get gene-level burden test results (genebass, IBD, BipEx2, SCHEMA)."""
+    async def get_gene_based_results(
+        self, gene: str, traits: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Get gene-level burden test results (genebass, IBD, BipEx2, SCHEMA).
+
+        Without `traits` results-api reads the combined per-dataset files, where genebass
+        carries only its mlog10p_burden > 4 hits; with them it reads the unfiltered
+        per-trait files, so a gene's null result in a named trait comes back as a row.
+        """
         import csv
         import io
 
-        resp = await self.client.get(f"{self.base_url}/v1/gene_based/{_seg(gene)}")
+        params = {"traits": ",".join(traits)} if traits else None
+        resp = await self.client.get(
+            f"{self.base_url}/v1/gene_based/{_seg(gene)}", params=params
+        )
         if resp.status_code == 200:
             reader = csv.DictReader(io.StringIO(resp.text), delimiter="\t")
             results = list(reader)

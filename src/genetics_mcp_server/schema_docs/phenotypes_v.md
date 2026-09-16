@@ -24,6 +24,10 @@ cannot be — for "find me traits matching this free-text description" use the r
 search endpoint. This table serves exact resolution and SQL-expressible filtering. Small
 table (~33k rows), so an unfiltered scan is cheap.
 
+## Scan pruning
+
+Clustered on `dataset`, `trait_original`: an equality on these cuts the bytes billed.
+
 ## Columns
 
 | column | type | description |

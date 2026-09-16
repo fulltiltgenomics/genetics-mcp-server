@@ -11,6 +11,10 @@ cell_line is 'meta' (cross-cell-line meta-analysis summary) or one of the 5 test
 log2FC). This is measured reporter activity, distinct from in-silico variant_effect
 predictions and from endogenous eQTL/caQTL. Always filter by resource, not dataset.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `cell_line`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

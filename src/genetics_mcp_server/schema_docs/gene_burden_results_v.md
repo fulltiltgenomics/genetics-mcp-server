@@ -6,8 +6,16 @@
 Gene-level burden test results from exome sequencing studies (e.g. BipEx2, SCHEMA2,
 Genebass, IBD exome). UNFILTERED: every gene x annotation x trait combination is present, so
 a null result for a specific gene in a specific trait is a real null result and not a
-missing row. Genebass alone contributes ~343M rows, so always constrain on gene and/or trait
-rather than scanning.
+missing row. Genebass contributes the bulk of the rows, and a query that names only a gene
+or a trait is refused under the sandbox's per-query scan cap: the cap is checked against
+BigQuery's partition-pruned estimate, and only a literal `chr = <n>` predicate lowers that.
+Always add the gene's chromosome (from gene_annotations_v or search_genes) beside `gene =`;
+`dataset =` (a clustering key) then cuts what is actually billed, which `resource =` does
+not, being derived from dataset in the view.
+
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `gene`, `trait`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
 
 ## Columns
 
@@ -17,7 +25,7 @@ rather than scanning.
 | `trait` | `STRING` | Trait/phenotype name |
 | `gene` | `STRING` | Gene symbol (e.g. PCSK9) |
 | `gene_id` | `STRING` | Ensembl gene ID (e.g. ENSG00000169174) |
-| `chr` | `INT64` | Chromosome number, chromosome X is 23 |
+| `chr` | `INT64` | Chromosome number, chromosome X is 23. The partitioning column: a literal `chr = <n>` is what keeps a query under the sandbox scan cap |
 | `gene_start_pos` | `INT64` | Gene start position (GRCh38) |
 | `gene_end_pos` | `INT64` | Gene end position (GRCh38) |
 | `annotation` | `STRING` | Variant annotation filter used in burden test (e.g. pLoF, nonsynonymous) |
@@ -30,7 +38,7 @@ rather than scanning.
 | `n_controls` | `INT64` | Number of controls in the analysis |
 | `trait_original` | `STRING` | Original trait name in the respective dataset |
 | `flags` | `STRING` | Quality or analysis flags (NA if none) |
-| `resource` | `STRING` | Data source identifier (lowercase). Use this for filtering, not dataset |
+| `resource` | `STRING` | Data source identifier (lowercase), derived from dataset in the view. Filtering on it selects the right rows but prunes nothing; `dataset` (exact spelling, see the enumerable values) is the clustering key |
 
 ## Columns with a small, enumerable set of values
 
@@ -44,23 +52,23 @@ rather than scanning.
 
 Queries that run against gene_burden_results_v as written.
 
-### All burden tests for a gene across every exome study and phenotype — the usual starting point for 'is this gene implicated anywhere'
+### All burden tests for a gene across every exome study and phenotype — the usual starting point for 'is this gene implicated anywhere'. The literal chr is not optional: without it the same query estimates over the sandbox cap and is refused.
 
 ```sql
 SELECT resource, dataset, trait, trait_original, annotation,
        mlog10p_burden, beta, se, n_cases, n_controls, total_variants
 FROM gene_burden_results_v
-WHERE gene = 'TLN1'
+WHERE chr = 9 AND gene = 'TLN1'
 ORDER BY mlog10p_burden DESC
 ```
 
-### pLoF burden hits for a disease. Trait names are source-specific strings, so match them case-insensitively rather than assuming an exact label.
+### pLoF burden hits for a disease. Trait names are source-specific strings, so match them case-insensitively rather than assuming an exact label. Genome-wide, so no chr predicate; the narrow column list is what keeps it under the cap.
 
 ```sql
 SELECT gene, annotation, trait, mlog10p_burden, beta, se,
        n_cases, n_controls, total_variants
 FROM gene_burden_results_v
-WHERE resource = 'genebass' AND annotation = 'pLoF'
+WHERE dataset = 'genebass' AND annotation = 'pLoF'
   AND LOWER(trait) LIKE '%crohn%'
 ORDER BY mlog10p_burden DESC
 ```
@@ -70,16 +78,16 @@ ORDER BY mlog10p_burden DESC
 ```sql
 SELECT gene, annotation, trait, mlog10p_burden, beta, n_cases, n_controls
 FROM gene_burden_results_v
-WHERE resource = 'bipex2' AND mlog10p_burden > 3
+WHERE dataset = 'BipEx2' AND mlog10p_burden > 3
 ORDER BY mlog10p_burden DESC LIMIT 20
 ```
 
-### One gene's burden result in specific traits, significant or not — the table is unfiltered, so this answers 'was this gene tested and what came out'
+### One gene's burden result in specific traits, significant or not — the table is unfiltered, so this answers 'was this gene tested and what came out'. chr beside gene as in the first example; dataset pins the study whose trait codes these are.
 
 ```sql
 SELECT trait_original, annotation, mlog10p_burden, beta, se, total_variants
 FROM gene_burden_results_v
-WHERE gene = 'PCSK9'
+WHERE chr = 1 AND gene = 'PCSK9' AND dataset = 'genebass'
   AND trait_original IN ('continuous_30780_both_sexes__irnt', 'icd10_E78_both_sexes__')
 ORDER BY mlog10p_burden DESC
 ```

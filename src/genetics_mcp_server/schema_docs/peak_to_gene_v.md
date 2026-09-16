@@ -15,6 +15,10 @@ are not linked to it. When the gene's chromosome is known, add a literal `cs.chr
 predicate to the join query — credible_sets is partitioned by chr, so this cuts the scan by
 an order of magnitude.
 
+## Scan pruning
+
+Clustered on `symbol`, `cell_type`, `peak_id`: an equality on these cuts the bytes billed.
+
 ## Columns
 
 | column | type | description |

@@ -149,7 +149,7 @@ Now, looking only at the extracted data and literature above, provide your analy
     _Block("""
 ## The Database
 
-It holds credible sets, colocalization, exome/burden results and more. Refer to views by their bare name (`credible_sets_v`) — never prefixed with a project or dataset; the database resolves that itself. Filter by data source with `WHERE resource = '<resource>'` rather than by dataset name; one resource often holds several datasets (`finngen` covers the core GWAS, Kanta lab tests, Olink pQTL, and more).
+It holds credible sets, colocalization, exome/burden results and more. Refer to views by their bare name (`credible_sets_v`) — never prefixed with a project or dataset; the database resolves that itself. Filter by data source with `WHERE resource = '<resource>'` rather than by dataset name; one resource often holds several datasets (`finngen` covers the core GWAS, Kanta lab tests, Olink pQTL, and more). Selecting rows is not the same as pruning the scan: each view's "Scan pruning" section below names its partition column, and a literal predicate on it is what keeps a query under the per-query scan cap — `resource`, `gene` or `trait` alone do not, however few rows they match.
 """,
            requires_any=_fs('query_database', 'run_analysis')),
     _Block("""Look up the resource, and what datasets sit under it, via `list_datasets`.

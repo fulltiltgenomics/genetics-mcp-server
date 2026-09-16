@@ -8,6 +8,10 @@ In-silico PREDICTED effects of variants on chromatin accessibility from deep-lea
 predicted effect score. These are model predictions, not measured associations. Always
 filter by resource, not dataset.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `tissue`, `model`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

@@ -7,6 +7,10 @@ Single-variant exome association results from multiple resources with different 
 thresholds. Genebass contains variants filtered to p < 1e-4. IBD exome (ibd_exome_2026)
 contains variants filtered to mlog10p > 4.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `gene`, `trait`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

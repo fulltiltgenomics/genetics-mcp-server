@@ -96,6 +96,7 @@ async def test_mpra_dispatches_on_argument_shape(kwargs, expected):
         ("exome", {"region": "19:1-2"}, "get_exome_results_by_region"),
         ("exome", {"phenotype": "T1D"}, "get_exome_results_by_phenotype"),
         ("gene_burden", {"gene": "APOE"}, "get_gene_based_results"),
+        ("gene_burden", {"gene": "APOE", "phenotypes": ["t1"]}, "get_gene_based_results"),
         ("gene_burden", {"phenotype": "T1D"}, "get_gene_based_results_by_phenotype"),
         ("hla", {"phenotype": "K11_COELIAC"}, "get_hla_by_phenotype"),
         ("hla", {"allele": "B*27:05"}, "get_hla_by_allele"),
@@ -767,3 +768,24 @@ def test_show_is_kept_out_of_the_audit_trail():
     """It reaches no executor, so a record for it would be counted as a one-row read."""
     assert not hasattr(GeneticsClient.show, "__wrapped__")
     assert hasattr(GeneticsClient.credible_sets, "__wrapped__")
+
+
+async def test_gene_burden_forwards_named_traits_to_the_gene_endpoint():
+    """gene= with phenotypes= reaches the unfiltered per-trait files; without it results-api
+    returns only genebass's significant hits, which is what made 'tested and null in this
+    trait' unreachable from the SDK."""
+    client, executor = make_client()
+    await client.gene_burden(gene="APBB2", phenotypes=["t1", "t2"])
+    assert executor.last == ("get_gene_based_results", ("APBB2",), {"traits": ["t1", "t2"]})
+
+    await client.gene_burden(gene="APBB2", phenotypes="t1")
+    assert executor.last[2] == {"traits": ["t1"]}
+
+    await client.gene_burden(gene="APBB2")
+    assert executor.last[2] == {"traits": None}
+
+
+async def test_gene_burden_phenotype_branch_refuses_phenotypes():
+    client, _executor = make_client()
+    with pytest.raises(GeneticsUsageError, match="phenotypes"):
+        await client.gene_burden(phenotype="T1D", phenotypes=["t1"])

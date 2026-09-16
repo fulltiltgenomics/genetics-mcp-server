@@ -15,6 +15,10 @@ you want only queryable datasets. Most rows (841 of ~890) are eQTL Catalogue QTD
 studies, which are the way to turn a tissue or cell-type question into a dataset filter for
 credible_sets_v. Small table, so an unfiltered scan is cheap.
 
+## Scan pruning
+
+Clustered on `dataset`, `resource`: an equality on these cuts the bytes billed.
+
 ## Columns
 
 | column | type | description |

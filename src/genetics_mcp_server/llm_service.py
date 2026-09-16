@@ -255,20 +255,44 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
 
 
 def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
-    """Add a cache_control breakpoint to the last block of the last message.
+    """Move the history's cache_control breakpoint to the last block of the last message.
 
     Mutates `messages` in place. Normalizes a plain-string content into a single
     text block so the breakpoint can attach. No-op for an empty message list.
+
+    Any breakpoint already on an earlier message is removed first: the tool loop calls
+    this after every tool-result turn so the growing history is re-cached each iteration,
+    and Anthropic allows four breakpoints in a request, all of which are spoken for. Leaving
+    the earlier one in place would make the fifth an API error. Measured on one 17-iteration
+    production turn before this: cache reads stayed at the prompt's 87k tokens on every call
+    while the uncached input grew to 125k, 1.2M uncached tokens in all.
     """
     if not messages:
         return
+    # list slots are replaced rather than the message dicts edited: the loop shares those
+    # dicts between the request it already sent and the next one, so an in-place edit would
+    # rewrite the record of what the earlier request carried
+    for i, message in enumerate(messages):
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and "cache_control" in block for block in content
+        ):
+            messages[i] = {
+                **message,
+                "content": [
+                    {k: v for k, v in block.items() if k != "cache_control"}
+                    if isinstance(block, dict)
+                    else block
+                    for block in content
+                ],
+            }
     last = messages[-1]
     content = last.get("content")
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
-        last["content"] = content
     if isinstance(content, list) and content and isinstance(content[-1], dict):
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+        content = [*content[:-1], {**content[-1], "cache_control": {"type": "ephemeral"}}]
+        messages[-1] = {**last, "content": content}
 
 
 # comfortably under the client's 90s inactivity timeout, so several ticks are
@@ -1123,10 +1147,9 @@ class LLMService:
         # larger replayed payload now that tool results are persisted and replayed.
         # Anthropic allows 4 breakpoints and all 4 are spoken for — tool definitions, the shared
         # system block, this user's own block (instructions and memory together), and this one —
-        # so anything that wants a new one has to take it from these.
-        # Caveats: ephemeral cache TTL is ~5 min, and the cache lookback window means very long
-        # tool-heavy single turns may not hit. Caching is most valuable for resumes and rapid
-        # follow-ups.
+        # so anything that wants a new one has to take it from these. The tool loop below moves
+        # this one onto each turn's newest message, so within a tool-heavy turn every call reads
+        # the previous iterations' tool results from cache rather than re-sending them.
         _mark_history_cache_breakpoint(anthropic_messages)
 
         # prepare request parameters
@@ -1608,6 +1631,7 @@ class LLMService:
                             ),
                         },
                     ]
+                    _mark_history_cache_breakpoint(request_params["messages"])
                     continue
 
                 # a turn that ends normally after laying out empty or placeholder
@@ -1644,6 +1668,7 @@ class LLMService:
                         },
                         {"role": "user", "content": CONTINUE_UNFILLED_PROMPT},
                     ]
+                    _mark_history_cache_breakpoint(request_params["messages"])
                     continue
 
                 if not tool_uses or not self.executor:
@@ -1913,6 +1938,9 @@ class LLMService:
                     {"role": "assistant", "content": _replayable_content(message.content)},
                     {"role": "user", "content": tool_results},
                 ]
+                # the breakpoint rides on the newest tool result, so the next call reads
+                # every earlier iteration of this turn from cache
+                _mark_history_cache_breakpoint(request_params["messages"])
 
             if truncated:
                 notice = "\n\n---\n*Response was cut short by the output token limit.*\n"

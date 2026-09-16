@@ -11,6 +11,10 @@ needs an rsID, an allele frequency, imputation quality, or Finnish enrichment fo
 found in those views. Association results are not here — use credible_sets_v,
 exome_variant_results_v etc. for those.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `most_severe`, `gene_most_severe`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

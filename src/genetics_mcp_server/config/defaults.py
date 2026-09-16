@@ -431,6 +431,7 @@ The database contains tables for credible sets, colocalization, exome/burden tes
 Refer to views by their bare name (e.g., `credible_sets_v`) — do NOT prefix them with a project or dataset. The database resolves the dataset itself. Views include a `resource` column for filtering by data source.
 Filter by data source using `WHERE resource = '<resource>'` rather than matching dataset names directly.
 A single resource often contains multiple datasets (e.g. `finngen` includes the core GWAS, Kanta lab tests, Olink pQTL, etc.).
+Selecting rows is not the same as pruning the scan: each view's "Scan pruning" section names its partition column, and a literal predicate on it is what keeps a query under the per-query scan cap — `resource`, `gene` or `trait` alone do not, however few rows they match.
 """,
         requires_any=_fs("query_database", "run_analysis"),
     ),

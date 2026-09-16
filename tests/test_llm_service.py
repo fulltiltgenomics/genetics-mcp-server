@@ -1403,3 +1403,52 @@ class TestUserMemoryBlock:
         params = await self._params(user_memory=self.DIGEST)
 
         assert "APOE and LDL" not in params["system"][0]["text"]
+
+
+class TestHistoryBreakpointFollowsTheTurn:
+    """The history breakpoint sits on the newest message of EVERY request in a turn, not
+    only the first: with it fixed on the replayed history, each tool iteration re-sent every
+    earlier iteration's tool results uncached — measured as a flat cache_read and a growing
+    input_tokens across a 17-call production turn."""
+
+    @staticmethod
+    def _marked(params):
+        return [
+            (i, j)
+            for i, message in enumerate(params["messages"])
+            for j, block in enumerate(message["content"])
+            if isinstance(block, dict) and "cache_control" in block
+        ]
+
+    def test_moving_the_mark_strips_the_earlier_one(self):
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        ]
+        _mark_history_cache_breakpoint(messages)
+        first_request = list(messages)
+        messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1"}]})
+        _mark_history_cache_breakpoint(messages)
+
+        assert "cache_control" not in messages[1]["content"][-1]
+        assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        # the request already sent keeps its own record of where the mark was
+        assert first_request[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    @pytest.mark.asyncio
+    async def test_every_request_of_a_tool_turn_marks_only_its_newest_message(self):
+        usage = dict(input_tokens=1, output_tokens=1)
+        svc = _with_tools(_service([
+            _tool_turn("t1", **usage), _tool_turn("t2", **usage), _answer_turn(**usage),
+        ]))
+        await _run(svc, enable_tools=True, system_prompt="SHARED")
+
+        calls = svc.anthropic_client.messages.calls
+        assert len(calls) == 3
+        for params in calls:
+            last_message = len(params["messages"]) - 1
+            last_block = len(params["messages"][-1]["content"]) - 1
+            assert self._marked(params) == [(last_message, last_block)]
+        # the newest message of a tool iteration is the tool_result turn
+        assert calls[1]["messages"][-1]["content"][-1]["type"] == "tool_result"
+        assert TestUserMemoryBlock._breakpoints(calls[2]) == 3  # no per-user block here

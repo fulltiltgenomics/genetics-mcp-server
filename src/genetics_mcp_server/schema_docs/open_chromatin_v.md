@@ -8,6 +8,10 @@ condition. Region-indexed presence/annotation atlas (no p-values): a row means t
 is open/active chromatin in the given context. Query by overlapping a position or region
 against peak_start/peak_end. Always filter by resource, not dataset.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `tissue`, `cell_type`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

@@ -11,6 +11,10 @@ rates (CpG units, Data-S1) or methylation depleted sequence (MDS) methylation ra
 significant at ~1e-12 (CpG) and ~1e-10 (MDS), MAF > 1e-4, imputation INFO > 0.9, variant
 within 100 kb of the methylation target.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `gene_most_severe`, `most_severe`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

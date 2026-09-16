@@ -32,6 +32,10 @@ key+variant pairs). Use SELECT DISTINCT, or COUNT(DISTINCT variant), for anythin
 variant; intersecting the two sides of a colocalization joins this view to itself and
 inflates up to 4x.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset`, `data_type`, `cs_id`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

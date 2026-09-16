@@ -19,6 +19,10 @@ answer) to get the genes each peak is linked to — see the peak_to_gene_v examp
 approximate the link by comparing peak and gene coordinates: linked peaks sit up to ~1 Mb
 from the gene and most peaks near a gene are not linked to it.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `data_type`, `resource`, `variant`, `pos`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

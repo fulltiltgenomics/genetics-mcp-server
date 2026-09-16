@@ -8,6 +8,10 @@ shared causal variant probability. The view is partitioned by chr, so add a lite
 predicate (chr = 19, not a join or a subquery) whenever the chromosome is known — without it
 the query scans every chromosome.
 
+## Scan pruning
+
+Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query under the sandbox's per-query scan cap, which BigQuery checks against its partition-pruned estimate before running anything. Clustered on `dataset1`, `data_type1`, `dataset2`, `data_type2`: an equality on these cuts the bytes actually billed but does not lower that estimate, so it never substitutes for the partition predicate.
+
 ## Columns
 
 | column | type | description |

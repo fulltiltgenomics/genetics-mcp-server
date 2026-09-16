@@ -32,6 +32,10 @@ than concatenating whole frames. The staged file and the underlying `hla_associa
 keep FinnGen's native `mlogp`/`sebeta`/`af_alt`/`af_alt_cases`/`af_alt_controls`; the view
 renames them 1:1, the values are unchanged.
 
+## Scan pruning
+
+Clustered on `phenotype`, `gene`, `allele`: an equality on these cuts the bytes billed.
+
 ## Columns
 
 | column | type | description |
