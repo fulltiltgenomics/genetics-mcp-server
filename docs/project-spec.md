@@ -27,6 +27,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The live frontend send path does not round-trip through these endpoints — it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) before inlining, so a first send needs no upload endpoint and therefore no session. (The original reason was stronger — sessions were created lazily *after* the first exchange, so there was no `session_id` to upload against at all. That is no longer true: `genetics-results-suite-vda` moved creation ahead of the request, because `run_analysis` refuses a turn whose `session_id` is null. The client-side parse is kept on its own merits, one fewer round trip.) The server-side parse is therefore defense-in-depth: it covers direct API consumers and guarantees stored bytes are never surfaced as binary; `?as=text` is available for any client that prefers a backend round-trip
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model families to context window sizes (tokens); pricing in the same module is keyed by family and version, so a price change between releases (Sonnet 5, Haiku 4.5, Fable 5.1's cache reads) is a row, not a rename. During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar
+- **Server-owned chat turns**: a turn runs as a registry task that outlives the HTTP response; the browser reattaches by sequence number after a lost connection and the server writes the assistant message itself (see "Server-owned turns")
 - **Chat history persistence**: SQLite-based storage of conversation threads. Assistant turns persist both their content blocks (`content_json`: text + `tool_use`) and the tool outputs (`tool_results_json`: the `tool_result` blocks). Persisting tool results means a **resumed** conversation replays the actual data the model saw, not just its prose summary — preventing factual drift across turns/sessions (see "Tool result persistence" under Architecture decisions)
 - **Configurable prompts**: Per-user LLM configuration stored in database
 - **Instructions**: Users store named sets of their own instructions and select one per chat; the chat request carries only the set id and the server appends the stored text to the system prompt as a second cached block (see "Instructions" below)
@@ -1484,6 +1485,46 @@ typed surface entirely. `executor._seg()` (`quote(value, safe="")`, plus explici
 the bare `.`/`..` segments that `quote` leaves alone because `.` is unreserved) now wraps every
 such segment, including the ones passed to `_build_download_url()`.
 
+## Server-owned turns (`turns.py`)
+
+A turn is a task the `TurnRegistry` owns, keyed by `message_id`; `POST /chat/v1/chat` starts it
+and returns only its first *subscription*. The response's generator replays the turn's buffered
+events from a sequence number and tails it; a client disconnect cancels that subscription and
+nothing else. This is what lets a laptop sleep mid-answer without the answer being lost: before
+it, the model ran inside the response and the browser was the only writer of chat history.
+
+- **Events** are `(event, payload)` pairs from `chat_api.event_generator`, buffered in memory with
+  their sequence number, which travels as the SSE `id`. A subscriber that lost its connection asks
+  `GET /chat/v1/chat/turns/{message_id}/events?from_seq=<last id + 1>` for the rest. Owner only —
+  the turn's `user` must equal the caller's — and 404 for anyone else and for a turn that has been
+  evicted (`RETAIN_SECONDS`, ten minutes after it settled).
+- **Stopping** is `POST /chat/v1/chat/turns/{message_id}/cancel`, which cancels the task. The
+  `CancelledError` propagates into `stream_chat` exactly as a disconnect used to, so its abandoned-
+  turn metrics path is unchanged. The registry then appends a `cancelled` event so a subscriber can
+  tell a stopped turn from a lost connection, and finishes normally. Cancel is a no-op once the
+  source has closed: cancelling during the write below would lose the row.
+- **Persistence** is the finish hook `_turn_persister` builds per request: `render_transcript`
+  turns the buffered events into the same `content` string the browser accumulates on screen —
+  prose, plus the `[IMAGE:…]`, `[FILE:…]` and `[TOOLUSE:…]` markers by the grammar of the
+  browser's `imageMarker.ts`, `fileMarker.ts` and `toolCallMarker.ts` — and `add_message` writes it
+  with `content_json` and `tool_results_json` from the `done` event, in a worker thread. It runs
+  for every ending (complete, error, cancelled) that produced any content; a secret chat or a
+  turn with no `session_id` has no hook. The browser writes the user message before the request
+  and no longer writes the assistant message. The marker grammar exists on both ends because the
+  two cannot import one module; `tests/test_turns.py` decodes the Python output with the
+  browser's regexes.
+- **Two flags, not one.** `closed` ends subscriptions; `settled` is set after the hook. Session
+  detail (`GET /chat/v1/chat/sessions/{id}`, owner only) reports `active_turn` while a turn of
+  that session is unsettled, so a browser that reloads between the last event and the row landing
+  attaches to the turn rather than reading an empty history.
+- **Shutdown.** uvicorn's graceful drain counts connections, and a detached turn is not one. The
+  lifespan awaits `TurnRegistry.drain(TURN_DRAIN_TIMEOUT_S)` before closing the LLM service, and
+  cancels what outlives the deadline. sse-starlette closes open streams at SIGTERM, so connected
+  browsers reattach to the new pod; the buffer is per process, so they find their answer in
+  history rather than in the buffer.
+- **One replica.** The buffer is in-process; chat-backend runs one pod with `strategy: Recreate`
+  for reasons stated on its Deployment, so a reconnect has nowhere else to land.
+
 ## Response Length
 
 The chat API takes a `verbosity` parameter (`"brief"` — the default — or `"detailed"`), surfaced in the web UI as the **Answer** radio group beside the literature-backend and tool-profile selectors. `chat_api.stream_chat` appends the matching fragment from `_VERBOSITY_PROMPTS` (`config/defaults.py`, via `verbosity_prompt()`) to the end of the system prompt.
@@ -1653,9 +1694,9 @@ indistinguishable and roundtrips per turn underivable.
 - **Keying.** A surrogate `id`, plus `session_id` and `message_id` columns and a *partial* unique
   index on `message_id WHERE message_id IS NOT NULL`. `message_id` is the client-generated
   `chat_messages` primary key and is globally unique on its own, so it needs no `session_id` to
-  disambiguate. The browser mints it before the request and sends it as `message_id`, and saves
-  a stopped or timed-out turn's partial content under the same id, so an abandoned turn's row
-  keys to the truncated answer it produced. Both ids are nullable and neither carries a foreign
+  disambiguate. The browser mints it before the request and sends it as `message_id`; the turn
+  registry then writes the assistant message — a stopped or timed-out turn's partial content
+  included — under that id, so an abandoned turn's row keys to the truncated answer it produced. Both ids are nullable and neither carries a foreign
   key — `PRAGMA foreign_keys` is ON here, so one would abort the insert: the row is written while
   the stream is still open, before the client POSTs the assistant message, and a session whose
   creation failed before the request has no row at all. `delete_session` therefore deletes these
@@ -1728,10 +1769,10 @@ indistinguishable and roundtrips per turn underivable.
   `asyncio.to_thread`, because `chat_history.db` sits on a ReadWriteOnce volume shared with the
   nightly analyze-conversations CronJob — SQLite blocks for its busy timeout when that job holds
   the write lock, and blocking the event loop would stall every other stream in the process.
-- **`message_id` plumbing.** `ChatRequest.message_id` (optional) carries the id the client will
-  save the assistant message under, through `stream_chat` into the row. The browser already holds
-  that id before it opens the stream but does not send it yet, so today the column is written NULL
-  and the row is joined to `chat_messages` by `session_id` + `created_at` ordering.
+- **`message_id` plumbing.** `ChatRequest.message_id` (optional) is the turn's id: the registry
+  key, the id the assistant message is written under, and the value `stream_chat` puts in the
+  metrics row. The browser sends it on every turn; a caller that omits it gets a server-minted
+  uuid4, so the metrics row still joins to the message it produced.
 
 `limit` on the history endpoint is `Query(20, ge=1, le=100)`. It was unvalidated when first
 written: SQLite treats a negative `LIMIT` as unbounded, so `?limit=-1` returned the entire
@@ -2575,6 +2616,7 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|---------|
 | `LLM_CONFIG_DB` | Path to LLM config SQLite DB | `/path/to/llm_config.db` |
 | `CHAT_HISTORY_DB` | Path to chat history SQLite DB | `/path/to/chat_history.db` |
+| `TURN_DRAIN_TIMEOUT_S` | How long shutdown waits for chat turns whose clients are gone before cancelling them; keep it inside the pod's termination grace period together with uvicorn's own drain | `270` |
 | `ATTACHMENT_STORAGE_PATH` | Path for file attachment storage | `/path/to/attachments` |
 | `MAX_ATTACHMENT_SIZE` | Max attachment size in bytes | `52428800` (50MB) |
 | `MAX_MESSAGE_CHARS` | Max typed-text characters in a single user message (excludes attachments) | `50000` |

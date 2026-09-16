@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -70,6 +71,15 @@ from genetics_mcp_server.tools import TOOL_DEFINITIONS
 from genetics_mcp_server.tools.definitions import (
     KNOWN_TOOL_PROFILES,
     code_execution_requested,
+)
+from genetics_mcp_server.turns import (
+    EventSource,
+    FinishHook,
+    Turn,
+    TurnAlreadyRunning,
+    done_payload,
+    get_turn_registry,
+    render_transcript,
 )
 
 logger = logging.getLogger(__name__)
@@ -312,6 +322,10 @@ async def lifespan(app: FastAPI):
     yield
     # cleanup
     cleanup_task.cancel()
+    # turns outlive their HTTP responses, so uvicorn's connection drain does not cover them.
+    # Waiting here is what turns a deploy landing mid-answer into a persisted answer; the
+    # bound keeps the pod inside its termination grace period (see chat-backend.yaml)
+    await get_turn_registry().drain(timeout=get_settings().turn_drain_timeout_s)
     service = get_llm_service()
     await service.close()
     logger.info("Chat API server stopped")
@@ -896,6 +910,9 @@ async def stream_chat(
         user, request.instruction_set_id, secret=request.secret
     )
     memory_stats: dict[str, Any] = {}
+    # the id the browser will look the assistant message up under; minted here when a
+    # caller other than the browser did not send one, so every turn is reattachable
+    turn_id = request.message_id or str(uuid.uuid4())
     user_memory = await _resolve_user_memory(
         user,
         request.session_id,
@@ -904,20 +921,22 @@ async def stream_chat(
         stats=memory_stats,
     )
 
-    async def event_generator():
-        """Generate SSE events from LLM stream."""
+    async def event_generator() -> EventSource:
+        """(event, payload) pairs of this turn.
+
+        Consumed by the turn registry's task, never by the HTTP response: the response is
+        one subscriber among possibly several, and a client that disconnects takes its
+        subscription away, not this generator.
+        """
         try:
             # populated only on a fresh, non-empty render (see _load_user_memory) — never
             # on a withheld turn or a later turn reading the stored digest
             if user_memory and "sessions" in memory_stats:
-                yield {
-                    "event": "message",
-                    "data": json.dumps({
-                        "type": "memory",
-                        "project": memory_stats.get("project"),
-                        "sessions": memory_stats["sessions"],
-                        "chars": memory_stats["chars"],
-                    }),
+                yield "message", {
+                    "type": "memory",
+                    "project": memory_stats.get("project"),
+                    "sessions": memory_stats["sessions"],
+                    "chars": memory_stats["chars"],
                 }
             async for chunk in service.stream_chat(
                 messages=messages,
@@ -933,37 +952,26 @@ async def stream_chat(
                 session_id=request.session_id,
                 user_instructions=user_instructions,
                 user_memory=user_memory,
-                message_id=request.message_id,
+                message_id=turn_id,
                 capture_thinking=request.capture_thinking,
                 gateway_asserted=gateway_asserted,
                 local_tools=local_tools,
             ):
                 if chunk.type == "text":
-                    yield {
-                        "event": "message",
-                        "data": json.dumps(
-                            {"type": "content", "content": chunk.content}
-                        ),
-                    }
+                    yield "message", {"type": "content", "content": chunk.content}
                 elif chunk.type == "image":
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({
-                            "type": "image",
-                            "image_data": chunk.content,
-                            "image_format": chunk.image_format or "png",
-                            "image_alt": chunk.image_alt or "Generated image",
-                        }),
+                    yield "message", {
+                        "type": "image",
+                        "image_data": chunk.content,
+                        "image_format": chunk.image_format or "png",
+                        "image_alt": chunk.image_alt or "Generated image",
                     }
                 elif chunk.type == "file":
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({
-                            "type": "file",
-                            "file_data": chunk.content,
-                            "file_mime": chunk.file_mime or "application/octet-stream",
-                            "file_name": chunk.file_name or "artifact",
-                        }),
+                    yield "message", {
+                        "type": "file",
+                        "file_data": chunk.content,
+                        "file_mime": chunk.file_mime or "application/octet-stream",
+                        "file_name": chunk.file_name or "artifact",
                     }
                 elif chunk.type == "tool_use":
                     # one per tool call, carrying the input WHOLE — a run_analysis script is
@@ -971,71 +979,153 @@ async def stream_chat(
                     # replaced cut it off at 400 chars with no way to expand it. The client
                     # renders a collapsed disclosure; a client that does not know this type
                     # drops it and simply shows no tool indicator.
-                    yield {
-                        "event": "message",
-                        "data": json.dumps(
-                            {"type": "tool_use", **json.loads(chunk.content)}
-                        ),
-                    }
+                    yield "message", {"type": "tool_use", **json.loads(chunk.content)}
                 elif chunk.type == "thinking":
                     # keepalive only: carries no reasoning content, and exists so a long
                     # thinking phase doesn't read as a stalled stream to the client
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({"type": "thinking"}),
-                    }
+                    yield "message", {"type": "thinking"}
                 elif chunk.type == "thinking_summary":
                     # only reached when the request opted in; the browser never does, so this
                     # branch is dead for ordinary chats rather than something they filter out
-                    yield {
-                        "event": "message",
-                        "data": json.dumps(
-                            {"type": "thinking_summary", **json.loads(chunk.content)}
-                        ),
-                    }
+                    yield "message", {"type": "thinking_summary", **json.loads(chunk.content)}
                 elif chunk.type == "usage":
-                    yield {
-                        "event": "message",
-                        "data": json.dumps({"type": "usage", **json.loads(chunk.content)}),
-                    }
+                    yield "message", {"type": "usage", **json.loads(chunk.content)}
                 elif chunk.type == "script_result":
                     # one per completed run_analysis. Metadata only (outcome, exception type,
                     # duration) — the script's source and output travel in the tool_result,
                     # not here. Unhandled chunk types are dropped silently by this dispatch,
                     # which is why the replay benchmark's script metrics need this branch.
-                    yield {
-                        "event": "message",
-                        "data": json.dumps(
-                            {"type": "script_result", **json.loads(chunk.content)}
-                        ),
-                    }
+                    yield "message", {"type": "script_result", **json.loads(chunk.content)}
                 elif chunk.type == "done":
-                    yield {
-                        "event": "message",
-                        "data": json.dumps(
-                            {
-                                "type": "done",
-                                "message_content": chunk.message_content,
-                                "tool_results": chunk.tool_results,
-                            }
-                        ),
+                    yield "message", {
+                        "type": "done",
+                        "message_content": chunk.message_content,
+                        "tool_results": chunk.tool_results,
                     }
 
         except Exception as e:
             logger.error(f"Error in chat stream: {e}", exc_info=True)
             error_msg = _classify_error(e)
-            yield {
-                "event": "error",
-                "data": json.dumps({"type": "error", "error": error_msg}),
-            }
+            yield "error", {"type": "error", "error": error_msg}
+
+    turn = Turn(turn_id, session_id=request.session_id, user=user, secret=request.secret)
+    try:
+        get_turn_registry().start(turn, event_generator(), _turn_persister(request, user))
+    except TurnAlreadyRunning:
+        raise HTTPException(
+            status_code=409, detail="A turn with this message_id is already running"
+        ) from None
+    return _turn_response(turn, from_seq=0)
+
+
+def _turn_persister(request: ChatRequest, user: str | None) -> FinishHook | None:
+    """The hook that writes a turn's assistant message when the turn ends, however it ends.
+
+    None for a secret chat or a turn with no session: neither has a row to write. The
+    content is rendered from the buffered events by the same rules the browser applies to
+    the live stream, so the stored transcript matches what was on screen; the browser no
+    longer writes the assistant message at all.
+    """
+    session_id = request.session_id
+    if request.secret or not session_id:
+        return None
+
+    async def persist(turn: Turn) -> None:
+        content = render_transcript(turn.events)
+        if not content.strip():
+            return
+        done = done_payload(turn.events)
+        content_json = None
+        tool_results_json = None
+        if done is not None:
+            if done.get("message_content"):
+                content_json = json.dumps(done["message_content"], separators=(",", ":"))
+            if done.get("tool_results"):
+                tool_results_json = json.dumps(done["tool_results"], separators=(",", ":"))
+
+        def write() -> bool:
+            db = get_chat_history_db()
+            # the same ownership check the save-message route applies to the browser
+            if db.get_session(session_id, user) is None:
+                return False
+            db.add_message(
+                session_id,
+                turn.id,
+                "assistant",
+                content,
+                content_json,
+                request.literature_backend,
+                request.tool_profile,
+                tool_results_json,
+                request.instruction_set_id,
+                request.verbosity,
+            )
+            return True
+
+        # a worker thread for the same reason the metrics write uses one: chat_history.db
+        # shares its volume with the nightly analysis job and SQLite blocks on its lock
+        written = await asyncio.to_thread(write)
+        logger.info(
+            f"[user={user}] [session={session_id}] turn {turn.id} {turn.outcome}: "
+            f"assistant message {'persisted' if written else 'NOT persisted (no such session)'} "
+            f"({len(content)} chars, {len(turn.events)} events)"
+        )
+
+    return persist
+
+
+def _turn_response(turn: Turn, *, from_seq: int) -> EventSourceResponse:
+    """One subscriber's view of a turn: the buffer from `from_seq`, then the live tail.
+
+    Every event carries its sequence number as the SSE id, so a client that loses the
+    connection asks for the rest with the number of the last one it saw plus one.
+    """
+
+    async def subscription():
+        async for ev in turn.subscribe(from_seq):
+            yield {"event": ev.event, "data": ev.data, "id": str(ev.seq)}
 
     return EventSourceResponse(
-        event_generator(),
+        subscription(),
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _owned_turn(turn_id: str, user: str | None) -> Turn:
+    turn = get_turn_registry().get(turn_id)
+    # one 404 for both: whether a turn exists is not something another user learns here
+    if turn is None or turn.user != user:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    return turn
+
+
+@app.get("/chat/v1/chat/turns/{turn_id}/events")
+async def turn_events(
+    turn_id: str,
+    from_seq: int = 0,
+    user: str | None = Depends(auth_required),
+):
+    """Reattach to a turn: replay its buffered events from `from_seq`, then tail it.
+
+    Same SSE shape as `POST /chat/v1/chat`, which is itself the first subscription to the
+    turn it starts. 404 once the turn has been evicted from the buffer; by then its
+    assistant message is in the session's history.
+    """
+    return _turn_response(_owned_turn(turn_id, user), from_seq=from_seq)
+
+
+@app.post("/chat/v1/chat/turns/{turn_id}/cancel")
+async def cancel_turn(
+    turn_id: str,
+    user: str | None = Depends(auth_required),
+):
+    """Stop a running turn. Closing the stream no longer does: the run outlives its
+    subscribers by design, so the Stop button has to say so explicitly."""
+    cancelled = _owned_turn(turn_id, user).cancel()
+    return {"cancelled": cancelled}
 
 
 @app.get("/healthz")

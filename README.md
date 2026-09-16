@@ -37,6 +37,7 @@ All environment variables are optional but needed for each type of functionality
 | `UNIPROT_CACHE_TTL` | TTL in seconds for cached UniProt responses (`0` disables) | `86400` |
 | `CHEMBL_API_URL` | ChEMBL REST API base URL (drug/target mechanisms, indications, bioactivity, chat only) | `https://www.ebi.ac.uk/chembl/api/data` |
 | `CHEMBL_CACHE_TTL` | TTL in seconds for cached ChEMBL responses (`0` disables) | `86400` |
+| `TURN_DRAIN_TIMEOUT_S` | How long the chat API waits at shutdown for turns whose clients disconnected before cancelling them | `270` |
 
 
 ### MCP Server

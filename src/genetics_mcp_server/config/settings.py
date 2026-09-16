@@ -202,6 +202,12 @@ class Settings:
         )
     )
 
+    # how long shutdown waits for chat turns whose clients are gone. Must fit inside the
+    # pod's terminationGracePeriodSeconds together with uvicorn's own connection drain
+    turn_drain_timeout_s: float = field(
+        default_factory=lambda: float(os.environ.get("TURN_DRAIN_TIMEOUT_S", "270"))
+    )
+
     # MCP settings
     mcp_enabled: bool = True
     mcp_max_iterations: int = 25

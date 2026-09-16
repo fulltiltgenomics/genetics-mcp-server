@@ -30,6 +30,7 @@ from genetics_mcp_server.memory_gate import (
     is_identifiable_user,
     memory_setting_on,
 )
+from genetics_mcp_server.turns import get_turn_registry
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,11 @@ class MessageResponse(BaseModel):
     verbosity: Optional[str] = None  # answer detail in force for this turn: brief or detailed
 
 
+class ActiveTurnResponse(BaseModel):
+    """A turn of this session that is still running or not yet written to history."""
+    message_id: str
+
+
 class SessionDetailResponse(BaseModel):
     """Full session details with messages."""
     id: str
@@ -98,6 +104,8 @@ class SessionDetailResponse(BaseModel):
     is_owner: Optional[bool] = None
     shared: Optional[bool] = None
     project_id: Optional[str] = None
+    # owner only: a reader of a shared session sees the history, not the live run
+    active_turn: Optional[ActiveTurnResponse] = None
 
 
 class ShareRequest(BaseModel):
@@ -346,6 +354,11 @@ async def get_session(
 
     session, is_owner = result
     messages = db.get_messages(session_id)
+    active_turn = None
+    if is_owner:
+        turn = get_turn_registry().active_for_session(session_id)
+        if turn is not None and turn.user == user:
+            active_turn = ActiveTurnResponse(message_id=turn.id)
 
     return SessionDetailResponse(
         id=session.id,
@@ -358,6 +371,7 @@ async def get_session(
         is_owner=is_owner,
         shared=session.shared,
         project_id=session.project_id,
+        active_turn=active_turn,
         messages=[
             MessageResponse(
                 id=msg.id,
