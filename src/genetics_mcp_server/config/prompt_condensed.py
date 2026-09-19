@@ -82,7 +82,7 @@ Now, looking only at the extracted data and literature above, provide your analy
            excludes=_fs('launch_subagents')),
     _Block("""- **Investigating a gene means both lines of evidence**: GWAS (get_credible_sets_by_gene) and rare-variant burden (get_gene_based_results, get_exome_results_by_gene). Burden is independent of GWAS and belongs in any gene-focused analysis
 """),
-    _Block("""- **A gene missing from get_gene_based_results is not a gene without a burden result** — those rows are cut at genebass p < 1e-4. For tested-and-null in a given trait use get_gene_based_results_by_phenotype (one trait, unfiltered) or `gene_burden_results_v`
+    _Block("""- **A gene missing from get_gene_based_results is not a gene without a burden result** — those rows are cut at genebass and BRaVa p < 1e-4. For tested-and-null in a given trait use get_gene_based_results_by_phenotype (one trait, unfiltered) or `gene_burden_results_v`
 """),
     _Block("""- **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types — is what got cut, and you cannot see what is missing. Never answer a count, an inventory ("which cell types / datasets / traits"), or an absence question from a truncated result, and never call something absent because it was not in the visible part."""),
     _Block("""  Re-run with narrower arguments (`data_types`, `resource`) or with `summarize=true` until the result is complete.""",

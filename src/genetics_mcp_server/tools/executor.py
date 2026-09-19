@@ -2501,10 +2501,10 @@ class ToolExecutor:
     async def get_gene_based_results(
         self, gene: str, traits: list[str] | None = None
     ) -> dict[str, Any]:
-        """Get gene-level burden test results (genebass, IBD, BipEx2, SCHEMA).
+        """Get gene-level burden test results (genebass, BRaVa, IBD, BipEx2, SCHEMA).
 
         Without `traits` results-api reads the combined per-dataset files, where genebass
-        carries only its mlog10p_burden > 4 hits; with them it reads the unfiltered
+        and BRaVa carry only their mlog10p_burden > 4 hits; with them it reads the unfiltered
         per-trait files, so a gene's null result in a named trait comes back as a row.
         """
         import csv

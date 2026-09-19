@@ -79,7 +79,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_exome_results_by_variant` | Exome results for one specific variant across exome resources — the rare-variant counterpart to `get_credible_sets_by_variant` |
 | `get_exome_results_by_region` | Exome results overlapping a `chr:start-end` region; rows capped at 500 inline with `truncated` set |
 | `get_exome_results_by_phenotype` | Get exome variant results for a specific phenotype across all genes (genebass and IBD) |
-| `get_gene_based_results` | Get gene-level burden test results from genebass, IBD, BipEx2, and SCHEMA (genebass rows filtered to p < 1e-4) |
+| `get_gene_based_results` | Get gene-level burden test results from genebass, BRaVa, IBD, BipEx2, and SCHEMA (genebass and BRaVa rows filtered to p < 1e-4) |
 | `get_gene_based_results_by_phenotype` | Get the complete unfiltered gene burden results for one phenotype — every gene and annotation class, no p-value cutoff |
 | `get_nearest_genes` | Get genes nearest to a variant position |
 | `get_genes_in_region` | Get all genes in a genomic region |
