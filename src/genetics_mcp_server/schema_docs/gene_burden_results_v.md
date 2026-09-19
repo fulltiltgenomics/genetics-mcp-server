@@ -11,7 +11,16 @@ or a trait is refused under the sandbox's per-query scan cap: the cap is checked
 BigQuery's partition-pruned estimate, and only a literal `chr = <n>` predicate lowers that.
 Always add the gene's chromosome (from gene_annotations_v or search_genes) beside `gene =`;
 `dataset =` (a clustering key) then cuts what is actually billed, which `resource =` does
-not, being derived from dataset in the view.
+not, being derived from dataset in the view. BRaVa rows are the Burden inverse-variance-
+weighted test only — the source's Stouffer, SKAT and SKAT-O rows are not loaded — and their
+`annotation` is a composite `<mask>|MAF<<cutoff>` string rather than a bare mask name; read
+the spellings from the enumerable values of `annotation` scoped by `resource`, not from
+memory. BRaVa's per-ancestry strata are phenotype codes, not a column: `trait_original` is
+the phenotype code for the cross-ancestry meta-analysis and `<code>|<STRATUM>` (AFR, AMR,
+EAS, EUR, SAS, non_EUR) for a stratum, and `n_cases`/`n_controls` are that stratum's counts
+— on BRaVa's quantitative traits `n_cases` carries the analysed sample size and `n_controls`
+is NULL. `total_variants` and `total_variants_pheno` are NULL for every BRaVa row; the
+published files carry no variant counts.
 
 ## Scan pruning
 
@@ -28,7 +37,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `chr` | `INT64` | Chromosome number, chromosome X is 23. The partitioning column: a literal `chr = <n>` is what keeps a query under the sandbox scan cap |
 | `gene_start_pos` | `INT64` | Gene start position (GRCh38) |
 | `gene_end_pos` | `INT64` | Gene end position (GRCh38) |
-| `annotation` | `STRING` | Variant annotation filter used in burden test (e.g. pLoF, nonsynonymous) |
+| `annotation` | `STRING` | Variant annotation filter used in burden test (e.g. pLoF, nonsynonymous); BRaVa spells it `<mask>\|MAF<<cutoff>` |
 | `mlog10p_burden` | `FLOAT64` | -log10(p-value) from the gene-level burden test. Higher = more significant |
 | `beta` | `FLOAT64` | Effect size estimate from burden test |
 | `se` | `FLOAT64` | Standard error of beta |
@@ -89,5 +98,15 @@ SELECT trait_original, annotation, mlog10p_burden, beta, se, total_variants
 FROM gene_burden_results_v
 WHERE chr = 1 AND gene = 'PCSK9' AND dataset = 'genebass'
   AND trait_original IN ('continuous_30780_both_sexes__irnt', 'icd10_E78_both_sexes__')
+ORDER BY mlog10p_burden DESC
+```
+
+### One gene across BRaVa's ancestry strata. A stratum is a phenotype code, not a column, so the strata of a trait are matched with LIKE 'AFib|%' — use the equality trait_original = 'AFib' for the cross-ancestry meta-analysis row instead. chr beside gene as in the first example.
+
+```sql
+SELECT trait_original, annotation, mlog10p_burden, beta, se, n_cases, n_controls
+FROM gene_burden_results_v
+WHERE chr = 2 AND gene = 'TTN' AND dataset = 'BRaVa'
+  AND trait_original LIKE 'AFib|%'
 ORDER BY mlog10p_burden DESC
 ```

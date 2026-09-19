@@ -15,14 +15,14 @@ trait_original='continuous_30040_both_sexes__irnt', and QTL rows store a gene sy
 trait with the Ensembl id in trait_original. Joining on trait returns zero rows silently.
 COVERAGE IS PARTIAL BY DESIGN. Only datasets that ship a phenotype metadata file have rows:
 FinnGen R14/R12/Kanta/drugs, the FinnGen+UKBB and FinnGen+MVP+UKBB meta-analyses, Open
-Targets, Genebass, COVID-19 HGI and IIBDGC. QTL datasets (FinnGen_snRNAseq, FinnGen_ATACseq,
-FinnGen_Olink*, UKB_PPP, every QTD*) have NO rows — their traits are genes, proteins and
-peaks, resolved through gene_annotations_v and peak_to_gene_v instead. Datasets whose codes
-are already readable (PGC, GP2, BipEx2, SCHEMA2, IBD_exome) have no rows either. Use a LEFT
-JOIN when the dataset is not known in advance. Ranked fuzzy phenotype SEARCH is not here and
-cannot be — for "find me traits matching this free-text description" use the results-api
-search endpoint. This table serves exact resolution and SQL-expressible filtering. Small
-table (~33k rows), so an unfiltered scan is cheap.
+Targets, Genebass, BRaVa, COVID-19 HGI and IIBDGC. QTL datasets (FinnGen_snRNAseq,
+FinnGen_ATACseq, FinnGen_Olink*, UKB_PPP, every QTD*) have NO rows — their traits are genes,
+proteins and peaks, resolved through gene_annotations_v and peak_to_gene_v instead. Datasets
+whose codes are already readable (PGC, GP2, BipEx2, SCHEMA2, IBD_exome) have no rows either.
+Use a LEFT JOIN when the dataset is not known in advance. Ranked fuzzy phenotype SEARCH is
+not here and cannot be — for "find me traits matching this free-text description" use the
+results-api search endpoint. This table serves exact resolution and SQL-expressible
+filtering. Small table (~33k rows), so an unfiltered scan is cheap.
 
 ## Scan pruning
 
