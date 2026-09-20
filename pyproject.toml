@@ -10,6 +10,14 @@ dependencies = [
     "polars==1.40.1",
     "python-dotenv==1.2.2",
     "matplotlib==3.10.9",
+    # used only by sdk/linemodels.py (the EM optimiser) and sdk/plots.py (the line-models
+    # region), both lazily; declared so the tests run it on purpose rather than through
+    # alphagenome's transitive closure. The sandbox image pins its own copy in
+    # genetics-results-suite sandbox/requirements.txt, since the SDK is installed there
+    # --no-deps. Split on the interpreter because 1.18 dropped 3.11, which the lock already
+    # resolved this way; the 3.11 pin is also the sandbox's.
+    "scipy==1.17.1; python_version < '3.12'",
+    "scipy==1.18.1; python_version >= '3.12'",
     "anthropic==0.97.0",
     "openai==2.33.0",
     "fastapi==0.136.1",

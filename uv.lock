@@ -753,6 +753,8 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-dotenv" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "sse-starlette" },
     { name = "uvicorn" },
 ]
@@ -791,6 +793,8 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = "==3.8.0" },
     { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.12" },
+    { name = "scipy", marker = "python_full_version < '3.12'", specifier = "==1.17.1" },
+    { name = "scipy", marker = "python_full_version >= '3.12'", specifier = "==1.18.1" },
     { name = "sse-starlette", specifier = "==3.4.1" },
     { name = "uvicorn", specifier = "==0.46.0" },
     { name = "xlsxwriter", marker = "extra == 'dev'", specifier = "==3.2.9" },
