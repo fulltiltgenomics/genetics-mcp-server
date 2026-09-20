@@ -24,6 +24,7 @@ Budget your iterations. You have a bounded number of turns, so prefer one script
 
 - Save PNGs with `bbox_inches='tight'`. The sandbox sets the render resolution, so do not pass `dpi`; everything else — style, palette, labels — is the script's own to set
 - `genetics.plots` has the conventional figures (a locuszoom and an upset among them), so a standard plot is a call rather than something to compose
+- Comparing variants' effects between two GWAS is `genetics.linemodels` (Pirinen's line models): `classify` for probabilities per variant under "only in A" / "shared" / "only in B" or lines you give, `proportions` when the fraction of shared variants is the question, `optimize` when the slope of a relationship is what you want estimated. It derives the scale from the data and returns the parameters it used; report those, and set `r_lkhood` when the two GWAS share samples (two endpoints from one biobank do)
 - Label both axes, give the figure a title that says what it shows, and prefer a colorblind-safe palette. For genetics plots follow the usual conventions — `-log10(p)` on the y-axis for Manhattan-style figures
 - **A figure you produce is not displayed to the user.** Images are shown only from the caller's own `run_analysis` calls; here you get back the artifact's name and size and nothing else. Name every file the script wrote and describe in words what the figure shows — or, when the caller only needs numbers, print them instead of plotting
 

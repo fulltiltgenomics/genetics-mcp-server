@@ -2007,14 +2007,16 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "exactly how to import it. Call this before writing a "
             "script instead of guessing function names. Modules: 'genetics' (the sync functions a "
             "script calls), 'client' (the awaitable GeneticsClient form), 'errors' (what a "
-            "script catches). Omit `module` for a cheap index of module names and the "
+            "script catches), 'plots' (the standard figures), 'linemodels' (clustering "
+            "variants by the relationship between their effects in two GWAS, with the "
+            "parameter guidance). Omit `module` for a cheap index of module names and the "
             "functions each exports."
         ),
         "parameters": {
             "module": {
                 "type": "string",
                 "description": "SDK module to describe. Omit for the index.",
-                "enum": ["genetics", "client", "errors", "plots"],
+                "enum": ["genetics", "client", "errors", "plots", "linemodels"],
             },
         },
     },
@@ -2071,6 +2073,12 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "there. Every "
             "figure is styled by the sandbox itself; a script neither needs nor should add a "
             "style, and one that sets its own is overriding a deliberate default.\n\n"
+            "Comparing the same variants' effects between two GWAS — two phenotypes, two "
+            "cohorts, two sexes — is `genetics.linemodels` (Pirinen's line models): it "
+            "gives each variant a probability of 'effect only in A', 'shared' and 'only in "
+            "B', or of lines you specify, derives the scale from the data and reports every "
+            "parameter it used. list_capabilities(module=\"linemodels\") has the "
+            "parameter guidance; `genetics.plots.linemodels` draws the result.\n\n"
             "Each run is independent: no variables, files or imports survive from one call to "
             "the next, so a follow-up script must redo the work it needs."
         ),

@@ -40,11 +40,12 @@ import re
 import textwrap
 from typing import Any
 
+import numpy as np
 import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsUsageError
 
-__all__ = ["locuszoom", "phewas", "upset"]
+__all__ = ["locuszoom", "phewas", "upset", "linemodels"]
 
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
@@ -1464,4 +1465,213 @@ def upset(
         "intersections": [{"sets": [n for n in rows if n in k], "count": nonempty[k]} for k in shown],
         "n_intersections": len(nonempty),
         "n_elements": sum(nonempty.values()),
+    }
+
+
+# --------------------------------------------------------------------------- line models
+
+# Okabe–Ito, in an order that keeps the first three models far apart; the palette is data
+# encoding (a reader decodes the model from the hue), so it does not follow the prop_cycle
+_LINEMODEL_COLOURS = (
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000",
+)
+_LINEMODEL_UNDETERMINED = "#9A9A9A"
+_LINEMODEL_ERRORBAR = "#BBBBBB"
+_LINEMODEL_REGION_PROB = 0.95
+_LINEMODEL_FIGURE_IN = 3.6
+# how many multiples of the largest scale the axes span when no data set the extent; the
+# R package's convention
+_LINEMODEL_AXIS_SCALES = 3.0
+
+
+def _region_boundary(covariance, prob: float):
+    """The x, y of the highest-density region's boundary under N(0, covariance)."""
+    from scipy.stats import chi2
+
+    radius2 = chi2.ppf(prob, 2)
+    # eigen rather than Cholesky: cor = 1 makes the covariance singular, and the region is
+    # then a segment along the line rather than an error
+    values, vectors = np.linalg.eigh(covariance)
+    values = np.clip(values, 0.0, None)
+    t = np.linspace(0.0, 2.0 * math.pi, 361)
+    circle = np.vstack([np.cos(t), np.sin(t)])
+    pts = vectors @ (np.sqrt(values * radius2)[:, None] * circle)
+    return pts[0], pts[1]
+
+
+def linemodels(
+    result: Any,
+    *,
+    X: Any = None,
+    SE: Any = None,
+    groups: pl.DataFrame | None = None,
+    threshold: float = 0.95,
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+    title: str | None = None,
+    xlim: Any = None,
+    ylim: Any = None,
+    path: str | None = None,
+    ax: Any = None,
+) -> dict[str, Any]:
+    """Line models over two effect variables, with the variants coloured by assignment.
+
+    `result` is what `genetics.linemodels.classify`, `proportions` or `optimize` returned
+    (its `models` and `groups` are used), or just a `models` frame with `model`, `scale`,
+    `slope` and `cor` columns. Each model is drawn as its line through the origin and the
+    dashed boundary of the region holding 95% of its effects — a slope of infinity is the
+    vertical axis and a scale of 0 a point at the origin — so the figure shows what each
+    hypothesis claims before any point is read against it.
+
+    Pass the same `X` (and `SE`, for 95% error bars) the fit was given to draw the variants:
+    a point is filled in its model's colour when that model's probability reaches
+    `threshold`, and left grey when no model does — those sit near the origin, where the
+    models are not separable, by design. `groups` overrides the result's own. Axis labels
+    default to the column names of `X`.
+
+    Returns `path`, `models` in drawing order, `n_points`, `n_assigned` per model,
+    `n_undetermined` and the `threshold` used. `path` may be relative, in which case it is
+    written inside the execution's artifacts directory; pass `ax` to draw into an existing
+    figure instead, in which case nothing is saved.
+    """
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server.sdk import linemodels as lm
+
+    if isinstance(result, dict):
+        models = result.get("models")
+        if groups is None:
+            groups = result.get("groups")
+    else:
+        models = result
+    if not isinstance(models, pl.DataFrame) or not {"model", "scale", "slope", "cor"} <= set(models.columns):
+        raise GeneticsUsageError(
+            "result must be a genetics.linemodels result or a models frame with model, "
+            "scale, slope and cor columns; only two effect variables can be drawn"
+        )
+    names = models["model"].to_list()
+    scales = [float(v) for v in models["scale"].to_list()]
+    slopes = [float(v) for v in models["slope"].to_list()]
+    cors = [float(v) for v in models["cor"].to_list()]
+    if len(names) > len(_LINEMODEL_COLOURS):
+        raise GeneticsUsageError(f"at most {len(_LINEMODEL_COLOURS)} models can be drawn")
+    if not 0 < threshold <= 1:
+        raise GeneticsUsageError("threshold must lie in (0, 1]")
+
+    points = None
+    errors = None
+    dims = None
+    if X is not None:
+        points, dims = lm._matrix(X, "X")
+        if points.shape[1] != 2:
+            raise GeneticsUsageError("only two effect variables can be drawn; select two columns")
+        if SE is not None:
+            errors, _ = lm._matrix(SE, "SE")
+            if errors.shape != points.shape:
+                raise GeneticsUsageError(f"X has shape {points.shape} but SE has shape {errors.shape}")
+    colour_of = dict(zip(names, _LINEMODEL_COLOURS))
+
+    assigned: dict[str, int] = {n: 0 for n in names}
+    point_colours: list[str] = []
+    if points is not None and groups is not None:
+        if groups.height != points.shape[0]:
+            raise GeneticsUsageError(
+                f"groups has {groups.height} rows but X has {points.shape[0]}"
+            )
+        missing = [n for n in names if n not in groups.columns]
+        if missing:
+            raise GeneticsUsageError(f"groups lacks a probability column for {missing}")
+        probs = groups.select(names).to_numpy()
+        best = probs.argmax(axis=1)
+        for i in range(points.shape[0]):
+            if probs[i, best[i]] >= threshold:
+                name = names[best[i]]
+                assigned[name] += 1
+                point_colours.append(colour_of[name])
+            else:
+                point_colours.append(_LINEMODEL_UNDETERMINED)
+    elif points is not None:
+        point_colours = [_LINEMODEL_UNDETERMINED] * points.shape[0]
+
+    own_figure = ax is None
+    if own_figure:
+        figure, ax = plt.subplots(figsize=(_LINEMODEL_FIGURE_IN, _LINEMODEL_FIGURE_IN),
+                                  constrained_layout=True)
+    else:
+        figure = ax.get_figure()
+
+    extent = _LINEMODEL_AXIS_SCALES * max(scales) if scales else 1.0
+    if points is not None:
+        reach = np.abs(points) + (1.96 * errors if errors is not None else 0.0)
+        extent = max(extent, 1.08 * float(reach.max()))
+    lo_x, hi_x = (-extent, extent) if xlim is None else (float(xlim[0]), float(xlim[1]))
+    lo_y, hi_y = (-extent, extent) if ylim is None else (float(ylim[0]), float(ylim[1]))
+
+    ax.axhline(0, color="#000000", linewidth=0.5, zorder=1)
+    ax.axvline(0, color="#000000", linewidth=0.5, zorder=1)
+    for name, scale, slope, cor in zip(names, scales, slopes, cors):
+        colour = colour_of[name]
+        if scale < lm._NULL_SCALE:
+            ax.plot([0], [0], marker="o", color=colour, markersize=4, zorder=3)
+            continue
+        if math.isinf(slope):
+            ax.plot([0, 0], [lo_y, hi_y], color=colour, linewidth=1.0, zorder=2)
+        else:
+            xs = np.array([lo_x, hi_x])
+            ax.plot(xs, slope * xs, color=colour, linewidth=1.0, zorder=2)
+        rx, ry = _region_boundary(
+            lm._prior_covariance(scale, np.array([slope]), cor), _LINEMODEL_REGION_PROB
+        )
+        ax.plot(rx, ry, color=colour, linewidth=0.7, linestyle="--", zorder=2)
+
+    if points is not None:
+        if errors is not None:
+            ax.errorbar(points[:, 0], points[:, 1], xerr=1.96 * errors[:, 0],
+                        yerr=1.96 * errors[:, 1], fmt="none", ecolor=_LINEMODEL_ERRORBAR,
+                        elinewidth=0.5, zorder=3)
+        filled = [c != _LINEMODEL_UNDETERMINED for c in point_colours]
+        colours = np.array(point_colours)
+        mask = np.array(filled)
+        if (~mask).any():
+            ax.scatter(points[~mask, 0], points[~mask, 1], s=14, facecolors="none",
+                       edgecolors=_LINEMODEL_UNDETERMINED, linewidths=0.6, zorder=4)
+        if mask.any():
+            ax.scatter(points[mask, 0], points[mask, 1], s=14, c=colours[mask],
+                       edgecolors="#FFFFFF", linewidths=0.3, zorder=5)
+
+    from matplotlib.lines import Line2D
+
+    handles = [
+        Line2D([0], [0], color=colour_of[n], linewidth=1.5,
+               label=f"{n} ({assigned[n]})" if points is not None and groups is not None else n)
+        for n in names
+    ]
+    if points is not None and groups is not None:
+        undetermined = sum(1 for c in point_colours if c == _LINEMODEL_UNDETERMINED)
+        handles.append(Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="none",
+                              markeredgecolor=_LINEMODEL_UNDETERMINED,
+                              label=f"< {threshold:g} ({undetermined})"))
+    else:
+        undetermined = 0
+    ax.legend(handles=handles, fontsize=5, frameon=False, loc="best")
+    ax.set_xlim(lo_x, hi_x)
+    ax.set_ylim(lo_y, hi_y)
+    ax.set_xlabel(xlabel or (dims[0] if dims else "effect 1"), fontsize=_LABEL_SIZE)
+    ax.set_ylabel(ylabel or (dims[1] if dims else "effect 2"), fontsize=_LABEL_SIZE)
+    ax.set_title(title or "", fontsize=_TITLE_SIZE)
+    ax.grid(True, linewidth=0.3, color="#DDDDDD", zorder=0)
+    _size(ax)
+
+    written = None
+    if own_figure:
+        written = _resolve_path(path, "linemodels.png")
+        figure.savefig(written)
+        plt.close(figure)
+    return {
+        "path": written,
+        "models": names,
+        "n_points": 0 if points is None else int(points.shape[0]),
+        "n_assigned": assigned,
+        "n_undetermined": undetermined,
+        "threshold": threshold,
     }

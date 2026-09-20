@@ -132,10 +132,12 @@ Four evidence types that must not be conflated, because a user question about "r
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
-locuszoom, a phewas and an upset — as functions a `run_analysis` script calls, and the
-figure comes back as an artifact. The upset is the general one: it takes any sets a script
-has in hand (members, a frame of membership columns, or intersection counts already
-tallied) and draws them one way, in greys, with every count outside the bar it counts.
+locuszoom, a phewas, an upset and the line-models figure — as functions a `run_analysis`
+script calls, and the figure comes back as an artifact. The upset is the general one: it
+takes any sets a script has in hand (members, a frame of membership columns, or
+intersection counts already tallied) and draws them one way, in greys, with every count
+outside the bar it counts. The line-models figure takes what `genetics.linemodels` returned
+and draws each model's line and 95% region with the variants coloured by assignment.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -442,7 +444,7 @@ exception that would cost the user the turn.
 | Tool | Description |
 |------|-------------|
 | `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code` and an optional `timeout_s` (1–120, default 60) — **and no identity**: the authenticated user and the chat session id are injected by the caller — `llm_service._execute_tool` on the main path, `subagent._execute_subagent_tool` on the subagent path — each stripping any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
-| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — and its members come from `sdk/plots.py`'s `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of the four. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`, `linemodels`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — and `linemodels` the line-model fits; each one's members come from its module's `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of the five. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
 | `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated **`(sub, session_id)`** pair (`genetics-results-suite-dh3` — `session_id` alone is client-supplied and authorizes nothing); another user's or another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
 **All three live in `CODE_EXECUTION_TOOL_DEFINITIONS`**, the list `resolve_tools` includes
@@ -926,6 +928,38 @@ df.filter(pl.col("pip") > 0.5).join(genetics.mpra(gene="IL7R"), on="variant")
 The MCP and chat tool surfaces are unchanged and still call `ToolExecutor` directly; the SDK
 is an additional entry point, not a replacement.
 
+### Line models (`genetics.linemodels`)
+
+`sdk/linemodels.py` is a numpy port of Matti Pirinen's `linemodels` R package (Pirinen,
+Bioinformatics 2023): given each variant's effect estimates and standard errors in two or
+more GWAS, it gives the posterior probability that the variant's true effects lie on each of
+K lines through the origin — "effect only in A" (slope 0), "the same effect in both" (slope
+1), "only in B" (slope ∞), or any line a hypothesis names. `classify` is R's `line.models`
+(fixed priors), `proportions` is `line.models.with.proportions` (a Gibbs sampler over the
+mixture proportions), `optimize` is `line.models.optimize` (EM over scales, slopes and
+correlations), and `estimator_correlation` is `beta.cor.case.control`. The feature-dependent
+prior of R's `line.models.with.features` is not ported: it needs a Pólya-gamma multinomial
+sampler and no published analysis uses it.
+
+**Why a port and not R in the sandbox.** The model core is ~150 lines of R over a Cholesky
+and a rotation; R itself would add a second runtime and ~140 MB to a boundary image that
+deliberately ships no shell. The port is held to the R package's outputs on the package's
+own example data and the paper's COVID-19 HGI example (`tests/fixtures/linemodels/`, written
+by the R scripts beside them): fixed-parameter classification agrees to floating-point
+precision, the sampler's proportions to Monte Carlo noise and the paper's published
+confident-assignment counts, and the EM optima to the same optimum from the same start.
+
+**The parameters the data cannot supply**, and what the module does about each, are the
+module docstring's subject — it is what `list_capabilities(module="linemodels")` renders and
+what the shipped `sandbox/stubs/linemodels.pyi` carries. In short: slopes are hypotheses
+(defaulting to the three canonical ones for two variables), the scale defaults to half the
+95th percentile of |effect| in the data and is reported back, `cor` to 0.995, `r_lkhood`
+must be set when the two GWAS share samples (two endpoints of one biobank do; the helper
+computes it from case-control overlap), and `maf` applies Pirinen's √(2f(1−f)) scaling.
+Every return value is a dict of polars frames and its `models` frame states the values
+actually used, so a defaulted analysis can be restated exactly. `genetics.plots.linemodels`
+draws the result.
+
 ### The grid collapse
 
 The by-gene / by-variant / by-region / by-phenotype split that produced the near-duplicate
@@ -1274,8 +1308,9 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
   is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py` ships too but sits outside
-  the closure, resolved lazily so the servers never import matplotlib.
+  `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py` and `sdk/linemodels.py`
+  ship too but sit outside the closure, resolved lazily so the servers never import
+  matplotlib or numpy.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` and `chembl.py` import `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
@@ -2156,7 +2191,8 @@ src/genetics_mcp_server/
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   └── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset)
+│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels)
+│   └── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI

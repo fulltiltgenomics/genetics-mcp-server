@@ -290,13 +290,17 @@ print(json.dumps({
 
 
 # Shipped by prune_venv.py's SDK_ALLOWLIST but NOT reachable from `import
-# genetics_mcp_server.sdk`, so the closure probe below cannot see them. sdk/plots.py is
-# resolved through sdk/__init__.py's module __getattr__ precisely so the servers never import
-# matplotlib, which means the measurement that keeps this file honest stops at its door — and
-# a deferred `import somethingelse` inside it would ship and fail inside the sandbox with
-# nothing here objecting. Listed rather than measured because there is nothing to measure: if
-# this list and SDK_ALLOWLIST disagree, the symptom is a shipped file nobody scans.
-SHIPPED_OUTSIDE_CLOSURE = ("genetics_mcp_server.sdk.plots",)
+# genetics_mcp_server.sdk`, so the closure probe below cannot see them. sdk/plots.py and
+# sdk/linemodels.py are resolved through sdk/__init__.py's module __getattr__ precisely so
+# the servers never import matplotlib or numpy, which means the measurement that keeps this
+# file honest stops at their door — and a deferred `import somethingelse` inside either would
+# ship and fail inside the sandbox with nothing here objecting. Listed rather than measured
+# because there is nothing to measure: if this list and SDK_ALLOWLIST disagree, the symptom
+# is a shipped file nobody scans.
+SHIPPED_OUTSIDE_CLOSURE = (
+    "genetics_mcp_server.sdk.plots",
+    "genetics_mcp_server.sdk.linemodels",
+)
 
 
 def _shipped_sources() -> dict[str, str]:

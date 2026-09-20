@@ -74,14 +74,14 @@ class TestToolDefinitions:
         assert tools["read_artifact"]["input_schema"]["required"] == ["name"]
         capabilities = tools["list_capabilities"]["input_schema"]
         assert capabilities["required"] == []
-        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors", "plots"]
+        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors", "plots", "linemodels"]
 
 
 class TestListCapabilities:
     async def test_index_lists_every_module(self, executor):
         result = await executor.list_capabilities()
         assert result["success"] is True
-        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors", "plots"]
+        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors", "plots", "linemodels"]
         assert all(m["summary"] for m in result["modules"])
 
     async def test_index_covers_the_whole_sdk_export_list(self, executor):
@@ -123,7 +123,7 @@ class TestListCapabilities:
 
     async def test_discloses_no_credentials(self, executor, monkeypatch):
         monkeypatch.setenv("INTERNAL_API_SECRET", "super-secret-value")
-        for module in (None, "genetics", "client", "errors", "plots"):
+        for module in (None, "genetics", "client", "errors", "plots", "linemodels"):
             result = await executor.list_capabilities(module=module)
             assert "super-secret-value" not in str(result)
 
@@ -153,14 +153,14 @@ class TestListCapabilities:
             "results-api",
             "genetics-results-suite-6uk",
         )
-        for module in (None, "genetics", "client", "errors", "plots"):
+        for module in (None, "genetics", "client", "errors", "plots", "linemodels"):
             result = await executor.list_capabilities(module=module)
             assert "doc" not in result
             rendered = str(result)
             for token in forbidden:
                 assert token not in rendered, f"{token!r} leaked for module {module!r}"
 
-    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors", "plots"])
+    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors", "plots", "linemodels"])
     async def test_every_response_says_how_to_import_the_sdk(self, executor, module):
         """genetics-results-suite-706: the catalogue is the only reachable place that can.
 
@@ -173,12 +173,12 @@ class TestListCapabilities:
         result = await executor.list_capabilities(module=module)
         assert "import genetics" in result["usage"]
 
-    @pytest.mark.parametrize("module", ["genetics", "client", "errors", "plots"])
+    @pytest.mark.parametrize("module", ["genetics", "client", "errors", "plots", "linemodels"])
     async def test_every_module_response_shows_the_call_path_not_only_the_import(
         self, executor, module
     ):
         """The import line alone reads as `genetics.<name>(...)` for every module, which is
-        right for one of the four. Measured: a session read `def locuszoom(...)` out of
+        right for one of the five. Measured: a session read `def locuszoom(...)` out of
         module="plots", wrote `genetics.locuszoom(...)`, got an AttributeError and spent two
         further executions finding `genetics.plots`."""
         from genetics_mcp_server.tools.executor import _SDK_CALL_PREFIXES, _sdk_members

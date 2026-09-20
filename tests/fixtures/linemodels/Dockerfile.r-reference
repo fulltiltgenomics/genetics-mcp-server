@@ -1,0 +1,5 @@
+FROM rocker/r-ver:4.4.3
+RUN Rscript -e 'install.packages("UPG", repos="https://p3m.dev/cran/__linux__/jammy/latest")' \
+ && Rscript -e 'library(UPG)'
+COPY linemodels /build/linemodels
+RUN R CMD INSTALL /build/linemodels && Rscript -e 'library(linemodels); print(packageVersion("linemodels"))'
