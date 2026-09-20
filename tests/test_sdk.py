@@ -789,3 +789,82 @@ async def test_gene_burden_phenotype_branch_refuses_phenotypes():
     client, _executor = make_client()
     with pytest.raises(GeneticsUsageError, match="phenotypes"):
         await client.gene_burden(phenotype="T1D", phenotypes=["t1"])
+
+
+class TestInputFiles:
+    """`input_path`/`open_input` are the only way a script reaches a delivered file, and the
+    name it is given comes from a model. So the tests are about refusals: no name may leave
+    the inputs directory, no mode may write, and "you guessed a name" must read differently
+    from "nothing was delivered"."""
+
+    @pytest.fixture
+    def inputs_dir(self, tmp_path, monkeypatch):
+        directory = tmp_path / "inputs"
+        directory.mkdir()
+        (directory / "data.tsv").write_bytes(b"a\tb\n1\t2\n")
+        monkeypatch.setenv("SANDBOX_INPUTS_DIR", str(directory))
+        return directory
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_no_inputs_directory_says_files_are_attached_not_fetched(self, monkeypatch, value):
+        if value is None:
+            monkeypatch.delenv("SANDBOX_INPUTS_DIR", raising=False)
+        else:
+            monkeypatch.setenv("SANDBOX_INPUTS_DIR", value)
+        with pytest.raises(GeneticsUsageError) as excinfo:
+            genetics.input_path("data.tsv")
+        assert "attached" in str(excinfo.value)
+
+    def test_a_delivered_file_resolves_and_opens(self, inputs_dir):
+        assert genetics.input_path("data.tsv") == str(inputs_dir / "data.tsv")
+        with genetics.open_input("data.tsv") as fh:
+            assert fh.read() == b"a\tb\n1\t2\n"
+
+    @pytest.mark.parametrize("mode", ["r", "rt"])
+    def test_text_mode_decodes(self, inputs_dir, mode):
+        with genetics.open_input("data.tsv", mode) as fh:
+            assert fh.read().startswith("a\tb")
+
+    @pytest.mark.parametrize("mode", ["w", "a", "r+", "rb+", "x", "wb", "ab"])
+    def test_a_writing_mode_is_refused(self, inputs_dir, mode):
+        """Read-only by design: a script saving over its own input destroys what it was
+        given, and the delivered file is not re-fetchable."""
+        with pytest.raises(GeneticsUsageError) as excinfo:
+            genetics.open_input("data.tsv", mode)
+        assert "read-only" in str(excinfo.value)
+
+    def test_an_encoding_with_binary_mode_is_refused(self, inputs_dir):
+        with pytest.raises(GeneticsUsageError):
+            genetics.open_input("data.tsv", "rb", encoding="utf-8")
+
+    @pytest.mark.parametrize(
+        "name", ["", ".", "..", "../data.tsv", "sub/data.tsv", "sub\\data.tsv", "/etc/passwd", 42, None]
+    )
+    def test_a_name_that_is_not_a_bare_file_name_is_refused(self, inputs_dir, name):
+        """No name can reach outside the directory: one with a separator is refused outright,
+        and one without a separator makes os.path.join yield a direct child."""
+        with pytest.raises(GeneticsUsageError):
+            genetics.input_path(name)
+
+    @pytest.mark.parametrize("name", ["other.tsv", "data.tsv ", "data.tsv\x00", "DATA.TSV"])
+    def test_a_name_nothing_delivered_lists_what_was(self, inputs_dir, name):
+        with pytest.raises(GeneticsUsageError) as excinfo:
+            genetics.input_path(name)
+        assert "data.tsv" in str(excinfo.value)
+
+    def test_a_directory_is_not_a_deliverable_input(self, inputs_dir):
+        (inputs_dir / "adir").mkdir()
+        with pytest.raises(GeneticsUsageError) as excinfo:
+            genetics.input_path("adir")
+        assert "no input named" in str(excinfo.value)
+
+    def test_an_empty_inputs_directory_says_none_were_delivered(self, tmp_path, monkeypatch):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.setenv("SANDBOX_INPUTS_DIR", str(empty))
+        with pytest.raises(GeneticsUsageError) as excinfo:
+            genetics.open_input("data.tsv")
+        assert "none were delivered" in str(excinfo.value)
+
+    def test_the_helpers_are_exported(self):
+        assert {"input_path", "open_input"} <= set(genetics.__all__)

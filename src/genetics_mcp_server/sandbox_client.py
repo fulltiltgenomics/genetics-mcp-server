@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import re
@@ -65,7 +66,39 @@ MAX_CODE_BYTES = 256 * 1024
 """Measured on ``len(code.encode("utf-8"))`` — the decoded string, not the JSON escaping."""
 
 MAX_BODY_BYTES = 1024 * 1024
-"""Measured on the raw bytes on the wire."""
+"""Measured on the raw bytes on the wire. Deliberately **not** raised for ``inputs``: they
+ride inside this body as base64, so the input caps below do not on their own keep a request
+under it — 512 KiB of inputs is ~683 KiB encoded, which leaves room for a 256 KiB script only
+while that script needs little JSON escaping. The body cap is therefore checked separately,
+after the payload is serialised, and is the one that refuses the combination."""
+
+MAX_INPUT_BYTES = 512 * 1024
+"""One delivered input, measured on the **decoded** bytes rather than on the wire."""
+
+MAX_INPUTS_TOTAL_BYTES = 512 * 1024
+"""Every delivered input of one request, decoded."""
+
+MAX_INPUTS = 4
+"""Elements in ``inputs``."""
+
+INPUT_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+"""§2's rule for an input name, verbatim. The supervisor makes it a file name inside the
+execution's inputs directory, so a laxer form here would hand it a path; the leading
+alphanumeric is what excludes ``""``, ``..`` and a dotfile without a special case."""
+
+_MEDIA_TOKEN = r"[A-Za-z0-9!#$&^_.+-]{1,64}"
+_MEDIA_PARAM = (
+    r"[ \t]*;[ \t]*" + _MEDIA_TOKEN + r"=(?:" + _MEDIA_TOKEN + r'|"[^"\\\x00-\x1f\x7f]{0,128}")'
+)
+INPUT_CONTENT_TYPE_PATTERN = re.compile(
+    r"\A" + _MEDIA_TOKEN + r"/" + _MEDIA_TOKEN + r"(?:" + _MEDIA_PARAM + r"){0,4}\Z"
+)
+"""§2's rule for ``content_type``, verbatim: RFC 7231 type/subtype with up to four bounded
+parameters, so that ``text/csv; charset=utf-8`` — what a real fetcher reports — is accepted
+while a bare ``csv`` is refused here instead of coming back as a 400."""
+
+INPUT_SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
+"""The form of ``SandboxInput.expected_sha256``. Never sent; see that field."""
 
 MAX_QUEUED_WAIT_S = 120
 """The supervisor queues at most this long before answering 429. Queue depth is at most two
@@ -133,6 +166,12 @@ ERROR_TOKEN_EXPIRED = "TokenExpired"
 ERROR_DUPLICATE_EXECUTION_ID = "DuplicateExecutionId"
 ERROR_BUSY = "Busy"
 ERROR_NOT_READY = "NotReady"
+ERROR_INPUTS_TOO_LARGE = "InputsTooLarge"
+"""413, and deliberately distinct from the body cap's ``PayloadTooLarge`` so that a caller
+can tell "drop an input and retry" from "your body is too big". Both carry
+``execution_id: null``, so ``error.type`` is the only thing that separates them. This client
+mirrors all three input caps in :meth:`SandboxClient._validate`, so receiving this means the
+two ends disagree about the numbers — which is why it is logged as drift."""
 
 
 class SandboxError(RuntimeError):
@@ -209,6 +248,30 @@ class SandboxNotConfigured(SandboxError):
 class SandboxProtocolError(SandboxError):
     """A response the contract does not describe: unparseable body, wrong shape, or an
     ``execution_id`` that is not the one we sent."""
+
+
+@dataclass(frozen=True)
+class SandboxInput:
+    """One file to deliver into the execution, as bytes the caller already holds.
+
+    Raw bytes rather than the wire's base64: the encoding and the ``sha256`` are computed
+    here, next to the caps, so a caller cannot send a digest that does not describe the
+    bytes and the decoded-byte caps are measured on the thing the supervisor measures.
+
+    ``content_type`` is carried because the contract accepts it, and is a label only — the
+    supervisor writes bytes, not a type, and nothing downstream may trust it.
+
+    ``expected_sha256`` closes the integrity chain to whatever produced these bytes — the
+    url-fetcher reports the digest of what it fetched. It is checked against ``content`` here
+    and then **discarded**: forwarding it would let a caller name the digest the supervisor
+    compares against, and the supervisor must keep computing its own from the bytes it
+    decoded, or ``DigestMismatch`` stops covering the hop it exists for.
+    """
+
+    name: str
+    content: bytes
+    content_type: str | None = None
+    expected_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -499,6 +562,7 @@ class SandboxClient:
         session_id: str,
         timeout_s: int | None = None,
         execution_id: str | None = None,
+        inputs: list[SandboxInput] | tuple[SandboxInput, ...] | None = None,
     ) -> dict[str, Any]:
         """Submit one script and return the supervisor's result **unchanged**.
 
@@ -506,13 +570,22 @@ class SandboxClient:
         here otherwise, and a retry always mints a fresh one because a repeated id is now
         refused with 409 ``DuplicateExecutionId``.
 
+        ``inputs`` are files the script reads from the directory named by
+        ``SANDBOX_INPUTS_DIR`` (``genetics.open_input``). They are ephemeral to one execution
+        and are **re-sent with every attempt**, which is the direct consequence of the
+        preceding paragraph: the id a retry runs under does not exist when the body is built,
+        so nothing about an input may be keyed to one.
+
         Raises :class:`SandboxTokenUnavailable` — deliberately uncaught — when no signing key
         is configured, and one of the :class:`SandboxError` subclasses when no result could be
         obtained. A *script* failure is not an exception: it is a 200 with ``status`` of
         ``"error"``, ``"timeout"`` or ``"limit"``.
         """
         timeout_s = DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
-        self._validate(code, timeout_s, user, session_id, execution_id)
+        if inputs is not None and not isinstance(inputs, (list, tuple)):
+            raise SandboxRejected("inputs must be a list of SandboxInput")
+        inputs = tuple(inputs or ())
+        self._validate(code, timeout_s, user, session_id, execution_id, inputs)
 
         attempt = 0
         while True:
@@ -527,7 +600,9 @@ class SandboxClient:
             execution_id = None
 
             try:
-                return await self._submit(tokens, code=code, timeout_s=timeout_s)
+                return await self._submit(
+                    tokens, code=code, timeout_s=timeout_s, inputs=inputs
+                )
             except SandboxBusy as exc:
                 if attempt >= MAX_SUBMIT_ATTEMPTS:
                     raise
@@ -555,6 +630,7 @@ class SandboxClient:
         user: str,
         session_id: str,
         execution_id: str | None,
+        inputs: tuple[SandboxInput, ...] = (),
     ) -> None:
         # every caller-supplied value the body carries is checked here, so that a request the
         # supervisor is certain to 400 never leaves, and so that a caller catching SandboxError
@@ -587,9 +663,81 @@ class SandboxClient:
                 "execution_id must be a lowercase-hex uuid4 in canonical form; it names the "
                 "sandbox scratch directory"
             )
+        self._validate_inputs(inputs)
+
+    @staticmethod
+    def _validate_inputs(inputs: tuple[SandboxInput, ...]) -> None:
+        # the three caps, the name rule and the uniqueness rule are the supervisor's, mirrored
+        # so a request it is certain to refuse never leaves. Refused, never trimmed or
+        # renamed: an input the caller did not send is a script reading bytes nobody asked
+        # for, which is a wrong answer rather than an error.
+        if len(inputs) > MAX_INPUTS:
+            raise SandboxRejected(f"at most {MAX_INPUTS} inputs, got {len(inputs)}")
+        total = 0
+        seen: set[str] = set()
+        for index, item in enumerate(inputs):
+            where = f"inputs[{index}]"
+            if not isinstance(item, SandboxInput):
+                raise SandboxRejected(f"{where} must be a SandboxInput")
+            if not isinstance(item.name, str) or not INPUT_NAME_PATTERN.fullmatch(item.name):
+                raise SandboxRejected(
+                    f"{where}.name must match {INPUT_NAME_PATTERN.pattern}; it names a file "
+                    "inside the execution's inputs directory"
+                )
+            if item.name in seen:
+                raise SandboxRejected(f"{where}.name duplicates an earlier input")
+            seen.add(item.name)
+            if not isinstance(item.content, bytes):
+                # bytes, not bytearray: SandboxInput is frozen but a buffer is not, and
+                # _submit re-encodes per retry attempt while this runs once — a caller
+                # mutating a bytearray after validation would push an input past the cap and
+                # the supervisor's 413 would then read as contract drift.
+                raise SandboxRejected(f"{where}.content must be the file's raw bytes")
+            if len(item.content) > MAX_INPUT_BYTES:
+                raise SandboxRejected(
+                    f"{where} is {len(item.content)} bytes, over the "
+                    f"{MAX_INPUT_BYTES}-byte per-input limit"
+                )
+            total += len(item.content)
+            if total > MAX_INPUTS_TOTAL_BYTES:
+                raise SandboxRejected(
+                    f"inputs total more than the {MAX_INPUTS_TOTAL_BYTES}-byte limit "
+                    f"for one execution"
+                )
+            if item.content_type is not None and (
+                not isinstance(item.content_type, str)
+                or not INPUT_CONTENT_TYPE_PATTERN.fullmatch(item.content_type)
+            ):
+                # the supervisor 400s anything that is not RFC 7231 type/subtype, so "csv"
+                # and "" are refused here rather than sent. "" in particular must not reach
+                # _submit, which would omit the field a caller believes it set.
+                raise SandboxRejected(
+                    f"{where}.content_type must be a media type like 'text/csv', or None"
+                )
+            if item.expected_sha256 is not None:
+                if not isinstance(item.expected_sha256, str) or not INPUT_SHA256_PATTERN.fullmatch(
+                    item.expected_sha256
+                ):
+                    raise SandboxRejected(
+                        f"{where}.expected_sha256 must be 64 lowercase hex characters"
+                    )
+                actual = hashlib.sha256(item.content).hexdigest()
+                if actual != item.expected_sha256:
+                    # the producer of these bytes and this process disagree, so the digest the
+                    # supervisor would compute describes bytes nobody vouched for. Raised
+                    # before anything leaves, because the wire digest cannot catch this hop.
+                    raise SandboxRejected(
+                        f"{where} does not match its expected sha256: expected "
+                        f"{item.expected_sha256}, the bytes hash to {actual}"
+                    )
 
     async def _submit(
-        self, tokens: SandboxTokens, *, code: str, timeout_s: int
+        self,
+        tokens: SandboxTokens,
+        *,
+        code: str,
+        timeout_s: int,
+        inputs: tuple[SandboxInput, ...] = (),
     ) -> dict[str, Any]:
         # exactly the contract's fields and no others: unknown top-level fields are a 400,
         # so that a field added on one side and not the other fails on the first call.
@@ -604,12 +752,42 @@ class SandboxClient:
             "session_id": tokens.session_id,
             "timeout_s": timeout_s,
         }
+        if inputs:
+            # omitted entirely when there are none, rather than sent as []: unknown fields are
+            # a 400, so a sandbox that predates this field still serves every execution that
+            # does not use it, while one that does carry inputs still fails on the first call
+            # instead of running without them.
+            body["inputs"] = [
+                {
+                    "name": item.name,
+                    "content_base64": base64.b64encode(item.content).decode("ascii"),
+                    # over the decoded bytes, computed here from the same buffer that was
+                    # encoded: the digest exists to catch a body mangled between these two
+                    # ends, so it must not be carried in from further upstream
+                    "sha256": hashlib.sha256(item.content).hexdigest(),
+                    **(
+                        {"content_type": item.content_type}
+                        if item.content_type is not None
+                        else {}
+                    ),
+                }
+                for item in inputs
+            ]
         # serialised here rather than by httpx so the 1 MiB cap is measured on the bytes that
         # actually go on the wire, which is where the supervisor measures it
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         if len(payload) > MAX_BODY_BYTES:
+            # the input caps are sized to fit under this one, so with inputs present the
+            # actionable half is which of the two to shrink
+            carried = (
+                f" carrying {len(inputs)} input(s) of "
+                f"{sum(len(i.content) for i in inputs)} bytes"
+                if inputs
+                else ""
+            )
             raise SandboxRejected(
-                f"request body is {len(payload)} bytes, over the {MAX_BODY_BYTES}-byte limit"
+                f"request body is {len(payload)} bytes{carried}, over the "
+                f"{MAX_BODY_BYTES}-byte limit"
             )
 
         timeout = httpx.Timeout(
@@ -665,6 +843,12 @@ class SandboxClient:
                 status_code=status,
                 error_type=error_type or (ERROR_NOT_READY if status == 503 else None),
             )
+        if status == 413 and error_type == ERROR_INPUTS_TOO_LARGE:
+            # every input cap is mirrored in _validate_inputs, so a request carrying inputs
+            # the supervisor considers oversize never leaves this process. Reaching here
+            # means the two ends disagree about the numbers, which is a contract drift worth
+            # a log line rather than a caller bug to report as one.
+            logger.warning("sandbox refused inputs this client had accepted: %s", detail)
         if 400 <= status < 500:
             # includes both 409s. They are distinguished by error.type, never by the status
             # code: TokenExpired is retryable and handled by the caller loop, while

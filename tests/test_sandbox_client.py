@@ -11,7 +11,10 @@ Everything here runs with no sandbox and no credentials: the HTTP layer is an
 `httpx.MockTransport` and the signing key is a fixture.
 """
 
+import base64
+import hashlib
 import json
+import logging
 
 import httpx
 import jwt
@@ -24,6 +27,7 @@ from genetics_mcp_server.sandbox_client import (
     SandboxBusy,
     SandboxClient,
     SandboxDeadlineExceeded,
+    SandboxInput,
     SandboxInternalError,
     SandboxNotConfigured,
     SandboxProtocolError,
@@ -673,3 +677,343 @@ class TestConfiguration:
             assert SandboxClient("http://127.0.0.1:8081").base_url == "http://127.0.0.1:8081"
         finally:
             settings_module.get_settings.cache_clear()
+
+
+class TestInputs:
+    """`inputs` is the one field whose rules live in two independently written ends, so each
+    rule the supervisor enforces is asserted here to be enforced BEFORE the wire — a request
+    it is certain to 413 or 400 must never leave — and the wire element is pinned field for
+    field."""
+
+    async def test_an_input_is_carried_as_the_contract_element(self):
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[SandboxInput(name="data.tsv", content=b"a\tb\n", content_type="text/csv")],
+        )
+        body = recorder.bodies[0]
+        assert set(body) == {
+            "code",
+            "execution_id",
+            "tokens",
+            "user",
+            "session_id",
+            "timeout_s",
+            "inputs",
+        }
+        (element,) = body["inputs"]
+        assert set(element) == {"name", "content_base64", "sha256", "content_type"}
+        assert element["name"] == "data.tsv"
+        assert base64.b64decode(element["content_base64"]) == b"a\tb\n"
+        assert element["sha256"] == hashlib.sha256(b"a\tb\n").hexdigest()
+        assert element["content_type"] == "text/csv"
+
+    async def test_content_type_is_omitted_rather_than_sent_as_null(self):
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[SandboxInput(name="a.txt", content=b"x")],
+        )
+        assert set(recorder.bodies[0]["inputs"][0]) == {"name", "content_base64", "sha256"}
+
+    @pytest.mark.parametrize("inputs", [None, [], ()])
+    async def test_the_field_is_absent_when_there_are_none(self, inputs):
+        """Unknown top-level fields are a 400, so a sandbox predating this field must still
+        serve every execution that does not use it."""
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE, user=USER, session_id=SESSION, inputs=inputs
+        )
+        assert "inputs" not in recorder.bodies[0]
+
+    async def test_an_input_at_the_per_input_cap_is_accepted(self):
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[SandboxInput(name="big.bin", content=b"x" * sandbox_client.MAX_INPUT_BYTES)],
+        )
+        assert len(recorder.requests) == 1
+
+    async def test_one_byte_over_the_per_input_cap_never_reaches_the_wire(self):
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[
+                    SandboxInput(name="big.bin", content=b"x" * (sandbox_client.MAX_INPUT_BYTES + 1))
+                ],
+            )
+        assert recorder.requests == []
+
+    async def test_inputs_summing_to_the_total_cap_are_accepted(self):
+        half = sandbox_client.MAX_INPUTS_TOTAL_BYTES // 2
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[
+                SandboxInput(name="a.bin", content=b"a" * half),
+                SandboxInput(name="b.bin", content=b"b" * (sandbox_client.MAX_INPUTS_TOTAL_BYTES - half)),
+            ],
+        )
+        assert len(recorder.requests) == 1
+
+    async def test_one_byte_over_the_total_cap_never_reaches_the_wire(self):
+        """Each input is under the per-input cap; only their sum is over it."""
+        half = sandbox_client.MAX_INPUTS_TOTAL_BYTES // 2
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected) as excinfo:
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[
+                    SandboxInput(name="a.bin", content=b"a" * half),
+                    SandboxInput(
+                        name="b.bin",
+                        content=b"b" * (sandbox_client.MAX_INPUTS_TOTAL_BYTES - half + 1),
+                    ),
+                ],
+            )
+        assert "total" in str(excinfo.value)
+        assert recorder.requests == []
+
+    async def test_the_maximum_number_of_inputs_is_accepted(self):
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[
+                SandboxInput(name=f"f{i}.txt", content=b"x")
+                for i in range(sandbox_client.MAX_INPUTS)
+            ],
+        )
+        assert len(recorder.bodies[0]["inputs"]) == sandbox_client.MAX_INPUTS
+
+    async def test_one_input_too_many_never_reaches_the_wire(self):
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[
+                    SandboxInput(name=f"f{i}.txt", content=b"x")
+                    for i in range(sandbox_client.MAX_INPUTS + 1)
+                ],
+            )
+        assert recorder.requests == []
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b.txt",
+            "a\\b.txt",
+            "../etc/passwd",
+            "/etc/passwd",
+            "a b.txt",
+            "a.txt\n",
+            "x" * 65,
+            42,
+            None,
+        ],
+    )
+    async def test_a_name_the_supervisor_would_refuse_never_reaches_the_wire(self, name):
+        """The name becomes a file inside the execution's inputs directory, so it is bounded
+        the way execution_id is: refused here rather than sent and 400ed."""
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[SandboxInput(name=name, content=b"x")],
+            )
+        assert recorder.requests == []
+
+    @pytest.mark.parametrize("name", ["a", "data.tsv", "A_1-2.vcf.gz", "x" * 64])
+    async def test_a_contract_shaped_name_is_sent_unchanged(self, name):
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[SandboxInput(name=name, content=b"x")],
+        )
+        assert recorder.bodies[0]["inputs"][0]["name"] == name
+
+    async def test_two_inputs_with_the_same_name_are_refused_not_deduplicated(self):
+        """One would overwrite the other in the inputs directory, and which one survived
+        would decide what the script read."""
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected) as excinfo:
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[
+                    SandboxInput(name="a.txt", content=b"first"),
+                    SandboxInput(name="a.txt", content=b"second"),
+                ],
+            )
+        assert "duplicates" in str(excinfo.value)
+        assert recorder.requests == []
+
+    @pytest.mark.parametrize("content_type", ["csv", "", "text/", "text/csv; ", 42])
+    async def test_a_content_type_that_is_not_a_media_type_never_reaches_the_wire(
+        self, content_type
+    ):
+        """The supervisor validates it against RFC 7231 and 400s the rest — including the
+        empty string, which must be refused rather than quietly dropped from the body."""
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[SandboxInput(name="a.txt", content=b"x", content_type=content_type)],
+            )
+        assert recorder.requests == []
+
+    @pytest.mark.parametrize(
+        "content_type", ["text/csv", "text/csv; charset=utf-8", 'text/csv; name="a b"']
+    )
+    async def test_a_real_fetchers_content_type_is_accepted(self, content_type):
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[SandboxInput(name="a.txt", content=b"x", content_type=content_type)],
+        )
+        assert recorder.bodies[0]["inputs"][0]["content_type"] == content_type
+
+    async def test_a_mutable_buffer_is_refused_as_content(self):
+        """SandboxInput is frozen, a bytearray is not, and _submit re-encodes on every retry
+        while validation runs once — a buffer grown afterwards would pass the cap here and
+        be refused by the supervisor as if the two ends disagreed about the numbers."""
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[SandboxInput(name="a.txt", content=bytearray(b"x"))],
+            )
+        assert recorder.requests == []
+
+    async def test_a_matching_expected_digest_is_verified_and_then_discarded(self):
+        """It closes the chain to whoever fetched the bytes, and must NOT go on the wire: the
+        supervisor computes its own from what it decoded, which is the only way its
+        DigestMismatch still covers the hop between these two processes."""
+        content = b"fetched bytes"
+        recorder = _Recorder(_echoing_ok)
+        await _client(recorder).execute(
+            code=CODE,
+            user=USER,
+            session_id=SESSION,
+            inputs=[
+                SandboxInput(
+                    name="a.txt",
+                    content=content,
+                    expected_sha256=hashlib.sha256(content).hexdigest(),
+                )
+            ],
+        )
+        (element,) = recorder.bodies[0]["inputs"]
+        assert "expected_sha256" not in element
+        assert element["sha256"] == hashlib.sha256(content).hexdigest()
+
+    async def test_a_mismatching_expected_digest_is_refused_before_anything_leaves(self):
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected) as excinfo:
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[
+                    SandboxInput(
+                        name="a.txt", content=b"these bytes", expected_sha256="0" * 64
+                    )
+                ],
+            )
+        assert "expected sha256" in str(excinfo.value)
+        assert recorder.requests == []
+
+    @pytest.mark.parametrize(
+        "expected", ["", "deadbeef", "0" * 63, "A" * 64, 42]
+    )
+    async def test_a_malformed_expected_digest_is_refused(self, expected):
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[SandboxInput(name="a.txt", content=b"x", expected_sha256=expected)],
+            )
+        assert recorder.requests == []
+
+    async def test_a_retry_re_sends_the_inputs_under_a_fresh_execution_id(self):
+        """Inputs are ephemeral to one execution and nothing about them may be keyed to an id
+        that does not exist when the body is built — a design that uploaded them once, against
+        the first id, delivers nothing to the execution that actually runs."""
+        slept = []
+        recorder = _Recorder(_error_response(429, "Busy"), _echoing_ok)
+        inputs = [SandboxInput(name="a.txt", content=b"payload", content_type="text/plain")]
+        result = await _client(recorder, slept=slept).execute(
+            code=CODE, user=USER, session_id=SESSION, inputs=inputs
+        )
+        first, second = recorder.bodies
+        assert first["execution_id"] != second["execution_id"]
+        assert first["inputs"] == second["inputs"]
+        assert base64.b64decode(second["inputs"][0]["content_base64"]) == b"payload"
+        assert result["execution_id"] == second["execution_id"]
+
+    async def test_inputs_that_are_not_a_list_are_refused(self):
+        recorder = _Recorder(_echoing_ok)
+        for bad in (SandboxInput(name="a.txt", content=b"x"), "a.txt", {"a.txt": b"x"}):
+            with pytest.raises(SandboxRejected):
+                await _client(recorder).execute(
+                    code=CODE, user=USER, session_id=SESSION, inputs=bad
+                )
+        assert recorder.requests == []
+
+    async def test_an_element_that_is_not_a_sandbox_input_is_refused(self):
+        recorder = _Recorder(_echoing_ok)
+        with pytest.raises(SandboxRejected):
+            await _client(recorder).execute(
+                code=CODE,
+                user=USER,
+                session_id=SESSION,
+                inputs=[{"name": "a.txt", "content_base64": "eA=="}],
+            )
+        assert recorder.requests == []
+
+    async def test_an_inputs_too_large_413_is_reported_as_drift(self, caplog):
+        """Every cap is mirrored, so this answer can only mean the two ends disagree about
+        the numbers — which is a deployment problem, not the caller's bug."""
+        recorder = _Recorder(_error_response(413, sandbox_client.ERROR_INPUTS_TOO_LARGE, "too big"))
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(SandboxRejected):
+                await _client(recorder).execute(
+                    code=CODE,
+                    user=USER,
+                    session_id=SESSION,
+                    inputs=[SandboxInput(name="a.txt", content=b"x")],
+                )
+        assert any("drift" in r.message or "had accepted" in r.getMessage() for r in caplog.records)

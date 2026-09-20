@@ -62,10 +62,17 @@ the results of every sibling that had already succeeded.
 SAVE FILES INTO `os.environ["SANDBOX_ARTIFACTS_DIR"]`. The working directory is scratch and is
 discarded when the run ends, so a relative `write_csv("x.csv")` is lost with it and reported as
 no artifact. `genetics.plots` helpers already resolve a relative path there.
+
+READ ATTACHED FILES WITH `open_input(name)`. A file attached to the analysis is delivered
+into the run and read by its bare name; `input_path(name)` gives the path for a reader that
+wants one. Egress is an allow-list of the suite's own APIs, so a script cannot fetch anything
+from the internet itself — a file that is not attached cannot be reached, and urllib or
+requests will not get it.
 """
 
 import functools
 import inspect
+import os
 from typing import Any
 
 from genetics_mcp_server.sdk import _runner
@@ -106,6 +113,9 @@ _FUNCTIONS = (
 )
 
 _client: GeneticsClient | None = None
+
+# the child's environment names the directory; the SDK never guesses a path for it
+_INPUTS_DIR_ENV = "SANDBOX_INPUTS_DIR"
 
 # endpoints are not a configuration surface: the client credentials every request to them,
 # so accepting a caller-supplied base URL would turn one injected line —
@@ -159,6 +169,70 @@ def close() -> None:
     if _client is not None:
         client, _client = _client, None
         _runner.run(client.close())
+
+
+def input_path(name: str) -> str:
+    """The path of one file delivered into this execution, or a usage error.
+
+    Files are attached to the call that starts the script and fetched outside the sandbox —
+    egress here is an allow-list of the suite's own APIs, so a script cannot fetch a file from
+    anywhere else itself — and are ephemeral to this one run. The directory is named
+    to the child by `SANDBOX_INPUTS_DIR`; resolving through this function rather than joining
+    that variable by hand is what turns "the model guessed a file name" into a message that
+    lists what was actually delivered.
+
+    `name` is a bare file name: the delivering end validates it as one and refuses a path, so
+    a name with a separator in it could never have been delivered under that spelling.
+    """
+    directory = os.environ.get(_INPUTS_DIR_ENV)
+    if not directory:
+        raise GeneticsUsageError(
+            f"no input files were delivered to this execution ({_INPUTS_DIR_ENV} is unset); "
+            f"files are attached to the analysis call, not opened from a URL by the script"
+        )
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        raise GeneticsUsageError(
+            f"input name must be a file name, not {name!r}"
+        )
+    if any(sep and sep in name for sep in ("/", "\\", os.sep, os.altsep)):
+        raise GeneticsUsageError(
+            f"input name {name!r} must be a bare file name, not a path: inputs are delivered "
+            f"by name into {_INPUTS_DIR_ENV} and are reached by that name alone"
+        )
+    path = os.path.join(directory, name)
+    if not os.path.isfile(path):
+        try:
+            delivered = sorted(os.listdir(directory))
+        except OSError:
+            delivered = []
+        raise GeneticsUsageError(
+            f"no input named {name!r} was delivered to this execution; "
+            + (f"delivered: {', '.join(delivered)}" if delivered else "none were delivered")
+        )
+    return path
+
+
+def open_input(name: str, mode: str = "rb", encoding: str | None = None) -> Any:
+    """Open a delivered input file for reading. Read-only by design.
+
+    Binary by default, because the delivering end writes bytes and no content type it was
+    given is trusted; pass `mode="r"` for text. The file is written mode 0400 so that a
+    script saving its output over its input fails instead of destroying what it was given —
+    an accident guard, not a boundary, since the script owns the file.
+
+        with genetics.open_input("data.tsv", "r") as fh:
+            df = pl.read_csv(fh.read().encode(), separator="\\t")
+    """
+    if mode not in ("rb", "r", "rt"):
+        raise GeneticsUsageError(
+            f"open_input is read-only; mode must be 'rb', 'r' or 'rt', got {mode!r}"
+        )
+    path = input_path(name)
+    if mode == "rb":
+        if encoding is not None:
+            raise GeneticsUsageError("encoding cannot be given for binary mode 'rb'")
+        return open(path, "rb")
+    return open(path, mode, encoding=encoding or "utf-8")
 
 
 def _make_sync(name: str):
@@ -225,6 +299,8 @@ __all__ = [
     "close",
     "configure",
     "get_client",
+    "input_path",
+    "open_input",
     "parse_region",
     *_LAZY_MODULES,
 ]
