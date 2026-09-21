@@ -2363,6 +2363,60 @@ class TestRunAnalysisInputErrorTaxonomy:
         )
         assert "HTTP 404" in result["error"]
 
+    async def test_a_nonretryable_upstream_status_is_an_upstream_error_not_a_refusal(
+        self, executor, monkeypatch
+    ):
+        """A 404 is the origin saying the URL does not resolve, not the policy saying no —
+        a corrected URL may well work, so it gets its own error_type rather than
+        `InputRefused`'s "do not retry" advice."""
+        from genetics_mcp_server.url_fetch_client import UrlFetchRefused
+
+        _install_fetcher(
+            monkeypatch,
+            _StubFetcher(
+                raises=UrlFetchRefused(
+                    "url-fetcher did not fetch the url (upstream_status: example.org "
+                    "answered 404 (no content-type))",
+                    error_type="upstream_status",
+                    details={"upstream_status": 404},
+                )
+            ),
+        )
+        result = await _run_with_inputs(
+            executor,
+            _StubSandbox(result=_result_body()),
+            [{"url": "https://example.org/private/data.tsv"}],
+        )
+        assert result["error_type"] == "InputUpstreamError"
+        assert result["retryable"] is False
+        assert "example.org" in result["error"]
+        assert "404" in result["error"]
+        assert "https://example.org/private/data.tsv" not in result["error"]
+
+    async def test_a_retryable_upstream_status_stays_input_unavailable(
+        self, executor, monkeypatch
+    ):
+        """The flag decides, not the status: a 503 marked retryable by the fetcher is a
+        transient failure even though its `error_type` is also `upstream_status`."""
+        from genetics_mcp_server.url_fetch_client import UrlFetchUnavailable
+
+        _install_fetcher(
+            monkeypatch,
+            _StubFetcher(
+                raises=UrlFetchUnavailable(
+                    "url-fetcher did not fetch the url (upstream_status: example.org "
+                    "answered 503 (no content-type))",
+                    error_type="upstream_status",
+                    details={"upstream_status": 503},
+                )
+            ),
+        )
+        result = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"url": "https://example.org/x.tsv"}]
+        )
+        assert result["error_type"] == "InputUnavailable"
+        assert result["retryable"] is True
+
     async def test_a_transient_failure_is_retryable(self, executor, monkeypatch):
         from genetics_mcp_server.url_fetch_client import UrlFetchUnavailable
 
@@ -2468,6 +2522,7 @@ class TestRunAnalysisInputErrorTaxonomy:
             "InputBudgetExceeded",
             "InputFetchNotConfigured",
             "InputFetcherProtocolError",
+            "InputUpstreamError",
         }
         sandbox = {
             "SandboxUnavailable",

@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from genetics_mcp_server.tools.executor import (
     INTERNAL_ERROR_MSG,
@@ -1647,6 +1647,30 @@ class ServerToolExecutor(ToolExecutor):
                     try:
                         source = await fetch_client.fetch(spec.value, user=user)
                     except fetcher.UrlFetchRefused as e:
+                        if e.error_type == fetcher.ERROR_UPSTREAM_STATUS:
+                            # the origin answered, and answered no — a corrected URL may
+                            # well work, which is the opposite next move from a policy
+                            # refusal, so it gets its own error_type rather than folding
+                            # into InputRefused's "do not retry" advice.
+                            status = e.details.get("upstream_status")
+                            host = urlparse(spec.value).hostname or spec.value
+                            logger.warning(
+                                "run_analysis input %d got an upstream error from the fetcher: %s",
+                                index,
+                                e,
+                            )
+                            return (
+                                [],
+                                [],
+                                self._input_error(
+                                    f"Input {index} could not be fetched: the server at {host} "
+                                    f"answered HTTP {status}. Check the URL — a typo, a moved "
+                                    "file or a private repository all look like this — and try "
+                                    "a corrected one; if the file is not reachable by URL, ask "
+                                    "the user to upload it.",
+                                    "InputUpstreamError",
+                                ),
+                            )
                         logger.warning("run_analysis input %d was refused by the fetcher: %s", index, e)
                         return (
                             [],
