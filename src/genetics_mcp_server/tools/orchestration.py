@@ -22,13 +22,17 @@ data-access half — everywhere, not only in the sandbox.
 """
 
 import asyncio
+import hashlib
 import logging
 import mimetypes
 import os
+import re
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Any
@@ -147,6 +151,67 @@ ARTIFACT_READ_MAX_BYTES = 512 * 1024
 # nothing chat-backend records about an execution can be worth more than this — a longer-lived
 # record would promise reads that can only come back 404 or 409.
 ARTIFACT_RETENTION_S = 300
+
+
+# THE NAME SEAM between what url-fetcher produces and what the sandbox accepts, closed here
+# because this is the only place both ends are in scope. `filename_for` in url-fetcher emits
+# Unicode `[isalnum ._-]` up to 128 characters and allows a leading `.` or `-`, while
+# `sandbox_client.INPUT_NAME_PATTERN` demands a leading ASCII alphanumeric and at most 64
+# characters — so `_data.tsv`, `-set.tsv`, `café.txt` and an 84-character name are all legal
+# fetcher output that the sandbox client refuses. A fetched or uploaded name is folded to the
+# narrower form rather than passed through and refused one layer later.
+_INPUT_NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._-]")
+
+# INPUT_NAME_PATTERN's own ceiling: its one leading character plus 63 more. Tied back to the
+# pattern in tests/test_code_execution_tools.py rather than parsed out of it, the way
+# definitions.py ties its timeout bound to MAX_TIMEOUT_S.
+_INPUT_NAME_MAX = 64
+
+# the longest tail still worth carrying through the truncation. A longer one is not an
+# extension, and keeping it would consume the part of the name a person recognises.
+_INPUT_EXT_MAX = 16
+
+
+def _sanitised_input_name(raw: Any, index: int, pattern: Any) -> str:
+    """A sandbox-legal delivered name derived from the source's own name.
+
+    ASCII-folded, disallowed characters replaced, leading non-alphanumerics dropped, and
+    truncated with the extension preserved — the extension survives because the model is
+    told this name and reads the file by it, and `.tsv` is how it knows what it opened.
+    `input<N>` is the floor when nothing of the original survives.
+    """
+    folded = (
+        unicodedata.normalize("NFKD", raw if isinstance(raw, str) else "")
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    cleaned = _INPUT_NAME_DISALLOWED.sub("_", folded)
+    stem, dot, ext = cleaned.rpartition(".")
+    if not dot or not ext or len(ext) > _INPUT_EXT_MAX:
+        stem, ext = cleaned, ""
+    # the leading strip runs on the STEM, after the extension has been split off. Stripping
+    # the whole name first collapses a name whose stem did not survive the fold — "名前.csv"
+    # — to the bare extension "csv", which is not a file name the model can recognise.
+    stem = stem.lstrip("._-")
+    suffix = f".{ext}" if ext else ""
+    for name in (stem[: _INPUT_NAME_MAX - len(suffix)] + suffix, f"input{index}{suffix}"):
+        if pattern.fullmatch(name):
+            return name
+    return f"input{index}"
+
+
+@dataclass(frozen=True)
+class _InputSpec:
+    """One element of `inputs` after its shape was checked: one source, one optional name."""
+
+    kind: str
+    """``"url"`` or ``"attachment"``. Echoed to the model beside the delivered name."""
+
+    value: str
+    """The url, or the attachment id."""
+
+    requested_name: str | None = None
+    """The caller's chosen delivered name, or None to derive one from the source's own."""
 
 
 def _is_identity(value: Any) -> bool:
@@ -1334,16 +1399,479 @@ class ServerToolExecutor(ToolExecutor):
                 "This is a server configuration fault and will not be fixed by retrying."
             )
 
+    @staticmethod
+    def _input_error(message: str, error_type: str, *, retryable: bool = False) -> dict[str, Any]:
+        """A delivery failure, in the field the sandbox's failures already use.
+
+        Its own `error_type` values, deliberately beside `SandboxUnavailable` and
+        `SandboxRejected` rather than inside them: a url the fetcher refused by policy and a
+        sandbox that is restarting call for opposite next moves, and a delivery problem worded
+        as a sandbox problem reads to the model as a flaky tool worth retrying forever.
+
+        Nothing has executed when one of these is returned — see `_resolve_inputs`.
+        """
+        return {
+            "success": False,
+            "error": message,
+            "error_type": error_type,
+            "retryable": retryable,
+        }
+
+    @staticmethod
+    def _fetch_reason(exc: Any) -> str:
+        """The fetcher's own words, plus the upstream status where it named one.
+
+        RELAYED, NOT PARAPHRASED. A refusal that names the policy it applied is a visible
+        request to widen that policy; a summary of it is not, and the user never learns which
+        rule stopped them.
+        """
+        reason = (str(exc) or "").strip() or "no reason given"
+        details = getattr(exc, "details", None)
+        upstream = details.get("upstream_status") if isinstance(details, dict) else None
+        if isinstance(upstream, (int, str)) and not isinstance(upstream, bool) and upstream != "":
+            return f"{reason} (the upstream server answered HTTP {upstream})"
+        return reason
+
+    def _parse_input_specs(
+        self, inputs: Any, max_inputs: int
+    ) -> tuple[list[_InputSpec], dict[str, Any] | None]:
+        """Shape-check `inputs` without touching the network or the disk.
+
+        Separate from the resolution below so that a malformed list costs no fetch at all:
+        the sixth element being wrong must not be discovered after five files have been
+        pulled over the wire.
+        """
+        if not isinstance(inputs, list):
+            return [], self._input_error(
+                "inputs must be a list of {'url': ...} or {'attachment_id': ...} objects.",
+                "InputRejected",
+            )
+        if len(inputs) > max_inputs:
+            return [], self._input_error(
+                f"At most {max_inputs} files can be delivered to one run; this call asked for "
+                f"{len(inputs)}. Deliver the ones the script needs, or summarise upstream.",
+                "InputRejected",
+            )
+        specs: list[_InputSpec] = []
+        requested_at: dict[str, int] = {}
+        for position, entry in enumerate(inputs, start=1):
+            if not isinstance(entry, dict):
+                return [], self._input_error(
+                    f"inputs[{position}] must be an object carrying a 'url' or an "
+                    "'attachment_id'.",
+                    "InputRejected",
+                )
+            named = [
+                (kind, entry[key])
+                for kind, key in (("url", "url"), ("attachment", "attachment_id"))
+                if isinstance(entry.get(key), str) and entry[key].strip()
+            ]
+            if len(named) != 1:
+                return [], self._input_error(
+                    f"inputs[{position}] must carry exactly one of 'url' or 'attachment_id'.",
+                    "InputRejected",
+                )
+            requested = entry.get("name")
+            if requested is not None and not (isinstance(requested, str) and requested.strip()):
+                return [], self._input_error(
+                    f"inputs[{position}].name must be a non-empty string when it is given at "
+                    "all; omit it to use the file's own name.",
+                    "InputRejected",
+                )
+            if requested is not None:
+                # every caller-supplied name is known HERE, so a collision between two of
+                # them costs no fetch. A collision between DERIVED names cannot be seen until
+                # the sources have answered, and is caught in `_resolve_inputs`.
+                first = requested_at.setdefault(requested.strip(), position)
+                if first != position:
+                    return [], self._input_error(
+                        f"inputs[{first}] and inputs[{position}] both ask to be delivered as "
+                        f"{requested.strip()!r}. Two files cannot share one name; give each "
+                        "its own.",
+                        "InputRejected",
+                    )
+            kind, value = named[0]
+            specs.append(
+                _InputSpec(
+                    kind=kind,
+                    value=value.strip(),
+                    requested_name=requested.strip() if isinstance(requested, str) else None,
+                )
+            )
+        return specs, None
+
+    @staticmethod
+    def _resolve_attachment(attachment_id: str, *, user: str, session_id: str) -> Any:
+        """The attachment this user uploaded to THIS session, or None.
+
+        Both halves or nothing: the store scopes an attachment by session, and a session id is
+        not an authorization — it is the session's own ownership row that ties it to the
+        caller. `session_id` here is the one run_analysis is executing under, which
+        llm_service injects after stripping any same-named key the model emitted, so a model
+        can neither name another session nor reach a file by guessing an id alone.
+        """
+        from genetics_mcp_server.db import get_chat_history_db
+        from genetics_mcp_server.routers.chat_history import resolve_owned_attachment
+
+        return resolve_owned_attachment(get_chat_history_db(), user, session_id, attachment_id)
+
+    async def _resolve_inputs(
+        self,
+        inputs: Any,
+        *,
+        user: str,
+        session_id: str,
+        timeout_s: int | None,
+    ) -> tuple[list[Any], list[dict[str, Any]], dict[str, Any] | None]:
+        """Every source resolved to bytes, before anything is minted or executed.
+
+        Returns the transport's inputs, what to echo to the model, and a refusal — and a
+        refusal means NO execution was created: no execution_id, no artifact record, nothing
+        half-run to explain or reap. `mint_execution_tokens` runs inside `sandbox.execute`,
+        which this returns before reaching.
+
+        A FETCH IS NEVER RETRIED HERE. The fetcher has no queue and answers no 429, so a
+        transient failure is reported once, with `retryable: true` and the reason, and whether
+        to ask again is the model's decision rather than a loop inside one tool call.
+        """
+        from genetics_mcp_server import url_fetch_client as fetcher
+        from genetics_mcp_server.sandbox_client import (
+            BODY_WRITE_DEADLINE_S,
+            CONNECT_TIMEOUT_S,
+            DEFAULT_TIMEOUT_S,
+            INPUT_CONTENT_TYPE_PATTERN,
+            INPUT_NAME_PATTERN,
+            MAX_INPUT_BYTES,
+            MAX_INPUTS,
+            MAX_INPUTS_TOTAL_BYTES,
+            MAX_TIMEOUT_S,
+            SandboxInput,
+            client_deadline_s,
+        )
+
+        specs, refusal = self._parse_input_specs(inputs, MAX_INPUTS)
+        if refusal is not None:
+            return [], [], refusal
+
+        # every caller-chosen name checked before the first fetch, not as each source is
+        # reached: a name this layer will refuse must not cost the fetch of the source
+        # before it
+        for index, spec in enumerate(specs, start=1):
+            if spec.requested_name is not None and not INPUT_NAME_PATTERN.fullmatch(
+                spec.requested_name
+            ):
+                return (
+                    [],
+                    [],
+                    self._input_error(
+                        f"inputs[{index}].name {spec.requested_name!r} cannot be used as a file "
+                        f"name: it must match {INPUT_NAME_PATTERN.pattern} — start with a "
+                        "letter or digit, use only letters, digits, '.', '_' and '-', and stay "
+                        "within 64 characters. Omit it and the file's own name is used.",
+                        "InputRejected",
+                    ),
+                )
+
+        url_count = sum(1 for spec in specs if spec.kind == "url")
+        fetch_client = None
+        if url_count:
+            # BEFORE the admission rule below, not on the first fetch: with no fetcher
+            # configured there is no budget question to answer, and answering "lower
+            # timeout_s" to a deployment that can never fetch anything sends the model round
+            # a loop that cannot succeed. Attachments still work here, so the message names
+            # the channel that does rather than reporting the tool as broken.
+            try:
+                fetch_client = fetcher.get_url_fetch_client()
+            except fetcher.UrlFetchNotConfigured as e:
+                logger.error("run_analysis was given a url input but %s", e)
+                return (
+                    [],
+                    [],
+                    self._input_error(
+                        "Fetching external URLs is not enabled on this deployment; "
+                        "upload the file as an attachment instead.",
+                        "InputFetchNotConfigured",
+                    ),
+                )
+
+        worst_fetch = url_count * (
+            fetcher.client_deadline_s() + fetcher.FETCHER_CONNECT_TIMEOUT_S
+        )
+        if url_count:
+            # THE ADMISSION RULE, and the one place the fetch budget meets the turn budget.
+            # Fetches are sequential and all of them happen before the execution, so this
+            # turn's 300s must hold `url_count * the fetch client's per-fetch worst case`
+            # (45s each: the fetcher's 30s wall clock, a 10s margin, and the 5s this client
+            # allows to connect to the fetcher at all) PLUS one worst-case attempt — connect
+            # 5 + body write 10 + the supervisor's 120s queued wait + timeout_s + a 15s
+            # margin. An attachment is a local read and costs nothing here.
+            #
+            # Over the budget the call is refused BEFORE the first fetch rather than part way
+            # through: bytes that land after the turn's budget is gone have spent the user's
+            # time on something nothing can use. At the default timeout_s of 60 that admits
+            # two urls (90 + 210 = 300s, exactly the budget) and refuses three (135 + 210);
+            # a script asking for the full 120s has already been promised most of the turn
+            # and gets no url fetches at all (45 + 270) — the test beside this one fails if
+            # either edge moves.
+            effective = (
+                timeout_s
+                if isinstance(timeout_s, int)
+                and not isinstance(timeout_s, bool)
+                and 1 <= timeout_s <= MAX_TIMEOUT_S
+                else DEFAULT_TIMEOUT_S
+            )
+            worst_attempt = (
+                CONNECT_TIMEOUT_S + BODY_WRITE_DEADLINE_S + client_deadline_s(effective)
+            )
+            if worst_fetch + worst_attempt > self._RUN_ANALYSIS_DEADLINE_S:
+                return (
+                    [],
+                    [],
+                    self._input_error(
+                        f"{url_count} URL input(s) can take up to {worst_fetch:.0f}s to fetch "
+                        f"and a run with timeout_s={effective} up to {worst_attempt:.0f}s, "
+                        f"which is over this turn's {self._RUN_ANALYSIS_DEADLINE_S}s budget. "
+                        "Fetch fewer URLs in one call, or lower timeout_s.",
+                        "InputBudgetExceeded",
+                    ),
+                )
+
+        async def resolve_all() -> tuple[list[Any], list[dict[str, Any]], dict[str, Any] | None]:
+            resolved: list[Any] = []
+            delivered: list[dict[str, Any]] = []
+            claimed: dict[str, int] = {}
+            total_bytes = 0
+
+            for index, spec in enumerate(specs, start=1):
+                if spec.kind == "url":
+                    try:
+                        source = await fetch_client.fetch(spec.value, user=user)
+                    except fetcher.UrlFetchRefused as e:
+                        logger.warning("run_analysis input %d was refused by the fetcher: %s", index, e)
+                        return (
+                            [],
+                            [],
+                            self._input_error(
+                                f"Input {index} was not fetched: {self._fetch_reason(e)}. That is a "
+                                "decision about this URL rather than a transient failure — asking "
+                                "again returns the same answer.",
+                                "InputRefused",
+                            ),
+                        )
+                    except fetcher.UrlFetchProtocolError as e:
+                        logger.error("url-fetcher broke its own contract on input %d: %s", index, e)
+                        return (
+                            [],
+                            [],
+                            self._input_error(
+                                f"Input {index} could not be fetched: the file service answered in "
+                                "a way this server does not understand. That is a fault in this "
+                                "deployment — our bug or a misdeployment — not in the request, and "
+                                "retrying will not change it.",
+                                "InputFetcherProtocolError",
+                            ),
+                        )
+                    except fetcher.UrlFetchUnavailable as e:
+                        logger.warning("run_analysis input %d could not be fetched: %s", index, e)
+                        return (
+                            [],
+                            [],
+                            self._input_error(
+                                f"Input {index} could not be fetched right now: "
+                                f"{self._fetch_reason(e)}. Nothing was run. This may work on a "
+                                "second attempt.",
+                                "InputUnavailable",
+                                retryable=True,
+                            ),
+                        )
+                    except fetcher.UrlFetchError as e:
+                        # the family is not a closed set; an unrecognised member is reported with
+                        # the contract's own retryable flag rather than dropped
+                        logger.error("unclassified url fetch failure on input %d: %s", index, e)
+                        return (
+                            [],
+                            [],
+                            self._input_error(
+                                f"Input {index} could not be fetched: {self._fetch_reason(e)}.",
+                                "InputUnavailable" if e.retryable else "InputRefused",
+                                retryable=bool(e.retryable),
+                            ),
+                        )
+                    content = source.content
+                    source_name = source.name
+                    digest = source.sha256
+                    content_type = source.content_type
+                else:
+                    attachment = self._resolve_attachment(
+                        spec.value, user=user, session_id=session_id
+                    )
+                    if attachment is None:
+                        # ONE ANSWER FOR "not yours" AND "does not exist", and the same shape a
+                        # policy refusal gets: two different messages would make this an oracle
+                        # for which attachment ids exist in other people's conversations.
+                        logger.warning(
+                            "run_analysis input %d named an attachment this session cannot use",
+                            index,
+                        )
+                        return (
+                            [],
+                            [],
+                            self._input_error(
+                                f"Input {index}: no such file is available in this conversation. "
+                                "Ask the user to upload it here, then pass the attachment_id the "
+                                "upload reports.",
+                                "InputNotFound",
+                            ),
+                        )
+                    try:
+                        with open(attachment.storage_path, "rb") as handle:
+                            content = handle.read(MAX_INPUT_BYTES + 1)
+                    except OSError as e:
+                        logger.error(
+                            "attachment %s is recorded but unreadable: %s", attachment.id, e
+                        )
+                        return (
+                            [],
+                            [],
+                            self._input_error(
+                                f"Input {index}: the uploaded file is recorded in this "
+                                "conversation but its bytes could not be read back on this "
+                                "deployment. That is a fault on our side — a second attempt and "
+                                "a fresh upload of the same file will both hit it.",
+                                "InputUnreadable",
+                            ),
+                        )
+                    source_name = attachment.file_name
+                    digest = hashlib.sha256(content).hexdigest()
+                    content_type = attachment.mime_type
+
+                if len(content) > MAX_INPUT_BYTES:
+                    return (
+                        [],
+                        [],
+                        self._input_error(
+                            f"Input {index} is over the {MAX_INPUT_BYTES}-byte per-file limit for "
+                            "sandbox delivery. Filter or summarise it before delivering it.",
+                            "InputTooLarge",
+                        ),
+                    )
+                total_bytes += len(content)
+                if total_bytes > MAX_INPUTS_TOTAL_BYTES:
+                    return (
+                        [],
+                        [],
+                        self._input_error(
+                            f"The delivered files total more than the {MAX_INPUTS_TOTAL_BYTES}-byte "
+                            "limit for one run. Deliver fewer, or smaller ones.",
+                            "InputTooLarge",
+                        ),
+                    )
+
+                name = spec.requested_name or _sanitised_input_name(
+                    source_name, index, INPUT_NAME_PATTERN
+                )
+                if name in claimed:
+                    # DERIVED names only — two caller-supplied ones are refused in
+                    # `_parse_input_specs`, before the first fetch. A collision between names
+                    # taken from the sources cannot be seen until the sources have answered.
+                    # The transport refuses duplicates too; refused here, the model reads
+                    # which two sources collided instead of a validation error naming neither.
+                    return (
+                        [],
+                        [],
+                        self._input_error(
+                            f"Inputs {claimed[name]} and {index} would both be delivered as "
+                            f"'{name}'. Give one of them an explicit 'name'.",
+                            "InputRejected",
+                        ),
+                    )
+                claimed[name] = index
+
+                resolved.append(
+                    SandboxInput(
+                        name=name,
+                        content=content,
+                        # a label the upstream chose, kept only when it parses. An unparseable
+                        # one is dropped rather than allowed to fail the whole run: nothing
+                        # downstream may trust it to describe the bytes anyway.
+                        content_type=(
+                            content_type
+                            if isinstance(content_type, str)
+                            and INPUT_CONTENT_TYPE_PATTERN.fullmatch(content_type)
+                            else None
+                        ),
+                        # the fetcher's own digest, so the chain from origin to execution is
+                        # unbroken. SandboxInput verifies it against these bytes and discards it.
+                        # Both digests reaching here are already verified against the bytes —
+                        # `UrlFetchClient._result` checks the fetcher's, and an attachment's is
+                        # computed from the bytes just read — so the transport's mismatch arm is
+                        # unreachable. A future source that hands over an UNVERIFIED digest makes
+                        # it reachable, and it surfaces as `SandboxRejected` carrying a timeout_s
+                        # hint the model cannot act on; such a source needs its own `Input*` type.
+                        expected_sha256=digest,
+                    )
+                )
+                delivered.append({"name": name, "source": spec.kind, "size": len(content)})
+                # one line per source that resolved, written INSIDE this loop: a later input
+                # can still refuse the whole call, so nothing here says anything was executed.
+                # Never the content, and never the url — a refused fetch's url is logged at
+                # warning above, where it is a diagnostic rather than a record of traffic.
+                logger.info(
+                    "run_analysis input resolved: name=%s source=%s size=%d sha256=%s",
+                    name,
+                    spec.kind,
+                    len(content),
+                    digest,
+                )
+
+            return resolved, delivered, None
+
+        if not url_count:
+            return await resolve_all()
+        try:
+            # THE PREDICTION, ENFORCED. Admission above assumed `worst_fetch` and no more,
+            # and neither half of that is bounded on its own: `client_deadline_s` is a read
+            # deadline per chunk of `aiter_bytes`, so a trickling responder extends it, and
+            # the fetcher's own `guard.check` resolves names outside any clock. Without this
+            # cap the phase can outrun its share of the turn, the execution is then handed a
+            # budget smaller than one attempt, and a live sandbox is killed at
+            # `asyncio.wait_for` and reported as `TurnBudgetExceeded`.
+            return await asyncio.wait_for(resolve_all(), timeout=worst_fetch)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "run_analysis input resolution ran past its %.0fs phase budget (session=%s)",
+                worst_fetch,
+                session_id,
+            )
+            return (
+                [],
+                [],
+                self._input_error(
+                    f"The files could not be fetched within the {worst_fetch:.0f}s this turn "
+                    "allows for fetching. Nothing was run. This may work on a second attempt, "
+                    "or with fewer URLs in one call.",
+                    "InputUnavailable",
+                    retryable=True,
+                ),
+            )
+
     async def run_analysis(
         self,
         code: str,
         timeout_s: int | None = None,
         *,
+        inputs: list[dict[str, Any]] | None = None,
         user: str | None = None,
         session_id: str | None = None,
         gateway_asserted: bool = False,
     ) -> dict[str, Any]:
         """Run one script in the sandbox and render the supervisor's result for the model.
+
+        `inputs` names files to deliver into the execution: `{"url": ...}` or
+        `{"attachment_id": ...}`, each with an optional `name`. They are resolved to bytes
+        BEFORE any credential is minted, so a source that cannot be delivered produces no
+        execution at all; the names they were delivered under come back in the result,
+        because that is what a script passes to `genetics.open_input`.
 
         `user` and `session_id` are supplied by the CALLER, never by the model: they are the
         subject and the session of the per-execution credential, and llm_service strips any
@@ -1504,6 +2032,36 @@ class ServerToolExecutor(ToolExecutor):
         if not_configured is not None:
             return not_configured
 
+        resolved_inputs: list[Any] = []
+        delivered_inputs: list[dict[str, Any]] = []
+        budget_s = float(self._RUN_ANALYSIS_DEADLINE_S)
+        if inputs:
+            # AFTER the identity gates above and BEFORE the sandbox call. The identity is
+            # what a fetch is made on behalf of and what an attachment is checked against, so
+            # a call with no user has already been refused here and never reaches a fetcher;
+            # and `mint_execution_tokens` runs inside `sandbox.execute`, so a delivery that
+            # fails leaves no execution_id, no artifacts and nothing to retry against.
+            started = time.monotonic()
+            # called bare, unlike every other failure path in this method: `_resolve_inputs`
+            # handles the `UrlFetch*` family and `OSError` itself, but a DB error out of
+            # `get_chat_history_db()` or an httpx error outside `TransportError` would
+            # propagate out of run_analysis rather than being shaped for the model. No
+            # reachable trigger was found for either; a handler here would be guessing at the
+            # wording of a failure nobody has seen.
+            resolved_inputs, delivered_inputs, refusal = await self._resolve_inputs(
+                inputs, user=user, session_id=session_id, timeout_s=timeout_s
+            )
+            if refusal is not None:
+                return refusal
+            # what the fetches ACTUALLY spent comes off this turn's budget — never off the
+            # client's per-attempt read deadline, which is derived from the supervisor's own
+            # worst case and must not be shortened. `budget_s >= worst_attempt` holds here
+            # because `_resolve_inputs` does BOTH halves: it refuses up front anything whose
+            # worst case would not fit, and it then caps the resolution phase at exactly the
+            # `worst_fetch` that admission assumed, so the subtraction below cannot exceed
+            # it. Either half alone leaves this false — admission predicts, the cap enforces.
+            budget_s -= time.monotonic() - started
+
         try:
             result = await asyncio.wait_for(
                 sandbox.execute(
@@ -1511,8 +2069,9 @@ class ServerToolExecutor(ToolExecutor):
                     user=user,
                     session_id=session_id,
                     timeout_s=timeout_s,
+                    inputs=resolved_inputs,
                 ),
-                timeout=self._RUN_ANALYSIS_DEADLINE_S,
+                timeout=budget_s,
             )
         except SandboxTokenUnavailable as e:
             # FIRST, and by name. See the docstring: this is the one failure that must not
@@ -1578,14 +2137,16 @@ class ServerToolExecutor(ToolExecutor):
                 "retryable": True,
             }
         except SandboxRejected as e:
-            # a caller bug — including a timeout_s or a script size this client refused to
-            # send. Actionable, because the model chose the value.
+            # a caller bug — a timeout_s or a script size this client refused to send, or a
+            # delivered input the transport's own validation caught. Actionable, because the
+            # model chose the value; `e` carries which one, so the hint is an example rather
+            # than a claim that timeout_s is the only cause.
             logger.warning("sandbox refused run_analysis: %s", e)
             return {
                 "success": False,
                 "error": (
                     f"The analysis request was rejected: {e}. Fix the request rather than "
-                    f"repeating it — timeout_s must be 1-{MAX_TIMEOUT_S} seconds."
+                    f"repeating it — timeout_s, for example, must be 1-{MAX_TIMEOUT_S} seconds."
                 ),
                 "error_type": "SandboxRejected",
                 "retryable": False,
@@ -1612,6 +2173,7 @@ class ServerToolExecutor(ToolExecutor):
             images=images,
             files=files,
             not_delivered=[*images_not_delivered, *files_not_delivered],
+            inputs_delivered=delivered_inputs,
         )
 
     @staticmethod
@@ -1851,6 +2413,7 @@ class ServerToolExecutor(ToolExecutor):
         images: list[dict[str, Any]] | None = None,
         files: list[dict[str, Any]] | None = None,
         not_delivered: list[dict[str, str]] | None = None,
+        inputs_delivered: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Turn the supervisor's 200 body into the tool result the model reads.
 
@@ -1933,6 +2496,12 @@ class ServerToolExecutor(ToolExecutor):
             # before `output` for the same reason `artifacts_retained_in_clear` is: a result
             # truncated to a prefix must still carry the list of what the user did not get
             rendered["artifacts_not_delivered"] = not_delivered
+        if inputs_delivered:
+            # before `output` for that same reason, and one of its own: these are the names
+            # `genetics.open_input` takes, and they are not always the names the caller asked
+            # for. A script that printed enough to trip the truncation would otherwise leave
+            # the model guessing what its own next script should open.
+            rendered["inputs_delivered"] = inputs_delivered
         rendered["output"] = result.get("output") if isinstance(result.get("output"), str) else ""
         rendered["output_truncated"] = bool(result.get("output_truncated"))
         rendered["artifacts"] = artifacts

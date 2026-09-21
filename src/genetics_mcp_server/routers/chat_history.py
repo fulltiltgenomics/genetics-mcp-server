@@ -951,6 +951,27 @@ async def generate_title(
 
 # --- Attachment Endpoints ---
 
+
+def resolve_owned_attachment(db, user: str, session_id: str, attachment_id: str):
+    """The attachment `user` uploaded to `session_id`, or None.
+
+    BOTH CHECKS OR NOTHING. `get_attachment` scopes by session alone, and a session id is not
+    an authorization: it is the session's own ownership row that ties it to a person. The two
+    lookups are stated here rather than at each caller because they are no longer only a
+    route's business — `run_analysis` resolves an `attachment_id` into sandbox input bytes
+    through this same pair, and a caller that made one check and not the other would deliver
+    another user's upload into an execution.
+
+    None for a foreign attachment and for one that never existed alike: the callers must not
+    be able to tell those apart, or the answer becomes an oracle for which ids exist.
+    """
+    if not user or not session_id or not attachment_id:
+        return None
+    if db.get_session(session_id, user) is None:
+        return None
+    return db.get_attachment(attachment_id, session_id)
+
+
 @router.post(
     "/chat/sessions/{session_id}/attachments",
     summary="Upload a file attachment",
@@ -1106,12 +1127,7 @@ async def get_attachment(
 
     db = get_chat_history_db()
 
-    # verify session ownership
-    session = db.get_session(session_id, user)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    attachment = db.get_attachment(attachment_id, session_id)
+    attachment = resolve_owned_attachment(db, user, session_id, attachment_id)
     if attachment is None:
         raise HTTPException(status_code=404, detail="Attachment not found")
 

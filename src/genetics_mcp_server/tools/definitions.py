@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# WHEN A PARAMETER MAY DECLARE `minimum`/`maximum`/`pattern` (genetics-results-suite-4h6.70).
-# get_anthropic_tools copies these three keywords straight into the emitted input_schema, so
+# WHEN A PARAMETER MAY DECLARE `minimum`/`maximum`/`pattern`/`maxItems`
+# (genetics-results-suite-4h6.70).
+# get_anthropic_tools copies these keywords straight into the emitted input_schema, so
 # a bound here is a claim about the SERVER, not a wish. The rule is: declare a bound only
 # where enforcing code already applies it to every path that parameter can take, and derive
 # the number from that code rather than from the description — where the two disagree the
@@ -29,7 +30,9 @@ logger = logging.getLogger(__name__)
 #
 # Two different kinds of bound live on this surface, and this comment must not blur them:
 #   - REJECTED: the `sql_int`/`sql_float` sites (the four `window` params, `min_pip`,
-#     `get_hla_by_allele.max_rows`) and the sandbox timeout raise on an out-of-range value.
+#     `get_hla_by_allele.max_rows`), the sandbox timeout and `run_analysis.inputs`'
+#     `maxItems` raise on an out-of-range value — the last of those twice, in
+#     `_parse_input_specs` before anything is fetched and in `_validate_inputs` on the wire.
 #     These are also mirrored onto the MCP surface as pydantic `Field(ge=..., le=...)` —
 #     see the docstring on register_mcp_tools below — because there the identical
 #     rejection just moves earlier.
@@ -2100,6 +2103,46 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "minimum": 1,
                 "maximum": 120,
             },
+            "inputs": {
+                "type": "array",
+                "description": (
+                    "Files to put into the sandbox before the script runs. Each item names "
+                    "exactly one source — a `url` to fetch, or the `attachment_id` of a file "
+                    "the user uploaded to this conversation — and may give a `name` to "
+                    "deliver it under. The result reports the name each file was actually "
+                    "delivered as; the script opens it with genetics.open_input(name). A "
+                    "source that cannot be delivered fails the call before anything runs."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "URL to fetch the file from.",
+                        },
+                        "attachment_id": {
+                            "type": "string",
+                            "description": (
+                                "Id of a file the user uploaded to this conversation."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Name to deliver the file under: letters, digits, '.', '_' "
+                                "and '-', starting with a letter or digit. Omit it and the "
+                                "file's own name is used."
+                            ),
+                        },
+                    },
+                },
+                # sandbox_client.MAX_INPUTS, spelled out rather than imported: this module
+                # is on the MCP server's import graph, which
+                # tests/test_mcp_server.py requires the sandbox transport to stay off. Tied
+                # to the constant in tests/test_tool_schema_bounds.py, the same way the
+                # timeout bound above is tied to MAX_TIMEOUT_S.
+                "maxItems": 4,
+            },
         },
     },
     {
@@ -2415,7 +2458,7 @@ def _to_anthropic_format(
             # declares one only where the server already enforces it — see the block
             # comment above TOOL_DEFINITIONS. `0`/`0.0` are legitimate bounds, so these
             # test for presence rather than truthiness.
-            for keyword in ("minimum", "maximum", "pattern"):
+            for keyword in ("minimum", "maximum", "pattern", "maxItems"):
                 if keyword in param_info:
                     prop[keyword] = param_info[keyword]
             properties[param_name] = prop

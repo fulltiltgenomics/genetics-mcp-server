@@ -29,6 +29,7 @@ EXPECTED_BOUNDS = [
     ("get_hla_by_allele", "max_rows", {"minimum": 1, "maximum": 100_000}),
     ("query_database", "max_rows", {"maximum": 100_000}),
     ("run_analysis", "timeout_s", {"minimum": 1, "maximum": 120}),
+    ("run_analysis", "inputs", {"maxItems": 4}),
     ("web_search", "max_results", {"maximum": 10}),
     ("search_mgi", "max_results", {"minimum": 1, "maximum": 100}),
     ("search_cbioportal", "max_results", {"minimum": 1, "maximum": 100}),
@@ -69,6 +70,9 @@ def test_bounds_track_the_constants_that_enforce_them():
     assert (
         props["run_analysis"]["properties"]["timeout_s"]["maximum"]
         == sandbox_client.MAX_TIMEOUT_S
+    )
+    assert (
+        props["run_analysis"]["properties"]["inputs"]["maxItems"] == sandbox_client.MAX_INPUTS
     )
 
 

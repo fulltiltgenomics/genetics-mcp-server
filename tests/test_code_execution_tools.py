@@ -8,8 +8,10 @@ transport — no live sandbox, no credentials.
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
+import time
 
 import pytest
 from conftest import settings_env
@@ -851,7 +853,9 @@ class _StubSandbox:
         self.artifacts = artifacts or {}
         self.fetched = []
 
-    async def execute(self, *, code, user, session_id, timeout_s=None, execution_id=None):
+    async def execute(
+        self, *, code, user, session_id, timeout_s=None, execution_id=None, inputs=None
+    ):
         self.calls.append(
             {
                 "code": code,
@@ -859,6 +863,7 @@ class _StubSandbox:
                 "session_id": session_id,
                 "timeout_s": timeout_s,
                 "execution_id": execution_id,
+                "inputs": list(inputs or ()),
             }
         )
         if self.raises is not None:
@@ -2130,3 +2135,763 @@ class TestArtifactsRetainedInClear:
         prefix = result_json[: limit - 1000]
         assert "artifacts_retained_in_clear" in prefix
         assert prefix.index("artifacts_retained_in_clear") < prefix.index('"output"')
+
+
+# --- inputs: sources resolved before an execution exists (vxtv.13, vxtv.14) ---
+
+
+def _without_comments(source):
+    """`source` with every `#` comment removed, so a scan of it sees code alone."""
+    import io
+    import textwrap
+    import tokenize
+
+    readline = io.StringIO(textwrap.dedent(source)).readline
+    return "\n".join(
+        token.string
+        for token in tokenize.generate_tokens(readline)
+        if token.type != tokenize.COMMENT
+    )
+
+
+def _fetched(
+    url="https://example.org/data.tsv",
+    name="data.tsv",
+    content=b"a\tb\n1\t2\n",
+    content_type="text/tab-separated-values",
+):
+    from genetics_mcp_server.url_fetch_client import FetchedFile
+
+    return FetchedFile(
+        url=url,
+        name=name,
+        content=content,
+        size_bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        content_type=content_type,
+        content_encoding=None,
+        redirects=0,
+    )
+
+
+class _StubFetcher:
+    """Stands in for UrlFetchClient. Records what it was asked and replays one outcome."""
+
+    def __init__(self, files=None, raises=None):
+        self.files = files or {}
+        self.raises = raises
+        self.calls = []
+
+    async def fetch(self, url, *, user):
+        self.calls.append((url, user))
+        if self.raises is not None:
+            raise self.raises
+        return self.files.get(url) or _fetched(url=url)
+
+
+def _install_fetcher(monkeypatch, client=None, unavailable=None):
+    """Point `get_url_fetch_client` at a stub, or make it raise at construction."""
+    from genetics_mcp_server import url_fetch_client as fetcher_module
+
+    def factory():
+        if unavailable is not None:
+            raise unavailable
+        return client
+
+    monkeypatch.setattr(fetcher_module, "get_url_fetch_client", factory)
+    return client
+
+
+class _FakeAttachment:
+    def __init__(self, attachment_id, session_id, file_name, storage_path, mime_type="text/csv"):
+        self.id = attachment_id
+        self.session_id = session_id
+        self.file_name = file_name
+        self.storage_path = str(storage_path)
+        self.mime_type = mime_type
+
+
+class _FakeAttachmentStore:
+    """The two lookups `resolve_owned_attachment` makes, with nothing else attached.
+
+    `get_session` answers only for the owner, `get_attachment` only within its session —
+    exactly the shapes ChatHistoryDB has, so the real helper runs against this.
+    """
+
+    def __init__(self, *, owner, session_id, rows):
+        self.owner = owner
+        self.session_id = session_id
+        self.rows = {row.id: row for row in rows}
+
+    def get_session(self, session_id, user_id):
+        if session_id == self.session_id and user_id == self.owner:
+            return object()
+        return None
+
+    def get_attachment(self, attachment_id, session_id):
+        row = self.rows.get(attachment_id)
+        return row if row is not None and row.session_id == session_id else None
+
+
+def _install_attachments(monkeypatch, store):
+    from genetics_mcp_server import db as db_module
+
+    monkeypatch.setattr(db_module, "get_chat_history_db", lambda: store)
+    return store
+
+
+async def _run_with_inputs(executor, sandbox, inputs, **kwargs):
+    kwargs.setdefault("inputs", inputs)
+    return await _run(executor, sandbox, **kwargs)
+
+
+class TestRunAnalysisInputsResolveBeforeAnythingIsMinted:
+    """Decision 2: a source that cannot be delivered leaves no execution behind at all."""
+
+    async def test_a_refused_fetch_mints_no_credential_and_sends_no_request(
+        self, executor, monkeypatch
+    ):
+        import httpx
+
+        from genetics_mcp_server import sandbox_client as sandbox_client_module
+        from genetics_mcp_server.sandbox_client import SandboxClient
+        from genetics_mcp_server.url_fetch_client import UrlFetchRefused
+
+        minted = []
+
+        def _mint(**kwargs):
+            minted.append(kwargs)
+            raise AssertionError("nothing may be minted for a run that has no inputs to deliver")
+
+        monkeypatch.setattr(sandbox_client_module, "mint_execution_tokens", _mint)
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=_result_body())
+
+        _install_fetcher(
+            monkeypatch,
+            _StubFetcher(raises=UrlFetchRefused("host is not on the fetch allow-list")),
+        )
+        executor._sandbox = SandboxClient(
+            "http://sandbox:8080", transport=httpx.MockTransport(handler)
+        )
+        result = await executor.run_analysis(
+            code="print(1)",
+            inputs=[{"url": "https://example.org/data.tsv"}],
+            user="u@finngen.fi",
+            session_id="conv-9",
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "InputRefused"
+        assert minted == [], "resolution must precede minting"
+        assert requests == [], "no execution may exist for a failed delivery"
+
+    async def test_a_failed_delivery_records_no_artifact_manifest(self, executor, monkeypatch):
+        from genetics_mcp_server.url_fetch_client import UrlFetchRefused
+
+        _install_fetcher(monkeypatch, _StubFetcher(raises=UrlFetchRefused("blocked")))
+        sandbox = _StubSandbox(
+            result=_result_body(artifacts=[{"name": "x.png", "size": 1, "content_type": "image/png"}])
+        )
+        result = await _run_with_inputs(
+            executor, sandbox, [{"url": "https://example.org/data.tsv"}]
+        )
+        assert result["error_type"] == "InputRefused"
+        assert sandbox.calls == []
+        assert (
+            orchestration_module._ARTIFACT_MANIFESTS.resolve("u@finngen.fi", "conv-9", "x.png")
+            is None
+        )
+
+    async def test_no_user_means_no_fetch_at_all(self, executor, monkeypatch):
+        """Decision 1: no owner is nobody to fetch on behalf of, and nobody to check an
+        attachment against — so the identity gate refuses before a source is touched."""
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
+        sandbox = _StubSandbox(result=_result_body())
+        executor._sandbox = sandbox
+        result = await executor.run_analysis(
+            code="print(1)",
+            inputs=[{"url": "https://example.org/data.tsv"}],
+            user=None,
+            session_id="conv-9",
+        )
+        assert result["success"] is False
+        assert result["retryable"] is False
+        assert fetcher.calls == []
+        assert sandbox.calls == []
+
+
+class TestRunAnalysisInputErrorTaxonomy:
+    """Decision 4: delivery failures are their own `error_type` values beside the sandbox's."""
+
+    async def test_a_policy_refusal_is_not_retryable_and_names_the_policy(
+        self, executor, monkeypatch
+    ):
+        from genetics_mcp_server.url_fetch_client import UrlFetchRefused
+
+        _install_fetcher(
+            monkeypatch,
+            _StubFetcher(
+                raises=UrlFetchRefused("scheme 'ftp' is not in the allow-list {http, https}")
+            ),
+        )
+        result = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"url": "ftp://example.org/x.tsv"}]
+        )
+        assert result["error_type"] == "InputRefused"
+        assert result["retryable"] is False
+        assert "scheme 'ftp' is not in the allow-list {http, https}" in result["error"]
+
+    async def test_an_upstream_status_is_quoted(self, executor, monkeypatch):
+        from genetics_mcp_server.url_fetch_client import UrlFetchRefused
+
+        _install_fetcher(
+            monkeypatch,
+            _StubFetcher(
+                raises=UrlFetchRefused(
+                    "the upstream refused the request",
+                    error_type="upstream_status",
+                    details={"upstream_status": 404},
+                )
+            ),
+        )
+        result = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"url": "https://example.org/x.tsv"}]
+        )
+        assert "HTTP 404" in result["error"]
+
+    async def test_a_transient_failure_is_retryable(self, executor, monkeypatch):
+        from genetics_mcp_server.url_fetch_client import UrlFetchUnavailable
+
+        _install_fetcher(
+            monkeypatch, _StubFetcher(raises=UrlFetchUnavailable("url-fetcher is not reachable"))
+        )
+        result = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"url": "https://example.org/x.tsv"}]
+        )
+        assert result["error_type"] == "InputUnavailable"
+        assert result["retryable"] is True
+
+    async def test_a_protocol_error_says_it_is_ours(self, executor, monkeypatch):
+        from genetics_mcp_server.url_fetch_client import UrlFetchProtocolError
+
+        _install_fetcher(
+            monkeypatch, _StubFetcher(raises=UrlFetchProtocolError("sha256 does not describe it"))
+        )
+        result = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"url": "https://example.org/x.tsv"}]
+        )
+        assert result["error_type"] == "InputFetcherProtocolError"
+        assert result["retryable"] is False
+        assert "deployment" in result["error"]
+
+    async def test_an_unconfigured_fetcher_points_at_the_upload_channel(
+        self, executor, monkeypatch
+    ):
+        from genetics_mcp_server.url_fetch_client import UrlFetchNotConfigured
+
+        _install_fetcher(monkeypatch, unavailable=UrlFetchNotConfigured("URL_FETCHER_URL unset"))
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"url": "https://example.org/x.tsv"}])
+        assert result["error_type"] == "InputFetchNotConfigured"
+        assert result["retryable"] is False
+        assert "upload the file as an attachment instead" in result["error"]
+        assert sandbox.calls == []
+
+    async def test_an_unconfigured_fetcher_answers_even_when_the_budget_would_refuse(
+        self, executor, monkeypatch
+    ):
+        """timeout_s=120 leaves no room for any url, but "lower timeout_s" is advice this
+        deployment can never act on — no timeout_s makes an absent fetcher reachable."""
+        from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
+        from genetics_mcp_server.url_fetch_client import UrlFetchNotConfigured
+
+        _install_fetcher(monkeypatch, unavailable=UrlFetchNotConfigured("URL_FETCHER_URL unset"))
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor,
+            sandbox,
+            [{"url": "https://example.org/x.tsv"}],
+            timeout_s=MAX_TIMEOUT_S,
+        )
+        assert result["error_type"] == "InputFetchNotConfigured"
+        assert "upload the file as an attachment instead" in result["error"]
+        assert sandbox.calls == []
+
+    async def test_an_attachment_still_works_with_no_fetcher_configured(
+        self, executor, monkeypatch, tmp_path
+    ):
+        from genetics_mcp_server.url_fetch_client import UrlFetchNotConfigured
+
+        _install_fetcher(monkeypatch, unavailable=UrlFetchNotConfigured("URL_FETCHER_URL unset"))
+        path = tmp_path / "upload.tsv"
+        path.write_bytes(b"a\tb\n")
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-9", "upload.tsv", path)],
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"attachment_id": "att-1"}])
+        assert result["success"] is True
+        assert result["inputs_delivered"] == [
+            {"name": "upload.tsv", "source": "attachment", "size": 4}
+        ]
+        # ahead of `output`, like artifacts_warning and artifacts_not_delivered: a script
+        # that prints enough to trip the truncation must not cut away the names its own next
+        # script has to pass to genetics.open_input
+        keys = list(result)
+        assert keys.index("inputs_delivered") < keys.index("output")
+
+    def test_the_new_types_do_not_collide_with_the_sandbox_ones(self):
+        """They sit BESIDE SandboxUnavailable/SandboxRejected in the same field, never
+        inside them: the two families call for opposite next moves."""
+        # comments stripped first: the claim is about what this method RETURNS, and one
+        # comment names `SandboxRejected` precisely to say which arm a future unverified
+        # digest would land in
+        source = _without_comments(
+            inspect.getsource(orchestration_module.ServerToolExecutor._resolve_inputs)
+        )
+        delivery = {
+            "InputRejected",
+            "InputRefused",
+            "InputUnavailable",
+            "InputUnreadable",
+            "InputNotFound",
+            "InputTooLarge",
+            "InputBudgetExceeded",
+            "InputFetchNotConfigured",
+            "InputFetcherProtocolError",
+        }
+        sandbox = {
+            "SandboxUnavailable",
+            "SandboxBusy",
+            "SandboxRejected",
+            "SandboxDeadlineExceeded",
+            "SandboxNotConfigured",
+            "TurnBudgetExceeded",
+        }
+        assert delivery & sandbox == set()
+        for name in sandbox:
+            assert name not in source
+
+
+class TestRunAnalysisInputNameSeam:
+    """Decision 5. url-fetcher's names are legal there and refused by the sandbox client."""
+
+    def test_the_length_ceiling_is_the_patterns_own(self):
+        from genetics_mcp_server.sandbox_client import INPUT_NAME_PATTERN
+
+        ceiling = orchestration_module._INPUT_NAME_MAX
+        assert INPUT_NAME_PATTERN.fullmatch("a" * ceiling)
+        assert not INPUT_NAME_PATTERN.fullmatch("a" * (ceiling + 1))
+
+    @pytest.mark.parametrize(
+        "fetched_name,expected",
+        [
+            ("_data.tsv", "data.tsv"),
+            ("-set.tsv", "set.tsv"),
+            ("café.txt", "cafe.txt"),
+            ("x" * 80 + ".tsv", "x" * 60 + ".tsv"),
+            # nothing of the stem survives the ASCII fold; the bare extension "csv" is not a
+            # name, so the floor applies and the extension is kept on it
+            ("名前.csv", "input1.csv"),
+        ],
+    )
+    async def test_a_fetcher_legal_name_is_delivered_under_a_sandbox_legal_one(
+        self, executor, monkeypatch, fetched_name, expected
+    ):
+        from genetics_mcp_server.sandbox_client import INPUT_NAME_PATTERN
+
+        url = "https://example.org/thing"
+        _install_fetcher(monkeypatch, _StubFetcher(files={url: _fetched(url=url, name=fetched_name)}))
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"url": url}])
+
+        delivered = sandbox.calls[0]["inputs"][0]
+        assert delivered.name == expected
+        assert INPUT_NAME_PATTERN.fullmatch(delivered.name)
+        # the echoed name IS the delivered one: it is what genetics.open_input takes
+        assert result["inputs_delivered"][0]["name"] == delivered.name
+
+    async def test_an_explicit_name_wins_and_an_unusable_one_is_refused(
+        self, executor, monkeypatch
+    ):
+        url = "https://example.org/thing"
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher(files={url: _fetched(url=url)}))
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"url": url, "name": "cohort.tsv"}])
+        assert sandbox.calls[0]["inputs"][0].name == "cohort.tsv"
+
+        fetcher.calls.clear()
+        refused = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"url": url, "name": "../escape"}]
+        )
+        assert refused["error_type"] == "InputRejected"
+        assert "../escape" in refused["error"]
+        assert fetcher.calls == [], "a name this layer refuses costs no fetch"
+        assert result["success"] is True
+
+    async def test_two_requested_names_that_are_equal_cost_no_fetch(self, executor, monkeypatch):
+        """Both names are caller-supplied, so the collision is knowable before the wire."""
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor,
+            sandbox,
+            [
+                {"url": "https://a.example.org/x", "name": "cohort.tsv"},
+                {"url": "https://b.example.org/x", "name": "cohort.tsv"},
+            ],
+        )
+        assert result["error_type"] == "InputRejected"
+        assert "cohort.tsv" in result["error"]
+        assert fetcher.calls == [], "a collision between requested names must precede the fetch"
+        assert sandbox.calls == []
+
+    async def test_two_sources_that_sanitise_to_one_name_are_refused(self, executor, monkeypatch):
+        files = {
+            "https://a.example.org/x": _fetched(url="https://a.example.org/x", name="_hits.tsv"),
+            "https://b.example.org/x": _fetched(url="https://b.example.org/x", name="hits.tsv"),
+        }
+        _install_fetcher(monkeypatch, _StubFetcher(files=files))
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor, sandbox, [{"url": "https://a.example.org/x"}, {"url": "https://b.example.org/x"}]
+        )
+        assert result["error_type"] == "InputRejected"
+        assert "hits.tsv" in result["error"]
+        assert sandbox.calls == []
+
+
+class TestRunAnalysisInputIntegrity:
+    async def test_the_digest_handed_to_the_sandbox_is_the_fetchers(self, executor, monkeypatch):
+        url = "https://example.org/x.tsv"
+        fetched = _fetched(url=url, content=b"chr\tpos\n1\t2\n")
+        _install_fetcher(monkeypatch, _StubFetcher(files={url: fetched}))
+        sandbox = _StubSandbox(result=_result_body())
+        await _run_with_inputs(executor, sandbox, [{"url": url}])
+        delivered = sandbox.calls[0]["inputs"][0]
+        assert delivered.expected_sha256 == fetched.sha256
+        assert delivered.content == fetched.content
+
+    async def test_an_unparseable_upstream_content_type_is_dropped_not_fatal(
+        self, executor, monkeypatch
+    ):
+        url = "https://example.org/x.tsv"
+        _install_fetcher(
+            monkeypatch, _StubFetcher(files={url: _fetched(url=url, content_type="tsv")})
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"url": url}])
+        assert result["success"] is True
+        assert sandbox.calls[0]["inputs"][0].content_type is None
+
+
+class TestRunAnalysisInputDeadline:
+    """Decision 6: the fetch worst case and one execution attempt share the turn budget."""
+
+    @staticmethod
+    def _numbers():
+        """The four terms the admission rule is built from, taken from their own modules."""
+        from genetics_mcp_server import url_fetch_client as fetcher_module
+        from genetics_mcp_server.sandbox_client import (
+            BODY_WRITE_DEADLINE_S,
+            CONNECT_TIMEOUT_S,
+            DEFAULT_TIMEOUT_S,
+            MAX_TIMEOUT_S,
+            client_deadline_s,
+        )
+
+        per_url = fetcher_module.client_deadline_s() + fetcher_module.FETCHER_CONNECT_TIMEOUT_S
+
+        def attempt(t):
+            return CONNECT_TIMEOUT_S + BODY_WRITE_DEADLINE_S + client_deadline_s(t)
+
+        return (
+            per_url,
+            attempt(DEFAULT_TIMEOUT_S),
+            attempt(MAX_TIMEOUT_S),
+            float(orchestration_module.ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S),
+        )
+
+    def test_the_admitted_edges_are_two_urls_at_60s_and_none_at_120s(self):
+        """The per-url cost includes the CONNECT timeout to the fetcher, which the fetch
+        client's own deadline does not cover: 40 + 5, not 40. If any of these numbers moves,
+        this fails before the behavioural tests below do and says which edge went."""
+        per_url, attempt_60, attempt_120, budget = self._numbers()
+        assert (per_url, attempt_60, attempt_120, budget) == (45.0, 210.0, 270.0, 300.0)
+        assert 2 * per_url + attempt_60 == budget  # exactly 300s: admitted
+        assert 3 * per_url + attempt_60 > budget  # 345s: refused
+        assert 1 * per_url + attempt_120 > budget  # 315s: refused, no url fits at all
+
+    async def test_a_request_that_cannot_fit_is_refused_before_any_fetch(
+        self, executor, monkeypatch
+    ):
+        from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
+
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor, sandbox, [{"url": "https://example.org/x.tsv"}], timeout_s=MAX_TIMEOUT_S
+        )
+        assert result["error_type"] == "InputBudgetExceeded"
+        assert result["retryable"] is False
+        assert str(orchestration_module.ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S) in result["error"]
+        assert fetcher.calls == [], "the refusal must precede the first fetch"
+        assert sandbox.calls == []
+
+    async def test_the_default_timeout_still_admits_two_urls(self, executor, monkeypatch):
+        files = {
+            f"https://example.org/{n}.tsv": _fetched(
+                url=f"https://example.org/{n}.tsv", name=f"{n}.tsv"
+            )
+            for n in ("one", "two")
+        }
+        _install_fetcher(monkeypatch, _StubFetcher(files=files))
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"url": u} for u in files])
+        assert result["success"] is True
+        assert [i["name"] for i in result["inputs_delivered"]] == ["one.tsv", "two.tsv"]
+
+    async def test_the_default_timeout_refuses_three(self, executor, monkeypatch):
+        """The other edge of the same rule, so neither can move unnoticed."""
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor,
+            sandbox,
+            [{"url": f"https://example.org/{n}.tsv"} for n in ("one", "two", "three")],
+        )
+        assert result["error_type"] == "InputBudgetExceeded"
+        assert fetcher.calls == []
+
+    async def test_a_fetch_phase_that_runs_long_is_cut_off_at_what_admission_assumed(
+        self, executor, monkeypatch
+    ):
+        """Admission PREDICTS `worst_fetch`; nothing in the fetch client bounds it (the read
+        deadline is per chunk, and the fetcher resolves names outside any clock). Unbounded,
+        the phase eats the execution's share of the turn and a live sandbox is killed at the
+        turn budget and reported as TurnBudgetExceeded."""
+        from genetics_mcp_server import url_fetch_client as fetcher_module
+
+        # the real bound is 45s per url; shrunk here so the test costs milliseconds, and it
+        # is the same two attributes the admission rule reads
+        monkeypatch.setattr(fetcher_module, "client_deadline_s", lambda: 0.05)
+        monkeypatch.setattr(fetcher_module, "FETCHER_CONNECT_TIMEOUT_S", 0.0)
+
+        class _SlowFetcher(_StubFetcher):
+            async def fetch(self, url, *, user):
+                self.calls.append((url, user))
+                await asyncio.sleep(30)
+                raise AssertionError("the phase bound did not fire")
+
+        fetcher = _install_fetcher(monkeypatch, _SlowFetcher())
+        sandbox = _StubSandbox(result=_result_body())
+        started = time.monotonic()
+        result = await _run_with_inputs(executor, sandbox, [{"url": "https://example.org/x.tsv"}])
+        elapsed = time.monotonic() - started
+
+        assert result["error_type"] == "InputUnavailable"
+        assert result["retryable"] is True
+        assert "Nothing was run" in result["error"]
+        assert fetcher.calls, "the fetch was attempted"
+        assert sandbox.calls == [], "no execution is created when the phase is cut off"
+        assert elapsed < 5, f"the caller waited {elapsed:.1f}s on a stub that never answers"
+
+    async def test_an_attachment_costs_nothing_against_the_fetch_budget(
+        self, executor, monkeypatch, tmp_path
+    ):
+        from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
+
+        path = tmp_path / "upload.tsv"
+        path.write_bytes(b"a\n")
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-9", "upload.tsv", path)],
+            ),
+        )
+        result = await _run_with_inputs(
+            executor,
+            _StubSandbox(result=_result_body()),
+            [{"attachment_id": "att-1"}],
+            timeout_s=MAX_TIMEOUT_S,
+        )
+        assert result["success"] is True
+
+
+class TestRunAnalysisAttachmentInputs:
+    """vxtv.14: the owner check and the session check, and one answer for both failures."""
+
+    @pytest.fixture
+    def upload(self, tmp_path):
+        path = tmp_path / "cohort.tsv"
+        path.write_bytes(b"id\tvalue\n1\t2\n")
+        return path
+
+    async def test_the_owner_in_this_session_gets_the_bytes(self, executor, monkeypatch, upload):
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-9", "cohort.tsv", upload)],
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"attachment_id": "att-1"}])
+        delivered = sandbox.calls[0]["inputs"][0]
+        assert delivered.name == "cohort.tsv"
+        assert delivered.content == upload.read_bytes()
+        assert delivered.expected_sha256 == hashlib.sha256(upload.read_bytes()).hexdigest()
+        assert result["inputs_delivered"][0]["source"] == "attachment"
+
+    async def test_another_users_attachment_is_refused(self, executor, monkeypatch, upload):
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="someone-else@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-9", "cohort.tsv", upload)],
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"attachment_id": "att-1"}])
+        assert result["error_type"] == "InputNotFound"
+        assert result["retryable"] is False
+        assert sandbox.calls == []
+
+    async def test_an_attachment_of_another_session_is_refused(
+        self, executor, monkeypatch, upload
+    ):
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-OTHER", "cohort.tsv", upload)],
+            ),
+        )
+        result = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"attachment_id": "att-1"}]
+        )
+        assert result["error_type"] == "InputNotFound"
+
+    async def test_foreign_and_absent_read_identically(self, executor, monkeypatch, upload):
+        """The message must not become an oracle for which attachment ids exist."""
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="someone-else@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-9", "cohort.tsv", upload)],
+            ),
+        )
+        foreign = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"attachment_id": "att-1"}]
+        )
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(owner="u@finngen.fi", session_id="conv-9", rows=[]),
+        )
+        absent = await _run_with_inputs(
+            executor, _StubSandbox(result=_result_body()), [{"attachment_id": "att-1"}]
+        )
+        assert foreign == absent
+
+    async def test_a_recorded_attachment_whose_bytes_are_gone_is_its_own_type(
+        self, executor, monkeypatch, tmp_path
+    ):
+        """A row pointing at storage that cannot be read is OUR fault, and neither a retry
+        nor a fresh upload of the same file clears it — so it is not `InputUnavailable`."""
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[
+                    _FakeAttachment("att-1", "conv-9", "gone.tsv", tmp_path / "not-written.tsv")
+                ],
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"attachment_id": "att-1"}])
+        assert result["error_type"] == "InputUnreadable"
+        assert result["retryable"] is False
+        assert "could not be read back" in result["error"]
+        assert sandbox.calls == []
+
+    def test_the_resolver_needs_both_the_owner_and_the_session(self, upload):
+        from genetics_mcp_server.routers.chat_history import resolve_owned_attachment
+
+        store = _FakeAttachmentStore(
+            owner="u@finngen.fi",
+            session_id="conv-9",
+            rows=[_FakeAttachment("att-1", "conv-9", "cohort.tsv", upload)],
+        )
+        assert resolve_owned_attachment(store, "u@finngen.fi", "conv-9", "att-1") is not None
+        assert resolve_owned_attachment(store, "other@finngen.fi", "conv-9", "att-1") is None
+        assert resolve_owned_attachment(store, "u@finngen.fi", "conv-OTHER", "att-1") is None
+        assert resolve_owned_attachment(store, None, "conv-9", "att-1") is None
+
+
+class TestRunAnalysisInputsDefinition:
+    def test_the_schema_offers_one_source_per_item_and_mirrors_the_transport_cap(self):
+        from genetics_mcp_server.sandbox_client import MAX_INPUTS
+
+        by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
+        inputs = by_name["run_analysis"]["parameters"]["inputs"]
+        assert inputs["type"] == "array"
+        assert inputs["maxItems"] == MAX_INPUTS
+        assert set(inputs["items"]["properties"]) == {"url", "attachment_id", "name"}
+        assert not inputs.get("required")
+
+    def test_the_cap_reaches_the_emitted_schema(self):
+        from genetics_mcp_server.sandbox_client import MAX_INPUTS
+
+        tool = next(
+            t for t in get_anthropic_tools(code_execution=True) if t["name"] == "run_analysis"
+        )
+        assert tool["input_schema"]["properties"]["inputs"]["maxItems"] == MAX_INPUTS
+
+    async def test_more_sources_than_the_cap_are_refused_before_any_fetch(
+        self, executor, monkeypatch
+    ):
+        from genetics_mcp_server.sandbox_client import MAX_INPUTS
+
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor,
+            sandbox,
+            [{"url": f"https://example.org/{n}.tsv"} for n in range(MAX_INPUTS + 1)],
+        )
+        assert result["error_type"] == "InputRejected"
+        assert fetcher.calls == []
+        assert sandbox.calls == []
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "https://example.org/x.tsv",
+            {},
+            {"url": "https://example.org/x.tsv", "attachment_id": "att-1"},
+            {"name": "x.tsv"},
+        ],
+    )
+    async def test_an_item_naming_no_single_source_is_refused(
+        self, executor, monkeypatch, entry
+    ):
+        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
+        result = await _run_with_inputs(executor, _StubSandbox(result=_result_body()), [entry])
+        assert result["error_type"] == "InputRejected"
+        assert fetcher.calls == []
