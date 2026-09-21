@@ -92,6 +92,29 @@ class Settings:
         ).lower() in ("1", "true", "yes")
     )
 
+    # base URL of the url-fetcher (url-fetcher/server.py, the two-route contract). NO DEFAULT,
+    # for the same reason sandbox_url has none: a guessed address points a POST at whatever
+    # occupies a common port on a dev machine, and that service's answers classify as fetcher
+    # failures instead of "nothing is configured". Empty here and refused loudly at
+    # UrlFetchClient construction.
+    url_fetcher_url: str = field(
+        default_factory=lambda: os.environ.get("URL_FETCHER_URL", "")
+    )
+
+    # bounds of the in-memory per-user fetch cache (url_fetch_client.FetchCache). Either at or
+    # below zero disables caching, which must change nothing but latency. The TTL is minutes
+    # rather than hours because the cache exists to serve one analysis loop — measured on the
+    # staging chat DB, a reply runs 2.5 executions at the median and 16 at the tail — not to
+    # stand in for a download store.
+    url_fetch_cache_ttl_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("URL_FETCH_CACHE_TTL_SECONDS", "900"))
+    )
+    # 32 MiB against a 512 KiB per-fetch cap, so the ceiling is reached by entries rather than
+    # by one file
+    url_fetch_cache_max_bytes: int = field(
+        default_factory=lambda: int(os.environ.get("URL_FETCH_CACHE_MAX_BYTES", "33554432"))
+    )
+
     # the tool profile a user gets before choosing one. It is served through the user-settings
     # endpoint rather than applied to the chat request, because the browser sends its choice
     # explicitly on every turn and sends null for "All" — a request-side default could not tell
