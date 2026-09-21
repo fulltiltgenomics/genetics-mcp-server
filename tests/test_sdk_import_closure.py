@@ -120,7 +120,10 @@ def test_named_modules_stay_out(module):
 # The distributions genetics-results-suite/sandbox/requirements.txt pins. pip installs those
 # WITH their dependencies; the SDK wheel then goes in --no-deps (docs/code-execution-security.md,
 # "Deviation 2"), so this list plus its transitive requirements is the entire third-party surface
-# the sandbox interpreter has. Changing it means changing that file, and vice versa.
+# the sandbox interpreter has that the SDK may reach. Changing it means changing that file, and
+# vice versa — EXCEPT for that file's deliberate openings (scienceplots, pypdf), which are
+# deliberately absent here: they are installed for a script to use and the SDK must never import
+# them, so a shipped source file naming one is exactly what the test below should fail.
 SANDBOX_PINNED_DISTRIBUTIONS = ("numpy", "scipy", "polars", "matplotlib", "httpx")
 
 # The top-level module names those pins provide, and the only third-party names a shipped source
