@@ -2455,11 +2455,12 @@ class TestRunAnalysisInputErrorTaxonomy:
         assert "upload the file as an attachment instead" in result["error"]
         assert sandbox.calls == []
 
-    async def test_an_unconfigured_fetcher_answers_even_when_the_budget_would_refuse(
+    async def test_an_unconfigured_fetcher_is_never_answered_with_lower_timeout_s(
         self, executor, monkeypatch
     ):
-        """timeout_s=120 leaves no room for any url, but "lower timeout_s" is advice this
-        deployment can never act on — no timeout_s makes an absent fetcher reachable."""
+        """"Lower timeout_s" is advice this deployment can never act on — no timeout_s makes
+        an absent fetcher reachable — so this branch answers ahead of every budget wording,
+        at the timeout_s that leaves a url the least room."""
         from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
         from genetics_mcp_server.url_fetch_client import UrlFetchNotConfigured
 
@@ -2650,11 +2651,11 @@ class TestRunAnalysisInputIntegrity:
 
 
 class TestRunAnalysisInputDeadline:
-    """Decision 6: the fetch worst case and one execution attempt share the turn budget."""
+    """Decision 6: resolution gets the turn budget left once one execution attempt is reserved."""
 
     @staticmethod
     def _numbers():
-        """The four terms the admission rule is built from, taken from their own modules."""
+        """The four terms the reservation is built from, taken from their own modules."""
         from genetics_mcp_server import url_fetch_client as fetcher_module
         from genetics_mcp_server.sandbox_client import (
             BODY_WRITE_DEADLINE_S,
@@ -2676,70 +2677,83 @@ class TestRunAnalysisInputDeadline:
             float(orchestration_module.ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S),
         )
 
-    def test_the_admitted_edges_are_two_urls_at_60s_and_none_at_120s(self):
-        """The per-url cost includes the CONNECT timeout to the fetcher, which the fetch
-        client's own deadline does not cover: 40 + 5, not 40. If any of these numbers moves,
-        this fails before the behavioural tests below do and says which edge went."""
+    def test_the_reservation_leaves_90s_at_60s_and_30s_at_120s(self):
+        """The two numbers the comment beside the reservation quotes. The per-url cost
+        includes the CONNECT timeout to the fetcher, which the fetch client's own deadline
+        does not cover: 40 + 5, not 40. If any of these moves, this fails before the
+        behavioural tests below do and says which term went."""
         per_url, attempt_60, attempt_120, budget = self._numbers()
         assert (per_url, attempt_60, attempt_120, budget) == (45.0, 210.0, 270.0, 300.0)
-        assert 2 * per_url + attempt_60 == budget  # exactly 300s: admitted
-        assert 3 * per_url + attempt_60 > budget  # 345s: refused
-        assert 1 * per_url + attempt_120 > budget  # 315s: refused, no url fits at all
+        assert budget - attempt_60 == 90.0
+        assert budget - attempt_120 == 30.0
 
-    async def test_a_request_that_cannot_fit_is_refused_before_any_fetch(
+    async def test_four_urls_at_the_maximum_timeout_are_admitted_and_keep_their_timeout_s(
         self, executor, monkeypatch
     ):
+        """Nothing is charged the fetcher's worst case up front: four urls whose fetches
+        answer at once run, and the execution gets the timeout_s it asked for."""
         from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
 
-        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
-        sandbox = _StubSandbox(result=_result_body())
-        result = await _run_with_inputs(
-            executor, sandbox, [{"url": "https://example.org/x.tsv"}], timeout_s=MAX_TIMEOUT_S
-        )
-        assert result["error_type"] == "InputBudgetExceeded"
-        assert result["retryable"] is False
-        assert str(orchestration_module.ServerToolExecutor._RUN_ANALYSIS_DEADLINE_S) in result["error"]
-        assert fetcher.calls == [], "the refusal must precede the first fetch"
-        assert sandbox.calls == []
-
-    async def test_the_default_timeout_still_admits_two_urls(self, executor, monkeypatch):
         files = {
             f"https://example.org/{n}.tsv": _fetched(
                 url=f"https://example.org/{n}.tsv", name=f"{n}.tsv"
             )
-            for n in ("one", "two")
+            for n in ("one", "two", "three", "four")
         }
         _install_fetcher(monkeypatch, _StubFetcher(files=files))
         sandbox = _StubSandbox(result=_result_body())
-        result = await _run_with_inputs(executor, sandbox, [{"url": u} for u in files])
-        assert result["success"] is True
-        assert [i["name"] for i in result["inputs_delivered"]] == ["one.tsv", "two.tsv"]
-
-    async def test_the_default_timeout_refuses_three(self, executor, monkeypatch):
-        """The other edge of the same rule, so neither can move unnoticed."""
-        fetcher = _install_fetcher(monkeypatch, _StubFetcher())
-        sandbox = _StubSandbox(result=_result_body())
         result = await _run_with_inputs(
-            executor,
-            sandbox,
-            [{"url": f"https://example.org/{n}.tsv"} for n in ("one", "two", "three")],
+            executor, sandbox, [{"url": u} for u in files], timeout_s=MAX_TIMEOUT_S
         )
-        assert result["error_type"] == "InputBudgetExceeded"
-        assert fetcher.calls == []
+        assert result["success"] is True
+        assert [i["name"] for i in result["inputs_delivered"]] == [
+            "one.tsv",
+            "two.tsv",
+            "three.tsv",
+            "four.tsv",
+        ]
+        assert sandbox.calls[0]["timeout_s"] == MAX_TIMEOUT_S
 
-    async def test_a_fetch_phase_that_runs_long_is_cut_off_at_what_admission_assumed(
+    async def test_the_phase_bound_is_what_is_left_after_the_reservation(
         self, executor, monkeypatch
     ):
-        """Admission PREDICTS `worst_fetch`; nothing in the fetch client bounds it (the read
-        deadline is per chunk, and the fetcher resolves names outside any clock). Unbounded,
-        the phase eats the execution's share of the turn and a live sandbox is killed at the
-        turn budget and reported as TurnBudgetExceeded."""
-        from genetics_mcp_server import url_fetch_client as fetcher_module
+        """min(worst_fetch, budget - worst_attempt), whichever binds: one url at the default
+        is bounded by the fetcher's own worst case, four at the maximum by the reservation."""
+        from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
 
-        # the real bound is 45s per url; shrunk here so the test costs milliseconds, and it
-        # is the same two attributes the admission rule reads
-        monkeypatch.setattr(fetcher_module, "client_deadline_s", lambda: 0.05)
-        monkeypatch.setattr(fetcher_module, "FETCHER_CONNECT_TIMEOUT_S", 0.0)
+        per_url, attempt_60, attempt_120, budget = self._numbers()
+        recorded = []
+        real_wait_for = asyncio.wait_for
+
+        async def _recording_wait_for(awaitable, timeout):
+            recorded.append(timeout)
+            return await real_wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", _recording_wait_for)
+        files = {
+            f"https://example.org/{n}.tsv": _fetched(
+                url=f"https://example.org/{n}.tsv", name=f"{n}.tsv"
+            )
+            for n in ("one", "two", "three", "four")
+        }
+        _install_fetcher(monkeypatch, _StubFetcher(files=files))
+        sandbox = _StubSandbox(result=_result_body())
+
+        one = [{"url": "https://example.org/one.tsv"}]
+        assert (await _run_with_inputs(executor, sandbox, one))["success"] is True
+        # the resolution phase is bounded first, the execution second
+        assert recorded[0] == min(per_url, budget - attempt_60) == per_url
+
+        recorded.clear()
+        result = await _run_with_inputs(
+            executor, sandbox, [{"url": u} for u in files], timeout_s=MAX_TIMEOUT_S
+        )
+        assert result["success"] is True
+        assert recorded[0] == min(4 * per_url, budget - attempt_120) == 30.0
+
+    @staticmethod
+    def _slow_fetcher(monkeypatch):
+        """A fetcher that never answers, installed so only a phase bound can end the wait."""
 
         class _SlowFetcher(_StubFetcher):
             async def fetch(self, url, *, user):
@@ -2747,7 +2761,57 @@ class TestRunAnalysisInputDeadline:
                 await asyncio.sleep(30)
                 raise AssertionError("the phase bound did not fire")
 
-        fetcher = _install_fetcher(monkeypatch, _SlowFetcher())
+        return _install_fetcher(monkeypatch, _SlowFetcher())
+
+    async def test_a_fetch_that_outruns_the_reservation_is_the_budget_error(
+        self, executor, monkeypatch
+    ):
+        """The reservation binds from three urls at the default and every url at the maximum.
+        A second attempt would be cut at the same place, so this one is not retryable."""
+        from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
+
+        # the real remainder at the maximum timeout_s is 30s; shrunk here so the test costs
+        # milliseconds, through the same constant the reservation subtracts from
+        monkeypatch.setattr(
+            orchestration_module.ServerToolExecutor, "_RUN_ANALYSIS_DEADLINE_S", 270.05
+        )
+        fetcher = self._slow_fetcher(monkeypatch)
+        sandbox = _StubSandbox(result=_result_body())
+        started = time.monotonic()
+        result = await _run_with_inputs(
+            executor,
+            sandbox,
+            [{"url": f"https://example.org/{n}.tsv"} for n in ("one", "two", "three", "four")],
+            timeout_s=MAX_TIMEOUT_S,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result["error_type"] == "InputBudgetExceeded"
+        assert result["retryable"] is False
+        assert "fetching 4 URL input(s) did not finish in the" in result["error"]
+        assert "after reserving 270s for a run with timeout_s=120" in result["error"]
+        assert "lower timeout_s or fetch fewer URLs in one call" in result["error"]
+        assert fetcher.calls, "the fetch was attempted before anything was refused"
+        assert sandbox.calls == [], "no execution is created when the phase is cut off"
+        assert elapsed < 5, f"the caller waited {elapsed:.1f}s on a stub that never answers"
+
+    async def test_a_fetch_that_outruns_the_fetchers_own_worst_case_stays_retryable(
+        self, executor, monkeypatch
+    ):
+        """One url at the default is bounded by the fetcher's worst case, not the
+        reservation: this request had everything it could ask for, and a slow origin is the
+        likely cause. Nothing in the fetch client bounds a fetch on its own (the read
+        deadline is per chunk, and the fetcher resolves names outside any clock) — unbounded,
+        the phase eats the execution's share of the turn and a live sandbox is killed at the
+        turn budget and reported as TurnBudgetExceeded."""
+        from genetics_mcp_server import url_fetch_client as fetcher_module
+
+        # the real bound is 45s per url; shrunk here so the test costs milliseconds, and it
+        # is the same two attributes the phase bound reads
+        monkeypatch.setattr(fetcher_module, "client_deadline_s", lambda: 0.05)
+        monkeypatch.setattr(fetcher_module, "FETCHER_CONNECT_TIMEOUT_S", 0.0)
+
+        fetcher = self._slow_fetcher(monkeypatch)
         sandbox = _StubSandbox(result=_result_body())
         started = time.monotonic()
         result = await _run_with_inputs(executor, sandbox, [{"url": "https://example.org/x.tsv"}])
@@ -2755,8 +2819,9 @@ class TestRunAnalysisInputDeadline:
 
         assert result["error_type"] == "InputUnavailable"
         assert result["retryable"] is True
+        assert "may work on a second attempt" in result["error"]
         assert "Nothing was run" in result["error"]
-        assert fetcher.calls, "the fetch was attempted"
+        assert fetcher.calls, "the fetch was attempted before anything was refused"
         assert sandbox.calls == [], "no execution is created when the phase is cut off"
         assert elapsed < 5, f"the caller waited {elapsed:.1f}s on a stub that never answers"
 

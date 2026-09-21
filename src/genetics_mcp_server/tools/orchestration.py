@@ -1575,11 +1575,10 @@ class ServerToolExecutor(ToolExecutor):
         url_count = sum(1 for spec in specs if spec.kind == "url")
         fetch_client = None
         if url_count:
-            # BEFORE the admission rule below, not on the first fetch: with no fetcher
-            # configured there is no budget question to answer, and answering "lower
-            # timeout_s" to a deployment that can never fetch anything sends the model round
-            # a loop that cannot succeed. Attachments still work here, so the message names
-            # the channel that does rather than reporting the tool as broken.
+            # Obtained here rather than at the first fetch so that a deployment with no
+            # fetcher is told so, rather than being told to lower timeout_s — advice no
+            # timeout_s can act on. Attachments still work, so the message names the channel
+            # that does rather than reporting the tool as broken.
             try:
                 fetch_client = fetcher.get_url_fetch_client()
             except fetcher.UrlFetchNotConfigured as e:
@@ -1594,25 +1593,26 @@ class ServerToolExecutor(ToolExecutor):
                     ),
                 )
 
-        worst_fetch = url_count * (
-            fetcher.client_deadline_s() + fetcher.FETCHER_CONNECT_TIMEOUT_S
-        )
         if url_count:
-            # THE ADMISSION RULE, and the one place the fetch budget meets the turn budget.
-            # Fetches are sequential and all of them happen before the execution, so this
-            # turn's 300s must hold `url_count * the fetch client's per-fetch worst case`
-            # (45s each: the fetcher's 30s wall clock, a 10s margin, and the 5s this client
-            # allows to connect to the fetcher at all) PLUS one worst-case attempt — connect
-            # 5 + body write 10 + the supervisor's 120s queued wait + timeout_s + a 15s
-            # margin. An attachment is a local read and costs nothing here.
+            worst_fetch = url_count * (
+                fetcher.client_deadline_s() + fetcher.FETCHER_CONNECT_TIMEOUT_S
+            )
+            # THE RESERVATION, and the one place the fetch budget meets the turn budget.
+            # Fetches are sequential and all of them precede the execution, so the turn's
+            # budget must still hold one worst-case attempt — connect + body write + the
+            # supervisor's queued wait + timeout_s + a margin — after the last byte lands.
+            # Reserving that and giving resolution only what is left makes `budget_s >=
+            # worst_attempt` true by construction where the execution is launched, so the
+            # execution is never handed a turn budget shorter than one worst-case attempt at
+            # the timeout_s it asked for. The reservation
+            # leaves 90s at the default timeout_s of 60 and 30s at the maximum 120; the
+            # fetcher's own per-fetch worst case caps the phase below that where it is smaller.
             #
-            # Over the budget the call is refused BEFORE the first fetch rather than part way
-            # through: bytes that land after the turn's budget is gone have spent the user's
-            # time on something nothing can use. At the default timeout_s of 60 that admits
-            # two urls (90 + 210 = 300s, exactly the budget) and refuses three (135 + 210);
-            # a script asking for the full 120s has already been promised most of the turn
-            # and gets no url fetches at all (45 + 270) — the test beside this one fails if
-            # either edge moves.
+            # Nothing is refused before it is tried. A fetch normally answers in well under a
+            # second, and charging every call the fetcher's per-fetch worst case up front
+            # refused calls that nothing had slowed — a single cached URL with a high
+            # timeout_s among them. A fetch that is genuinely slow is refused when it
+            # overruns the reservation. An attachment is a local read and costs nothing here.
             effective = (
                 timeout_s
                 if isinstance(timeout_s, int)
@@ -1623,18 +1623,9 @@ class ServerToolExecutor(ToolExecutor):
             worst_attempt = (
                 CONNECT_TIMEOUT_S + BODY_WRITE_DEADLINE_S + client_deadline_s(effective)
             )
-            if worst_fetch + worst_attempt > self._RUN_ANALYSIS_DEADLINE_S:
-                return (
-                    [],
-                    [],
-                    self._input_error(
-                        f"{url_count} URL input(s) can take up to {worst_fetch:.0f}s to fetch "
-                        f"and a run with timeout_s={effective} up to {worst_attempt:.0f}s, "
-                        f"which is over this turn's {self._RUN_ANALYSIS_DEADLINE_S}s budget. "
-                        "Fetch fewer URLs in one call, or lower timeout_s.",
-                        "InputBudgetExceeded",
-                    ),
-                )
+            resolve_budget_s = min(
+                worst_fetch, self._RUN_ANALYSIS_DEADLINE_S - worst_attempt
+            )
 
         async def resolve_all() -> tuple[list[Any], list[dict[str, Any]], dict[str, Any] | None]:
             resolved: list[Any] = []
@@ -1853,27 +1844,45 @@ class ServerToolExecutor(ToolExecutor):
         if not url_count:
             return await resolve_all()
         try:
-            # THE PREDICTION, ENFORCED. Admission above assumed `worst_fetch` and no more,
-            # and neither half of that is bounded on its own: `client_deadline_s` is a read
-            # deadline per chunk of `aiter_bytes`, so a trickling responder extends it, and
-            # the fetcher's own `guard.check` resolves names outside any clock. Without this
-            # cap the phase can outrun its share of the turn, the execution is then handed a
-            # budget smaller than one attempt, and a live sandbox is killed at
-            # `asyncio.wait_for` and reported as `TurnBudgetExceeded`.
-            return await asyncio.wait_for(resolve_all(), timeout=worst_fetch)
+            # THE RESERVATION, ENFORCED. Neither half of a fetch is bounded on its own:
+            # `client_deadline_s` is a read deadline per chunk of `aiter_bytes`, so a
+            # trickling responder extends it, and the fetcher's own `guard.check` resolves
+            # names outside any clock. Without this cap the phase can outrun its share of
+            # the turn, the execution is then handed a budget smaller than one attempt, and
+            # a live sandbox is killed at `asyncio.wait_for` and reported as
+            # `TurnBudgetExceeded`.
+            return await asyncio.wait_for(resolve_all(), timeout=resolve_budget_s)
         except asyncio.TimeoutError:
             logger.warning(
                 "run_analysis input resolution ran past its %.0fs phase budget (session=%s)",
-                worst_fetch,
+                resolve_budget_s,
                 session_id,
             )
+            # WHICH TERM OF THE `min` CUT IT OFF decides what the model is told, and the two
+            # call for opposite next moves. Cut short by the reservation, the fetches never
+            # had their own worst case available and a second attempt at this timeout_s would
+            # be cut at the same place — so it is the budget error, and not retryable. Cut off
+            # at the fetcher's own worst case, this request had everything it could ask for
+            # and a slow origin is the likely cause, which a retry may well survive.
+            if resolve_budget_s < worst_fetch:
+                return (
+                    [],
+                    [],
+                    self._input_error(
+                        f"fetching {url_count} URL input(s) did not finish in the "
+                        f"{resolve_budget_s:.0f}s left after reserving {worst_attempt:.0f}s "
+                        f"for a run with timeout_s={effective}; lower timeout_s or fetch "
+                        "fewer URLs in one call. Nothing was run.",
+                        "InputBudgetExceeded",
+                    ),
+                )
             return (
                 [],
                 [],
                 self._input_error(
-                    f"The files could not be fetched within the {worst_fetch:.0f}s this turn "
-                    "allows for fetching. Nothing was run. This may work on a second attempt, "
-                    "or with fewer URLs in one call.",
+                    f"The files could not be fetched within the {resolve_budget_s:.0f}s this "
+                    "turn allows for fetching. Nothing was run. This may work on a second "
+                    "attempt, or with fewer URLs in one call.",
                     "InputUnavailable",
                     retryable=True,
                 ),
@@ -2079,11 +2088,12 @@ class ServerToolExecutor(ToolExecutor):
                 return refusal
             # what the fetches ACTUALLY spent comes off this turn's budget — never off the
             # client's per-attempt read deadline, which is derived from the supervisor's own
-            # worst case and must not be shortened. `budget_s >= worst_attempt` holds here
-            # because `_resolve_inputs` does BOTH halves: it refuses up front anything whose
-            # worst case would not fit, and it then caps the resolution phase at exactly the
-            # `worst_fetch` that admission assumed, so the subtraction below cannot exceed
-            # it. Either half alone leaves this false — admission predicts, the cap enforces.
+            # worst case and must not be shortened. Where url inputs were fetched,
+            # `budget_s >= worst_attempt` holds by construction: `_resolve_inputs` caps that
+            # phase at the budget left once one worst-case attempt at this timeout_s is
+            # reserved, measured from this same constant, so the subtraction cannot take more
+            # than the phase was allowed. An attachment is a local read against no such cap,
+            # and costs what it costs.
             budget_s -= time.monotonic() - started
 
         try:
