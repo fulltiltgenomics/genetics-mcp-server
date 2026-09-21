@@ -671,3 +671,67 @@ class TestHealth:
 
         client, _ = _client(boom)
         assert await client.healthy() is False
+
+
+class TestTheAllowList:
+    """`allowed_hosts()` — the prompt's source for which hosts a URL input can come from."""
+
+    async def test_the_list_is_read_once_and_cached(self):
+        client, recorder = _client(
+            httpx.Response(200, json={"status": "ok", "allowed_hosts": ["a.example", "b.example"]})
+        )
+        assert await client.allowed_hosts() == ("a.example", "b.example")
+        assert await client.allowed_hosts() == ("a.example", "b.example")
+        assert recorder.calls == 1
+
+    async def test_an_absent_field_is_unknown_rather_than_empty(self):
+        client, _ = _client(httpx.Response(200, json={"status": "ok"}))
+        assert await client.allowed_hosts() is None
+
+    async def test_an_unreachable_fetcher_is_none(self):
+        def boom(request):
+            raise httpx.ConnectError("refused", request=request)
+
+        client, _ = _client(boom)
+        assert await client.allowed_hosts() is None
+
+    async def test_a_non_200_is_none(self):
+        client, _ = _client(httpx.Response(503, json={"error": {"type": "x"}}))
+        assert await client.allowed_hosts() is None
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"allowed_hosts": "a.example"},
+            {"allowed_hosts": ["a.example", 7]},
+            {"allowed_hosts": {"a.example": True}},
+            {"allowed_hosts": None},
+            ["a.example"],
+        ],
+    )
+    async def test_a_malformed_list_is_none(self, body):
+        client, _ = _client(httpx.Response(200, json=body))
+        assert await client.allowed_hosts() is None
+
+    async def test_a_body_that_is_not_json_is_none(self):
+        client, _ = _client(
+            httpx.Response(200, content=b"not json", headers={"Content-Type": "application/json"})
+        )
+        assert await client.allowed_hosts() is None
+
+    async def test_a_failure_is_not_cached(self):
+        """The fetcher can come up after this process did; only a success is remembered."""
+        client, recorder = _client(
+            httpx.Response(200, json={"status": "ok"}),
+            httpx.Response(200, json={"status": "ok", "allowed_hosts": ["a.example"]}),
+        )
+        assert await client.allowed_hosts() is None
+        assert await client.allowed_hosts() == ("a.example",)
+        assert recorder.calls == 2
+
+    async def test_an_empty_list_is_an_answer_and_is_cached(self):
+        """A fetcher that can reach nothing is knowable; only "cannot say" is None."""
+        client, recorder = _client(httpx.Response(200, json={"status": "ok", "allowed_hosts": []}))
+        assert await client.allowed_hosts() == ()
+        assert await client.allowed_hosts() == ()
+        assert recorder.calls == 1

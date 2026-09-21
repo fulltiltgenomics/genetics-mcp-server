@@ -30,7 +30,12 @@ from collections.abc import Collection, Iterable
 from functools import lru_cache
 
 from genetics_mcp_server import schema_docs
-from genetics_mcp_server.config.prompt_blocks import _Block, _fs
+from genetics_mcp_server.config.prompt_blocks import (
+    _Block,
+    _fs,
+    block_text,
+    url_input_hosts_rule,
+)
 from genetics_mcp_server.config.prompt_condensed import (
     CONDENSED_PROMPT_BLOCKS as _CONDENSED_PROMPT_BLOCKS,
 )
@@ -634,6 +639,10 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
 """,
         requires_any=_fs("run_analysis"),
     ),
+    # the fifth inputs rule, and the only one whose text is not written here: the allow-list
+    # lives in the fetcher's configuration, and a copy of it in this file would be wrong the
+    # next time that changes. Emitted only when the deployment has a fetcher that says so.
+    _Block("", requires_any=_fs("run_analysis"), render=url_input_hosts_rule),
     _Block(
         "\n- Scripts are the only data path on this surface, so a question that needs data needs a script. Everything the SDK exposes is discoverable with list_capabilities; do not conclude data is unavailable without checking there first.\n",
         excludes=_fs("get_credible_sets_by_gene", "query_database"),
@@ -802,7 +811,7 @@ def _assemble(
     tool_names: Collection[str] | None, blocks: tuple[_Block, ...] = _PROMPT_BLOCKS
 ) -> str:
     if tool_names is None:
-        return "".join(b.text for b in blocks)
+        return "".join(t for b in blocks if (t := block_text(b)) is not None)
     available = frozenset(tool_names)
     parts: list[str] = []
     for block in blocks:
@@ -814,7 +823,10 @@ def _assemble(
             continue
         if not block.requires_all <= available:
             continue
-        parts.append(block.text)
+        text = block_text(block)
+        if text is None:
+            continue
+        parts.append(text)
     return "".join(parts)
 
 

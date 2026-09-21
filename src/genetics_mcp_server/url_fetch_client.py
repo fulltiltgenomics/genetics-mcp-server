@@ -50,6 +50,11 @@ FETCH_PATH = "/fetch"
 HEALTH_PATH = "/healthz"
 """``server.py``: two routes and no third."""
 
+HEALTH_ALLOWED_HOSTS_FIELD = "allowed_hosts"
+"""``server.do_GET``: the guard's host allow-list, carried on the health route. A fetcher that
+does not send the field is not the same as one that allows nothing, so absence reads as
+unknown rather than as an empty list."""
+
 MAX_REQUEST_BYTES = 8 * 1024
 """``server.MAX_REQUEST_BYTES``. The route takes a url and nothing else, and answers 413 to a
 larger body, so the serialised payload is measured here and refused locally instead."""
@@ -99,6 +104,12 @@ found here, so a name that collides across the two ends with two meanings defeat
 
 Short on purpose, for the same reason the sandbox client's is: "no fetcher at all" is a deploy
 state that must be distinguishable from a slow upstream."""
+
+ALLOW_LIST_PROBE_TIMEOUT_S = 1.0
+"""Per-phase bound on the allow-list probe, giving it a ~2 s worst case against the 10 s
+:data:`FETCHER_CONNECT_TIMEOUT_S` allows. It is deliberately tighter than a health check:
+this probe runs on system-prompt assembly and buys one sentence of the prompt, so a fetcher
+that accepts a connection and then says nothing must not hold a chat turn for ten seconds."""
 
 RESPONSE_MARGIN_S = 10
 """The client's allowance over the fetcher's wall clock for base64, serialisation and the
@@ -414,6 +425,7 @@ class UrlFetchClient:
         self.base_url = resolved.rstrip("/")
         self.cache = cache if cache is not None else FetchCache(ttl_s=0, max_bytes=0)
         self._transport = transport
+        self._allowed_hosts: tuple[str, ...] | None = None
 
     def _client(self, timeout: httpx.Timeout) -> httpx.AsyncClient:
         # a fresh client per call, so nothing here keeps a connection between fetches. Leaving
@@ -426,20 +438,63 @@ class UrlFetchClient:
             base_url=self.base_url, timeout=timeout, transport=self._transport
         )
 
-    async def healthy(self) -> bool:
-        """``GET /healthz``. True iff the fetcher answered 200; never raises, because every
-        caller of this wants "is it there" rather than a diagnosis."""
+    async def _health(self, phase_timeout_s: float = FETCHER_CONNECT_TIMEOUT_S) -> httpx.Response | None:
+        """``GET /healthz``, or None if the fetcher could not be reached at all.
+
+        ``phase_timeout_s`` bounds connect and read separately, so the worst case a caller can
+        wait is twice it: a connect that stalls to its limit, then a response that never
+        arrives."""
         timeout = httpx.Timeout(
-            FETCHER_CONNECT_TIMEOUT_S,
-            connect=FETCHER_CONNECT_TIMEOUT_S,
-            read=FETCHER_CONNECT_TIMEOUT_S,
+            phase_timeout_s, connect=phase_timeout_s, read=phase_timeout_s
         )
         try:
             async with self._client(timeout) as client:
-                response = await client.get(HEALTH_PATH)
+                return await client.get(HEALTH_PATH)
         except httpx.HTTPError:
-            return False
-        return response.status_code == 200
+            return None
+
+    async def healthy(self) -> bool:
+        """``GET /healthz``. True iff the fetcher answered 200; never raises, because every
+        caller of this wants "is it there" rather than a diagnosis."""
+        response = await self._health()
+        return response is not None and response.status_code == 200
+
+    async def allowed_hosts(self) -> tuple[str, ...] | None:
+        """The hosts the fetcher's guard will fetch from, or None when it cannot say.
+
+        None covers every way the answer is not knowable — unreachable, non-200, the field
+        absent because the fetcher predates it, or a shape that is not a list of strings —
+        because a caller that cannot distinguish them would have to guess, and the one caller
+        there is (the system prompt) says nothing rather than guessing.
+
+        Cached on the instance after the first success, and never re-read. That is a cache in
+        a **different pod** from the one whose configuration it holds, so it does go stale:
+        widening the fetcher's list leaves this process naming the old one until it restarts.
+        What makes that acceptable is that nothing here is the decision — the fetcher still
+        refuses or allows the fetch itself, and the only cost of a stale copy is that the model
+        is told about a host it no longer has to avoid, or not told about one it could now use,
+        for one refused fetch. Narrowing the list is never unsafe for the same reason.
+
+        It is NEVER on the request path — :meth:`fetch` must not wait on a second round trip to
+        learn what a refusal would tell it anyway — so it is probed on a shorter budget than
+        :meth:`healthy`: a prompt sentence is worth less waiting than a deploy diagnosis.
+        """
+        if self._allowed_hosts is not None:
+            return self._allowed_hosts
+        response = await self._health(ALLOW_LIST_PROBE_TIMEOUT_S)
+        if response is None or response.status_code != 200:
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            return None
+        if not isinstance(body, dict):
+            return None
+        hosts = body.get(HEALTH_ALLOWED_HOSTS_FIELD)
+        if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
+            return None
+        self._allowed_hosts = tuple(hosts)
+        return self._allowed_hosts
 
     async def fetch(self, url: str, *, user: str) -> FetchedFile:
         """The bytes at ``url``, fetched on behalf of ``user``.

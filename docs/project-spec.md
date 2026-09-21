@@ -1921,6 +1921,32 @@ reference disappear with `ENABLE_SUBAGENTS=false`, "Phenotype Reports" with
 `ENABLE_PHENOTYPE_REPORT=false`, and every per-tool routing section under `tool_profile="code"`.
 `tool_names=None` skips the filtering entirely and emits every block.
 
+**One block's text is not written in either prompt module.** A `_Block` may carry `render`, a
+callable that supplies its text at assemble time and drops the block entirely by returning
+`None`; `text` is then empty, so the tool-name gate sees nothing and the block states its
+precondition in `requires_any` instead. The one user is the fifth `run_analysis` inputs rule,
+which names the hosts a URL input may come from: that list is the deployed url-fetcher's
+configuration, read from its `GET /healthz` through `UrlFetchClient.allowed_hosts`, and a copy
+of it in the prompt source would be wrong the next time `URL_FETCHER_ALLOWED_HOSTS` changed.
+`prompt_blocks.url_fetch_allowed_hosts` reads it at most once per process — prompt assembly
+runs on every chat request and must not wait on the network — on a 1-second-per-phase budget
+(`url_fetch_client.ALLOW_LIST_PROBE_TIMEOUT_S`, a ~2 s worst case, tighter than a health check
+because this buys one sentence of the prompt), and remembers "unavailable" for 60 seconds
+rather than probing again per turn. **Operationally that means widening the fetcher's
+`URL_FETCHER_ALLOWED_HOSTS` requires rolling chat-backend too**: the successful read is never
+refreshed, so until the pod restarts the prompt still names the old hosts and a URL on a newly
+allowed host costs one refused fetch before the model gives up. Nothing is unsafe about the
+stale copy — the fetcher, not the prompt, decides every fetch — and a replica that starts while
+the fetcher is down picks the list up on its first retry, so the shared prompt prefix changes
+once within that replica's first minute.
+
+When `URL_FETCHER_URL` is unset, the fetcher cannot be reached, or it sends no such field, the
+rule is not emitted at all: the model learns the policy from an `InputRefused` message either
+way, and a prompt that states the wrong hosts is worse than one that states none. An **empty**
+allow-list is a different answer from an absent one and gets its own sentence — URL inputs are
+unavailable in this deployment, ask for an upload — because a fetcher configured to reach
+nowhere is knowable, and reading it as unknown would spend a turn discovering it.
+
 Because a block is dropped for ANY unavailable name in it, a tool named in passing would take
 its whole block with it — a parenthetical, an example or a negation is enough. **Domain science
 and grounding rules are therefore written into blocks that name no tool**, with only the "which
@@ -2170,7 +2196,7 @@ src/genetics_mcp_server/
 ├── download_store.py    # disk-persisted download storage for TSV files
 ├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
 ├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
-├── url_fetch_client.py  # HTTP transport to the url-fetcher, plus the per-user in-memory fetch cache
+├── url_fetch_client.py  # HTTP transport to the url-fetcher, plus the per-user in-memory fetch cache; `allowed_hosts()` reads the fetcher's host allow-list off the health route for the system prompt
 ├── memory_digest.py     # entity extraction and session clustering, shared by the digest and its premise gate
 ├── memory_gate.py       # the one place that decides whether a caller gets cross-session memory
 ├── config/

@@ -1159,6 +1159,118 @@ class TestRunAnalysisInputsRules:
         for rule in self.RULES:
             assert rule not in prompt, f"{variant}: lost the gate: {rule!r} survived without run_analysis"
 
+    @pytest.fixture
+    def fetcher_allow_list(self, monkeypatch):
+        """Install a fetcher whose allow-list is whatever a test asks for.
+
+        The rule reads it through the process-wide client and remembers the answer, so the
+        cache is cleared here too — monkeypatch restores whatever the rest of the session
+        had read."""
+        from genetics_mcp_server import url_fetch_client
+        from genetics_mcp_server.config import prompt_blocks
+
+        def install(hosts):
+            class _Fetcher:
+                async def allowed_hosts(self):
+                    return hosts
+
+            monkeypatch.setattr(url_fetch_client, "get_url_fetch_client", _Fetcher)
+            monkeypatch.setattr(prompt_blocks, "_url_fetch_hosts", None)
+
+        return install
+
+    HOSTS = ("raw.githubusercontent.com", "eutils.ncbi.nlm.nih.gov")
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_host_list_is_the_fetchers_own(self, fetcher_allow_list, variant):
+        fetcher_allow_list(self.HOSTS)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False), variant=variant
+        )
+        assert (
+            "URL inputs are fetched only from these hosts: "
+            "raw.githubusercontent.com, eutils.ncbi.nlm.nih.gov." in prompt
+        )
+        assert "ask the user to upload it" in prompt
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_nothing_is_said_when_the_fetcher_cannot_say(self, fetcher_allow_list, variant):
+        fetcher_allow_list(None)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False), variant=variant
+        )
+        assert "URL inputs are fetched only from" not in prompt
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_an_empty_list_is_not_the_same_as_no_answer(self, fetcher_allow_list, variant):
+        fetcher_allow_list(())
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False), variant=variant
+        )
+        assert (
+            "URL inputs are unavailable in this deployment; ask the user to upload the file."
+            in prompt
+        )
+        assert "fetched only from these hosts" not in prompt
+
+    async def test_the_rule_renders_from_inside_a_running_event_loop(self, fetcher_allow_list):
+        """What production does: assembly is called from an async request handler, so the
+        probe cannot use the loop it is already on."""
+        fetcher_allow_list(self.HOSTS)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False)
+        )
+        assert (
+            "URL inputs are fetched only from these hosts: "
+            "raw.githubusercontent.com, eutils.ncbi.nlm.nih.gov." in prompt
+        )
+
+    def test_a_probe_that_raises_does_not_reach_the_chat_turn(self, monkeypatch):
+        from genetics_mcp_server.config import prompt_blocks
+
+        def boom():
+            raise RuntimeError("the client blew up")
+
+        monkeypatch.setattr(prompt_blocks, "_probe_url_fetch_allowed_hosts", boom)
+        monkeypatch.setattr(prompt_blocks, "_url_fetch_hosts", None)
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("code", subagents=False))
+        assert "URL inputs are fetched only from" not in prompt
+
+    def test_unavailable_is_believed_for_a_minute_and_a_success_forever(self, monkeypatch):
+        from genetics_mcp_server.config import prompt_blocks
+
+        now = [1000.0]
+
+        class _Clock:
+            monotonic = staticmethod(lambda: now[0])
+
+        probes = []
+
+        def probe():
+            probes.append(now[0])
+            return None if len(probes) == 1 else self.HOSTS
+
+        monkeypatch.setattr(prompt_blocks, "time", _Clock)
+        monkeypatch.setattr(prompt_blocks, "_probe_url_fetch_allowed_hosts", probe)
+        monkeypatch.setattr(prompt_blocks, "_url_fetch_hosts", None)
+
+        assert prompt_blocks.url_fetch_allowed_hosts() is None
+        now[0] += 59
+        assert prompt_blocks.url_fetch_allowed_hosts() is None
+        assert len(probes) == 1, "an unreachable fetcher was probed again inside the window"
+        now[0] += 2
+        assert prompt_blocks.url_fetch_allowed_hosts() == self.HOSTS
+        now[0] += 10_000
+        assert prompt_blocks.url_fetch_allowed_hosts() == self.HOSTS
+        assert len(probes) == 2, "a successful read was probed again"
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_host_list_is_gated_on_run_analysis(self, fetcher_allow_list, variant):
+        fetcher_allow_list(self.HOSTS)
+        without = resolve(None, subagents=False, sandbox=False) - {"run_analysis"}
+        prompt = default_system_prompt("FinnGenie", tool_names=without, variant=variant)
+        assert "URL inputs are fetched only from" not in prompt
+
     def test_the_tool_description_names_inputs_delivered_and_open_input(self):
         """The result echoes `inputs_delivered`, and the script reads a file back with
         `open_input` — the description must use the model's own vocabulary, not a
