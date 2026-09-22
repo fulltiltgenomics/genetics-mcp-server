@@ -304,22 +304,99 @@ _THINKING_KEEPALIVE_SECONDS = 10.0
 _DETACHED_METRIC_WRITES: set[asyncio.Task] = set()
 
 
-def _refusal_fallback_params(model: str, fallback: str) -> dict[str, Any]:
-    """Request fields that re-run a classifier refusal on another model, server side.
+_FALLBACK_CREDIT_BETA = "fallback-credit-2026-07-01"
 
-    The pinned SDK does not type `fallbacks`, so it travels in `extra_body` under the beta
-    header. The two forms carry different headers and the API rejects a mismatch, so they
-    are built together here and nowhere else.
+
+def _refusal_fallback_params(model: str, fallback: str, retry_model: str = "") -> dict[str, Any]:
+    """Request fields that re-run a classifier refusal on another model.
+
+    `fallback` is the server-side form: the API retries inside the same call. The pinned
+    SDK does not type `fallbacks`, so it travels in `extra_body` under the beta header;
+    the two forms carry different headers and the API rejects a mismatch, so they are
+    built together here and nowhere else. `retry_model` opts the request into the credit
+    beta as well, so a refusal the server-side path leaves standing carries the token the
+    client-side retry (`_refusal_retry_params`) redeems.
     """
-    if not fallback or not model_supports_refusal_fallback(model):
+    if not model_supports_refusal_fallback(model):
         return {}
+    betas: list[str] = []
+    params: dict[str, Any] = {}
     if fallback == "default":
-        body: Any = "default"
-        beta = "server-side-fallback-2026-07-01"
-    else:
-        body = [{"model": fallback}]
-        beta = "server-side-fallback-2026-06-01"
-    return {"extra_body": {"fallbacks": body}, "extra_headers": {"anthropic-beta": beta}}
+        params["extra_body"] = {"fallbacks": "default"}
+        betas.append("server-side-fallback-2026-07-01")
+    elif fallback:
+        params["extra_body"] = {"fallbacks": [{"model": fallback}]}
+        betas.append("server-side-fallback-2026-06-01")
+    if retry_model:
+        betas.append(_FALLBACK_CREDIT_BETA)
+    if not betas:
+        return {}
+    params["extra_headers"] = {"anthropic-beta": ",".join(betas)}
+    return params
+
+
+def _refusal_field(details: Any, name: str) -> Any:
+    """A `stop_details` field, whether the SDK typed it or kept it as an extra."""
+    if details is None:
+        return None
+    value = getattr(details, name, None)
+    if value is None and hasattr(details, "model_dump"):
+        value = details.model_dump().get(name)
+    return value
+
+
+def _refusal_echo(content: list[Any]) -> list[dict[str, Any]]:
+    """The refused turn as the credit retry's appended assistant message.
+
+    Client tool calls are omitted: none of them ran, so none has a result to pair with.
+    Thinking blocks stay, as the API asks; it validates them itself against the token.
+    """
+    echoed = [b.model_dump(exclude_none=True) for b in content if b.type != "tool_use"]
+    if echoed and echoed[-1].get("type") == "text":
+        echoed[-1]["text"] = echoed[-1]["text"].rstrip()
+        if not echoed[-1]["text"]:
+            echoed.pop()
+    return echoed
+
+
+def _refusal_retry_ladder(claim: Any, echo: list[dict[str, Any]]) -> list[str]:
+    """The retry shapes to try in order, richest first, each a rung the API may reject.
+
+    `claim` is `fallback_has_prefill_claim`: False rules the continuation shape out;
+    None (the field absent) leaves it in, since the rejection handling covers it.
+    """
+    rungs = []
+    if claim is not False and echo:
+        rungs.append("continue")
+    rungs += ["exact", "plain"]
+    return rungs
+
+
+def _refusal_retry_params(
+    request_params: dict[str, Any],
+    retry_model: str,
+    token: str,
+    shape: str,
+    echo: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The refused request re-aimed at `retry_model`, in one of the ladder's shapes.
+
+    Redemption compares the retry against the refused request field by field, so the
+    body is the same object graph with only `model`, the credit and (for "continue")
+    one appended assistant message changed. `fallbacks` and its header come off: a
+    retry must not carry them, and their family is exempt from the header match.
+    """
+    params = {k: v for k, v in request_params.items() if k not in ("extra_body", "extra_headers")}
+    params["model"] = retry_model
+    extra_body = {k: v for k, v in (request_params.get("extra_body") or {}).items() if k != "fallbacks"}
+    if shape != "plain":
+        extra_body["fallback_credit_token"] = token
+    if extra_body:
+        params["extra_body"] = extra_body
+    params["extra_headers"] = {"anthropic-beta": _FALLBACK_CREDIT_BETA}
+    if shape == "continue":
+        params["messages"] = [*params["messages"], {"role": "assistant", "content": echo}]
+    return params
 
 
 _MODEL_ID_RE = re.compile(r"^claude-([a-z]+)-(\d+)(?:-(\d+))?")
@@ -341,11 +418,18 @@ def _block_field(block: Any, name: str) -> Any:
     return dumped.get(name)
 
 
+def _fallback_notice_text(declined_model: str | None, served_model: str | None) -> str:
+    declined = _model_display_name(declined_model)
+    served = _model_display_name(served_model)
+    return f"\n\n*[{declined} declined this request; {served} answered instead]*\n\n"
+
+
 def _fallback_notice(block: Any) -> str:
     """The visible line that stands in for a `fallback` marker block."""
-    declined = _model_display_name((_block_field(block, "from") or {}).get("model"))
-    served = _model_display_name((_block_field(block, "to") or {}).get("model"))
-    return f"\n\n*[{declined} declined this request; {served} answered instead]*\n\n"
+    return _fallback_notice_text(
+        (_block_field(block, "from") or {}).get("model"),
+        (_block_field(block, "to") or {}).get("model"),
+    )
 
 
 def _last_fallback_index(content: list[Any]) -> int:
@@ -1099,6 +1183,119 @@ class LLMService:
             logger.error(f"Error streaming OpenAI chat: {e}")
             raise
 
+    async def _stream_with_retries(
+        self,
+        request_params: dict[str, Any],
+        out: dict[str, Any],
+        log_prefix: str,
+        settings: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """One model call, streamed, retried over transient faults.
+
+        Text and keepalives are yielded as they arrive; the final message, the attempt
+        count and the raw `stop_details` of a refusal are reported through `out`, since
+        an async generator cannot return them.
+        """
+        # retry transient Anthropic errors with exponential backoff
+        max_retries = settings.anthropic_max_retries
+        attempt = 0
+        for attempt in range(max_retries + 1):
+            text_yielded_this_attempt = False
+            try:
+                # 5 min timeout per iteration to prevent indefinite hangs
+                async with asyncio.timeout(300):
+                    async with self.anthropic_client.messages.stream(**request_params) as stream:
+                        last_keepalive = 0.0
+                        async for event in stream:
+                            # a `fallback` block marks where the requested model
+                            # declined and another took over; say so where it
+                            # happens, since the text after it changes voice
+                            if (
+                                event.type == "content_block_start"
+                                and getattr(event.content_block, "type", None) == "fallback"
+                            ):
+                                text_yielded_this_attempt = True
+                                yield StreamChunk(
+                                    type="text", content=_fallback_notice(event.content_block)
+                                )
+                                continue
+                            # the pinned SDK's accumulator drops `stop_details`
+                            # from the final message, so a refusal's category and
+                            # credit token are only ever seen here, on the raw
+                            # delta that carries them
+                            if event.type == "message_delta":
+                                details = getattr(
+                                    getattr(event, "delta", None), "stop_details", None
+                                )
+                                if details is not None:
+                                    out["refusal_details"] = details
+                                continue
+                            if event.type != "content_block_delta":
+                                continue
+                            delta = event.delta
+                            if delta.type == "text_delta":
+                                text_yielded_this_attempt = True
+                                yield StreamChunk(type="text", content=delta.text)
+                            elif delta.type == "thinking_delta":
+                                # thinking deltas never reach text_stream, so a long
+                                # reasoning phase reads as a dead connection to the
+                                # client's inactivity timer. Tick occasionally to keep
+                                # the stream alive; the event itself is the signal, so
+                                # the reasoning text stays out of the payload.
+                                now = time.monotonic()
+                                if now - last_keepalive >= _THINKING_KEEPALIVE_SECONDS:
+                                    last_keepalive = now
+                                    yield StreamChunk(type="thinking")
+
+                        message = await stream.get_final_message()
+                break
+            except Exception as e:
+                from anthropic import APIConnectionError, APIStatusError
+                # mid-stream overload/internal errors arrive as a base
+                # APIStatusError with status_code=200, so also match on the
+                # error type carried in the body.
+                err_type = anthropic_error_type(e)
+                is_retryable = (
+                    isinstance(e, APIConnectionError)
+                    or (isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529))
+                    or err_type in ("overloaded_error", "api_error", "internal_server_error")
+                )
+                # A 429 is a REFUSAL, not a fault: the account's capacity is spent, so
+                # this is off unless a caller with no waiting user (the benchmark) asks
+                # for it. Matched on both channels for the same reason the 5xx branch
+                # above is: mid-stream it arrives as an APIStatusError carrying the
+                # streaming status 200, with the real type only in the body.
+                is_rate_limited = (
+                    isinstance(e, APIStatusError) and e.status_code == 429
+                ) or err_type == "rate_limit_error"
+                if is_rate_limited and settings.anthropic_retry_rate_limit:
+                    is_retryable = True
+                if not is_retryable or attempt >= max_retries:
+                    raise
+                wait = 2 ** attempt
+                # Anthropic says when to come back; obey it rather than guessing, but
+                # bound it so one header cannot park this worker indefinitely. Above
+                # the cap the wait is refused outright rather than silently clamped:
+                # coming back before the server said to is what it asked us not to do.
+                retry_after = _retry_after_seconds(e) if is_rate_limited else None
+                if retry_after is not None:
+                    if retry_after > settings.anthropic_retry_after_max_s:
+                        raise
+                    wait = retry_after
+                logger.warning(
+                    f"{log_prefix}Retryable Anthropic error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                    f"Retrying in {wait}s..."
+                )
+                if text_yielded_this_attempt:
+                    yield StreamChunk(
+                        type="text",
+                        content="\n\n*[Connection interrupted, retrying...]*\n\n",
+                    )
+                await asyncio.sleep(wait)
+
+        out["message"] = message
+        out["attempts"] = attempt + 1
+
     async def _stream_anthropic(
         self,
         messages: list[dict],
@@ -1171,7 +1368,11 @@ class LLMService:
         if model_supports_adaptive_thinking(model):
             request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
 
-        request_params.update(_refusal_fallback_params(model, settings.refusal_fallback))
+        request_params.update(
+            _refusal_fallback_params(
+                model, settings.refusal_fallback, settings.refusal_retry_model
+            )
+        )
 
         # the system prompt goes out as two separately cached blocks. Block 0 is identical
         # for every user (default prompt + response-length fragment), so one cache entry
@@ -1295,103 +1496,14 @@ class LLMService:
             over_budget = False
             finish_requested = False
 
-            while iteration < max_iterations:
-                iteration += 1
+            # the model this turn is currently asking for: the requested one until a
+            # client-side refusal retry moves the turn onto the model that answered
+            turn_model = model
 
-                # spans EVERY attempt of the retry loop below, backoff sleeps included, so
-                # `turn_elapsed_ms` minus this is the wall time that was NOT the model call
-                model_started = time.monotonic()
-
-                # retry transient Anthropic errors with exponential backoff
-                max_retries = settings.anthropic_max_retries
-                attempt = 0
-                for attempt in range(max_retries + 1):
-                    text_yielded_this_attempt = False
-                    try:
-                        # 5 min timeout per iteration to prevent indefinite hangs
-                        async with asyncio.timeout(300):
-                            async with self.anthropic_client.messages.stream(**request_params) as stream:
-                                last_keepalive = 0.0
-                                async for event in stream:
-                                    # a `fallback` block marks where the requested model
-                                    # declined and another took over; say so where it
-                                    # happens, since the text after it changes voice
-                                    if (
-                                        event.type == "content_block_start"
-                                        and getattr(event.content_block, "type", None) == "fallback"
-                                    ):
-                                        text_yielded_this_attempt = True
-                                        yield StreamChunk(
-                                            type="text", content=_fallback_notice(event.content_block)
-                                        )
-                                        continue
-                                    if event.type != "content_block_delta":
-                                        continue
-                                    delta = event.delta
-                                    if delta.type == "text_delta":
-                                        text_yielded_this_attempt = True
-                                        yield StreamChunk(type="text", content=delta.text)
-                                    elif delta.type == "thinking_delta":
-                                        # thinking deltas never reach text_stream, so a long
-                                        # reasoning phase reads as a dead connection to the
-                                        # client's inactivity timer. Tick occasionally to keep
-                                        # the stream alive; the event itself is the signal, so
-                                        # the reasoning text stays out of the payload.
-                                        now = time.monotonic()
-                                        if now - last_keepalive >= _THINKING_KEEPALIVE_SECONDS:
-                                            last_keepalive = now
-                                            yield StreamChunk(type="thinking")
-
-                                message = await stream.get_final_message()
-                        break
-                    except Exception as e:
-                        from anthropic import APIConnectionError, APIStatusError
-                        # mid-stream overload/internal errors arrive as a base
-                        # APIStatusError with status_code=200, so also match on the
-                        # error type carried in the body.
-                        err_type = anthropic_error_type(e)
-                        is_retryable = (
-                            isinstance(e, APIConnectionError)
-                            or (isinstance(e, APIStatusError) and e.status_code in (500, 502, 503, 529))
-                            or err_type in ("overloaded_error", "api_error", "internal_server_error")
-                        )
-                        # A 429 is a REFUSAL, not a fault: the account's capacity is spent, so
-                        # this is off unless a caller with no waiting user (the benchmark) asks
-                        # for it. Matched on both channels for the same reason the 5xx branch
-                        # above is: mid-stream it arrives as an APIStatusError carrying the
-                        # streaming status 200, with the real type only in the body.
-                        is_rate_limited = (
-                            isinstance(e, APIStatusError) and e.status_code == 429
-                        ) or err_type == "rate_limit_error"
-                        if is_rate_limited and settings.anthropic_retry_rate_limit:
-                            is_retryable = True
-                        if not is_retryable or attempt >= max_retries:
-                            raise
-                        wait = 2 ** attempt
-                        # Anthropic says when to come back; obey it rather than guessing, but
-                        # bound it so one header cannot park this worker indefinitely. Above
-                        # the cap the wait is refused outright rather than silently clamped:
-                        # coming back before the server said to is what it asked us not to do.
-                        retry_after = _retry_after_seconds(e) if is_rate_limited else None
-                        if retry_after is not None:
-                            if retry_after > settings.anthropic_retry_after_max_s:
-                                raise
-                            wait = retry_after
-                        logger.warning(
-                            f"{log_prefix}Retryable Anthropic error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
-                            f"Retrying in {wait}s..."
-                        )
-                        if text_yielded_this_attempt:
-                            yield StreamChunk(
-                                type="text",
-                                content="\n\n*[Connection interrupted, retrying...]*\n\n",
-                            )
-                        await asyncio.sleep(wait)
-
-                model_ms = int((time.monotonic() - model_started) * 1000)
-                model_attempts = attempt + 1
-
-                # log token usage and cost for this iteration
+            def _book(message: Any, note: str = "") -> tuple[str, float, int, int, int, int]:
+                """Price one model call into the turn's totals and log it."""
+                nonlocal total_cost, priced_iterations, total_input_tokens
+                nonlocal total_output_tokens, total_cache_read, total_cache_create
                 usage = message.usage
                 input_tok = usage.input_tokens
                 output_tok = usage.output_tokens
@@ -1411,11 +1523,115 @@ class LLMService:
                 total_cache_read += cache_read
                 total_cache_create += cache_create
                 logger.info(
-                    f"{log_prefix}API call iteration={iteration} model={served_model} "
+                    f"{log_prefix}API call iteration={iteration}{note} model={served_model} "
                     f"input_tokens={input_tok} output_tokens={output_tok} "
                     f"cache_read={cache_read} cache_create={cache_create} "
                     f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
                 )
+                return served_model, iter_cost, input_tok, cache_read, cache_create, output_tok
+
+            while iteration < max_iterations:
+                iteration += 1
+
+                # spans EVERY attempt of the retry loop below, backoff sleeps included, so
+                # `turn_elapsed_ms` minus this is the wall time that was NOT the model call
+                model_started = time.monotonic()
+
+                out: dict[str, Any] = {}
+                async for chunk in self._stream_with_retries(
+                    request_params, out, log_prefix, settings
+                ):
+                    yield chunk
+                message = out["message"]
+                model_attempts = out["attempts"]
+                refusal_details = out.get("refusal_details")
+
+                # a refusal the server-side fallback left standing is retried here. The
+                # API leaves two kinds standing: a category with no recommended
+                # fallback, and a streaming decline that fires while a tool-use block is
+                # still open — the shape a tool-heavy turn refuses in. The refusal
+                # carries a credit token; redeemed on the retry it reprices the new
+                # model's cache write as a read. The shapes are tried richest first,
+                # continuing the partial output before answering from scratch, and each
+                # rejection is a 400 that arrives before anything streams, so the notice
+                # is only shown once a retry is actually answering.
+                if message.stop_reason == "refusal":
+                    refused_model = getattr(message, "model", None) or request_params["model"]
+                    token = _refusal_field(refusal_details, "fallback_credit_token")
+                    retry_model = settings.refusal_retry_model
+                    if token and retry_model and retry_model != refused_model:
+                        logger.warning(
+                            f"{log_prefix}Model refused the request "
+                            f"(category={_refusal_field(refusal_details, 'category')}, "
+                            f"explanation={_refusal_field(refusal_details, 'explanation')!r}); "
+                            f"retrying on {retry_model} with fallback credit"
+                        )
+                        _book(message, " (refused)")
+                        echo = _refusal_echo(message.content)
+                        claim = _refusal_field(refusal_details, "fallback_has_prefill_claim")
+                        kept = [b for b in message.content if b.type == "text"]
+                        notice = _fallback_notice_text(refused_model, retry_model)
+                        for shape in _refusal_retry_ladder(claim, echo):
+                            retry_params = _refusal_retry_params(
+                                request_params, retry_model, token, shape, echo
+                            )
+                            retry_out: dict[str, Any] = {}
+                            announced = False
+                            try:
+                                async for chunk in self._stream_with_retries(
+                                    retry_params, retry_out, log_prefix, settings
+                                ):
+                                    if not announced:
+                                        announced = True
+                                        yield StreamChunk(type="text", content=notice)
+                                    yield chunk
+                            except Exception as e:
+                                from anthropic import APIStatusError
+
+                                if announced or not (
+                                    isinstance(e, APIStatusError) and e.status_code == 400
+                                ):
+                                    raise
+                                logger.warning(
+                                    f"{log_prefix}Fallback-credit retry ({shape}) rejected: {e}"
+                                )
+                                # transient by the API's own account: the next rung would
+                                # forfeit the credit for nothing, so the refusal stands
+                                if "redemption temporarily unavailable" in str(e):
+                                    break
+                                continue
+                            if not announced:
+                                yield StreamChunk(type="text", content=notice)
+                            from anthropic.types import TextBlock
+
+                            retry_message = retry_out["message"]
+                            model_attempts += retry_out["attempts"]
+                            refusal_details = retry_out.get("refusal_details")
+                            logger.info(
+                                f"{log_prefix}Refusal retried on {retry_model} ({shape}): "
+                                f"stop_reason={retry_message.stop_reason}"
+                            )
+                            # the rest of the turn stays on the model that answered, with
+                            # neither the server-side fallback nor the spent credit
+                            request_params = _refusal_retry_params(
+                                request_params, retry_model, token, "plain", echo
+                            )
+                            turn_model = retry_model
+                            # what the user saw, in order: the declined model's text, the
+                            # notice, then the answer; that is also what is replayed
+                            retry_message.content = [
+                                *kept,
+                                TextBlock(type="text", text=notice),
+                                *retry_message.content,
+                            ]
+                            message = retry_message
+                            break
+
+                model_ms = int((time.monotonic() - model_started) * 1000)
+
+                (
+                    served_model, iter_cost, input_tok, cache_read, cache_create, output_tok
+                ) = _book(message)
 
                 # both budgets are checked after the spend is booked and before anything
                 # is dispatched. The hard cap ends the loop at the first iteration that
@@ -1542,9 +1758,9 @@ class LLMService:
                 # a conversation that fell back once is routed straight to the fallback
                 # model for a while afterwards, with no marker block to announce it. The
                 # model name on the response is the only signal, so say so after the text.
-                if served_model != model and fallback_cut < 0:
+                if served_model != turn_model and fallback_cut < 0:
                     logger.warning(
-                        f"{log_prefix}Turn served by {served_model} instead of {model} "
+                        f"{log_prefix}Turn served by {served_model} instead of {turn_model} "
                         "(sticky refusal fallback)"
                     )
                     notice = f"\n\n*[Answered by {_model_display_name(served_model)}]*\n"
@@ -1564,11 +1780,18 @@ class LLMService:
                 # request the model refused. Without this the loop reported the empty
                 # turn as a completed answer.
                 if message.stop_reason == "refusal":
-                    category = getattr(getattr(message, "stop_details", None), "category", None)
-                    logger.warning(f"{log_prefix}Model refused the request (category={category})")
+                    if refusal_details is None:
+                        refusal_details = getattr(message, "stop_details", None)
+                    category = _refusal_field(refusal_details, "category")
+                    explanation = _refusal_field(refusal_details, "explanation")
+                    logger.warning(
+                        f"{log_prefix}Model refused the request "
+                        f"(model={served_model}, category={category}, explanation={explanation!r})"
+                    )
                     notice = (
                         "\n\n---\n*The model declined this request"
                         + (f" ({category})" if category else "")
+                        + (f": {explanation}" if explanation else "")
                         + ". Try rephrasing it.*\n"
                     )
                     yield StreamChunk(type="text", content=notice)

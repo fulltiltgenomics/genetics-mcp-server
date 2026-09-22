@@ -931,3 +931,336 @@ async def test_cost_budgets_of_zero_are_disabled(monkeypatch):
     assert "tool_choice" not in svc.anthropic_client.messages.calls[1]
     text = "".join(c.content for c in chunks if c.type == "text")
     assert "cost" not in text
+
+
+# --- client-side refusal retry with fallback credit --------------------------------------
+#
+# The server-side fallback leaves two refusals standing: a category with no recommended
+# fallback, and a streaming decline inside an open tool-use block. Prod 2026-09-22 hit the
+# second four turns out of four; each reached the user as "declined this request" with the
+# category logged as None, because the SDK's stream accumulator drops `stop_details`.
+
+from genetics_mcp_server.llm_service import (
+    _refusal_echo,
+    _refusal_retry_ladder,
+    _refusal_retry_params,
+)
+
+
+def _refusal_delta(category="bio", explanation=None, token="tok-1", claim=True):
+    details = SimpleNamespace(
+        type="refusal",
+        category=category,
+        explanation=explanation,
+        fallback_credit_token=token,
+        fallback_has_prefill_claim=claim,
+    )
+    return SimpleNamespace(type="message_delta", delta=SimpleNamespace(stop_details=details))
+
+
+def _refused_message(content, model="claude-fable-5-1"):
+    message = _FakeMessage(content, "refusal")
+    message.model = model
+    return message
+
+
+def _bad_request(text):
+    import anthropic
+    import httpx
+
+    return anthropic.BadRequestError(
+        text,
+        response=httpx.Response(400, request=httpx.Request("POST", "https://api/v1/messages")),
+        body={"error": {"type": "invalid_request_error", "message": text}},
+    )
+
+
+class _RejectingStream(_FakeStream):
+    def __init__(self, error):
+        self._error = error
+
+    async def __aenter__(self):
+        raise self._error
+
+
+class _FakeMessagesWithRejections(_FakeMessages):
+    """A turn entry that is an exception is raised when that call's stream opens."""
+
+    def stream(self, **params):
+        self.calls.append(params)
+        turn = self._turns.pop(0)
+        if isinstance(turn, Exception):
+            return _RejectingStream(turn)
+        return _FakeStream(*turn)
+
+
+def _fable_service(turns, executor=None):
+    svc = _service(turns, executor=executor)
+    svc.anthropic_client = SimpleNamespace(messages=_FakeMessagesWithRejections(turns))
+    return svc
+
+
+async def _collect_fable(svc):
+    chunks = []
+    async for chunk in svc._stream_anthropic(
+        messages=[{"role": "user", "content": "hi"}],
+        model="claude-fable-5-1",
+        system_prompt=None,
+        enable_tools=False,
+        code_execution=False,
+    ):
+        chunks.append(chunk)
+    return chunks
+
+
+def _opus_answer(text="Answer", stop_reason="end_turn", content=None):
+    message = _FakeMessage(content or [_Block("text", text=text)], stop_reason)
+    message.model = "claude-opus-5"
+    return ([_delta_event("text_delta", text)], message)
+
+
+class TestRefusalCreditParams:
+    def test_the_request_opts_into_the_credit_beta_alongside_the_fallback(self):
+        params = _refusal_fallback_params("claude-fable-5-1", "default", "claude-opus-5")
+        assert params["extra_body"] == {"fallbacks": "default"}
+        assert params["extra_headers"]["anthropic-beta"] == (
+            "server-side-fallback-2026-07-01,fallback-credit-2026-07-01"
+        )
+
+    def test_the_credit_beta_is_sent_even_with_the_server_side_fallback_off(self):
+        params = _refusal_fallback_params("claude-fable-5-1", "", "claude-opus-5")
+        assert "extra_body" not in params
+        assert params["extra_headers"] == {"anthropic-beta": "fallback-credit-2026-07-01"}
+
+    def test_the_echo_drops_tool_calls_and_trailing_whitespace(self):
+        content = [
+            _Block("thinking", thinking="", signature="s"),
+            _Block("tool_use", id="t1", name="run_analysis", input={"code": "x"}),
+            _Block("text", text="Partial  \n"),
+        ]
+        assert _refusal_echo(content) == [
+            {"type": "thinking", "thinking": "", "signature": "s"},
+            {"type": "text", "text": "Partial"},
+        ]
+
+    def test_a_whitespace_only_tail_is_dropped_from_the_echo(self):
+        assert _refusal_echo([_Block("text", text="  \n")]) == []
+
+    def test_the_ladder_continues_first_unless_the_claim_is_false(self):
+        echo = [{"type": "text", "text": "Partial"}]
+        assert _refusal_retry_ladder(True, echo) == ["continue", "exact", "plain"]
+        assert _refusal_retry_ladder(None, echo) == ["continue", "exact", "plain"]
+        assert _refusal_retry_ladder(False, echo) == ["exact", "plain"]
+        assert _refusal_retry_ladder(True, []) == ["exact", "plain"]
+
+    def test_the_retry_keeps_the_body_and_swaps_the_fallback_for_the_credit(self):
+        request = {
+            "model": "claude-fable-5-1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10,
+            "tools": [{"name": "t"}],
+            "extra_body": {"fallbacks": "default"},
+            "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01,fallback-credit-2026-07-01"},
+        }
+        echo = [{"type": "text", "text": "Partial"}]
+        cont = _refusal_retry_params(request, "claude-opus-5", "tok", "continue", echo)
+        assert cont["model"] == "claude-opus-5"
+        assert cont["tools"] == request["tools"] and cont["max_tokens"] == 10
+        assert cont["extra_body"] == {"fallback_credit_token": "tok"}
+        assert cont["extra_headers"] == {"anthropic-beta": "fallback-credit-2026-07-01"}
+        assert cont["messages"] == [*request["messages"], {"role": "assistant", "content": echo}]
+        exact = _refusal_retry_params(request, "claude-opus-5", "tok", "exact", echo)
+        assert exact["messages"] == request["messages"]
+        assert exact["extra_body"] == {"fallback_credit_token": "tok"}
+        plain = _refusal_retry_params(request, "claude-opus-5", "tok", "plain", echo)
+        assert "extra_body" not in plain
+        # the refused request is untouched: every rung is built from the same body
+        assert request["extra_body"] == {"fallbacks": "default"}
+        assert request["messages"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_category_is_read_off_the_delta_not_the_final_message():
+    """The accumulator never carries `stop_details`; the delta does. No token, no retry."""
+    turns = [([_refusal_delta(category="general_harms", explanation="policy", token=None)],
+              _refused_message([]))]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "declined this request (general_harms): policy" in text
+    assert len(svc.anthropic_client.messages.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_standing_refusal_is_retried_on_opus_continuing_the_partial_output():
+    stale = _Block("tool_use", id="t0", name="run_analysis", input={"code": "x"})
+    refused = _refused_message([_Block("text", text="Partial "), stale])
+    turns = [
+        ([_delta_event("text_delta", "Partial "), _refusal_delta()], refused),
+        _opus_answer("Answer"),
+    ]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    partial, notice, answer = (
+        text.index("Partial"),
+        text.index("Claude Fable 5.1 declined this request; Claude Opus 5 answered instead"),
+        text.index("Answer"),
+    )
+    assert partial < notice < answer
+    assert "Try rephrasing" not in text
+    assert "[Answered by" not in text
+
+    calls = svc.anthropic_client.messages.calls
+    assert len(calls) == 2
+    retry = calls[1]
+    assert retry["model"] == "claude-opus-5"
+    assert retry["extra_body"] == {"fallback_credit_token": "tok-1"}
+    assert retry["extra_headers"] == {"anthropic-beta": "fallback-credit-2026-07-01"}
+    assert retry["messages"][-1] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Partial"}],
+    }
+    assert retry["messages"][:-1] == calls[0]["messages"]
+
+    done = next(c for c in chunks if c.type == "done")
+    persisted = [b for b in done.message_content if b["type"] == "text"]
+    assert [b["text"].strip() for b in persisted][0] == "Partial"
+    assert "declined this request" in persisted[1]["text"]
+    assert persisted[2]["text"] == "Answer"
+    assert not [b for b in done.message_content if b["type"] == "tool_use"]
+    # both attempts are billed: the refused partial output and the answer
+    usage = json.loads(next(c for c in chunks if c.type == "usage").content)
+    assert usage["context_window"] == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_before_any_output_is_retried_from_scratch():
+    turns = [([_refusal_delta(claim=False)], _refused_message([])), _opus_answer("Answer")]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.index("declined this request; Claude Opus 5 answered") < text.index("Answer")
+    retry = svc.anthropic_client.messages.calls[1]
+    assert retry["messages"] == svc.anthropic_client.messages.calls[0]["messages"]
+    assert retry["extra_body"] == {"fallback_credit_token": "tok-1"}
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_continuation_falls_down_the_ladder_before_forfeiting_the_credit():
+    refused = _refused_message([_Block("text", text="Partial")])
+    turns = [
+        ([_refusal_delta()], refused),
+        _bad_request("request body does not match the refused request"),
+        _bad_request("fallback_credit_token is invalid"),
+        _opus_answer("Answer"),
+    ]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert text.count("declined this request; Claude Opus 5 answered") == 1
+    assert text.endswith("Answer") or "Answer" in text
+    calls = svc.anthropic_client.messages.calls
+    assert [c["model"] for c in calls] == ["claude-fable-5-1"] + ["claude-opus-5"] * 3
+    assert calls[1]["messages"][-1]["role"] == "assistant"
+    assert calls[2]["messages"] == calls[0]["messages"]
+    assert calls[2]["extra_body"] == {"fallback_credit_token": "tok-1"}
+    assert "extra_body" not in calls[3]
+
+
+@pytest.mark.asyncio
+async def test_a_transient_redemption_failure_leaves_the_refusal_standing():
+    turns = [
+        ([_refusal_delta()], _refused_message([_Block("text", text="Partial")])),
+        _bad_request("credit redemption temporarily unavailable"),
+    ]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "declined this request (bio). Try rephrasing" in text
+    assert len(svc.anthropic_client.messages.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_non_400_failure_on_the_retry_propagates():
+    import anthropic
+    import httpx
+
+    error = anthropic.PermissionDeniedError(
+        "no",
+        response=httpx.Response(403, request=httpx.Request("POST", "https://api/v1/messages")),
+        body={"error": {"type": "permission_error", "message": "no"}},
+    )
+    turns = [([_refusal_delta()], _refused_message([])), error]
+    with pytest.raises(anthropic.PermissionDeniedError):
+        await _collect_fable(_fable_service(turns))
+
+
+@pytest.mark.asyncio
+async def test_the_retry_model_refusing_too_reaches_the_user_as_a_notice():
+    opus = _refused_message([], model="claude-opus-5")
+    turns = [
+        ([_refusal_delta()], _refused_message([])),
+        ([_refusal_delta(category="cyber", token=None)], opus),
+    ]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "declined this request (cyber). Try rephrasing" in text
+    assert len(svc.anthropic_client.messages.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_after_a_retry_the_rest_of_the_turn_stays_on_the_retry_model():
+    live = _Block("tool_use", id="t1", name="run_analysis", input={"code": "print(1)"})
+    refused = _refused_message([_Block("text", text="Start")])
+    first_opus = _FakeMessage([_Block("text", text="Running"), live], "tool_use")
+    first_opus.model = "claude-opus-5"
+    turns = [([_refusal_delta()], refused), ([], first_opus), _opus_answer("done")]
+    svc = _fable_service(turns, executor=SimpleNamespace())
+
+    async def _execute_tool(name, tool_input, *args, **kwargs):
+        return {"success": True, "output": "1"}
+
+    svc._execute_tool = _execute_tool
+    chunks = await _collect_fable(svc)
+
+    calls = svc.anthropic_client.messages.calls
+    assert [c["model"] for c in calls] == ["claude-fable-5-1", "claude-opus-5", "claude-opus-5"]
+    assert "extra_body" not in calls[2]
+    assert calls[2]["extra_headers"] == {"anthropic-beta": "fallback-credit-2026-07-01"}
+    # the tool the retry model asked for ran, and the replay carries the declined text,
+    # the notice and the retry's own blocks as one assistant turn
+    assert [json.loads(c.content)["id"] for c in chunks if c.type == "tool_use"] == ["t1"]
+    replayed = calls[2]["messages"][-2]["content"]
+    assert [b["type"] for b in replayed] == ["text", "text", "text", "tool_use"]
+    assert replayed[0]["text"] == "Start"
+    assert "declined this request" in replayed[1]["text"]
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "[Answered by" not in text
+
+
+@pytest.mark.asyncio
+async def test_an_empty_retry_model_turns_the_client_side_retry_off(monkeypatch):
+    from genetics_mcp_server import llm_service
+
+    real = llm_service.get_settings
+
+    def _settings():
+        s = real()
+        s.refusal_retry_model = ""
+        return s
+
+    monkeypatch.setattr(llm_service, "get_settings", _settings)
+    turns = [([_refusal_delta()], _refused_message([]))]
+    svc = _fable_service(turns)
+    chunks = await _collect_fable(svc)
+    text = "".join(c.content for c in chunks if c.type == "text")
+    assert "Try rephrasing" in text
+    assert len(svc.anthropic_client.messages.calls) == 1

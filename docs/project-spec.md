@@ -2327,10 +2327,15 @@ literal at a call site.
   `CONTINUE_UNFILLED_PROMPT`, sharing the `MAX_CONTINUATIONS` budget; if it keeps coming
   back unfilled, a "results above were left unfilled" notice is appended.
 - **`stop_reason == "refusal"`** — a safety classifier declined the request (Fable's cover
-  research biology, so a genetics question can trip one; `stop_details.category` names
-  which) and no fallback answered. The turn ends there: no tool in it is executed, it is
-  not resumed, and a "model declined this request" notice is appended to whatever partial
-  text streamed before the classifier fired.
+  research biology, so a genetics question can trip one) and no fallback answered, neither
+  the server-side one nor the client-side credit retry below. The turn ends there: no tool
+  in it is executed, it is not resumed, and a "model declined this request" notice carrying
+  the category and explanation is appended to whatever partial text streamed before the
+  classifier fired. `stop_details` is read off the raw `message_delta` event in
+  `_stream_with_retries`, not off the final message: the pinned SDK's stream accumulator
+  copies `stop_reason` from that delta and drops `stop_details`, so the final message
+  carries `None` whatever the API said, and a refusal can also arrive with a `null`
+  category by design.
 
 ### Refusal fallback
 
@@ -2352,6 +2357,29 @@ stream and the response carries:
   use that model, not the requested one. A conversation that fell back once is routed
   straight to the fallback model for about an hour with no marker block; the loop detects
   that from `model` alone and appends "*[Answered by Claude Opus 5]*" after the text.
+
+The server-side fallback leaves two refusals standing: a category with no recommended
+fallback (including the `null` category), and a streaming decline that fires while a
+tool-use block is still open on the stream — the shape a tool-heavy turn refuses in, and
+the one every standing refusal in prod up to 2026-09-22 had. Those are retried client side
+on `REFUSAL_RETRY_MODEL` (default `claude-opus-5`, one of Fable's permitted credit targets;
+empty turns it off). The request also carries the `fallback-credit-2026-07-01` beta, so the
+refusal's `stop_details` brings a one-time credit token; redeemed on the retry it reprices
+the new model's prompt-cache write as a read. The retry is the refused body with only
+`model` changed, `fallbacks` and its header removed and the token added, in the shapes the
+API accepts, richest first (`_refusal_retry_ladder`): continuing the partial output by
+appending the refused turn as an assistant message (its text and thinking, never its tool
+calls, which did not run) unless `fallback_has_prefill_claim` is false; then the unchanged
+body with the token; then without the token, forfeiting the credit. A 400 on a rung falls
+to the next; "redemption temporarily unavailable" ends the ladder and the refusal stands;
+any other error propagates. Each rejection arrives before anything streams, so the
+"*[Claude Fable 5.1 declined this request; Claude Opus 5 answered instead]*" notice is
+emitted only once a retry is answering, and the refused attempt is billed like any other
+call (a mid-stream refusal charges the output already streamed). The rest of the turn then
+stays on the retry model, with neither the server-side fallback nor the spent credit, and
+the assistant turn is persisted and replayed as the declined model's text, the notice, and
+the retry model's blocks in that order. A retry model that refuses too reaches the user as
+the notice above, naming its category.
 
 `_has_unfilled_output()` decides the third case from the artifact — placeholder cells such
 as `*[from query]*`, or a column-label header with no data under it — never from "let me
@@ -2634,6 +2662,7 @@ All configuration is via environment variables (`.env` file supported):
 | `MAX_TURN_COST_USD` | What one user turn may spend before it is told to finish. Checked after each model call's cost is booked and before its tools are dispatched; the tools the crossing call asked for still run, and the next call carries their results with `tool_choice: none` and `FINISH_TURN_PROMPT`, so the answer is written from what was gathered. The user sees a "reached its cost budget" notice after that answer. A call that crossed the line while ending the turn reports nothing, since nothing was cut. `0` disables it | `20.0` |
 | `MAX_TURN_COST_HARD_USD` | The unconditional stop above that: the loop ends at the first model call that crosses it with the turn still open, and the user gets a "reached its cost limit" notice. Every other bound here limits a failure shape known in advance; this one limits the bill for shapes that are not. Checked before the finish budget, so a value at or below it makes the stop the only guard. `0` disables it | `50.0` |
 | `REFUSAL_FALLBACK` | Who answers when a safety classifier declines a request: `default` lets Anthropic pick by refusal category, a model id pins the substitute, empty shows the refusal to the user. Sent only to models that run the classifiers (Fable, Mythos, Opus 5+) | `default` |
+| `REFUSAL_RETRY_MODEL` | Who answers, client side, when a refusal stands after the server-side fallback — a category with no recommended fallback, or a streaming decline inside an open tool-use block. The refusal's fallback-credit token is redeemed on the retry so the new model's cache write is priced as a read. Must be one of the refused model's permitted credit targets (Opus 4.8 or Opus 5 for Fable); empty shows the refusal to the user | `claude-opus-5` |
 | `ANTHROPIC_MAX_RETRIES` | Attempts the streaming call makes over connection errors, 5xx and `overloaded_error`, with exponential backoff | `3` |
 | `ANTHROPIC_RETRY_RATE_LIMIT` | Whether an Anthropic **429** is also retried. Off by default and deliberately so: a 429 means the account's capacity is spent, so retrying in front of a waiting user buys a longer spinner and takes capacity from the next request. A benchmark has no waiting user and turns it on | `false` |
 | `ANTHROPIC_RETRY_AFTER_MAX_S` | Ceiling on a honoured `retry-after`. Above it the wait is refused and the error propagates rather than being silently clamped — returning before the server said to is what the header asks us not to do | `60` |
@@ -3012,7 +3041,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_llm_config_db_migration.py` | One-shot import of legacy per-user instructions into instruction sets |
 | `test_instruction_sets_db.py` | Instruction-set accessors: per-user scoping, write-time caps (including a concurrent-create race), over-cap rows reported not truncated, history, archiving, ordering, timestamp degradation, transaction safety (rollback on failure or on a failed commit, update racing an archive, update's read-modify-write under the write lock, reads never returning uncommitted rows) |
 | `test_llm_service.py` | Replayed-history helpers: `tool_use`/`tool_result` pairing, marker stripping, cache breakpoint, truncation item counting; and the dispatch guard — a tool outside the set the request advertised is refused as a `tool_result` and never reaches the executor, in both directions, with the check reading the resolved set rather than any profile string |
-| `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, and the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it |
+| `test_stream_truncation.py` | The Anthropic streaming loop itself (the rest of the suite mocks `stream_chat` wholesale): `max_tokens` continuation, resuming a turn that presented unfilled results, the throttled contentless `thinking` keepalive, the reasoning opt-in — no `thinking_summary` without `capture_thinking`, the summary emitted with its iteration when asked for, `redacted_thinking` emitting nothing, and thinking staying out of `message_content` in **both** cases so opting in cannot persist or replay it — and refusals: the server-side fallback's request fields and marker handling, the category read off the `message_delta` rather than the final message, and the client-side credit retry — the continuation and from-scratch shapes, the ladder falling through 400s to a tokenless retry, a transient redemption failure leaving the refusal standing, a non-400 propagating, the retry model refusing too, the rest of the turn staying on the retry model, and the empty setting turning it off |
 | `test_subagent.py` | Subagent service, skills, sandbox tools |
 | `test_variant_analysis.py` | Variant list analysis tool |
 | `test_downloads.py` | Download store, TSV conversion, download endpoint, and the regression guard for silent download failures: every malformed `_download_data` payload (including verbatim reproductions of the `bef` and `buc` positional-rows payloads, and a non-`str` `filename`) must raise `DownloadShapeError` out of `_convert_to_tsv`, must never return quietly from `_process_download_hints`, and must there yield `DOWNLOAD_SHAPE_NOTE` plus a `DOWNLOAD_SHAPE_DEFECT tool=…` ERROR line with a traceback *without* propagating; a `TypeError` from the store still propagates (pinning the narrow `except`); `ENOSPC`, an unwritable storage path and an unencodable upstream value each surface `DOWNLOAD_FAILED_NOTE` plus a `DOWNLOAD_FAILED tool=…` ERROR line |

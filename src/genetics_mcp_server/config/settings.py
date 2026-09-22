@@ -189,6 +189,14 @@ class Settings:
     refusal_fallback: str = field(
         default_factory=lambda: os.environ.get("REFUSAL_FALLBACK", "default")
     )
+    # which model the chat loop retries on, client side, when a refusal stands after the
+    # server-side fallback: the API leaves a category with no recommended fallback and a
+    # streaming decline inside an open tool-use block unretried. Must be one of the refused
+    # model's permitted credit targets (Opus 4.8 or Opus 5 for Fable); empty turns it off
+    # and the refusal reaches the user as a notice
+    refusal_retry_model: str = field(
+        default_factory=lambda: os.environ.get("REFUSAL_RETRY_MODEL", "claude-opus-5")
+    )
     # How the streaming call reacts to a REFUSAL rather than a transient fault. Both default
     # to the behaviour production has always had, and exist so a benchmark can push the API
     # as hard as it allows without either changing what a real user experiences.

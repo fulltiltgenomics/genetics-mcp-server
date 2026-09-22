@@ -423,6 +423,7 @@ class TestTurnMetrics:
                 max_turn_cost_usd=20.0,
                 max_turn_cost_hard_usd=50.0,
                 refusal_fallback="default",
+                refusal_retry_model="claude-opus-5",
                 disabled_tools=[],
                 # this stands in for the whole Settings object, so a new field consulted by
                 # the streaming path has to be added here too
