@@ -448,6 +448,21 @@ _NATURE_ARTICLE = re.compile(r"nature\.com/articles/([A-Za-z0-9._-]+?)(?:\.pdf)?
 # (`/content/10.1101/2024.03.14.584883v1.full.pdf`); the prefix is not always 10.1101
 _RXIV_CONTENT = re.compile(r"(?:bio|med)rxiv\.org/content/(10\.\d{4,9}/\d+(?:\.\d+)*)")
 
+# Sized against `settings.mcp_max_result_size` (50,000 chars; llm_service.py truncates a
+# tool result to a prefix once it exceeds that). Perplexity returns at most 20 hits per
+# call, and hydration's five touched fields (pub_types, subjects capped at
+# `_EPMC_SUBJECTS_CAP`=8, cited_by, publication_status, is_preprint) add ~480 chars per
+# hydrated record. 20 hits at a 1,200-char abstract plus that hydration overhead stays
+# under the cap; a larger max_results, a larger `_EPMC_SUBJECTS_CAP`, or a bigger
+# `mcp_max_result_size` each change this arithmetic and would need rechecking against it.
+# Measured on prod's persisted literature results (2026-09-27) as serialised JSON-string
+# length — what the cap itself counts, `ensure_ascii` escaping included, not raw text: the
+# largest observed, 20 hydrated Perplexity hits, was 44,864 chars.
+_EPMC_ABSTRACT_CHARS = 1200
+# the indexer's first descriptors: the check tags (Humans, Animals) sat past the 8th in 2 of
+# 244 sampled records that had one, and the tail beyond 8 is mostly qualifier-level detail
+_EPMC_SUBJECTS_CAP = 8
+
 # Bounds the single-record follow-up queries one hydration may make, so a page of hits
 # that the batch cannot resolve costs a fixed number of Europe PMC calls, not one per hit.
 _HYDRATION_LOOKUP_LIMIT = 12
@@ -486,6 +501,13 @@ def _epmc_phrase(value: str) -> str:
     # an unbalanced quote inside one clause makes Europe PMC answer the whole OR query with
     # HTTP 200 and zero hits, which silently loses every other record in the batch
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _batch_clause(record: dict) -> str | None:
@@ -1040,6 +1062,11 @@ class ServerToolExecutor(ToolExecutor):
             for field in ("title", "authors", "journal", "year", "abstract"):
                 if match.get(field):
                     record[field] = match[field]
+            # copied even when empty or zero: the Perplexity hit has no value of its own to keep
+            for field in ("pub_types", "subjects", "cited_by", "publication_status"):
+                record[field] = match.get(field)
+            if match.get("is_preprint"):
+                record["is_preprint"] = True
             record["doi"] = record.get("doi") or match.get("doi")
             record["pmid"] = record.get("pmid") or match.get("pmid")
             record["metadata_source"] = "europepmc"
@@ -1152,12 +1179,23 @@ class ServerToolExecutor(ToolExecutor):
                     "journal": paper.get("journalTitle", "")
                     or paper.get("bookOrReportDetails", {}).get("publisher", ""),
                     "year": paper.get("pubYear", ""),
-                    "abstract": strip_html(paper.get("abstractText", "") or "")[:1500],
+                    "abstract": strip_html(paper.get("abstractText", "") or "")[
+                        :_EPMC_ABSTRACT_CHARS
+                    ],
                     "doi": doi,
                     "pmid": pmid,
                     "source": source,
                     "is_preprint": source == "PPR",
                     "url": url,
+                    "pub_types": list((paper.get("pubTypeList") or {}).get("pubType") or []),
+                    "subjects": [
+                        heading["descriptorName"]
+                        for heading in (paper.get("meshHeadingList") or {}).get("meshHeading")
+                        or []
+                        if heading.get("descriptorName")
+                    ][:_EPMC_SUBJECTS_CAP],
+                    "cited_by": _int_or_none(paper.get("citedByCount")),
+                    "publication_status": paper.get("publicationStatus"),
                 }
             )
         return formatted

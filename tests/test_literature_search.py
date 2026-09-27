@@ -17,6 +17,7 @@ from genetics_mcp_server.tools import ServerToolExecutor, orchestration
 from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS
 from genetics_mcp_server.tools.executor import _ResilientAsyncClient
 from genetics_mcp_server.tools.orchestration import (
+    _EPMC_SUBJECTS_CAP,
     _HYDRATION_LOOKUP_LIMIT,
     _literature_ids_from_url,
 )
@@ -56,6 +57,19 @@ EPMC_RESPONSE = {
                 "pubYear": "2021",
                 "abstractText": "Full abstract text.",
                 "source": "MED",
+                # core fields as Europe PMC returned them for this PMID on 2026-09-27
+                "pubTypeList": {"pubType": ["Meta-Analysis", "research-article", "Journal Article"]},
+                "meshHeadingList": {
+                    "meshHeading": [
+                        {"majorTopic_YN": "N", "descriptorName": name}
+                        for name in (
+                            "Humans", "Platelet Count", "Phenotype", "Quantitative Trait Loci",
+                            "Female", "Male", "Genetic Variation", "Biomarkers",
+                        )
+                    ]
+                },
+                "citedByCount": 16,
+                "publicationStatus": "epublish",
             },
             {
                 "pmcid": "PMC2974578",
@@ -65,6 +79,28 @@ EPMC_RESPONSE = {
                 "pubYear": "2010",
                 "abstractText": "Second abstract.",
                 "source": "PMC",
+                # core fields as Europe PMC returned them for PMC2974578 on 2026-09-27: 14
+                # descriptors, so the subjects cap applies
+                "pubTypeList": {
+                    "pubType": [
+                        "Research Support, Non-U.S. Gov't", "review-article", "Review",
+                        "Journal Article", "Research Support, N.I.H., Extramural",
+                    ]
+                },
+                "meshHeadingList": {
+                    "meshHeading": [
+                        {"majorTopic_YN": "N", "descriptorName": name}
+                        for name in (
+                            "Blood Platelets", "Chromosomes, Human, Pair 12", "Humans",
+                            "Platelet Count", "Platelet Function Tests", "Risk Factors",
+                            "Genomics", "Thrombopoiesis", "Cell Size", "Platelet Aggregation",
+                            "Polymorphism, Single Nucleotide", "Quantitative Trait Loci",
+                            "Coronary Artery Disease", "Genome-Wide Association Study",
+                        )
+                    ]
+                },
+                "citedByCount": 57,
+                "publicationStatus": "ppublish",
             },
         ]
     },
@@ -215,6 +251,102 @@ class TestPerplexityMetadata:
         assert record["pmid"] == "34580418"
         # no title in the response, so it is hydrated from Europe PMC
         assert record["title"] == "Genetic variants associated with platelet count"
+
+
+class TestCoreFields:
+    """Europe PMC core fields a reader can weigh a hit by, on both backends."""
+
+    # a live PPR record (2026-09-27): no MeSH, no publicationStatus
+    PREPRINT = {
+        "id": "PPR822204",
+        "source": "PPR",
+        "doi": "10.1101/2024.03.14.584883",
+        "title": "Transcriptomic and epigenomic consequences of heterozygous loss",
+        "pubTypeList": {"pubType": ["Preprint"]},
+        "citedByCount": 1,
+    }
+
+    async def test_europepmc_record_keeps_core_fields(self, monkeypatch):
+        monkeypatch.setenv("LITERATURE_SEARCH_BACKEND", "europepmc")
+        executor = _executor_with_transport(_handler())
+        try:
+            result = await executor.search_scientific_literature("platelet count", max_results=5)
+        finally:
+            await executor.close()
+
+        record = result["results"][0]
+        assert record["pub_types"] == ["Meta-Analysis", "research-article", "Journal Article"]
+        assert record["subjects"][:2] == ["Humans", "Platelet Count"]
+        assert record["cited_by"] == 16
+        assert record["publication_status"] == "epublish"
+        assert record["is_preprint"] is False
+
+    def test_subjects_are_capped_in_indexer_order(self):
+        record = ServerToolExecutor()._format_literature_results(
+            [EPMC_RESPONSE["resultList"]["result"][1]]
+        )[0]
+        assert len(record["subjects"]) == _EPMC_SUBJECTS_CAP < 14
+        assert record["subjects"][:3] == ["Blood Platelets", "Chromosomes, Human, Pair 12", "Humans"]
+
+    def test_missing_fields_are_empty_not_errors(self):
+        preprint, bare = ServerToolExecutor()._format_literature_results(
+            [self.PREPRINT, {"title": "t", "citedByCount": "n/a", "meshHeadingList": None}]
+        )
+        assert preprint["is_preprint"] is True
+        assert preprint["pub_types"] == ["Preprint"]
+        assert preprint["subjects"] == []
+        assert preprint["cited_by"] == 1
+        assert preprint["publication_status"] is None
+        assert bare["pub_types"] == [] and bare["subjects"] == []
+        assert bare["cited_by"] is None
+
+    async def test_hydrated_perplexity_hit_carries_core_fields(self, monkeypatch):
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+        executor = _executor_with_transport(_handler())
+        try:
+            result = await executor.search_scientific_literature(
+                "platelet count", max_results=5, backend="perplexity"
+            )
+        finally:
+            await executor.close()
+
+        by_pmid, by_pmcid = result["results"]
+        assert by_pmid["pub_types"] == ["Meta-Analysis", "research-article", "Journal Article"]
+        assert by_pmid["cited_by"] == 16
+        assert by_pmid["publication_status"] == "epublish"
+        assert by_pmcid["cited_by"] == 57
+        assert len(by_pmcid["subjects"]) == _EPMC_SUBJECTS_CAP
+
+    async def test_unhydrated_perplexity_hit_has_no_core_fields(self, monkeypatch):
+        """Absent means unknown; an empty list would read as Europe PMC saying so."""
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+        executor = _executor_with_transport(_handler(epmc_status=503))
+        try:
+            result = await executor.search_scientific_literature(
+                "platelet count", max_results=5, backend="perplexity"
+            )
+        finally:
+            await executor.close()
+
+        for field in ("pub_types", "subjects", "cited_by", "publication_status"):
+            assert field not in result["results"][0]
+
+    async def test_biorxiv_hit_matched_to_non_preprint_record_stays_preprint(self):
+        """is_preprint is set from the URL and a match may only raise it, never lower it."""
+        doi = "10.1101/2024.03.14.584883"
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=_title_page([_epmc_record("MED", "t", "2024", doi, "Author A.")]),
+            )
+
+        hit = {"url": f"https://www.biorxiv.org/content/{doi}v1.full", "title": "t"}
+        record = (await _hydrate_with(handle, [hit]))[0]
+
+        assert record["metadata_source"] == "europepmc"
+        assert record["doi"] == doi
+        assert record["is_preprint"] is True
 
 
 class TestBackendIsCallerControlled:

@@ -1015,7 +1015,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "- 'perplexity' backend: queries the Perplexity AI API, which searches a broader configured set of scientific web domains and returns an AI-generated summary with citations.\n"
             "When reporting results to the user, name the backend that was actually queried: the 'backend' field in the response, which is authoritative. "
             "Do NOT invent hybrid labels like 'PubMed/Europe PMC' or 'Perplexity/PubMed' — PubMed etc. are content indexed by the europepmc backend, not separate backends. "
-            "Perplexity hits carry bibliographic metadata (authors, journal) looked up in Europe PMC where a PMID/DOI/PMCID was available; that is recorded per record in 'metadata_source' and does not change which backend was searched."
+            "Perplexity hits carry bibliographic metadata (authors, journal) looked up in Europe PMC where a PMID/DOI/PMCID was available; that is recorded per record in 'metadata_source' and does not change which backend was searched.\n"
+            "Records matched in Europe PMC also carry fields that bound what they can be read as; on a Perplexity hit Europe PMC did not match, 'pub_types', 'subjects', 'cited_by', and 'publication_status' are absent, meaning unknown. "
+            "'pub_types': the indexer's publication-type labels, not a reading of the study design. "
+            "'subjects': the first few MeSH descriptors; MeSH lags publication by months and never exists for preprints, so an empty list is unknown, not evidence of absence (not 'not animal'). "
+            "'cited_by': reflects age and attention, not quality. "
+            "'publication_status': Europe PMC's status (e.g. epublish, ppublish). "
+            "'is_preprint' is always present on every hit: True when the hit's URL is a bioRxiv/medRxiv link or the matched Europe PMC record is a preprint. False is not evidence it isn't one — an arXiv, Research Square, or SSRN link reads False too."
         ),
         "parameters": {
             "query": {
