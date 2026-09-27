@@ -2545,7 +2545,7 @@ The `mcp_proxy.py` module allows connecting to remote MCP servers:
 1. Fetches tool definitions via JSON-RPC initialize, the `notifications/initialized` the spec has the client send next, then tools/list
 2. Dynamically creates wrapper functions using exec()
 3. Forwards tool calls to the remote server
-4. Parses SSE responses and extracts JSON-RPC results
+4. Parses SSE responses, picking the JSON-RPC response by request id: a server may put notifications (C3PO logs one per knowledge-base query) on the stream ahead of it
 
 Each `EXTERNAL_MCP_SERVERS` entry is `URL[|option]...`, parsed by `ServerConfig.parse`: an
 option is `key=value` for `path` (the endpoint under the URL, default `/mcp`, `/` for a server
