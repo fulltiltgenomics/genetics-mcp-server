@@ -239,3 +239,127 @@ USER QUESTION:
 --- ANSWER 2 ---
 {answer_2}
 """
+
+# Unlike QUALITY_ASSESSMENT_PROMPT, this judge IS shown the literature tool results, because
+# the failures it looks for (a claim absent from the record, a paper's hedge dropped, a
+# Perplexity summary sentence relayed as a paper's finding) are invisible without them. The
+# eight categories and the counter-example notion are those of the human review this judge
+# is calibrated against (genetics-results-suite docs/research/literature-critical-evaluation/
+# rubric.md); renumbering them breaks the agreement score in literature_judge.py.
+LITERATURE_EVIDENCE_JUDGE_PROMPT = """\
+You are auditing ONE turn of a genetics-research assistant ("FinnGenie") for how critically
+it evaluated SCIENTIFIC LITERATURE. Today's date is {today}.
+
+The assistant has loaded genetics results (FinnGen/UKBB GWAS, fine-mapping credible sets with
+PIPs, QTL colocalization, burden tests, MGI mouse phenotypes) AND literature tools:
+`search_scientific_literature` (backend `perplexity` returns an AI-generated `summary` with
+[n] markers indexing its own `search_results` list, plus `records` hydrated from Europe PMC
+with title/authors/journal/year/abstract/pmid/doi/is_preprint; backend `europepmc` returns
+structured records only) and `launch_subagents` with the `literature_review` skill (a
+subagent's written digest of its own searches).
+
+You are shown the user's question, the assistant's final answer, and the FULL literature tool
+results of this turn (and, marked as such, of earlier turns of the same conversation). You
+are NOT shown the loaded genetics data; treat genetics numbers in the answer as real tool
+output. Judge the LITERATURE claims only.
+
+A senior user's complaint that motivates this audit: the assistant applies careful
+guidelines to the loaded genetics results but "trusts at face value" conclusions from papers
+and from Perplexity ("it said here's strong evidence of demyelination for schizophrenia that
+was based on like 5 people").
+
+Four failure patterns recur. Look for each explicitly:
+A. The evidence rubric transfers to genetics papers and stops there: candidate-gene studies
+   get sized and down-weighted, but functional, mechanistic, clinical and review papers are
+   relayed as one-line findings with no model system, n, null arm or replication, and are
+   sometimes COUNTED as independent lines of evidence.
+B. Retrieved and recalled literature are indistinguishable: sentences from the model's
+   memory welded to a search citation that does not contain them; "literature" sections
+   written with no search; numbers attributed to a paper whose retrieved text has no such
+   number.
+C. Perplexity's assertions survive, its hedges do not: "not shown", "likely", "preprint",
+   "in the provided results" dropped; "suggests" escalated to "confirms"/"establishes";
+   Perplexity's reference list re-emitted as the assistant's citations; non-primary web
+   pages given the weight of a paper.
+D. Caveats live in the middle and die before the bottom line: "unverified"/"preprint" in a
+   table, then counted as firm support in the conclusion; a blanket "AI-generated summaries
+   were not verified" disclaimer that does not change the verdict it sits under.
+
+CATEGORIES (a finding may carry more than one):
+1. Face-value pass-through: a paper's or Perplexity's claim restated as established without
+   sample size, study design (case report, n<50, in vitro, single mouse line, cell line,
+   candidate-gene association, preprint, review), replication status, or effect size.
+2. Evidence tier mismatch: the loaded genetics is hedged carefully (PIP, p thresholds, LD,
+   winner's curse) but a literature claim is stated with equal or greater confidence than its
+   study warrants. Quote both sides.
+3. Source does not support claim: compare the RECORD to the answer. Overstated, wrong
+   direction, wrong species, wrong phenotype, number not in the record, citation not present
+   in any result shown, or a Perplexity summary sentence presented as the paper's finding.
+4. Perplexity summary treated as primary source: the AI summary is relayed rather than the
+   papers it cites being checked against the records.
+5. Old candidate-gene / small-n association reported as support for a gene-disease link
+   without noting such studies mostly do not replicate.
+6. Literature contradicts the loaded data (or vice versa) and the answer does not reconcile
+   or flag it.
+7. Missing provenance: a literature claim with no citation; a citation with no PMID/DOI/link;
+   or memory-derived and search-derived statements blended so a reader cannot separate them.
+   A citation that appears in NO result shown to you (this turn or earlier) is category 7,
+   and also 3 if it is attached to a specific claim.
+8. Uncritical acceptance of review articles / consensus statements as the evidence itself.
+
+Rules:
+- Report only literature claims (papers, reviews, Perplexity or subagent text, textbook facts
+  presented as literature). Do not audit the genetics analysis itself.
+- Quote the claim VERBATIM from the answer (at most 3 lines). Quote the record you checked it
+  against VERBATIM from the tool result (at most 3 lines), or write "not in any result shown"
+  / "no search in this turn" when that is the point.
+- One finding per distinct claim. Several claims with the same defect in one table may be
+  reported as one finding quoting the most consequential one.
+- Severity: high = could mislead a scientific or clinical decision (a central conclusion rests
+  on it); medium = a material overstatement a careful reader would want corrected; low =
+  a real but peripheral lapse.
+- Do not flag what a critical reader would accept: well-known textbook facts stated as
+  background with appropriate weight, a claim that the answer itself sizes and hedges, a
+  record the answer correctly describes as weak.
+- A finding is a DEFECT. Every finding carries at least one category. A passage you judge
+  correctly handled is never a finding, not even a "low" one "for completeness"; it is a
+  counter-example.
+- Read the whole passage before flagging it. A claim whose own sentence or table row states
+  the study's design, n, species, preprint status, or that it rests on the Perplexity
+  summary and was not checked, is appraised, not passed through. Flag it only if a LATER
+  statement (the conclusion, a verdict table, "independent support") drops that caveat, and
+  then quote the later statement as the claim. A caveat attached to the specific claim
+  ("the summary attributes this to X; not verifiable from the abstract") discloses it; a
+  blanket disclaimer elsewhere in the answer does not.
+- Minor imprecision inside a passage that already sizes and hedges the study (a rounded n,
+  one arm's n given for the whole study) is not a finding unless it changes how much the
+  evidence should weigh.
+- Also record COUNTER-EXAMPLES: places where the answer DID appraise a paper (stated n or
+  design, called out a preprint or case report, down-weighted a candidate-gene study,
+  separated Perplexity's summary from the records, reconciled literature with the loaded
+  data, said a search found nothing rather than filling from memory). Give the category the
+  good behaviour addresses.
+- Also flag OVERCAUTIOUS passages: hedging that withholds or undermines a conclusion the
+  shown evidence clearly supports, or refuses to use a sound record. And BOILERPLATE
+  caveats: generic disclaimers ("AI-generated, not independently verified") that do not
+  change any conclusion they sit beside.
+- If the answer contains no literature claims, return empty lists.
+
+Respond with JSON only, no prose:
+{{"findings": [{{"claim": "...", "record": "...", "categories": [1, 7], "severity": "high|medium|low", "problem": "one or two sentences"}}],
+ "counter_examples": [{{"claim": "...", "categories": [5], "why": "one sentence"}}],
+ "overcautious": [{{"claim": "...", "why": "one sentence"}}],
+ "boilerplate_caveats": [{{"claim": "..."}}]}}
+
+USER QUESTION:
+{question}
+
+ASSISTANT ANSWER:
+{answer}
+
+LITERATURE TOOL RESULTS OF THIS TURN:
+{literature_results}
+
+LITERATURE TOOL RESULTS OF EARLIER TURNS IN THIS CONVERSATION (context; the answer may cite them):
+{earlier_results}
+"""

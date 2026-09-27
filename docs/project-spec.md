@@ -2232,6 +2232,7 @@ src/genetics_mcp_server/
 │   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
 │   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
 │   ├── mcp_oauth_login.py   # one-off browser login for an OAuth-protected external MCP server (C3PO)
+│   ├── literature_judge.py  # literature-evidence judge: baseline over prod turns, calibration, replay scoring
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -3078,6 +3079,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chembl_descriptions.py` | Every backticked name in the three ChEMBL tool descriptions and in the ChEMBL prompt blocks resolves to a parameter, a tool name, or a key of that tool's mocked happy-path result |
 | `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
 | `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
+| `test_literature_judge.py` | Literature-evidence judge harness, no network: the `[F..]`/`[G..]` label loader (a `VOID` line skips an overturned entry) and prefix resolution of message ids, the literature-bearing-turn predicate, tool results matched to calls by id, the agreement arithmetic (finding pairs, counter-examples violated by category or by quoting the praised passage; a finding with no category counts toward neither and is reported as dropped), the prod-rows cache name following `--users` and `--context`, the deterministic half split, the category mix, and the replay-JSON loader |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from. Also `cluster_sessions` (chain linkage, the `min_shared` threshold, strict kinds only, order-independent numbering) and the M1/M2/M3 shares over a two-project synthetic history, including the pseudonym agreeing with `memory_gate.user_log_hash` |
@@ -3898,6 +3900,24 @@ already written) — a run produces cost and latency numbers with no judge call 
   any chat history. `analyze_conversations` is not run in this environment, but the
   reason survives: the moment this points at a deployment whose history *is* sampled
   into the next `eval_dataset.json`, replayed turns would corrupt the sample.
+
+## Literature Evidence Judging
+
+`scripts/literature_judge.py` measures how critically a chat turn appraises the literature it
+cites. Unlike the conversation-analysis judge, it reads each answer **beside the persisted
+literature tool results** (`search_scientific_literature`, and `launch_subagents` calls with a
+`literature_review` task), which is the only way to see a claim that is absent from its record,
+a dropped Perplexity hedge, or a memory sentence welded to a search citation. The prompt is
+`LITERATURE_EVIDENCE_JUDGE_PROMPT` in `conversation_prompts.py`; its eight categories are those
+of the human review in genetics-results-suite `docs/research/literature-critical-evaluation/`,
+whose labelled findings and counter-examples it is calibrated against. `--db` is the baseline
+over prod turns (one read-only `kubectl exec` of `chat_history.db`, cached locally),
+`--calibrate dev|heldout` scores agreement on one half of the labelled turns, and `--report`
+scores a replay JSON. The replay input shape, the agreement definition and the calibration
+hazard (labels made on a truncated dump; only persisted turns are scored; a `VOID` line in a
+review file retires a label the full record overturned) are in the module docstring. Each
+literature result is shown to the judge up to the answering model's own tool-result cap
+(`mcp_max_result_size`), so the judge never reads less of the record than the claim was written from.
 
 ## Development Workflow
 
