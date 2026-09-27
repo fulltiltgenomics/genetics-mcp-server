@@ -30,6 +30,7 @@ class _Server:
         self.refresh_count = 0
         self.rotate = True
         self.reject_bearer: str | None = None
+        self.sse_notification_first = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -53,7 +54,12 @@ class _Server:
             result = {"tools": self.tools}
         else:
             result = {"content": [{"type": "text", "text": json.dumps({"ok": method})}]}
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
+        reply = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+        if self.sse_notification_first and method == "tools/call":
+            note = {"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "KB query finished"}}
+            body = f"event: message\ndata: {json.dumps(note)}\n\nevent: message\ndata: {json.dumps(reply)}\n\n"
+            return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json=reply)
 
     def mcp_methods(self) -> list[str]:
         return [json.loads(r.content)["method"] for r in self.requests if str(r.url) != TOKEN_ENDPOINT]
@@ -101,6 +107,24 @@ class TestServerConfig:
 
     def test_no_allow_list_admits_everything(self):
         assert ServerConfig.parse("https://x.invalid").admits("anything")
+
+
+class TestSseParsing:
+    async def test_a_notification_ahead_of_the_response_on_the_stream_is_not_mistaken_for_it(self, server):
+        server.sse_notification_first = True
+        client = MCPProxyClient("https://x.invalid")
+        assert await client.call_tool("query_kb", {"query": "q"}) == {"ok": "tools/call"}
+
+    def test_the_response_is_picked_by_request_id_and_a_bare_notification_yields_none(self):
+        client = MCPProxyClient("https://x.invalid")
+        stream = (
+            'data: {"jsonrpc":"2.0","method":"notifications/message","params":{}}\n\n'
+            'data: {"jsonrpc":"2.0","id":7,"result":{"a":1}}\n\n'
+            'data: {"jsonrpc":"2.0","id":8,"result":{"a":2}}\n\n'
+        )
+        assert client._parse_sse_response(stream, 7) == {"jsonrpc": "2.0", "id": 7, "result": {"a": 1}}
+        assert client._parse_sse_response(stream, 9)["id"] == 8
+        assert client._parse_sse_response('data: {"jsonrpc":"2.0","method":"notifications/message"}\n', 1) is None
 
 
 class TestEndpointPath:

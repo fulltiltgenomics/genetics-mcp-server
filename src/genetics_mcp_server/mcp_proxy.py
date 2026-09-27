@@ -289,16 +289,31 @@ class MCPProxyClient:
             "params": params or {},
         }
 
-    def _parse_sse_response(self, text: str) -> dict | None:
-        """Parse SSE response to extract JSON-RPC result."""
+    def _parse_sse_response(self, text: str, request_id: int | None = None) -> dict | None:
+        """The JSON-RPC response to `request_id` out of an SSE stream.
+
+        A server may emit notifications (`notifications/message` log lines, progress) on the
+        same stream ahead of the response; C3PO does for every knowledge-base query. Those
+        carry no `id`, so the response is the event whose id matches, falling back to the
+        last event that has a result or an error.
+        """
+        response = None
         for line in text.strip().split("\n"):
-            if line.startswith("data: "):
-                data = line[6:]
-                try:
-                    return json.loads(data)
-                except json.JSONDecodeError:
-                    pass
-        return None
+            if not line.startswith("data: "):
+                continue
+            try:
+                message = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            if request_id is not None and message.get("id") == request_id:
+                return message
+            if "result" in message or "error" in message:
+                response = message
+            elif message.get("method"):
+                logger.debug(f"{self.base_url} sent {message['method']}: {json.dumps(message.get('params'))[:300]}")
+        return response
 
     def _notify_sync(self, method: str) -> None:
         """Send a JSON-RPC notification; the server answers with no body, and a refusal is
@@ -330,7 +345,7 @@ class MCPProxyClient:
 
             content_type = response.headers.get("content-type", "")
             if "text/event-stream" in content_type:
-                result = self._parse_sse_response(response.text)
+                result = self._parse_sse_response(response.text, payload.get("id"))
                 if result:
                     return result
                 raise RuntimeError(f"Failed to parse SSE response: {response.text}")
@@ -356,7 +371,7 @@ class MCPProxyClient:
 
             content_type = response.headers.get("content-type", "")
             if "text/event-stream" in content_type:
-                result = self._parse_sse_response(response.text)
+                result = self._parse_sse_response(response.text, payload.get("id"))
                 if result:
                     return result
                 raise RuntimeError(f"Failed to parse SSE response: {response.text}")
