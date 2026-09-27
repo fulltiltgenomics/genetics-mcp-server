@@ -495,6 +495,33 @@ _REQUIRED_EVERYWHERE = [
     "r² > 0.95 to the lead",
     "PIPs from pseudo credible sets should be interpreted with more caution",
 ]
+# the literature rubric names no tool so the gate cannot take it from a surface; recalled
+# literature needs no tool at all, and it is where the provenance failure is worst
+_LITERATURE_RUBRIC = [
+    "**Grade literature as you grade the loaded data**",
+    "each citation row carries design, model system",
+    "**retrieved** (a search result in this conversation, linked) or **recalled** (memory)",
+    "A claim with no retrieved record is labelled recalled",
+    "never attached to a citation that does not contain it",
+    "A recalled row carries no link, id or number",
+    "Name the tier of every non-GWAS paper",
+    "cell line, single mouse line, case report, Mendelian randomisation, narrative review, preprint",
+    "A narrative review or consensus statement points at primary studies and is not itself evidence",
+    "an AI-generated search summary is not a source",
+    "keep the summary's hedges, not only its assertions",
+    "Converging evidence is weighed, not counted",
+    "not three confirmations",
+    "Agreement with the loaded data is reconciled as carefully as disagreement",
+    "\"consistent with\" needs the paper's number beside yours",
+    "A caveat stated in Pass 2 survives into Pass 3 and the bottom line",
+    "beside the claim it qualifies",
+]
+_REQUIRED_EVERYWHERE += _LITERATURE_RUBRIC
+_PERPLEXITY_RECORD_CLAUSE = [
+    "`[n]` markers in a `perplexity` `summary` can point past the records returned",
+    "cite only markers that have a returned record",
+    "was not matched to an indexed paper: judge from its `url` whether it is one",
+]
 # these presuppose a path to credible-set / MHC rows, which `rag` does not have; the
 # narrowing bullet rides the same data-path gate and reconciles itself with the re-query rule,
 # so the two have to survive together
@@ -550,6 +577,28 @@ class TestLoadBearingTextIsPresent:
         prompt = default_system_prompt("FinnGenie", tool_names=resolve(profile, subagents=False))
         for text in _REQUIRED_WITH_A_DATA_PATH:
             assert text in prompt, f"{profile} lost: {text!r}"
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_literature_rubric_survives_without_the_literature_tool(self, profile):
+        available = resolve(profile, subagents=False) - {"search_scientific_literature"}
+        prompt = default_system_prompt("FinnGenie", tool_names=available)
+        for text in _LITERATURE_RUBRIC:
+            assert text in prompt, f"{profile} lost: {text!r}"
+        # the whole block, not only the pinned fragments: an unpinned tool name added
+        # anywhere in it would gate the rubric off the surfaces lacking that tool
+        from genetics_mcp_server.config.defaults import tools_named_in
+
+        (block,) = [b for b in PROMPT_VARIANTS["condensed"] if _LITERATURE_RUBRIC[0] in b.text]
+        assert not tools_named_in(block.text)
+        assert not tool_names_mentioned(block.text)
+
+    @pytest.mark.parametrize("text", _PERPLEXITY_RECORD_CLAUSE)
+    def test_the_perplexity_record_clause_follows_the_literature_tool(self, text):
+        available = resolve("nocode", subagents=False)
+        assert "search_scientific_literature" in available
+        assert text in default_system_prompt("FinnGenie", tool_names=available)
+        without = available - {"search_scientific_literature"}
+        assert text not in default_system_prompt("FinnGenie", tool_names=without)
 
     def test_sql_surfaces_without_a_database_tool_get_a_schema_route(self):
         """The code surface has `run_analysis` (whose SDK exposes `sql()`) but neither
