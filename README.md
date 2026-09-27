@@ -30,7 +30,7 @@ All environment variables are optional but needed for each type of functionality
 | `PERPLEXITY_API_KEY` | Perplexity API key (for literature search, the default backend) | - |
 | `TAVILY_API_KEY` | Tavily API key (for web search) | - |
 | `MCP_API_KEY` | Comma-separated bearer tokens; required to start the MCP server on a remote transport | - |
-| `EXTERNAL_MCP_SERVERS` | Comma-separated URLs of external MCP servers to proxy (e.g. gnomAD, Open Targets) | - |
+| `EXTERNAL_MCP_SERVERS` | Comma-separated external MCP servers to proxy (e.g. gnomAD, Open Targets, C3PO); an entry is `URL[|option]...`, see `.env.example` | - |
 | `RAG_MCP_SERVER` | URL of [genetics-rag-service](https://github.com/ykjain/genetics-rag-service) server | - |
 | `UNIPROT_API_URL` | UniProt REST API base URL (protein annotations, chat only) | `https://rest.uniprot.org` |
 | `EBI_PROTEINS_API_URL` | EBI Proteins API base URL (protein-to-genome mapping, chat only) | `https://www.ebi.ac.uk/proteins/api` |

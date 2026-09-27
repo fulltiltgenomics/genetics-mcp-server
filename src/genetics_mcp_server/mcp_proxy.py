@@ -6,11 +6,16 @@ and creates wrapper functions that forward calls.
 """
 
 import asyncio
+import hashlib
 import json
 import keyword
 import logging
 import os
 import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -39,29 +44,238 @@ _proxy_clients: dict[str, "MCPProxyClient"] = {}
 _rag_proxy_clients: dict[str, "MCPProxyClient"] = {}
 
 
+# refresh this many seconds before the access token's stated expiry, so a call that starts
+# just under the wire does not arrive with a token the server already considers dead
+_TOKEN_REFRESH_MARGIN = 60.0
+
+
+class OAuthRefreshTokenSource:
+    """Bearer tokens for a server behind OAuth 2.1, minted from a stored refresh token.
+
+    Servers such as C3PO accept no client-credentials grant, so a service process cannot log
+    itself in: an operator runs the device-code login once (`scripts/mcp_oauth_login.py`) and
+    the refresh token it yields is what this process holds. Access tokens are short-lived and
+    are re-minted here on demand.
+
+    Refresh tokens rotate at some issuers — using one retires it and the response carries its
+    successor — so the newest one is written to `state_path` after every refresh and read back
+    ahead of the seed on the next start. The seed still wins when it is a different token
+    from the one the file grew out of: that is a fresh login, and the file is the stale side.
+    Without a state path a rotated token dies with the process, and the next start refreshes
+    from a retired seed and fails; `from_env` warns about that at startup rather than at the
+    first 401.
+    """
+
+    def __init__(self, seed: dict[str, Any], state_path: Path | None = None, name: str = ""):
+        for key in ("token_endpoint", "client_id", "refresh_token"):
+            if not seed.get(key):
+                raise ValueError(f"OAuth credentials for {name or 'external MCP server'} lack {key!r}")
+        self.name = name
+        self.token_endpoint: str = seed["token_endpoint"]
+        self.client_id: str = seed["client_id"]
+        self.client_secret: str | None = seed.get("client_secret") or None
+        self.state_path = state_path
+        self._seed_fingerprint = self._fingerprint(seed["refresh_token"])
+        self._refresh_token: str = seed["refresh_token"]
+        self._access_token: str | None = None
+        self._expires_at = 0.0
+        self._lock = threading.Lock()
+        self._load_state()
+
+    @staticmethod
+    def _fingerprint(token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+    def _load_state(self) -> None:
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            state = json.loads(self.state_path.read_text())
+        except (OSError, ValueError) as e:
+            logger.warning(f"Ignoring unreadable OAuth state {self.state_path}: {e}")
+            return
+        if state.get("seed_fingerprint") != self._seed_fingerprint:
+            logger.info(f"OAuth seed for {self.name} changed; ignoring the stored refresh token")
+            return
+        if state.get("refresh_token"):
+            self._refresh_token = state["refresh_token"]
+
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"seed_fingerprint": self._seed_fingerprint, "refresh_token": self._refresh_token}
+                )
+            )
+            tmp.chmod(0o600)
+            tmp.replace(self.state_path)
+        except OSError as e:
+            logger.error(f"Could not persist rotated OAuth refresh token for {self.name}: {e}")
+
+    def _refresh(self) -> None:
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token,
+            "client_id": self.client_id,
+        }
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(self.token_endpoint, data=data)
+        if response.status_code != 200:
+            # the body names the OAuth error (invalid_grant = the refresh token is dead and an
+            # operator has to log in again); it never carries a token, so it is safe to log
+            raise RuntimeError(
+                f"OAuth token refresh for {self.name} failed: HTTP {response.status_code} "
+                f"{response.text[:300]}"
+            )
+        body = response.json()
+        self._access_token = body["access_token"]
+        self._expires_at = time.monotonic() + float(body.get("expires_in", 300))
+        rotated = body.get("refresh_token")
+        if rotated and rotated != self._refresh_token:
+            self._refresh_token = rotated
+            self._save_state()
+        logger.info(f"Refreshed OAuth access token for {self.name}")
+
+    def access_token(self) -> str:
+        """A currently valid access token, refreshing when the held one is near expiry."""
+        with self._lock:
+            if not self._access_token or time.monotonic() >= self._expires_at - _TOKEN_REFRESH_MARGIN:
+                self._refresh()
+            return self._access_token  # type: ignore[return-value]
+
+    def invalidate(self) -> None:
+        """Forget the access token, so the next call refreshes; used after a 401."""
+        with self._lock:
+            self._access_token = None
+            self._expires_at = 0.0
+
+    @classmethod
+    def from_env(cls, env_var: str, state_dir: str | None) -> "OAuthRefreshTokenSource":
+        raw = os.environ.get(env_var, "")
+        if not raw:
+            raise ValueError(f"{env_var} is not set; run the device-code login and store its output there")
+        seed = json.loads(raw)
+        state_path = Path(state_dir) / f"{env_var}.json" if state_dir else None
+        if state_path is None:
+            logger.warning(
+                f"EXTERNAL_MCP_STATE_DIR is unset: a refresh token rotated for {env_var} "
+                "will not survive a restart"
+            )
+        return cls(seed, state_path=state_path, name=env_var)
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    """One EXTERNAL_MCP_SERVERS entry, parsed.
+
+    Entry syntax is `URL[|option]...`, an option being `key=value` for a known key, else a
+    bare static bearer token (the original `URL|TOKEN` form; a token may itself contain
+    `=`). Keys: `path` (the JSON-RPC endpoint under the URL, default `/mcp`; `/` for a
+    server that answers at its root), `timeout` (seconds), `oauth` (the env var holding
+    the operator login's JSON), `token` (an explicit static bearer token), `tools` (a
+    `+`-separated allow-list of upstream names; `,` already separates entries), `prefix`
+    (registers each tool as `<prefix>_<name>`, keeping a server's names out of the flat
+    space the local tools share — C3PO's `list_datasets` would otherwise shadow ours).
+    """
+
+    url: str
+    endpoint_path: str = "/mcp"
+    timeout: float = 60.0
+    auth_token: str | None = None
+    oauth_env: str | None = None
+    tools: frozenset[str] | None = None
+    prefix: str = ""
+
+    KNOWN_OPTIONS = ("path", "timeout", "oauth", "token", "tools", "prefix")
+
+    @classmethod
+    def parse(cls, entry: str, default_timeout: float = 60.0) -> "ServerConfig":
+        parts = [p.strip() for p in entry.split("|")]
+        fields: dict[str, Any] = {"url": parts[0], "timeout": default_timeout}
+        for opt in parts[1:]:
+            if not opt:
+                continue
+            key, sep, value = opt.partition("=")
+            if sep and key in cls.KNOWN_OPTIONS:
+                if key == "path":
+                    fields["endpoint_path"] = value
+                elif key == "timeout":
+                    fields["timeout"] = float(value)
+                elif key == "oauth":
+                    fields["oauth_env"] = value
+                elif key == "token":
+                    fields["auth_token"] = value
+                elif key == "tools":
+                    fields["tools"] = frozenset(t for t in value.split("+") if t)
+                elif key == "prefix":
+                    fields["prefix"] = value
+            else:
+                fields["auth_token"] = opt
+        return cls(**fields)
+
+    def admits(self, tool_name: str) -> bool:
+        return self.tools is None or tool_name in self.tools
+
+
 class MCPProxyClient:
     """Client for proxying tools from a remote MCP server."""
 
     def __init__(
-        self, base_url: str, timeout: float = 30.0, prefix: str = "", auth_token: str | None = None
+        self,
+        base_url: str,
+        timeout: float = 30.0,
+        prefix: str = "",
+        auth_token: str | None = None,
+        endpoint_path: str = "/mcp",
+        token_source: OAuthRefreshTokenSource | None = None,
     ):
         """
         Initialize the proxy client.
 
         Args:
-            base_url: Base URL of the remote MCP server (without /mcp suffix)
+            base_url: Base URL of the remote MCP server
             timeout: Request timeout in seconds
             prefix: Optional prefix to add to tool names to avoid conflicts
-            auth_token: Optional Bearer token for Authorization header
+            auth_token: Optional static Bearer token for the Authorization header
+            endpoint_path: Path of the JSON-RPC endpoint under base_url; "/" for a server
+                that answers at its root
+            token_source: Bearer tokens minted per call, for a server behind OAuth; wins
+                over auth_token
         """
         self.base_url = base_url.rstrip("/")
+        path = endpoint_path.strip("/")
+        self.url = f"{self.base_url}/{path}" if path else self.base_url
         self.timeout = timeout
         self.prefix = prefix
         self.auth_token = auth_token
+        self.token_source = token_source
         self.session_id: str | None = None
         self._request_id = 0
         self._tools: list[dict] = []
         self._initialized = False
+
+    def _headers(self) -> dict[str, str]:
+        """Request headers; with a token source this may block on a token refresh."""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self.token_source:
+            headers["Authorization"] = f"Bearer {self.token_source.access_token()}"
+        elif self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        return headers
+
+    def _has_auth(self) -> bool:
+        return bool(self.token_source or self.auth_token)
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -86,19 +300,24 @@ class MCPProxyClient:
                     pass
         return None
 
-    def _post_sync(self, payload: dict) -> dict:
-        """Synchronous POST to /mcp endpoint."""
-        url = f"{self.base_url}/mcp"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
+    def _notify_sync(self, method: str) -> None:
+        """Send a JSON-RPC notification; the server answers with no body, and a refusal is
+        logged rather than raised since the notification carries nothing we need back."""
+        payload = {"jsonrpc": "2.0", "method": method}
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                response = client.post(self.url, json=payload, headers=self._headers())
+            if response.status_code >= 400:
+                logger.debug(f"{method} to {self.url} answered HTTP {response.status_code}")
+        except Exception as e:
+            logger.debug(f"{method} to {self.url} failed: {e}")
 
-        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self.auth_token else 'no'}")
+    def _post_sync(self, payload: dict) -> dict:
+        """Synchronous POST to the server's JSON-RPC endpoint."""
+        url = self.url
+        headers = self._headers()
+
+        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self._has_auth() else 'no'}")
 
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(url, json=payload, headers=headers)
@@ -119,18 +338,12 @@ class MCPProxyClient:
             return response.json()
 
     async def _post_async(self, payload: dict) -> dict:
-        """Async POST to /mcp endpoint."""
-        url = f"{self.base_url}/mcp"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
+        """Async POST to the server's JSON-RPC endpoint."""
+        url = self.url
+        # a token refresh is a blocking HTTP round trip; keep it off the event loop
+        headers = await asyncio.get_running_loop().run_in_executor(None, self._headers)
 
-        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self.auth_token else 'no'}")
+        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self._has_auth() else 'no'}")
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(url, json=payload, headers=headers)
@@ -170,6 +383,9 @@ class MCPProxyClient:
                 return False
 
             self._initialized = True
+            # the spec has the client confirm before its first request; servers holding a
+            # session refuse tools/list until they see it, stateless ones ignore it
+            self._notify_sync("notifications/initialized")
             logger.info(
                 f"Connected to remote MCP server: {result.get('result', {}).get('serverInfo', {})}"
             )
@@ -265,6 +481,8 @@ class MCPProxyClient:
             if e.response.status_code in (400, 401, 403):
                 self._initialized = False
                 self.session_id = None
+                if self.token_source:
+                    self.token_source.invalidate()
             return {"success": False, "error": f"HTTP {e.response.status_code}: {e.response.text}"}
 
         except Exception as e:
@@ -338,7 +556,12 @@ def _build_function_signature(input_schema: dict) -> tuple[list[str], list[str],
     return required_params, optional_params, defaults
 
 
-def register_proxy_tools(mcp, proxy_client: MCPProxyClient, exclude_tools: set[str] | None = None):
+def register_proxy_tools(
+    mcp,
+    proxy_client: MCPProxyClient,
+    exclude_tools: set[str] | None = None,
+    allow_tools: frozenset[str] | None = None,
+):
     """
     Register proxy tools from a remote MCP server with a FastMCP instance.
 
@@ -346,6 +569,7 @@ def register_proxy_tools(mcp, proxy_client: MCPProxyClient, exclude_tools: set[s
         mcp: FastMCP server instance
         proxy_client: Initialized MCPProxyClient
         exclude_tools: Set of tool names to exclude (without prefix)
+        allow_tools: the entry's `tools=` allow-list; None admits everything
     """
     exclude_tools = exclude_tools or set()
     tools = proxy_client.list_tools_sync()
@@ -357,7 +581,7 @@ def register_proxy_tools(mcp, proxy_client: MCPProxyClient, exclude_tools: set[s
     registered_count = 0
     for tool in tools:
         original_name = tool.get("name", "")
-        if original_name in exclude_tools:
+        if original_name in exclude_tools or (allow_tools is not None and original_name not in allow_tools):
             logger.debug(f"Skipping excluded tool: {original_name}")
             continue
 
@@ -507,19 +731,28 @@ async def execute_external_tool(tool_name: str, arguments: dict[str, Any]) -> di
     return await proxy_client.call_tool(original_name, arguments)
 
 
-def _parse_server_config(server_entry: str) -> tuple[str, str | None]:
-    """
-    Parse server entry to extract URL and optional auth token.
+def build_proxy_client(entry: str, default_timeout: float) -> tuple[MCPProxyClient, ServerConfig]:
+    """A client for one EXTERNAL_MCP_SERVERS entry (see ServerConfig for the syntax).
 
-    Format: URL or URL|AUTH_TOKEN
-
-    Returns:
-        Tuple of (url, auth_token)
+    Raises ValueError when the entry names an `oauth=` env var that is unset or malformed,
+    so the caller can skip the server with the reason in the log rather than register it
+    and fail on the first call.
     """
-    if "|" in server_entry:
-        parts = server_entry.split("|", 1)
-        return parts[0].strip(), parts[1].strip()
-    return server_entry, None
+    config = ServerConfig.parse(entry, default_timeout)
+    token_source = None
+    if config.oauth_env:
+        token_source = OAuthRefreshTokenSource.from_env(
+            config.oauth_env, os.environ.get("EXTERNAL_MCP_STATE_DIR") or None
+        )
+    client = MCPProxyClient(
+        base_url=config.url,
+        timeout=config.timeout,
+        prefix=config.prefix,
+        auth_token=config.auth_token,
+        endpoint_path=config.endpoint_path,
+        token_source=token_source,
+    )
+    return client, config
 
 
 def _initialize_rag_server(exclude_tools: set[str] | None = None) -> int:
@@ -540,10 +773,10 @@ def _initialize_rag_server(exclude_tools: set[str] | None = None) -> int:
         logger.debug("RAG_MCP_SERVER not set, skipping RAG server initialization")
         return 0
 
-    server_url, auth_token = _parse_server_config(rag_server.strip())
-    logger.info(f"Connecting to RAG MCP server: {server_url}")
     try:
-        proxy_client = MCPProxyClient(base_url=server_url, timeout=180.0, auth_token=auth_token)
+        proxy_client, config = build_proxy_client(rag_server.strip(), default_timeout=180.0)
+        server_url = config.url
+        logger.info(f"Connecting to RAG MCP server: {server_url}")
         tools = proxy_client.list_tools_sync()
 
         if not tools:
@@ -553,7 +786,7 @@ def _initialize_rag_server(exclude_tools: set[str] | None = None) -> int:
         registered = 0
         for tool in tools:
             original_name = tool.get("name", "")
-            if original_name in exclude_tools:
+            if original_name in exclude_tools or not config.admits(original_name):
                 logger.debug(f"Skipping excluded RAG tool: {original_name}")
                 continue
             _rag_proxy_clients[proxy_client.get_prefixed_name(original_name)] = proxy_client
@@ -566,7 +799,7 @@ def _initialize_rag_server(exclude_tools: set[str] | None = None) -> int:
         return registered
 
     except Exception as e:
-        logger.error(f"Failed to connect to RAG MCP server {server_url}: {e}", exc_info=True)
+        logger.error(f"Failed to connect to RAG MCP server {rag_server}: {e}", exc_info=True)
         return 0
 
 
@@ -596,10 +829,14 @@ def initialize_external_servers() -> int:
             if not server_entry:
                 continue
 
-            server_url, auth_token = _parse_server_config(server_entry)
-            logger.info(f"Connecting to external MCP server: {server_url} (auth={'configured' if auth_token else 'none'})")
+            server_url = server_entry.split("|", 1)[0].strip()
             try:
-                proxy_client = MCPProxyClient(base_url=server_url, timeout=60.0, auth_token=auth_token)
+                proxy_client, config = build_proxy_client(server_entry, default_timeout=60.0)
+                logger.info(
+                    f"Connecting to external MCP server: {server_url} "
+                    f"(auth={'oauth' if config.oauth_env else 'token' if config.auth_token else 'none'}, "
+                    f"endpoint={proxy_client.url}, timeout={config.timeout}s)"
+                )
                 tools = proxy_client.list_tools_sync()
 
                 if not tools:
@@ -609,7 +846,7 @@ def initialize_external_servers() -> int:
                 registered = 0
                 for tool in tools:
                     original_name = tool.get("name", "")
-                    if original_name in exclude_tools:
+                    if original_name in exclude_tools or not config.admits(original_name):
                         logger.debug(f"Skipping excluded tool: {original_name}")
                         continue
                     tool_name = proxy_client.get_prefixed_name(original_name)

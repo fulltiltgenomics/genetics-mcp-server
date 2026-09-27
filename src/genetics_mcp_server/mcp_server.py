@@ -134,17 +134,18 @@ exclude_tools_str = os.environ.get("EXTERNAL_MCP_EXCLUDE_TOOLS", "")
 exclude_tools = set(t.strip() for t in exclude_tools_str.split(",") if t.strip())
 
 if external_servers:
-    from genetics_mcp_server.mcp_proxy import MCPProxyClient, register_proxy_tools
+    from genetics_mcp_server.mcp_proxy import build_proxy_client, register_proxy_tools
 
-    for server_url in external_servers.split(","):
-        server_url = server_url.strip()
-        if not server_url:
+    for server_entry in external_servers.split(","):
+        server_entry = server_entry.strip()
+        if not server_entry:
             continue
 
+        server_url = server_entry.split("|", 1)[0].strip()
         logger.info(f"Connecting to external MCP server: {server_url}")
         try:
-            proxy_client = MCPProxyClient(base_url=server_url, timeout=60.0)
-            register_proxy_tools(mcp, proxy_client, exclude_tools=exclude_tools)
+            proxy_client, config = build_proxy_client(server_entry, default_timeout=60.0)
+            register_proxy_tools(mcp, proxy_client, exclude_tools=exclude_tools, allow_tools=config.tools)
         except Exception as e:
             logger.error(f"Failed to connect to external MCP server {server_url}: {e}")
 

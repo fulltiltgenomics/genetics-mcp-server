@@ -2231,6 +2231,7 @@ src/genetics_mcp_server/
 │   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
 │   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
 │   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
+│   ├── mcp_oauth_login.py   # one-off browser login for an OAuth-protected external MCP server (C3PO)
 │   └── conversation_prompts.py  # LLM prompt templates for topic categorization
 ├── skills/
 │   ├── __init__.py
@@ -2541,10 +2542,29 @@ The `ToolExecutor` class implements each tool as an async method that:
 ### External MCP proxying
 
 The `mcp_proxy.py` module allows connecting to remote MCP servers:
-1. Fetches tool definitions via JSON-RPC initialize/tools/list
+1. Fetches tool definitions via JSON-RPC initialize, the `notifications/initialized` the spec has the client send next, then tools/list
 2. Dynamically creates wrapper functions using exec()
 3. Forwards tool calls to the remote server
 4. Parses SSE responses and extracts JSON-RPC results
+
+Each `EXTERNAL_MCP_SERVERS` entry is `URL[|option]...`, parsed by `ServerConfig.parse`: an
+option is `key=value` for `path` (the endpoint under the URL, default `/mcp`, `/` for a server
+answering at its root), `timeout`, `token`, `oauth`, `tools` (a `+`-separated allow-list,
+applied beside `EXTERNAL_MCP_EXCLUDE_TOOLS`) or `prefix` (registers `<prefix>_<name>`, so a
+server's names cannot shadow a local tool's), and anything else is a static bearer token, which
+keeps the original `URL|TOKEN` form parsing. `build_proxy_client` turns an entry into a client
+and is the one constructor path for chat-backend, the RAG server and the standalone MCP server.
+
+`oauth=<ENV>` is for a server behind OAuth 2.1 with no client-credentials grant (C3PO). The env
+var holds the JSON that `scripts/mcp_oauth_login.py` writes after an operator completes the
+authorization-code flow once, pasting the redirect address back since the browser is not on
+the machine running it (AuthKit refuses the device-code grant to a dynamically registered
+client): `token_endpoint`, `client_id`, `refresh_token`. `OAuthRefreshTokenSource`
+mints access tokens from it on demand, refreshing inside a 60 s margin of expiry and after any
+401/403 on a call, and writes the rotated refresh token to `EXTERNAL_MCP_STATE_DIR/<ENV>.json`,
+reading it back ahead of the seed on the next start unless the seed itself changed. A token
+refresh is a blocking round trip and runs off the event loop. An entry whose `oauth=` var is
+unset is skipped with the reason logged rather than registered unauthenticated.
 
 ### Subagent system
 
@@ -2980,8 +3000,9 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 |----------|-------------|
 | `LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (default `INFO`) |
 | `MCP_DISABLE_TRANSPORT_SECURITY` | Allow all hosts/origins (dev only) |
-| `EXTERNAL_MCP_SERVERS` | Comma-separated URLs of always-on external MCP servers (gnomAD, Open Targets) |
+| `EXTERNAL_MCP_SERVERS` | Comma-separated entries of always-on external MCP servers (gnomAD, Open Targets, C3PO); entry syntax under "External MCP proxying" |
 | `EXTERNAL_MCP_EXCLUDE_TOOLS` | Tool names to exclude from proxying |
+| `EXTERNAL_MCP_STATE_DIR` | Directory where a rotated OAuth refresh token is persisted for `oauth=` entries; unset, a rotation dies with the process |
 | `ENABLE_CREDIBLE_SETS_STATS` | Enable `get_credible_sets_stats` tool (default `false`) |
 | `ENABLE_PHENOTYPE_REPORT` | Enable `get_phenotype_report` tool (default `false`) |
 | `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
@@ -2994,6 +3015,7 @@ These flags feed `settings.disabled_tools` (as does `ENABLE_SUBAGENTS`), which t
 Default external servers:
 - gnomAD: `https://gnomad-mcp-dpsnoyqx6q-uc.a.run.app`
 - Open Targets: `https://mcp.platform.opentargets.org`
+- C3PO: `https://mcp.c3po.bio|path=/|timeout=120|oauth=C3PO_MCP_OAUTH|prefix=c3po|tools=<read-only names>` — the deployed entry is in genetics-results-suite's `docs/chat-tool-reference.md` § 6
 
 ### Subagent options
 

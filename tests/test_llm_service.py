@@ -1226,8 +1226,9 @@ class _FakeProxyClient:
 
     prefix = ""
 
-    def __init__(self, base_url, timeout=30.0, auth_token=None):
+    def __init__(self, base_url, timeout=30.0, auth_token=None, **kwargs):
         self.base_url = base_url
+        self.url = base_url
         self._tools = [
             {"name": "aou_hidden", "description": "d", "inputSchema": {"type": "object"}},
             {"name": "gnomad_variant", "description": "d", "inputSchema": {"type": "object"}},
