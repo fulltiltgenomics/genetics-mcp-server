@@ -202,6 +202,58 @@ def test_load_replay_fills_earlier_results_for_the_harness_shape(tmp_path):
     assert t0_other_arm.earlier_results == []
 
 
+def test_load_replay_carries_arm_only_for_the_harness_shape(tmp_path):
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps({"turns": [
+        {"case_id": "c1", "arm": "code", "turn_index": 0, "status": "ok",
+         "user_question": "Q", "final_answer": "A", "literature_results": []},
+    ]}))
+    assert lj.load_replay(path)[0].arm == "code"
+
+    path2 = tmp_path / "replay.json"
+    path2.write_text(json.dumps([{"question": "Q", "answer": "A", "id": "t1"}]))
+    assert lj.load_replay(path2)[0].arm == ""
+
+
+def test_summarize_by_arm_splits_a_two_arm_replay_and_pools_via_summarize(tmp_path):
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps({"turns": [
+        {"case_id": "c1", "arm": "code", "turn_index": 0, "status": "ok",
+         "user_question": "Q0", "final_answer": "A0", "literature_results": []},
+        {"case_id": "c1", "arm": "code", "turn_index": 1, "status": "ok",
+         "user_question": "Q1", "final_answer": "A1", "literature_results": []},
+        {"case_id": "c1", "arm": "nocode", "turn_index": 0, "status": "ok",
+         "user_question": "Q0", "final_answer": "A0'", "literature_results": []},
+    ]}))
+    turns = lj.load_replay(path)
+    ids = [t.id for t in turns]
+    assert ids == ["c1:code:0", "c1:code:1", "c1:nocode:0"]
+
+    judgements = {
+        "c1:code:0": {"findings": [{"claim": "x", "categories": [1]}]},
+        "c1:code:1": {"findings": []},
+        "c1:nocode:0": {"findings": [{"claim": "y", "categories": [3]}, {"claim": "z", "categories": [3]}]},
+    }
+    by_arm = lj.summarize_by_arm(turns, judgements)
+    assert set(by_arm) == {"code", "nocode"}
+    assert by_arm["code"]["turns"] == 2
+    assert by_arm["code"]["findings"] == 1
+    assert by_arm["nocode"]["turns"] == 1
+    assert by_arm["nocode"]["findings"] == 2
+    # code's one finding is record-decidable (cat 1), nocode's two are claim-level (cat 3)
+    assert by_arm["code"]["category_mix"] == {"record_only": 1}
+    assert by_arm["nocode"]["category_mix"] == {"claim_only": 2}
+
+    pooled = lj.summarize(judgements)
+    assert pooled["turns"] == 3
+    assert pooled["findings"] == 3
+
+
+def test_summarize_by_arm_is_empty_when_no_turn_carries_an_arm():
+    turns = [lj.Turn(id="t1", question="Q", answer="A", literature_results=[])]
+    assert lj.summarize_by_arm(turns, {"t1": {"findings": []}}) == {}
+
+
 @pytest.mark.parametrize("payload", [
     {"not_turns": []},
     [{"question": "Q"}],

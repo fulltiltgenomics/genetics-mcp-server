@@ -220,6 +220,7 @@ class Turn:
     user: str = ""
     created_at: str = ""
     persisted: bool = True
+    arm: str = ""  # only the harness's --output shape carries this (see load_replay)
 
     @property
     def literature_bearing(self) -> bool:
@@ -293,6 +294,7 @@ def load_replay(path: Path) -> list[Turn]:
                 "answer": t.get("final_answer") or "",
                 "literature_results": results(t.get("literature_results")),
                 "turn_index": t.get("turn_index", i),
+                "arm": t.get("arm") or "",
             }
             harness_by_group.setdefault((t.get("case_id"), t.get("arm")), []).append(entry)
             entries.append(entry)
@@ -321,7 +323,8 @@ def load_replay(path: Path) -> list[Turn]:
 
     turns = [
         Turn(id=e["turn_id"], question=e["question"], answer=e["answer"],
-             literature_results=e["literature_results"], earlier_results=e["earlier_results"])
+             literature_results=e["literature_results"], earlier_results=e["earlier_results"],
+             arm=e.get("arm", ""))
         for e in entries if e is not None
     ]
     if skipped:
@@ -553,6 +556,21 @@ def summarize(judgements: dict[str, dict]) -> dict:
     }
 
 
+def summarize_by_arm(turns: list[Turn], judgements: dict[str, dict]) -> dict[str, dict]:
+    """Per-arm summaries, for a replay whose turns carry an arm (the harness's --output
+    shape). Pooling across arms the way `summarize` does hides exactly the comparison a
+    paired A/B run was for. The arm comes from `Turn.arm`, never from splitting the turn id:
+    a label defaulted from a URL is `profile@host:port`, so the id's ':' fields are ambiguous.
+    Empty when no turn has an arm (prod turns never do).
+    """
+    arms = sorted({t.arm for t in turns if t.arm})
+    ids_by_arm = {arm: {t.id for t in turns if t.arm == arm} for arm in arms}
+    return {
+        arm: summarize({tid: j for tid, j in judgements.items() if tid in ids})
+        for arm, ids in ids_by_arm.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Prod rows
 # ---------------------------------------------------------------------------
@@ -773,8 +791,13 @@ def main(argv=None) -> None:
         concurrency=args.concurrency,
     ))
     summary = summarize(judgements)
-    _print_summary("judge summary", summary)
+    by_arm = summarize_by_arm(turns, judgements) if args.report else {}
+    for arm, arm_summary in by_arm.items():
+        _print_summary(f"judge summary (arm={arm})", arm_summary)
+    _print_summary("judge summary (pooled)" if by_arm else "judge summary", summary)
     result = {"summary": summary, "judgements": judgements}
+    if by_arm:
+        result["summary_by_arm"] = by_arm
 
     if args.calibrate:
         agg = score_agreement(half, judgements)

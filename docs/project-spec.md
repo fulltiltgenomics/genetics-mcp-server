@@ -3078,8 +3078,8 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chembl.py` | ChEMBL client: target resolution through UniProt, paging caps, phase filtering, attribution |
 | `test_chembl_descriptions.py` | Every backticked name in the three ChEMBL tool descriptions and in the ChEMBL prompt blocks resolves to a parameter, a tool name, or a key of that tool's mocked happy-path result |
 | `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
-| `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export; `session_is_literature_bearing` (a direct call and a `launch_subagents` `literature_review` task, neither for an unrelated tool), the `literature_bearing` tag on every exported case, and `--literature-bearing` restricting the pool before the per-topic sample |
-| `test_literature_judge.py` | Literature-evidence judge harness, no network: the `[F..]`/`[G..]` label loader (a `VOID` line skips an overturned entry) and prefix resolution of message ids, the literature-bearing-turn predicate, tool results matched to calls by id, the agreement arithmetic (finding pairs, counter-examples violated by category or by quoting the praised passage; a finding with no category counts toward neither and is reported as dropped), the prod-rows cache name following `--users` and `--context`, the deterministic half split, the category mix, and the replay-JSON loader — both the documented `question`/`answer` shape and replay_benchmark.py's own `--output` report shape (told apart by `status`, non-`"ok"` turns skipped) |
+| `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export; `session_is_literature_bearing` (a direct call and a `launch_subagents` `literature_review` task, neither for an unrelated tool), the `literature_bearing` tag on every exported case, `--literature-bearing` restricting the pool before the per-topic sample, and the per-topic cap itself — the default still applies unadorned, `max_per_topic=0` exports the whole pool uncapped, and an explicit `--max-per-topic` overrides either default |
+| `test_literature_judge.py` | Literature-evidence judge harness, no network: the `[F..]`/`[G..]` label loader (a `VOID` line skips an overturned entry) and prefix resolution of message ids, the literature-bearing-turn predicate, tool results matched to calls by id, the agreement arithmetic (finding pairs, counter-examples violated by category or by quoting the praised passage; a finding with no category counts toward neither and is reported as dropped), the prod-rows cache name following `--users` and `--context`, the deterministic half split, the category mix, and the replay-JSON loader — both the documented `question`/`answer` shape and replay_benchmark.py's own `--output` report shape (told apart by `status`, non-`"ok"` turns skipped), including that only the harness shape's turns carry an arm and `summarize_by_arm` splits a replay's judgements by it while pooling turns with none |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from. Also `cluster_sessions` (chain linkage, the `min_shared` threshold, strict kinds only, order-independent numbering) and the M1/M2/M3 shares over a two-project synthetic history, including the pseudonym agreeing with `memory_gate.user_log_hash` |
@@ -3477,12 +3477,18 @@ harness issues two arms per case. `--base-url` therefore defaults to
   time, before its own per-topic sample is taken, and tags every exported case with a
   `literature_bearing` bool (`session_is_literature_bearing`) that `load_cases` prefers over
   re-deriving the answer from `tools_used`, which cannot see a `launch_subagents` call's
-  task skill. `literature_judge.py --report` reads the harness's own `--output` JSON
-  directly — it recognises the shape by the `status` field and skips turns that are not
-  `"ok"`, so no separate export step exists for it; that shape carries no `earlier_results`
-  field per turn (unlike a prod row), so the loader rebuilds it from each turn's own
-  `case_id`/`arm`/`turn_index`, the same per-(case, arm) accumulation `build_turns` does per
-  session.
+  task skill. `--max-per-topic N` sets that per-topic cap explicitly (`0` = no cap); with
+  `--literature-bearing` and no explicit `--max-per-topic`, the cap defaults to none, since
+  the literature premise is about the whole restricted population, not a per-topic sample of
+  it — the nightly default path (neither flag given) still caps at 5. `literature_judge.py
+  --report` reads the harness's own `--output` JSON directly — it recognises the shape by the
+  `status` field and skips turns that are not `"ok"`, so no separate export step exists for
+  it; that shape carries no `earlier_results` field per turn (unlike a prod row), so the
+  loader rebuilds it from each turn's own `case_id`/`arm`/`turn_index`, the same
+  per-(case, arm) accumulation `build_turns` does per session. The loader also keeps each
+  harness turn's `arm` on the turn, so `--report` additionally splits the printed and saved
+  summary per arm (`summarize_by_arm`, the same `summarize` arithmetic per arm) before
+  printing the pooled figures; `--db` never splits, since prod turns carry no arm.
 - **The prose the answer-slicing rule discards is recorded too, with its position.** Every
   turn keeps `final_answer_dropped_prose` — `{after_call, text}` per block — alongside the
   `final_answer_dropped_chars` count, from the same boundary (`dropped_prose_blocks`, beside

@@ -1565,8 +1565,9 @@ def export_eval_dataset(
 
     `literature_bearing_only` restricts the pool to sessions that called
     search_scientific_literature or launched a literature_review subagent BEFORE the
-    per-topic top/bottom-by-score sample is taken: the default max_per_topic sample is drawn
-    from every topic and is not the population a literature-quality benchmark needs.
+    per-topic top/bottom-by-score sample is taken. `max_per_topic=0` means no cap — every
+    session in the (possibly literature-bearing-restricted) pool is exported, since a
+    literature-quality benchmark needs the population, not a per-topic sample of it.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1590,7 +1591,7 @@ def export_eval_dataset(
         convs.sort(key=lambda c: c.success_score, reverse=True)
         # take top, bottom, and middle
         selected = []
-        if len(convs) >= max_per_topic:
+        if max_per_topic and len(convs) >= max_per_topic:
             n = max_per_topic
             selected = convs[:n // 2] + convs[-(n - n // 2):]
         else:
@@ -2163,6 +2164,12 @@ async def main():
                         help="Restrict the eval dataset export to sessions that called "
                              "search_scientific_literature or launched a literature_review "
                              "subagent, sampled before the per-topic top/bottom cut")
+    parser.add_argument("--max-per-topic", type=int, default=None,
+                        help="Cap on conversations sampled per topic (top/bottom split), "
+                             "0 means no cap. Default: 5, except with --literature-bearing "
+                             "and no explicit value here, where the default is no cap — the "
+                             "literature premise is about the whole bearing population, not "
+                             "a per-topic sample of it")
     args = parser.parse_args()
 
     # progress goes to stderr so stdout stays pipeable for the report; the level prefix
@@ -2485,8 +2492,15 @@ async def main():
     # --- export eval dataset ---
     if not args.report_only:
         logger.info("Exporting eval dataset...")
+        if args.max_per_topic is not None:
+            max_per_topic = args.max_per_topic
+        elif args.literature_bearing:
+            max_per_topic = 0
+        else:
+            max_per_topic = 5
         export_eval_dataset(
             all_metrics, messages, output_dir,
+            max_per_topic=max_per_topic,
             literature_bearing_only=args.literature_bearing,
         )
 

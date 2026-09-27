@@ -639,6 +639,69 @@ class TestExportEvalDataset:
 
 
 @pytest.fixture
+def eight_session_db(tmp_path):
+    """Eight one-turn sessions in a single topic, for exercising the per-topic cap."""
+    db_path = str(tmp_path / "eight_session_chat.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT,
+            created_at TIMESTAMP, updated_at TIMESTAMP, rating INTEGER, comment TEXT,
+            phenotype_code TEXT
+        );
+        CREATE TABLE chat_messages (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, created_at TIMESTAMP, thumbs_up BOOLEAN,
+            content_json TEXT, literature_backend TEXT, tool_profile TEXT
+        );
+    """)
+    for i in range(8):
+        sid = f"s{i}"
+        conn.execute(
+            "INSERT INTO chat_sessions VALUES (?, 'u@test.com', ?, '2026-01-01', "
+            "'2026-01-01', NULL, NULL, NULL)", (sid, sid))
+        conn.execute(
+            "INSERT INTO chat_messages VALUES (?, ?, 'user', ?, '2026-01-01 10:00:00', "
+            "NULL, NULL, NULL, NULL)", (f"{sid}-q", sid, "any papers?"))
+        conn.execute(
+            "INSERT INTO chat_messages VALUES (?, ?, 'assistant', ?, '2026-01-01 10:00:01', "
+            "NULL, NULL, NULL, NULL)", (f"{sid}-a", sid, "yes"))
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestMaxPerTopic:
+    def _metrics_and_messages(self, eight_session_db):
+        sessions, messages = load_data(eight_session_db)
+        tool_stats = build_session_tool_stats(messages)
+        topics = {f"s{i}": {"topic": "t", "complexity": 1, "brief_reason": ""} for i in range(8)}
+        metrics = compute_all_metrics(sessions, messages, tool_stats, topics)
+        return metrics, messages
+
+    def test_default_cap_still_applies(self, eight_session_db, tmp_path):
+        metrics, messages = self._metrics_and_messages(eight_session_db)
+        output_dir = tmp_path / "eval_output"
+        export_eval_dataset(metrics, messages, output_dir)  # max_per_topic default (5)
+        cases = json.loads((output_dir / "eval_dataset.json").read_text())
+        assert len(cases) == 5
+
+    def test_zero_means_no_cap(self, eight_session_db, tmp_path):
+        metrics, messages = self._metrics_and_messages(eight_session_db)
+        output_dir = tmp_path / "eval_output"
+        export_eval_dataset(metrics, messages, output_dir, max_per_topic=0)
+        cases = json.loads((output_dir / "eval_dataset.json").read_text())
+        assert len(cases) == 8
+
+    def test_explicit_cap_overrides_default(self, eight_session_db, tmp_path):
+        metrics, messages = self._metrics_and_messages(eight_session_db)
+        output_dir = tmp_path / "eval_output"
+        export_eval_dataset(metrics, messages, output_dir, max_per_topic=2)
+        cases = json.loads((output_dir / "eval_dataset.json").read_text())
+        assert len(cases) == 2
+
+
+@pytest.fixture
 def literature_db(tmp_path):
     """One session that called search_scientific_literature, one that only used another
     tool, and one that launched a launch_subagents literature_review task."""
