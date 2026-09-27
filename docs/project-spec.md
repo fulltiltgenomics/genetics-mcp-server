@@ -2233,7 +2233,7 @@ src/genetics_mcp_server/
 │   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
 │   ├── mcp_oauth_login.py   # one-off browser login for an OAuth-protected external MCP server (C3PO)
 │   ├── literature_judge.py  # literature-evidence judge: baseline over prod turns, calibration, replay scoring
-│   └── conversation_prompts.py  # LLM prompt templates for topic categorization
+│   └── conversation_prompts.py  # LLM prompt templates: the analyzer's topic, issue and quality prompts, the pairwise and literature-evidence judges
 ├── skills/
 │   ├── __init__.py
 │   ├── definitions.py      # skill definitions and registry

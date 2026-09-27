@@ -1023,7 +1023,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "'subjects': the first few MeSH descriptors; MeSH lags publication by months and never exists for preprints, so an empty list is unknown, not evidence of absence (not 'not animal'). "
             "'cited_by': reflects age and attention, not quality. "
             "'publication_status': Europe PMC's status (e.g. epublish, ppublish). "
-            "'is_preprint' is always present on every hit: True when the hit's URL is a bioRxiv/medRxiv link or the matched Europe PMC record is a preprint. False is not evidence it isn't one — an arXiv, Research Square, or SSRN link reads False too."
+            "'is_preprint' is always present on every ranked hit: True when the hit's URL is a bioRxiv/medRxiv link or the matched Europe PMC record is a preprint. False is not evidence it isn't one — an arXiv, Research Square, or SSRN link reads False too."
         ),
         "parameters": {
             "query": {
