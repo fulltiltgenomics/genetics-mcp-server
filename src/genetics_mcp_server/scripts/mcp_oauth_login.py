@@ -17,7 +17,9 @@ WorkOS AuthKit, C3PO's issuer, refuses it for a dynamically registered client ("
 denied" on the activation page, measured 2026-09-27).
 
 The account that signs in is the identity every chat user then acts as on that server, so
-sign in with the account that should own that.
+sign in with the account that should own that. Run it once PER DEPLOYMENT: a refresh token
+rotates on use and the retired one is refused a few minutes later, so two processes sharing
+one seed lock each other out.
 
 Usage:
     python -m genetics_mcp_server.scripts.mcp_oauth_login https://mcp.c3po.bio --path / --out c3po.json
