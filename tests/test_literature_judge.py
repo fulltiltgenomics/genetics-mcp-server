@@ -160,6 +160,48 @@ def test_load_replay_accepts_both_result_shapes(tmp_path):
     assert t2.id == "1" and not t2.literature_bearing
 
 
+def test_load_replay_accepts_the_harness_report_shape(tmp_path):
+    """replay_benchmark.py's own --output JSON, read with no conversion step."""
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps({"turns": [
+        {"case_id": "c1", "arm": "code", "turn_index": 0, "status": "ok",
+         "user_question": "Q", "final_answer": "A",
+         "literature_results": [{"name": "search_scientific_literature", "input": {"q": "x"},
+                                  "content": "paper text"}]},
+        {"case_id": "c1", "arm": "code", "turn_index": 1, "status": "error",
+         "user_question": "Q2", "final_answer": None, "literature_results": []},
+    ]}))
+    turns = lj.load_replay(path)
+    assert len(turns) == 1  # the "error" turn has no answer to judge and is skipped
+    t = turns[0]
+    assert t.id == "c1:code:0" and t.question == "Q" and t.answer == "A"
+    assert t.literature_bearing and t.literature_results[0]["content"] == "paper text"
+
+
+def test_load_replay_fills_earlier_results_for_the_harness_shape(tmp_path):
+    """The harness's own --output report carries no earlier_results field per turn (unlike
+    a prod row), so the loader has to rebuild the same per-(case, arm) accumulation
+    build_turns does for prod rows, in turn_index order."""
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps({"turns": [
+        {"case_id": "c1", "arm": "code", "turn_index": 0, "status": "ok",
+         "user_question": "Q0", "final_answer": "A0",
+         "literature_results": [{"name": "search_scientific_literature", "input": {},
+                                  "content": "paper one"}]},
+        {"case_id": "c1", "arm": "code", "turn_index": 1, "status": "ok",
+         "user_question": "Q1", "final_answer": "A1",
+         "literature_results": [{"name": "search_scientific_literature", "input": {},
+                                  "content": "paper two"}]},
+        # a different arm of the same case starts its own accumulation from empty
+        {"case_id": "c1", "arm": "nocode", "turn_index": 0, "status": "ok",
+         "user_question": "Q0", "final_answer": "A0'", "literature_results": []},
+    ]}))
+    t0, t1, t0_other_arm = lj.load_replay(path)
+    assert t0.earlier_results == []
+    assert [r["content"] for r in t1.earlier_results] == ["paper one"]
+    assert t0_other_arm.earlier_results == []
+
+
 @pytest.mark.parametrize("payload", [
     {"not_turns": []},
     [{"question": "Q"}],

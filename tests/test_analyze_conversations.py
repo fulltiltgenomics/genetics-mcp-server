@@ -34,6 +34,7 @@ from genetics_mcp_server.scripts.analyze_conversations import (
     message_tool_calls,
     parse_tool_calls,
     parse_tool_calls_from_content_json,
+    session_is_literature_bearing,
 )
 
 
@@ -635,6 +636,92 @@ class TestExportEvalDataset:
         # pre-existing keys must survive for any consumer of the old shape
         for key in ("first_user_message", "tools_used", "total_tool_calls", "turn_count"):
             assert key in data[0]
+
+
+@pytest.fixture
+def literature_db(tmp_path):
+    """One session that called search_scientific_literature, one that only used another
+    tool, and one that launched a launch_subagents literature_review task."""
+    db_path = str(tmp_path / "literature_chat.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE chat_sessions (
+            id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT,
+            created_at TIMESTAMP, updated_at TIMESTAMP, rating INTEGER, comment TEXT,
+            phenotype_code TEXT
+        );
+        CREATE TABLE chat_messages (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, created_at TIMESTAMP, thumbs_up BOOLEAN,
+            content_json TEXT, literature_backend TEXT, tool_profile TEXT,
+            instruction_set_id TEXT, verbosity TEXT
+        );
+        INSERT INTO chat_sessions VALUES
+            ('lit', 'u@test.com', 'lit', '2026-01-01', '2026-01-01', NULL, NULL, NULL),
+            ('sub', 'u@test.com', 'sub', '2026-01-01', '2026-01-01', NULL, NULL, NULL),
+            ('plain', 'u@test.com', 'plain', '2026-01-01', '2026-01-01', NULL, NULL, NULL);
+    """)
+    rows = [
+        ("lit-q", "lit", "user", "any papers on GPR17?", None),
+        ("lit-a", "lit", "assistant", "yes", json.dumps(
+            [{"type": "tool_use", "id": "t1", "name": "search_scientific_literature",
+              "input": {"query": "GPR17"}}]
+        )),
+        ("sub-q", "sub", "user", "any papers on GPR17?", None),
+        ("sub-a", "sub", "assistant", "yes", json.dumps(
+            [{"type": "tool_use", "id": "t2", "name": "launch_subagents",
+              "input": {"tasks": [{"skill": "literature_review", "prompt": "GPR17"}]}}]
+        )),
+        ("plain-q", "plain", "user", "what variants are near GPR17?", None),
+        ("plain-a", "plain", "assistant", "some", json.dumps(
+            [{"type": "tool_use", "id": "t3", "name": "get_variants", "input": {}}]
+        )),
+    ]
+    conn.executemany(
+        "INSERT INTO chat_messages "
+        "(id, session_id, role, content, created_at, content_json) VALUES (?, ?, ?, ?, ?, ?)",
+        [(mid, sid, role, content, "2026-01-01 10:00:00", cj) for mid, sid, role, content, cj in rows],
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestLiteratureBearingSelection:
+    def _metrics_and_messages(self, literature_db):
+        sessions, messages = load_data(literature_db)
+        tool_stats = build_session_tool_stats(messages)
+        metrics = compute_all_metrics(sessions, messages, tool_stats, {})
+        return metrics, messages
+
+    def test_session_is_literature_bearing_direct_call_and_subagent(self, literature_db):
+        metrics, messages = self._metrics_and_messages(literature_db)
+
+        def is_bearing(sid):
+            return session_is_literature_bearing(
+                messages.filter(pl.col("session_id") == sid).sort(message_sort_keys(messages))
+            )
+
+        assert is_bearing("lit")
+        assert is_bearing("sub")
+        assert not is_bearing("plain")
+
+    def test_export_tags_literature_bearing_per_case(self, literature_db, tmp_path):
+        metrics, messages = self._metrics_and_messages(literature_db)
+        output_dir = tmp_path / "eval_output"
+        export_eval_dataset(metrics, messages, output_dir)
+        cases = {c["session_id"]: c for c in json.loads((output_dir / "eval_dataset.json").read_text())}
+        assert cases["lit"]["literature_bearing"] is True
+        assert cases["sub"]["literature_bearing"] is True
+        assert cases["plain"]["literature_bearing"] is False
+
+    def test_literature_bearing_only_restricts_the_pool_before_sampling(self, literature_db, tmp_path):
+        metrics, messages = self._metrics_and_messages(literature_db)
+        output_dir = tmp_path / "eval_output"
+        export_eval_dataset(metrics, messages, output_dir, literature_bearing_only=True)
+        cases = json.loads((output_dir / "eval_dataset.json").read_text())
+        assert {c["session_id"] for c in cases} == {"lit", "sub"}
+        assert all(c["literature_bearing"] for c in cases)
 
 
 @pytest.fixture

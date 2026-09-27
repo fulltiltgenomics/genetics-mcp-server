@@ -86,6 +86,23 @@ CODE_EXECUTION_TOOL = "run_analysis"
 # surface and the identical-surface guard below refuses the run.
 ALL_TOOLS_ARM = "all"
 
+# mirrors literature_judge.LITERATURE_TOOL / SUBAGENT_TOOL / LITERATURE_SKILL
+# (scripts/literature_judge.py) — kept as the harness's own literals for the same reason as
+# CODE_EXECUTION_TOOL above: this reads a REMOTE server's stream, which may not be this
+# build. Pinned against literature_judge by a test rather than imported.
+LITERATURE_TOOL = "search_scientific_literature"
+LITERATURE_SUBAGENT_TOOL = "launch_subagents"
+LITERATURE_SUBAGENT_SKILL = "literature_review"
+
+# mirrors settings.mcp_max_result_size (config/settings.py) — the size llm_service already
+# truncates a tool result to server-side, appending its own cut notice, before the result
+# ever reaches this harness. The cap here only bounds how much of that already-truncated
+# text lands in the report; it cannot hide evidence from the judge that the model saw,
+# because the model never saw more than this either. Kept as a literal rather than imported
+# for the same remote-build reason as LITERATURE_TOOL; pinned by a test against
+# get_settings().mcp_max_result_size.
+LITERATURE_RESULT_CAP = 50_000
+
 
 @dataclass(frozen=True)
 class Arm:
@@ -360,6 +377,14 @@ class TurnRecord:
     # transcript claim a fragment was the whole reply.
     final_answer_dropped_prose: list[dict[str, Any]] = field(default_factory=list)
 
+    # the ONE exception to extract_tool_calls's "results are NOT recorded" rule — see its
+    # docstring. One entry per literature call (a search_scientific_literature call, or a
+    # launch_subagents call with a literature_review task — see extract_literature_results),
+    # {"name", "input", "content"}, content capped at LITERATURE_RESULT_CAP. Always captured
+    # when the turn made such a call; empty otherwise, which is itself the literature judge's
+    # "no search for a literature answer" finding.
+    literature_results: list[dict[str, Any]] = field(default_factory=list)
+
     # one entry per iteration that reasoned, {"iteration", "text"}, and EMPTY unless the run
     # asked for it with --capture-thinking. Populated from the `thinking_summary` chunks,
     # which the server emits only on request: the text exists nowhere else, since llm_service
@@ -421,9 +446,9 @@ def extract_tool_calls(message_content: list[dict[str, Any]] | None) -> list[dic
     """Every tool_use block in a done chunk, in the order the model emitted them.
 
     Deliberately not the '*[Using tool: X]*' text markers: those are display prose the
-    model has been observed to imitate (analyze_conversations, genetics-results-suite-4h6.2).
-    message_content carries the actual blocks from every iteration of the turn, so this is
-    the whole turn's call sequence, in order, with the arguments each was given.
+    model has been observed to imitate (see analyze_conversations). message_content
+    carries the actual blocks from every iteration of the turn, so this is the whole
+    turn's call sequence, in order, with the arguments each was given.
 
     THE ARGUMENTS ARE KEPT VERBATIM AND UNTRUNCATED, including `run_analysis`'s entire
     script. That is the point: a tool-call count says the code arm made one call where the
@@ -434,6 +459,13 @@ def extract_tool_calls(message_content: list[dict[str, Any]] | None) -> list[dic
     Results are NOT recorded, only calls. `tool_results` can carry thousands of data rows
     per call, which would make a report unreadable and unopenable, and the question this
     answers is what the model ASKED for.
+
+    THE ONE EXCEPTION is `TurnRecord.literature_results` (see `extract_literature_results`
+    below): the literature judge (literature_judge.py) has to read the answer BESIDE the
+    records the model saw, or it cannot tell a paper's finding from a Perplexity summary
+    sentence or from the model's own memory. That capture is scoped to literature calls and
+    bounded per result at LITERATURE_RESULT_CAP for exactly the reason the general rule
+    exists — everything else stays calls-only.
 
     `secret=true` does not redact these: llm_service omits tool input from its LOG line, not
     from the `done` chunk (`block.model_dump(exclude_none=True)`). Verified 2026-08-19. A
@@ -460,6 +492,64 @@ def extract_tool_calls(message_content: list[dict[str, Any]] | None) -> list[dic
 def count_tool_calls(message_content: list[dict[str, Any]] | None) -> int:
     """Count real tool_use blocks. Defined via the extractor so the two cannot disagree."""
     return len(extract_tool_calls(message_content))
+
+
+def _is_literature_call(block: dict[str, Any]) -> bool:
+    """Mirrors literature_judge.literature_tool_uses — the single definition of what counts
+    as a literature call, shared here as the harness's own literals (see LITERATURE_TOOL).
+    """
+    if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+        return False
+    name = block.get("name")
+    if name == LITERATURE_TOOL:
+        return True
+    if name != LITERATURE_SUBAGENT_TOOL:
+        return False
+    tasks = (block.get("input") or {}).get("tasks") or []
+    return any(isinstance(t, dict) and t.get("skill") == LITERATURE_SUBAGENT_SKILL for t in tasks)
+
+
+def extract_literature_results(
+    message_content: list[dict[str, Any]] | None,
+    tool_results: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """The turn's literature-call results, matched to their calls by tool_use_id — a
+    `search_scientific_literature` call, or a `launch_subagents` call with a
+    literature_review task, whose result is the subagents' own digest of their searches.
+    See the docstring of `extract_tool_calls` for why this exists at all.
+
+    Mirrors literature_judge.literature_tool_uses so the two modules cannot disagree about
+    what a literature call is: the judge derives a turn's `literature_bearing` from exactly
+    this captured list, and a turn that delegated its search to a subagent must not look, to
+    the judge, like a literature answer written with no search at all.
+
+    Shaped to match literature_judge.literature_results()'s per-result dict (name, input,
+    content) so a replay report's turns and a prod-row Turn need no separate parsing on the
+    judge's side.
+    """
+    if not message_content or not tool_results:
+        return []
+    results_by_id = {
+        r.get("tool_use_id"): r
+        for r in tool_results
+        if isinstance(r, dict) and r.get("tool_use_id") is not None
+    }
+    out = []
+    for block in message_content:
+        if not _is_literature_call(block):
+            continue
+        result = results_by_id.get(block.get("id"))
+        if result is None:
+            text = ""
+        else:
+            content = result.get("content")
+            text = content if isinstance(content, str) else json.dumps(content, default=str)
+        if len(text) > LITERATURE_RESULT_CAP:
+            text = text[:LITERATURE_RESULT_CAP] + (
+                f"\n[... {len(text) - LITERATURE_RESULT_CAP} chars cut by the replay harness ...]"
+            )
+        out.append({"name": block.get("name"), "input": block.get("input"), "content": text})
+    return out
 
 
 def attach_call_metadata(
@@ -1011,6 +1101,7 @@ async def replay_turn(
             message_content
         )
         record.final_answer_dropped_prose = dropped_prose_blocks(message_content)
+        record.literature_results = extract_literature_results(message_content, tool_results)
     else:
         # the flag is only meaningful for a turn that finished; an aborted one never got
         # far enough for the absence of the marker to mean anything
@@ -1863,11 +1954,36 @@ def format_summary(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def load_cases(dataset: Path, limit: int | None) -> list[dict[str, Any]]:
-    """Load eval cases in a deterministic order, keeping only replayable ones."""
+def is_case_literature_bearing(case: dict[str, Any]) -> bool:
+    """Did this eval case call search_scientific_literature or a literature_review subagent?
+
+    Prefers the `literature_bearing` field analyze_conversations.export_eval_dataset writes
+    per case (it can see the raw content_json blocks, so it can tell a literature_review
+    subagent call from any other skill). Falls back to `tools_used` — a flat tool-name list
+    with no subagent skill in it — for a dataset exported before that field existed, which
+    can only catch the direct-call half of the population.
+    """
+    explicit = case.get("literature_bearing")
+    if isinstance(explicit, bool):
+        return explicit
+    return LITERATURE_TOOL in (case.get("tools_used") or [])
+
+
+def load_cases(
+    dataset: Path, limit: int | None, literature_bearing_only: bool = False
+) -> list[dict[str, Any]]:
+    """Load eval cases in a deterministic order, keeping only replayable ones.
+
+    `literature_bearing_only` restricts to `is_case_literature_bearing` cases BEFORE
+    `limit` is applied, so `--limit N` selects N literature-bearing cases rather than
+    filtering N arbitrary ones down to fewer — the default per-topic sample is not the
+    population a literature-quality benchmark needs.
+    """
     with open(dataset) as f:
         data = json.load(f)
     cases = [c for c in data if c.get("user_turns")]
+    if literature_bearing_only:
+        cases = [c for c in cases if is_case_literature_bearing(c)]
     cases.sort(key=lambda c: str(c.get("session_id") or ""))
     if limit is not None:
         cases = cases[:limit]
@@ -1886,13 +2002,14 @@ async def run_benchmark(
     auth_token: str | None,
     provider: str | None = None,
     capture_thinking: bool = False,
+    literature_bearing_only: bool = False,
 ) -> dict[str, Any]:
     # a bare profile name means what it has always meant: that surface, on --base-url.
     # Coercing here rather than demanding Arms keeps one definition of what a bare name
     # resolves to, and keeps every caller that predates the prompt-variant dimension
     # working unchanged.
     arms = tuple(a if isinstance(a, Arm) else parse_arm(a, base_url) for a in arms)
-    cases = load_cases(dataset, limit)
+    cases = load_cases(dataset, limit, literature_bearing_only=literature_bearing_only)
     run_id = uuid.uuid4().hex[:8]
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -1973,6 +2090,7 @@ async def run_benchmark(
             "timeout_s": timeout,
             "secret": True,
             "capture_thinking": capture_thinking,
+            "literature_bearing_only": literature_bearing_only,
             # what the SERVER said each arm resolves to, asked before the run rather than
             # re-derived afterwards from a tree that may have moved
             "arm_tools": arm_tools,
@@ -2045,6 +2163,15 @@ def build_parser() -> argparse.ArgumentParser:
         "tool call. Off by default: it multiplies the report's size and is not needed for "
         "any metric — thinking tokens are already inside output_tokens either way",
     )
+    parser.add_argument(
+        "--literature-bearing",
+        action="store_true",
+        help="restrict the run to cases that called search_scientific_literature or "
+        "launched a literature_review subagent (is_case_literature_bearing), applied "
+        "before --limit. The default eval_dataset.json sample is per-topic top/bottom by "
+        "success score and is not that population — needed to judge replayed turns with "
+        "literature_judge.py --report.",
+    )
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")
     parser.add_argument("--dry-run", action="store_true", help="resolve the plan, issue no requests")
     parser.add_argument(
@@ -2111,7 +2238,7 @@ def main(argv: list[str] | None = None) -> int:
     judge_model = args.judge_model or pairwise_judge.DEFAULT_JUDGE_MODEL
 
     if args.dry_run:
-        cases = load_cases(args.dataset, args.limit)
+        cases = load_cases(args.dataset, args.limit, literature_bearing_only=args.literature_bearing)
         turns = sum(
             len((c.get("user_turns") or [])[: args.max_turns]) for c in cases
         )
@@ -2163,6 +2290,7 @@ def main(argv: list[str] | None = None) -> int:
                 auth_token=os.environ.get("REPLAY_AUTH_TOKEN"),
                 provider=args.provider,
                 capture_thinking=args.capture_thinking,
+                literature_bearing_only=args.literature_bearing,
             )
         )
     except ArmResolutionError as exc:
@@ -2171,7 +2299,7 @@ def main(argv: list[str] | None = None) -> int:
     except RateLimitedError as exc:
         turns_needed = sum(
             len((c.get("user_turns") or [])[: args.max_turns])
-            for c in load_cases(args.dataset, args.limit)
+            for c in load_cases(args.dataset, args.limit, literature_bearing_only=args.literature_bearing)
         ) * 2
         print(
             f"\nABORTED: the chat service is rate-limiting this run.\n  {exc}\n\n"

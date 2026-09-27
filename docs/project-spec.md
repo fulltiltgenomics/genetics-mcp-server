@@ -3078,14 +3078,14 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_chembl.py` | ChEMBL client: target resolution through UniProt, paging caps, phase filtering, attribution |
 | `test_chembl_descriptions.py` | Every backticked name in the three ChEMBL tool descriptions and in the ChEMBL prompt blocks resolves to a parameter, a tool name, or a key of that tool's mocked happy-path result |
 | `test_temperature.py` | Temperature off by default, model-specific rejection (`model_rejects_temperature()`) |
-| `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export |
-| `test_literature_judge.py` | Literature-evidence judge harness, no network: the `[F..]`/`[G..]` label loader (a `VOID` line skips an overturned entry) and prefix resolution of message ids, the literature-bearing-turn predicate, tool results matched to calls by id, the agreement arithmetic (finding pairs, counter-examples violated by category or by quoting the praised passage; a finding with no category counts toward neither and is reported as dropped), the prod-rows cache name following `--users` and `--context`, the deterministic half split, the category mix, and the replay-JSON loader |
+| `test_analyze_conversations.py` | Conversation analysis: parsing, categorization, metrics, eval export; `session_is_literature_bearing` (a direct call and a `launch_subagents` `literature_review` task, neither for an unrelated tool), the `literature_bearing` tag on every exported case, and `--literature-bearing` restricting the pool before the per-topic sample |
+| `test_literature_judge.py` | Literature-evidence judge harness, no network: the `[F..]`/`[G..]` label loader (a `VOID` line skips an overturned entry) and prefix resolution of message ids, the literature-bearing-turn predicate, tool results matched to calls by id, the agreement arithmetic (finding pairs, counter-examples violated by category or by quoting the praised passage; a finding with no category counts toward neither and is reported as dropped), the prod-rows cache name following `--users` and `--context`, the deterministic half split, the category mix, and the replay-JSON loader — both the documented `question`/`answer` shape and replay_benchmark.py's own `--output` report shape (told apart by `status`, non-`"ok"` turns skipped) |
 | `test_conversation_analysis_db.py` | Conversation analysis cache tables, upsert idempotency, staleness selection |
 | `test_analysis_timeseries.py` | Rolling-window series aggregation |
 | `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from. Also `cluster_sessions` (chain linkage, the `min_shared` threshold, strict kinds only, order-independent numbering) and the M1/M2/M3 shares over a two-project synthetic history, including the pseudonym agreeing with `memory_gate.user_log_hash` |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
-| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server) |
+| `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server); `literature_results` captured for a `search_scientific_literature` call or a `literature_review` subagent task and capped, `LITERATURE_TOOL`/`LITERATURE_SUBAGENT_TOOL`/`LITERATURE_SUBAGENT_SKILL`/`LITERATURE_RESULT_CAP` pinned against `literature_judge`/`settings.mcp_max_result_size`, and `--literature-bearing`/`is_case_literature_bearing` filtering `load_cases` before `--limit` |
 | `test_arm_resolution.py` | The benchmark's arm preflight: the `nocode`/`code` defaults; the harness's own arm and code-execution-tool literals pinned against `code_execution_requested` and `resolve_tools`; and the three refusals — an unknown `tool_profile` (rather than silently falling back to the no-code surface), an arm that is not the surface it names (a `code` arm resolved without `run_analysis`, or another arm resolved with it), and two arms whose resolved names are equal — against the two that are deliberately survivable, an endpoint-less server and one arm failing to resolve |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |
 | `test_benchmark_counters.py` | The recorded 9c6595ac baseline is exactly what the current code computes on that report, so a before/after delta is never a comparison of two different definitions; a discovery script is counted as opening a turn only when it is the first; re-execution is scoped to the case rather than the turn, which is where a refine follow-up shows up at all; every counter is present at 0 rather than absent, so an arm that did none of something is not confused with a report that never measured it |
@@ -3457,6 +3457,32 @@ harness issues two arms per case. `--base-url` therefore defaults to
   and takes the tool-call count from the `done` chunk's `message_content` by counting
   real `tool_use` blocks (never the `*[Using tool: …]*` display markers, which the
   model has been observed to imitate as prose).
+- **`literature_results` is the one exception to "results are not recorded".** Every other
+  tool call is kept as calls-only (`extract_tool_calls`) — arguments, not the (potentially
+  huge) `tool_result` payload. A literature call is the single named exception — a
+  `search_scientific_literature` call, or a `launch_subagents` call with a
+  `literature_review` task, matching `literature_judge.literature_tool_uses`'s definition
+  exactly so the two modules cannot disagree about what counts: each turn's literature
+  calls are matched to their `tool_result` by `tool_use_id` and kept as
+  `{name, input, content}`, content capped at `LITERATURE_RESULT_CAP` (mirrors
+  `settings.mcp_max_result_size`, the size `llm_service` already truncates a tool result to
+  server-side; the cap here only bounds report size, since the model never saw more than
+  that either), because `literature_judge.py` has to read the answer beside the record the
+  model saw to tell a paper's finding from a Perplexity summary sentence or the model's own
+  memory. A missing result is recorded as `""`, matching `literature_judge.literature_results()`.
+  `--literature-bearing` restricts `load_cases` to cases that called that tool or launched a
+  `literature_review` subagent (`is_case_literature_bearing`), applied before `--limit`: the
+  default per-topic top/bottom-by-score sample in `eval_dataset.json` is not that population.
+  `analyze_conversations.py --literature-bearing` applies the same restriction at export
+  time, before its own per-topic sample is taken, and tags every exported case with a
+  `literature_bearing` bool (`session_is_literature_bearing`) that `load_cases` prefers over
+  re-deriving the answer from `tools_used`, which cannot see a `launch_subagents` call's
+  task skill. `literature_judge.py --report` reads the harness's own `--output` JSON
+  directly — it recognises the shape by the `status` field and skips turns that are not
+  `"ok"`, so no separate export step exists for it; that shape carries no `earlier_results`
+  field per turn (unlike a prod row), so the loader rebuilds it from each turn's own
+  `case_id`/`arm`/`turn_index`, the same per-(case, arm) accumulation `build_turns` does per
+  session.
 - **The prose the answer-slicing rule discards is recorded too, with its position.** Every
   turn keeps `final_answer_dropped_prose` — `{after_call, text}` per block — alongside the
   `final_answer_dropped_chars` count, from the same boundary (`dropped_prose_blocks`, beside
@@ -3750,8 +3776,9 @@ appears in the
 call list immediately **before** the calls it produced — collected at the top of a turn it
 would answer nothing — and iterations that called no tool, the final answering one included,
 show their reasoning after the calls. What a saved report cannot supply is stated in the
-document itself rather than left to be discovered: **tool results are not recorded at all**,
-and assistant prose written before a turn's last tool call was discarded at capture by
+document itself rather than left to be discovered: **tool results are not recorded**, except
+`literature_results` for a literature call (see § Replay Benchmark), and
+assistant prose written before a turn's last tool call was discarded at capture by
 `final_answer_split` with only its length kept, so a turn that lost text says how much.
 - Authentication, when the target requires it, comes from `$REPLAY_AUTH_TOKEN` and is
   sent as a bearer token; it is never written into the report or logged.

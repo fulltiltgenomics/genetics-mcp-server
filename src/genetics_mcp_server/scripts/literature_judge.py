@@ -42,6 +42,16 @@ A turn with an empty `literature_results` is still judged (a literature section 
 no search is a finding in its own right), but reported separately from literature-bearing
 turns so the two rates are not mixed.
 
+`--report` also accepts replay_benchmark.py's OWN `--output` JSON directly, with no
+conversion step: it is an object with a `turns` key whose entries carry `user_question`,
+`final_answer`, `status` and `literature_results` in place of `question`/`answer`/`id`. The
+loader tells the two shapes apart by the presence of `status` (the documented shape never
+has one) and drops every turn whose `status` isn't `"ok"` — an error/timeout/not_attempted
+turn carries no answer to judge. `earlier_results` for this shape is rebuilt from the
+turns' own `case_id`/`arm`/`turn_index`, the same per-(case, arm) accumulation the prod
+path (`build_turns`) does per session, since the harness's own report carries no such
+field per turn.
+
 Calibration hazard. The human labels were made on a review dump that truncated literature
 results at 9,000 characters, and turns before July 2026 have no persisted tool results at
 all, so a label on such a turn was made from the answer text alone. Agreement is therefore
@@ -244,7 +254,9 @@ def build_turns(rows: list[dict]) -> list[Turn]:
 
 
 def load_replay(path: Path) -> list[Turn]:
-    """Load the replay-JSON shape documented in the module docstring."""
+    """Load a replay-JSON turn list, in either the documented shape or the harness's own
+    `--output` report shape — see the module docstring for both.
+    """
     data = json.loads(Path(path).read_text())
     if isinstance(data, dict):
         data = data.get("turns")
@@ -263,15 +275,57 @@ def load_replay(path: Path) -> list[Turn]:
                 raise ValueError(f"{path}: a literature result must be a string or have 'content'")
         return out
 
-    turns = []
+    entries: list[dict | None] = []  # None marks a skipped (non-"ok") harness turn
+    harness_by_group: dict[tuple, list[dict]] = {}
+    skipped = 0
     for i, t in enumerate(data):
-        if not isinstance(t, dict) or "question" not in t or "answer" not in t:
-            raise ValueError(f"{path}: turn {i} lacks 'question' or 'answer'")
-        turns.append(Turn(
-            id=str(t.get("id", i)), question=t["question"] or "", answer=t["answer"] or "",
-            literature_results=results(t.get("literature_results")),
-            earlier_results=results(t.get("earlier_results")),
-        ))
+        if not isinstance(t, dict):
+            raise ValueError(f"{path}: turn {i} is not an object")
+        if "status" in t and "question" not in t:
+            # replay_benchmark.py's own TurnRecord shape: only "ok" turns have an answer
+            if t.get("status") != "ok":
+                skipped += 1
+                entries.append(None)
+                continue
+            entry = {
+                "turn_id": f"{t.get('case_id', '?')}:{t.get('arm', '?')}:{t.get('turn_index', i)}",
+                "question": t.get("user_question") or "",
+                "answer": t.get("final_answer") or "",
+                "literature_results": results(t.get("literature_results")),
+                "turn_index": t.get("turn_index", i),
+            }
+            harness_by_group.setdefault((t.get("case_id"), t.get("arm")), []).append(entry)
+            entries.append(entry)
+        elif "question" in t and "answer" in t:
+            entries.append({
+                "turn_id": str(t.get("id", i)), "question": t["question"] or "",
+                "answer": t["answer"] or "",
+                "literature_results": results(t.get("literature_results")),
+                "earlier_results": results(t.get("earlier_results")),
+            })
+        else:
+            raise ValueError(
+                f"{path}: turn {i} lacks 'question'/'answer' (or the harness's "
+                "'user_question'/'final_answer' with status=='ok')"
+            )
+
+    # the harness's own report carries no earlier_results field per turn (TurnRecord has
+    # none) — rebuild the same per-(case, arm) accumulation build_turns does per session,
+    # in turn_index order, so a multi-turn replay case gets the context prod turns get.
+    for group in harness_by_group.values():
+        group.sort(key=lambda e: e["turn_index"])
+        earlier: list[dict] = []
+        for entry in group:
+            entry["earlier_results"] = list(earlier)
+            earlier.extend(entry["literature_results"])
+
+    turns = [
+        Turn(id=e["turn_id"], question=e["question"], answer=e["answer"],
+             literature_results=e["literature_results"], earlier_results=e["earlier_results"])
+        for e in entries if e is not None
+    ]
+    if skipped:
+        logger.info("--report: skipped %d harness turn(s) with status != 'ok'", skipped)
     return turns
 
 

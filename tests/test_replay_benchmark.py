@@ -15,16 +15,23 @@ import uvicorn
 from fastapi import FastAPI, Request
 from sse_starlette.sse import EventSourceResponse
 
+from genetics_mcp_server.config.settings import get_settings
 from genetics_mcp_server.llm_service import _sanitize_tool_blocks
 from genetics_mcp_server.scripts.replay_benchmark import (
     ALL_TOOLS_ARM,
+    LITERATURE_RESULT_CAP,
+    LITERATURE_SUBAGENT_SKILL,
+    LITERATURE_SUBAGENT_TOOL,
+    LITERATURE_TOOL,
     MIN_N_FOR_PERCENTILE,
     _iteration_timing_lines,
     _script_lines,
     build_parser,
     count_tool_calls,
     distribution,
+    extract_literature_results,
     format_summary,
+    is_case_literature_bearing,
     load_cases,
     percentile,
     run_benchmark,
@@ -107,6 +114,20 @@ def _tool_turn(tool_use_id="t1"):
                 "tool_use_id": tool_use_id,
                 "content": '{"results": ["a lot of tokens"]}',
             }
+        ],
+    )
+
+
+def _lit_tool_turn(tool_use_id="lit1", content="paper: GPR17 and demyelination"):
+    """A done chunk shaped like a turn that called search_scientific_literature."""
+    return _done(
+        blocks=[
+            {"type": "tool_use", "id": tool_use_id, "name": LITERATURE_TOOL,
+             "input": {"query": "GPR17"}},
+            {"type": "text", "text": "answer"},
+        ],
+        tool_results=[
+            {"type": "tool_result", "tool_use_id": tool_use_id, "content": content},
         ],
     )
 
@@ -223,6 +244,96 @@ def test_load_cases_is_deterministic_and_drops_unreplayable(tmp_path):
     )
     assert [c["session_id"] for c in load_cases(dataset, None)] == ["aaa", "ccc"]
     assert [c["session_id"] for c in load_cases(dataset, 1)] == ["aaa"]
+
+
+def test_is_case_literature_bearing_prefers_the_explicit_field_over_tools_used():
+    # explicit field wins even when it disagrees with tools_used (a dataset exported by
+    # export_eval_dataset can see the subagent's skill, tools_used alone cannot)
+    assert is_case_literature_bearing({"literature_bearing": True, "tools_used": []})
+    assert not is_case_literature_bearing({"literature_bearing": False, "tools_used": ["search_scientific_literature"]})
+    # no explicit field: falls back to tools_used
+    assert is_case_literature_bearing({"tools_used": ["search_scientific_literature"]})
+    assert not is_case_literature_bearing({"tools_used": ["get_variants"]})
+    assert not is_case_literature_bearing({})
+
+
+def test_load_cases_literature_bearing_only_filters_before_the_limit(tmp_path):
+    lit = make_case("lit")
+    lit["literature_bearing"] = True
+    plain = make_case("plain")
+    plain["literature_bearing"] = False
+    dataset = write_dataset(tmp_path, [lit, plain])
+    assert [c["session_id"] for c in load_cases(dataset, None, literature_bearing_only=True)] == ["lit"]
+    # a --limit above the filtered population must not resurrect the dropped case
+    assert [c["session_id"] for c in load_cases(dataset, 5, literature_bearing_only=True)] == ["lit"]
+
+
+def test_literature_tool_pinned_against_the_judge():
+    """The harness keeps its own literals for the literature tool/subagent names rather than
+    importing literature_judge's, because it reads a REMOTE server's stream that may not be
+    this build — a rename here should turn into a red test, not a silent mismatch with what
+    the judge looks for."""
+    from genetics_mcp_server.scripts import literature_judge
+
+    assert LITERATURE_TOOL == literature_judge.LITERATURE_TOOL
+    assert LITERATURE_SUBAGENT_TOOL == literature_judge.SUBAGENT_TOOL
+    assert LITERATURE_SUBAGENT_SKILL == literature_judge.LITERATURE_SKILL
+
+
+def test_literature_result_cap_pinned_against_settings():
+    assert LITERATURE_RESULT_CAP == get_settings().mcp_max_result_size
+
+
+def test_extract_literature_results_captures_only_the_literature_tool_and_caps_it():
+    blocks = [
+        {"type": "tool_use", "id": "t1", "name": "get_variants", "input": {"q": "x"}},
+        {"type": "tool_use", "id": "t2", "name": LITERATURE_TOOL, "input": {"query": "GPR17"}},
+        {"type": "text", "text": "answer"},
+    ]
+    results = [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "variant rows"},
+        {"type": "tool_result", "tool_use_id": "t2", "content": "x" * (LITERATURE_RESULT_CAP + 20)},
+    ]
+    out = extract_literature_results(blocks, results)
+    assert len(out) == 1
+    assert out[0]["name"] == LITERATURE_TOOL and out[0]["input"] == {"query": "GPR17"}
+    assert out[0]["content"].endswith("[... 20 chars cut by the replay harness ...]")
+    assert out[0]["content"].startswith("x" * LITERATURE_RESULT_CAP)
+    assert len(out[0]["content"]) == LITERATURE_RESULT_CAP + len(
+        "\n[... 20 chars cut by the replay harness ...]"
+    )
+
+    assert extract_literature_results(None, results) == []
+    assert extract_literature_results(blocks, None) == []
+    assert extract_literature_results(blocks, []) == []
+
+
+def test_extract_literature_results_captures_a_literature_review_subagent_call():
+    """A turn that delegated the search to a subagent must still show up as a literature
+    call, or the judge (which derives literature_bearing from this same capture, mirrored
+    from literature_judge.literature_tool_uses) scores it as no search at all."""
+    blocks = [
+        {"type": "tool_use", "id": "t1", "name": LITERATURE_SUBAGENT_TOOL,
+         "input": {"tasks": [{"skill": LITERATURE_SUBAGENT_SKILL, "query": "GPR17"}]}},
+        {"type": "tool_use", "id": "t2", "name": LITERATURE_SUBAGENT_TOOL,
+         "input": {"tasks": [{"skill": "data_analysis", "query": "x"}]}},
+    ]
+    results = [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "subagent digest"},
+        {"type": "tool_result", "tool_use_id": "t2", "content": "unrelated"},
+    ]
+    out = extract_literature_results(blocks, results)
+    assert len(out) == 1
+    assert out[0]["name"] == LITERATURE_SUBAGENT_TOOL and out[0]["content"] == "subagent digest"
+
+
+def test_extract_literature_results_with_no_matching_result_is_empty_string():
+    """Not the string "null" — literature_judge.literature_results() uses "" for a missing
+    result, and the two need to agree or the judge's "(no result persisted)" rendering
+    would miss a replayed turn's missing result."""
+    blocks = [{"type": "tool_use", "id": "t1", "name": LITERATURE_TOOL, "input": {}}]
+    out = extract_literature_results(blocks, [{"type": "tool_result", "tool_use_id": "other", "content": "x"}])
+    assert out == [{"name": LITERATURE_TOOL, "input": {}, "content": ""}]
 
 
 # ------------------------------------------------------------------- end to end
@@ -713,6 +824,35 @@ async def test_replayed_history_carries_tool_results_so_tool_use_survives_saniti
         for b in sanitized[1]["content"]
     ), "tool_use was stripped as orphaned; the replayed context is not production-shaped"
     assert sanitized[2]["content"] == messages[2]["content"]
+
+
+async def test_literature_results_are_captured_on_a_real_stream_and_not_for_other_tools(
+    stub_server, tmp_path
+):
+    """The literature judge needs the record beside the answer; every other tool call stays
+    calls-only (extract_tool_calls's rule), so a non-literature result must not leak in."""
+    stub_server.plan = {None: [_usage(1, 100, 10, 100, 10), _lit_tool_turn("lit1", "the paper")]}
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset, base_url=stub_server.base_url, arms=(ALL_TOOLS_ARM,), limit=None,
+        concurrency=1, model=None, timeout=30.0, max_turns=None, auth_token=None,
+    )
+    turn = report["turns"][0]
+    assert turn["literature_results"] == [
+        {"name": LITERATURE_TOOL, "input": {"query": "GPR17"}, "content": "the paper"}
+    ]
+
+
+async def test_a_non_literature_tool_result_is_not_captured_as_literature(stub_server, tmp_path):
+    stub_server.plan = {None: [_usage(1, 100, 10, 100, 10), _tool_turn("tu-1")]}
+    dataset = write_dataset(tmp_path, [make_case("s1")])
+
+    report = await run_benchmark(
+        dataset=dataset, base_url=stub_server.base_url, arms=(ALL_TOOLS_ARM,), limit=None,
+        concurrency=1, model=None, timeout=30.0, max_turns=None, auth_token=None,
+    )
+    assert report["turns"][0]["literature_results"] == []
 
 
 async def test_matched_comparison_does_not_flatter_an_arm_that_fails_late(

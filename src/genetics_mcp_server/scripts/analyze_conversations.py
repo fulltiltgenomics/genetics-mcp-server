@@ -287,6 +287,43 @@ def message_tool_calls(row: dict) -> tuple[list[str], bool]:
     return parse_tool_calls(row.get("content") or ""), False
 
 
+# mirrors literature_judge.SUBAGENT_TOOL / LITERATURE_SKILL (scripts/literature_judge.py).
+# Kept as local literals rather than imported: literature_judge imports FROM this module
+# (CostTracker, create_with_backoff, ...), so importing back would cycle. A test pins the
+# two definitions together.
+_LITERATURE_TOOL = "search_scientific_literature"
+_LITERATURE_SUBAGENT_TOOL = "launch_subagents"
+_LITERATURE_SUBAGENT_SKILL = "literature_review"
+
+
+def session_is_literature_bearing(session_msgs) -> bool:
+    """Did this session call search_scientific_literature, or launch a literature_review
+    subagent? The population a literature-quality benchmark needs, not the whole eval
+    sample.
+    """
+    for msg_row in session_msgs.filter(pl.col("role") == "assistant").iter_rows(named=True):
+        tools, _authoritative = message_tool_calls(msg_row)
+        if _LITERATURE_TOOL in tools:
+            return True
+        if _LITERATURE_SUBAGENT_TOOL not in tools:
+            continue
+        try:
+            raw_blocks = json.loads(msg_row.get("content_json") or "null")
+        except (TypeError, ValueError):
+            raw_blocks = None
+        if not isinstance(raw_blocks, list):
+            continue
+        for block in raw_blocks:
+            if not (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") == _LITERATURE_SUBAGENT_TOOL):
+                continue
+            tasks = (block.get("input") or {}).get("tasks") or []
+            if any(isinstance(t, dict) and t.get("skill") == _LITERATURE_SUBAGENT_SKILL
+                   for t in tasks):
+                return True
+    return False
+
+
 @dataclass
 class ToolCountCoverage:
     """How much of the tool-call counting rests on authoritative content_json.
@@ -1519,13 +1556,28 @@ def export_eval_dataset(
     messages: pl.DataFrame,
     output_dir: Path,
     max_per_topic: int = 5,
+    literature_bearing_only: bool = False,
 ):
     """Export representative conversations as eval test cases.
 
     Each case carries the full ordered user-turn sequence (`user_turns`) so a replay
     harness can drive the whole conversation, not just its opening message.
+
+    `literature_bearing_only` restricts the pool to sessions that called
+    search_scientific_literature or launched a literature_review subagent BEFORE the
+    per-topic top/bottom-by-score sample is taken: the default max_per_topic sample is drawn
+    from every topic and is not the population a literature-quality benchmark needs.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if literature_bearing_only:
+        metrics = [
+            m for m in metrics
+            if session_is_literature_bearing(
+                messages.filter(pl.col("session_id") == m.session_id)
+                .sort(message_sort_keys(messages))
+            )
+        ]
 
     # group by topic, select diverse conversations
     by_topic: dict[str, list[ConversationMetrics]] = {}
@@ -1572,6 +1624,11 @@ def export_eval_dataset(
                 "user_rating": conv.user_rating,
                 "first_user_message": conv.first_user_message[:500],
                 "tools_used": tools_used,
+                # already proven True when literature_bearing_only filtered the pool;
+                # otherwise computed fresh, only for the small selected set
+                "literature_bearing": (
+                    True if literature_bearing_only else session_is_literature_bearing(session_msgs)
+                ),
                 "total_tool_calls": conv.total_tool_calls,
                 "tool_count_is_lower_bound": conv.tool_count_is_lower_bound,
                 "turn_count": len(turns),
@@ -2102,6 +2159,10 @@ async def main():
                              "to this file (default: <output-dir>/report.md)")
     parser.add_argument("--report-only", action="store_true",
                         help="Only print the report, skip eval export")
+    parser.add_argument("--literature-bearing", action="store_true",
+                        help="Restrict the eval dataset export to sessions that called "
+                             "search_scientific_literature or launched a literature_review "
+                             "subagent, sampled before the per-topic top/bottom cut")
     args = parser.parse_args()
 
     # progress goes to stderr so stdout stays pipeable for the report; the level prefix
@@ -2424,7 +2485,10 @@ async def main():
     # --- export eval dataset ---
     if not args.report_only:
         logger.info("Exporting eval dataset...")
-        export_eval_dataset(all_metrics, messages, output_dir)
+        export_eval_dataset(
+            all_metrics, messages, output_dir,
+            literature_bearing_only=args.literature_bearing,
+        )
 
     # --- save metrics as JSON (local-dev only) ---
     # the DB cache is now the source of truth; metrics.json is a convenience
