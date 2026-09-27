@@ -518,9 +518,11 @@ _LITERATURE_RUBRIC = [
 ]
 _REQUIRED_EVERYWHERE += _LITERATURE_RUBRIC
 _PERPLEXITY_RECORD_CLAUSE = [
-    "`[n]` markers in a `perplexity` `summary` can point past the records returned",
-    "cite only markers that have a returned record",
-    "was not matched to an indexed paper: judge from its `url` whether it is one",
+    "`[n]` markers in a `perplexity` `summary` resolve through `summary_citations`",
+    "a marker mapped to null has no record, so do not cite it",
+    "Each citation row from a `perplexity` result carries its record's `record_kind`",
+    "`perplexity_snippet`, `cited_only` and `database_page` are leads, not evidence",
+    "judge from its `url` whether it is a paper before citing it as one",
 ]
 # these presuppose a path to credible-set / MHC rows, which `rag` does not have; the
 # narrowing bullet rides the same data-path gate and reconciles itself with the re-query rule,

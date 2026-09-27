@@ -101,7 +101,7 @@ Now, looking only at the extracted data and literature above, provide your analy
 """),
     _Block("""- When using search_scientific_literature, name the backend that was actually queried — the result's `backend` field, exactly one of `europepmc` or `perplexity`. You do not choose it: it is the user's setting, and if they want the other one they change that setting. A per-record `metadata_source` of `europepmc` on a `perplexity` result does not change which backend searched. PubMed, Europe PMC, bioRxiv and medRxiv are content indexed by the `europepmc` backend, not backends themselves — never write a slashed hybrid like "PubMed/Europe PMC"
 - Cite every paper as a markdown link built from the result's `url` field, e.g. `[Smith et al. 2021](https://pubmed.ncbi.nlm.nih.gov/12345678/)`
-- `[n]` markers in a `perplexity` `summary` can point past the records returned — cite only markers that have a returned record. A record with `metadata_source` `perplexity` and no `pmid`, `doi` or `pmcid` was not matched to an indexed paper: judge from its `url` whether it is one before citing it as a paper; press releases, foundation pages, wikis and patient-information sites are not
+- `[n]` markers in a `perplexity` `summary` resolve through `summary_citations`; a marker mapped to null has no record, so do not cite it. Each citation row from a `perplexity` result carries its record's `record_kind`: only `europepmc` was matched to an indexed paper, and `perplexity_snippet`, `cited_only` and `database_page` are leads, not evidence — for a snippet, judge from its `url` whether it is a paper before citing it as one; press releases, foundation pages, wikis and patient-information sites are not
 """),
     _Block("""
 ## Choosing How to Get Data

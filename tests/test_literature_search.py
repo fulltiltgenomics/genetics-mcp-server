@@ -717,3 +717,151 @@ class TestHydrationDegrades:
         assert result["success"] is True
         assert result["results"][0]["title"] == "Genetic variants associated with platelet count are ..."
         assert {r["metadata_source"] for r in result["results"]} == {"perplexity"}
+
+
+def _hits(n: int) -> list[dict]:
+    return [
+        {"title": f"Paper {i}", "url": f"https://example.org/paper-{i}", "snippet": f"s{i}"}
+        for i in range(1, n + 1)
+    ]
+
+
+def _format(search_results: list[dict], summary: str, max_results: int) -> dict:
+    data = {"choices": [{"message": {"content": summary}}], "search_results": search_results}
+    return ServerToolExecutor()._format_perplexity_literature_results(data, "q", max_results)
+
+
+class TestRecordKind:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.ncbi.nlm.nih.gov/gene/7157",
+            "https://www.ncbi.nlm.nih.gov/clinvar/variation/12345/",
+            "https://www.ncbi.nlm.nih.gov/books/NBK1116/",
+            "https://pubmed.ncbi.nlm.nih.gov/?term=TP53",
+            "https://www.genecards.org/cgi-bin/carddisp.pl?gene=TP53",
+            "https://omim.org/entry/191170",
+            "https://www.uniprot.org/uniprotkb/P04637/entry",
+        ],
+    )
+    def test_database_pages(self, url):
+        result = _format([{"title": "TP53", "url": url}], "", 10)
+        assert result["results"][0]["record_kind"] == "database_page"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://pubmed.ncbi.nlm.nih.gov/34580418/",
+            "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2974578/",
+            "https://www.ncbi.nlm.nih.gov/pubmed/34580418",
+            "https://www.nature.com/articles/s41586-022-05473-8",
+            "https://example.org/press-release",
+        ],
+    )
+    def test_unmatched_non_database_hits_are_snippets(self, url):
+        result = _format([{"title": "T", "url": url}], "", 10)
+        assert result["results"][0]["record_kind"] == "perplexity_snippet"
+
+    async def test_hydration_sets_europepmc_and_leaves_the_rest(self, monkeypatch):
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+        payload = {
+            **PERPLEXITY_RESPONSE,
+            "search_results": [
+                *PERPLEXITY_RESPONSE["search_results"],
+                {"title": "TP53 gene", "url": "https://www.ncbi.nlm.nih.gov/gene/7157"},
+            ],
+        }
+        executor = _executor_with_transport(_handler(perplexity_payload=payload))
+        try:
+            result = await executor.search_scientific_literature(
+                "platelet count", max_results=5, backend="perplexity"
+            )
+        finally:
+            await executor.close()
+
+        assert [r["record_kind"] for r in result["results"]] == [
+            "europepmc", "europepmc", "database_page",
+        ]
+        assert all(r["metadata_source"] == "europepmc" for r in result["results"][:2])
+
+    async def test_unhydrated_hits_keep_their_kind(self, monkeypatch):
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+        executor = _executor_with_transport(_handler(epmc_status=503))
+        try:
+            result = await executor.search_scientific_literature(
+                "platelet count", max_results=5, backend="perplexity"
+            )
+        finally:
+            await executor.close()
+
+        assert {r["record_kind"] for r in result["results"]} == {"perplexity_snippet"}
+
+
+class TestSummaryCitations:
+    def test_marker_past_max_results_gets_a_cited_only_record(self):
+        result = _format(_hits(6), "A [1] and B [5][2]. C [5].", max_results=3)
+
+        assert result["returned"] == 3
+        ranked, cited = result["results"][:3], result["results"][3:]
+        assert [r["title"] for r in ranked] == ["Paper 1", "Paper 2", "Paper 3"]
+        assert cited == [
+            {"title": "Paper 5", "url": "https://example.org/paper-5", "record_kind": "cited_only"}
+        ]
+
+    def test_citations_resolve_against_every_hit_with_null_past_the_list(self):
+        result = _format(_hits(4), "A [2]. B [4]. C [9]. D [0].", max_results=2)
+
+        assert result["summary_citations"] == {
+            0: None,
+            2: {
+                "title": "Paper 2",
+                "url": "https://example.org/paper-2",
+                "record_kind": "perplexity_snippet",
+            },
+            4: {"title": "Paper 4", "url": "https://example.org/paper-4", "record_kind": "cited_only"},
+            9: None,
+        }
+
+    def test_summary_is_labelled_as_perplexity_prose(self):
+        result = _format(_hits(1), "Claim [1].", max_results=1)
+
+        assert result["summary"] == "Claim [1]."
+        assert "AI-generated" in result["summary_note"]
+        assert "not to any paper" in result["summary_note"]
+
+    async def test_cited_only_records_are_not_hydrated(self, monkeypatch):
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+        payload = {
+            "choices": [{"message": {"content": "Platelets [1]; second [2]."}}],
+            "search_results": PERPLEXITY_RESPONSE["search_results"],
+        }
+        queries: list[str] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "www.ebi.ac.uk":
+                queries.append(request.url.params["query"])
+            return _handler(perplexity_payload=payload)(request)
+
+        executor = _executor_with_transport(handle)
+        try:
+            result = await executor.search_scientific_literature(
+                "platelet count", max_results=1, backend="perplexity"
+            )
+        finally:
+            await executor.close()
+
+        assert result["returned"] == 1
+        assert [r["record_kind"] for r in result["results"]] == ["europepmc", "cited_only"]
+        assert queries and all("PMC2974578" not in q for q in queries)
+        assert result["results"][1] == {
+            "title": "A second paper",
+            "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC2974578/",
+            "record_kind": "cited_only",
+        }
+        # rebuilt after hydration, so a cited hit's corrected title and kind reach the map
+        assert result["summary_citations"][1] == {
+            "title": "Genetic variants associated with platelet count",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/34580418/",
+            "record_kind": "europepmc",
+        }
+        assert result["summary_citations"][2]["record_kind"] == "cited_only"

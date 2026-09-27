@@ -458,6 +458,12 @@ _RXIV_CONTENT = re.compile(r"(?:bio|med)rxiv\.org/content/(10\.\d{4,9}/\d+(?:\.\
 # Measured on prod's persisted literature results (2026-09-27) as serialised JSON-string
 # length — what the cap itself counts, `ensure_ascii` escaping included, not raw text: the
 # largest observed, 20 hydrated Perplexity hits, was 44,864 chars.
+# `summary_citations` repeats title, url and record_kind once per distinct [n] in the
+# summary, and each marker past max_results adds a `cited_only` record of those same three
+# fields; both are bounded by how many markers a summary carries, and Perplexity numbers
+# them over its at most 20 hits. Over the persisted summaries (2026-09-27) the highest [n]
+# was 20 and the most distinct markers 14, and adding both to each persisted result grew it
+# by at most ~5,000 chars — the 44,864-char one to ~48,000, still under the cap.
 _EPMC_ABSTRACT_CHARS = 1200
 # the indexer's first descriptors: the check tags (Humans, Animals) sat past the 8th in 2 of
 # 244 sampled records that had one, and the tail beyond 8 is mostly qualifier-level detail
@@ -586,13 +592,55 @@ def _one_work(candidates: list[dict], record: dict) -> dict | None:
     return None
 
 
+# hosts whose every page is a curated database entry rather than a paper
+_DATABASE_HOSTS = frozenset({
+    "genecards.org", "malacards.org", "omim.org", "uniprot.org", "rest.uniprot.org",
+    "ensembl.org", "gnomad.broadinstitute.org", "gtexportal.org", "proteinatlas.org",
+    "orpha.net", "medlineplus.gov", "clinicaltrials.gov", "informatics.jax.org",
+})
+
+
 def _is_database_page(url: str) -> bool:
-    # NCBI Gene/ClinVar/GTR/Bookshelf pages and PubMed search listings are not papers, and
-    # their titles would only spend title-search queries
+    # NCBI Gene/ClinVar/GTR/Bookshelf pages, PubMed search listings and database hosts are
+    # not papers: their titles would only spend title-search queries, and the model must
+    # not cite them as one
     parsed = urlparse(url)
-    if parsed.netloc == "www.ncbi.nlm.nih.gov":
-        return not parsed.path.startswith("/pmc/")
-    return parsed.netloc == "pubmed.ncbi.nlm.nih.gov" and not re.match(r"/\d+", parsed.path)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if host == "ncbi.nlm.nih.gov":
+        return not re.match(r"/(pmc/|pubmed/\d)", parsed.path)
+    if host == "pubmed.ncbi.nlm.nih.gov":
+        return not re.match(r"/\d+", parsed.path)
+    return host in _DATABASE_HOSTS
+
+
+_SUMMARY_MARKER = re.compile(r"\[(\d+)\]")
+_SUMMARY_NOTE = (
+    "AI-generated prose by Perplexity: its claims belong to Perplexity, not to any paper; "
+    "check each against the record its [n] resolves to in summary_citations."
+)
+
+
+def _summary_markers(summary: str) -> list[int]:
+    return sorted({int(n) for n in _SUMMARY_MARKER.findall(summary)})
+
+
+def _summary_citations(summary: str, results: list[dict], total: int) -> dict[int, dict | None]:
+    """{n: {title, url, record_kind} or None} for every [n] in `summary`.
+
+    Perplexity numbers its markers over the whole hit list, which is what `total` counts.
+    The ranked records come first in `results` in hit order, then one `cited_only` record per
+    marker past them in ascending marker order, as the formatter emits them.
+    """
+    ranked = [r for r in results if r.get("record_kind") != "cited_only"]
+    cited_only = iter(r for r in results if r.get("record_kind") == "cited_only")
+    citations: dict[int, dict | None] = {}
+    for n in _summary_markers(summary):
+        if not 1 <= n <= total:
+            citations[n] = None
+            continue
+        record = ranked[n - 1] if n <= len(ranked) else next(cited_only)
+        citations[n] = {k: record.get(k) for k in ("title", "url", "record_kind")}
+    return citations
 
 
 class ServerToolExecutor(ToolExecutor):
@@ -900,10 +948,16 @@ class ServerToolExecutor(ToolExecutor):
             formatted = self._format_perplexity_literature_results(data, query, max_results)
             snapshot = copy.deepcopy(formatted["results"])
             try:
-                await self._hydrate_literature_metadata(formatted["results"])
+                await self._hydrate_literature_metadata(
+                    [r for r in formatted["results"] if r["record_kind"] != "cited_only"]
+                )
             except Exception:
                 logger.warning("Literature metadata hydration failed", exc_info=True)
                 formatted["results"] = snapshot
+            # hydration can change a cited record's title and kind
+            formatted["summary_citations"] = _summary_citations(
+                formatted["summary"], formatted["results"], formatted["total_found"]
+            )
             return formatted
 
         raise Exception(f"Perplexity API error: HTTP {resp.status_code}")
@@ -943,15 +997,31 @@ class ServerToolExecutor(ToolExecutor):
                 "metadata_source": "perplexity",
                 "is_preprint": is_preprint,
                 "url": url,
+                "record_kind": "database_page" if _is_database_page(url) else "perplexity_snippet",
             })
+        returned = len(results)
+
+        # the summary numbers its markers over every hit, not the max_results kept, so a
+        # marker past the cut still gets a record to resolve to; it is not ranked, so it
+        # neither counts against max_results nor goes to hydration
+        for n in _summary_markers(content):
+            if returned < n <= len(entries):
+                entry = entries[n - 1]
+                results.append({
+                    "title": entry.get("title") or "",
+                    "url": entry.get("url") or "",
+                    "record_kind": "cited_only",
+                })
 
         return {
             "success": True,
             "query": query,
             "total_found": len(entries),
-            "returned": len(results),
+            "returned": returned,
             "results": results,
             "summary": content,
+            "summary_note": _SUMMARY_NOTE,
+            "summary_citations": _summary_citations(content, results, len(entries)),
             "source": "perplexity",
         }
 
@@ -1070,6 +1140,7 @@ class ServerToolExecutor(ToolExecutor):
             record["doi"] = record.get("doi") or match.get("doi")
             record["pmid"] = record.get("pmid") or match.get("pmid")
             record["metadata_source"] = "europepmc"
+            record["record_kind"] = "europepmc"
 
     async def _europepmc_records(
         self, query: str, page_size: int, timeout: float = 15.0

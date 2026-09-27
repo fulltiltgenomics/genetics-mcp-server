@@ -1016,6 +1016,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "When reporting results to the user, name the backend that was actually queried: the 'backend' field in the response, which is authoritative. "
             "Do NOT invent hybrid labels like 'PubMed/Europe PMC' or 'Perplexity/PubMed' — PubMed etc. are content indexed by the europepmc backend, not separate backends. "
             "Perplexity hits carry bibliographic metadata (authors, journal) looked up in Europe PMC where a PMID/DOI/PMCID was available; that is recorded per record in 'metadata_source' and does not change which backend was searched.\n"
+            "Every Perplexity record has a 'record_kind': 'europepmc' (matched to an indexed Europe PMC record), 'perplexity_snippet' (a URL and Perplexity's snippet, unmatched), 'database_page' (a database entry such as NCBI Gene, ClinVar, OMIM or UniProt, not a paper), or 'cited_only' (title and url only: a hit the summary cites beyond max_results, not counted in 'returned'). "
+            "'summary_citations' maps each [n] in the 'summary' to that hit's {title, url, record_kind}, or null when no hit has that number; the summary is Perplexity's prose, not any paper's claim.\n"
             "Records matched in Europe PMC also carry fields that bound what they can be read as; on a Perplexity hit Europe PMC did not match, 'pub_types', 'subjects', 'cited_by', and 'publication_status' are absent, meaning unknown. "
             "'pub_types': the indexer's publication-type labels, not a reading of the study design. "
             "'subjects': the first few MeSH descriptors; MeSH lags publication by months and never exists for preprints, so an empty list is unknown, not evidence of absence (not 'not animal'). "
