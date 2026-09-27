@@ -4,13 +4,22 @@ Self-contained: the Perplexity and Europe PMC calls are served by an httpx
 MockTransport, so no API keys or network access are needed.
 """
 
+import asyncio
+import json
+import time
+from pathlib import Path
+
 import httpx
 import pytest
 
 from genetics_mcp_server.llm_service import LLMService
-from genetics_mcp_server.tools import ServerToolExecutor
+from genetics_mcp_server.tools import ServerToolExecutor, orchestration
 from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS
 from genetics_mcp_server.tools.executor import _ResilientAsyncClient
+from genetics_mcp_server.tools.orchestration import (
+    _HYDRATION_LOOKUP_LIMIT,
+    _literature_ids_from_url,
+)
 
 PERPLEXITY_RESPONSE = {
     "choices": [{"message": {"content": "Two papers describe the locus."}}],
@@ -261,3 +270,318 @@ class TestBackendIsCallerControlled:
         await service.executor.close()
 
         assert result["backend"] == "perplexity"
+
+
+# live Europe PMC responses captured for these search_results; the batch response is the
+# real one, so it omits the PMC-hosted preprint that only a single-id query returns
+HYDRATION_FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures" / "literature" / "perplexity_hydration.json").read_text()
+)
+
+
+def _fixture_handler(sent: list[str]):
+    by_query = HYDRATION_FIXTURE["europepmc_by_query"]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "www.ebi.ac.uk", request.url.host
+        query = request.url.params["query"]
+        sent.append(query)
+        return httpx.Response(
+            200, json=by_query.get(query, {"hitCount": 0, "resultList": {"result": []}})
+        )
+
+    return handle
+
+
+async def _hydrate(search_results: list[dict], sent: list[str]) -> list[dict]:
+    executor = _executor_with_transport(_fixture_handler(sent))
+    try:
+        data = {"choices": [{"message": {"content": ""}}], "search_results": search_results}
+        results = executor._format_perplexity_literature_results(data, "q", 100)["results"]
+        await executor._hydrate_literature_metadata(results)
+    finally:
+        await executor.close()
+    return results
+
+
+class TestLiteratureIdsFromUrl:
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://pubmed.ncbi.nlm.nih.gov/34580418/", ("34580418", None, None)),
+            (
+                "https://pmc.ncbi.nlm.nih.gov/articles/PMC11601760/figure/F4/",
+                (None, None, "PMC11601760"),
+            ),
+            (
+                "https://www.nature.com/articles/s41467-018-05379-y",
+                (None, "10.1038/s41467-018-05379-y", None),
+            ),
+            ("https://www.nature.com/articles/nn.2410.pdf", (None, "10.1038/nn.2410", None)),
+            (
+                "https://www.biorxiv.org/content/10.1101/427484v1.full.pdf",
+                (None, "10.1101/427484", None),
+            ),
+            (
+                "https://www.medrxiv.org/content/10.1101/2024.11.20.24317557v2.full-text",
+                (None, "10.1101/2024.11.20.24317557", None),
+            ),
+            (
+                "https://www.pnas.org/doi/abs/10.1073/pnas.2022580118",
+                (None, "10.1073/pnas.2022580118", None),
+            ),
+            (
+                "https://doi.org/10.1126/science.abf8683?via=x",
+                (None, "10.1126/science.abf8683", None),
+            ),
+            (
+                "https://pubmed.ncbi.nlm.nih.gov/?linkname=pubmed_pubmed_citedin&from_uid=21041656",
+                (None, None, None),
+            ),
+            ("https://connect.biorxiv.org/relate/feed/214", (None, None, None)),
+        ],
+    )
+    def test_ids(self, url, expected):
+        assert _literature_ids_from_url(url) == expected
+
+
+class TestHydrationResolution:
+    async def test_fixture_hits_resolve(self):
+        sent: list[str] = []
+        results = await _hydrate(HYDRATION_FIXTURE["search_results"], sent)
+        by_url = {r["url"]: r for r in results}
+
+        resolved = {
+            "https://pmc.ncbi.nlm.nih.gov/articles/PMC11410376/": "10.1093/bib/bbae449",
+            # the batch OR query never returns this one; the single PMCID query does
+            "https://pmc.ncbi.nlm.nih.gov/articles/PMC11870466/": "10.1101/2025.02.18.638922",
+            "https://www.nature.com/articles/nn.2410": "10.1038/nn.2410",
+            "https://www.biorxiv.org/content/10.1101/2024.03.14.584883v1.full": "10.1101/2024.03.14.584883",
+            "https://www.pnas.org/doi/10.1073/pnas.0809885106": "10.1073/pnas.0809885106",
+            # no id in the URL: matched on the exact title, and on a long truncated prefix
+            "https://www.cell.com/cell-genomics/fulltext/S2666-979X(23)00218-5": "10.1016/j.xgen.2023.100404",
+            "https://www.cell.com/cell-stem-cell/pdf/S1934-5909(20)30004-7.pdf": "10.1016/j.stem.2020.01.004",
+        }
+        for url, doi in resolved.items():
+            assert by_url[url]["metadata_source"] == "europepmc", url
+            assert by_url[url]["doi"] == doi
+            assert by_url[url]["authors"]
+
+        # a truncated prefix this short is not searched, and a database page never is
+        for url in (
+            "https://www.cell.com/cell-reports/fulltext/S2211-1247(25)00037-3",
+            "https://www.ncbi.nlm.nih.gov/gene/2840",
+        ):
+            assert by_url[url]["metadata_source"] == "perplexity"
+        assert not any("Oligodendrocytes drive" in q or "GPR17 G protein" in q for q in sent)
+        assert sent[0].count(" OR ") == 4
+        assert sum(q.startswith("TITLE:") for q in sent) == 2
+        # the word the ellipsis follows may be cut short, so it is not searched
+        assert 'TITLE:"DUX-miR-344-ZMYM2-Mediated Activation of"' in sent
+
+    async def test_title_match_must_be_exact(self):
+        sent: list[str] = []
+        title = "Systematic investigation of allelic regulatory activity"
+        results = await _hydrate([{"url": "https://example.org/a", "title": title}], sent)
+        assert sent == [f'TITLE:"{title}"']
+        assert results[0]["metadata_source"] == "perplexity"
+
+    async def test_quote_in_doi_is_escaped(self):
+        """An unbalanced quote makes Europe PMC return zero hits for the whole OR query."""
+        sent: list[str] = []
+        await _hydrate(
+            [
+                {"url": 'https://doi.org/10.1000/a"b', "title": ""},
+                {"url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11410376/", "title": ""},
+            ],
+            sent,
+        )
+        assert sent[0] == 'DOI:"10.1000/a\\"b" OR PMCID:PMC11410376'
+
+    async def test_follow_up_queries_are_capped(self):
+        sent: list[str] = []
+        hits = [
+            {"url": f"https://pubmed.ncbi.nlm.nih.gov/{n}/", "title": ""}
+            for n in range(1, _HYDRATION_LOOKUP_LIMIT + 6)
+        ] + [{"url": "https://example.org/x", "title": "A title long enough to be searched on"}]
+        await _hydrate(hits, sent)
+        assert len(sent) == 1 + _HYDRATION_LOOKUP_LIMIT
+        assert all(q.endswith(" AND SRC:MED") for q in sent[1:])
+
+    async def test_no_follow_ups_when_europepmc_fails(self, monkeypatch):
+        calls = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(400, text="bad request")
+
+        executor = _executor_with_transport(handle)
+        try:
+            data = {
+                "choices": [{"message": {"content": ""}}],
+                "search_results": HYDRATION_FIXTURE["search_results"],
+            }
+            results = executor._format_perplexity_literature_results(data, "q", 100)["results"]
+            await executor._hydrate_literature_metadata(results)
+        finally:
+            await executor.close()
+        assert len(calls) == 1
+        assert {r["metadata_source"] for r in results} == {"perplexity"}
+
+
+def _title_page(records: list[dict], hit_count: int | None = None) -> dict:
+    return {
+        "hitCount": len(records) if hit_count is None else hit_count,
+        "resultList": {"result": records},
+    }
+
+
+def _epmc_record(source: str, title: str, year: str, doi: str, authors: str) -> dict:
+    return {
+        "source": source,
+        "title": title,
+        "pubYear": year,
+        "doi": doi,
+        "authorString": authors,
+        "journalTitle": "J",
+    }
+
+
+async def _hydrate_with(handler, search_results: list[dict]) -> list[dict]:
+    executor = _executor_with_transport(handler)
+    try:
+        data = {"choices": [{"message": {"content": ""}}], "search_results": search_results}
+        results = executor._format_perplexity_literature_results(data, "q", 100)["results"]
+        await executor._hydrate_literature_metadata(results)
+    finally:
+        await executor.close()
+    return results
+
+
+class TestTitleMatchIsOneWork:
+    TITLE = "Genetics of type 2 diabetes in two unrelated cohorts"
+
+    async def _resolve(self, page: dict, url: str = "https://example.org/a", date: str = ""):
+        def handle(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=page)
+
+        hit = {"url": url, "title": self.TITLE, "date": date}
+        return (await _hydrate_with(handle, [hit]))[0]
+
+    async def test_two_different_same_title_records_are_refused(self):
+        record = await self._resolve(
+            _title_page([
+                _epmc_record("MED", self.TITLE, "2010", "10.1/a", "Smith A, Jones B."),
+                _epmc_record("MED", self.TITLE, "2019", "10.1/b", "Brown C."),
+            ])
+        )
+        assert record["metadata_source"] == "perplexity"
+        assert record["doi"] is None
+
+    async def test_preprint_and_journal_version_follow_the_hit_url(self):
+        page = _title_page([
+            _epmc_record("MED", self.TITLE, "2023", "10.1/journal", "McAfee JC, Lee S."),
+            _epmc_record("PPR", self.TITLE, "2022", "10.1101/preprint", "McAfee JC, Lee S."),
+        ])
+        journal = await self._resolve(page)
+        preprint = await self._resolve(page, url="https://www.biorxiv.org/search/diabetes")
+        assert journal["doi"] == "10.1/journal"
+        assert preprint["doi"] == "10.1101/preprint"
+
+    async def test_year_must_be_close_to_the_perplexity_date(self):
+        record = await self._resolve(
+            _title_page([_epmc_record("MED", self.TITLE, "2010", "10.1/a", "Smith A.")]),
+            date="2021-03-01",
+        )
+        assert record["metadata_source"] == "perplexity"
+
+    async def test_partial_page_is_refused(self):
+        """Uniqueness cannot be judged when Europe PMC has more hits than the page shows."""
+        record = await self._resolve(
+            _title_page(
+                [_epmc_record("MED", self.TITLE, "2010", "10.1/a", "Smith A.")], hit_count=74
+            )
+        )
+        assert record["metadata_source"] == "perplexity"
+
+
+class TestHydrationDegrades:
+    async def test_unknown_derived_doi_falls_back_to_title(self):
+        """Old nature.com slugs drop the DOI's dots, so the derived DOI is unknown."""
+        sent: list[str] = []
+        results = await _hydrate(
+            [
+                {
+                    "url": "https://www.nature.com/articles/mp201577",
+                    "title": "CRMPs: critical molecules for neurite morphogenesis and "
+                    "neuropsychiatric diseases - Molecular Psychiatry",
+                }
+            ],
+            sent,
+        )
+        assert sent[0] == 'DOI:"10.1038/mp201577"'
+        assert sent[-1].startswith('TITLE:"CRMPs')
+        assert results[0]["metadata_source"] == "europepmc"
+        assert results[0]["doi"] == "10.1038/mp.2015.77"
+
+    async def test_duplicate_ids_spend_one_follow_up(self):
+        sent: list[str] = []
+        hits = [
+            {"url": "https://pubmed.ncbi.nlm.nih.gov/111/", "title": ""},
+            {"url": "https://pubmed.ncbi.nlm.nih.gov/111/?from=x", "title": ""},
+        ]
+        await _hydrate(hits, sent)
+        assert sent[1:] == ["EXT_ID:111 AND SRC:MED"]
+
+    async def test_follow_up_that_raises_leaves_the_rest(self):
+        batch_query = next(iter(HYDRATION_FIXTURE["europepmc_by_query"]))
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            query = request.url.params["query"]
+            if query != batch_query:
+                raise httpx.ReadError("connection reset", request=request)
+            return httpx.Response(200, json=HYDRATION_FIXTURE["europepmc_by_query"][query])
+
+        results = await _hydrate_with(handle, HYDRATION_FIXTURE["search_results"])
+        by_url = {r["url"]: r for r in results}
+        assert by_url["https://www.nature.com/articles/nn.2410"]["metadata_source"] == "europepmc"
+        pmc_preprint = by_url["https://pmc.ncbi.nlm.nih.gov/articles/PMC11870466/"]
+        assert pmc_preprint["metadata_source"] == "perplexity"
+
+    async def test_hung_europepmc_is_bounded_by_the_budget(self, monkeypatch):
+        """An id-less page skips the batch, so only the total budget bounds the follow-ups."""
+        monkeypatch.setattr(orchestration, "_HYDRATION_FOLLOW_UP_BUDGET_S", 0.3)
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(30)
+            raise AssertionError("unreachable")
+
+        hits = [
+            {"url": f"https://example.org/{n}", "title": f"A long enough title number {n}"}
+            for n in range(6)
+        ]
+        started = time.monotonic()
+        results = await _hydrate_with(handle, hits)
+        assert time.monotonic() - started < 3
+        assert {r["metadata_source"] for r in results} == {"perplexity"}
+
+    async def test_hydration_exception_returns_unhydrated_hits(self, monkeypatch):
+        """A malformed Europe PMC entry must not fail the whole search."""
+        monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "api.perplexity.ai":
+                return httpx.Response(200, json=PERPLEXITY_RESPONSE)
+            return httpx.Response(200, json=_title_page(["not a record"]))
+
+        executor = _executor_with_transport(handle)
+        try:
+            result = await executor.search_scientific_literature(
+                "platelet count", max_results=5, backend="perplexity"
+            )
+        finally:
+            await executor.close()
+
+        assert result["success"] is True
+        assert result["results"][0]["title"] == "Genetic variants associated with platelet count are ..."
+        assert {r["metadata_source"] for r in result["results"]} == {"perplexity"}

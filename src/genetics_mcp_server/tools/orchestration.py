@@ -22,6 +22,7 @@ data-access half — everywhere, not only in the sandbox.
 """
 
 import asyncio
+import copy
 import hashlib
 import logging
 import mimetypes
@@ -436,6 +437,142 @@ def _requested_variants(variants: str | list[str]) -> list[str]:
     return [v for v in ids if v]
 
 
+_EPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+
+# doi.org links and publisher pages that carry the DOI in a /doi/ path segment (pnas.org,
+# science.org, ...)
+_DOI_IN_URL = re.compile(r"(?:doi\.org/|/doi/(?:abs/|full/|pdf/|epdf/)?)(10\.\d{4,9}/[^?#\s]+)")
+# nature.com article slugs are the DOI suffix under the 10.1038 prefix
+_NATURE_ARTICLE = re.compile(r"nature\.com/articles/([A-Za-z0-9._-]+?)(?:\.pdf)?(?:[/?#]|$)")
+# bioRxiv/medRxiv content paths embed the DOI followed by a version and a view suffix
+# (`/content/10.1101/2024.03.14.584883v1.full.pdf`); the prefix is not always 10.1101
+_RXIV_CONTENT = re.compile(r"(?:bio|med)rxiv\.org/content/(10\.\d{4,9}/\d+(?:\.\d+)*)")
+
+# Bounds the single-record follow-up queries one hydration may make, so a page of hits
+# that the batch cannot resolve costs a fixed number of Europe PMC calls, not one per hit.
+_HYDRATION_LOOKUP_LIMIT = 12
+_HYDRATION_LOOKUP_CONCURRENCY = 4
+# the follow-ups sit on the chat turn's critical path, and the batch call has usually
+# resolved most hits already, so they get one total budget rather than 15 s per wave
+_HYDRATION_FOLLOW_UP_BUDGET_S = 8.0
+_HYDRATION_FOLLOW_UP_TIMEOUT_S = 5.0
+# a title search asks for one page; when Europe PMC reports more hits than that, the rest
+# are unseen and a match that looks unique on the page may not be
+_TITLE_SEARCH_PAGE_SIZE = 10
+# a truncated Perplexity title is matched on its prefix only when the prefix is long
+# enough that a prefix unique across the whole result set is unlikely to be a different paper
+_TITLE_PREFIX_MIN_WORDS = 6
+
+
+def _literature_ids_from_url(url: str) -> tuple[str | None, str | None, str | None]:
+    """(pmid, doi, pmcid) recoverable from a hit's URL."""
+    pmid = doi = pmcid = None
+    if "pubmed.ncbi.nlm.nih.gov/" in url:
+        match = re.search(r"/(\d+)", url)
+        if match:
+            pmid = match.group(1)
+    for pattern, prefix in ((_DOI_IN_URL, ""), (_RXIV_CONTENT, ""), (_NATURE_ARTICLE, "10.1038/")):
+        match = pattern.search(url)
+        if match:
+            doi = prefix + match.group(1).rstrip("/")
+            break
+    match = re.search(r"(PMC\d+)", url)
+    if match:
+        pmcid = match.group(1)
+    return pmid, doi, pmcid
+
+
+def _epmc_phrase(value: str) -> str:
+    # an unbalanced quote inside one clause makes Europe PMC answer the whole OR query with
+    # HTTP 200 and zero hits, which silently loses every other record in the batch
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _batch_clause(record: dict) -> str | None:
+    if record.get("pmid"):
+        return f"EXT_ID:{record['pmid']}"
+    if record.get("doi"):
+        return f"DOI:{_epmc_phrase(record['doi'])}"
+    if record.get("pmcid"):
+        return f"PMCID:{record['pmcid']}"
+    return None
+
+
+def _single_record_query(record: dict) -> str | None:
+    # Europe PMC's boolean search index folds a PMC-hosted preprint's MED record into its
+    # PPR twin, so neither `PMCID:` nor a bare `EXT_ID:` inside an OR ever matches it; a
+    # query that is exactly `PMCID:x` or `EXT_ID:n AND SRC:MED` is answered as an id lookup
+    # and does return it
+    if record.get("pmcid"):
+        return f"PMCID:{record['pmcid']}"
+    if record.get("pmid"):
+        return f"EXT_ID:{record['pmid']} AND SRC:MED"
+    if record.get("doi"):
+        return f"DOI:{_epmc_phrase(record['doi'])}"
+    return None
+
+
+def _normalised_title(title: str) -> str:
+    folded = unicodedata.normalize("NFKD", title).lower()
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", folded).split())
+
+
+def _title_phrase(title: str) -> tuple[str, bool]:
+    """(the phrase to search, whether it is a truncated prefix) for a Perplexity hit title.
+
+    Perplexity appends the site (" - Nature Neuroscience", " | Science") and cuts long titles
+    with an ellipsis.
+    """
+    title = title.strip()
+    for _ in range(2):
+        stripped = re.sub(r"\s+[-|–—]\s+[^-|–—]{1,60}$", "", title)
+        if stripped == title:
+            break
+        title = stripped
+    truncated = title.endswith(("...", "…"))
+    if truncated:
+        # the ellipsis can fall mid-word, and a partial word breaks both the phrase search
+        # and the prefix match
+        words = title.rstrip(".… ").split()
+        title = " ".join(words[:-1])
+    return title, truncated
+
+
+def _first_author(paper: dict) -> str:
+    return _normalised_title((paper.get("authors") or "").split(",")[0])
+
+
+def _years_close(a: str, b: str) -> bool:
+    return a.isdigit() and b.isdigit() and abs(int(a) - int(b)) <= 1
+
+
+def _one_work(candidates: list[dict], record: dict) -> dict | None:
+    """The single work `candidates` (same-title Europe PMC records) describe, or None.
+
+    A preprint and its journal version are one work; which record of the pair describes the
+    hit follows the hit URL's preprint status, not Europe PMC's result order.
+    """
+    if record.get("year"):
+        candidates = [c for c in candidates if _years_close(c.get("year") or "", record["year"])]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) == 2:
+        a, b = candidates
+        same_work = _first_author(a) == _first_author(b) or _years_close(a["year"], b["year"])
+        if a["is_preprint"] != b["is_preprint"] and same_work:
+            return a if a["is_preprint"] == bool(record.get("is_preprint")) else b
+    return None
+
+
+def _is_database_page(url: str) -> bool:
+    # NCBI Gene/ClinVar/GTR/Bookshelf pages and PubMed search listings are not papers, and
+    # their titles would only spend title-search queries
+    parsed = urlparse(url)
+    if parsed.netloc == "www.ncbi.nlm.nih.gov":
+        return not parsed.path.startswith("/pmc/")
+    return parsed.netloc == "pubmed.ncbi.nlm.nih.gov" and not re.match(r"/\d+", parsed.path)
+
+
 class ServerToolExecutor(ToolExecutor):
     """The tool executor as the chat backend and the MCP server construct it."""
 
@@ -739,7 +876,12 @@ class ServerToolExecutor(ToolExecutor):
         if resp.status_code == 200:
             data = resp.json()
             formatted = self._format_perplexity_literature_results(data, query, max_results)
-            await self._hydrate_literature_metadata(formatted["results"])
+            snapshot = copy.deepcopy(formatted["results"])
+            try:
+                await self._hydrate_literature_metadata(formatted["results"])
+            except Exception:
+                logger.warning("Literature metadata hydration failed", exc_info=True)
+                formatted["results"] = snapshot
             return formatted
 
         raise Exception(f"Perplexity API error: HTTP {resp.status_code}")
@@ -751,8 +893,6 @@ class ServerToolExecutor(ToolExecutor):
         max_results: int,
     ) -> dict[str, Any]:
         """Format Perplexity response to match Europe PMC output structure."""
-        import re
-
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         search_results = data.get("search_results") or []
         citations = data.get("citations") or []
@@ -763,19 +903,7 @@ class ServerToolExecutor(ToolExecutor):
         for entry in entries[:max_results]:
             url = entry.get("url") or ""
 
-            # extract DOI/PMID/PMCID from URL if possible
-            doi = None
-            pmid = None
-            pmcid = None
-            if "doi.org/" in url:
-                doi = url.split("doi.org/")[-1]
-            if "pubmed.ncbi.nlm.nih.gov/" in url:
-                match = re.search(r"/(\d+)", url)
-                if match:
-                    pmid = match.group(1)
-            match = re.search(r"(PMC\d+)", url)
-            if match:
-                pmcid = match.group(1)
+            pmid, doi, pmcid = _literature_ids_from_url(url)
 
             is_preprint = "biorxiv.org" in url or "medrxiv.org" in url
             date = entry.get("date") or ""
@@ -806,55 +934,107 @@ class ServerToolExecutor(ToolExecutor):
         }
 
     async def _hydrate_literature_metadata(self, results: list[dict]) -> None:
-        """Fill in authors/journal/title for Perplexity hits that carry a PMID, DOI or PMCID.
+        """Fill in authors/journal/title for Perplexity hits from Europe PMC.
 
-        Perplexity returns no bibliographic metadata beyond a title, so records are looked up
-        in Europe PMC in one batched query. Best-effort: the hits stay usable if it fails.
+        Hits with a PMID, DOI or PMCID are looked up in one batched OR query; the ones it
+        misses get a single-record query each, and hits with no id (or only a URL-derived DOI
+        Europe PMC does not know) a title search each, all capped by `_HYDRATION_LOOKUP_LIMIT`
+        and bounded in total by `_HYDRATION_FOLLOW_UP_BUDGET_S`. Best-effort: the hits stay
+        usable if any of it fails.
         """
-        clauses = []
-        for record in results:
-            if record.get("pmid"):
-                clauses.append(f"EXT_ID:{record['pmid']}")
-            elif record.get("doi"):
-                clauses.append(f'DOI:"{record["doi"]}"')
-            elif record.get("pmcid"):
-                clauses.append(f"PMCID:{record['pmcid']}")
-
-        if not clauses:
-            return
-
-        url = (
-            f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
-            f"?query={quote(' OR '.join(clauses))}"
-            f"&format=json"
-            f"&pageSize={len(clauses)}"
-            f"&resultType=core"
-        )
-
-        try:
-            resp = await self.external_client.get(url, timeout=15.0)
-            if resp.status_code != 200:
-                logger.warning(
-                    f"Literature metadata hydration skipped: Europe PMC HTTP {resp.status_code}"
-                )
-                return
-            records = resp.json().get("resultList", {}).get("result", [])
-        except Exception as e:
-            logger.warning(f"Literature metadata hydration failed: {e}")
-            return
-
+        clauses = [clause for record in results if (clause := _batch_clause(record))]
         by_id: dict[str, dict] = {}
-        for raw, paper in zip(records, self._format_literature_results(records)):
-            for key in (raw.get("pmid"), (raw.get("doi") or "").lower(), raw.get("pmcid")):
-                if key:
-                    by_id[key] = paper
+        if clauses:
+            # headroom over one row per clause: a bare EXT_ID also matches other sources'
+            # records with the same number, which would otherwise push real hits off the page
+            page = await self._europepmc_records(" OR ".join(clauses), page_size=3 * len(clauses))
+            if page is None:
+                # Europe PMC itself is failing; per-hit follow-ups would only multiply that
+                return
+            self._index_europepmc_records(page[0], by_id)
+
+        def title_searchable(record: dict) -> bool:
+            return bool(record.get("title")) and not _is_database_page(record.get("url") or "")
+
+        missed: dict[str, dict] = {}
+        for record in results:
+            query = _single_record_query(record)
+            if query and not self._europepmc_match(record, by_id):
+                missed.setdefault(query, record)
+        idless = [r for r in results if not _batch_clause(r) and title_searchable(r)]
+        id_queries = list(missed.items())[:_HYDRATION_LOOKUP_LIMIT]
+        idless = idless[: _HYDRATION_LOOKUP_LIMIT - len(id_queries)]
+        spare = [_HYDRATION_LOOKUP_LIMIT - len(id_queries) - len(idless)]
+
+        semaphore = asyncio.Semaphore(_HYDRATION_LOOKUP_CONCURRENCY)
+        title_matches: dict[int, dict] = {}
+        done = [0]
+
+        async def lookup_title(record: dict) -> None:
+            phrase, truncated = _title_phrase(record["title"])
+            wanted = _normalised_title(phrase)
+            if not wanted or (truncated and len(wanted.split()) < _TITLE_PREFIX_MIN_WORDS):
+                return
+            async with semaphore:
+                page = await self._europepmc_records(
+                    f"TITLE:{_epmc_phrase(phrase)}",
+                    page_size=_TITLE_SEARCH_PAGE_SIZE,
+                    timeout=_HYDRATION_FOLLOW_UP_TIMEOUT_S,
+                )
+            if page is None or page[1] > _TITLE_SEARCH_PAGE_SIZE:
+                return
+            papers = self._format_literature_results(page[0])
+            if truncated:
+                hits = [p for p in papers if _normalised_title(p["title"]).startswith(wanted)]
+            else:
+                # the site-suffix strip can also cut a real " - " subtitle, so the full title
+                # counts
+                accepted = {wanted, _normalised_title(record["title"])}
+                hits = [p for p in papers if _normalised_title(p["title"]) in accepted]
+            match = _one_work(hits, record)
+            if match:
+                title_matches[id(record)] = match
+
+        async def lookup_id(query: str, record: dict) -> None:
+            async with semaphore:
+                page = await self._europepmc_records(
+                    query, page_size=3, timeout=_HYDRATION_FOLLOW_UP_TIMEOUT_S
+                )
+            self._index_europepmc_records(page[0] if page else [], by_id)
+            # a DOI derived from a URL can be wrong (old nature.com slugs whose real DOI has
+            # dots); a PMID or PMCID read off PubMed/PMC is not, so only a DOI falls back
+            only_doi = not record.get("pmid") and not record.get("pmcid")
+            if (
+                only_doi
+                and not self._europepmc_match(record, by_id)
+                and title_searchable(record)
+                and spare[0] > 0
+            ):
+                spare[0] -= 1
+                await lookup_title(record)
+
+        async def counted(lookup) -> None:
+            await lookup
+            done[0] += 1
+
+        lookups = [lookup_id(q, r) for q, r in id_queries] + [lookup_title(r) for r in idless]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(counted(lookup) for lookup in lookups)),
+                timeout=_HYDRATION_FOLLOW_UP_BUDGET_S,
+            )
+        except TimeoutError:
+            logger.warning(
+                f"Literature metadata follow-ups hit the {_HYDRATION_FOLLOW_UP_BUDGET_S:g} s "
+                f"budget; {len(lookups) - done[0]} of {len(lookups)} skipped"
+            )
 
         for record in results:
-            match = (
-                by_id.get(record.get("pmid") or "")
-                or by_id.get((record.get("doi") or "").lower())
-                or by_id.get(record.get("pmcid") or "")
-            )
+            match = self._europepmc_match(record, by_id)
+            if not match and id(record) in title_matches:
+                match = title_matches[id(record)]
+                # reached only when the hit's own id was absent or unknown to Europe PMC
+                record["doi"] = match.get("doi") or record.get("doi")
             if not match:
                 continue
             for field in ("title", "authors", "journal", "year", "abstract"):
@@ -863,6 +1043,42 @@ class ServerToolExecutor(ToolExecutor):
             record["doi"] = record.get("doi") or match.get("doi")
             record["pmid"] = record.get("pmid") or match.get("pmid")
             record["metadata_source"] = "europepmc"
+
+    async def _europepmc_records(
+        self, query: str, page_size: int, timeout: float = 15.0
+    ) -> tuple[list[dict], int] | None:
+        """(raw Europe PMC core records, hitCount) for `query`, or None when the call fails."""
+        url = (
+            f"{_EPMC_SEARCH_URL}?query={quote(query)}&format=json"
+            f"&pageSize={min(page_size, 1000)}&resultType=core"
+        )
+        try:
+            resp = await self.external_client.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Literature metadata lookup skipped: Europe PMC HTTP {resp.status_code}"
+                )
+                return None
+            data = resp.json()
+            records = data.get("resultList", {}).get("result", [])
+            return records, int(data.get("hitCount") or len(records))
+        except Exception as e:
+            logger.warning(f"Literature metadata lookup failed: {e}")
+            return None
+
+    def _index_europepmc_records(self, records: list[dict], by_id: dict[str, dict]) -> None:
+        for raw, paper in zip(records, self._format_literature_results(records)):
+            for key in (raw.get("pmid"), (raw.get("doi") or "").lower(), raw.get("pmcid")):
+                if key:
+                    by_id.setdefault(key, paper)
+
+    @staticmethod
+    def _europepmc_match(record: dict, by_id: dict[str, dict]) -> dict | None:
+        return (
+            by_id.get(record.get("pmid") or "")
+            or by_id.get((record.get("doi") or "").lower())
+            or by_id.get(record.get("pmcid") or "")
+        )
 
     async def web_search(
         self,

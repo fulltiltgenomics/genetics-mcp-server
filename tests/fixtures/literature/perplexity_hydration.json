@@ -1,0 +1,171 @@
+{
+  "search_results": [
+    {
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11410376/",
+      "title": "Plain PMC article"
+    },
+    {
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11870466/",
+      "title": "PMC-hosted preprint"
+    },
+    {
+      "url": "https://www.nature.com/articles/nn.2410",
+      "title": "The oligodendrocyte-specific G protein–coupled receptor GPR17 is a cell-intrinsic timer of myelination - Nature Neuroscience"
+    },
+    {
+      "url": "https://www.biorxiv.org/content/10.1101/2024.03.14.584883v1.full",
+      "title": "bioRxiv preprint"
+    },
+    {
+      "url": "https://www.pnas.org/doi/10.1073/pnas.0809885106",
+      "title": "PNAS article"
+    },
+    {
+      "url": "https://www.cell.com/cell-genomics/fulltext/S2666-979X(23)00218-5",
+      "title": "Systematic investigation of allelic regulatory activity of schizophrenia-associated common variants"
+    },
+    {
+      "url": "https://www.cell.com/cell-stem-cell/pdf/S1934-5909(20)30004-7.pdf",
+      "title": "DUX-miR-344-ZMYM2-Mediated Activation of MERVL ..."
+    },
+    {
+      "url": "https://www.cell.com/cell-reports/fulltext/S2211-1247(25)00037-3",
+      "title": "Oligodendrocytes drive neuroinflammation and ..."
+    },
+    {
+      "url": "https://www.ncbi.nlm.nih.gov/gene/2840",
+      "title": "GPR17 G protein-coupled receptor 17 [ Homo sapiens (human) ]"
+    }
+  ],
+  "europepmc_by_query": {
+    "PMCID:PMC11410376 OR PMCID:PMC11870466 OR DOI:\"10.1038/nn.2410\" OR DOI:\"10.1101/2024.03.14.584883\" OR DOI:\"10.1073/pnas.0809885106\"": {
+      "hitCount": 4,
+      "resultList": {
+        "result": [
+          {
+            "id": "PPR822204",
+            "source": "PPR",
+            "doi": "10.1101/2024.03.14.584883",
+            "title": "Transcriptomic and epigenomic consequences of heterozygous loss of function mutations in  <i>AKAP11</i>  , the first large-effect shared risk gene for bipolar disorder and schizophrenia",
+            "authorString": "Farhangdoost N, Liao C, Liu Y, Alda M, Dion PA, Rouleau GA, Khayachi A, Chaumette B.",
+            "pubYear": "2024",
+            "abstractText": "The gene A-kinase anchoring protein 11 (  AKAP11 ) recently emerged as a shared risk factor between bipolar disorder and schizophrenia, driven by large-effect loss-of-function (LoF) variants. Recent research has uncovered the neurophysiological characteristics and synapse proteomics profile of  Akap"
+          },
+          {
+            "id": "39293804",
+            "source": "MED",
+            "pmid": "39293804",
+            "pmcid": "PMC11410376",
+            "doi": "10.1093/bib/bbae449",
+            "title": "Designing interpretable deep learning applications for functional genomics: a quantitative analysis.",
+            "authorString": "van Hilten A, Katz S, Saccenti E, Niessen WJ, Roshchupkin GV.",
+            "pubYear": "2024",
+            "abstractText": "Deep learning applications have had a profound impact on many scientific fields, including functional genomics. Deep learning models can learn complex interactions between and within omics data; however, interpreting and explaining these models can be challenging. Interpretability is essential not o"
+          },
+          {
+            "id": "19838178",
+            "source": "MED",
+            "pmid": "19838178",
+            "pmcid": "PMC2783566",
+            "doi": "10.1038/nn.2410",
+            "title": "The oligodendrocyte-specific G protein-coupled receptor GPR17 is a cell-intrinsic timer of myelination.",
+            "authorString": "Chen Y, Wu H, Wang S, Koito H, Li J, Ye F, Hoang J, Escobar SS, Gow A, Arnett HA, Trapp BD, Karandikar NJ, Hsieh J, Lu QR.",
+            "pubYear": "2009",
+            "abstractText": "The basic helix-loop-helix transcription factor Olig1 promotes oligodendrocyte maturation and is required for myelin repair. We characterized an Olig1-regulated G protein-coupled receptor, GPR17, whose function is to oppose the action of Olig1. Gpr17 was restricted to oligodendrocyte lineage cells, "
+          },
+          {
+            "id": "19433798",
+            "source": "MED",
+            "pmid": "19433798",
+            "pmcid": "PMC2689000",
+            "doi": "10.1073/pnas.0809885106",
+            "title": "The Drosophila DPP signal is produced by cleavage of its proprotein at evolutionary diversified furin-recognition sites.",
+            "authorString": "Künnapuu J, Björkgren I, Shimmi O.",
+            "pubYear": "2009",
+            "abstractText": "Maturation of bone morphogenetic proteins (BMPs) requires cleavage of their precursor proteins by furin-type proprotein convertases. Here, we find that cleavage sites of the BMP2/4/decapentaplegic (DPP) subfamily have been evolutionary diversified and can be categorized into 4 different types. Cnida"
+          }
+        ]
+      }
+    },
+    "PMCID:PMC11870466": {
+      "hitCount": 1,
+      "resultList": {
+        "result": [
+          {
+            "id": "40027628",
+            "source": "MED",
+            "pmid": "40027628",
+            "pmcid": "PMC11870466",
+            "doi": "10.1101/2025.02.18.638922",
+            "title": "Mapping the regulatory effects of common and rare non-coding variants across cellular and developmental contexts in the brain and heart.",
+            "authorString": "Marderstein AR, Kundu S, Padhi EM, Deshpande S, Wang A, Robb E, Sun Y, Yun CM, Pomales-Matos D, Xie Y, Nachun D, Jessa S, Kundaje A, Montgomery SB.",
+            "pubYear": "2025",
+            "abstractText": "Whole genome sequencing has identified over a billion non-coding variants in humans, while GWAS has revealed the non-coding genome as a significant contributor to disease. However, prioritizing causal common and rare non-coding variants in human disease, and understanding how selective pressures hav"
+          }
+        ]
+      }
+    },
+    "TITLE:\"Systematic investigation of allelic regulatory activity of schizophrenia-associated common variants\"": {
+      "hitCount": 2,
+      "resultList": {
+        "result": [
+          {
+            "id": "37868037",
+            "source": "MED",
+            "pmid": "37868037",
+            "pmcid": "PMC10589626",
+            "doi": "10.1016/j.xgen.2023.100404",
+            "title": "Systematic investigation of allelic regulatory activity of schizophrenia-associated common variants.",
+            "authorString": "McAfee JC, Lee S, Lee J, Bell JL, Krupa O, Davis J, Insigne K, Bond ML, Zhao N, Boyle AP, Phanstiel DH, Love MI, Stein JL, Ruzicka WB, Davila-Velderrain J, Kosuri S, Won H.",
+            "pubYear": "2023",
+            "abstractText": "Genome-wide association studies (GWASs) have successfully identified 145 genomic regions that contribute to schizophrenia risk, but linkage disequilibrium makes it challenging to discern causal variants. We performed a massively parallel reporter assay (MPRA) on 5,173 fine-mapped schizophrenia GWAS "
+          },
+          {
+            "id": "PPR546357",
+            "source": "PPR",
+            "doi": "10.1101/2022.09.15.22279954",
+            "title": "Systematic investigation of allelic regulatory activity of schizophrenia-associated common variants",
+            "authorString": "McAfee JC, Lee S, Lee J, Bell JL, Krupa O, Davis J, Insigne K, Bond ML, Phanstiel DH, Love MI, Stein JL, Kosuri S, Won H.",
+            "pubYear": "2022",
+            "abstractText": "Genome-wide association studies (GWAS) have successfully identified 145 genomic regions that contribute to schizophrenia risk, but linkage disequilibrium (LD) makes it challenging to discern causal variants. Computational finemapping prioritized thousands of credible variants, ∼98% of which lie with"
+          }
+        ]
+      }
+    },
+    "TITLE:\"DUX-miR-344-ZMYM2-Mediated Activation of\"": {
+      "hitCount": 1,
+      "resultList": {
+        "result": [
+          {
+            "id": "32032525",
+            "source": "MED",
+            "pmid": "32032525",
+            "pmcid": "PMC8074926",
+            "doi": "10.1016/j.stem.2020.01.004",
+            "title": "DUX-miR-344-ZMYM2-Mediated Activation of MERVL LTRs Induces a Totipotent 2C-like State.",
+            "authorString": "Yang F, Huang X, Zang R, Chen J, Fidalgo M, Sanchez-Priego C, Yang J, Caichen A, Ma F, Macfarlan T, Wang H, Gao S, Zhou H, Wang J.",
+            "pubYear": "2020",
+            "abstractText": "Mouse embryonic stem cells (ESCs) sporadically express preimplantation two-cell-stage (2C) transcripts, including MERVL endogenous retrovirus and Zscan4 cluster genes. Such 2C-like cells (2CLCs) can contribute to both embryonic and extraembryonic tissues when reintroduced into early embryos, although the molecular mechanism underlying such an expanded 2CLC potency remains elusive. We examine global nucleosome occupancy and gene expression in 2CLCs and identified miR-344 as the noncoding molecule that positively controls 2CLC potency. We find that activation of endogenous MERVL or miR-344-2 alone is sufficient to induce 2CLCs with activation of 2C genes and an expanded potency. Mechanistically, miR-344 is activated by DUX and post-transcriptionally represses ZMYM2 and its partner LSD1, and ZMYM2 recruits LSD1/HDAC corepressor complex to MERVL LTR for transcriptional repression. Consistently, zygotic depletion of Zmym2 compromises the totipotency-to-pluripotency transition during early development. Our studies establish the previously unappreciated DUX-miR-344-Zmym2/Lsd1 axis that controls MERVL for expanded stem cell potency."
+          }
+        ]
+      }
+    },
+    "TITLE:\"CRMPs: critical molecules for neurite morphogenesis and neuropsychiatric diseases\"": {
+      "hitCount": 1,
+      "resultList": {
+        "result": [
+          {
+            "id": "26077693",
+            "source": "MED",
+            "pmid": "26077693",
+            "doi": "10.1038/mp.2015.77",
+            "title": "CRMPs: critical molecules for neurite morphogenesis and neuropsychiatric diseases.",
+            "authorString": "Quach TT, Honnorat J, Kolattukudy PE, Khanna R, Duchemin AM.",
+            "pubYear": "2015",
+            "abstractText": "Neuronal polarity and spatial rearrangement of neuronal processes are central to the development of all mature nervous systems. Recent studies have highlighted the dynamic expression of Collapsin-Response-Mediator Proteins (CRMPs) in neuronal dendritic/axonal compartments, described their interaction with cytoskeleton proteins, identified their ability to activate L- and N-type voltage-gated calcium channels (VGCCs) and delineated their crucial role as signaling molecules essential for neuron differentiation and neural network development and maintenance. In addition, evidence obtained from genome-wide/genetic linkage/proteomic/translational approaches revealed that CRMP expression is altered in human pathologies including mental (schizophrenia and mood disorders) and neurological (Alzheimer's, prion encephalopathy, epilepsy and others) disorders. Changes in CRMPs levels have been observed after psychotropic treatments, and disrupting CRMP2 binding to calcium channels blocked neuropathic pain. These observations, altogether with those obtained from genetically modified mice targeting individual CRMPs and RNA interference approaches, pave the way for considering CRMPs as potential early disease markers and modulation of their activity as therapeutic strategy for disorders associated with neurite abnormalities."
+          }
+        ]
+      }
+    }
+  }
+}
