@@ -34,6 +34,9 @@ filters that view expects.
 | `coloc_credsets_v` | Variants inside colocalized credible sets |
 | `exome_variant_results_v` | Single-variant exome association results |
 | `gene_burden_results_v` | Gene-level exome burden tests |
+| `exome_gene_counts_v` | Per-gene rare-variant counts by class and inheritance mode (count-based exome studies) |
+| `exome_gene_bayes_results_v` | Gene-level Bayes factor and Bayesian FDR (count-based exome studies) |
+| `exome_variant_counts_v` | Per-variant allele counts by inheritance mode (count-based exome studies) |
 | `asm_qtl_v` | Allele-specific methylation QTLs (deCODE) |
 | `open_chromatin_v` | Accessible-chromatin peak atlas by cell type |
 | `variant_effect_v` | Predicted variant effects on chromatin accessibility |
