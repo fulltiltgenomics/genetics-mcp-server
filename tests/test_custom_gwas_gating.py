@@ -160,3 +160,35 @@ class TestProbe:
             transport=httpx.MockTransport(lambda req: httpx.Response(404, text="no"))
         )
         assert await executor.on_request_datasets() is None
+
+
+class TestOneRunsMetadata:
+    """A release holds hundreds of runs and get_resource_metadata caps rows, so a run's
+    date and sizes are read by name rather than by paging the release's table."""
+
+    async def test_named_phenotypes_reach_the_endpoint_as_a_filter(self):
+        seen = {}
+
+        def handler(request):
+            seen["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[{"phenotype_code": "G6_MS", "date": "2026-09-02"}])
+
+        executor = ToolExecutor(api_base_url="http://api.test/api")
+        executor.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        result = await executor.get_resource_metadata("finngen_custom_r14", ["G6_MS", " AFB "])
+        assert seen["params"] == {"format": "json", "phenotypes": "G6_MS,AFB"}
+        assert result["success"] and result["metadata"][0]["date"] == "2026-09-02"
+        assert not result["truncated"]
+
+    async def test_an_unknown_run_names_the_run_in_the_error(self):
+        executor = ToolExecutor(api_base_url="http://api.test/api")
+        executor.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda req: httpx.Response(404, text="no"))
+        )
+        result = await executor.get_resource_metadata("finngen_custom_r14", ["NOPE"])
+        assert result["success"] is False and "NOPE" in result["error"]
+
+    def test_the_tool_offers_the_filter(self):
+        (tool,) = [t for t in get_anthropic_tools() if t["name"] == "get_resource_metadata"]
+        assert "phenotypes" in tool["input_schema"]["properties"]
+        assert "phenotypes" not in tool["input_schema"].get("required", [])

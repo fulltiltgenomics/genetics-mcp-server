@@ -105,7 +105,7 @@ Four evidence types that must not be conflated, because a user question about "r
 |------|-------------|
 | `get_colocalization` | Find traits sharing causal signals at a variant |
 | `get_colocalization_by_credible_set` | Colocalizations of ONE credible set (resource + phenotype + `cs_id`), so the result is that signal's partners rather than everything at the position. `dual_format` returns both traits' columns |
-| `get_resource_metadata` | Harmonized per-trait metadata for a resource (trait names, sample sizes, sub-studies of a collection) — the per-trait rows behind `list_datasets`' aggregates |
+| `get_resource_metadata` | Harmonized per-trait metadata for a resource, or of the codes named in optional `phenotypes` — one named trait of a large resource, which the row cap would otherwise truncate (trait names, sample sizes, sub-studies of a collection) — the per-trait rows behind `list_datasets`' aggregates |
 | `get_dataset_display_names` | Display-name overrides keyed by the raw `dataset` column value, for rendering results |
 | `get_phenotype_report` | Get detailed markdown report for a phenotype. Disabled by default — enable with `ENABLE_PHENOTYPE_REPORT` |
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |

@@ -715,7 +715,7 @@ async def test_resource_metadata_reaches_the_per_trait_endpoint():
     )
     frame = await client.resource_metadata("finngen")
     assert executor.last[0] == "get_resource_metadata"
-    assert executor.last[1] == ("finngen",)
+    assert executor.last[1] == ("finngen", None)
     assert frame.height == 2
     assert frame["trait_name"].to_list() == ["Coronary heart disease", "Type 1 diabetes"]
 

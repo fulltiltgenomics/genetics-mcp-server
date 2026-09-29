@@ -903,12 +903,17 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "category": "general",
         # the per-trait half of the catalogue; see list_datasets
         "sdk_replaceable": False,
-        "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them.",
+        "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes, author and date, and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them. For one named trait pass its code in `phenotypes`: a large resource is truncated by the row cap before an alphabetically late code.",
         "parameters": {
             "resource": {
                 "type": "string",
                 "description": "Resource name (e.g. 'finngen', 'eqtl_catalogue')",
                 "required": True,
+            },
+            "phenotypes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional: only these phenotype codes (e.g. ['T2D', 'I9_CHD']). Omit for every trait of the resource.",
             },
         },
     },
@@ -2954,9 +2959,11 @@ def register_mcp_tools(
         return await executor.list_datasets(resource, include_stats)
 
     @_tool()
-    async def get_resource_metadata(resource: str) -> dict:
+    async def get_resource_metadata(
+        resource: str, phenotypes: list[str] | None = None
+    ) -> dict:
         """Get the harmonized per-trait metadata of one resource."""
-        return await executor.get_resource_metadata(resource)
+        return await executor.get_resource_metadata(resource, phenotypes)
 
     @_tool()
     async def get_dataset_display_names() -> dict:

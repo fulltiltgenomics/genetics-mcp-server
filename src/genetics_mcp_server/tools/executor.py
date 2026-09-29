@@ -2862,11 +2862,18 @@ class ToolExecutor:
             return {"success": True, "display_names": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
-    async def get_resource_metadata(self, resource: str) -> dict[str, Any]:
-        """Get harmonized per-trait metadata (sample sizes, trait names) for a resource."""
+    async def get_resource_metadata(
+        self, resource: str, phenotypes: list[str] | str | None = None
+    ) -> dict[str, Any]:
+        """Get harmonized per-trait metadata (sample sizes, trait names) for a resource,
+        or of the named phenotypes only."""
+        params: dict[str, str] = {"format": "json"}
+        if phenotypes:
+            codes = [phenotypes] if isinstance(phenotypes, str) else list(phenotypes)
+            params["phenotypes"] = ",".join(c.strip() for c in codes if c and c.strip())
         resp = await self.client.get(
             f"{self.base_url}/v1/resource_metadata/{_seg(resource)}",
-            params={"format": "json"},
+            params=params,
             timeout=300.0,
         )
         if resp.status_code == 200:
@@ -2881,7 +2888,8 @@ class ToolExecutor:
                 "_download_url": self._build_download_url(f"/v1/resource_metadata/{_seg(resource)}"),
             }
         if resp.status_code == 404:
-            return {"success": False, "error": f"Not found: resource '{resource}'"}
+            what = f"phenotypes {phenotypes!r} in resource '{resource}'" if phenotypes else f"resource '{resource}'"
+            return {"success": False, "error": f"Not found: {what}"}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     # -------------------------------------------------------------------------

@@ -1144,8 +1144,11 @@ class GeneticsClient:
             await self._executor.list_datasets(resource=resource, include_stats=include_stats)
         )["datasets"]
 
-    async def resource_metadata(self, resource: str) -> pl.DataFrame:
-        """Harmonized per-trait metadata for one resource — one row per trait it serves.
+    async def resource_metadata(
+        self, resource: str, phenotypes: list[str] | None = None
+    ) -> pl.DataFrame:
+        """Harmonized per-trait metadata for one resource — one row per trait it serves,
+        or only the traits named in `phenotypes`.
 
         `resources()` names the resources and `datasets()` gives the dataset-level
         aggregates; this is the rows behind them: the trait code, its human-readable name,
@@ -1154,7 +1157,9 @@ class GeneticsClient:
         carries, so they differ between resources — read them off the frame rather than
         assuming a fixed schema.
         """
-        return self._rows(await self._executor.get_resource_metadata(resource), key="metadata")
+        return self._rows(
+            await self._executor.get_resource_metadata(resource, phenotypes), key="metadata"
+        )
 
     async def show(self, data: Any) -> None:
         """Print every column of every row, one row per line. Nothing is elided.
