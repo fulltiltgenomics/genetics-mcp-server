@@ -34,6 +34,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _Block,
     _fs,
     block_text,
+    custom_gwas_resources,
     url_input_hosts_rule,
 )
 from genetics_mcp_server.config.prompt_condensed import (
@@ -56,6 +57,25 @@ _SUMMARIZE_PARAM_TOOLS = _fs(
     "get_credible_sets_by_region",
     "get_credible_sets_by_variant",
 )
+
+
+_CUSTOM_GWAS_SECTION = """
+### Users' own custom GWAS (sandbox userresults)
+
+A FinnGen sandbox user can run a custom GWAS (REGENIE unmodifiable pipeline) and, optionally, fine-mapping on it; those results are served here straight from the userresults bucket under the resources {resources} — one per data freeze the run was made on. The "phenotype" is the run name the user gave.
+
+**Only on request.** These are users' own, unreviewed analyses — a run may be underpowered, mis-specified or a test — so they are kept out of every default surface: `search_phenotypes` and `list_datasets` do not show them unless called with one of these resources, and no other tool reaches them without the resource named. Touch them ONLY when the user explicitly asks about a GWAS they (or a named colleague) ran themselves, a custom GWAS, or userresults. Never use one to answer a question about FinnGen, a disease or a variant in general, never present its numbers next to release results as if they were the same kind of evidence, and say in the answer that the result is a user's custom run. Every user sees every run and the bucket records no owner, so "my GWAS" cannot be verified — take the run name the user gives, and when it is ambiguous (the same name exists in several freezes, or matches a core endpoint code) ask which run they mean rather than guessing.
+
+What is available per run: summary statistics for every run (`get_summary_stats`, `get_summary_stats_by_region`), SuSiE 95% credible sets only for runs whose user also ran the fine-mapping pipeline (`get_credible_sets_by_phenotype`, `get_credible_set_leads_by_phenotype`, `get_credible_set_by_id`), and HLA allele results for R14 runs (`get_hla_by_phenotype`). There is no cross-run index: `get_credible_sets_by_gene` / `_by_variant` / `_by_region`, colocalization and PheWAS-style questions do not cover custom runs. Case and control counts, the run's description and the date it was written come from `get_resource_metadata` for the release's resource; who ran it is recorded nowhere that is served. Credible-set rows carry `aaf` as NA because the pipeline records the minor-allele frequency instead. A run finished minutes ago is queryable by its exact name before it appears in `search_phenotypes`.
+"""
+
+
+def _custom_gwas_section(template: str) -> str | None:
+    """The section with this deployment's release resources filled in, or nothing."""
+    resources = custom_gwas_resources()
+    if not resources:
+        return None
+    return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
 
 
 _PROMPT_BLOCKS: tuple[_Block, ...] = (
@@ -219,6 +239,14 @@ A magnitude-only modality's comparison carries no direction at all — that abse
     # can still make the mistake. Only the "which tool" sentence is per-surface. Before this
     # split the whole section was gated away for `bigquery`, `rag` and `code`, because the
     # ONE gating force was the tool names in that sentence.
+    # rendered from results-api's answer (prompt_blocks.on_request_datasets): the resource
+    # names are the deployment's, and a deployment serving no such release emits nothing.
+    # `text` still carries the template so the tool-name gate reads the same names.
+    _Block(
+        _CUSTOM_GWAS_SECTION,
+        requires_any=_fs("get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"),
+        render=lambda: _custom_gwas_section(_CUSTOM_GWAS_SECTION),
+    ),
     _Block("""
 ### HLA / the MHC region
 

@@ -49,7 +49,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 
 | Tool | Description |
 |------|-------------|
-| `search_phenotypes` | Look up phenotype codes by disease/trait name |
+| `search_phenotypes` | Look up phenotype codes by disease/trait name. Optional `resource` restricts hits to one resource and is the only way to find a sandbox custom GWAS run (the run name being the phenotype): those are on-request datasets results-api keeps out of every search that does not name them. The release resources are named in the description only where the deployment serves them (see `on_request_datasets` below) |
 | `search_genes` | Look up gene symbols and genomic positions |
 | `lookup_variants_by_rsid` | Convert rsIDs to variant IDs (chr:pos:ref:alt format) |
 | `lookup_phenotype_names` | Batch translate phenotype codes to human-readable names |
@@ -63,7 +63,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_credible_sets_by_gene` | Get credible sets for variants near a gene (gene body ± `window`, default **500 kb**). The wide default is deliberate: the strongest signal attributed to a gene can sit several hundred kb away (e.g. a long-range regulatory variant), so a narrow window can silently drop the top hit |
 | `get_credible_sets_by_variant` | Find associations containing a specific variant |
 | `get_credible_sets_by_region` | Get credible sets overlapping a `chr:start-end` region across resources, for loci defined by coordinates rather than a gene or variant. Same `summarize` semantics as the by-variant tool; variant-level rows are capped at 500 inline with `truncated` set |
-| `get_credible_sets_by_phenotype` | Get all GWAS associations for a phenotype |
+| `get_credible_sets_by_phenotype` | Get all GWAS associations for a phenotype. With `resource` set to a sandbox custom GWAS release (named in the hint a deployment serving one gets) it serves a user's own run's SuSiE sets, read by results-api straight from the userresults bucket; only the per-phenotype credible-set tools reach those runs, the by-gene/variant/region ones do not, and the prompt allows it only when the user asks about their own or a custom GWAS |
 | `get_credible_set_leads_by_phenotype` | One row per credible set: its lead variant (flagged lead, else highest PIP, ties by p-value). The cheap way to enumerate a trait's independent signals without pulling every member variant |
 | `get_credible_set_by_id` | Get all variants in a specific credible set |
 | `get_credible_sets_by_qtl_gene` | Get QTL associations where a gene is the molecular trait. `summarize` defaults to **true** (credible set-level), like the sibling credible-set tools — see Architecture decision 7. Also the correct tool for **gene-based caQTL** questions: a caQTL trait is a chromatin peak, and the underlying `all_cs_qtl_file` resolves the Open4Gene peak-to-gene link (cell-type-matched), so `trait` holds the linked gene symbol while `trait_original`/`cs_id` keep the peak id. Peak-vs-gene coordinate matching is NOT a substitute — linked peaks sit up to ~1 Mb away and most peaks near a gene are not linked to it |
@@ -109,7 +109,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_dataset_display_names` | Display-name overrides keyed by the raw `dataset` column value, for rendering results |
 | `get_phenotype_report` | Get detailed markdown report for a phenotype. Disabled by default — enable with `ENABLE_PHENOTYPE_REPORT` |
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
-| `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs |
+| `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs; a sandbox custom GWAS run is reached with its release's resource and the run name as the phenotype, named in the hint where the deployment serves one |
 | `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
 | `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlog10p`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |

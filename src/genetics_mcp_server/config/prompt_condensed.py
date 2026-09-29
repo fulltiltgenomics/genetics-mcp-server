@@ -42,7 +42,26 @@ Generated from the review that produced it; edit the blocks here, not a copy els
 """
 
 from genetics_mcp_server import schema_docs
-from genetics_mcp_server.config.prompt_blocks import _Block, _fs, url_input_hosts_rule
+from genetics_mcp_server.config.prompt_blocks import (
+    _Block,
+    _fs,
+    custom_gwas_resources,
+    url_input_hosts_rule,
+)
+
+_CUSTOM_GWAS_SECTION = """
+### Users' own custom GWAS (sandbox userresults)
+
+Sandbox custom GWAS runs are served straight from the userresults bucket as resources {resources} (one per freeze), the run name being the "phenotype". **Only on request**: they are users' own unreviewed analyses, hidden from `search_phenotypes` and `list_datasets` unless called with one of these resources, and reached by no other tool without it. Touch them only when the user explicitly asks about a GWAS they ran themselves, a custom GWAS or userresults; never to answer a general question about FinnGen, a disease or a variant, never presented beside release results as the same kind of evidence, and always named as a user's custom run in the answer. Every user sees every run and no owner is recorded, so take the run name the user gives and ask when it is ambiguous. Per run: summary statistics always; SuSiE 95% credible sets only where the user ran fine-mapping; HLA alleles for R14 runs. No cross-run index (by-gene/by-variant/by-region credible-set tools, coloc and PheWAS do not cover them); `get_resource_metadata` on the release's resource gives case/control counts, the description and the date the run was written; credible-set `aaf` is NA.
+"""
+
+
+def _custom_gwas_section(template: str) -> str | None:
+    resources = custom_gwas_resources()
+    if not resources:
+        return None
+    return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
+
 
 CONDENSED_PROMPT_BLOCKS: tuple[_Block, ...] = (
     _Block("""
@@ -318,6 +337,10 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
 - Carry the per-modality `validation` block into the answer: `quantity: "magnitude"` means the direction is not reported and you must not state one; `status: "unvalidated"` means the modality was never checked against anything measured here; `population_rho` is a cohort-level correlation for the modality and never a confidence for the variant in hand
 - Presented side by side, the labelling matters MORE, not less: every predicted number named as predicted, every measured number sourced, the two never merged or averaged into one figure, and disagreement stated as disagreement
 """),
+    # rendered from results-api's answer, see defaults.py's counterpart
+    _Block(_CUSTOM_GWAS_SECTION,
+           requires_any=_fs('get_summary_stats', 'get_credible_sets_by_phenotype', 'search_phenotypes'),
+           render=lambda: _custom_gwas_section(_CUSTOM_GWAS_SECTION)),
     _Block("""
 ### HLA / the MHC region
 

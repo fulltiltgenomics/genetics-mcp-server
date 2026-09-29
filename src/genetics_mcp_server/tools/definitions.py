@@ -116,6 +116,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "description": "Maximum results (default 100)",
                 "default": 100,
             },
+            "resource": {
+                "type": "string",
+                "description": "Optional: restrict hits to one resource",
+            },
         },
     },
     {
@@ -263,7 +267,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource: 'finngen' or 'ukbb' (default 'finngen')",
+                "description": "Data resource (default 'finngen')",
                 "default": "finngen",
             },
             "summarize": {
@@ -1673,7 +1677,7 @@ For the reverse question — which traits an allele is associated with — use g
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource carrying HLA results",
+                "description": "Data resource carrying HLA results: 'finngen' (core R14 endpoints)",
                 "default": "finngen",
             },
         },
@@ -2428,7 +2432,8 @@ def get_anthropic_tools(
         disabled_tools: Optional set of tool names to exclude, applied after the surface.
     """
     return _to_anthropic_format(
-        resolve_tools(code_execution, disabled_tools), custom_descriptions
+        _with_custom_gwas_hints(resolve_tools(code_execution, disabled_tools)),
+        custom_descriptions,
     )
 
 
@@ -2445,7 +2450,61 @@ def all_anthropic_tools(
     definitions = all_local_tool_definitions()
     if disabled_tools:
         definitions = [t for t in definitions if t["name"] not in disabled_tools]
-    return _to_anthropic_format(definitions, custom_descriptions)
+    return _to_anthropic_format(_with_custom_gwas_hints(definitions), custom_descriptions)
+
+
+# Appended to the descriptions above when the deployment serves sandbox custom GWAS
+# releases (config.prompt_blocks.on_request_datasets, results-api's answer): the resource
+# names are the deployment's, so no static text here names one, and a deployment with no
+# such data hands the model descriptions that never mention it. (tool, parameter, text);
+# "" is the tool's own description. `{resources}` = the releases, `{hla_resources}` = those
+# with HLA results — a hint using it is dropped when there are none.
+_CUSTOM_GWAS_HINTS: list[tuple[str, str, str]] = [
+    ("search_phenotypes", "", " Sandbox custom GWAS runs (resources {resources}) are NOT in the default index: only when the user asks about a GWAS they ran themselves, pass the release's resource in `resource` to search the run names."),
+    ("search_phenotypes", "resource", ". Required to find a sandbox custom GWAS run: one of {resources}"),
+    ("get_credible_sets_by_phenotype", "resource", ". A user's own sandbox custom GWAS is one of {resources}, by the release it was run on, with the run name as the phenotype"),
+    ("get_credible_set_leads_by_phenotype", "resource", "; one of {resources} for a sandbox custom GWAS run, named by the run"),
+    ("get_credible_set_by_id", "resource", "; one of {resources} for a sandbox custom GWAS run"),
+    ("list_datasets", "resource", " Sandbox custom GWAS releases ({resources}) are on-request datasets: they are listed only when named here, never in the general catalogue."),
+    ("get_summary_stats", "resource", "; a sandbox custom GWAS run is one of {resources} by release, with the run name as the phenotype"),
+    ("get_summary_stats_by_region", "resource", "; a sandbox custom GWAS run is one of {resources} by release, with the run name as the phenotype"),
+    ("get_hla_by_phenotype", "resource", " or {hla_resources} (a sandbox custom GWAS run, named by the run; runs of the other releases have no HLA results)"),
+]
+
+
+def _with_custom_gwas_hints(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The definitions with this deployment's custom GWAS hints appended, copies where
+    a text changes so the module-level definitions stay as written."""
+    from genetics_mcp_server.config.prompt_blocks import (
+        custom_gwas_hla_resources,
+        custom_gwas_resources,
+    )
+
+    resources = custom_gwas_resources()
+    if not resources:
+        return tools
+    fill = {
+        "{resources}": ", ".join(f"'{r}'" for r in resources),
+        "{hla_resources}": ", ".join(f"'{r}'" for r in custom_gwas_hla_resources()),
+    }
+    hinted = {}
+    for name, param, text in _CUSTOM_GWAS_HINTS:
+        if "{hla_resources}" in text and not fill["{hla_resources}"]:
+            continue
+        for k, v in fill.items():
+            text = text.replace(k, v)
+        hinted.setdefault(name, []).append((param, text))
+    out = []
+    for tool in tools:
+        if tool["name"] not in hinted:
+            out.append(tool)
+            continue
+        tool = {**tool, "parameters": {k: dict(v) for k, v in tool.get("parameters", {}).items()}}
+        for param, text in hinted[tool["name"]]:
+            target = tool if param == "" else tool["parameters"][param]
+            target["description"] = target["description"] + text
+        out.append(tool)
+    return out
 
 
 def _to_anthropic_format(
@@ -2595,9 +2654,11 @@ def register_mcp_tools(
     _tool = _gate(mcp, disabled_tools or set(), code_execution)
 
     @_tool()
-    async def search_phenotypes(query: str, limit: int = 100) -> dict:
-        """Look up phenotypes by disease/trait name. Supports comma-separated values for batch lookup."""
-        return await executor.search_phenotypes(query, limit)
+    async def search_phenotypes(
+        query: str, limit: int = 100, resource: str | None = None
+    ) -> dict:
+        """Look up phenotypes by disease/trait name. Supports comma-separated values for batch lookup. `resource` restricts hits to one resource and is the only way to find an on-request dataset's phenotypes."""
+        return await executor.search_phenotypes(query, limit, resource)
 
     @_tool()
     async def search_genes(query: str, limit: int = 10) -> dict:

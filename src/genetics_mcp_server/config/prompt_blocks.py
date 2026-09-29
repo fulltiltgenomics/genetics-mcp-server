@@ -167,3 +167,71 @@ def url_input_hosts_rule() -> str | None:
         f"- **URL inputs are fetched only from these hosts: {', '.join(hosts)}.** A file "
         "anywhere else is unreachable — do not try another host; ask the user to upload it.\n"
     )
+
+
+# how long "results-api did not answer" is believed before probing again — the same shape as
+# the fetcher's host list above, for the same reason: assembly runs per chat request
+_ON_REQUEST_RETRY_S = 60.0
+# ((resource, data_type) pairs or None, when it was read); an answer is kept for the life
+# of the process, since the registry a results-api serves changes only with its ConfigMap
+_on_request_datasets: tuple[tuple[tuple[str, str], ...] | None, float] | None = None
+
+
+def _probe_on_request_datasets() -> tuple[tuple[str, str], ...] | None:
+    """results-api's answer, through an executor of this probe's own.
+
+    Imported inside the call: `tools.executor` pulls in httpx and settings. A fresh
+    executor per probe, closed on the loop that used it — the answer outlives the loop,
+    an httpx client must not.
+    """
+    from genetics_mcp_server.tools.executor import ToolExecutor
+
+    async def _ask():
+        executor = ToolExecutor()
+        try:
+            return await executor.on_request_datasets()
+        finally:
+            await executor.close()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_ask())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(_ask())).result()
+
+
+def on_request_datasets() -> tuple[tuple[str, str], ...] | None:
+    """(resource, data_type) of the datasets this deployment serves only on request, or
+    None while results-api has not said.
+
+    A daly results-api answers (), a finngen one names its sandbox custom GWAS releases.
+    The prompt section and the tool-description hints that name those resources are
+    rendered from this and from nothing static, so a deployment without such data never
+    hears of it; None and () both render nothing.
+    """
+    global _on_request_datasets
+    now = time.monotonic()
+    if _on_request_datasets is not None:
+        pairs, read_at = _on_request_datasets
+        if pairs is not None or now - read_at < _ON_REQUEST_RETRY_S:
+            return pairs
+    try:
+        pairs = _probe_on_request_datasets()
+    except Exception:  # noqa: BLE001 - a prompt is never worth failing a chat turn for
+        logger.warning("could not read results-api's on-request datasets", exc_info=True)
+        pairs = None
+    _on_request_datasets = (pairs, now)
+    return pairs
+
+
+def custom_gwas_resources() -> tuple[str, ...]:
+    """The on-request resources, i.e. the sandbox custom GWAS releases; () when unknown."""
+    return tuple(sorted({resource for resource, _ in (on_request_datasets() or ())}))
+
+
+def custom_gwas_hla_resources() -> tuple[str, ...]:
+    """Those of them that also carry HLA allele results."""
+    return tuple(
+        sorted({r for r, data_type in (on_request_datasets() or ()) if data_type == "hla"})
+    )

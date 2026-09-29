@@ -1091,18 +1091,25 @@ class ToolExecutor:
     # Search Tools
     # -------------------------------------------------------------------------
 
-    async def search_phenotypes(self, query: str, limit: int = 100) -> dict[str, Any]:
-        """Search phenotypes via autocomplete endpoint. Supports comma-separated trait names."""
+    async def search_phenotypes(
+        self, query: str, limit: int = 100, resource: str | None = None
+    ) -> dict[str, Any]:
+        """Search phenotypes via autocomplete endpoint. Supports comma-separated trait names.
+
+        `resource` restricts the hits to one resource; it is also the only way to search an
+        on_request resource (a sandbox custom GWAS release), which the index leaves out of
+        every search that does not name it.
+        """
         normalized_query = ",".join(term.strip() for term in query.split(","))
-        resp = await self.client.get(
-            f"{self.base_url}/v1/search",
-            params={
-                "q": normalized_query,
-                "types": "phenotypes",
-                "limit": limit,
-                "format": "json",
-            },
-        )
+        params: dict[str, Any] = {
+            "q": normalized_query,
+            "types": "phenotypes",
+            "limit": limit,
+            "format": "json",
+        }
+        if resource:
+            params["resources"] = resource
+        resp = await self.client.get(f"{self.base_url}/v1/search", params=params)
         if resp.status_code == 200:
             return {"success": True, **self._columns_meta(resp), "results": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -2831,6 +2838,22 @@ class ToolExecutor:
         if resp.status_code == 200:
             return {"success": True, "datasets": resp.json()}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def on_request_datasets(self) -> tuple[tuple[str, str], ...] | None:
+        """(resource, data_type) of every dataset this deployment serves only on request —
+        the sandbox custom GWAS releases — or None when results-api could not say.
+
+        The route is results-api's own, and one of its own so that a results-api too old
+        to know it answers 404 ("unknown") and never the whole catalogue.
+        """
+        resp = await self.client.get(
+            f"{self.base_url}/v1/datasets/on_request", params={"include_stats": "false"}
+        )
+        if resp.status_code != 200:
+            return None
+        return tuple(
+            sorted({(d["resource"], d.get("data_type") or "") for d in resp.json()})
+        )
 
     async def get_dataset_display_names(self) -> dict[str, Any]:
         """Get the display-name overrides keyed by the raw `dataset` column value."""

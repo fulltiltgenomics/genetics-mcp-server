@@ -15,6 +15,32 @@ os.environ.setdefault("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 os.environ["REQUIRE_AUTH"] = "false"
 
 
+# what results-api answers a finngen deployment: the three sandbox custom GWAS releases,
+# R14 also with HLA. Every test sees this deployment (see the autouse fixture below).
+FINNGEN_ON_REQUEST_DATASETS = (
+    ("finngen_custom_r12", "gwas"),
+    ("finngen_custom_r13", "gwas"),
+    ("finngen_custom_r14", "gwas"),
+    ("finngen_custom_r14", "hla"),
+)
+
+
+@pytest.fixture(autouse=True)
+def on_request_datasets_known(monkeypatch):
+    """Pin the deployment the prompt and tool-description tests describe.
+
+    The custom GWAS section and hints render from a probe of results-api; without this the
+    tests would depend on whatever happens to listen on GENETICS_API_URL — a dev stack
+    answering, or nothing. The cache is cleared as well, so a test that installs its own
+    answer (tests/test_custom_gwas_gating.py) is not served this one."""
+    from genetics_mcp_server.config import prompt_blocks
+
+    monkeypatch.setattr(
+        prompt_blocks, "_probe_on_request_datasets", lambda: FINNGEN_ON_REQUEST_DATASETS
+    )
+    monkeypatch.setattr(prompt_blocks, "_on_request_datasets", None)
+
+
 def pytest_configure(config):
     """Abort the run if genetics_mcp_server resolves outside the tree being tested.
 
