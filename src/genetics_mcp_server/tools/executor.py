@@ -988,8 +988,17 @@ class ToolExecutor:
         sql: str,
         max_rows: int = 1000,
         dry_run: bool = False,
+        *,
+        strip_limit: bool = True,
     ) -> dict[str, Any]:
-        """Execute a SQL query against the genetics BigQuery database."""
+        """Execute a SQL query against the genetics BigQuery database.
+
+        `strip_limit` exists for the SDK: the chat tool drops a trailing LIMIT so the
+        download link carries the whole result, but a script's `genetics.sql()` has no
+        download and runs under db-api's 25 000-row sandbox cap, so a stripped `LIMIT 10`
+        over a large view came back flagged truncated and the SDK raised on a query that
+        was correctly bounded.
+        """
         if not self.bigquery_url:
             return {
                 "success": False,
@@ -1000,7 +1009,7 @@ class ToolExecutor:
             # strip SQL LIMIT so the download gets the full result set;
             # always fetch up to 100k rows for the download, the LLM
             # result is truncated to max_rows and further by mcp_max_result_size
-            download_sql, _ = self._strip_trailing_limit(sql)
+            download_sql = self._strip_trailing_limit(sql)[0] if strip_limit else sql
             # 100 000 is at or above every reachable db-api `caps.max_rows` (25 000 for a
             # sandbox execution, 100 000 relaxed), and that is what makes the `truncated` bit
             # below mean "the SERVER capped this" rather than "your own max_rows capped this".

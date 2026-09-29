@@ -432,6 +432,30 @@ async def test_typed_methods_drop_the_number_when_db_api_does_not_report_a_cap()
         await executor.close()
 
 
+async def test_sql_sends_the_scripts_limit_to_db_api_unstripped():
+    """`query_database` strips a trailing LIMIT for the chat tool's download link. A script
+    has no download, and under the 25 000-row sandbox cap that stripping turned
+    `ORDER BY mlog10p DESC LIMIT 10` over a 108 490-row view into a truncated result and a
+    GeneticsError telling the model to bound a query it had already bounded."""
+    client, executor = _client_over_real_executor({
+        "columns": ["x"],
+        "rows": [[1]],
+        "total_rows": 1,
+        "truncated": False,
+        "max_rows_applied": 25_000,
+    })
+    try:
+        await client.sql("SELECT x FROM credible_sets_v ORDER BY x DESC LIMIT 10")
+        sent = executor.client.post.await_args.kwargs["json"]["sql"]
+        assert sent.endswith("LIMIT 10")
+        # the chat tool keeps stripping: its download is the reason the stripping exists
+        await executor.query_database("SELECT x FROM credible_sets_v LIMIT 10")
+        sent = executor.client.post.await_args.kwargs["json"]["sql"]
+        assert "LIMIT" not in sent
+    finally:
+        await executor.close()
+
+
 async def test_bigquery_limit_defaults_to_the_row_ceiling_not_500():
     client, executor = make_client()
     await client.mpra(gene="APOE")

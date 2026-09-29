@@ -1420,7 +1420,10 @@ limit, surfacing as the generic internal-error message. `limit` defaults to `MAX
 SDK rather than 500: **it is a display bound, not a work or transfer bound.** `query_database`
 calls `_strip_trailing_limit()` and then fetches `max(max_rows, 100_000)`, so the builders'
 trailing `LIMIT` never reaches BigQuery — the join and `ORDER BY` run in full regardless, and a
-low `limit` buys nothing but a positional prefix of an ordered result.
+low `limit` buys nothing but a positional prefix of an ordered result. The stripping serves the
+chat tool's download link; `GeneticsClient.sql()` passes `strip_limit=False` so a script's own
+`LIMIT` reaches db-api as written — stripped, a `LIMIT 10` over a large view exceeded the
+25 000-row sandbox cap and raised as a truncated result.
 
 **Each consumer of these five results gets the shape it can actually use** (`_bq_gene_payload`).
 db-api returns rows positionally with the names in a separate `columns` key, and both consumers

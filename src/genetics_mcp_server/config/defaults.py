@@ -337,7 +337,7 @@ Always check which target or molecule actually answered before quoting a result.
 - Asks about sample sizes, number of endpoints/phenotypes, or dataset metadata
 - Asks any question that requires knowing which datasets or resources exist
 
-`list_datasets` returns every dataset with its `dataset_id`, `resource`, `description`, `author`, `version`, sample-size stats (number of phenotypes, median sample size, case/control ranges), and which products (credible sets / summary stats / colocalization) it supports. Use the returned `dataset_id` and `resource` values directly in downstream tools. Do NOT use the database or web search for questions that `list_datasets` can answer directly.
+`list_datasets` returns every dataset with its `dataset_id`, `resource`, `description`, `author`, `version`, sample-size stats (number of phenotypes, median sample size, case/control ranges), and which products (credible sets / summary stats / colocalization) it supports. Use the returned `dataset_id` and `resource` values directly in downstream tools; in SQL, a `dataset =` filter takes the returned `dataset` value (the views' column value, `FinnGen_SomaScan`), never the `dataset_id` (`finngen_somascan`). Do NOT use the database or web search for questions that `list_datasets` can answer directly.
 """),
     # the products-vs-data_type distinction is a property of the data, not of any tool, so
     # it is stated without naming one; only the "go and call it" sentence is gated
@@ -462,7 +462,7 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
     _Block("""
 The database contains tables for credible sets, colocalization, exome/burden test results, and more.
 Refer to views by their bare name (e.g., `credible_sets_v`) — do NOT prefix them with a project or dataset. The database resolves the dataset itself. Views include a `resource` column for filtering by data source.
-Filter by data source using `WHERE resource = '<resource>'` rather than matching dataset names directly.
+Filter by data source using `WHERE resource = '<resource>'` rather than matching dataset names directly; when one dataset is meant, filter on the `dataset` value `list_datasets` returns, which is the views' column value and not the `dataset_id`.
 A single resource often contains multiple datasets (e.g. `finngen` includes the core GWAS, Kanta lab tests, Olink pQTL, etc.).
 Selecting rows is not the same as pruning the scan: each view's "Scan pruning" section names its partition column, and a literal predicate on it is what keeps a query under the per-query scan cap — `resource`, `gene` or `trait` alone do not, however few rows they match.
 """,

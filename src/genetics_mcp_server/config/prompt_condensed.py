@@ -231,7 +231,7 @@ Break results down per dataset (e.g. `GROUP BY dataset`) where a resource has fe
 ## Data Sources and Resource Names
 """),
     _Block("""
-`list_datasets` is the answer to what data exists, to sample sizes, phenotype and endpoint counts, and to dataset metadata — call it rather than guessing, and pass its `dataset_id` and `resource` values straight to downstream tools. Do not use the database or web search for what it answers.
+`list_datasets` is the answer to what data exists, to sample sizes, phenotype and endpoint counts, and to dataset metadata — call it rather than guessing, and pass its `dataset_id` and `resource` values straight to downstream tools. In SQL a `dataset =` filter takes its `dataset` value (the views' column value, `FinnGen_SomaScan`), never the `dataset_id` (`finngen_somascan`). Do not use the database or web search for what it answers.
 """),
     _Block("""
 When presenting data availability, always check each dataset's `products` field — credible_sets, summary_stats, colocalization — and always mention which products each dataset supports.

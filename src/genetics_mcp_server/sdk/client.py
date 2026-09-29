@@ -980,7 +980,12 @@ class GeneticsClient:
     async def _query(self, query: str, *, max_rows: int = 100_000) -> pl.DataFrame:
         # the executor and not self.sql(): every public method is audited, and a typed
         # function that went through sql() would write two lines for one read
-        result = self._payload(await self._executor.query_database(query, max_rows=max_rows))
+        # the query runs as written: the executor's LIMIT stripping serves the chat tool's
+        # download link, and here it would turn a bounded query into a full scan that trips
+        # the sandbox row cap
+        result = self._payload(
+            await self._executor.query_database(query, max_rows=max_rows, strip_limit=False)
+        )
         self._check_truncation(result)
         return _frame(result.get("rows") or [], columns=result.get("columns") or None)
 
@@ -1129,13 +1134,18 @@ class GeneticsClient:
         frame. Each carries::
 
             {"dataset_id", "resource", "version", "description", "author",
-             "publication_date", "trait_type", "data_type", "products",
+             "publication_date", "trait_type", "data_type", "products", "dataset"?,
              "qtl_types"?, "n_samples"?, "n_phenotypes"?, "pseudo_credible_sets"?,
              "collection"?, "subdataset_id_field"?, "stats"?, "metadata_endpoint"?}
 
         The trailing `?` keys are present only when the registry sets them, so read them
         with `.get`. Filter it as a list comprehension over `data_type` or `resource`
         rather than walking it for nested dicts.
+
+        `dataset_id` is the registry key and `dataset` is the value the results views hold
+        in their `dataset` column ("finngen_somascan" vs "FinnGen_SomaScan"): a SQL filter
+        takes `dataset`, never the id. It is a list where one entry appears under two labels
+        across views, and absent for data no view carries.
 
         `sql("SELECT ... FROM datasets_v")` answers the same question in SQL and joins
         against the results views; prefer it when the answer is going into a query anyway.

@@ -883,7 +883,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "ALWAYS call this FIRST when the user asks about data availability, sample "
             "sizes, number of endpoints/phenotypes, dataset metadata, or mentions a "
             "data source by name. The returned `dataset_id` and `resource` are what "
-            "you pass to downstream tools. For datasets marked `collection: true` "
+            "you pass to downstream tools; `dataset` is the value the database views hold "
+            "in their `dataset` column, so a SQL `dataset =` filter takes it, not the id. "
+            "For datasets marked `collection: true` "
             "(e.g. eQTL Catalogue), sub-studies are enumerated in "
             "/resource_metadata/{resource} (link in `metadata_endpoint`)."
         ),
