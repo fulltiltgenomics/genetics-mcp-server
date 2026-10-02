@@ -2297,3 +2297,458 @@ def test_forest_refuses_what_it_cannot_draw(kwargs, message):
 def test_an_empty_frame_is_refused_rather_than_drawn_as_an_empty_table():
     with pytest.raises(GeneticsUsageError, match="nothing to plot"):
         plots.forest(cohort_frame().head(0), label="cohort")
+
+
+# --------------------------------------------------------------------------------- volcano
+
+
+def burden_frame(**over):
+    """Twelve genes' burden results for one trait: hits both ways and a body of nulls."""
+    columns = {
+        "gene": ["PCSK9", "APOB", "LDLR", "ABCG5", "ANGPTL3", "LPL",
+                 "G7", "G8", "G9", "G10", "G11", "G12"],
+        "beta": [-0.9, -1.1, 1.4, 0.5, -0.6, 0.42, 0.1, -0.2, 0.05, 0.3, -0.15, 0.0],
+        "se": [0.05, 0.06, 0.09, 0.06, 0.07, 0.05, 0.2, 0.3, 0.1, 0.4, 0.2, 0.1],
+        "mlog10p": [71.7, 74.3, 53.8, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0],
+        "n_carriers": [812, 640, 120, 400, 95, 1500, 30, 12, 300, 8, 44, 260],
+    }
+    columns.update(over)
+    return pl.DataFrame(columns)
+
+
+def drawn_volcano(monkeypatch, tmp_path, frame, **kwargs):
+    """A whole volcano drawn to `tmp_path`: the result and its axes."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    captured = {}
+    real_close = plt.close
+
+    def capture(figure=None):
+        if hasattr(figure, "axes"):
+            captured["figure"] = figure
+        real_close(figure)
+
+    monkeypatch.setattr(plt, "close", capture)
+    kwargs.setdefault("significance", 1e-6)
+    result = plots.volcano(frame, **kwargs)
+    return result, captured["figure"].axes[0]
+
+
+def face_colours(ax):
+    """The fill colours on the panel, as hex, with how many markers carry each."""
+    from matplotlib.colors import to_hex
+
+    tally = {}
+    for collection in ax.collections:
+        faces = collection.get_facecolors()
+        n = len(collection.get_offsets())
+        if not len(faces):
+            continue
+        key = to_hex(faces[0]).upper()
+        tally[key] = tally.get(key, 0) + n
+    return tally
+
+
+def annotations(ax):
+    return [t.get_text() for t in ax.texts]
+
+
+def test_volcano_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), label="gene")
+    assert result["path"] == str(tmp_path / "volcano.png")
+    assert (tmp_path / "volcano.png").stat().st_size > 0
+    assert result["n_points"] == result["n_tests"] == 12 and result["n_missing"] == 0
+    assert result["correction"] == "fixed" and result["threshold_p"] == pytest.approx(1e-6)
+    assert (result["n_significant"], result["n_up"], result["n_down"]) == (6, 3, 3)
+    assert result["top"][0] == {
+        "label": "APOB", "estimate": -1.1, "mlog10p": 74.3, "direction": "down"
+    }
+    # direction is the hue, and what did not pass is pale
+    colours = face_colours(ax)
+    assert colours[plots._VOLCANO_UP] == 3 and colours[plots._VOLCANO_DOWN] == 3
+    assert colours[plots._VOLCANO_BELOW] == 6
+    # each side's count is written over the frame, and every hit is named
+    texts = annotations(ax)
+    assert "3 negative" in texts and "3 positive" in texts and "p 1e-6" in texts
+    assert sorted(result["labelled"]) == ["ABCG5", "ANGPTL3", "APOB", "LDLR", "LPL", "PCSK9"]
+    assert ax.get_ylabel() == r"$-\log_{10}(p)$" and ax.get_xlabel() == "Effect size (β)"
+
+
+def test_the_x_axis_is_symmetric_about_the_null(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame())
+    lo, hi = result["xlim"]
+    assert lo == pytest.approx(-hi) and hi >= 1.4
+    assert ax.get_xlim() == pytest.approx((lo, hi))
+
+
+def test_there_is_no_default_threshold():
+    with pytest.raises(TypeError, match="significance"):
+        plots.volcano(burden_frame())
+
+
+def test_bonferroni_divides_by_the_tests_in_the_frame_or_by_the_number_given(
+    monkeypatch, tmp_path
+):
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), significance="bonferroni")
+    assert result["correction"] == "bonferroni" and result["n_tests"] == 12
+    assert result["threshold_p"] == pytest.approx(0.05 / 12)
+    assert "Bonferroni 0.05/12: p 0.0042" in annotations(ax)
+    # a frame already cut to its hits has lost the tests that failed
+    filtered = burden_frame().filter(pl.col("mlog10p") > 4)
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, filtered, significance="bonferroni", n_tests=18_000
+    )
+    assert result["threshold_p"] == pytest.approx(0.05 / 18_000)
+    assert "Bonferroni 0.05/18,000: p 2.78e-6" in annotations(ax)
+    with pytest.raises(GeneticsUsageError, match="no smaller than the 6 p-values"):
+        plots.volcano(filtered, significance="bonferroni", n_tests=3)
+
+
+def test_fdr_is_benjamini_hochberg_and_the_line_is_the_p_it_comes_to(monkeypatch, tmp_path):
+    pvals = [0.001, 0.008, 0.039, 0.041, 0.042, 0.06, 0.074, 0.205, 0.212, 0.216]
+    frame = pl.DataFrame({"beta": [0.1 * (i + 1) for i in range(10)], "pval": pvals})
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="fdr")
+    # the step-up by hand: the largest k with p(k) <= k * 0.05 / 10 is 2
+    assert result["n_significant"] == 2
+    assert result["threshold_p"] == pytest.approx(2 * 0.05 / 10)
+    assert "FDR 5% over 10 tests: p 0.01" in annotations(ax)
+    # with the frame standing for 40 tests, only the first survives
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="fdr", n_tests=40)
+    assert result["n_significant"] == 1
+    assert result["threshold_p"] == pytest.approx(0.05 / 40)
+
+
+def test_fdr_with_nothing_passing_says_so_and_draws_what_was_needed(monkeypatch, tmp_path):
+    frame = pl.DataFrame({"beta": [0.1, -0.2, 0.3], "pval": [0.2, 0.5, 0.9]})
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="fdr")
+    assert result["n_significant"] == 0 and result["top"] == []
+    assert result["threshold_p"] == pytest.approx(0.05 / 3)
+    assert any(t.startswith("FDR 5%: nothing passes") for t in annotations(ax))
+    # the line is inside the panel even though no point reaches it
+    assert ax.get_ylim()[1] > result["threshold_mlog10p"]
+
+
+def test_no_threshold_draws_no_line_and_calls_nothing(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(), significance=None, label="gene", labels=3
+    )
+    assert result["correction"] is None and result["threshold_p"] is None
+    assert result["n_significant"] == result["n_up"] == result["n_down"] == 0
+    colours = face_colours(ax)
+    assert plots._VOLCANO_UP not in colours and plots._VOLCANO_DOWN not in colours
+    # the strongest are still named, from both sides
+    assert result["labelled"] == ["LDLR", "APOB", "PCSK9"]
+
+
+def test_log_odds_ratios_are_drawn_as_ratios_on_a_log_axis_around_one(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), scale="log_ratio")
+    assert ax.get_xscale() == "log" and ax.get_xlabel() == "Odds ratio"
+    lo, hi = result["xlim"]
+    assert lo * hi == pytest.approx(1.0) and lo < 1 < hi
+    assert any(tuple(line.get_xdata()) == (1.0, 1.0) for line in ax.lines)
+    assert result["top"][0]["estimate"] == pytest.approx(math.exp(-1.1))
+    assert "3 below 1" in annotations(ax) and "3 above 1" in annotations(ax)
+
+
+def test_ratios_given_as_ratios_are_logged_and_a_zero_sits_at_the_edge(monkeypatch, tmp_path):
+    frame = pl.DataFrame({
+        "gene": ["A", "B", "C", "D"],
+        "or": [2.0, 0.5, 0.0, 1.1],
+        "pval": [1e-9, 1e-8, 0.4, 0.5],
+    })
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, estimate="or", scale="ratio")
+    assert (result["n_up"], result["n_down"], result["n_clipped"]) == (1, 1, 1)
+    assert result["xlim"][0] * result["xlim"][1] == pytest.approx(1.0)
+    with pytest.raises(GeneticsUsageError, match="scale='log_ratio'"):
+        plots.volcano(frame.with_columns(pl.lit(-0.3).alias("or")), estimate="or",
+                      scale="ratio", significance=1e-6)
+    with pytest.raises(GeneticsUsageError, match="standard error is on the log scale"):
+        plots.volcano(frame.with_columns(pl.lit(0.1).alias("se")), estimate="or",
+                      scale="ratio", se="se", significance=1e-6)
+
+
+def test_a_p_value_of_zero_is_drawn_at_the_top_edge_and_not_given_a_value(monkeypatch, tmp_path):
+    frame = pl.DataFrame({"gene": ["A", "B", "C"], "beta": [1.0, -0.5, 0.1],
+                          "pval": [0.0, 1e-12, 0.3]})
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene")
+    assert result["n_offscale"] == 1 and result["n_significant"] == 2
+    assert result["top"][0]["label"] == "A" and math.isinf(result["top"][0]["mlog10p"])
+    # the axis is set by the finite values, and the point sits on its top edge
+    top = ax.get_ylim()[1]
+    assert 12 < top < 14
+    assert any(
+        (collection.get_offsets()[:, 1] == top).any() for collection in ax.collections
+    )
+    # an infinite -log10 p is the same thing said the other way
+    result, _ax = drawn_volcano(
+        monkeypatch, tmp_path,
+        pl.DataFrame({"beta": [1.0, -0.5], "mlog10p": [math.inf, 12.0]}),
+    )
+    assert result["n_offscale"] == 1
+
+
+def test_rows_without_an_estimate_or_a_p_value_are_counted_and_not_drawn(monkeypatch, tmp_path):
+    frame = pl.DataFrame({
+        "beta": [0.5, None, float("nan"), -0.4, 0.2, 0.3],
+        "pval": [1e-9, 1e-9, 1e-9, None, 1.5, 1e-7],
+    })
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="bonferroni")
+    assert result["n_points"] == 2 and result["n_missing"] == 4
+    # a test with no effect size was still a test; a p-value outside [0, 1] is not one
+    assert result["n_tests"] == 4
+    with pytest.raises(GeneticsUsageError, match="no row has both"):
+        plots.volcano(frame.head(5).tail(4), significance=0.05)
+
+
+def test_a_runaway_estimate_does_not_take_the_volcano_axis(monkeypatch, tmp_path):
+    frame = burden_frame(
+        beta=[-0.9, -1.1, 1.4, 0.5, -0.6, 0.42, 0.1, -0.2, 0.05, 0.3, -14.2, 22.0],
+    )
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame)
+    assert result["n_clipped"] == 2
+    assert result["xlim"][1] < 5
+    # both are still on the figure, as arrowheads on the edge they lie beyond
+    edges = [
+        float(x) for collection in ax.collections
+        for x in collection.get_offsets()[:, 0] if abs(x) == pytest.approx(result["xlim"][1])
+    ]
+    assert sorted(edges) == pytest.approx(list(result["xlim"]))
+
+
+def test_a_significant_estimate_sets_the_axis_however_far_out_it_is(monkeypatch, tmp_path):
+    frame = burden_frame(beta=[-0.9, -1.1, 30.0, 0.5, -0.6, 0.42, 0.1, -0.2, 0.05, 0.3, -0.15, 0.0])
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame)
+    assert result["n_clipped"] == 0 and result["xlim"][1] > 30
+
+
+def test_an_explicit_xlim_cuts_what_lies_outside_it_on_the_volcano(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), xlim=(-1, 1))
+    assert result["xlim"] == (-1.0, 1.0) and ax.get_xlim() == (-1.0, 1.0)
+    assert result["n_clipped"] == 2 and result["n_significant"] == 6
+
+
+def test_effects_that_are_all_zero_still_get_an_axis(monkeypatch, tmp_path):
+    frame = pl.DataFrame({"beta": [0.0, 0.0], "pval": [0.5, 1e-9]})
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame)
+    assert result["xlim"] == pytest.approx((-1.08, 1.08))
+    # significant, and in neither direction
+    assert (result["n_significant"], result["n_up"], result["n_down"], result["n_small"]) == (1, 0, 0, 1)
+
+
+def test_one_association_that_dwarfs_the_rest_breaks_the_p_axis(monkeypatch, tmp_path):
+    frame = burden_frame(mlog10p=[349.0, 61.6, 24.3, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0])
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame)
+    assert result["y_log_above"] == 20.0 and ax.get_yscale() == "symlog"
+    assert "log scale above 20" in annotations(ax)
+    # the threshold is far enough up the panel to read what sits around it
+    line_at = ax.transData.transform((0, result["threshold_mlog10p"]))[1]
+    bottom, height = ax.bbox.y0, ax.bbox.height
+    assert (line_at - bottom) / height > 0.1
+    ticks = list(ax.get_yticks())
+    assert 20.0 in ticks and max(ticks) >= 200
+    # a spread that fits a linear axis is left on one
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(
+        mlog10p=[40.0, 30.0, 24.3, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0]
+    ))
+    assert result["y_log_above"] is None and ax.get_yscale() == "linear"
+
+
+def test_names_are_shared_between_the_two_sides_and_given_once_each(monkeypatch, tmp_path):
+    frame = pl.DataFrame({
+        "gene": ["U1", "U2", "U3", "U4", "U5", "U6", "D1", "D1", "D2"],
+        "beta": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, -1.0, -1.2, -0.8],
+        "mlog10p": [30.0, 29.0, 28.0, 27.0, 26.0, 25.0, 9.0, 8.5, 8.0],
+    })
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene", labels=4)
+    # the weaker side keeps its half although the stronger side could fill every slot
+    assert result["labelled"] == ["U1", "U2", "D1", "D2"]
+    # and a side with fewer hits than its half passes the rest across
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene", labels=8)
+    assert result["labelled"] == ["U1", "U2", "U3", "U4", "U5", "U6", "D1", "D2"]
+    # an odd slot goes to the strongest hit not yet named, whichever side it is on
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene", labels=3)
+    assert result["labelled"] == ["U1", "U2", "D1"]
+    # a name's second point is named only once every name has been given
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene", labels=10)
+    assert result["labelled"] == ["U1", "U2", "U3", "U4", "U5", "U6", "D1", "D1", "D2"]
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene", labels=0)
+    assert result["labelled"] == [] and "U1" not in annotations(ax)
+
+
+def test_named_labels_are_drawn_whether_or_not_they_passed(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(), label="gene", labels=["G10", "PCSK9"]
+    )
+    assert result["labelled"] == ["G10", "PCSK9"]
+    assert {"G10", "PCSK9"} <= set(annotations(ax)) and "APOB" not in annotations(ax)
+    with pytest.raises(GeneticsUsageError, match=r"labels \['NOPE'\] are not in column 'gene'"):
+        plots.volcano(burden_frame(), label="gene", labels=["NOPE"], significance=1e-6)
+    with pytest.raises(GeneticsUsageError, match="pass label= too"):
+        plots.volcano(burden_frame(), labels=["PCSK9"], significance=1e-6)
+
+
+def test_a_named_point_carries_its_interval_when_the_frame_has_a_standard_error(
+    monkeypatch, tmp_path
+):
+    _result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), label="gene", labels=["LDLR"])
+    whiskers = [
+        line for line in ax.lines
+        if len(line.get_xdata()) == 2 and line.get_ydata()[0] == line.get_ydata()[1] == 53.8
+    ]
+    assert len(whiskers) == 1
+    assert tuple(whiskers[0].get_xdata()) == pytest.approx((1.4 - 1.96 * 0.09, 1.4 + 1.96 * 0.09), abs=1e-3)
+    # the outermost point's interval is inside the axis rather than cut by its edge
+    assert ax.get_xlim()[1] > 1.4 + 1.96 * 0.09
+    _result, ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(), label="gene", labels=["LDLR"], se=None
+    )
+    assert not [line for line in ax.lines if line.get_ydata()[0] == 53.8]
+
+
+def test_min_effect_marks_small_effects_without_calling_them_hits(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), min_effect=0.55)
+    assert result["n_significant"] == 6
+    assert (result["n_up"], result["n_down"], result["n_small"]) == (1, 3, 2)
+    assert face_colours(ax)[plots._VOLCANO_SMALL] == 2
+    verticals = sorted(
+        line.get_xdata()[0] for line in ax.lines
+        if len(line.get_xdata()) == 2 and line.get_xdata()[0] == line.get_xdata()[1]
+    )
+    assert verticals == pytest.approx([-0.55, 0.0, 0.55])
+    # on a ratio axis the line is a ratio, drawn at it and at its reciprocal
+    result, _ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(), scale="log_ratio", min_effect=2.0
+    )
+    assert (result["n_up"], result["n_down"], result["n_small"]) == (1, 2, 3)
+
+
+def test_colour_names_a_category_and_groups_the_rarest_past_seven(monkeypatch, tmp_path):
+    masks = ["pLoF", "missense", "pLoF", "synonymous", "missense", "pLoF"] + ["pLoF"] * 6
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(mask=masks), colour="mask"
+    )
+    assert result["colours"] == ["pLoF", "missense", "synonymous"]
+    legend = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert legend == ["pLoF", "missense", "synonymous"]
+    colours = face_colours(ax)
+    assert colours[plots._FOREST_SERIES[0][0]] == 3 and colours[plots._FOREST_SERIES[1][0]] == 2
+    assert plots._VOLCANO_UP not in colours or plots._FOREST_SERIES[1][0] == plots._VOLCANO_UP
+
+    many = pl.DataFrame({
+        "beta": [0.1 * (i + 1) for i in range(10)],
+        "mlog10p": [20.0] * 10,
+        "tissue": ["liver", "liver", "liver", "t4", "t5", "t6", "t7", "t8", "t9", "t10"],
+    })
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, many, colour="tissue")
+    assert len(result["colours"]) == len(plots._FOREST_SERIES)
+    assert result["colours"][0] == "liver" and result["colours"][-1] == "Other"
+
+
+def test_size_scales_the_hits_marker_area_and_says_so_in_the_legend(monkeypatch, tmp_path):
+    _result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), size="n_carriers")
+    areas = sorted({float(s) for c in ax.collections for s in c.get_sizes()})
+    lo, hi = plots._VOLCANO_AREA_RANGE
+    # the six hits are scaled, the largest to the top of the range; the rest keep the
+    # area every point below the line has
+    assert areas[-1] == pytest.approx(hi) and len(areas) == 7
+    assert areas[0] == plots._VOLCANO_AREA_BELOW[0] and lo < areas[1]
+    legend = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert legend == ["n_carriers 95", "n_carriers 1,500"]
+
+
+def test_a_size_column_holding_one_value_encodes_nothing_and_is_not_drawn(monkeypatch, tmp_path):
+    _result, ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(n_cases=[87_959] * 12), size="n_cases"
+    )
+    assert ax.get_legend() is None
+    assert {float(s) for c in ax.collections for s in c.get_sizes()} == {
+        plots._VOLCANO_AREA, plots._VOLCANO_AREA_BELOW[0]
+    }
+
+
+def test_the_p_column_is_found_or_asked_for(monkeypatch, tmp_path):
+    burden = burden_frame().rename({"mlog10p": "mlog10p_burden"})
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, burden)
+    assert result["n_significant"] == 6
+    with pytest.raises(GeneticsUsageError, match="several -log10 p columns"):
+        plots.volcano(burden.with_columns(pl.col("mlog10p_burden").alias("mlog10p_skat")),
+                      significance=1e-6)
+    with pytest.raises(GeneticsUsageError, match="neither `mlog10p` nor `pval`"):
+        plots.volcano(burden.drop("mlog10p_burden"), significance=1e-6)
+    # a p-value column gives the picture its -log10 gives
+    as_p = burden_frame().with_columns((10.0 ** -pl.col("mlog10p")).alias("p")).drop("mlog10p")
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, as_p, pvalue="p")
+    assert result["n_significant"] == 6
+    assert result["top"][0]["mlog10p"] == pytest.approx(74.3)
+
+
+def test_a_cloud_is_drawn_smaller_and_rasterised(monkeypatch, tmp_path):
+    n = 3000
+    frame = pl.DataFrame({
+        "beta": [((i % 41) - 20) / 20 for i in range(n)],
+        "mlog10p": [(i % 17) / 10 for i in range(n)],
+    })
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="bonferroni")
+    assert result["n_points"] == n and result["n_significant"] == 0
+    cloud = [c for c in ax.collections if len(c.get_offsets()) == n]
+    assert len(cloud) == 1 and cloud[0].get_rasterized()
+    assert set(cloud[0].get_sizes()) == {plots._VOLCANO_AREA_BELOW[1]}
+
+
+def test_volcano_into_a_caller_supplied_axis_saves_nothing(tmp_path, monkeypatch):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    figure, ax = plt.subplots()
+    try:
+        result = plots.volcano(burden_frame(), significance=1e-6, label="gene", ax=ax,
+                               title="LDL cholesterol")
+        assert result["path"] is None and not list(tmp_path.iterdir())
+        assert ax.get_title() == "LDL cholesterol" and len(ax.collections) >= 3
+    finally:
+        plt.close(figure)
+
+
+def test_a_label_is_cut_to_length_and_a_dollar_sign_is_not_mathtext_on_the_volcano(
+    monkeypatch, tmp_path
+):
+    genes = ["A trait whose name runs well past what a point label can hold", "$x$ and $y$"]
+    frame = pl.DataFrame({"trait": genes, "beta": [1.0, -1.0], "mlog10p": [20.0, 18.0]})
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, label="trait")
+    assert result["labelled"] == ["A trait whose name runs well…", r"\$x\$ and \$y\$"]
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"significance": "holm"}, "significance is a p threshold"),
+        ({"significance": 5}, r"p threshold in \(0, 1\)"),
+        ({"significance": True}, r"p threshold in \(0, 1\)"),
+        ({"alpha": 5}, "alpha is a level"),
+        ({"scale": "odds"}, "scale must be one of"),
+        ({"estimate": "log2fc"}, "are not in the frame"),
+        ({"direction": "risk"}, "direction is a pair"),
+        ({"min_effect": -1}, "a positive effect size"),
+        ({"scale": "log_ratio", "min_effect": 0.5}, "a ratio above 1"),
+        ({"xlim": (2, 1)}, "xlim must be increasing"),
+        ({"scale": "log_ratio", "xlim": (-1, 2)}, "positive on a ratio axis"),
+        ({"labels": "PCSK9"}, "wrap one name in a list"),
+        ({"n_tests": 2.5}, "n_tests is how many tests were run"),
+    ],
+)
+def test_volcano_refuses_what_it_cannot_draw(kwargs, message):
+    kwargs.setdefault("significance", 1e-6)
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.volcano(burden_frame(), **kwargs)
+
+
+def test_an_empty_frame_is_refused_rather_than_drawn_as_an_empty_volcano():
+    with pytest.raises(GeneticsUsageError, match="nothing to plot"):
+        plots.volcano(burden_frame().head(0), significance=1e-6)
+    with pytest.raises(GeneticsUsageError, match="polars DataFrame"):
+        plots.volcano([{"beta": 1}], significance=1e-6)

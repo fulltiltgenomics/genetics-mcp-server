@@ -132,7 +132,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
-locuszoom, a phewas, an upset, the line-models figure and a forest plot — as functions a
+locuszoom, a phewas, an upset, the line-models figure, a forest plot and a volcano — as functions a
 `run_analysis` script calls, and the figure comes back as an artifact. The upset is the general one: it
 takes any sets a script has in hand (members, a frame of membership columns, or
 intersection counts already tallied) and draws them one way, in greys, with every count
@@ -147,6 +147,17 @@ several series on one row, a pooled diamond (inverse-variance fixed or DerSimoni
 random, with I² and the heterogeneity p returned) and the handling of what real results
 contain — a null estimate, a missing standard error, an interval from a model that did not
 converge — are in the function's docstring, which is the spec.
+The volcano takes the same kind of frame — an effect and a p-value per row — and the same
+`scale`, and draws effect size against -log10 p with what passes the threshold coloured by
+direction and named. It has no default threshold: `significance` is a p-value,
+`"bonferroni"` or `"fdr"`, and `n_tests=` carries the number of tests when the frame was
+already cut to its hits — `gene_burden(gene=...)` returns Genebass and BRaVa rows that
+way, and credible sets are hits by construction — since a correction over the survivors is
+far too lenient. The y axis is always the raw p-value with the
+correction drawn as a line on it; an effect-size line (`min_effect`) is a display filter and
+is documented as not being a test. What real tables contain is handled in the function and
+listed in its docstring: a p-value of 0, estimates from models that did not converge, one
+association hundreds of orders of magnitude past the rest, a gene tested under several masks.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -2248,7 +2259,7 @@ src/genetics_mcp_server/
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest)
+│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest, volcano)
 │   └── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
 ├── subagent.py             # parallel subagent service
 ├── scripts/

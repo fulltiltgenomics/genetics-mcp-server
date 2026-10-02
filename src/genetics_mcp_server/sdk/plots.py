@@ -5,6 +5,7 @@
     genetics.plots.phewas(variant="19:44908684:T:C")
     genetics.plots.upset(sets={"Crohn": cd_ids, "UC": uc_ids})
     genetics.plots.forest(frame, label="cohort", scale="log_ratio", pool="fixed")
+    genetics.plots.volcano(frame, label="gene", significance="bonferroni")
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
@@ -48,7 +49,7 @@ import polars as pl
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import LD_MAX_WINDOW
 
-__all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest"]
+__all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest", "volcano"]
 
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
@@ -788,7 +789,7 @@ _LEADER_FROM = 10  # points of offset beyond which a label gets a line back to i
 
 
 def _place_labels(ax, renderer, labels: list[tuple[str, float, float, float]],
-                  points: np.ndarray, taken: list) -> None:
+                  points: np.ndarray, taken: list, fontstyle: str = "normal") -> None:
     """Annotate each (text, x, y, fontsize) where it covers the fewest points.
 
     At a fixed offset the lead's caption lands on its own LD partners at a dense locus, and
@@ -804,6 +805,7 @@ def _place_labels(ax, renderer, labels: list[tuple[str, float, float, float]],
         note = ax.annotate(
             text, (x, y), textcoords="offset points", xytext=_LABEL_SPOTS[0][:2],
             ha=_LABEL_SPOTS[0][2], va=_LABEL_SPOTS[0][3], fontsize=fontsize, zorder=5,
+            fontstyle=fontstyle,
             arrowprops={"arrowstyle": "-", "linewidth": 0.4, "color": "#555555",
                         "shrinkA": 0, "shrinkB": 3},
         )
@@ -2865,4 +2867,677 @@ def forest(
         "rows": [row["label"] for rows in by_group.values() for row in rows],
         "size_in": size_in,
         "pooled": pooled,
+    }
+
+
+# --------------------------------------------------------------------------------- volcano
+
+# Direction is what a reader decodes from the hue, so the pair is fixed and not the
+# prop_cycle's: Okabe–Ito vermillion and blue, which stay apart under the colour-vision
+# deficiencies that merge the conventional red and green.
+_VOLCANO_UP = "#D55E00"
+_VOLCANO_DOWN = "#0072B2"
+# What did not pass is context: pale, so the cloud at the foot of the plot does not compete
+# with the points a reader is meant to find. What passed the p threshold but not the effect
+# one sits between the two.
+_VOLCANO_BELOW = "#C4C4C4"
+_VOLCANO_SMALL = "#7A7A7A"
+_VOLCANO_NULL_RULE = "#DDDDDD"
+
+_VOLCANO_CORRECTIONS = ("bonferroni", "fdr")
+_VOLCANO_LABEL_CHARS = 30
+
+# marker areas in points²: a point that passed, one that did not — smaller in a cloud of
+# more than `_VOLCANO_CLOUD` points, where the larger one merges them into a slab — and the
+# range `size=` scales across
+_VOLCANO_AREA = 11.0
+_VOLCANO_AREA_BELOW = (9.0, 5.0)
+_VOLCANO_CLOUD = 1000
+_VOLCANO_AREA_RANGE = (9.0, 60.0)
+
+# The x axis reaches `_VOLCANO_CLIP` times the furthest significant estimate or
+# `_VOLCANO_BODY` times the median size, whichever is further, and stops at the furthest
+# estimate when that is nearer. What lies beyond is what a model that did not converge
+# returns — a log odds ratio of -14 for a gene with no carriers among the cases — and one
+# such row otherwise flattens the figure into a column at the null. The median, because a
+# high quantile is one of the runaway rows as soon as a short table holds two of them;
+# eight of them, because the largest of 20,000 normal null estimates is about six medians.
+_VOLCANO_CLIP = 2.0
+_VOLCANO_BODY = 8.0
+
+# -log10 p is linear up to a break and logarithmic above it once the strongest association
+# is more than `_VOLCANO_LOG_TRIGGER` times past the break, with the linear part keeping
+# `_VOLCANO_LINEAR_SHARE` of the height. One association at 300 otherwise puts every other
+# one, and the threshold, in the bottom tenth of the panel. PheWeb's Manhattan plots break
+# at 20 for the same reason.
+_VOLCANO_LOG_FROM = 20.0
+_VOLCANO_LOG_TRIGGER = 2.5
+_VOLCANO_LINEAR_SHARE = 0.55
+
+
+def _volcano_reach(x: np.ndarray, significant: np.ndarray) -> float:
+    """How far the x axis reaches either side of the null, on the analysis scale."""
+    finite = np.isfinite(x)
+    sizes = np.abs(x[finite])
+    if not len(sizes):
+        return 1.0
+    full = float(sizes.max())
+    within = max(
+        _VOLCANO_CLIP * float(np.abs(x[finite & significant]).max(initial=0.0)),
+        _VOLCANO_BODY * float(np.quantile(sizes, 0.5, method="lower")),
+    )
+    return (min(full, within) if within > 0 else full) or 1.0
+
+
+def _volcano_y_ticks(linthresh: float, top: float) -> list[float]:
+    """Ticks for the broken -log10 p axis: even steps to the break, 1-2-5 above it."""
+    from matplotlib.ticker import MaxNLocator
+
+    ticks = [
+        float(t) for t in MaxNLocator(nbins=4, steps=[1, 2, 5, 10]).tick_values(0, linthresh)
+        if 0 <= t <= linthresh
+    ]
+    decades = range(math.floor(math.log10(linthresh)), math.ceil(math.log10(top)) + 1)
+    upper: list[float] = []
+    for mantissas in ((1, 2, 5), (1,)):
+        # not within 40% of the break, where a label would sit on the break's own
+        upper = [
+            m * 10.0 ** e for e in decades for m in mantissas
+            if linthresh * 1.4 <= m * 10.0 ** e <= top
+        ]
+        if len(upper) <= 5:
+            break
+    return ticks + upper
+
+
+def _volcano_threshold_text(
+    correction: str, significance: Any, alpha: float, n_tests: int, n_pass: int, line_y: float
+) -> str:
+    """What the threshold line is, written on it: the rule, and the p it comes to."""
+    if correction == "fixed":
+        # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
+        return f"p {significance:g}".replace("e-0", "e-")
+    level = f"{alpha * 100:g}%"
+    p = f"{10 ** -line_y:.2g}" if line_y < 3 else _format_p(line_y)
+    if correction == "bonferroni":
+        return f"Bonferroni {alpha:g}/{n_tests:,}: p {p}"
+    if not n_pass:
+        return f"FDR {level}: nothing passes; the strongest needed p {p}"
+    return f"FDR {level} over {n_tests:,} tests: p {p}"
+
+
+def volcano(
+    data: pl.DataFrame,
+    *,
+    significance: Any,
+    estimate: str = "beta",
+    pvalue: str = "auto",
+    label: str | None = None,
+    se: str | None = "auto",
+    scale: str = "linear",
+    alpha: float = 0.05,
+    n_tests: int | None = None,
+    min_effect: float | None = None,
+    labels: Any = 10,
+    colour: str | None = None,
+    size: str | None = None,
+    effect: str | None = None,
+    xlabel: str | None = None,
+    xlim: Any = None,
+    direction: Any = None,
+    italic: bool = False,
+    path: str | None = None,
+    title: str | None = None,
+    ax: Any = None,
+) -> dict[str, Any]:
+    """Volcano plot: effect size against -log10 p for every test in a frame, hits coloured by direction.
+
+    `data` has one row per test — a gene's burden result, a variant, a phenotype, a protein.
+    `estimate` names the effect column and `pvalue` the p-value one: `mlog10p` where the
+    frame has it, else `pval`, else the one column whose name starts with `mlog10p`
+    (`mlog10p_burden`); a name starting with `mlog` is read as -log10 p, anything else as a
+    p-value. -log10 p is preferred because it does not underflow. The y axis is always the
+    RAW p-value: pass those, not adjusted ones, and let `significance` draw the correction.
+
+    SAY WHAT COUNTS AS SIGNIFICANT, with `significance` — there is no default, because the
+    right threshold depends on how many tests were run and published ones differ by orders
+    of magnitude:
+
+    - a number — a p threshold used as given: `5e-8`, or the exome-wide one of the study.
+    - `"bonferroni"` — `alpha` (0.05) divided by the number of tests.
+    - `"fdr"` — Benjamini–Hochberg at `alpha`. The line is drawn at the p-value the
+      procedure comes to for this data, so it moves with the data.
+
+    The number of tests is the number of rows with a p-value. THAT IS ONLY RIGHT FOR AN
+    UNFILTERED FRAME: one already cut to its hits (`gene_burden(gene=...)` returns Genebass
+    rows at -log10 p > 4 only; credible sets are significant by construction) has lost the
+    tests that failed, and a correction over what is left is far too lenient. Pass
+    `n_tests=` with how many were run — for `"fdr"` this assumes the rows kept are the
+    strongest ones — or pass the study's own threshold as a number.
+    `significance=None` draws no line and calls nothing.
+
+    WHAT IS DRAWN. Points past the threshold are vermillion where the effect is positive
+    and blue where it is negative, with the count of each in the top corners; everything
+    else is pale grey. The x axis is symmetric about the null so that a lopsided figure
+    means lopsided results. `scale` says what the estimates are, as on the forest plot:
+    `"linear"` (a beta, a log2 fold change; null at 0), `"log_ratio"` (log odds ratios,
+    which is what a binary trait's `beta` is — drawn on a log axis labelled in odds-ratio
+    units, null at 1) or `"ratio"` (already ratios). `effect` is the measure's name on the
+    axis ("OR", "HR", "log2 fold change") and `direction=("protective", "risk")` names the
+    two sides beside their counts.
+
+    `min_effect=` adds a pair of vertical lines at that effect size either side of the null
+    (in axis units: 1.5 on a ratio axis means 1.5 and 1/1.5), and a point past the p
+    threshold but inside them is dark grey and counted in `n_small`, not as a hit. It is a
+    filter on the ESTIMATES for display and not a test: the false-discovery statement
+    belongs to the p threshold alone, and selecting on both does not control it for the
+    claim that an effect is larger than the line.
+
+    NAMES. `label` names the column that identifies a point. The strongest hits are named,
+    up to `labels` of them (10) shared between the two sides so the weaker side is not
+    crowded out. A name that recurs — a gene tested under two masks — is given at its
+    strongest point on a side first and at its others only if names are left over; put
+    what tells them apart into the label column to name each. `labels=[...]` names exactly
+    those instead, significant or not, each ringed so it can be found in the cloud, and
+    `labels=0` names nothing. With a standard error in the frame (`se`, or the column
+    `se=` names) each named point carries its 95% interval as a whisker. Read it: the
+    furthest points on a volcano are the least precise ones as often as they are the
+    largest effects. `italic=True` sets the names in italics, for gene symbols.
+
+    `colour=` names a categorical column — a variant class, a tissue, a dataset — and
+    colours the hits by it instead of by direction, with a legend; past seven values the
+    rarest are grouped as `Other`. `size=` names a numeric column — sample size, carrier
+    count — that the hits' marker area is scaled by, with the range in the legend.
+
+    WHAT IS HANDLED RATHER THAN LEFT TO THE CALLER. A row with no estimate or no usable
+    p-value is not drawn and is counted in `n_missing`. A p-value of exactly 0, or an
+    infinite -log10 p, is an arrowhead at the top edge rather than a value invented for it.
+    Estimates far beyond every informative one — what a model that did not converge
+    returns — do not set the x axis: they sit at its edge as arrowheads, as does anything
+    outside an explicit `xlim=` (in axis units), counted in `n_clipped`. When one
+    association dwarfs the rest, -log10 p turns logarithmic above a marked break so the
+    threshold and everything near it stay readable; `y_log_above` says where.
+
+    Returns a dict describing what was drawn: `path`, `n_points`, `n_missing`, `n_tests`,
+    `correction` ("fixed", "bonferroni", "fdr" or None), `threshold_p` and
+    `threshold_mlog10p`, `n_significant` (past the p threshold), `n_up`, `n_down` and
+    `n_small`, `n_clipped`, `n_offscale` (drawn at the top edge), `scale`, `xlim` in axis
+    units, `y_log_above`, `labelled` (the names on the figure), `colours` (the legend's
+    categories) and `top`: the ten strongest hits as dicts of `label`, `estimate` in axis
+    units, `mlog10p` and `direction`.
+
+    `path` may be relative, in which case it is written inside the execution's artifacts
+    directory and returned to the user automatically; that is also where the default goes.
+    Pass `ax` to draw into an existing axis instead, in which case nothing is saved.
+    """
+    import collections
+
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator, NullLocator
+    from matplotlib.transforms import ScaledTranslation
+
+    if not isinstance(data, pl.DataFrame):
+        raise GeneticsUsageError(f"data must be a polars DataFrame, not {type(data).__name__}")
+    if scale not in _FOREST_SCALES:
+        raise GeneticsUsageError(f"scale must be one of {_FOREST_SCALES}, not {scale!r}")
+    if significance is None:
+        correction = None
+    elif isinstance(significance, str):
+        if significance not in _VOLCANO_CORRECTIONS:
+            raise GeneticsUsageError(
+                f"significance is a p threshold, one of {_VOLCANO_CORRECTIONS}, or None; "
+                f"got {significance!r}"
+            )
+        correction = significance
+    elif (
+        isinstance(significance, bool) or not isinstance(significance, (int, float))
+        or not 0 < significance < 1
+    ):
+        raise GeneticsUsageError(
+            f"significance is a p threshold in (0, 1), one of {_VOLCANO_CORRECTIONS}, or "
+            f"None; got {significance!r}"
+        )
+    else:
+        correction = "fixed"
+    if not 0 < alpha < 1:
+        raise GeneticsUsageError(f"alpha is a level in (0, 1), e.g. 0.05; got {alpha!r}")
+    if direction is not None and (isinstance(direction, str) or len(direction) != 2):
+        raise GeneticsUsageError(
+            "direction is a pair: what below the null means, then what above it means"
+        )
+    ratio = scale != "linear"
+    if min_effect is not None and not (min_effect > 1 if ratio else min_effect > 0):
+        raise GeneticsUsageError(
+            "min_effect is in the units of the axis: "
+            + ("a ratio above 1 on a ratio axis, e.g. 1.5 for 1.5 and 1/1.5"
+               if ratio else "a positive effect size")
+            + f"; got {min_effect!r}"
+        )
+    if pvalue == "auto":
+        found = [c for c in ("mlog10p", "pval") if c in data.columns][:1] or [
+            c for c in data.columns if c.lower().startswith("mlog10p")
+        ]
+        if len(found) != 1:
+            raise GeneticsUsageError(
+                ("the frame has neither `mlog10p` nor `pval`" if not found
+                 else f"the frame has several -log10 p columns {found}")
+                + f"; name the one to plot with pvalue=. Columns are {data.columns}"
+            )
+        pvalue = found[0]
+    if se == "auto":
+        se = "se" if "se" in data.columns and scale != "ratio" else None
+    elif se is not None and scale == "ratio":
+        raise GeneticsUsageError(
+            "a standard error is on the log scale and scale='ratio' estimates are not. "
+            "If the estimates are log ratios, that is scale='log_ratio'"
+        )
+    explicit = None
+    if isinstance(labels, (list, tuple, set, frozenset, pl.Series)):
+        explicit = list(labels)
+        if label is None:
+            raise GeneticsUsageError("labels=[...] names points by their label; pass label= too")
+    elif isinstance(labels, str):
+        raise GeneticsUsageError("labels is a count or a list of names; wrap one name in a list")
+    missing = [
+        c for c in (estimate, pvalue, label, se, colour, size)
+        if c is not None and c not in data.columns
+    ]
+    if missing:
+        raise GeneticsUsageError(f"columns {missing} are not in the frame; columns are {data.columns}")
+    if data.is_empty():
+        raise GeneticsUsageError("the frame has no rows — nothing to plot")
+
+    n = data.height
+    x_all = np.full(n, np.nan)
+    for i, value in enumerate(_floats(data, estimate, keep_inf=True)):
+        if value is None:
+            continue
+        if scale != "ratio":
+            x_all[i] = value
+        elif value < 0:
+            raise GeneticsUsageError(
+                f"scale='ratio' takes ratios, which are not negative, but row {i} has "
+                f"{estimate}={value:g}. Log odds ratios — a GWAS `beta` — are scale='log_ratio'"
+            )
+        else:
+            x_all[i] = -math.inf if value == 0 else math.log(value)
+    if pvalue.lower().startswith("mlog"):
+        y_all = np.array(
+            [np.nan if v is None or v < 0 else v for v in _floats(data, pvalue, keep_inf=True)],
+            dtype=float,
+        )
+    else:
+        y_all = np.array(
+            [
+                np.nan if p is None or not 0 <= p <= 1
+                else math.inf if p == 0 else abs(-math.log10(p))
+                for p in _floats(data, pvalue)
+            ],
+            dtype=float,
+        )
+    tested = ~np.isnan(y_all)
+    if n_tests is None:
+        n_tests = int(tested.sum())
+    elif isinstance(n_tests, bool) or int(n_tests) != n_tests or n_tests < int(tested.sum()):
+        raise GeneticsUsageError(
+            f"n_tests is how many tests were run, a whole number no smaller than the "
+            f"{int(tested.sum()):,} p-values in the frame; got {n_tests!r}"
+        )
+    n_tests = int(n_tests)
+    keep = tested & ~np.isnan(x_all)
+    if not keep.any():
+        raise GeneticsUsageError(
+            f"no row has both an estimate in {estimate!r} and a p-value in {pvalue!r} — "
+            f"nothing to plot"
+        )
+    kept = np.nonzero(keep)[0]
+    x, y = x_all[kept], y_all[kept]
+    count = len(kept)
+
+    line_y, n_pass = None, 0
+    if correction == "fixed":
+        line_y = -math.log10(significance)
+    elif correction == "bonferroni":
+        line_y = math.log10(n_tests) - math.log10(alpha)
+    elif correction == "fdr":
+        # step-up over every p-value in the frame, estimate or not: a test that has no
+        # effect size to plot was still a test
+        ranked = np.sort(y_all[tested])[::-1]
+        critical = math.log10(n_tests) - math.log10(alpha) - np.log10(np.arange(1, len(ranked) + 1))
+        passing = np.nonzero(ranked >= critical)[0]
+        n_pass = int(passing[-1]) + 1 if len(passing) else 0
+        # the largest p the procedure rejects at; with nothing rejected, the one the
+        # strongest test would have had to reach
+        line_y = math.log10(n_tests) - math.log10(alpha) - math.log10(max(n_pass, 1))
+
+    if min_effect is None:
+        band = 0.0
+    else:
+        band = math.log(min_effect) if ratio else float(min_effect)
+    significant = y >= line_y if line_y is not None else np.zeros(count, dtype=bool)
+    up = significant & (x > 0) & (np.abs(x) >= band)
+    down = significant & (x < 0) & (np.abs(x) >= band)
+    small = significant & ~up & ~down
+    # without a threshold nothing is a hit, and every point is a candidate for a name
+    called = (up | down) if correction else np.ones(count, dtype=bool)
+
+    texts = None
+    if label is not None:
+        values = data[label].to_list()
+        texts = ["" if values[i] is None else _plain(values[i], _VOLCANO_LABEL_CHARS) for i in kept]
+    # strongest first; between equal p-values, the larger effect
+    order = np.lexsort((-np.abs(x), -y))
+    named: list[int] = []
+    if explicit is not None:
+        strongest_of: dict[str, int] = {}
+        for i in order:
+            strongest_of.setdefault(texts[i], int(i))
+        wanted = list(dict.fromkeys(_plain(v, _VOLCANO_LABEL_CHARS) for v in explicit))
+        absent = [w for w in wanted if w not in strongest_of]
+        if absent:
+            raise GeneticsUsageError(
+                f"labels {absent} are not in column {label!r} among the {count:,} rows drawn"
+            )
+        named = [strongest_of[w] for w in wanted]
+    elif texts is not None and labels:
+        budget = max(int(labels), 0)
+        rank = {int(i): r for r, i in enumerate(order)}
+        per_side, repeats = [], []
+        for negative in (False, True):
+            seen: set[str] = set()
+            firsts = []
+            for i in (int(i) for i in order):
+                if not called[i] or not texts[i] or (x[i] < 0) != negative:
+                    continue
+                if texts[i] in seen:
+                    repeats.append(i)
+                else:
+                    seen.add(texts[i])
+                    firsts.append(i)
+            per_side.append(firsts)
+        # half the names to each side while it has hits to name, what a side leaves unused
+        # to the strongest of the rest, and a name's weaker points — a gene's second mask —
+        # only once every name has been given
+        high, low = per_side
+        named = high[: budget // 2] + low[: budget // 2]
+        spare = sorted(high[budget // 2:] + low[budget // 2:], key=rank.__getitem__)
+        named += spare[: budget - len(named)]
+        named += sorted(repeats, key=rank.__getitem__)[: budget - len(named)]
+        named.sort(key=lambda i: (x[i] < 0, rank[i]))
+
+    # 95% intervals of the named points, on the analysis scale
+    half_widths: dict[int, float] = {}
+    if se is not None and named:
+        errors = _floats(data, se)
+        z = statistics.NormalDist().inv_cdf(0.975)
+        for i in named:
+            error = errors[kept[i]]
+            if error is not None and error > 0 and math.isfinite(x[i]) and math.isfinite(y[i]):
+                half_widths[i] = z * error
+
+    def shown(a: float) -> float:
+        """Analysis scale to axis units."""
+        return math.exp(max(min(a, _FOREST_MAX_LOG), -_FOREST_MAX_LOG)) if ratio else float(a)
+
+    if xlim is not None:
+        try:
+            x_lo, x_hi = float(xlim[0]), float(xlim[1])
+        except (TypeError, ValueError, IndexError):
+            raise GeneticsUsageError(f"xlim is a (low, high) pair in the units of the axis; got {xlim!r}")
+        if not x_lo < x_hi or (ratio and x_lo <= 0):
+            raise GeneticsUsageError(
+                f"xlim must be increasing{' and positive on a ratio axis' if ratio else ''}; got {xlim!r}"
+            )
+        lim_lo, lim_hi = (math.log(x_lo), math.log(x_hi)) if ratio else (x_lo, x_hi)
+    else:
+        reach = max(_volcano_reach(x, significant), band * 1.15)
+        # a named point's interval is inside the axis too, unless it is so wide that
+        # holding it would cost the rest of the figure half its width again
+        ends = max((abs(x[i]) + half for i, half in half_widths.items()), default=0.0)
+        reach = 1.08 * max(reach, min(ends, 1.5 * reach))
+        if ratio:
+            reach = min(reach, _FOREST_MAX_LOG)
+        lim_lo, lim_hi = -reach, reach
+        x_lo, x_hi = shown(lim_lo), shown(lim_hi)
+    off_left, off_right = x < lim_lo, x > lim_hi
+    plot_x = np.clip(x, lim_lo, lim_hi)
+    if ratio:
+        plot_x = np.exp(plot_x)
+
+    finite = np.isfinite(y)
+    top = max(float(y[finite].max()) if finite.any() else 0.0, line_y or 0.0)
+    linthresh = max(_VOLCANO_LOG_FROM, 10.0 * math.ceil(2 * (line_y or 0.0) / 10))
+    log_y = top > _VOLCANO_LOG_TRIGGER * linthresh
+    # headroom for a name over the strongest point; on the broken axis the same share of
+    # the height takes a power, since the part above the break is logarithmic
+    y_top = linthresh * (top / linthresh) ** 1.12 if log_y else top + max(0.08 * top, 0.5)
+    off_top = ~finite
+    plot_y = np.where(finite, y, y_top)
+
+    areas = np.where(
+        called | small, _VOLCANO_AREA, _VOLCANO_AREA_BELOW[count > _VOLCANO_CLOUD]
+    )
+    size_range = None
+    if size:
+        # the hits only: a size on every point of the cloud is a slab nobody can read
+        sized = called | small
+        weights = np.array(
+            [np.nan if v is None or v <= 0 else v for v in _floats(data, size)], dtype=float
+        )[kept]
+        known = weights[sized & ~np.isnan(weights)]
+        # one value throughout — the sample size of a single study — encodes nothing
+        if len(known) and known.max() > known.min():
+            lo_area, hi_area = _VOLCANO_AREA_RANGE
+            scaled = lo_area + (hi_area - lo_area) * np.nan_to_num(weights) / known.max()
+            areas = np.where(sized, scaled, areas)
+            size_range = (float(known.min()), float(known.max()))
+
+    categories: list[str] = []
+    styles: dict[str, tuple[str, str]] = {}
+    category_of: list[str] = []
+    if colour:
+        values = data[colour].to_list()
+        category_of = [
+            _FOREST_UNGROUPED if values[i] is None else _plain(values[i], _FOREST_CELL_CHARS)
+            for i in kept
+        ]
+        tally = collections.Counter(category_of[i] for i in np.nonzero(called)[0])
+        categories = [name for name, _count in tally.most_common()]
+        if len(categories) > len(_FOREST_SERIES):
+            categories = [
+                c for c in categories if c != _FOREST_UNGROUPED
+            ][: len(_FOREST_SERIES) - 1] + [_FOREST_UNGROUPED]
+        category_of = [c if c in categories else _FOREST_UNGROUPED for c in category_of]
+        styles = dict(zip(categories, _FOREST_SERIES))
+
+    own_figure = ax is None
+    if own_figure:
+        figure, ax = plt.subplots(figsize=(5.0, 3.9), constrained_layout=True)
+    else:
+        figure = ax.get_figure()
+    if ratio:
+        ax.set_xscale("log")
+    ax.set_xlim(x_lo, x_hi)
+    if log_y:
+        share = _VOLCANO_LINEAR_SHARE
+        ax.set_yscale(
+            "symlog", linthresh=linthresh,
+            linscale=math.log10(y_top / linthresh) * share / (1 - share),
+        )
+    ax.set_ylim(0, y_top)
+
+    def draw(mask: np.ndarray, colour_: str, marker: str = "o", **style: Any) -> None:
+        """One class of points: in place, or as an arrowhead on the edge they lie beyond."""
+        edge = off_top | off_left | off_right
+        for chosen, shape, clip in (
+            (mask & ~edge, marker, True),
+            (mask & off_top, "^", False),
+            (mask & ~off_top & off_left, "<", False),
+            (mask & ~off_top & off_right, ">", False),
+        ):
+            if chosen.any():
+                ax.scatter(plot_x[chosen], plot_y[chosen], s=areas[chosen], color=colour_,
+                           marker=shape, clip_on=clip, **style)
+
+    if lim_lo < 0 < lim_hi:
+        ax.axvline(shown(0.0), color=_VOLCANO_NULL_RULE, linewidth=_AXIS_LINEWIDTH, zorder=1)
+    # the cloud is rasterised: tens of thousands of markers as vector paths make a PDF
+    # that takes longer to open than the figure does to read
+    draw(~called & ~small, _VOLCANO_BELOW, linewidths=0, alpha=0.75, rasterized=True, zorder=2)
+    draw(small, _VOLCANO_SMALL, linewidths=0, alpha=0.85, zorder=2.2)
+    hit = {"linewidths": 0.2, "edgecolors": "#33333355", "zorder": 3}
+    colour_of = np.full(count, _VOLCANO_SMALL, dtype=object)
+    if colour:
+        tags = np.array(category_of, dtype=object)
+        for name in categories:
+            draw(called & (tags == name), styles[name][0], styles[name][1], **hit)
+            colour_of[called & (tags == name)] = styles[name][0]
+    elif correction:
+        draw(up, _VOLCANO_UP, **hit)
+        draw(down, _VOLCANO_DOWN, **hit)
+        colour_of[up], colour_of[down] = _VOLCANO_UP, _VOLCANO_DOWN
+    else:
+        draw(called, _VOLCANO_SMALL, linewidths=0, alpha=0.85, zorder=3)
+    if explicit is not None:
+        # a ring, so a named point that is not a hit can be found in the cloud
+        ax.scatter(plot_x[named], plot_y[named], s=areas[named] + 14, facecolors="none",
+                   edgecolors="black", linewidths=0.6, clip_on=False, zorder=3.2)
+
+    backing = {"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6}
+    if line_y is not None:
+        ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
+        ax.text(0.006, line_y,
+                _volcano_threshold_text(correction, significance, alpha, n_tests, n_pass, line_y),
+                transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=5,
+                color=_SIGNIFICANCE_GREY, bbox=backing, zorder=4)
+    if band:
+        for edge in (-band, band):
+            if lim_lo < edge < lim_hi:
+                ax.axvline(shown(edge), color=_SIGNIFICANCE_GREY, linewidth=0.6,
+                           linestyle=":", zorder=1)
+    if log_y:
+        ax.axhline(linthresh, color=_VOLCANO_NULL_RULE, linewidth=_AXIS_LINEWIDTH,
+                   linestyle=(0, (1, 2)), zorder=1)
+        ax.text(0.994, linthresh, f"log scale above {linthresh:g}",
+                transform=ax.get_yaxis_transform(), ha="right", va="bottom", fontsize=5,
+                color=_SIGNIFICANCE_GREY, bbox=backing, zorder=4)
+    n_up, n_down = int(up.sum()), int(down.sum())
+    if correction:
+        # over the frame, not in its corners: the top corners of a volcano are where the
+        # strongest hits are
+        sides = direction or (("below 1", "above 1") if ratio else ("negative", "positive"))
+        for number, side, at, ha, ink in (
+            (n_down, sides[0], 0, "left", _VOLCANO_DOWN),
+            (n_up, sides[1], 1, "right", _VOLCANO_UP),
+        ):
+            ax.annotate(f"{number:,} {_plain(side, _VOLCANO_LABEL_CHARS)}", (at, 1),
+                        xycoords="axes fraction", xytext=(0, 3), textcoords="offset points",
+                        ha=ha, va="bottom", fontsize=_LABEL_SIZE,
+                        color=_FOREST_INK if colour else ink)
+
+    _dress(ax, title or "")
+    if ratio:
+        ticks = _forest_ratio_ticks(x_lo, x_hi)
+        ax.xaxis.set_major_locator(FixedLocator(ticks))
+        ax.xaxis.set_major_formatter(FixedFormatter([_forest_tick_label(t) for t in ticks]))
+        ax.xaxis.set_minor_locator(NullLocator())
+    else:
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=7, steps=[1, 2, 2.5, 5, 10]))
+    if log_y:
+        ticks = _volcano_y_ticks(linthresh, y_top)
+        ax.yaxis.set_major_locator(FixedLocator(ticks))
+        ax.yaxis.set_major_formatter(FixedFormatter([f"{t:g}" for t in ticks]))
+        ax.yaxis.set_minor_locator(NullLocator())
+    if effect is None:
+        effect = "OR" if ratio else "β"
+    if xlabel is None:
+        xlabel = _FOREST_EFFECT_NAMES.get(effect, "Effect size (β)" if effect == "β" else effect)
+    ax.set_xlabel(xlabel, fontsize=_LABEL_SIZE)
+
+    handles = [
+        Line2D([0], [0], color=styles[name][0], marker=styles[name][1], linestyle="none",
+               markersize=_FOREST_MARKER_PT, label=name)
+        for name in categories
+    ]
+    if size_range is not None:
+        lo_area, hi_area = _VOLCANO_AREA_RANGE
+        handles += [
+            Line2D([0], [0], color=_VOLCANO_SMALL, marker="o", linestyle="none",
+                   markersize=math.sqrt(lo_area + (hi_area - lo_area) * value / size_range[1]),
+                   label=f"{_plain(size, _FOREST_CELL_CHARS)} {_forest_cell(value)}")
+            for value in size_range
+        ]
+    if handles:
+        # under the axis label, where no point can be: every corner of a volcano may hold some
+        under = ScaledTranslation(0, -26 / 72, figure.dpi_scale_trans)
+        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0),
+                  bbox_transform=ax.transAxes + under, ncol=min(len(handles), 4),
+                  frameon=False, fontsize=5, handlelength=1.2, columnspacing=1.2,
+                  borderaxespad=0.2)
+
+    whiskers: list[np.ndarray] = []
+    for i, half in half_widths.items():
+        lo, hi = max(x[i] - half, lim_lo), min(x[i] + half, lim_hi)
+        if lo < hi:
+            ax.plot([shown(lo), shown(hi)], [plot_y[i]] * 2, color=colour_of[i],
+                    linewidth=0.6, solid_capstyle="butt", zorder=2.8)
+            # sampled along its length, so a name is kept off it the way it is kept off
+            # the points
+            along = np.linspace(lo, hi, 12)
+            whiskers.append(np.column_stack(
+                [np.exp(along) if ratio else along, np.full(12, plot_y[i])]
+            ))
+
+    # last, because where a name fits depends on everything else already being in place
+    if title:
+        _fit_title(ax, figure, own_figure)
+        if correction:
+            # a line above the counts, which the title would otherwise run into
+            ax.set_title(ax.get_title(), fontsize=_TITLE_SIZE, pad=13)
+    renderer = _renderer(figure)
+    taken = [] if renderer is None else [
+        artist.get_window_extent(renderer)
+        for artist in [*ax.texts, ax.get_legend()] if artist is not None
+    ]
+    _place_labels(
+        ax, renderer, [(texts[i], plot_x[i], plot_y[i], 5) for i in named],
+        ax.transData.transform(np.vstack([np.column_stack([plot_x, plot_y]), *whiskers])),
+        taken, fontstyle="italic" if italic else "normal",
+    )
+
+    written = None
+    if own_figure:
+        written = _resolve_path(path, "volcano.png")
+        figure.savefig(written)
+        plt.close(figure)
+
+    return {
+        "path": written,
+        "n_points": count,
+        "n_missing": n - count,
+        "n_tests": n_tests,
+        "correction": correction,
+        "threshold_p": None if line_y is None else 10 ** -line_y,
+        "threshold_mlog10p": line_y,
+        "n_significant": int(significant.sum()),
+        "n_up": n_up,
+        "n_down": n_down,
+        "n_small": int(small.sum()),
+        "n_clipped": int((off_left | off_right).sum()),
+        "n_offscale": int(off_top.sum()),
+        "scale": scale,
+        "xlim": (x_lo, x_hi),
+        "y_log_above": linthresh if log_y else None,
+        "labelled": [texts[i] for i in named],
+        "colours": categories,
+        "top": [
+            {
+                "label": texts[i] if texts is not None else None,
+                "estimate": shown(x[i]),
+                "mlog10p": float(y[i]),
+                "direction": "up" if x[i] > 0 else "down",
+            }
+            for i in [int(i) for i in order if up[i] or down[i]][:10]
+        ],
     }
