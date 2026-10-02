@@ -1215,7 +1215,7 @@ def test_ld_is_never_asked_for_over_more_than_the_server_accepts(monkeypatch, tm
     result = plots.locuszoom(
         phenotype="X", region="16:5000000-8000000", data=wide_frame(), genes=False,
     )
-    assert seen["window"] == plots._LD_MAX_WINDOW
+    assert seen["window"] == plots.LD_MAX_WINDOW
     # the lead is at the left edge, so 2.5 Mb either side of it stops short of the right one
     assert result["ld_status"] == "partial"
     assert result["ld_joined"] is True

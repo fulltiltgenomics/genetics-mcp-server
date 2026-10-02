@@ -79,6 +79,29 @@ async def test_the_pair_lookup_uses_the_same_path():
     assert urlsplit(capture["url"]).path.startswith("/api/v1/ld/")
 
 
+async def test_a_pair_is_never_asked_about_over_a_window_the_ld_server_refuses():
+    """The cap was 5 Mb against a server whose window stops at 5 Mb in total, so every pair
+    more than 2 Mb apart was sent and refused."""
+    from genetics_mcp_server.tools.executor import LD_MAX_PAIR_DISTANCE, LD_MAX_WINDOW
+
+    capture = {}
+    async with executor_with(capture=capture) as executor:
+        await executor.get_ld_between_variants(
+            "6:10000000:A:G", f"6:{10_000_000 + LD_MAX_PAIR_DISTANCE}:C:G"
+        )
+        furthest = capture["kwargs"]["params"]["window"]
+        capture.clear()
+        refused = await executor.get_ld_between_variants(
+            "6:10000000:A:G", f"6:{10_000_000 + LD_MAX_PAIR_DISTANCE + 1}:C:G"
+        )
+
+    assert furthest == LD_MAX_WINDOW
+    assert refused["success"] is False
+    assert "too far apart" in refused["error"]
+    assert f"{LD_MAX_PAIR_DISTANCE / 1e6:g} Mb" in refused["error"]
+    assert capture == {}, "a pair past the limit still reached results-api"
+
+
 async def test_the_proxys_parameter_names_are_sent_not_the_upstreams():
     """results-api takes r2_threshold and translates; sending the upstream's `r2_thresh`
     here would be silently dropped as an unknown query parameter — and results-api rejects

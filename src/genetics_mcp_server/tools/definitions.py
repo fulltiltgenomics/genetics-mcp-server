@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from genetics_mcp_server import schema_docs
+from genetics_mcp_server.tools.executor import LD_MAX_PAIR_DISTANCE
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -1563,7 +1564,8 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
         "name": "get_ld_between_variants",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get linkage disequilibrium (LD) statistics between two specific variants. Returns r2 and D' values from the FinnGen reference panel. Both variants must be on the same chromosome and within 5 Mb of each other.",
+        "description": "Get linkage disequilibrium (LD) statistics between two specific variants. Returns r2 and D' values from the FinnGen reference panel. Both variants must be on the same chromosome and within "
+        f"{LD_MAX_PAIR_DISTANCE / 1e6:g} Mb of each other.",
         "parameters": {
             "variant1": {
                 "type": "string",

@@ -8,8 +8,8 @@
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
-continuous, that the lead variant is a diamond, that genes belong under the association panel
-and not beside it. Written out per request, each of those is a coin flip. Written here once,
+continuous, that the lead is marked out by size and colour rather than by a shape of its own,
+that genes belong under the association panel and not beside it. Written out per request, each of those is a coin flip. Written here once,
 they are the same in every conversation and a defect is fixed in one place.
 
 WHY NOT A TOOL. A tool is a round trip with a fixed argument list; this is a Python function,
@@ -46,6 +46,7 @@ import numpy as np
 import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
+from genetics_mcp_server.tools.executor import LD_MAX_WINDOW
 
 __all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest"]
 
@@ -126,10 +127,6 @@ _LD_MIN_R2 = 0.05
 # ±250 kb plot drops the one point showing the signal is not a singleton.
 _LD_SEARCH_SPAN_MULTIPLE = 2
 
-# The LD server's own ceiling on `window`: above it the answer is HTTP 400 "window must be
-# between 100000 and 5000000" and the whole figure goes grey. results-api holds the same
-# number in app/config/ld.py; an upstream that changes its bounds falsifies both.
-_LD_MAX_WINDOW = 5_000_000
 _LD_MIN_WINDOW = 200_000
 
 # Below the significance line, the strongest variant in a window is usually a rare one with
@@ -1030,7 +1027,8 @@ def locuszoom(
     # a lead anywhere inside it, and to see just past both edges — up to the server's ceiling
     ld_window = min(
         max(_LD_SEARCH_SPAN_MULTIPLE * max(span_hi - span_lo, 1), _LD_MIN_WINDOW),
-        _LD_MAX_WINDOW,
+        # past the server's ceiling the answer is a 400 and the whole figure goes grey
+        LD_MAX_WINDOW,
     )
     if ld:
         try:

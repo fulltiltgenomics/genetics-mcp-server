@@ -371,6 +371,22 @@ class _SandboxTokenAuth(httpx.Auth):
 _KEEP_DEFAULT_ROW_LIMIT = object()
 
 
+# The FinnGen LD server's ceiling on `window`: above it the answer is HTTP 400 "window must be
+# between 100000 and 5000000". results-api holds the same number in app/config/ld.py; an
+# upstream that changes its bounds falsifies both.
+LD_MAX_WINDOW = 5_000_000
+
+# Asked for beyond twice a pair's distance. The server's window is the total span centred on
+# the query variant, but its right-hand reach falls short of half of it: measured at
+# 12:49272869:C:T, a partner 291,680 bp to the right is missed at twice the distance plus
+# 8 kb and found at plus 12 kb. How that shortfall grows with the window is not known, so the
+# margin is far larger than the one measurement needs.
+_LD_PAIR_MARGIN = 1_000_000
+
+# the furthest apart two variants can be and still be asked about with the whole margin
+LD_MAX_PAIR_DISTANCE = (LD_MAX_WINDOW - _LD_PAIR_MARGIN) // 2
+
+
 def _ld_error(resp: Any) -> str:
     """One message for both LD call sites, distinguishing the proxy from the upstream.
 
@@ -2648,15 +2664,17 @@ class ToolExecutor:
 
             distance = abs(pos2 - pos1)
 
-            # max 5 Mb distance
-            if distance > 5_000_000:
+            if distance > LD_MAX_PAIR_DISTANCE:
                 return {
                     "success": False,
-                    "error": f"Variants are too far apart ({distance:,} bp). Maximum allowed distance is 5 Mb.",
+                    "error": (
+                        f"Variants are too far apart ({distance:,} bp). Maximum allowed "
+                        f"distance is {LD_MAX_PAIR_DISTANCE / 1e6:g} Mb, the furthest the LD "
+                        "server's window reaches."
+                    ),
                 }
 
-            # window = 2 * distance + 1000000 (API bug workaround)
-            window = 2 * distance + 1_000_000
+            window = 2 * distance + _LD_PAIR_MARGIN
 
             resp = await self._ld_request(
                 variant1, window=window, r2_threshold=r2_threshold, panel=panel
