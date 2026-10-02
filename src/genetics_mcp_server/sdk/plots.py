@@ -2905,6 +2905,13 @@ _VOLCANO_AREA_RANGE = (9.0, 60.0)
 _VOLCANO_CLIP = 2.0
 _VOLCANO_BODY = 8.0
 
+# On a ratio axis an estimate further than this factor from 1 sets nothing, significant or
+# not. Significance does not vouch for it: measured on the IIBDGC Crohn's disease lead
+# variants, 263 of 918 rows were variants under 1% frequency with log odds ratios of 12 to
+# 514, every one past 5e-8, and the axis they set ran from 1e-241 to 1e241. The forest
+# prints a ratio past the same bound as `>1,000` rather than as digits.
+_VOLCANO_MAX_RATIO = 1000.0
+
 # -log10 p is linear up to a break and logarithmic above it once the strongest association
 # is more than `_VOLCANO_LOG_TRIGGER` times past the break, with the linear part keeping
 # `_VOLCANO_LINEAR_SHARE` of the height. One association at 300 otherwise puts every other
@@ -3054,7 +3061,10 @@ def volcano(
     infinite -log10 p, is an arrowhead at the top edge rather than a value invented for it.
     Estimates far beyond every informative one — what a model that did not converge
     returns — do not set the x axis: they sit at its edge as arrowheads, as does anything
-    outside an explicit `xlim=` (in axis units), counted in `n_clipped`. When one
+    outside an explicit `xlim=` (in axis units), counted in `n_clipped`. On a ratio axis
+    that includes any estimate more than 1000-fold from 1, significant or not; on a linear
+    one a significant estimate always sets the axis, so say `scale="log_ratio"` for log
+    odds ratios or pass `xlim=` when `n_clipped` is 0 and `xlim` is absurd. When one
     association dwarfs the rest, -log10 p turns logarithmic above a marked break so the
     threshold and everything near it stay readable; `y_log_above` says where.
 
@@ -3291,10 +3301,15 @@ def volcano(
             )
         lim_lo, lim_hi = (math.log(x_lo), math.log(x_hi)) if ratio else (x_lo, x_hi)
     else:
-        reach = max(_volcano_reach(x, significant), band * 1.15)
+        believable = (
+            np.abs(x) <= math.log(_VOLCANO_MAX_RATIO) if ratio else np.ones(count, dtype=bool)
+        )
+        reach = max(_volcano_reach(x[believable], significant[believable]), band * 1.15)
         # a named point's interval is inside the axis too, unless it is so wide that
         # holding it would cost the rest of the figure half its width again
-        ends = max((abs(x[i]) + half for i, half in half_widths.items()), default=0.0)
+        ends = max(
+            (abs(x[i]) + half for i, half in half_widths.items() if believable[i]), default=0.0
+        )
         reach = 1.08 * max(reach, min(ends, 1.5 * reach))
         if ratio:
             reach = min(reach, _FOREST_MAX_LOG)

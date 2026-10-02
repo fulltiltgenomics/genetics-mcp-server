@@ -2524,6 +2524,37 @@ def test_a_significant_estimate_sets_the_axis_however_far_out_it_is(monkeypatch,
     assert result["n_clipped"] == 0 and result["xlim"][1] > 30
 
 
+def test_a_ratio_past_a_thousandfold_never_sets_the_axis_even_when_significant(
+    monkeypatch, tmp_path
+):
+    # what the IIBDGC lead variants hold: real log odds ratios beside rare-variant rows
+    # whose estimates are in the hundreds and whose p-values are as small as any
+    frame = pl.DataFrame({
+        "gene": ["NOD2", "IL23R", "ATG16L1", "ZNF586", "PCDH9", "X1"],
+        "beta": [1.108, -0.7647, 0.2, -461.8, 341.2, 11.6],
+        "se": [0.02, 0.02, 0.01, 20.29, 27.99, 1.5],
+        "mlog10p": [418.0, 265.8, 60.0, 113.9, 33.4, 14.0],
+    })
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, frame, label="gene", scale="log_ratio", significance=5e-8
+    )
+    lo, hi = result["xlim"]
+    assert 0.1 < lo < 1 < hi < 10 and lo * hi == pytest.approx(1.0)
+    # they are still hits, still counted and still on the figure, at its edge
+    assert result["n_clipped"] == 3 and result["n_significant"] == 6
+    assert (result["n_up"], result["n_down"]) == (4, 2)
+    assert ax.get_xlim() == pytest.approx((lo, hi))
+    # at the bound itself an estimate is still one
+    edge = frame.with_columns(
+        pl.Series("beta", [1.108, -0.7647, 0.2, math.log(900), 0.3, 0.1])
+    )
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, edge, scale="log_ratio", significance=5e-8)
+    assert result["n_clipped"] == 0 and result["xlim"][1] > 900
+    # a linear axis has no unit to judge by, so there significance still sets it
+    result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, significance=5e-8)
+    assert result["n_clipped"] == 0 and result["xlim"][1] > 461
+
+
 def test_an_explicit_xlim_cuts_what_lies_outside_it_on_the_volcano(monkeypatch, tmp_path):
     result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), xlim=(-1, 1))
     assert result["xlim"] == (-1.0, 1.0) and ax.get_xlim() == (-1.0, 1.0)
