@@ -39,6 +39,8 @@ async def test_get_asm_qtl_by_gene_surfaces_rows():
         assert result["_download_data"]["rows"] == fake_rows
         # `columns` at the top level is SDK-only, so the model's payload is not padded
         assert "columns" not in result
+        assert result["total_count"] == 1
+        assert result["truncated"] is False
         with_meta = await executor.get_asm_qtl_by_gene("APOE", with_metadata=True)
         assert with_meta["columns"] == fake_columns
         assert with_meta["truncated"] is False
@@ -265,6 +267,99 @@ async def test_sql_builders_render_resources_as_a_quoted_in_list():
 
         sql = executor.query_database.await_args.args[0]
         assert "a.resource IN ('mpra_a', 'mpra_b')" in sql
+
+
+# what `query_database` returns for a statement that matched more than `max_rows`: the
+# rows are the capped page, `total_rows` is db-api's count for the LIMIT-stripped statement
+_CAPPED_QUERY_RESULT = {
+    "success": True,
+    "columns": ["chr", "pos", "mlog10p"],
+    "rows": [["19", 44908822, 12.3], ["19", 44909000, 8.1]],
+    "total_rows": 538,
+    "truncated": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [(name, ("APOE",)) for name in sorted(_BY_GENE_FILENAMES)]
+    + [
+        ("get_hla_by_allele", ("DRB1*15:01",)),
+        ("get_dosage_sensitivity", (["APOE"],)),
+        ("get_rcnv_associations", ("APOE",)),
+    ],
+)
+async def test_a_capped_result_says_so_without_being_asked(method, args):
+    """A capped page with no flag is indistinguishable from a complete answer, and the
+    MCP surface cannot pass `with_metadata` — so the total and the flag are unconditional."""
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    executor.query_database = AsyncMock(return_value=dict(_CAPPED_QUERY_RESULT))
+    try:
+        result = await getattr(executor, method)(*args)
+
+        assert result["success"] is True
+        assert len(result["results"]) == 2
+        assert result["total_count"] == 538
+        assert result["truncated"] is True
+        # the schema stays SDK-only: every row already carries its names
+        assert "columns" not in result
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize("method", sorted(_BY_GENE_FILENAMES))
+async def test_a_complete_result_reports_its_own_size(method):
+    executor = ToolExecutor(bigquery_api_url="http://unused.test")
+    executor.query_database = AsyncMock(
+        return_value={**_CAPPED_QUERY_RESULT, "total_rows": 2, "truncated": False}
+    )
+    try:
+        result = await getattr(executor, method)("APOE")
+
+        assert result["total_count"] == len(result["results"]) == 2
+        assert result["truncated"] is False
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize("method", sorted(_BY_GENE_FILENAMES))
+def test_by_gene_tools_take_limit_on_both_surfaces(method):
+    """Reporting a truncation is only half of it: the caller needs the argument that
+    lifts the cap, on the chat schema and on the MCP signature alike."""
+    import asyncio
+
+    from mcp.server.fastmcp import FastMCP
+
+    from genetics_mcp_server.tools.definitions import get_anthropic_tools, register_mcp_tools
+
+    class _Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            async def _call(*args, **kwargs):
+                self.calls.append((name, args, kwargs))
+                return {}
+
+            return _call
+
+    chat = {t["name"]: t["input_schema"] for t in get_anthropic_tools()}
+    assert chat[method]["properties"]["limit"]["default"] == 500
+
+    recorder = _Recorder()
+    mcp = FastMCP("limit-test")
+    register_mcp_tools(mcp, recorder)
+    schema = {t.name: t.inputSchema for t in asyncio.run(mcp.list_tools())}[method]
+    assert schema["properties"]["limit"]["default"] == 500
+
+    asyncio.run(mcp.call_tool(method, {"gene": "APOE", "limit": 1234}))
+    (name, args, kwargs), = recorder.calls
+    assert name == method
+    # the executor's `limit` is positional on every one of these, in a different slot each
+    import inspect
+
+    bound = inspect.signature(getattr(ToolExecutor, method)).bind(None, *args, **kwargs)
+    assert bound.arguments["limit"] == 1234
 
 
 async def test_limit_is_honoured_by_the_statement_and_the_row_cap():

@@ -91,7 +91,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | Tool | Description |
 |------|-------------|
 | `get_asm_qtl_by_variant` | Allele-specific methylation QTL (ASM-QTL) for a variant: associations with CpG/MDS methylation rates, effect sizes, methylation rate on reference vs alternative haplotype, primary/secondary variant rank. `resources`: `decode_cpg`, `decode_mds` |
-| `get_asm_qtl_by_gene` | ASM-QTL for variants near a gene (gene body ± `window`) |
+| `get_asm_qtl_by_gene` | ASM-QTL for variants near a gene (gene body ± `window`), at most `limit` rows |
 | `get_peak_to_genes`, `get_gene_to_peaks` | Open4Gene peak-to-gene **links** with the cell type each link was significant in — which gene a regulatory region acts on, and its inverse. This is what turns a caQTL peak id into candidate target genes; distinct from the open-chromatin atlas tools below, which measure accessibility and carry no link evidence |
 | `get_open_chromatin_by_peak` | One atlas peak by its `chr-start-end` id, with every cell_type/tissue/condition row recorded for it |
 | `get_open_chromatin_by_variant`, `get_open_chromatin_by_region`, `get_open_chromatin_by_gene` | Measured open-chromatin **atlas** peaks (scATAC/snATAC/bulk-ATAC/chromHMM) overlapping a variant position, a region, or a gene's window, labelled by `cell_type`, `tissue`, `life_stage` and `condition` so cell-type specificity can be reported. `resources`: `marderstein`, `li_brain_atac`, `catlas`, `epimap`, `calderon_immune`, `rosmap_brain` |
@@ -115,7 +115,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
 | `get_dosage_sensitivity` | pHaplo / pTriplo dosage-sensitivity scores for a list of genes (Collins et al. 2022, 18,641 autosomal protein-coding genes from rare CNVs in 950,278 individuals). Executor-side SQL over BigQuery `dosage_sensitivity_v`. Symbols are matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published and the Ensembl ID in one pass, so a gene renamed since 2013 still resolves. `haploinsufficient`/`triplosensitive` are the paper's own cutoffs (0.86 / 0.94) returned as columns |
 | `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL in every statistic column, `beta` through `mlog10_fdr_q_secondary`) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
-| `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants |
+| `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants. `version` is the source's release, relayed from results-api's `X-Dataset-Version` header |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
 ### LD tools (FinnGen LD Server)
@@ -1461,11 +1461,20 @@ dead download link. It now shapes its payload the same way — named dicts in `r
 `_positional_rows`. It keeps its own payload builder rather than calling `_bq_gene_payload`
 because it is keyed on `allele`/`resource`/`min_mlogp`/`min_info`/`count`, not on `gene`.
 
-They also take `with_metadata=False`. When set, the returned dict carries the underlying query's
-`columns` and `truncated`. Both are still needed after the shape change: an **empty** result has
+Every one of them returns `total_count` and `truncated` unconditionally (`_query_metadata`): a
+capped page that does not say so is indistinguishable from a complete answer, and an MCP client
+has no way to ask for the flag. `total_count` is db-api's row count for the statement with its
+trailing `LIMIT` stripped, so it is every matching row, not the page. The five by-gene tools
+take `limit` on both tool surfaces, which is the argument that lifts the cap; an open-chromatin
+locus beyond db-api's own row cap is reached by tiling `get_open_chromatin_by_region`, which
+streams from results-api and is not capped.
+
+They also take `with_metadata=False`. When set, the returned dict additionally carries the
+underlying query's `columns`, `capped_by_server` and `server_row_cap`. An **empty** result has
 no row to carry names, and `_frame()` builds `pl.DataFrame({c: [] for c in columns})` so a script
-filtering a no-hit gene gets an empty frame instead of `ColumnNotFound`; `truncated` is what
-`_check_truncation` raises on. It stays opt-in so the model's payload is not padded with either.
+filtering a no-hit gene gets an empty frame instead of `ColumnNotFound`; the two cap fields are
+what `_check_truncation` reads to word its error. These stay opt-in so the model's payload is
+not padded with them.
 
 ### Empty results keep their schema
 

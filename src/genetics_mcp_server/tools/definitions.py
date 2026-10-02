@@ -399,7 +399,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_asm_qtl_by_gene",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get allele-specific methylation QTL (ASM-QTL) data for variants near a gene. Returns associations between sequence variants and CpG/MDS methylation rates for variants within the gene body ± window, selected by genomic coordinates (not by most-severe-consequence attribution, which misses nearby regulatory variants).",
+        "description": "Get allele-specific methylation QTL (ASM-QTL) data for variants near a gene. Returns associations between sequence variants and CpG/MDS methylation rates for variants within the gene body ± window, selected by genomic coordinates (not by most-severe-consequence attribution, which misses nearby regulatory variants). Rows are capped at `limit` (default 500): `total_count` is every matching row and `truncated` says whether the cap cut them.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -417,6 +417,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
                 "minimum": 0,
                 "maximum": 10_000_000,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum rows to return (default 500). When `truncated` is true, raise this or narrow `window` or `resources` to get the rest.",
+                "default": 500,
+                # executor.py sql_int(limit, minimum=1, maximum=ToolExecutor._MAX_SQL_LIMIT)
+                "minimum": 1,
+                "maximum": 100_000,
             },
         },
     },
@@ -527,7 +535,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_open_chromatin_by_gene",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory/enhancer peaks). Answers 'in which cell types/tissues/conditions is the chromatin around this gene open/accessible?'. Returns accessible regions labeled by cell_type, tissue, life_stage and condition. This is a peak ATLAS of measured accessibility — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links).",
+        "description": "Get open-chromatin (scATAC/snATAC/bulk-ATAC/chromHMM) atlas peaks near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory/enhancer peaks). Answers 'in which cell types/tissues/conditions is the chromatin around this gene open/accessible?'. Returns accessible regions labeled by cell_type, tissue, life_stage and condition. This is a peak ATLAS of measured accessibility — distinct from caqtl (accessibility QTL) and chromatin_peaks (peak-to-gene links). Rows are capped at `limit` (default 500): `total_count` is every matching row and `truncated` says whether the cap cut them. A locus too dense for one call can be tiled with get_open_chromatin_by_region, which is not capped.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -545,6 +553,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
                 "minimum": 0,
                 "maximum": 10_000_000,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum rows to return (default 500). When `truncated` is true, raise this or narrow `window` or `resources` to get the rest.",
+                "default": 500,
+                # executor.py sql_int(limit, minimum=1, maximum=ToolExecutor._MAX_SQL_LIMIT)
+                "minimum": 1,
+                "maximum": 100_000,
             },
         },
     },
@@ -569,7 +585,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_variant_effect_by_gene",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get in-silico PREDICTED variant effects on chromatin accessibility for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'how strongly and in which cell types are this gene's variants predicted to affect chromatin accessibility?'. Returns per-model, per-cell-type predicted-effect rows: ChromBPNet (model=chrombpnet) predicted accessibility effect in specific cell_type/tissue contexts; FLARE (model=flare) pan-context regulatory score (cell_type/tissue may be null). These are MODEL PREDICTIONS — distinct from measured caqtl (accessibility QTL) and open_chromatin (measured accessibility atlas).",
+        "description": "Get in-silico PREDICTED variant effects on chromatin accessibility for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'how strongly and in which cell types are this gene's variants predicted to affect chromatin accessibility?'. Returns per-model, per-cell-type predicted-effect rows: ChromBPNet (model=chrombpnet) predicted accessibility effect in specific cell_type/tissue contexts; FLARE (model=flare) pan-context regulatory score (cell_type/tissue may be null). These are MODEL PREDICTIONS — distinct from measured caqtl (accessibility QTL) and open_chromatin (measured accessibility atlas). Rows are capped at `limit` (default 500): `total_count` is every matching row and `truncated` says whether the cap cut them.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -587,6 +603,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 # executor.py sql_int(window, minimum=0, maximum=ToolExecutor._MAX_SQL_WINDOW)
                 "minimum": 0,
                 "maximum": 10_000_000,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum rows to return (default 500). When `truncated` is true, raise this or narrow `window` or `resources` to get the rest.",
+                "default": 500,
+                # executor.py sql_int(limit, minimum=1, maximum=ToolExecutor._MAX_SQL_LIMIT)
+                "minimum": 1,
+                "maximum": 100_000,
             },
         },
     },
@@ -638,7 +662,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_mpra_by_gene",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get MEASURED cis-regulatory allelic MPRA activity (Siraj et al. 2026) for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'which of this gene's variants actually modulate reporter/enhancer activity (emVar), how strongly, and in which cell lines?'. Returns LONG rows (one per variant per cell_line): cell_line is 'meta' (cross-cell-line summary) or one of K562/HEPG2/SKNSH/HCT116/A549; emVar (allelic skew significant — the key call), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2FC (element activity), *_mlog10p significance, mean_RNA_ref/alt. MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL; emVar rate/effect concordance scale with FinnGen fine-mapping PIP, so this corroborates functionally active fine-mapped variants. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect).",
+        "description": "Get MEASURED cis-regulatory allelic MPRA activity (Siraj et al. 2026) for variants near a gene, selected by genomic coordinates (gene body ± window, not most-severe-consequence attribution which misses nearby regulatory variants). Answers 'which of this gene's variants actually modulate reporter/enhancer activity (emVar), how strongly, and in which cell lines?'. Returns LONG rows (one per variant per cell_line): cell_line is 'meta' (cross-cell-line summary) or one of K562/HEPG2/SKNSH/HCT116/A549; emVar (allelic skew significant — the key call), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2FC (element activity), *_mlog10p significance, mean_RNA_ref/alt. MPRA MEASURES intrinsic cis-regulatory allelic activity — distinct from in-silico variant_effect (ChromBPNet/FLARE) PREDICTIONS and from endogenous eQTL/caQTL; emVar rate/effect concordance scale with FinnGen fine-mapping PIP, so this corroborates functionally active fine-mapped variants. Coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants; absence != no effect). Rows are capped at `limit` (default 500): `total_count` is every matching row and `truncated` says whether the cap cut them.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -657,13 +681,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "minimum": 0,
                 "maximum": 10_000_000,
             },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum rows to return (default 500). When `truncated` is true, raise this or narrow `window` or `resources` to get the rest.",
+                "default": 500,
+                # executor.py sql_int(limit, minimum=1, maximum=ToolExecutor._MAX_SQL_LIMIT)
+                "minimum": 1,
+                "maximum": 100_000,
+            },
         },
     },
     {
         "name": "get_mpra_pip_concordance_by_gene",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls for variants near a gene — the core regulatory-buffering check (Kanai et al.): do high-PIP (credibly causal) fine-mapped variants actually show measured cis-regulatory allelic activity (emVar) in MPRA? Joins credible_sets_v (FinnGen fine-mapped, filtered to resource + pip>=min_pip) to the MPRA cross-cell-line meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt variant key. Per matched variant returns: FinnGen PIP, cs_id, trait, data_type, GWAS mlog10p/beta, and the meta MPRA call — emVar (allele modulates reporter expression), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2Skew_mlog10p (skew significance), log2FC (element activity), cohort. Ordered emVar then PIP. This corroborates whether fine-mapped variants are FUNCTIONALLY active in a reporter assay — MPRA measures intrinsic cis-regulatory allelic activity, distinct from in-silico variant_effect predictions and endogenous eQTL/caQTL. Distinct from get_mpra_by_gene, which returns MPRA rows WITHOUT the PIP cross-reference. FinnGen-credible-set-based and meta-row-based by default; MPRA coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants).",
+        "description": "Cross-reference FinnGen fine-mapped credible-set PIP against MEASURED MPRA emVar calls for variants near a gene — the core regulatory-buffering check (Kanai et al.): do high-PIP (credibly causal) fine-mapped variants actually show measured cis-regulatory allelic activity (emVar) in MPRA? Joins credible_sets_v (FinnGen fine-mapped, filtered to resource + pip>=min_pip) to the MPRA cross-cell-line meta row (mpra_v.cell_line='meta') on the shared chr:pos:ref:alt variant key. Per matched variant returns: FinnGen PIP, cs_id, trait, data_type, GWAS mlog10p/beta, and the meta MPRA call — emVar (allele modulates reporter expression), active (element drives reporter above background), log2Skew (signed allelic effect log2(alt/ref)), log2Skew_mlog10p (skew significance), log2FC (element activity), cohort. Ordered emVar then PIP. This corroborates whether fine-mapped variants are FUNCTIONALLY active in a reporter assay — MPRA measures intrinsic cis-regulatory allelic activity, distinct from in-silico variant_effect predictions and endogenous eQTL/caQTL. Distinct from get_mpra_by_gene, which returns MPRA rows WITHOUT the PIP cross-reference. FinnGen-credible-set-based and meta-row-based by default; MPRA coverage is partial (fine-mapped GTEx/UKBB/BBJ + control common variants). Rows are capped at `limit` (default 500): `total_count` is every matching row and `truncated` says whether the cap cut them.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -690,6 +722,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 # executor.py sql_float(min_pip, minimum=0.0, maximum=1.0)
                 "minimum": 0.0,
                 "maximum": 1.0,
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum rows to return (default 500). When `truncated` is true, raise this, narrow `window` or raise `min_pip` to get the rest.",
+                "default": 500,
+                # executor.py sql_int(limit, minimum=1, maximum=ToolExecutor._MAX_SQL_LIMIT)
+                "minimum": 1,
+                "maximum": 100_000,
             },
         },
     },
@@ -1890,7 +1930,7 @@ Use this tool when:
 Query by exactly ONE of: a single variant, a genomic region, or a gene name.
 For batch lookups of multiple specific variants, use the 'variants' parameter instead.
 
-Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), heterozygous/homozygous counts, most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values. source=gnomad returns a different row: per-population AF_* columns, AN, filters, rsids and consequences, with no counts or enrichment. Every value arrives as a string on both sources.""",
+Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), alt allele counts carried in heterozygotes and in homozygotes (AC_Het, AC_Hom: a homozygote contributes 2, so homozygous individuals = AC_Hom / 2), most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values. source=gnomad returns a different row: per-population AF_* columns, AN, filters, rsids and consequences, with no counts or enrichment. Every value arrives as a string on both sources. `version` in the result is the release of the source the rows come from.""",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -2643,7 +2683,7 @@ def register_mcp_tools(
     so an `Annotated[..., Field(ge=..., le=...)]` here does not merely advertise a bound —
     pydantic REJECTS an out-of-range value before the executor sees it. That is why only
     the parameters the executor ALREADY rejects carry one (the `sql_int`/`sql_float` sites:
-    the four `window` arguments, `min_pip`, `get_hla_by_allele.max_rows`); there the
+    the by-gene tools' `window` and `limit`, `min_pip`, `get_hla_by_allele.max_rows`); there the
     declaration moves the identical rejection earlier, so it is not a breaking change
     (neither path ever returns success) — but it is not unobservable either: previously
     an out-of-range call got a normal tool result (`{"success": false, "error": "window
@@ -2781,9 +2821,10 @@ def register_mcp_tools(
         gene: str,
         resources: str | None = None,
         window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
+        limit: Annotated[int, Field(ge=1, le=100_000)] = 500,
     ) -> dict:
-        """Get ASM-QTL data for variants near a gene."""
-        return await executor.get_asm_qtl_by_gene(gene, resources, window)
+        """Get ASM-QTL data for variants near a gene. At most `limit` rows (default 500); `total_count` and `truncated` say whether more matched."""
+        return await executor.get_asm_qtl_by_gene(gene, resources, window, limit)
 
     @_tool()
     async def get_open_chromatin_by_variant(
@@ -2816,9 +2857,10 @@ def register_mcp_tools(
         gene: str,
         resources: str | None = None,
         window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
+        limit: Annotated[int, Field(ge=1, le=100_000)] = 500,
     ) -> dict:
-        """Get open-chromatin atlas peaks near a gene."""
-        return await executor.get_open_chromatin_by_gene(gene, resources, window)
+        """Get open-chromatin atlas peaks near a gene. At most `limit` rows (default 500); `total_count` and `truncated` say whether more matched. get_open_chromatin_by_region is not capped."""
+        return await executor.get_open_chromatin_by_gene(gene, resources, window, limit)
 
     @_tool()
     async def get_peak_to_genes(
@@ -2851,9 +2893,10 @@ def register_mcp_tools(
         gene: str,
         resources: str | None = None,
         window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
+        limit: Annotated[int, Field(ge=1, le=100_000)] = 500,
     ) -> dict:
-        """Get in-silico predicted variant effects on chromatin accessibility near a gene."""
-        return await executor.get_variant_effect_by_gene(gene, resources, window)
+        """Get in-silico predicted variant effects on chromatin accessibility near a gene. At most `limit` rows (default 500); `total_count` and `truncated` say whether more matched."""
+        return await executor.get_variant_effect_by_gene(gene, resources, window, limit)
 
     @_tool()
     async def get_mpra_by_variant(
@@ -2878,9 +2921,10 @@ def register_mcp_tools(
         gene: str,
         resources: str | None = None,
         window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
+        limit: Annotated[int, Field(ge=1, le=100_000)] = 500,
     ) -> dict:
-        """Get measured MPRA cis-regulatory allelic activity for variants near a gene."""
-        return await executor.get_mpra_by_gene(gene, resources, window)
+        """Get measured MPRA cis-regulatory allelic activity for variants near a gene. At most `limit` rows (default 500); `total_count` and `truncated` say whether more matched."""
+        return await executor.get_mpra_by_gene(gene, resources, window, limit)
 
     @_tool()
     async def get_mpra_pip_concordance_by_gene(
@@ -2888,9 +2932,10 @@ def register_mcp_tools(
         window: Annotated[int, Field(ge=0, le=10_000_000)] = 500000,
         resource: str = "finngen",
         min_pip: Annotated[float, Field(ge=0.0, le=1.0)] = 0.1,
+        limit: Annotated[int, Field(ge=1, le=100_000)] = 500,
     ) -> dict:
-        """Cross-reference FinnGen fine-mapped credible-set PIP against measured MPRA emVar calls near a gene."""
-        return await executor.get_mpra_pip_concordance_by_gene(gene, window, resource, min_pip)
+        """Cross-reference FinnGen fine-mapped credible-set PIP against measured MPRA emVar calls near a gene. At most `limit` rows (default 500); `total_count` and `truncated` say whether more matched."""
+        return await executor.get_mpra_pip_concordance_by_gene(gene, window, resource, min_pip, limit)
 
     @_tool()
     async def get_gene_disease_associations(gene: str) -> dict:
@@ -3277,7 +3322,7 @@ def register_mcp_tools(
         variants: list[str] | None = None,
         source: str = "finngen",
     ) -> dict:
-        """Get variant annotations (consequence, allele frequency, rsID, enrichment)."""
+        """Get variant annotations (consequence, allele frequency, rsID, enrichment). AC_Het/AC_Hom are alt allele counts, so a homozygote adds 2 to AC_Hom. `version` is the source's release."""
         return await executor.get_variant_annotations(
             variant=variant, region=region, gene=gene, variants=variants, source=source
         )

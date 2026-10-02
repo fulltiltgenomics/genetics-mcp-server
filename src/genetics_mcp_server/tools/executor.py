@@ -904,15 +904,20 @@ class ToolExecutor:
     def _query_metadata(
         payload: dict[str, Any], query_result: dict[str, Any], include: bool
     ) -> dict[str, Any]:
-        """Optionally attach the column names and truncation flag of the underlying query.
+        """Attach the row total and truncation flag of the underlying query, and optionally
+        its column names and server cap.
+
+        `total_count` and `truncated` are unconditional: a capped result that does not say
+        so is indistinguishable from a complete one, to a model and to an MCP client alike.
+        `total_count` is db-api's count for the statement `query_database` sent, whose
+        trailing LIMIT is stripped, so it is every matching row rather than the page.
 
         `results` already carries the names on every row, but an EMPTY result has no row
         to carry them: the SDK builds `pl.DataFrame({c: [] for c in columns})` so a script
-        filtering a no-hit gene gets an empty frame rather than ColumnNotFound. `truncated`
-        stays because silent truncation is the one failure a script cannot detect for
-        itself. Off by default so the model's payload is not padded with either.
+        filtering a no-hit gene gets an empty frame rather than ColumnNotFound. `columns`
+        is off by default so the model's payload is not padded with it.
 
-        `capped_by_server`/`server_row_cap` travel with `truncated` because they are what
+        `capped_by_server`/`server_row_cap` travel with `columns` because they are what
         `GeneticsClient._check_truncation` reads to tell db-api's own row cap (raising
         `limit` does nothing) from the LLM-slice cut (raising `limit` is the remedy). Drop
         them here and every typed SDK method that reaches db-api through this helper gets
@@ -920,9 +925,12 @@ class ToolExecutor:
         keys degrade to the generic message, which is what a pre-`max_rows_applied` db-api
         or a non-BigQuery payload produces.
         """
+        payload["total_count"] = query_result.get(
+            "total_rows", len(query_result.get("rows") or [])
+        )
+        payload["truncated"] = query_result.get("truncated", False)
         if include:
             payload["columns"] = query_result.get("columns", [])
-            payload["truncated"] = query_result.get("truncated", False)
             payload["capped_by_server"] = query_result.get("capped_by_server", False)
             payload["server_row_cap"] = query_result.get("server_row_cap")
         return payload
@@ -2989,6 +2997,10 @@ class ToolExecutor:
                     "count": len(results),
                     "results": results,
                 }
+                # results-api sends none for a source with no configured version
+                version = resp.headers.get("X-Dataset-Version")
+                if version:
+                    result["version"] = version
                 if results:
                     if variants is None:
                         result["_download_url"] = self._build_download_url(
