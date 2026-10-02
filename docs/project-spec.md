@@ -158,6 +158,11 @@ correction drawn as a line on it; an effect-size line (`min_effect`) is a displa
 is documented as not being a test. What real tables contain is handled in the function and
 listed in its docstring: a p-value of 0, estimates from models that did not converge, one
 association hundreds of orders of magnitude past the rest, a gene tested under several masks.
+Drawn with a point per phenotype it is the PheWAS volcano of one variant, and takes the two
+encodings FinnGen's LAVAA viewer reads that figure with: `ring=` marks the associations
+fine-mapped to the variant (a boolean column, or `pip` above `ring_min`), and `hulls=True`
+outlines each `colour=` category's hits with their convex hull, so a category the variant
+moves in both directions shows as a hull across the null.
 
 ### BigQuery tools (fallback for complex queries)
 

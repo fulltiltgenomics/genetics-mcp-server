@@ -2700,6 +2700,132 @@ def test_a_size_column_holding_one_value_encodes_nothing_and_is_not_drawn(monkey
     }
 
 
+def endpoint_frame(**over):
+    """One variant across ten endpoints in three categories, one of them on both sides."""
+    columns = {
+        "endpoint": ["Statins", "Lipid disorder", "Hypercholesterolaemia", "T2D", "Insulin",
+                     "Gestational diabetes", "Gallstones", "Cholecystectomy", "Gout", "Asthma"],
+        "category": ["Endocrine", "Endocrine", "Endocrine", "Diabetes", "Diabetes",
+                     "Diabetes", "Digestive", "Digestive", "Rheuma", "Respiratory"],
+        "beta": [-0.07, -0.06, 0.05, 0.05, 0.06, 0.10, 0.08, 0.07, -0.12, 0.01],
+        "mlog10p": [39.8, 20.0, 16.0, 12.0, 15.0, 19.0, 21.0, 20.0, 20.6, 0.4],
+        "pip": [0.99, 0.6, 0.05, None, 0.3, 0.02, 0.9, 0.11, 0.1, None],
+        "n_cases": [294_760, 60_000, 40_000, 70_000, 30_000, 15_000, 45_000, 38_000, 12_000, 50_000],
+    }
+    columns.update(over)
+    return pl.DataFrame(columns)
+
+
+def hull_patches(ax):
+    from matplotlib.patches import Polygon
+
+    return [patch for patch in ax.patches if isinstance(patch, Polygon)]
+
+
+def test_hulls_outline_each_categorys_hits_and_say_which_cross_the_null(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, colour="category", hulls=True
+    )
+    # a category with one hit has no hull, and the one below the line belongs to none
+    assert result["hulls"] == [
+        {"category": "Endocrine", "n_points": 3, "crosses_null": True},
+        {"category": "Diabetes", "n_points": 3, "crosses_null": False},
+        {"category": "Digestive", "n_points": 2, "crosses_null": False},
+    ]
+    patches = hull_patches(ax)
+    assert len(patches) == 3
+    # every corner of a hull is one of its category's own points
+    corners = {tuple(round(float(v), 6) for v in xy) for xy in patches[0].get_xy()}
+    assert corners == {(-0.07, 39.8), (-0.06, 20.0), (0.05, 16.0)}
+    # tinted in the category's colour, under the points
+    from matplotlib.colors import to_hex
+
+    assert to_hex(patches[0].get_facecolor()).upper() == plots._FOREST_SERIES[0][0]
+    assert patches[0].get_facecolor()[3] == pytest.approx(plots._VOLCANO_HULL_FILL)
+    assert patches[0].get_zorder() < min(c.get_zorder() for c in ax.collections)
+    with pytest.raises(GeneticsUsageError, match="needs colour="):
+        plots.volcano(endpoint_frame(), significance=5e-8, hulls=True)
+
+
+def test_a_hull_is_found_on_the_axes_as_drawn_and_not_on_the_raw_numbers(monkeypatch, tmp_path):
+    # on the broken -log10 p axis the middle point lies outside the straight line between
+    # the other two, though by the raw numbers it lies inside it
+    frame = pl.DataFrame({
+        "category": ["A"] * 4,
+        "beta": [0.0001, 0.5, 1.0, 1.0],
+        "mlog10p": [10.0, 150.0, 300.0, 10.0],
+    })
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, frame, significance=5e-8, colour="category", hulls=True
+    )
+    assert result["y_log_above"] == 20.0
+    corners = {tuple(float(v) for v in xy) for xy in hull_patches(ax)[0].get_xy()}
+    assert (0.5, 150.0) in corners
+
+
+@pytest.mark.parametrize(
+    "points, expected",
+    [
+        ([(0, 0), (2, 0), (2, 2), (0, 2), (1, 1)], {0, 1, 2, 3}),
+        ([(0, 0), (1, 1), (2, 2)], {0, 2}),
+        ([(1, 1), (1, 1), (3, 2)], {0, 2}),
+        ([(1, 1), (1, 1)], set()),
+        ([(1, 1)], set()),
+    ],
+)
+def test_the_hull_of_points_that_are_in_a_line_or_repeated_or_too_few(points, expected):
+    import numpy as np
+
+    assert set(plots._convex_hull(np.array(points, dtype=float))) == expected
+
+
+def test_ring_marks_the_fine_mapped_associations(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, ring="pip"
+    )
+    # above 0.1, not at it, and a null is not fine-mapped
+    assert result["n_ringed"] == 5
+    rings = [c for c in ax.collections if not len(c.get_facecolors())]
+    assert len(rings) == 1 and len(rings[0].get_offsets()) == 5
+    assert [t.get_text() for t in ax.get_legend().get_texts()] == ["pip > 0.1"]
+    result, _ax = drawn_volcano(
+        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, ring="pip", ring_min=0.5
+    )
+    assert result["n_ringed"] == 3
+    # a flag column is taken as it stands and named in the legend by its own name
+    flagged = endpoint_frame().with_columns((pl.col("pip") > 0.95).alias("fine_mapped"))
+    result, ax = drawn_volcano(monkeypatch, tmp_path, flagged, significance=5e-8, ring="fine_mapped")
+    assert result["n_ringed"] == 1
+    assert [t.get_text() for t in ax.get_legend().get_texts()] == ["fine_mapped"]
+    with pytest.raises(GeneticsUsageError, match="ring= names a boolean column"):
+        plots.volcano(endpoint_frame(), significance=5e-8, ring="endpoint")
+
+
+def test_with_ring_the_named_points_are_not_ringed_as_well(monkeypatch, tmp_path):
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, label="endpoint",
+        labels=["Asthma"], ring="pip",
+    )
+    rings = [c for c in ax.collections if not len(c.get_facecolors())]
+    assert result["n_ringed"] == 5 and len(rings[0].get_offsets()) == 5
+    assert (0.01, 0.4) not in {tuple(float(v) for v in xy) for xy in rings[0].get_offsets()}
+    # and without it they still are, and that ring is not counted as fine-mapping
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, label="endpoint",
+        labels=["Asthma"],
+    )
+    rings = [c for c in ax.collections if not len(c.get_facecolors())]
+    assert result["n_ringed"] == 0 and len(rings[0].get_offsets()) == 1
+
+
+def test_a_chapter_length_category_keeps_what_tells_it_apart(monkeypatch, tmp_path):
+    chapters = ["IX Diseases of the circulatory system", "XI Diseases of the digestive system"]
+    frame = endpoint_frame(category=[chapters[i % 2] for i in range(10)])
+    result, ax = drawn_volcano(monkeypatch, tmp_path, frame, significance=5e-8, colour="category")
+    assert sorted(result["colours"]) == chapters
+    assert ax.get_legend()._ncols == 2
+
+
 def test_the_p_column_is_found_or_asked_for(monkeypatch, tmp_path):
     burden = burden_frame().rename({"mlog10p": "mlog10p_burden"})
     result, _ax = drawn_volcano(monkeypatch, tmp_path, burden)

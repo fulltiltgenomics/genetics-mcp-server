@@ -2885,7 +2885,15 @@ _VOLCANO_SMALL = "#7A7A7A"
 _VOLCANO_NULL_RULE = "#DDDDDD"
 
 _VOLCANO_CORRECTIONS = ("bonferroni", "fdr")
+
+# a hull is a tint under the points and a hairline round them: enough to read which hits
+# belong together, not enough to hide the ones it covers
+_VOLCANO_HULL_FILL = 0.10
+_VOLCANO_HULL_EDGE = 0.55
 _VOLCANO_LABEL_CHARS = 30
+# longer than a forest's series name: the categories are often ICD chapters, which share
+# their first twenty characters ("Diseases of the ...") and differ after them
+_VOLCANO_CATEGORY_CHARS = 38
 
 # marker areas in points²: a point that passed, one that did not — smaller in a cloud of
 # more than `_VOLCANO_CLOUD` points, where the larger one merges them into a slab — and the
@@ -2934,6 +2942,35 @@ def _volcano_reach(x: np.ndarray, significant: np.ndarray) -> float:
         _VOLCANO_BODY * float(np.quantile(sizes, 0.5, method="lower")),
     )
     return (min(full, within) if within > 0 else full) or 1.0
+
+
+def _convex_hull(points: np.ndarray) -> list[int]:
+    """Row indices of the corners of the convex hull of 2-D points, in order round it.
+
+    Andrew's monotone chain rather than scipy's Qhull, which raises on exactly what a
+    category of two hits, or of three in a line, hands it. Repeated points count once;
+    fewer than three distinct corners come back as the two ends of a line, or as nothing.
+    """
+    _unique, first = np.unique(points, axis=0, return_index=True)
+    order = sorted((int(i) for i in first), key=lambda i: (points[i][0], points[i][1]))
+    if len(order) < 2:
+        return []
+
+    def turn(o: int, a: int, b: int) -> float:
+        return float(
+            (points[a][0] - points[o][0]) * (points[b][1] - points[o][1])
+            - (points[a][1] - points[o][1]) * (points[b][0] - points[o][0])
+        )
+
+    halves = []
+    for walk in (order, order[::-1]):
+        chain: list[int] = []
+        for i in walk:
+            while len(chain) >= 2 and turn(chain[-2], chain[-1], i) <= 0:
+                chain.pop()
+            chain.append(i)
+        halves.append(chain[:-1])
+    return halves[0] + halves[1]
 
 
 def _volcano_y_ticks(linthresh: float, top: float) -> list[float]:
@@ -2988,6 +3025,9 @@ def volcano(
     labels: Any = 10,
     colour: str | None = None,
     size: str | None = None,
+    ring: str | None = None,
+    ring_min: float = 0.1,
+    hulls: bool = False,
     effect: str | None = None,
     xlabel: str | None = None,
     xlim: Any = None,
@@ -3056,6 +3096,16 @@ def volcano(
     rarest are grouped as `Other`. `size=` names a numeric column — sample size, carrier
     count — that the hits' marker area is scaled by, with the range in the legend.
 
+    A PHEWAS OF ONE VARIANT is the same figure with a point per phenotype, and two more
+    encodings carry what it is read for. `ring=` names a column and draws a dark ring round
+    the points it marks: where a boolean column is true, or where a numeric one — a
+    credible set's `pip` — is above `ring_min` (0.1), so the associations fine-mapped to
+    this variant stand apart from the ones it only tags. `hulls=True`, with `colour=`,
+    outlines the hits of each category with their convex hull, tinted in the category's
+    colour: a hull that straddles the null is a category the variant raises the risk of
+    for some phenotypes and lowers for others. A category with a single hit has no hull,
+    nor does `Other`. With `ring=`, points named by `labels=[...]` are not ringed as well.
+
     WHAT IS HANDLED RATHER THAN LEFT TO THE CALLER. A row with no estimate or no usable
     p-value is not drawn and is counted in `n_missing`. A p-value of exactly 0, or an
     infinite -log10 p, is an arrowhead at the top edge rather than a value invented for it.
@@ -3073,8 +3123,9 @@ def volcano(
     `threshold_mlog10p`, `n_significant` (past the p threshold), `n_up`, `n_down` and
     `n_small`, `n_clipped`, `n_offscale` (drawn at the top edge), `scale`, `xlim` in axis
     units, `y_log_above`, `labelled` (the names on the figure), `colours` (the legend's
-    categories) and `top`: the ten strongest hits as dicts of `label`, `estimate` in axis
-    units, `mlog10p` and `direction`.
+    categories), `n_ringed`, `hulls` (one dict per hull drawn: `category`, `n_points` and
+    `crosses_null`) and `top`: the ten strongest hits as dicts of `label`, `estimate` in
+    axis units, `mlog10p` and `direction`.
 
     `path` may be relative, in which case it is written inside the execution's artifacts
     directory and returned to the user automatically; that is also where the default goes.
@@ -3083,7 +3134,9 @@ def volcano(
     import collections
 
     import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Polygon
     from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator, NullLocator
     from matplotlib.transforms import ScaledTranslation
 
@@ -3091,6 +3144,11 @@ def volcano(
         raise GeneticsUsageError(f"data must be a polars DataFrame, not {type(data).__name__}")
     if scale not in _FOREST_SCALES:
         raise GeneticsUsageError(f"scale must be one of {_FOREST_SCALES}, not {scale!r}")
+    if hulls and not colour:
+        raise GeneticsUsageError(
+            "hulls=True outlines each category's hits, so it needs colour= naming the "
+            "category column"
+        )
     if significance is None:
         correction = None
     elif isinstance(significance, str):
@@ -3150,13 +3208,26 @@ def volcano(
     elif isinstance(labels, str):
         raise GeneticsUsageError("labels is a count or a list of names; wrap one name in a list")
     missing = [
-        c for c in (estimate, pvalue, label, se, colour, size)
+        c for c in (estimate, pvalue, label, se, colour, size, ring)
         if c is not None and c not in data.columns
     ]
     if missing:
         raise GeneticsUsageError(f"columns {missing} are not in the frame; columns are {data.columns}")
     if data.is_empty():
         raise GeneticsUsageError("the frame has no rows — nothing to plot")
+    ring_flags, ring_text = None, None
+    if ring:
+        if data.schema[ring] == pl.Boolean:
+            ring_flags = data[ring].fill_null(False).to_list()
+            ring_text = _plain(ring, _FOREST_CELL_CHARS)
+        elif data.schema[ring].is_numeric():
+            ring_flags = [v is not None and v > ring_min for v in _floats(data, ring)]
+            ring_text = f"{_plain(ring, _FOREST_CELL_CHARS)} > {ring_min:g}"
+        else:
+            raise GeneticsUsageError(
+                f"ring= names a boolean column, or a numeric one read against ring_min; "
+                f"{ring!r} is {data.schema[ring]}"
+            )
 
     n = data.height
     x_all = np.full(n, np.nan)
@@ -3354,7 +3425,8 @@ def volcano(
     if colour:
         values = data[colour].to_list()
         category_of = [
-            _FOREST_UNGROUPED if values[i] is None else _plain(values[i], _FOREST_CELL_CHARS)
+            _FOREST_UNGROUPED if values[i] is None
+            else _plain(values[i], _VOLCANO_CATEGORY_CHARS)
             for i in kept
         ]
         tally = collections.Counter(category_of[i] for i in np.nonzero(called)[0])
@@ -3414,9 +3486,41 @@ def volcano(
         colour_of[up], colour_of[down] = _VOLCANO_UP, _VOLCANO_DOWN
     else:
         draw(called, _VOLCANO_SMALL, linewidths=0, alpha=0.85, zorder=3)
-    if explicit is not None:
-        # a ring, so a named point that is not a hit can be found in the cloud
-        ax.scatter(plot_x[named], plot_y[named], s=areas[named] + 14, facecolors="none",
+    drawn_hulls: list[dict[str, Any]] = []
+    if hulls:
+        # corners are found where the axes are straight — past the log and the broken
+        # scale — or a hull drawn on them would cut inside its own points
+        scaled = ax.transScale.transform(np.column_stack([plot_x, plot_y]))
+        null_x = shown(0.0)
+        for name in categories:
+            members = np.nonzero(called & (tags == name))[0]
+            if name == _FOREST_UNGROUPED or len(members) < 2:
+                continue
+            corners = [members[i] for i in _convex_hull(scaled[members])]
+            if not corners:
+                continue
+            ink = styles[name][0]
+            ax.add_patch(Polygon(
+                np.column_stack([plot_x[corners], plot_y[corners]]), closed=True,
+                facecolor=to_rgba(ink, _VOLCANO_HULL_FILL),
+                edgecolor=to_rgba(ink, _VOLCANO_HULL_EDGE), linewidth=0.6,
+                joinstyle="round", zorder=1.5,
+            ))
+            drawn_hulls.append({
+                "category": name,
+                "n_points": int(len(members)),
+                "crosses_null": bool(
+                    plot_x[members].min() < null_x < plot_x[members].max()
+                ),
+            })
+    ringed = np.zeros(count, dtype=bool)
+    if ring_flags is not None:
+        ringed = np.array(ring_flags, dtype=bool)[kept]
+    elif explicit is not None:
+        # so a named point that is not a hit can be found in the cloud
+        ringed[named] = True
+    if ringed.any():
+        ax.scatter(plot_x[ringed], plot_y[ringed], s=areas[ringed] + 14, facecolors="none",
                    edgecolors="black", linewidths=0.6, clip_on=False, zorder=3.2)
 
     backing = {"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6}
@@ -3483,11 +3587,19 @@ def volcano(
                    label=f"{_plain(size, _FOREST_CELL_CHARS)} {_forest_cell(value)}")
             for value in size_range
         ]
+    if ring_text is not None:
+        handles.append(Line2D(
+            [0], [0], marker="o", linestyle="none", markersize=_FOREST_MARKER_PT + 1.5,
+            markerfacecolor="none", markeredgecolor="black", markeredgewidth=0.6,
+            label=ring_text,
+        ))
     if handles:
         # under the axis label, where no point can be: every corner of a volcano may hold some
         under = ScaledTranslation(0, -26 / 72, figure.dpi_scale_trans)
+        # four columns of short names fit under the axes; three of chapter-length ones
+        wide = max(len(handle.get_label()) for handle in handles) > _FOREST_CELL_CHARS
         ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0),
-                  bbox_transform=ax.transAxes + under, ncol=min(len(handles), 4),
+                  bbox_transform=ax.transAxes + under, ncol=min(len(handles), 3 if wide else 4),
                   frameon=False, fontsize=5, handlelength=1.2, columnspacing=1.2,
                   borderaxespad=0.2)
 
@@ -3546,6 +3658,8 @@ def volcano(
         "y_log_above": linthresh if log_y else None,
         "labelled": [texts[i] for i in named],
         "colours": categories,
+        "n_ringed": int(ringed.sum()) if ring_flags is not None else 0,
+        "hulls": drawn_hulls,
         "top": [
             {
                 "label": texts[i] if texts is not None else None,
