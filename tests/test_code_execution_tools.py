@@ -2393,6 +2393,33 @@ class TestRunAnalysisInputErrorTaxonomy:
         assert "404" in result["error"]
         assert "https://example.org/private/data.tsv" not in result["error"]
 
+    async def test_an_oversize_fetch_is_too_large_not_a_refusal(self, executor, monkeypatch):
+        """`InputRefused` tells the model to ask for an upload, and an upload of the same file
+        meets the same cap — so the size class gets the type an oversize attachment already
+        has, with the fetcher's own measurement relayed and the way out stated."""
+        from genetics_mcp_server.url_fetch_client import ERROR_TOO_LARGE, UrlFetchRefused
+
+        _install_fetcher(
+            monkeypatch,
+            _StubFetcher(
+                raises=UrlFetchRefused(
+                    "url-fetcher did not fetch the url (too_large: example.org declares "
+                    "262730239 bytes, over the 16777216 byte cap)",
+                    error_type=ERROR_TOO_LARGE,
+                )
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(
+            executor, sandbox, [{"url": "https://example.org/uc.meta.txt.gz"}]
+        )
+        assert result["error_type"] == "InputTooLarge"
+        assert result["retryable"] is False
+        assert "declares 262730239 bytes" in result["error"]
+        assert "do not ask for it to be uploaded" in result["error"]
+        assert "summary-statistics" in result["error"]
+        assert sandbox.calls == []
+
     async def test_a_retryable_upstream_status_stays_input_unavailable(
         self, executor, monkeypatch
     ):

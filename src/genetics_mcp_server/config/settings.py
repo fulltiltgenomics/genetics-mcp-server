@@ -109,8 +109,8 @@ class Settings:
     url_fetch_cache_ttl_seconds: int = field(
         default_factory=lambda: int(os.environ.get("URL_FETCH_CACHE_TTL_SECONDS", "900"))
     )
-    # 32 MiB against a 512 KiB per-fetch cap, so the ceiling is reached by entries rather than
-    # by one file
+    # two fetches at the per-fetch cap (url_fetch_client.MAX_FETCH_BYTES); a larger ceiling is
+    # resident memory in a single-replica process for files an analysis loop rarely revisits
     url_fetch_cache_max_bytes: int = field(
         default_factory=lambda: int(os.environ.get("URL_FETCH_CACHE_MAX_BYTES", "33554432"))
     )

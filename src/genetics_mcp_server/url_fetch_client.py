@@ -59,7 +59,7 @@ MAX_REQUEST_BYTES = 8 * 1024
 """``server.MAX_REQUEST_BYTES``. The route takes a url and nothing else, and answers 413 to a
 larger body, so the serialised payload is measured here and refused locally instead."""
 
-MAX_FETCH_BYTES = 512 * 1024
+MAX_FETCH_BYTES = 16 * 1024 * 1024
 """``fetch.MAX_BYTES``. The fetcher **aborts** at the cap rather than truncating, so a success
 body carrying more than this means the two ends disagree about the number."""
 
@@ -116,14 +116,15 @@ RESPONSE_MARGIN_S = 10
 hop."""
 
 # A memory bound against a responder that is not the fetcher we mirrored, not a contract check
-# on it. The base64 of a MAX_FETCH_BYTES payload is ~0.67 MiB, but the rest of the envelope is
+# on it. The base64 of a MAX_FETCH_BYTES payload is 4/3 of it, but the rest of the envelope is
 # NOT bounded by the fetcher: fetch.py follows a Location header with no length check (up to
 # 65536 bytes, http.client's own limit), so the reported final url can run far past
 # MAX_REQUEST_BYTES, and server._send's json.dumps escapes non-ASCII at 6 bytes out per input
 # character, so a non-ASCII name or url inflates further still. A ceiling derived tightly from
-# those fields would refuse a legitimate success; 2 MiB instead bounds a misbehaving responder
-# to a few MiB resident rather than tens, which is the whole purpose.
-MAX_RESPONSE_BYTES = 4 * MAX_FETCH_BYTES
+# those fields would refuse a legitimate success; twice the payload leaves the envelope two
+# thirds of a payload of slack and still bounds what a misbehaving responder can make this
+# process read.
+MAX_RESPONSE_BYTES = 2 * MAX_FETCH_BYTES
 
 
 def client_deadline_s() -> float:

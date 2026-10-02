@@ -1742,6 +1742,17 @@ class ServerToolExecutor(ToolExecutor):
             "retryable": retryable,
         }
 
+    # what an over-the-cap input is answered with, whichever end measured it. Its own
+    # error_type rather than InputRefused: that one tells the model to ask for an upload, and
+    # an upload of the same file meets the same cap.
+    _INPUT_TOO_LARGE_ADVICE = (
+        "The same limit applies to an uploaded file, so do not retry this and do not ask for "
+        "it to be uploaded as it is. A complete genome-wide summary-statistics file is always "
+        "over the limit: tell the user it is too large to load here, and ask for the part the "
+        "question needs — a region, one gene's variants, or the genome-wide-significant rows "
+        "— as a smaller file, or answer from the datasets already loaded here."
+    )
+
     @staticmethod
     def _fetch_reason(exc: Any) -> str:
         """The fetcher's own words, plus the upstream status where it named one.
@@ -1988,6 +1999,16 @@ class ServerToolExecutor(ToolExecutor):
                                 ),
                             )
                         logger.warning("run_analysis input %d was refused by the fetcher: %s", index, e)
+                        if e.error_type == fetcher.ERROR_TOO_LARGE:
+                            return (
+                                [],
+                                [],
+                                self._input_error(
+                                    f"Input {index} is too large to deliver: "
+                                    f"{self._fetch_reason(e)}. {self._INPUT_TOO_LARGE_ADVICE}",
+                                    "InputTooLarge",
+                                ),
+                            )
                         return (
                             [],
                             [],
@@ -2090,8 +2111,8 @@ class ServerToolExecutor(ToolExecutor):
                         [],
                         [],
                         self._input_error(
-                            f"Input {index} is over the {MAX_INPUT_BYTES}-byte per-file limit for "
-                            "sandbox delivery. Filter or summarise it before delivering it.",
+                            f"Input {index} is over the {MAX_INPUT_BYTES // (1024 * 1024)} MiB "
+                            f"per-file limit for sandbox delivery. {self._INPUT_TOO_LARGE_ADVICE}",
                             "InputTooLarge",
                         ),
                     )
@@ -2101,8 +2122,9 @@ class ServerToolExecutor(ToolExecutor):
                         [],
                         [],
                         self._input_error(
-                            f"The delivered files total more than the {MAX_INPUTS_TOTAL_BYTES}-byte "
-                            "limit for one run. Deliver fewer, or smaller ones.",
+                            "The delivered files total more than the "
+                            f"{MAX_INPUTS_TOTAL_BYTES // (1024 * 1024)} MiB limit for one run. "
+                            "Deliver fewer, or smaller ones.",
                             "InputTooLarge",
                         ),
                     )

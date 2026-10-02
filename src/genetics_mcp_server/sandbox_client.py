@@ -65,17 +65,17 @@ this client rejects it locally too instead of sending a request it knows will fa
 MAX_CODE_BYTES = 256 * 1024
 """Measured on ``len(code.encode("utf-8"))`` — the decoded string, not the JSON escaping."""
 
-MAX_BODY_BYTES = 1024 * 1024
-"""Measured on the raw bytes on the wire. Deliberately **not** raised for ``inputs``: they
-ride inside this body as base64, so the input caps below do not on their own keep a request
-under it — 512 KiB of inputs is ~683 KiB encoded, which leaves room for a 256 KiB script only
-while that script needs little JSON escaping. The body cap is therefore checked separately,
-after the payload is serialised, and is the one that refuses the combination."""
+MAX_BODY_BYTES = 24 * 1024 * 1024
+"""Measured on the raw bytes on the wire. ``inputs`` ride inside this body as base64, and the
+supervisor sizes the cap to carry the input caps below (~21.4 MiB encoded) beside a full-size
+script at JSON's worst escaping, so no legal combination of code and inputs exceeds it. It is
+still checked separately, after the payload is serialised, because the wire is where the
+supervisor measures it."""
 
-MAX_INPUT_BYTES = 512 * 1024
+MAX_INPUT_BYTES = 16 * 1024 * 1024
 """One delivered input, measured on the **decoded** bytes rather than on the wire."""
 
-MAX_INPUTS_TOTAL_BYTES = 512 * 1024
+MAX_INPUTS_TOTAL_BYTES = 16 * 1024 * 1024
 """Every delivered input of one request, decoded."""
 
 MAX_INPUTS = 4
@@ -773,7 +773,7 @@ class SandboxClient:
                 }
                 for item in inputs
             ]
-        # serialised here rather than by httpx so the 1 MiB cap is measured on the bytes that
+        # serialised here rather than by httpx so the body cap is measured on the bytes that
         # actually go on the wire, which is where the supervisor measures it
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         if len(payload) > MAX_BODY_BYTES:
