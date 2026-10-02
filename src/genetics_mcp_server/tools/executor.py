@@ -379,6 +379,8 @@ def _ld_error(resp: Any) -> str:
     later — survives into the message rather than collapsing into one status number."""
     if resp.status_code == 502:
         return "the LD server is unavailable (results-api could not reach it)"
+    if resp.status_code == 404:
+        return "the query variant is not in the LD panel, so there is no LD to report for it"
     if resp.status_code == 422:
         detail = ""
         try:
@@ -387,6 +389,18 @@ def _ld_error(resp: Any) -> str:
             pass
         return f"LD request refused: {detail or 'invalid variant, window, threshold or panel'}"
     return f"LD lookup failed: HTTP {resp.status_code}"
+
+
+def _ld_failure(resp: Any) -> dict[str, Any]:
+    """The failed-LD result, with a code where the failure is one a caller can branch on.
+
+    A variant the panel does not carry is an answer rather than an outage, and a locuszoom
+    has to tell the two apart to say why its points are grey.
+    """
+    failure: dict[str, Any] = {"success": False, "error": _ld_error(resp)}
+    if resp.status_code == 404:
+        failure["error_code"] = "ld_variant_not_in_panel"
+    return failure
 
 
 def _seg(value: Any) -> str:
@@ -2649,10 +2663,7 @@ class ToolExecutor:
             )
 
             if resp.status_code != 200:
-                return {
-                    "success": False,
-                    "error": _ld_error(resp),
-                }
+                return _ld_failure(resp)
 
             data = resp.json()
             ld_results = data.get("ld", [])
@@ -2710,7 +2721,7 @@ class ToolExecutor:
             )
 
             if resp.status_code != 200:
-                return {"success": False, "error": _ld_error(resp)}
+                return _ld_failure(resp)
 
             data = resp.json()
             ld_results = data.get("ld", [])

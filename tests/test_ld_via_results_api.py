@@ -110,6 +110,18 @@ async def test_an_unreachable_ld_server_reads_as_unavailable_rather_than_as_a_ba
     assert "unavailable" in result["error"]
 
 
+async def test_a_variant_the_panel_does_not_carry_is_not_reported_as_an_outage():
+    async with executor_with(
+        FakeResponse(status_code=404, payload={"detail": "6:44693011:A:G is not in LD panel sisu42"})
+    ) as executor:
+        result = await executor.get_variants_in_ld("6:44693011:A:G")
+
+    assert result["success"] is False
+    assert "not in the LD panel" in result["error"]
+    assert "unavailable" not in result["error"]
+    assert result["error_code"] == "ld_variant_not_in_panel"
+
+
 async def test_a_refused_request_says_what_to_change():
     async with executor_with(
         FakeResponse(status_code=422, payload={"detail": "window 99999999 is outside 1..11000000"})

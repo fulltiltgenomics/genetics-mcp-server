@@ -7,7 +7,11 @@ class GeneticsError(RuntimeError):
     The tool layer returns `{"success": False, "error": ...}` because a model reads the
     dict. A script author does not check a flag after every call, so the SDK raises instead
     — a failure that is ignored would otherwise show up as an empty DataFrame.
+
+    `code` is the tool layer's `error_code` where it gave one, else None.
     """
+
+    code: str | None = None
 
 
 class GeneticsUsageError(GeneticsError):

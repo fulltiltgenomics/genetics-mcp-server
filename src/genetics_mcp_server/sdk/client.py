@@ -200,7 +200,10 @@ class GeneticsClient:
     @staticmethod
     def _payload(result: dict[str, Any]) -> dict[str, Any]:
         if not result.get("success"):
-            raise GeneticsError(result.get("error") or "request failed")
+            error = GeneticsError(result.get("error") or "request failed")
+            # the tool layer's machine-readable reason, for the callers that branch on why
+            error.code = result.get("error_code")
+            raise error
         return result
 
     @classmethod

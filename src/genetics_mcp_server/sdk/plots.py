@@ -45,7 +45,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from genetics_mcp_server.sdk.errors import GeneticsUsageError
+from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 
 __all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest"]
 
@@ -125,6 +125,22 @@ _LD_MIN_R2 = 0.05
 # strongest variant there (r²=0.78, and more significant than the lead) sits 292 kb away, so a
 # ±250 kb plot drops the one point showing the signal is not a singleton.
 _LD_SEARCH_SPAN_MULTIPLE = 2
+
+# The LD server's own ceiling on `window`: above it the answer is HTTP 400 "window must be
+# between 100000 and 5000000" and the whole figure goes grey. results-api holds the same
+# number in app/config/ld.py; an upstream that changes its bounds falsifies both.
+_LD_MAX_WINDOW = 5_000_000
+_LD_MIN_WINDOW = 200_000
+
+# Below the significance line, the strongest variant in a window is usually a rare one with
+# an unstable estimate — measured: AF 5e-5 with beta 40 at CACNA1C, AF 0.00025 with beta 2.1
+# at RBFOX1, both at p ~ 1e-4. Marked as the lead it is a caption for noise, and it is often
+# absent from the LD panel, which costs the colours too. So a lead nobody chose has to earn
+# it one of two ways: reach the line, or be at least this common.
+_LEAD_MIN_MAF = 0.01
+
+# how many `label_r2` neighbours are named. More than this and the labels are the figure.
+_MAX_R2_LABELS = 8
 
 # r² at which a partner outside the window is worth reporting. The note asks the reader to
 # redraw at a wider window, so it sits where that is worth doing — a partner the ramp would
@@ -213,6 +229,43 @@ def _variant_head(variant_id: str, consequence: str | None, gene: str | None) ->
     return f"{variant_id}  {gene} {term}" if gene else f"{variant_id}  {term}"
 
 
+def _af_columns(columns: list[str]) -> list[str]:
+    """`af` first, then the per-cohort ones a meta-analysis carries instead (`fg_af`, ...)."""
+    return [c for c in columns if c == "af"] + sorted(c for c in columns if c.endswith("_af"))
+
+
+def _allele_frequency(row: dict[str, Any]) -> tuple[float, str] | None:
+    """The row's allele frequency and the column it came from, or None when it has none."""
+    for column in _af_columns(list(row)):
+        value = row.get(column)
+        if value is None:
+            continue
+        try:
+            return float(value), column
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _default_lead(frame: pl.DataFrame, significance: float | None) -> dict[str, Any]:
+    """The row a locuszoom leads with when the caller named none.
+
+    The strongest variant, unless it is both below the significance line and rarer than
+    _LEAD_MIN_MAF, in which case the strongest variant that is not rare. A variant with no
+    frequency is not called rare, so a frame without any AF column behaves as it always did.
+    """
+    ranked = frame.sort("_y", descending=True)
+    top = ranked.row(0, named=True)
+    line = -math.log10(significance or 5e-8)
+    if top["_y"] >= line:
+        return top
+    for row in ranked.iter_rows(named=True):
+        found = _allele_frequency(row)
+        if found is None or min(found[0], 1 - found[0]) >= _LEAD_MIN_MAF:
+            return row
+    return top
+
+
 def _lead_label(
     variant_id: str,
     row: dict[str, Any],
@@ -230,9 +283,13 @@ def _lead_label(
     beta = row.get("beta")
     if beta is not None:
         parts.append(f"beta {float(beta):.3g}")
-    af = row.get("af")
-    if af is not None:
-        parts.append(f"AF {float(af):.4g}")
+    found = _allele_frequency(row)
+    if found is not None:
+        af, column = found
+        # a meta-analysis row has one frequency per cohort and no pooled one, so the label
+        # says whose it is
+        source = "" if column == "af" else f" ({column.removesuffix('_af')})"
+        parts.append(f"AF {af:.4g}{source}")
     return f"{head}\n" + "  ".join(parts)
 
 
@@ -545,8 +602,14 @@ def _draw_genes(
         return 0, 0
     # sorted by what is actually drawn, so the row packing below sees the same spans the
     # reader does
+    # A gene whose drawn span misses the window is left out: the API returns a gene whose
+    # RECORD overlaps the region, and its canonical transcript can lie wholly outside, where
+    # its label would float past the axes with no model under it.
     drawable = sorted(
-        (d for d in (_drawable(g) for g in genes.iter_rows(named=True)) if d),
+        (
+            d for d in (_drawable(g) for g in genes.iter_rows(named=True))
+            if d and d[2] >= start and d[1] <= end
+        ),
         key=lambda d: d[1],
     )
     row_ends: list[int] = []
@@ -580,21 +643,32 @@ def _draw_genes(
     ax.set_ylim(-max(len(row_ends), 1) + 0.2, 0.9)
     return drawn, exons_drawn
 
-def _significance_line(ax, significance: float) -> float:
-    """The significance line and its label, drawn the same way on every plot; returns its y.
+def _significance_line(ax, significance: float, *, label_right: bool = False) -> float:
+    """The significance line and its label; returns the line's y.
 
     The label sits on the line rather than in a legend box: grey scaffolding named where it
     is, so the figure carries no legend unless something else needs one. Returns 0.0 and
     draws nothing when `significance` is falsy.
+
+    `label_right` is for a panel with a legend in its upper left corner, which covers a
+    left-hand label whenever nothing in the window clears the line. There the label is also
+    backed: on a tall axis the line runs through the cloud at the foot of the panel, and a
+    bare label is lost in it.
     """
     if not significance:
         return 0.0
     line_y = -math.log10(significance)
     ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
+    backing = (
+        {"bbox": {"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6},
+         "zorder": 4}
+        if label_right else {}
+    )
     # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
-    ax.text(0.006, line_y, f"p {significance:g}".replace("e-0", "e-"),
-            transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6,
-            color=_SIGNIFICANCE_GREY)
+    ax.text(0.994 if label_right else 0.006, line_y,
+            f"p {significance:g}".replace("e-0", "e-"),
+            transform=ax.get_yaxis_transform(), ha="right" if label_right else "left",
+            va="bottom", fontsize=6, color=_SIGNIFICANCE_GREY, **backing)
     return line_y
 
 
@@ -612,6 +686,163 @@ def _dress(ax, title: str) -> None:
     _size(ax)
 
 
+def _mb_axis(ax) -> None:
+    """Positions in Mb, with as many decimals as the tick step needs and no more.
+
+    The default formatter prints base pairs against an offset (`1.5915 ... 1e8`), which a
+    reader has to add up to find a position.
+    """
+    from matplotlib.ticker import FuncFormatter
+
+    def fmt(value: float, _pos: Any) -> str:
+        locs = sorted(ax.xaxis.get_majorticklocs())
+        step = min((b - a for a, b in zip(locs, locs[1:])), default=1e6) / 1e6
+        decimals = next(
+            (d for d in range(7) if abs(round(step, d) - step) < 1e-9), 6
+        )
+        return f"{value / 1e6:.{decimals}f}"
+
+    ax.xaxis.set_major_formatter(FuncFormatter(fmt))
+
+
+def _track_symbol(symbol: str | None, genes: pl.DataFrame | None) -> str | None:
+    """The name the gene track draws for a gene the annotation calls `symbol`.
+
+    The two come from different releases: the consequence annotation still says MINOS1 where
+    GENCODE says MICOS10, and a label in the annotation's spelling names a gene the track
+    under it does not have.
+    Only a previous symbol of exactly one gene in the window is rewritten; an alias is not
+    consulted, because aliases are shared between genes.
+    """
+    if not symbol or genes is None or genes.is_empty() or "gene_name" not in genes.columns:
+        return symbol
+    names = set(genes["gene_name"].to_list())
+    if symbol in names or "hgnc_prev_symbol" not in genes.columns:
+        return symbol
+    renamed = [
+        gene for gene in genes.iter_rows(named=True)
+        if symbol in str(gene.get("hgnc_prev_symbol") or "").split("|")
+    ]
+    if len(renamed) != 1:
+        return symbol
+    return _gene_label(renamed[0]) or symbol
+
+
+def _renderer(figure):
+    """The figure's renderer after a layout pass, or None where the backend has none.
+
+    Text extents and the data transform are only final once the layout has run, and both
+    are what the title fit and the label placement measure against.
+    """
+    try:
+        figure.draw_without_rendering()
+        return figure.canvas.get_renderer()
+    except Exception:
+        return None
+
+
+def _fit_title(ax, figure, own_figure: bool) -> None:
+    """Break a title that is wider than what it sits over, rather than let it be clipped.
+
+    A long phenotype name makes the default title wider than the figure. The break goes
+    at the dash before the region where that leaves two lines that fit, else wherever
+    textwrap puts it.
+    """
+    renderer = _renderer(figure)
+    title = ax.title.get_text()
+    if renderer is None or not title:
+        return
+    available = (figure.bbox if own_figure else ax.bbox).width
+    width = ax.title.get_window_extent(renderer).width
+    if width <= available:
+        return
+    per_line = max(int(len(title) * available / width) - 2, 20)
+    head, dash, tail = title.rpartition(" \u2014 ")
+    if dash and max(len(head), len(tail)) <= per_line:
+        ax.set_title(f"{head}\n{tail}", fontsize=_TITLE_SIZE)
+    else:
+        ax.set_title(textwrap.fill(title, per_line), fontsize=_TITLE_SIZE)
+
+
+def _label_spots() -> list[tuple[float, float, str, str]]:
+    """Where a label may sit relative to its point, in points, nearest first: (dx, dy, ha, va).
+
+    Below comes first because the strongest association is at the top of the panel, where a
+    label above it runs into the frame. The rings further out are for a crowded peak, where
+    several labelled points sit within a few points of each other and each needs a leader
+    line to somewhere clear.
+    """
+    spots: list[tuple[float, float, str, str]] = [
+        (0, -9, "center", "top"), (9, 0, "left", "center"), (-9, 0, "right", "center"),
+        (9, -9, "left", "top"), (-9, -9, "right", "top"), (0, 9, "center", "bottom"),
+        (9, 9, "left", "bottom"), (-9, 9, "right", "bottom"),
+    ]
+    for radius in (28, 50, 75, 105):
+        for degrees in (-30, -150, 0, 180, -60, -120, 30, 150, 60, 120):
+            dx = radius * math.cos(math.radians(degrees))
+            dy = radius * math.sin(math.radians(degrees))
+            va = "center" if degrees in (0, 180) else "top" if dy < 0 else "bottom"
+            spots.append((dx, dy, "left" if dx > 0 else "right", va))
+    return spots
+
+
+_LABEL_SPOTS = _label_spots()
+_LEADER_FROM = 10  # points of offset beyond which a label gets a line back to its point
+
+
+def _place_labels(ax, renderer, labels: list[tuple[str, float, float, float]],
+                  points: np.ndarray, taken: list) -> None:
+    """Annotate each (text, x, y, fontsize) where it covers the fewest points.
+
+    At a fixed offset the lead's caption lands on its own LD partners at a dense locus, and
+    across the y axis when the lead sits at the window's edge. Each label tries the spots in
+    _LABEL_SPOTS and keeps the first that is inside the axes, clear of the legend, the corner
+    notes and the labels already placed, and over no points; failing that, the least bad.
+    Without a renderer nothing can be measured and every label goes below its point.
+    """
+    from matplotlib.text import Text
+
+    frame = ax.bbox
+    for text, x, y, fontsize in labels:
+        note = ax.annotate(
+            text, (x, y), textcoords="offset points", xytext=_LABEL_SPOTS[0][:2],
+            ha=_LABEL_SPOTS[0][2], va=_LABEL_SPOTS[0][3], fontsize=fontsize, zorder=5,
+            arrowprops={"arrowstyle": "-", "linewidth": 0.4, "color": "#555555",
+                        "shrinkA": 0, "shrinkB": 3},
+        )
+        note.arrow_patch.set_visible(False)
+        if renderer is None:
+            continue
+        best = None
+        for index, (dx, dy, ha, va) in enumerate(_LABEL_SPOTS):
+            note.xyann = (dx, dy)
+            note.set_ha(ha)
+            note.set_va(va)
+            # the text alone: an annotation's own extent takes in its leader line, which
+            # reaches back to the point and so always "covers" it
+            note.update_positions(renderer)
+            box = Text.get_window_extent(note, renderer)
+            inside = (box.x0 >= frame.x0 and box.x1 <= frame.x1
+                      and box.y0 >= frame.y0 and box.y1 <= frame.y1)
+            covered = int((
+                (points[:, 0] >= box.x0 - 2) & (points[:, 0] <= box.x1 + 2)
+                & (points[:, 1] >= box.y0 - 2) & (points[:, 1] <= box.y1 + 2)
+            ).sum()) if len(points) else 0
+            clashes = sum(1 for other in taken if box.overlaps(other))
+            cost = (0 if inside else 10_000) + 500 * clashes + covered
+            if best is None or cost < best[0]:
+                best = (cost, index, box)
+            if cost == 0:
+                break
+        _cost, index, box = best
+        dx, dy, ha, va = _LABEL_SPOTS[index]
+        note.xyann = (dx, dy)
+        note.set_ha(ha)
+        note.set_va(va)
+        note.arrow_patch.set_visible(math.hypot(dx, dy) > _LEADER_FROM)
+        taken.append(box)
+
+
 def locuszoom(
     *,
     phenotype: str,
@@ -625,6 +856,8 @@ def locuszoom(
     ld_panel: str = "sisu42",
     genes: bool = True,
     coding: bool = True,
+    highlight: str | list[str] | None = None,
+    label_r2: float | None = None,
     data: pl.DataFrame | None = None,
     path: str | None = None,
     title: str | None = None,
@@ -637,8 +870,21 @@ def locuszoom(
     """Regional association plot: -log10 p against position, coloured by LD with the lead.
 
     Give either `region` ("12:49400000-49800000") or `variant` ("12:49578357:C:T"), which is
-    centred with `flank` either side. `lead` defaults to the strongest association in the
-    window, and LD is taken against it from the FinnGen LD server.
+    centred with `flank` either side. LD is taken against `lead` from the FinnGen LD server.
+
+    `lead` defaults to the strongest association in the window, with one exception: when
+    nothing reaches `significance`, a variant rarer than 1% is passed over for the strongest
+    one that is not, because the top of a flat window is usually a rare variant with an
+    unstable estimate. `strongest` in the returned dict is the plain maximum either way, so
+    the two differ exactly when that happened. A lead below the line is the top of the
+    noise, not a hit, and should be described that way.
+
+    `highlight` rings and names further variants (ids as chr:pos:ref:alt), and `label_r2`
+    names the lead's neighbours at or above that r² — `label_r2=0.8` is "label the top
+    variant and everything in tight LD with it". With `variant=`, the centred variant is
+    ringed and named on its own whenever it is not the lead. Labels use the rsID where the
+    summary statistics carry one. `highlighted` in the returned dict lists what was named,
+    as {variant, mlog10p, r2}.
 
     THE DEFAULT WINDOW IS THE RIGHT ONE UNLESS THE QUESTION IS ABOUT THE WINDOW. `flank` is
     250 kb either side, i.e. a 500 kb plot; pass `variant=` and leave it alone. Widening it as
@@ -662,13 +908,21 @@ def locuszoom(
     when the API served no exon structure, in which case the track is gene bodies only.
 
     Returns a dict describing what was drawn: `path`, `lead`, `lead_mlog10p`, `region`,
-    `phenotype`, `n_variants`, `n_genes`, `n_exons`, plus two worth reading every time.
+    `phenotype`, `n_variants`, `n_genes`, `n_exons`, plus the ones below, worth reading every
+    time.
 
-    `ld_joined` is False when the LD server returned nothing for the lead — a plot with grey
-    points rather than an error, because a locuszoom without LD is still the right picture of
-    the locus. Check it rather than assuming the colours mean something: the LD server is a
-    third party, reached through a proxy, so an outage there costs the colours and nothing
-    else.
+    `ld_joined` is False when there is no r² to colour by — a plot with grey points rather
+    than an error, because a locuszoom without LD is still the right picture of the locus.
+    `ld_status` says why, and the figure carries the same reason. Report the one that
+    applies rather than guessing at an outage:
+    "joined" — coloured as asked;
+    "partial" — the plot is wider than the LD server's 5 Mb window, so points more than
+    2.5 Mb from the lead are grey because they were never asked about;
+    "no_partners" — the panel carries the lead and nothing is correlated with it;
+    "lead_not_in_panel" — the panel does not carry the lead, which retrying will not change
+    (pass a `lead=` the panel has, or another `ld_panel`);
+    "unavailable" — the LD server failed, the one case worth retrying later;
+    "off" — `ld=False`.
 
     `ld_partners_outside_window` lists the variants correlated with the lead that fall
     outside the window, strongest first, as {variant, pos, r2}. It is non-empty when the
@@ -679,7 +933,9 @@ def locuszoom(
     `coding_marked` is False when the consequence lookup did not answer, in which case every
     point is a circle and shape means nothing; set `coding=False` to skip that fetch outright.
     The same lookup fills `lead_consequence` and `lead_gene`, which the lead's label also
-    carries, so the strongest variant names what it does and where before anyone asks.
+    carries, so the lead names what it does and where before anyone asks. `lead_gene` is the
+    annotation's symbol, the one a follow-up query filters on; `lead_gene_label` is what the
+    figure prints, which differs where GENCODE has since renamed the gene.
 
     `path` may be relative, in which case it is written inside the execution's artifacts
     directory and returned to the user automatically; that is also where the default goes.
@@ -730,9 +986,13 @@ def locuszoom(
     else:
         frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("_variant_id"))
 
+    def row_id(row: dict[str, Any]) -> str:
+        return row["_variant_id"] or f"{row.get('chr', chrom)}:{row['pos']}"
+
+    strongest = row_id(frame.sort("_y", descending=True).row(0, named=True))
     if lead is None:
-        lead_row = frame.sort("_y", descending=True).row(0, named=True)
-        lead = lead_row["_variant_id"] or f"{lead_row.get('chr', chrom)}:{lead_row['pos']}"
+        lead_row = _default_lead(frame, significance)
+        lead = row_id(lead_row)
     else:
         match = frame.filter(pl.col("_variant_id") == _norm_variant_id(lead))
         if match.is_empty():
@@ -741,31 +1001,64 @@ def locuszoom(
     lead_pos, lead_y = lead_row["pos"], lead_row["_y"]
     lead_id = _norm_variant_id(lead)
 
+    if label_r2 is not None and not 0 < label_r2 <= 1:
+        raise GeneticsUsageError(f"label_r2 is an r² threshold in (0, 1], got {label_r2!r}")
+    known_ids = set(frame["_variant_id"].drop_nulls().to_list())
+    marked: list[str] = []
+    centre = _norm_variant_id(variant) if variant else None
+    if centre and centre != lead_id and centre in known_ids:
+        marked.append(centre)
+    for wanted in [highlight] if isinstance(highlight, str) else list(highlight or []):
+        wanted_id = _norm_variant_id(wanted)
+        if wanted_id not in known_ids:
+            raise GeneticsUsageError(
+                f"highlight {wanted!r} is not among the variants in {region}"
+            )
+        if wanted_id != lead_id and wanted_id not in marked:
+            marked.append(wanted_id)
+
     # the window the DATA covers. Computed here rather than at plotting time because the LD
     # request is sized from it: `flank` is meaningless when the caller gave region=, and the
     # old `2 * flank` asked for the default width regardless of what was actually drawn.
     span_lo, span_hi = int(frame["pos"].min()), int(frame["pos"].max())
 
     ld_frame = None
+    ld_failure = None
     outside: list[dict[str, Any]] = []
+    # the server's `window` is the TOTAL span it centres on the lead, so this is
+    # _LD_SEARCH_SPAN_MULTIPLE times the plotted width — wide enough to cover the window from
+    # a lead anywhere inside it, and to see just past both edges — up to the server's ceiling
+    ld_window = min(
+        max(_LD_SEARCH_SPAN_MULTIPLE * max(span_hi - span_lo, 1), _LD_MIN_WINDOW),
+        _LD_MAX_WINDOW,
+    )
     if ld:
         try:
             ld_frame = sdk.ld(
-                lead_id,
-                # the server's `window` is the TOTAL span it centres on the lead, so this is
-                # _LD_SEARCH_SPAN_MULTIPLE times the plotted width — wide enough to cover the
-                # window from a lead anywhere inside it, and to see just past both edges
-                window=max(_LD_SEARCH_SPAN_MULTIPLE * max(span_hi - span_lo, 1), 200_000),
-                r2_threshold=_LD_MIN_R2,
-                panel=ld_panel,
+                lead_id, window=ld_window, r2_threshold=_LD_MIN_R2, panel=ld_panel
+            )
+        except GeneticsError as exc:
+            # neither loses the figure, but they are different answers: a lead the panel does
+            # not carry stays that way, and only a failed server is worth a retry
+            ld_failure = (
+                "lead_not_in_panel" if exc.code == "ld_variant_not_in_panel" else "unavailable"
             )
         except Exception:
-            # the LD server is a third party and its absence must not lose the figure; the
-            # returned ld_joined=False is how a caller learns the colours mean nothing
-            ld_frame = None
+            ld_failure = "unavailable"
         else:
             outside = _partners_outside(ld_frame, span_lo, span_hi)
     colours, r2_values, ld_joined = _ld_colours(frame, lead_id, ld_frame)
+    ld_reach = ld_window // 2
+    if not ld:
+        ld_status = "off"
+    elif ld_failure:
+        ld_status = ld_failure
+    elif not ld_joined:
+        ld_status = "no_partners"
+    elif lead_pos - ld_reach > span_lo or lead_pos + ld_reach < span_hi:
+        ld_status = "partial"
+    else:
+        ld_status = "joined"
     frame = frame.with_columns(pl.Series("_r2", r2_values, dtype=pl.Float64))
 
     consequences = _consequences(region) if coding else None
@@ -775,6 +1068,15 @@ def locuszoom(
         for vid in frame["_variant_id"]
     ]
     lead_consequence, lead_gene = (consequences or {}).get(lead_id, (None, None))
+
+    named = list(marked)
+    if label_r2 is not None:
+        partners = frame.filter(
+            (pl.col("_r2") >= label_r2) & (pl.col("_variant_id") != lead_id)
+        ).sort("_y", descending=True)
+        named += [
+            vid for vid in partners["_variant_id"].head(_MAX_R2_LABELS) if vid not in named
+        ]
 
     own_figure = ax is None
     gene_frame = None
@@ -808,19 +1110,28 @@ def locuszoom(
                    c=[colours[i] for i in rows], marker=marker, s=9, linewidths=0.2,
                    edgecolors="#33333355", zorder=2)
 
-    lead_index = next(
-        (i for i, vid in enumerate(frame["_variant_id"]) if vid == lead_id), None
-    )
+    index_of = {vid: i for i, vid in enumerate(frame["_variant_id"]) if vid is not None}
+    lead_index = index_of.get(lead_id)
     lead_coding = bool(lead_index is not None and coding_flags[lead_index])
     ax.scatter([lead_pos], [lead_y], marker=_MARKER_CODING if lead_coding else _MARKER_OTHER,
                s=40, c=_LEAD_COLOUR, edgecolors="black", linewidths=0.4, zorder=3)
-    # below the point: above it, the label of a lead at the top of the panel runs into the
-    # axes frame, which is where the strongest association always sits
-    ax.annotate(_lead_label(lead_id, lead_row, lead_y, lead_consequence, lead_gene),
-                (lead_pos, lead_y),
-                textcoords="offset points", xytext=(0, -9), ha="center", va="top",
-                fontsize=6)
-    line_y = _significance_line(ax, significance)
+    for vid in marked:
+        # a ring, so the point keeps the colour and shape it already carries
+        i = index_of[vid]
+        ax.scatter([positions[i]], [ys[i]], s=42, facecolors="none", edgecolors="black",
+                   linewidths=0.7, zorder=3,
+                   marker=_MARKER_CODING if coding_flags[i] else _MARKER_OTHER)
+    line_y = _significance_line(ax, significance, label_right=True)
+
+    ld_note = {
+        "lead_not_in_panel": f"no LD: {lead_id} is not in the {ld_panel} panel",
+        "unavailable": "no LD: the LD server did not answer",
+        "no_partners": rf"nothing at r$^2\geq${_LD_MIN_R2:g} with {lead_id} in {ld_panel}",
+    }.get(ld_status)
+    if ld_note:
+        # where the legend would have been, so grey points say why they are grey
+        ax.text(0.006, 0.99, ld_note, transform=ax.transAxes, ha="left", va="top",
+                fontsize=5, color=_SIGNIFICANCE_GREY)
 
     if outside:
         # on the figure and not only in the returned dict: the figure is what reaches the
@@ -850,7 +1161,10 @@ def locuszoom(
         # the panel is named, not just the quantity: r² is to the lead and from one LD panel,
         # and a reader comparing two figures cannot tell either from a bare "r²". The panel
         # is whatever the call asked for, so a different one relabels itself.
-        ax.legend(handles=handles, title=f"LD $r^2$ to {lead_id} ({ld_panel})",
+        legend_title = f"LD $r^2$ to {lead_id} ({ld_panel})"
+        if ld_status == "partial":
+            legend_title += f"\nonly within {ld_reach / 1e6:g} Mb of the lead"
+        ax.legend(handles=handles, title=legend_title,
                   fontsize=5, title_fontsize=5, loc="upper left", ncol=1)
 
     # pinned before the gene track can widen it through sharex
@@ -871,7 +1185,36 @@ def locuszoom(
         # models between the points and their own scale
         ax.tick_params(labelbottom=True)
     chrom_label = frame["chr"][0] if "chr" in frame.columns else ""
-    ax.set_xlabel(f"position on chromosome {chrom_label}".rstrip(), fontsize=_LABEL_SIZE)
+    ax.set_xlabel(
+        f"position on chromosome {chrom_label}".rstrip() + " (Mb)", fontsize=_LABEL_SIZE
+    )
+    _mb_axis(ax)
+
+    # last, because where a label fits depends on everything else already being in place
+    _fit_title(ax, figure, own_figure)
+    renderer = _renderer(figure)
+    lead_gene_label = _track_symbol(lead_gene, gene_frame)
+    labels = [(
+        _lead_label(lead_id, lead_row, lead_y, lead_consequence, lead_gene_label),
+        lead_pos, lead_y, 6,
+    )]
+    highlighted = []
+    for vid in named:
+        row = frame.row(index_of[vid], named=True)
+        rsid = str(row.get("rsid") or "")
+        text = rsid if rsid.startswith("rs") else vid
+        if row["_r2"] is not None:
+            text += rf"  r$^2$ {row['_r2']:.2f}"
+        labels.append((text, row["pos"], row["_y"], 5.5))
+        highlighted.append({"variant": vid, "mlog10p": float(row["_y"]), "r2": row["_r2"]})
+    taken = [] if renderer is None else [
+        artist.get_window_extent(renderer)
+        for artist in [*ax.texts, ax.get_legend()] if artist is not None
+    ]
+    _place_labels(
+        ax, renderer, labels,
+        ax.transData.transform(np.column_stack([positions, ys])), taken,
+    )
 
     written = None
     if own_figure:
@@ -888,11 +1231,15 @@ def locuszoom(
         "n_variants": frame.height,
         "n_genes": n_genes,
         "n_exons": n_exons,
+        "strongest": strongest,
         "ld_joined": ld_joined,
+        "ld_status": ld_status,
         "ld_partners_outside_window": outside,
         "coding_marked": coding_marked,
         "lead_consequence": lead_consequence,
         "lead_gene": lead_gene,
+        "lead_gene_label": lead_gene_label,
+        "highlighted": highlighted,
     }
 
 

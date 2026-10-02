@@ -15,7 +15,7 @@ import polars as pl
 import pytest
 
 from genetics_mcp_server.sdk import plots
-from genetics_mcp_server.sdk.errors import GeneticsUsageError
+from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 
 
 def sumstats(rows):
@@ -893,7 +893,7 @@ def test_the_position_scale_sits_on_the_association_panel_above_the_gene_track(
     assert result["n_genes"] == 1
     assert visible_tick_labels(ax), "the association panel carries no position scale"
     assert not visible_tick_labels(gene_ax), "the scale is drawn twice, or under the genes"
-    assert ax.get_xlabel() == "position on chromosome 12"
+    assert ax.get_xlabel() == "position on chromosome 12 (Mb)"
     assert gene_ax.get_xlabel() == ""
 
 
@@ -1114,6 +1114,351 @@ def test_the_default_window_is_250kb_either_side():
     assert inspect.signature(plots.locuszoom).parameters["flank"].default == 250_000
     region, _chrom = plots._region_from_variant("12:49272869:C:T", 250_000)
     assert region == "12:49022869-49522869"
+
+
+# ------------------------------------------------------- which variant leads, and why
+
+
+def flat_frame(top_af, *, top_mlog10p=4.2, af_column="af"):
+    """A window with nothing significant, whose strongest variant has the given frequency."""
+    rows = [
+        {"chr": "16", "pos": 6_000_000 + i * 1_000, "ref": "A", "alt": "G",
+         "mlog10p": 1.0 + (i % 5) * 0.5, af_column: 0.2}
+        for i in range(20)
+    ]
+    rows[4].update(mlog10p=3.8, **{af_column: 0.046})   # the best common variant
+    rows[9].update(mlog10p=top_mlog10p, **{af_column: top_af})
+    return pl.DataFrame(rows)
+
+
+def lead_of(frame, **over):
+    kwargs = {"phenotype": "X", "region": "16:6000000-6020000", "data": frame,
+              "ld": False, "genes": False}
+    kwargs.update(over)
+    return plots.locuszoom(**kwargs)
+
+
+def test_a_rare_variant_below_the_line_does_not_lead_a_flat_window(monkeypatch, tmp_path):
+    """Measured: the strongest variant at RBFOX1 for schizophrenia was AF 0.00025 with beta
+    2.1 at p 6.5e-5, and the figure captioned it as the lead."""
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = lead_of(flat_frame(0.00025))
+    assert result["lead"] == "16:6004000:A:G"
+    assert result["strongest"] == "16:6009000:A:G", "the plain maximum is no longer reported"
+
+
+def test_a_rare_variant_that_reaches_the_line_still_leads(monkeypatch, tmp_path):
+    """The rule must not cost the real rare signals: TUBA1C's missense lead is AF 0.002."""
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = lead_of(flat_frame(0.002, top_mlog10p=12.7))
+    assert result["lead"] == result["strongest"] == "16:6009000:A:G"
+
+
+def test_a_frame_with_no_frequency_leads_with_its_strongest_variant(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = lead_of(flat_frame(0.00025).drop("af"))
+    assert result["lead"] == "16:6009000:A:G"
+
+
+def test_an_explicit_lead_is_never_overruled(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = lead_of(flat_frame(0.00025), lead="16:6009000:A:G")
+    assert result["lead"] == "16:6009000:A:G"
+
+
+def test_a_meta_analysis_frame_is_judged_on_its_per_cohort_frequency(monkeypatch, tmp_path):
+    """finngen_ukbb has `fg_af` and `ukbb_af` and no `af`, so a rule that read `af` alone let
+    a UKBB-only variant at AF 5e-5 lead with a beta of 40."""
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = lead_of(flat_frame(5.4e-5, af_column="ukbb_af"))
+    assert result["lead"] == "16:6004000:A:G"
+
+
+def test_the_lead_label_says_whose_frequency_it_prints():
+    label = plots._lead_label(
+        "12:2427715:G:A", {"beta": 40.0, "fg_af": None, "ukbb_af": 5.394e-05}, 3.37
+    )
+    assert "AF 5.394e-05 (ukbb)" in label
+    assert "(ukbb)" not in plots._lead_label("1:1:A:C", {"af": 0.3}, 3.0)
+
+
+# --------------------------------------------------------- why the points are grey
+
+
+def ld_answer(rows):
+    return pl.DataFrame(rows, schema={"variant": pl.Utf8, "r2": pl.Float64})
+
+
+def wide_frame():
+    """3 Mb of positions with the lead at the left edge."""
+    rows = [
+        {"chr": "16", "pos": 5_000_000 + i * 100_000, "ref": "A", "alt": "G",
+         "pval": 0.01, "mlog10p": 2.0}
+        for i in range(31)
+    ]
+    rows[0]["mlog10p"] = 30.0
+    return sumstats(rows)
+
+
+def test_ld_is_never_asked_for_over_more_than_the_server_accepts(monkeypatch, tmp_path):
+    """Above 5 Mb the LD server answers 400, which cost a 2.56 Mb plot every colour it had."""
+    from genetics_mcp_server import sdk
+
+    seen = {}
+
+    def fake_ld(variant, *, window, r2_threshold, panel):
+        seen["window"] = window
+        return ld_answer({"variant": ["16:5100000:A:G"], "r2": [0.9]})
+
+    monkeypatch.setattr(sdk, "ld", fake_ld)
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = plots.locuszoom(
+        phenotype="X", region="16:5000000-8000000", data=wide_frame(), genes=False,
+    )
+    assert seen["window"] == plots._LD_MAX_WINDOW
+    # the lead is at the left edge, so 2.5 Mb either side of it stops short of the right one
+    assert result["ld_status"] == "partial"
+    assert result["ld_joined"] is True
+
+
+@pytest.mark.parametrize(
+    "raised,status,note",
+    [
+        (GeneticsError("not in panel"), "lead_not_in_panel", "is not in the sisu42 panel"),
+        (GeneticsError("the LD server is unavailable"), "unavailable", "did not answer"),
+        (RuntimeError("anything else"), "unavailable", "did not answer"),
+    ],
+)
+def test_a_figure_without_ld_says_which_kind_of_without(
+    monkeypatch, tmp_path, raised, status, note
+):
+    """Both used to come back as `ld_joined: False`, and the model told the user to wait for
+    an outage when the lead was simply absent from the panel."""
+    from genetics_mcp_server import sdk
+
+    if status == "lead_not_in_panel":
+        raised.code = "ld_variant_not_in_panel"
+
+    def failing_ld(variant, **kwargs):
+        raise raised
+
+    monkeypatch.setattr(sdk, "ld", failing_ld)
+    result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True)
+    assert result["ld_status"] == status
+    assert result["ld_joined"] is False
+    assert any(note in t.get_text() for t in ax.texts), "the figure does not say why"
+    assert ax.get_legend() is None
+
+
+def test_the_other_ld_statuses(monkeypatch, tmp_path):
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    call = {"phenotype": "X", "region": "12:49400000-49600000", "genes": False}
+    assert plots.locuszoom(data=frame_of(), ld=False, **call)["ld_status"] == "off"
+
+    monkeypatch.setattr(sdk, "ld", lambda variant, **k: ld_answer({"variant": [], "r2": []}))
+    assert plots.locuszoom(data=frame_of(), **call)["ld_status"] == "no_partners"
+
+    monkeypatch.setattr(
+        sdk, "ld", lambda variant, **k: ld_answer({"variant": ["12:49501000:C:T"], "r2": [0.9]})
+    )
+    assert plots.locuszoom(data=frame_of(), **call)["ld_status"] == "joined"
+
+
+def test_the_sdk_error_carries_the_tool_layers_code():
+    from genetics_mcp_server.sdk.client import GeneticsClient
+
+    with pytest.raises(GeneticsError) as caught:
+        GeneticsClient._payload(
+            {"success": False, "error": "nope", "error_code": "ld_variant_not_in_panel"}
+        )
+    assert caught.value.code == "ld_variant_not_in_panel"
+    with pytest.raises(GeneticsError) as caught:
+        GeneticsClient._payload({"success": False, "error": "nope"})
+    assert caught.value.code is None
+
+
+# ------------------------------------------------------- what the reader has to decode
+
+
+def test_positions_are_printed_in_mb_and_not_against_an_offset(monkeypatch, tmp_path):
+    """The default formatter drew `1.5915 ... 1.5945` under a `1e8` set in 10 pt type."""
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path)
+    ax.figure.canvas.draw()
+    labels = [t.get_text() for t in ax.get_xticklabels() if t.get_text()]
+    assert labels, "no tick labels were drawn"
+    assert all(49.4 <= float(label) <= 49.7 for label in labels), labels
+    assert len(set(labels)) == len(labels), f"too few decimals to tell ticks apart: {labels}"
+    assert ax.xaxis.get_offset_text().get_text() == ""
+
+
+def test_a_gene_whose_transcript_misses_the_window_is_not_drawn():
+    """results-api returns a gene whose RECORD overlaps the region; AIM2's canonical
+    transcript ends 75 kb before the FCER1A window starts, and its label floated outside the
+    axes with nothing under it."""
+    _figure, ax = gene_axis()
+    genes = pl.DataFrame({
+        "gene_name": ["AIM2", "FCER1A"],
+        "gene_start": [159_056_129, 159_289_714],
+        "gene_end": [159_188_222, 159_308_224],
+        "gene_strand": ["-", "+"],
+        "exon_starts": [[159_062_484], [159_302_336]],
+        "exon_ends": [[159_076_766], [159_308_202]],
+        "cds_starts": [[None], [None]],
+        "cds_ends": [[None], [None]],
+    })
+    drawn, _exons = plots._draw_genes(ax, genes, 159_152_270, 159_452_270)
+    assert drawn == 1
+    assert [t.get_text() for t in ax.texts] == ["FCER1A→"]
+
+
+@pytest.mark.parametrize(
+    "symbol,expected",
+    [
+        ("MINOS1", "MICOS10"),      # renamed since the annotation was built
+        ("MICOS10", "MICOS10"),
+        ("NBL1", "NBL1"),
+        ("C1orf151", "C1orf151"),   # a previous symbol of two genes here: left alone
+        ("NOT_HERE", "NOT_HERE"),
+        (None, None),
+    ],
+)
+def test_the_leads_gene_is_named_the_way_the_track_names_it(symbol, expected):
+    genes = pl.DataFrame({
+        "gene_name": ["MICOS10", "NBL1", "OTHER"],
+        "hgnc_prev_symbol": ["C1orf151|MINOS1", None, "C1orf151"],
+    })
+    assert plots._track_symbol(symbol, genes) == expected
+    assert plots._track_symbol(symbol, None) == symbol
+
+
+def test_a_title_wider_than_the_figure_is_broken_and_not_clipped(monkeypatch, tmp_path):
+    long_title = (
+        "Potassium [Moles/volume] in Serum or Plasma [mmol/l], sample-wise median "
+        "(median_3023103_age_adjusted_IRN, FinnGen R14) — 12:49022869-49522869"
+    )
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, title=long_title)
+    figure = ax.figure
+    renderer = figure.canvas.get_renderer()
+    figure.draw_without_rendering()
+    assert "\n" in ax.title.get_text()
+    assert ax.title.get_text().replace("\n", " — ") == long_title
+    assert ax.title.get_window_extent(renderer).width <= figure.bbox.width
+
+
+def label_box(ax, text_fragment):
+    from matplotlib.text import Text
+
+    figure = ax.figure
+    figure.draw_without_rendering()
+    renderer = figure.canvas.get_renderer()
+    note = next(t for t in ax.texts if text_fragment in t.get_text())
+    return Text.get_window_extent(note, renderer), renderer
+
+
+def test_the_lead_label_stays_inside_the_axes_and_off_the_points(monkeypatch, tmp_path):
+    """Fixed below the point, the caption of a lead at the window's left edge ran across the
+    y axis, and at a dense locus it sat on the lead's own LD partners."""
+    rows = frame_of(n=60).to_dicts()
+    for row in rows:
+        row["mlog10p"], row["pval"] = 2.0, 0.01
+    rows[0].update(mlog10p=30.0, pval=1e-30)
+    # a column of points directly under the lead, where the label used to go
+    for i in range(1, 12):
+        rows[i].update(pos=rows[0]["pos"] + 10, mlog10p=30.0 - i * 0.4)
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, data=sumstats(rows))
+    box, _renderer = label_box(ax, "\np ")
+    frame = ax.bbox
+    assert box.x0 >= frame.x0 and box.x1 <= frame.x1, "the label leaves the axes"
+    points = ax.transData.transform([(r["pos"], r["mlog10p"]) for r in rows])
+    covered = [
+        (x, y) for x, y in points if box.x0 <= x <= box.x1 and box.y0 <= y <= box.y1
+    ]
+    assert not covered, "the label is drawn over data"
+
+
+def test_the_significance_label_is_on_the_right_where_the_legend_is_not(
+    monkeypatch, tmp_path
+):
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path)
+    label = next(t for t in ax.texts if t.get_text() == "p 5e-8")
+    assert label.get_horizontalalignment() == "right"
+    assert label.get_position()[0] > 0.9
+
+
+# ------------------------------------------------------------ naming more than the lead
+
+
+def ld_frame_for(frame, r2s):
+    ids = [f"12:{pos}:C:T" for pos in frame["pos"]]
+    return ld_answer({"variant": [ids[i] for i in r2s], "r2": list(r2s.values())})
+
+
+def test_the_centred_variant_is_marked_when_it_is_not_the_lead(monkeypatch, tmp_path):
+    """Asked for a plot of rs2251746, the figure named only the lead 20 kb away."""
+    result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, region=None, variant="12:49510000:C:T", flank=100_000,
+    )
+    assert result["lead"] == "12:49503000:C:T"
+    assert [h["variant"] for h in result["highlighted"]] == ["12:49510000:C:T"]
+    assert any(t.get_text().startswith("12:49510000:C:T") for t in ax.texts)
+
+
+def test_the_centred_variant_that_is_the_lead_is_not_named_twice(monkeypatch, tmp_path):
+    result, _ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, region=None, variant="12:49503000:C:T", flank=100_000,
+    )
+    assert result["highlighted"] == []
+
+
+def test_highlight_names_what_it_is_given_and_refuses_what_is_not_there(monkeypatch, tmp_path):
+    result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, highlight=["chr12:49520000:c:t", "12:49503000:C:T"],
+    )
+    # the lead is already named; asking for it again does not label it twice
+    assert [h["variant"] for h in result["highlighted"]] == ["12:49520000:C:T"]
+    with pytest.raises(GeneticsUsageError, match="not among the variants"):
+        drawn_figure(monkeypatch, tmp_path, highlight="12:1:A:C")
+
+
+def test_label_r2_names_the_leads_neighbours_strongest_first_up_to_the_cap(
+    monkeypatch, tmp_path
+):
+    from genetics_mcp_server import sdk
+
+    frame = frame_of(n=25)
+    # twelve partners above the threshold, one below it
+    r2s = {i: 0.9 for i in range(5, 17)} | {20: 0.5}
+    monkeypatch.setattr(sdk, "ld", lambda variant, **k: ld_frame_for(frame, r2s))
+    result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, data=frame, ld=True, label_r2=0.8,
+    )
+    named = result["highlighted"]
+    assert len(named) == plots._MAX_R2_LABELS
+    assert all(h["r2"] == pytest.approx(0.9) for h in named)
+    assert [h["mlog10p"] for h in named] == sorted((h["mlog10p"] for h in named), reverse=True)
+    assert sum("r$^2$ 0.90" in t.get_text() for t in ax.texts) == plots._MAX_R2_LABELS
+
+
+def test_labels_use_the_rsid_where_the_frame_has_one(monkeypatch, tmp_path):
+    frame = frame_of().with_columns(
+        pl.when(pl.col("pos") == 49_520_000).then(pl.lit("rs356219")).otherwise(None)
+        .alias("rsid")
+    )
+    _result, ax, _gene_ax = drawn_figure(
+        monkeypatch, tmp_path, data=frame, highlight="12:49520000:C:T",
+    )
+    assert any(t.get_text() == "rs356219" for t in ax.texts)
+
+
+@pytest.mark.parametrize("threshold", [0, -0.1, 1.5])
+def test_label_r2_outside_zero_to_one_is_refused(threshold):
+    with pytest.raises(GeneticsUsageError, match="label_r2"):
+        plots.locuszoom(
+            phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
+            genes=False, label_r2=threshold,
+        )
 
 
 # ---------------------------------------------------------------------------------- phewas
