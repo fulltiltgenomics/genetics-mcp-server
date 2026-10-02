@@ -1574,3 +1574,381 @@ def test_a_long_set_name_is_wrapped_on_the_axis(monkeypatch, tmp_path):
     )
     label = sets.get_yticklabels()[0].get_text()
     assert "\n" in label and label.endswith("…")
+
+
+# ---------------------------------------------------------------------------------- forest
+
+
+def cohort_frame(**over):
+    """Six cohorts' log odds ratios for one variant, the last one too small to say anything."""
+    columns = {
+        "cohort": ["FinnGen", "UK Biobank", "MVP", "Estonia", "BBJ", "All of Us"],
+        "beta": [0.262, 0.301, 0.224, 0.41, 0.19, 0.33],
+        "se": [0.021, 0.034, 0.018, 0.09, 0.05, 0.31],
+        "mlog10p": [35.2, 18.1, 34.6, 5.3, 3.9, 0.55],
+        "n_cases": [48211, 31044, 91230, 6021, 40250, 812],
+    }
+    columns.update(over)
+    return pl.DataFrame(columns)
+
+
+def drawn_forest(monkeypatch, tmp_path, frame, **kwargs):
+    """A whole forest drawn to `tmp_path`: the result, the table canvas and the interval panel."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    captured = {}
+    real_close = plt.close
+
+    def capture(figure=None):
+        if hasattr(figure, "axes"):
+            captured["figure"] = figure
+        real_close(figure)
+
+    monkeypatch.setattr(plt, "close", capture)
+    kwargs.setdefault("label", "cohort")
+    result = plots.forest(frame, **kwargs)
+    canvas = captured["figure"].axes[0]
+    return result, canvas, canvas.child_axes[0]
+
+
+def canvas_texts(canvas):
+    return [t.get_text() for t in canvas.texts]
+
+
+def test_forest_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
+    result, canvas, _panel = drawn_forest(monkeypatch, tmp_path, cohort_frame())
+    assert result["path"] == str(tmp_path / "forest.png")
+    assert (tmp_path / "forest.png").stat().st_size > 0
+    assert result["rows"] == ["FinnGen", "UK Biobank", "MVP", "Estonia", "BBJ", "All of Us"]
+    assert result["n_rows"] == result["n_estimates"] == 6
+    assert result["n_missing"] == result["n_omitted"] == 0
+    assert result["scale"] == "linear" and result["pooled"] == []
+    # frame order top to bottom, the numbers beside each row, and a p-value set as a
+    # journal sets it rather than as Python prints it
+    texts = canvas_texts(canvas)
+    assert texts.index("FinnGen") < texts.index("All of Us")
+    assert "0.26 (0.22 to 0.30)" in texts
+    assert r"$6.3\times10^{-36}$" in texts and "0.28" in texts
+
+
+def test_log_ratios_are_drawn_as_ratios_on_a_log_axis_around_one(monkeypatch, tmp_path):
+    result, canvas, panel = drawn_forest(
+        monkeypatch, tmp_path, cohort_frame(), scale="log_ratio"
+    )
+    assert panel.get_xscale() == "log"
+    assert "1.30 (1.25–1.35)" in canvas_texts(canvas)
+    assert "OR (95% CI)" in canvas_texts(canvas)
+    assert panel.get_xlabel() == "Odds ratio (95% CI)"
+    lo, hi = result["xlim"]
+    assert 0 < lo < 1 < hi
+    # the null line is at 1, not at 0
+    assert any(tuple(line.get_xdata()) == (1.0, 1.0) for line in panel.lines)
+    # and the axis is ticked where odds ratios are read, not at the decades alone
+    assert len(panel.get_xticks()) >= 3
+
+
+def test_ratios_given_as_ratios_need_bounds_and_must_be_positive(monkeypatch, tmp_path):
+    frame = pl.DataFrame({
+        "gene": ["PCSK9", "APOC3", "LPA"],
+        "or": [0.53, 0.60, 1.9], "lo": [0.41, 0.0, 1.5], "hi": [0.69, 0.85, math.inf],
+    })
+    result, canvas, _panel = drawn_forest(
+        monkeypatch, tmp_path, frame, label="gene", estimate="or", lower="lo", upper="hi",
+        scale="ratio",
+    )
+    texts = canvas_texts(canvas)
+    # a bound of zero or infinity is a one-sided interval, drawn to the edge and written so
+    assert "0.60 (0–0.85)" in texts and "1.90 (1.50–∞)" in texts
+    assert result["n_clipped"] == 2
+
+    with pytest.raises(GeneticsUsageError, match="needs lower= and upper="):
+        plots.forest(frame, label="gene", estimate="or", se="lo", scale="ratio")
+    # the commonest mistake: a log odds ratio passed as a ratio
+    logged = frame.with_columns(pl.Series("or", [-0.63, -0.51, 0.64]))
+    with pytest.raises(GeneticsUsageError, match="log_ratio"):
+        plots.forest(logged, label="gene", estimate="or", lower="lo", upper="hi", scale="ratio")
+
+
+def test_an_estimate_that_did_not_converge_does_not_take_the_axis(monkeypatch, tmp_path):
+    """A log odds ratio of -14 with a standard error of 300 is what a variant with no carriers
+    among the cases returns; left to set the scale it flattens every other row."""
+    frame = cohort_frame(
+        beta=[0.262, 0.301, 0.224, 0.41, 0.19, -14.2],
+        se=[0.021, 0.034, 0.018, 0.09, 0.05, 310.0],
+    )
+    result, canvas, panel = drawn_forest(monkeypatch, tmp_path, frame, scale="log_ratio")
+    lo, hi = result["xlim"]
+    assert 0.3 < lo and hi < 4
+    assert result["n_clipped"] == 1
+    # cut at both edges with an arrowhead each, and no marker for an estimate off the axis
+    arrowheads = [line for line in panel.lines if not line.get_clip_on()]
+    assert len(arrowheads) == 2
+    # the text column still answers, without pretending the digits mean something
+    assert "<0.001 (<0.001–>1,000)" in canvas_texts(canvas)
+
+
+def test_a_null_estimate_keeps_its_row_and_a_missing_error_draws_the_point_alone(
+    monkeypatch, tmp_path
+):
+    frame = cohort_frame(
+        beta=[0.262, None, 0.224, float("nan"), 0.19, 0.33],
+        se=[0.021, 0.034, None, 0.09, 0.0, 0.31],
+    )
+    result, canvas, _panel = drawn_forest(monkeypatch, tmp_path, frame)
+    assert result["n_rows"] == 6
+    assert result["n_missing"] == 2 and result["n_estimates"] == 4
+    texts = canvas_texts(canvas)
+    assert texts.count("NA") == 2
+    # no interval to write for a null or zero standard error
+    assert "0.22" in texts and "0.19" in texts
+
+
+def test_pooling_is_inverse_variance_and_reports_heterogeneity(monkeypatch, tmp_path):
+    frame = cohort_frame()
+    result, canvas, panel = drawn_forest(
+        monkeypatch, tmp_path, frame, scale="log_ratio", pool="fixed"
+    )
+    weights = [1 / s ** 2 for s in frame["se"]]
+    expected = sum(w * b for w, b in zip(weights, frame["beta"])) / sum(weights)
+    (fit,) = result["pooled"]
+    assert fit["method"] == "fixed" and fit["k"] == 6 and fit["group"] is None
+    assert fit["estimate"] == pytest.approx(math.exp(expected))
+    assert fit["se"] == pytest.approx(math.sqrt(1 / sum(weights)))
+    assert fit["lower"] < fit["estimate"] < fit["upper"]
+    assert 0 <= fit["i2"] < 1 and 0 < fit["p_het"] <= 1
+    # the pooled row is last and drawn as a diamond rather than a marker; heterogeneity is
+    # returned for the text and kept off the figure
+    assert result["rows"][-1] == "Fixed effect meta-analysis"
+    assert len(panel.patches) == 1
+    assert not any("I^2" in text for text in canvas_texts(canvas))
+
+
+def test_random_effects_widen_the_interval_only_when_the_rows_disagree():
+    agree = plots._forest_pool([0.2, 0.2, 0.2], [0.05, 0.04, 0.06], "random")
+    assert agree["tau2"] == 0 and agree["i2"] == 0
+    assert agree["se"] == pytest.approx(plots._forest_pool([0.2] * 3, [0.05, 0.04, 0.06], "fixed")["se"])
+    disagree_fixed = plots._forest_pool([0.0, 0.5, 1.0], [0.05, 0.05, 0.05], "fixed")
+    disagree_random = plots._forest_pool([0.0, 0.5, 1.0], [0.05, 0.05, 0.05], "random")
+    assert disagree_random["tau2"] > 0 and disagree_random["i2"] > 0.9
+    assert disagree_random["se"] > disagree_fixed["se"]
+
+
+def test_a_row_flagged_as_a_summary_is_a_diamond_and_stays_out_of_the_pool(
+    monkeypatch, tmp_path
+):
+    frame = cohort_frame().with_columns(pl.lit(False).alias("is_meta")).vstack(
+        pl.DataFrame({
+            "cohort": ["Published meta-analysis"], "beta": [0.25], "se": [0.012],
+            "mlog10p": [92.0], "n_cases": [170_000], "is_meta": [True],
+        })
+    ).sample(fraction=1.0, shuffle=True, seed=1)
+    result, _canvas, panel = drawn_forest(
+        monkeypatch, tmp_path, frame, summary="is_meta", pool="fixed"
+    )
+    # wherever the frame had it, the summary row is drawn after the rows it summarises
+    assert result["rows"][-2:] == ["Published meta-analysis", "Fixed effect meta-analysis"]
+    assert result["pooled"][0]["k"] == 6
+    assert len(panel.patches) == 2
+
+
+def stratified_frame():
+    rows = []
+    for trait, effects in {
+        "Height": {"Females": (0.03, 0.01), "Males": (0.02, 0.012)},
+        "BMI": {"Females": (0.05, 0.02), "Males": (-0.01, 0.015)},
+        "Testosterone": {"Males": (0.08, 0.03)},
+    }.items():
+        for sex, (beta, se) in effects.items():
+            rows.append({"trait": trait, "sex": sex, "beta": beta, "se": se})
+    return pl.DataFrame(rows)
+
+
+def test_a_series_puts_several_estimates_on_one_row_and_names_them_in_a_legend(
+    monkeypatch, tmp_path
+):
+    result, _canvas, panel = drawn_forest(
+        monkeypatch, tmp_path, stratified_frame(), label="trait", series="sex"
+    )
+    assert result["rows"] == ["Height", "BMI", "Testosterone"]
+    assert result["series"] == ["Females", "Males"]
+    assert result["n_estimates"] == 5
+    assert [t.get_text() for t in panel.get_legend().get_texts()] == ["Females", "Males"]
+    # two hues, and the same series is the same hue on every row
+    colours = {line.get_color() for line in panel.lines if line.get_marker() in ("o", "s")}
+    assert len(colours) == 2
+
+    doubled = stratified_frame().vstack(stratified_frame().head(1))
+    with pytest.raises(GeneticsUsageError, match="share label"):
+        plots.forest(doubled, label="trait", series="sex")
+
+
+def test_groups_are_headed_in_order_of_first_appearance_and_pooled_separately(
+    monkeypatch, tmp_path
+):
+    frame = cohort_frame().with_columns(
+        pl.Series("ancestry", ["European", "European", "Mixed", "European", "East Asian", "Mixed"])
+    )
+    result, canvas, _panel = drawn_forest(
+        monkeypatch, tmp_path, frame, group="ancestry", pool="random", sort_by="estimate"
+    )
+    assert result["groups"] == ["European", "Mixed", "East Asian"]
+    # largest first within a group, the pooled row after its own group's rows, and no
+    # pooled row for a group of one
+    assert result["rows"] == [
+        "Estonia", "UK Biobank", "FinnGen", "Random effects meta-analysis",
+        "All of Us", "MVP", "Random effects meta-analysis",
+        "BBJ",
+    ]
+    assert [fit["group"] for fit in result["pooled"]] == ["European", "Mixed"]
+    headings = [t for t in canvas.texts if t.get_text() in result["groups"]]
+    assert all(t.get_fontweight() == "bold" for t in headings)
+
+
+def test_the_cut_keeps_the_first_rows_and_says_how_many_it_left_out(monkeypatch, tmp_path):
+    frame = pl.DataFrame({
+        "cohort": [f"locus {i}" for i in range(40)],
+        "beta": [0.01 * i for i in range(40)],
+        "se": [0.02] * 40,
+    })
+    result, canvas, _panel = drawn_forest(monkeypatch, tmp_path, frame, max_rows=15)
+    assert result["n_rows"] == 15 and result["n_omitted"] == 25
+    assert result["rows"][0] == "locus 0" and result["rows"][-1] == "locus 14"
+    assert "25 further rows not drawn" in canvas_texts(canvas)
+
+
+def test_significance_hollows_the_markers_that_miss_it(monkeypatch, tmp_path):
+    result, _canvas, panel = drawn_forest(
+        monkeypatch, tmp_path, cohort_frame(), significance=5e-8
+    )
+    faces = [
+        line.get_markerfacecolor() for line in panel.lines
+        if line.get_marker() == "o" and line.get_clip_on()
+    ]
+    # FinnGen, UK Biobank and MVP pass 5e-8; the other three do not
+    assert faces.count("white") == 3 and len(faces) == 6
+    assert len(panel.get_legend().get_texts()) == 2
+
+    with pytest.raises(GeneticsUsageError, match="significance= needs a p-value"):
+        plots.forest(cohort_frame().drop("mlog10p"), label="cohort", significance=5e-8)
+
+
+def test_a_weight_draws_squares_scaled_by_area_and_nothing_else_does(monkeypatch, tmp_path):
+    _result, _canvas, panel = drawn_forest(monkeypatch, tmp_path, cohort_frame())
+    plain = {(line.get_marker(), line.get_markersize()) for line in panel.lines if line.get_marker() == "o"}
+    assert plain == {("o", plots._FOREST_MARKER_PT)}
+
+    _result, _canvas, panel = drawn_forest(monkeypatch, tmp_path, cohort_frame(), weight="n_cases")
+    sides = [line.get_markersize() for line in panel.lines if line.get_marker() == "s"]
+    assert len(sides) == 6
+    # MVP has the most cases and All of Us the fewest
+    assert max(sides) == sides[2] == pytest.approx(plots._FOREST_WEIGHT_PT[1])
+    assert min(sides) == sides[5] and min(sides) >= plots._FOREST_WEIGHT_PT[0]
+
+
+def test_extra_columns_and_the_table_switch(monkeypatch, tmp_path):
+    result, canvas, _panel = drawn_forest(
+        monkeypatch, tmp_path, cohort_frame(), columns={"n_cases": "Cases"}, italic=True
+    )
+    texts = canvas_texts(canvas)
+    assert "Cases" in texts and "48,211" in texts
+    assert {t.get_fontstyle() for t in canvas.texts if t.get_text() == "FinnGen"} == {"italic"}
+    wide = result["size_in"][0]
+
+    result, canvas, _panel = drawn_forest(
+        monkeypatch, tmp_path, cohort_frame(), columns={"n_cases": "Cases"}, table=False
+    )
+    assert "Cases" not in canvas_texts(canvas) and "48,211" not in canvas_texts(canvas)
+    assert result["size_in"][0] < wide
+
+
+def test_a_label_is_cut_to_length_and_a_dollar_sign_is_not_mathtext(monkeypatch, tmp_path):
+    frame = cohort_frame(cohort=[
+        "Costs between $5 and $10 per sample", "x" * 80, "MVP", "Estonia", "BBJ", "All of Us",
+    ])
+    result, _canvas, _panel = drawn_forest(monkeypatch, tmp_path, frame)
+    assert result["rows"][0] == r"Costs between \$5 and \$10 per sample"
+    assert len(result["rows"][1]) == 48 and result["rows"][1].endswith("…")
+    assert (tmp_path / "forest.png").stat().st_size > 0
+
+
+def test_an_explicit_xlim_cuts_what_lies_outside_it(monkeypatch, tmp_path):
+    result, _canvas, panel = drawn_forest(
+        monkeypatch, tmp_path, cohort_frame(), scale="log_ratio", xlim=(1.0, 1.4)
+    )
+    assert result["xlim"] == (1.0, 1.4)
+    assert panel.get_xlim() == pytest.approx((1.0, 1.4))
+    # UK Biobank's upper bound, Estonia's estimate with it, and All of Us on both sides
+    assert result["n_clipped"] == 3
+
+
+def test_forest_into_a_caller_supplied_axis_saves_nothing(monkeypatch, tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    figure, (left, right) = plt.subplots(1, 2)
+    result = plots.forest(cohort_frame(), label="cohort", ax=left)
+    assert result["path"] is None
+    assert not list(tmp_path.iterdir())
+    assert left.child_axes and not right.child_axes
+    plt.close("all")
+
+
+@pytest.mark.parametrize(
+    "mlog10p, expected",
+    [
+        (0.55, "0.28"),
+        (2.0, "0.01"),
+        (7.3, r"$5.0\times10^{-8}$"),
+        (8.0, r"$1.0\times10^{-8}$"),
+        (400.5, r"$3.2\times10^{-401}$"),
+        (None, ""),
+        (float("inf"), ""),
+    ],
+)
+def test_a_p_value_is_set_the_way_a_journal_sets_it(mlog10p, expected):
+    assert plots._forest_p(mlog10p) == expected
+
+
+@pytest.mark.parametrize(
+    "lo, hi, expected",
+    [
+        (0.7, 1.6, [0.8, 1.0, 1.2, 1.4, 1.6]),
+        (0.18, 5.6, [0.2, 0.5, 1.0, 2.0, 5.0]),
+        # too many decades to tick each: every other one, counted from the null
+        (1e-4, 1e4, [1e-4, 1e-2, 1.0, 100.0, 1e4]),
+    ],
+)
+def test_a_ratio_axis_is_ticked_at_the_numbers_a_reader_expects(lo, hi, expected):
+    assert plots._forest_ratio_ticks(lo, hi) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"scale": "odds"}, "scale must be one of"),
+        ({"pool": "bayes"}, "pool must be one of"),
+        ({"sort_by": "p"}, "sort_by must be one of"),
+        ({"ci": 95}, "coverage"),
+        ({"lower": "beta"}, "both lower= and upper="),
+        ({"se": "stderr"}, "no 'stderr' column"),
+        ({"label": "study"}, "not in the frame"),
+        ({"columns": ["n_controls"]}, "not in the frame"),
+        ({"direction": "higher risk"}, "direction is a pair"),
+        ({"xlim": (2, 1)}, "xlim must be increasing"),
+        ({"scale": "log_ratio", "xlim": (-1, 2)}, "positive on a ratio axis"),
+    ],
+)
+def test_forest_refuses_what_it_cannot_draw(kwargs, message):
+    kwargs.setdefault("label", "cohort")
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.forest(cohort_frame(), **kwargs)
+
+
+def test_an_empty_frame_is_refused_rather_than_drawn_as_an_empty_table():
+    with pytest.raises(GeneticsUsageError, match="nothing to plot"):
+        plots.forest(cohort_frame().head(0), label="cohort")

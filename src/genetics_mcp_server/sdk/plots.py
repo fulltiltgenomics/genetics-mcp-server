@@ -4,6 +4,7 @@
     genetics.plots.locuszoom(phenotype="H8_HEARINGLOSS", variant="12:49578357:C:T")
     genetics.plots.phewas(variant="19:44908684:T:C")
     genetics.plots.upset(sets={"Crohn": cd_ids, "UC": uc_ids})
+    genetics.plots.forest(frame, label="cohort", scale="log_ratio", pool="fixed")
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
@@ -37,6 +38,7 @@ import itertools
 import math
 import os
 import re
+import statistics
 import textwrap
 from typing import Any
 
@@ -45,7 +47,7 @@ import polars as pl
 
 from genetics_mcp_server.sdk.errors import GeneticsUsageError
 
-__all__ = ["locuszoom", "phewas", "upset", "linemodels"]
+__all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest"]
 
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
@@ -1674,4 +1676,848 @@ def linemodels(
         "n_assigned": assigned,
         "n_undetermined": undetermined,
         "threshold": threshold,
+    }
+
+
+# ---------------------------------------------------------------------------------- forest
+
+# One ink when there is a single series: an estimate, its interval and the numbers beside it
+# are one statement, and a hue there would encode nothing a reader decodes.
+_FOREST_INK = "#222222"
+_FOREST_MUTED = "#8A8A8A"
+
+# Okabe–Ito without its yellow, which does not hold a hairline on white. Data encoding, as on
+# the line-models figure: a reader decodes the series from the hue and, in greyscale, from
+# the marker, so neither follows the prop_cycle. No diamond among the markers — that shape
+# is a pooled estimate's.
+_FOREST_SERIES = (
+    ("#0072B2", "o"), ("#D55E00", "s"), ("#009E73", "^"), ("#CC79A7", "v"),
+    ("#E69F00", "P"), ("#56B4E9", "X"), ("#000000", "h"),
+)
+
+# inches. A row holds one estimate, or one per series stacked `_FOREST_MARK_IN` apart. The
+# interval panel is a fixed width and the columns either side are measured, so the figure
+# is as wide as its longest label needs and as tall as its rows.
+_FOREST_ROW_IN = 0.155
+_FOREST_MARK_IN = 0.115
+_FOREST_HEADER_IN = 0.2
+_FOREST_PLOT_IN = 2.3
+_FOREST_GUTTER_IN = 0.14
+_FOREST_INDENT_IN = 0.09
+_FOREST_SIDE_IN = 0.08
+_FOREST_DIAMOND_IN = 0.045
+_FOREST_LABEL_CHARS = 48
+_FOREST_CELL_CHARS = 24
+
+# A small filled circle of one size, which is what the genetics literature draws; the
+# weight-scaled square is the meta-analysis convention and appears only when a weight is
+# asked for. Marker AREA is what a weight scales, between these two sides in points.
+_FOREST_MARKER_PT = 3.2
+_FOREST_WEIGHT_PT = (1.8, 5.6)
+_FOREST_INTERVAL_WIDTH = 0.75
+
+# An interval more than this many times wider than the median one does not set the axis: it
+# is drawn to the edge and ends in an arrowhead. Without it one estimate from a model that
+# did not converge — a log odds ratio of -14 with a standard error of 300 is what a variant
+# with no carriers among the cases returns — takes the whole axis and flattens every other
+# row into a column of dots at the null.
+_FOREST_CLIP = 4.0
+
+_FOREST_SCALES = ("linear", "log_ratio", "ratio")
+_FOREST_POOLS = {"fixed": "Fixed effect meta-analysis", "random": "Random effects meta-analysis"}
+_FOREST_SORTS = ("estimate",)
+_FOREST_EFFECT_NAMES = {"OR": "Odds ratio", "HR": "Hazard ratio", "RR": "Risk ratio"}
+_FOREST_UNGROUPED = "Other"
+
+# exp() of anything past this overflows a float, and a log ratio that large is not an
+# estimate of anything
+_FOREST_MAX_LOG = 700.0
+
+
+def _plain(value: Any, limit: int) -> str:
+    """A caller's string as text matplotlib draws literally, cut to `limit` characters.
+
+    Two dollar signs in one string are a mathtext expression to matplotlib, so a label
+    holding a pair of them fails at draw time and loses the figure.
+    """
+    text = " ".join(str(value).split())
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text.replace("$", r"\$")
+
+
+def _text_width_in(text: str, size: float, bold: bool = False) -> float:
+    """How wide a string draws, in inches, without needing a figure to draw it on."""
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+
+    if not text:
+        return 0.0
+    try:
+        prop = FontProperties(weight="bold" if bold else "normal")
+        return float(TextPath((0, 0), text, size=size, prop=prop).get_extents().width) / 72
+    except Exception:
+        # a string the path renderer cannot lay out still needs a column to sit in
+        return 0.6 * size * len(text) / 72
+
+
+def _floats(frame: pl.DataFrame, column: str, keep_inf: bool = False) -> list[float | None]:
+    """A column as floats, with what cannot be one — and NaN — as None.
+
+    `keep_inf` is for interval bounds, where an infinite bound is a one-sided interval
+    rather than a missing value.
+    """
+    out: list[float | None] = []
+    for value in frame[column].cast(pl.Float64, strict=False).to_list():
+        if value is None or math.isnan(value) or (math.isinf(value) and not keep_inf):
+            out.append(None)
+        else:
+            out.append(float(value))
+    return out
+
+
+def _forest_p(mlog10p: float | None) -> str:
+    """A p-value as a journal sets it: `0.034`, or `3.2×10⁻⁸` with a real superscript.
+
+    Taken apart from -log10(p) for the reason `_format_p` gives.
+    """
+    if mlog10p is None or not math.isfinite(mlog10p) or mlog10p < 0:
+        return ""
+    if mlog10p < 3:
+        return f"{10 ** -mlog10p:.2g}"
+    exponent = math.floor(mlog10p)
+    mantissa = 10 ** (1 - (mlog10p - exponent))
+    exponent += 1
+    if round(mantissa, 1) >= 10:
+        mantissa /= 10
+        exponent -= 1
+    return rf"${mantissa:.1f}\times10^{{-{exponent}}}$"
+
+
+def _forest_decimals(values: list[float]) -> int:
+    """Two decimals, or as many as it takes for the typical estimate to show two digits."""
+    sizes = sorted(abs(v) for v in values if v)
+    if not sizes or sizes[len(sizes) // 2] >= 0.1:
+        return 2
+    return min(6, math.ceil(-math.log10(sizes[len(sizes) // 2])) + 1)
+
+
+def _forest_number(value: float, decimals: int, ratio: bool = False) -> str:
+    """One number of the estimate column, with a typographic minus.
+
+    A ratio past three orders of magnitude either way is written as a bound: an odds ratio
+    of 5×10²⁵⁷ is a model that did not converge, and its digits are not information.
+    """
+    size = abs(value)
+    if ratio and size < 0.001:
+        return "<0.001"
+    if ratio and size > 1000:
+        return ">1,000"
+    if size >= 1e5:
+        exponent = math.floor(math.log10(size))
+        return rf"${value / 10 ** exponent:.1f}\times10^{{{exponent}}}$"
+    if size >= 100:
+        text = f"{value:.0f}"
+    elif size >= 10:
+        text = f"{value:.1f}"
+    else:
+        text = f"{value:.{3 if ratio and size < 0.01 else decimals}f}"
+    if float(text) == 0:
+        text = text.lstrip("-")
+    return text.replace("-", "−")
+
+
+def _forest_cell(value: Any) -> str:
+    """One cell of a caller's extra column: counts with separators, floats to three digits."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        if value.is_integer() and abs(value) < 1e15:
+            return f"{int(value):,}"
+        return f"{value:.3g}".replace("-", "−")
+    return _plain(value, _FOREST_CELL_CHARS)
+
+
+def _forest_ratio_ticks(lo: float, hi: float) -> list[float]:
+    """Tick values for a ratio axis: the numbers a reader expects, not the decades alone.
+
+    A log axis left to itself ticks at powers of ten, which puts one tick — or none — on an
+    axis running from 0.7 to 1.6, the range most odds ratios live in. A narrow axis is
+    ticked in even steps and a wide one at 1-2-5, thinned to the decades when those crowd.
+    """
+    from matplotlib.ticker import MaxNLocator
+
+    if hi / lo < 3:
+        ticks = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]).tick_values(lo, hi)
+        return [float(t) for t in ticks if lo <= t <= hi]
+    decades = range(math.floor(math.log10(lo)), math.ceil(math.log10(hi)) + 1)
+    ticks: list[float] = []
+    for mantissas in ((1, 2, 5), (1,)):
+        ticks = [m * 10.0 ** e for e in decades for m in mantissas if lo <= m * 10.0 ** e <= hi]
+        if len(ticks) <= 7:
+            return ticks
+    # every nth decade, counted from 1 so that the null keeps its tick
+    step = math.ceil(len(ticks) / 7)
+    return [10.0 ** e for e in decades if e % step == 0 and lo <= 10.0 ** e <= hi]
+
+
+def _forest_tick_label(value: float) -> str:
+    if value >= 1e4 or value < 1e-3:
+        return rf"$10^{{{round(math.log10(value))}}}$"
+    return f"{value:g}"
+
+
+def _forest_pool(estimates: list[float], ses: list[float], method: str) -> dict[str, float]:
+    """The inverse-variance pooled estimate and its heterogeneity, on the scale given.
+
+    `random` is DerSimonian–Laird: the between-row variance is the moment estimate from
+    Cochran's Q, floored at zero, where it gives the fixed-effect answer back.
+    """
+    from scipy.stats import chi2, norm
+
+    b = np.asarray(estimates, dtype=float)
+    variances = np.square(np.asarray(ses, dtype=float))
+    w = 1.0 / variances
+    fixed = float((w * b).sum() / w.sum())
+    q = float((w * np.square(b - fixed)).sum())
+    df = len(b) - 1
+    spread = float(w.sum() - np.square(w).sum() / w.sum())
+    tau2 = max(0.0, (q - df) / spread) if spread > 0 else 0.0
+    if method == "random":
+        w = 1.0 / (variances + tau2)
+    pooled = float((w * b).sum() / w.sum())
+    se = math.sqrt(1.0 / float(w.sum()))
+    return {
+        "a": pooled,
+        "se": se,
+        "mlog10p": float(-(math.log(2) + norm.logsf(abs(pooled / se))) / math.log(10)),
+        "k": len(b),
+        "q": q,
+        "i2": max(0.0, (q - df) / q) if q > 0 else 0.0,
+        "tau2": tau2,
+        "p_het": float(chi2.sf(q, df)),
+    }
+
+
+def _forest_limits(marks: list[dict[str, Any]]) -> tuple[float, float]:
+    """The axis limits on the analysis scale, where the null is 0.
+
+    The axis covers the null, every estimate that is informative, and every interval up to
+    `_FOREST_CLIP` median half-widths past those. An estimate whose own interval is wider
+    than that is not informative and does not set the axis either.
+    """
+    halves = [
+        (m["hi"] - m["lo"]) / 2 for m in marks
+        if m["lo"] is not None and m["hi"] is not None
+        and math.isfinite(m["lo"]) and math.isfinite(m["hi"]) and m["hi"] > m["lo"]
+    ]
+    reach = _FOREST_CLIP * statistics.median(halves) if halves else 0.0
+
+    def informative(m: dict[str, Any]) -> bool:
+        if m["a"] is None:
+            return False
+        if m["lo"] is None or m["hi"] is None or not halves:
+            return True
+        return (m["hi"] - m["lo"]) / 2 <= reach
+
+    centres = [m["a"] for m in marks if informative(m)] + [0.0]
+    lo, hi = min(centres), max(centres)
+    lows = [max(m["lo"], lo - reach) for m in marks if m["lo"] is not None]
+    highs = [min(m["hi"], hi + reach) for m in marks if m["hi"] is not None]
+    lo, hi = min(lows + [lo]), max(highs + [hi])
+    if hi <= lo:
+        return lo - 1.0, hi + 1.0
+    pad = 0.04 * (hi - lo)
+    return lo - pad, hi + pad
+
+
+def forest(
+    data: pl.DataFrame,
+    *,
+    label: str,
+    estimate: str = "beta",
+    se: str | None = "se",
+    lower: str | None = None,
+    upper: str | None = None,
+    scale: str = "linear",
+    ci: float = 0.95,
+    group: str | None = None,
+    series: str | None = None,
+    summary: str | None = None,
+    pool: str | None = None,
+    weight: str | None = None,
+    pvalue: str | None = "auto",
+    significance: float | None = None,
+    columns: Any = None,
+    table: bool = True,
+    sort_by: str | None = None,
+    effect: str | None = None,
+    xlabel: str | None = None,
+    xlim: Any = None,
+    direction: Any = None,
+    italic: bool = False,
+    max_rows: int = 45,
+    path: str | None = None,
+    title: str | None = None,
+    ax: Any = None,
+) -> dict[str, Any]:
+    """Forest plot: one estimate and its confidence interval per row, with the numbers beside it.
+
+    `data` has one row per estimate. `label` names the column written down the left;
+    `estimate` and `se` name the effect and its standard error, from which the `ci` interval
+    (95%) is drawn. Pass `lower=` and `upper=` instead where the frame carries the bounds —
+    they win over `se`, need not be symmetric, and an infinite one draws a one-sided
+    interval. Rows are drawn top to bottom in frame order, so sort the frame first, or pass
+    `sort_by="estimate"` for largest first.
+
+    SAY WHAT THE NUMBERS ARE, with `scale`:
+
+    - `"linear"` (default) — drawn as given, null at 0. A quantitative trait's beta.
+    - `"log_ratio"` — the estimates are LOG odds/hazard/risk ratios, which is what a
+      binary-trait GWAS `beta` and a burden `beta` are. They are exponentiated: the axis is
+      logarithmic and labelled in ratio units, the null is 1, and the text column reads
+      `1.35 (1.21–1.50)` where a linear one reads `0.12 (0.08 to 0.16)`.
+    - `"ratio"` — the estimates are already ratios; same axis, nothing exponentiated. This
+      one needs `lower=`/`upper=`, since a standard error is on the log scale.
+
+    Log odds ratios and per-s.d. betas do not share an axis: draw binary and quantitative
+    traits as two forests rather than one.
+
+    STRUCTURE. `group=` puts the rows under bold section headings, in order of first
+    appearance. `series=` draws several estimates on one row — one per value, each in its
+    own colour and marker with a legend — for the same rows measured twice: two cohorts,
+    two sexes, discovery and replication. A row is then one `label` (within its group), and
+    a series a row lacks leaves its slot empty. `summary=` names a boolean column flagging
+    rows that are already pooled estimates — a meta-analysis row from the data — which are
+    drawn last in their group, under a hairline, as a diamond spanning the interval.
+
+    `pool="fixed"` or `"random"` computes that diamond instead: the inverse-variance
+    (DerSimonian–Laird for random) estimate over each group's rows, or over all of them
+    without `group=`, and per series with `series=`. I² and the heterogeneity p are in the
+    returned `pooled`, not on the figure — report them in the text. Pool only rows that
+    estimate ONE quantity in INDEPENDENT samples — cohorts, ancestries, sexes. Different
+    phenotypes are not replicates, and a meta-analysis row pooled with its own components
+    counts those samples twice; flag such a row with `summary=`, which also keeps it out
+    of the pool.
+
+    ENCODING. Every estimate is a small filled circle unless one of these is asked for.
+    `significance=` (a p threshold) fills the markers that pass it and leaves the rest
+    hollow, with a legend saying so. `weight=` names a column — sample size, say — and
+    draws squares whose area is scaled by it, the meta-analysis convention.
+
+    TEXT. To the right: the estimate with its interval, the p-value when the frame has one
+    (`mlog10p`, else `pval`; `pvalue=` names another column, read as -log10 p when its name
+    starts with `mlog`, and `pvalue=None` drops it), and then any `columns=` — a list of
+    column names, or a dict of column to heading — such as case counts. `table=False`
+    leaves all of it out. `effect` is the measure's short name in the heading and the axis
+    label ("β", "OR", "HR"); `direction=("lower risk", "higher risk")` writes what each
+    side of the null means under the axis; `italic=True` sets the labels in italics, for
+    a column of gene symbols.
+
+    WHAT IS HANDLED RATHER THAN LEFT TO THE CALLER. A null or non-finite estimate keeps its
+    row and reads `NA`. A missing or non-positive standard error draws the point alone. An
+    interval far wider than the others is cut at the axis edge with an arrowhead instead of
+    setting the scale, and so is anything outside an explicit `xlim=` (given in the units
+    of the axis); the text column still carries the full numbers, and `n_clipped` and
+    `xlim` say how many were cut and where, for the legend. Labels are cut at 48
+    characters, and no more than `max_rows` rows are drawn — the first ones, with the rest
+    counted on the figure and in `n_omitted`; split a longer table into several figures.
+
+    Returns a dict describing what was drawn: `path`, `n_rows`, `n_estimates`, `n_missing`
+    (estimates that were null), `n_clipped` (intervals cut at the axis), `n_omitted`,
+    `scale`, `xlim` in axis units, `groups`, `series`, `rows` (the labels, top to bottom),
+    `size_in` (the width and height in inches the figure needs), and `pooled`: one dict per
+    computed diamond with `group`, `series`, `method`, `k`, `estimate`, `lower`, `upper` in
+    axis units, `se` on the scale the estimates were given, `mlog10p`, `q`, `i2`, `tau2` and
+    `p_het`.
+
+    `path` may be relative, in which case it is written inside the execution's artifacts
+    directory and returned to the user automatically; that is also where the default goes.
+    Pass `ax` to draw in its place in an existing figure, in which case nothing is saved;
+    give that axis about `size_in`, since the text does not shrink to fit.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.markers import CARETLEFT, CARETRIGHT
+    from matplotlib.patches import Polygon
+    from matplotlib.ticker import FixedFormatter, FixedLocator, MaxNLocator, NullLocator
+    from matplotlib.transforms import ScaledTranslation
+
+    if not isinstance(data, pl.DataFrame):
+        raise GeneticsUsageError(f"data must be a polars DataFrame, not {type(data).__name__}")
+    if scale not in _FOREST_SCALES:
+        raise GeneticsUsageError(f"scale must be one of {_FOREST_SCALES}, not {scale!r}")
+    if pool is not None and pool not in _FOREST_POOLS:
+        raise GeneticsUsageError(
+            f"pool must be one of {tuple(_FOREST_POOLS)} or None, not {pool!r}"
+        )
+    if sort_by is not None and sort_by not in _FOREST_SORTS:
+        raise GeneticsUsageError(f"sort_by must be one of {_FOREST_SORTS} or None, not {sort_by!r}")
+    if not 0 < ci < 1:
+        raise GeneticsUsageError(f"ci is a coverage in (0, 1), e.g. 0.95; got {ci!r}")
+    if (lower is None) != (upper is None):
+        raise GeneticsUsageError("give both lower= and upper=, or neither")
+    if direction is not None and (isinstance(direction, str) or len(direction) != 2):
+        raise GeneticsUsageError(
+            "direction is a pair: what below the null means, then what above it means"
+        )
+    if isinstance(columns, str):
+        columns = [columns]
+    extra = dict(columns) if isinstance(columns, dict) else {c: c for c in (columns or [])}
+    if pvalue == "auto":
+        pvalue = next((c for c in ("mlog10p", "pval") if c in data.columns), None)
+    has_bounds = lower is not None
+    if not has_bounds and se is not None and se not in data.columns:
+        raise GeneticsUsageError(
+            f"no {se!r} column to draw intervals from; name the standard error with se=, "
+            f"pass lower= and upper=, or se=None for the estimates alone. "
+            f"Columns are {data.columns}"
+        )
+    if not has_bounds and se is not None and scale == "ratio":
+        raise GeneticsUsageError(
+            "scale='ratio' needs lower= and upper=: a standard error is on the log scale. "
+            "If the estimates are log ratios, that is scale='log_ratio'"
+        )
+    needed = [label, estimate, lower, upper, group, series, summary, weight, pvalue, *extra]
+    missing = [c for c in needed if c is not None and c not in data.columns]
+    if missing:
+        raise GeneticsUsageError(f"columns {missing} are not in the frame; columns are {data.columns}")
+    if data.is_empty():
+        raise GeneticsUsageError("the frame has no rows — nothing to plot")
+    if significance is not None and pvalue is None:
+        raise GeneticsUsageError(
+            "significance= needs a p-value per row and the frame has neither `mlog10p` nor "
+            "`pval`; name the column with pvalue="
+        )
+
+    ratio = scale != "linear"
+    z = statistics.NormalDist().inv_cdf(0.5 + ci / 2)
+    n = data.height
+
+    def analysis(value: float | None, row: int, column: str) -> float | None:
+        """A value on the scale the arithmetic is done in: logged where it came as a ratio."""
+        if value is None:
+            return None
+        if scale == "log_ratio":
+            return max(min(value, _FOREST_MAX_LOG), -_FOREST_MAX_LOG)
+        if scale == "linear" or value == math.inf:
+            return value
+        if value == 0 and column == lower:
+            return -math.inf
+        if value <= 0:
+            raise GeneticsUsageError(
+                f"scale='ratio' takes ratios, which are positive, but row {row} has "
+                f"{column}={value:g}. Log odds ratios — a GWAS `beta` — are scale='log_ratio'"
+            )
+        return math.log(value)
+
+    estimates = _floats(data, estimate)
+    lows = _floats(data, lower, keep_inf=True) if has_bounds else [None] * n
+    highs = _floats(data, upper, keep_inf=True) if has_bounds else [None] * n
+    ses = _floats(data, se) if se is not None and se in data.columns and scale != "ratio" else [None] * n
+    weights = _floats(data, weight) if weight else [None] * n
+    if pvalue is None:
+        mlog10ps: list[float | None] = [None] * n
+    elif pvalue.lower().startswith("mlog"):
+        mlog10ps = _floats(data, pvalue, keep_inf=True)
+    else:
+        mlog10ps = [
+            None if p is None or not 0 <= p <= 1 else -math.log10(max(p, 5e-324))
+            for p in _floats(data, pvalue)
+        ]
+    flagged = (
+        data[summary].cast(pl.Boolean, strict=False).fill_null(False).to_list()
+        if summary else [False] * n
+    )
+    labels = [_plain("—" if v is None else v, _FOREST_LABEL_CHARS) for v in data[label].to_list()]
+    groups_of = (
+        [_FOREST_UNGROUPED if v is None else _plain(v, _FOREST_LABEL_CHARS) for v in data[group].to_list()]
+        if group else [None] * n
+    )
+    series_of = (
+        ["—" if v is None else _plain(v, _FOREST_CELL_CHARS) for v in data[series].to_list()]
+        if series else [None] * n
+    )
+    series_names = list(dict.fromkeys(series_of)) if series else []
+    if len(series_names) > len(_FOREST_SERIES):
+        raise GeneticsUsageError(
+            f"{series!r} has {len(series_names)} values and at most {len(_FOREST_SERIES)} "
+            f"series can be told apart on one row; use group= for the rest"
+        )
+    extra_cells = {c: [_forest_cell(v) for v in data[c].to_list()] for c in extra}
+    threshold = -math.log10(significance) if significance else None
+
+    marks: list[dict[str, Any]] = []
+    for i in range(n):
+        a = analysis(estimates[i], i, estimate)
+        se_a = ses[i] if ses[i] is not None and ses[i] > 0 else None
+        if has_bounds:
+            lo, hi = analysis(lows[i], i, lower), analysis(highs[i], i, upper)
+            if lo is None or hi is None:
+                lo = hi = None
+            elif lo > hi:
+                lo, hi = hi, lo
+            if se_a is None and lo is not None and math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+                se_a = (hi - lo) / (2 * z)
+        elif a is not None and se_a is not None:
+            lo, hi = a - z * se_a, a + z * se_a
+        else:
+            lo = hi = None
+        if a is None:
+            lo = hi = se_a = None
+        mlog10p = mlog10ps[i]
+        marks.append({
+            "a": a, "lo": lo, "hi": hi, "se": se_a, "mlog10p": mlog10p,
+            "weight": weights[i] if weights[i] is not None and weights[i] > 0 else None,
+            "series": series_of[i], "diamond": bool(flagged[i]),
+            "hollow": threshold is not None and (mlog10p is None or mlog10p < threshold),
+            "extra": [extra_cells[c][i] for c in extra],
+        })
+
+    # rows, per group in order of first appearance. Without series= a row is a frame row;
+    # with it a row is a label, holding one mark per series.
+    by_group: dict[str | None, list[dict[str, Any]]] = {}
+    index: dict[tuple[str | None, str], dict[str, Any]] = {}
+    for i, mark in enumerate(marks):
+        rows = by_group.setdefault(groups_of[i], [])
+        row = index.get((groups_of[i], labels[i])) if series else None
+        if row is None:
+            row = {"label": labels[i], "marks": []}
+            rows.append(row)
+            index[(groups_of[i], labels[i])] = row
+        elif any(m["series"] == mark["series"] for m in row["marks"]):
+            raise GeneticsUsageError(
+                f"two rows share label {labels[i]!r} and {series} {mark['series']!r}"
+                + (f" in group {groups_of[i]!r}" if group else "")
+                + "; a row is one label per series, so add what tells them apart to the label"
+            )
+        row["marks"].append(mark)
+    for rows in by_group.values():
+        for row in rows:
+            row["summary"] = all(m["diamond"] for m in row["marks"])
+
+        def order(row: dict[str, Any]) -> tuple[bool, bool, float]:
+            first = next((m["a"] for m in row["marks"] if m["a"] is not None), None)
+            by_estimate = sort_by == "estimate" and not row["summary"]
+            return (
+                row["summary"],
+                by_estimate and first is None,
+                -first if by_estimate and first is not None else 0.0,
+            )
+
+        rows.sort(key=order)
+
+    pooled: list[dict[str, Any]] = []
+    if pool:
+        for name, rows in by_group.items():
+            pooled_marks = []
+            for s in series_names or [None]:
+                usable = [
+                    m for row in rows for m in row["marks"]
+                    if m["series"] == s and not m["diamond"] and m["a"] is not None and m["se"]
+                ]
+                if len(usable) < 2:
+                    continue
+                fit = _forest_pool([m["a"] for m in usable], [m["se"] for m in usable], pool)
+                pooled_marks.append({
+                    "a": fit["a"], "lo": fit["a"] - z * fit["se"], "hi": fit["a"] + z * fit["se"],
+                    "se": fit["se"], "mlog10p": fit["mlog10p"], "weight": None, "series": s,
+                    "diamond": True, "hollow": False, "extra": [""] * len(extra),
+                })
+                pooled.append({"group": name, "series": s, "method": pool, **fit})
+            if pooled_marks:
+                rows.append({
+                    "label": _FOREST_POOLS[pool], "marks": pooled_marks, "summary": True,
+                    "pooled": True,
+                })
+
+    # the cut: the first max_rows rows of the frame's own estimates, a pooled row kept with
+    # whatever of its group survives
+    n_omitted, budget = 0, max(int(max_rows), 1)
+    for name in list(by_group):
+        kept = []
+        for row in by_group[name]:
+            if row.get("pooled"):
+                if kept:
+                    kept.append(row)
+            elif budget > 0:
+                kept.append(row)
+                budget -= 1
+            else:
+                n_omitted += 1
+        if kept:
+            by_group[name] = kept
+        else:
+            del by_group[name]
+    drawn = [m for rows in by_group.values() for row in rows for m in row["marks"]]
+
+    # a series only takes a slot of its own when some row actually holds two estimates;
+    # otherwise it is colour alone and every mark sits on its row's centre line
+    dodged = any(len(row["marks"]) > 1 for rows in by_group.values() for row in rows)
+    slots = len(series_names) if dodged else 1
+    row_in = _FOREST_ROW_IN if slots == 1 else 0.06 + _FOREST_MARK_IN * slots
+    text_size = _LABEL_SIZE if slots == 1 else 5
+
+    def shown(a: float) -> float:
+        """Analysis scale to axis units."""
+        return math.exp(max(min(a, _FOREST_MAX_LOG), -_FOREST_MAX_LOG)) if ratio else a
+
+    if xlim is not None:
+        try:
+            x_lo, x_hi = float(xlim[0]), float(xlim[1])
+        except (TypeError, ValueError, IndexError):
+            raise GeneticsUsageError(f"xlim is a (low, high) pair in the units of the axis; got {xlim!r}")
+        if not x_lo < x_hi or (ratio and x_lo <= 0):
+            raise GeneticsUsageError(
+                f"xlim must be increasing{' and positive on a ratio axis' if ratio else ''}; got {xlim!r}"
+            )
+        lim_lo, lim_hi = (math.log(x_lo), math.log(x_hi)) if ratio else (x_lo, x_hi)
+    else:
+        lim_lo, lim_hi = _forest_limits(drawn)
+        x_lo, x_hi = shown(lim_lo), shown(lim_hi)
+
+    decimals = _forest_decimals([shown(m["a"]) for m in drawn if m["a"] is not None])
+
+    def bound(a: float) -> str:
+        if math.isinf(a):
+            return ("0" if ratio else "−∞") if a < 0 else "∞"
+        return _forest_number(shown(a), decimals, ratio)
+
+    def estimate_text(m: dict[str, Any]) -> str:
+        if m["a"] is None:
+            return "NA"
+        if m["lo"] is None:
+            return bound(m["a"])
+        # an en dash between two ratios; "to" where a bound can carry a minus sign of its own
+        separator = "–" if ratio else " to "
+        return f"{bound(m['a'])} ({bound(m['lo'])}{separator}{bound(m['hi'])})"
+
+    if effect is None:
+        effect = "OR" if ratio else "β"
+    level = f"{ci * 100:g}% CI"
+    headings = [f"{effect} ({level})"] + ([r"$P$"] if pvalue else []) + list(extra.values())
+    numeric = [False] * (len(headings) - len(extra)) + [data.schema[c].is_numeric() for c in extra]
+    if not table:
+        headings, numeric = [], []
+    for m in drawn:
+        m["cells"] = (
+            [estimate_text(m)] + ([_forest_p(m["mlog10p"])] if pvalue else []) + m["extra"]
+        )[: len(headings)]
+
+    # layout, in inches from the left edge of the label column and the top of the heading row
+    indent = _FOREST_INDENT_IN if group else 0.0
+    label_in = max(
+        [_text_width_in(name, _LABEL_SIZE, bold=True) for name in by_group if name]
+        + [
+            indent + _text_width_in(row["label"], _LABEL_SIZE)
+            for rows in by_group.values() for row in rows
+        ]
+    )
+    column_in = [
+        max(
+            [_text_width_in(heading, _LABEL_SIZE)]
+            + [_text_width_in(m["cells"][j], text_size) for m in drawn]
+        )
+        for j, heading in enumerate(headings)
+    ]
+    plot_x = label_in + _FOREST_GUTTER_IN
+    column_x, cursor = [], plot_x + _FOREST_PLOT_IN + _FOREST_GUTTER_IN
+    for width, right in zip(column_in, numeric):
+        column_x.append(cursor + width if right else cursor)
+        cursor += width + _FOREST_GUTTER_IN
+    width_in = cursor - _FOREST_GUTTER_IN
+
+    y = _FOREST_HEADER_IN
+    layout: list[tuple[str, Any, float]] = []
+    for name, rows in by_group.items():
+        if name is not None:
+            layout.append(("group", name, y + _FOREST_HEADER_IN / 2))
+            y += _FOREST_HEADER_IN
+        for row in rows:
+            layout.append(("row", row, y + row_in / 2))
+            y += row_in
+    height_in = y + 0.04
+
+    handles = []
+    if series:
+        present = {m["series"] for m in drawn}
+        handles += [
+            Line2D([0], [0], color=colour, marker=marker, markersize=_FOREST_MARKER_PT,
+                   linewidth=_FOREST_INTERVAL_WIDTH, label=name)
+            for name, (colour, marker) in zip(series_names, _FOREST_SERIES) if name in present
+        ]
+    if threshold is not None:
+        # 5×10⁻⁸ as it is said, not the 5.0×10⁻⁸ a column of p-values aligns on
+        p_text = _forest_p(threshold).replace(r".0\times", r"\times")
+        handles += [
+            Line2D([0], [0], color=_FOREST_INK, marker="o", markersize=_FOREST_MARKER_PT,
+                   linestyle="none", markerfacecolor=face, markeredgewidth=0.7,
+                   label=rf"$P {sign}$ {p_text}")
+            for face, sign in ((_FOREST_INK, "<"), ("white", r"\geq"))
+        ]
+    note = f"{n_omitted:,} further row{'' if n_omitted == 1 else 's'} not drawn" if n_omitted else ""
+
+    # points below the axis: tick labels, then the direction line, then the axis label
+    below_pt = 12 + (8 if direction else 0) + 11
+    top_in = 0.06 + (0.2 if title else 0.0)
+    bottom_in = below_pt / 72 + (0.2 if handles or note else 0.0) + 0.05
+    size_in = (width_in + 2 * _FOREST_SIDE_IN, height_in + top_in + bottom_in)
+
+    own_figure = ax is None
+    if own_figure:
+        figure = plt.figure(figsize=size_in)
+        canvas = figure.add_axes([
+            _FOREST_SIDE_IN / size_in[0], bottom_in / size_in[1],
+            width_in / size_in[0], height_in / size_in[1],
+        ])
+    else:
+        figure, canvas = ax.get_figure(), ax
+    # two axes over one area: the canvas is the table, measured in inches from its top left,
+    # and the interval panel is inset into it so the two share rows by construction
+    canvas.set_xlim(0, width_in)
+    canvas.set_ylim(height_in, 0)
+    canvas.set_axis_off()
+    panel = canvas.inset_axes([plot_x / width_in, 0, _FOREST_PLOT_IN / width_in, 1])
+    panel.patch.set_visible(False)
+    for side in ("top", "left", "right"):
+        panel.spines[side].set_visible(False)
+    panel.set_yticks([])
+    if ratio:
+        panel.set_xscale("log")
+    panel.set_xlim(x_lo, x_hi)
+    panel.set_ylim(height_in, 0)
+
+    canvas.plot([0, width_in], [_FOREST_HEADER_IN] * 2, color=_FOREST_INK,
+                linewidth=_AXIS_LINEWIDTH, zorder=1)
+    for heading, x, right in zip(headings, column_x, numeric):
+        canvas.text(x, _FOREST_HEADER_IN / 2, heading, ha="right" if right else "left",
+                    va="center", fontsize=_LABEL_SIZE, color=_FOREST_INK)
+    if lim_lo < 0 < lim_hi:
+        panel.plot([shown(0.0)] * 2, [_FOREST_HEADER_IN, height_in], color=_FOREST_INK,
+                   linewidth=_AXIS_LINEWIDTH, linestyle=(0, (3, 2)), zorder=1)
+
+    heaviest = max((m["weight"] for m in drawn if m["weight"]), default=None)
+    style_of = dict(zip(series_names, _FOREST_SERIES))
+    n_clipped, banded, ruled = 0, False, False
+    for kind, item, y_row in layout:
+        if kind == "group":
+            banded = ruled = False
+            canvas.text(0, y_row, item, ha="left", va="center", fontsize=_LABEL_SIZE,
+                        fontweight="bold", color=_FOREST_INK)
+            continue
+        row = item
+        if banded:
+            canvas.axhspan(y_row - row_in / 2, y_row + row_in / 2, color=_UPSET_BAND,
+                           linewidth=0, zorder=0)
+        banded = not banded
+        if row["summary"] and not ruled:
+            # a hairline over the first summary row of a block: the diamond says what the
+            # row is, the rule says where the rows it summarises stop
+            canvas.plot([0, width_in], [y_row - row_in / 2] * 2, color=_FOREST_MUTED,
+                        linewidth=0.25, zorder=1)
+        ruled = row["summary"]
+        canvas.text(indent, y_row, row["label"], ha="left", va="center", fontsize=_LABEL_SIZE,
+                    fontstyle="italic" if italic and not row.get("pooled") else "normal",
+                    color=_FOREST_INK)
+        for m in row["marks"]:
+            slot = series_names.index(m["series"]) if dodged else 0
+            y_mark = y_row + (slot - (slots - 1) / 2) * _FOREST_MARK_IN
+            colour, marker = style_of.get(m["series"], (_FOREST_INK, "o"))
+            for cell, x, right in zip(m["cells"], column_x, numeric):
+                canvas.text(x, y_mark, cell, ha="right" if right else "left", va="center",
+                            fontsize=text_size,
+                            color=_FOREST_MUTED if cell == "NA" else _FOREST_INK)
+            if m["a"] is None:
+                continue
+            inside = lim_lo <= m["a"] <= lim_hi
+            lo, hi = (m["a"], m["a"]) if m["lo"] is None else (m["lo"], m["hi"])
+            cut_lo, cut_hi = lo < lim_lo, hi > lim_hi
+            n_clipped += cut_lo or cut_hi
+            seg_lo, seg_hi = max(lo, lim_lo), min(hi, lim_hi)
+            if m["diamond"] and m["lo"] is not None and inside and not (cut_lo or cut_hi):
+                panel.add_patch(Polygon(
+                    [(shown(lo), y_mark), (shown(m["a"]), y_mark - _FOREST_DIAMOND_IN),
+                     (shown(hi), y_mark), (shown(m["a"]), y_mark + _FOREST_DIAMOND_IN)],
+                    closed=True, facecolor=colour, edgecolor=colour, linewidth=0.5, zorder=3,
+                ))
+                continue
+            if seg_lo < seg_hi:
+                panel.plot([shown(seg_lo), shown(seg_hi)], [y_mark] * 2, color=colour,
+                           linewidth=_FOREST_INTERVAL_WIDTH, solid_capstyle="butt", zorder=2)
+            # an arrowhead where the interval leaves the axis; an estimate wholly outside
+            # it is an arrowhead alone, on the side it lies
+            for cut, edge, head in ((cut_lo, lim_lo, CARETLEFT), (cut_hi, lim_hi, CARETRIGHT)):
+                if cut:
+                    panel.plot([shown(edge)], [y_mark], marker=head, markersize=3,
+                               color=colour, linestyle="none", clip_on=False, zorder=4)
+            if not inside:
+                continue
+            side_pt = _FOREST_MARKER_PT
+            if heaviest and m["weight"]:
+                small, large = _FOREST_WEIGHT_PT
+                side_pt = math.sqrt(small ** 2 + (large ** 2 - small ** 2) * m["weight"] / heaviest)
+                marker = "s"
+            panel.plot([shown(m["a"])], [y_mark], marker="D" if m["diamond"] else marker,
+                       markersize=side_pt, color=colour, linestyle="none",
+                       markerfacecolor="white" if m["hollow"] else colour,
+                       markeredgecolor=colour, markeredgewidth=0.7, zorder=3)
+
+    if ratio:
+        ticks = _forest_ratio_ticks(x_lo, x_hi)
+        panel.xaxis.set_major_locator(FixedLocator(ticks))
+        panel.xaxis.set_major_formatter(FixedFormatter([_forest_tick_label(t) for t in ticks]))
+        panel.xaxis.set_minor_locator(NullLocator())
+    else:
+        panel.xaxis.set_major_locator(MaxNLocator(nbins=6, steps=[1, 2, 2.5, 5, 10]))
+    _size(panel)
+    if xlabel is None:
+        xlabel = f"{_FOREST_EFFECT_NAMES.get(effect, effect)} ({level})"
+    panel.set_xlabel(xlabel, fontsize=_LABEL_SIZE, labelpad=2 + (8 if direction else 0))
+    if direction is not None:
+        for text, x, ha in ((f"← {direction[0]}", 0, "left"), (f"{direction[1]} →", 1, "right")):
+            panel.annotate(_plain(text, _FOREST_LABEL_CHARS), (x, 0), xycoords="axes fraction",
+                           xytext=(0, -12), textcoords="offset points", ha=ha, va="top",
+                           fontsize=5, color=_FOREST_MUTED)
+    under = ScaledTranslation(0, -below_pt / 72, figure.dpi_scale_trans)
+    if handles:
+        panel.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0),
+                     bbox_transform=panel.transAxes + under, ncol=min(len(handles), 4),
+                     frameon=False, fontsize=5, handlelength=1.8, columnspacing=1.2,
+                     borderaxespad=0.2)
+    if note:
+        canvas.annotate(note, (0, 0), xycoords="axes fraction", xytext=(0, -below_pt),
+                        textcoords="offset points", ha="left", va="top", fontsize=5,
+                        color=_FOREST_MUTED)
+    if title:
+        canvas.set_title(title, fontsize=_TITLE_SIZE, loc="left", pad=3)
+
+    written = None
+    if own_figure:
+        written = _resolve_path(path, "forest.png")
+        figure.savefig(written)
+        plt.close(figure)
+
+    for fit in pooled:
+        a, se_fit = fit.pop("a"), fit["se"]
+        fit.update(estimate=shown(a), lower=shown(a - z * se_fit), upper=shown(a + z * se_fit))
+    return {
+        "path": written,
+        "n_rows": sum(len(rows) for rows in by_group.values()),
+        "n_estimates": sum(m["a"] is not None for m in drawn),
+        "n_missing": sum(m["a"] is None for m in drawn),
+        "n_clipped": int(n_clipped),
+        "n_omitted": n_omitted,
+        "scale": scale,
+        "xlim": (x_lo, x_hi),
+        "groups": [name for name in by_group if name is not None],
+        "series": series_names,
+        "rows": [row["label"] for rows in by_group.values() for row in rows],
+        "size_in": size_in,
+        "pooled": pooled,
     }

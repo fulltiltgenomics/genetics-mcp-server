@@ -132,12 +132,21 @@ Four evidence types that must not be conflated, because a user question about "r
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
-locuszoom, a phewas, an upset and the line-models figure — as functions a `run_analysis`
-script calls, and the figure comes back as an artifact. The upset is the general one: it
+locuszoom, a phewas, an upset, the line-models figure and a forest plot — as functions a
+`run_analysis` script calls, and the figure comes back as an artifact. The upset is the general one: it
 takes any sets a script has in hand (members, a frame of membership columns, or
 intersection counts already tallied) and draws them one way, in greys, with every count
 outside the bar it counts. The line-models figure takes what `genetics.linemodels` returned
 and draws each model's line and 95% region with the variants coloured by assignment.
+The forest is general the way the upset is: it takes any frame with one estimate per row and
+a standard error or interval bounds, and draws the table a journal prints — labels, an
+interval panel, and the estimate, interval and p-value in text beside it. The caller says
+what the numbers are (`scale="linear"`, `"log_ratio"` or `"ratio"`) rather than the function
+guessing, because a log odds ratio and a per-s.d. beta look the same in a frame. Grouping,
+several series on one row, a pooled diamond (inverse-variance fixed or DerSimonian–Laird
+random, with I² and the heterogeneity p returned) and the handling of what real results
+contain — a null estimate, a missing standard error, an interval from a model that did not
+converge — are in the function's docstring, which is the spec.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -2221,7 +2230,7 @@ src/genetics_mcp_server/
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop backing the sync facade
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels)
+│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest)
 │   └── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
 ├── subagent.py             # parallel subagent service
 ├── scripts/
