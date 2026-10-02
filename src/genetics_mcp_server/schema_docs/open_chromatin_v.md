@@ -31,8 +31,8 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `n_cells` | `INT64` | Number of cells supporting the peak (single-cell assays) |
 | `cell_ontology_id` | `STRING` | Cell Ontology (CL) identifier where available |
 | `uberon_id` | `STRING` | UBERON anatomy identifier where available |
-| `target_gene` | `STRING` | Linked target gene symbol for cCRE->gene links (else NA) |
-| `target_gene_id` | `STRING` | Linked target Ensembl gene ID for cCRE->gene links (else NA) |
+| `target_gene` | `STRING` | Linked target gene symbol(s), comma-separated, for cCRE->gene links. Only li_brain_atac rows carry any; NULL on every other resource, whose gene links are not loaded. For peak-to-gene links use peak_to_gene_v. |
+| `target_gene_id` | `STRING` | Linked target Ensembl gene ID. NULL on every row: no loaded resource supplies ids |
 | `version` | `STRING` | Data release version |
 | `resource` | `STRING` | Data source identifier (lowercase). Always filter by this column, not dataset |
 

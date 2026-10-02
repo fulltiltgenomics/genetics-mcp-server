@@ -5,10 +5,10 @@
 
 Per-variant functional annotation and FinnGen (R14) allele frequencies — one row per
 variant, covering all imputed variants, not only fine-mapped ones. This is the only view
-with genotype counts, and the rsID source for the credible-set, colocalization and exome
-views (asm_qtl_v and variant_effect_v carry their own rsid): join to it whenever a question
-needs an rsID, an allele frequency, imputation quality, or Finnish enrichment for variants
-found in those views. Association results are not here — use credible_sets_v,
+with per-genotype allele counts, and the rsID source for the credible-set, colocalization
+and exome views (asm_qtl_v and variant_effect_v carry their own rsid): join to it whenever a
+question needs an rsID, an allele frequency, imputation quality, or Finnish enrichment for
+variants found in those views. Association results are not here — use credible_sets_v,
 exome_variant_results_v etc. for those.
 
 ## Scan pruning
@@ -26,8 +26,8 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `alt` | `STRING` | Alternative (effect) allele |
 | `INFO` | `FLOAT64` | Imputation INFO score (imputation quality, 0-1). Low values indicate poorly imputed variants |
 | `AF` | `FLOAT64` | Alternative allele frequency in FinnGen. This is the alt allele frequency, not the minor allele frequency — there is no maf column, use LEAST(AF, 1 - AF) |
-| `AC_Het` | `INT64` | Number of heterozygous genotypes in FinnGen |
-| `AC_Hom` | `INT64` | Number of homozygous (alt/alt) genotypes in FinnGen |
+| `AC_Het` | `INT64` | Alt allele count carried in heterozygous genotypes in FinnGen: one per heterozygote, so it equals the number of heterozygous individuals |
+| `AC_Hom` | `INT64` | Alt allele count carried in homozygous (alt/alt) genotypes in FinnGen: two per homozygote, so the number of homozygous individuals is AC_Hom / 2 |
 | `most_severe` | `STRING` | Most severe VEP-predicted variant consequence |
 | `gene_most_severe` | `STRING` | Gene symbol associated with the most severe consequence |
 | `rsid` | `STRING` | dbSNP rsID when available. The rsID source for the credible-set, colocalization and exome views, which have none of their own; asm_qtl_v and variant_effect_v carry their own rsid |

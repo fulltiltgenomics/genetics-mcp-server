@@ -25,6 +25,11 @@ EXPECTED_BOUNDS = [
     ("get_variant_effect_by_gene", "window", {"minimum": 0, "maximum": 10_000_000}),
     ("get_mpra_by_gene", "window", {"minimum": 0, "maximum": 10_000_000}),
     ("get_mpra_pip_concordance_by_gene", "window", {"minimum": 0, "maximum": 10_000_000}),
+    ("get_asm_qtl_by_gene", "limit", {"minimum": 1, "maximum": 100_000}),
+    ("get_open_chromatin_by_gene", "limit", {"minimum": 1, "maximum": 100_000}),
+    ("get_variant_effect_by_gene", "limit", {"minimum": 1, "maximum": 100_000}),
+    ("get_mpra_by_gene", "limit", {"minimum": 1, "maximum": 100_000}),
+    ("get_mpra_pip_concordance_by_gene", "limit", {"minimum": 1, "maximum": 100_000}),
     ("get_mpra_pip_concordance_by_gene", "min_pip", {"minimum": 0.0, "maximum": 1.0}),
     ("get_hla_by_allele", "max_rows", {"minimum": 1, "maximum": 100_000}),
     ("query_database", "max_rows", {"maximum": 100_000}),
@@ -186,6 +191,9 @@ class TestTheMcpSurface:
         max_rows = schemas["get_hla_by_allele"]["properties"]["max_rows"]
         assert max_rows["minimum"] == 1
         assert max_rows["maximum"] == ToolExecutor._MAX_SQL_LIMIT
+        limit = schemas["get_open_chromatin_by_gene"]["properties"]["limit"]
+        assert limit["minimum"] == 1
+        assert limit["maximum"] == ToolExecutor._MAX_SQL_LIMIT
 
     def test_clamped_parameters_stay_bare_here(self):
         """Declaring a clamp on this surface would turn a working call into an error."""

@@ -208,11 +208,11 @@ class TestGetHlaByAllele:
         finally:
             await executor.close()
 
-    async def test_metadata_is_off_for_the_model_and_on_for_the_sdk(self):
-        """`results` now carries the names on every row, but an EMPTY result has no row
-        to carry them, so the SDK still needs `columns` to keep a schema — and needs
-        `truncated` to refuse a silent prefix. Both stay opt-in so the model's payload is
-        not padded with them."""
+    async def test_columns_are_off_for_the_model_and_on_for_the_sdk(self):
+        """`results` carries the names on every row, but an EMPTY result has no row to
+        carry them, so the SDK still needs `columns` to keep a schema; that stays opt-in
+        so the model's payload is not padded with it. `truncated` is not opt-in: a silent
+        prefix misleads the model exactly as it would a script."""
         executor = ToolExecutor(bigquery_api_url="http://unused.test")
         try:
             query_result = {
@@ -225,7 +225,7 @@ class TestGetHlaByAllele:
 
             plain = await executor.get_hla_by_allele("B*27:05")
             assert "columns" not in plain
-            assert "truncated" not in plain
+            assert plain["truncated"] is True
             # the names reach the model on the rows themselves instead
             assert plain["results"] == [
                 {"phenotype": "K11_COELIAC", "allele": "DQB1*02:01", "mlog10p": 1596.65}
