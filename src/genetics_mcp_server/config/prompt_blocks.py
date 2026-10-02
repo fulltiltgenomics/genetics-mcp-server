@@ -163,10 +163,29 @@ def url_input_hosts_rule() -> str | None:
             "- **URL inputs are unavailable in this deployment; ask the user to upload the "
             "file.**\n"
         )
-    return (
-        f"- **URL inputs are fetched only from these hosts: {', '.join(hosts)}.** A file "
+    # a leading dot is the fetcher's notation for a domain and every subdomain of it; spelled
+    # out, because the bare entry reads as a host name that does not exist
+    named = [f"{h[1:]} and its subdomains" if h.startswith(".") else h for h in hosts]
+    rule = (
+        f"- **URL inputs are fetched only from these hosts: {', '.join(named)}.** A file "
         "anywhere else is unreachable — do not try another host; ask the user to upload it.\n"
     )
+    if _PREPRINT_HOSTS <= set(hosts):
+        rule += _PREPRINT_ROUTE_RULE
+    return rule
+
+
+# the preprint servers answer a bot challenge on the URLs a user pastes, so listing the hosts
+# alone would send the model at an article page, get a refusal and stop. The route is stated
+# only when the fetcher allows every host on it.
+_PREPRINT_HOSTS = frozenset({"api.biorxiv.org", "www.biorxiv.org", "www.medrxiv.org"})
+_PREPRINT_ROUTE_RULE = (
+    "- **A bioRxiv or medRxiv article page or PDF cannot be fetched; go through the API.** "
+    "Fetch `https://api.biorxiv.org/details/<biorxiv|medrxiv>/<doi>` for the title, authors "
+    "and abstract; the last record's `jatsxml` field is the URL of the full-text XML, which "
+    "can be fetched as a URL input. That host rate-limits: if the XML fetch fails, do not "
+    "retry it — work from the abstract and say the full text was unavailable.\n"
+)
 
 
 # how long "results-api did not answer" is believed before probing again — the same shape as

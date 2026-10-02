@@ -1950,7 +1950,10 @@ refreshed, so until the pod restarts the prompt still names the old hosts and a 
 allowed host costs one refused fetch before the model gives up. Nothing is unsafe about the
 stale copy — the fetcher, not the prompt, decides every fetch — and a replica that starts while
 the fetcher is down picks the list up on its first retry, so the shared prompt prefix changes
-once within that replica's first minute.
+once within that replica's first minute. The same block adds one route the host list alone
+does not convey — bioRxiv and medRxiv preprints through `api.biorxiv.org` and the full-text XML
+its record links to — and only when the fetcher's list holds every host on that route, since
+the article pages a user pastes answer a bot challenge.
 
 When `URL_FETCHER_URL` is unset, the fetcher cannot be reached, or it sends no such field, the
 rule is not emitted at all: the model learns the policy from an `InputRefused` message either

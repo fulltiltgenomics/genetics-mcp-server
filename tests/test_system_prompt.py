@@ -1247,6 +1247,40 @@ class TestRunAnalysisInputsRules:
         assert "ask the user to upload it" in prompt
 
     @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_a_leading_dot_entry_is_spelled_out(self, fetcher_allow_list, variant):
+        fetcher_allow_list(("github.com", ".finngen.fi"))
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False), variant=variant
+        )
+        assert (
+            "URL inputs are fetched only from these hosts: "
+            "github.com, finngen.fi and its subdomains." in prompt
+        )
+
+    PREPRINT_HOSTS = ("api.biorxiv.org", "www.biorxiv.org", "www.medrxiv.org")
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_preprint_route_is_stated_when_every_host_on_it_is_allowed(
+        self, fetcher_allow_list, variant
+    ):
+        fetcher_allow_list(self.HOSTS + self.PREPRINT_HOSTS)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False), variant=variant
+        )
+        assert "https://api.biorxiv.org/details/<biorxiv|medrxiv>/<doi>" in prompt
+        assert "`jatsxml`" in prompt
+
+    @pytest.mark.parametrize("missing", PREPRINT_HOSTS)
+    def test_the_preprint_route_is_not_stated_with_a_host_missing(
+        self, fetcher_allow_list, missing
+    ):
+        """A route with a refused hop on it is worse than no route."""
+        fetcher_allow_list(self.HOSTS + tuple(h for h in self.PREPRINT_HOSTS if h != missing))
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("code", subagents=False))
+        assert "api.biorxiv.org/details" not in prompt
+        assert "fetched only from these hosts" in prompt
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
     def test_nothing_is_said_when_the_fetcher_cannot_say(self, fetcher_allow_list, variant):
         fetcher_allow_list(None)
         prompt = default_system_prompt(
