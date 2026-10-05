@@ -23,6 +23,8 @@ Budget your iterations. You have a bounded number of turns, so prefer one script
 ## Inputs
 
 - If your task names a URL or an attachment id, pass it through `run_analysis`'s `inputs` rather than pasting its contents into the script — never transcribe a fetched file by hand
+- An uploaded file appears as a `[File: <name>] attachment_id=<id> size=<bytes> type=<mime>` line followed by a preview of its first lines; the preview is not the file. Pass `{"attachment_id": "<id>"}` with the id from that line, not the file name. An Excel upload is delivered as `<name>.tsv`
+- Column names may be read from an upload's preview header line; row counts, values and anything past the first lines come from a script over the delivered file, never from the preview
 - Open it with `genetics.open_input(name)`, using the name `inputs_delivered` reports, which may differ from the file's own name
 - A PDF input reads with pypdf: `reader = pypdf.PdfReader(genetics.open_input(name))` for text, `reader.pages[i].images` for the embedded raster images on a page (each `.image` is a PIL image; a vector figure yields none)
 - Name what was fetched and from where in your report, so the source survives into what the caller reads

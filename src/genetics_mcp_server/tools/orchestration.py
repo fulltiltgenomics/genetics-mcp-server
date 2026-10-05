@@ -2079,8 +2079,11 @@ class ServerToolExecutor(ToolExecutor):
                             [],
                             self._input_error(
                                 f"Input {index}: no such file is available in this conversation. "
-                                "Ask the user to upload it here, then pass the attachment_id the "
-                                "upload reports.",
+                                "Pass the attachment_id from the file's [File: <name>] "
+                                "attachment_id=<id> line, not its name. If no such line is in "
+                                "the conversation, ask the user to upload the file in this chat. If you "
+                                "already passed that id, the file is no longer available: ask the "
+                                "user to upload it again.",
                                 "InputNotFound",
                             ),
                         )

@@ -2193,7 +2193,8 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "attachment_id": {
                             "type": "string",
                             "description": (
-                                "Id of a file the user uploaded to this conversation."
+                                "Id of a file the user uploaded to this conversation: the "
+                                "attachment_id on its [File: ...] line, not the file name."
                             ),
                         },
                         "name": {

@@ -1194,7 +1194,14 @@ class TestRunAnalysisInputsRules:
         "complete genome-wide summary-statistics file is always over it",
         "InputUpstreamError",
         "is the origin, not the policy",
+        "with the id from that line, not the file name",
+        "never from the preview",
     ]
+
+    def test_attachment_id_schema_names_the_id_not_the_file(self):
+        [tool] = [t for t in all_local_tool_definitions() if t["name"] == "run_analysis"]
+        item = tool["parameters"]["inputs"]["items"]
+        assert "not the file name" in item["properties"]["attachment_id"]["description"]
 
     @pytest.mark.parametrize("variant", _ALL_VARIANTS)
     @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
