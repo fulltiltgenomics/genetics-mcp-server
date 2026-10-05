@@ -18,9 +18,10 @@ HEADER = (
 
 
 def _row(cs_id, cell_type, pos, pip, mlog10p, dataset="FinnGen_ATACseq",
-         data_type="caQTL", trait="IL7R", resource="finngen"):
+         data_type="caQTL", trait="IL7R", resource="finngen",
+         trait_original="chr5-35863122-35863905"):
     return (
-        f"{resource}\t1\t{dataset}\t{data_type}\t{trait}\tchr5-35863122-35863905\t"
+        f"{resource}\t1\t{dataset}\t{data_type}\t{trait}\t{trait_original}\t"
         f"{cell_type}\t5\t{pos}\tA\tG\t{mlog10p}\t0.5\t0.05\t{pip}\t{cs_id}\t2\t0.9\t0.3\t"
         "intron_variant\tIL7R"
     )
@@ -54,6 +55,22 @@ class TestCredibleSetIdentity:
                  dataset="QTD000456", data_type="eQTL", resource="eqtl_catalogue"),
         ])
         assert summary["n_cs"] == 2
+
+    def test_same_named_studies_stay_separate(self):
+        """Two studies of one phenotype differ only by the accession inside `trait`."""
+        summary = _summarize([
+            _row("1:1000:A:G_1", "NA", 1000, 0.9, 40.0, dataset="Open_Targets",
+                 data_type="GWAS", resource="open_targets",
+                 trait="Type_2_diabetes_(GCST1)", trait_original="GCST1"),
+            _row("1:1000:A:G_1", "NA", 1000, 0.8, 30.0, dataset="Open_Targets",
+                 data_type="GWAS", resource="open_targets",
+                 trait="Type_2_diabetes_(GCST2)", trait_original="GCST2"),
+        ])
+        assert summary["n_cs"] == 2
+        assert {cs["trait"] for cs in summary["cs"]["GWAS"]} == {
+            "Type_2_diabetes_(GCST1)", "Type_2_diabetes_(GCST2)",
+        }
+        assert summary["counts"]["GWAS"]["n_traits"] == 2
 
     def test_distinct_cs_ids_in_one_cell_type_still_separate(self):
         summary = _summarize([

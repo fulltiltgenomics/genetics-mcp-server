@@ -980,7 +980,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "trait": {
                 "type": "string",
-                "description": "Optional: filter to specific trait/phenotype code",
+                "description": "Optional: filter to one trait. Matches a row's `trait` or its `trait_original` exactly, so a phenotype code or study accession (e.g. 'T2D', 'GCST004602') works as well as the `trait` value a result shows",
             },
         },
     },

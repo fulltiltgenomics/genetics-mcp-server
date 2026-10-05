@@ -3145,9 +3145,13 @@ class ToolExecutor:
                     "traits": [],
                 }
 
-            # filter by trait if specified
+            # either column: `trait` may be a display form of the study's code, and callers
+            # hold whichever one a previous result showed them
             if trait:
-                data = [row for row in data if row.get("trait") == trait]
+                data = [
+                    row for row in data
+                    if trait in (row.get("trait"), row.get("trait_original"))
+                ]
 
             # compute aggregate totals
             stat_cols = [
