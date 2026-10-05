@@ -736,6 +736,63 @@ class TestAttachmentEndpoints:
         assert text.text == "a\tb\n1\t2\n"
 
 
+    def test_data_file_over_the_sandbox_input_cap_is_refused(
+        self, client_with_auth, tmp_storage
+    ):
+        from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
+
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={
+                "file": ("sumstats.tsv", b"x" * (MAX_INPUT_BYTES + 1), "text/tab-separated-values")
+            },
+        )
+        assert resp.status_code == 400
+        assert "genome-wide-significant rows" in resp.json()["detail"]
+        assert not (tmp_storage / session_id).exists() or not any(
+            (tmp_storage / session_id).iterdir()
+        )
+
+    def test_data_file_at_the_cap_is_accepted(self, client_with_auth, tmp_storage):
+        from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
+
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("edge.tsv", b"x" * MAX_INPUT_BYTES, "text/tab-separated-values")},
+        )
+        assert resp.status_code == 200
+
+    def test_excel_is_measured_on_its_tsv_sidecar(
+        self, client_with_auth, tmp_storage, monkeypatch
+    ):
+        from genetics_mcp_server.routers import chat_history as chat_history_router
+        from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
+
+        # a small workbook whose TSV is over the cap is refused: the TSV is what is delivered
+        monkeypatch.setattr(
+            chat_history_router, "excel_to_tsv", lambda content: "x" * (MAX_INPUT_BYTES + 1)
+        )
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("small.xlsx", _make_xlsx({"s": [["a"], [1]]}), _XLSX_MIME)},
+        )
+        assert resp.status_code == 400
+        assert "as TSV" in resp.json()["detail"]
+
+    def test_images_keep_their_own_limit(self, client_with_auth, tmp_storage):
+        from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
+
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("big.png", b"\x89PNG" + b"0" * MAX_INPUT_BYTES, "image/png")},
+        )
+        assert resp.status_code == 200
+
+
 class TestGenerateTitle:
     """The title call must survive models that emit thinking blocks."""
 

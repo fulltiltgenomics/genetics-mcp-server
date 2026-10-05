@@ -131,7 +131,13 @@ def _classify_error(e: Exception) -> str:
     return "An internal server error occurred. Please try again."
 
 
-# prefix the frontend uses to inline data-file attachments as text blocks
+# an uploaded data file reaches the model as a REFERENCE text block, never its contents:
+#   [File: <name>] attachment_id=<id> size=<bytes> type=<mime>
+#   <a short preview, bounded by the browser>
+# The model pulls the file itself through run_analysis inputs ({"attachment_id": ...}). The
+# whole block is capped at settings.max_file_block_bytes (MAX_FILE_BLOCK_BYTES, mirrored by the
+# browser), which leaves room for the header line beside a full preview; a block over it is a
+# client that has gone back to inlining the file, and is refused rather than truncated
 _FILE_BLOCK_PREFIX = "[File: "
 
 # the frontend carries a generated plot inside the assistant's TEXT as
@@ -201,6 +207,39 @@ def _message_text_len(content) -> int:
     return total
 
 
+def _reject_inlined_file_blocks(content: Any) -> None:
+    """Raise HTTP 413 for any [File: block over the reference-block cap.
+
+    Inlined files are what made every upload fail: replayed each turn, a single table pushed
+    the conversation past the request cap or the model's context.
+    """
+    # string content is held only by max_request_chars: this is a tripwire for a client going
+    # back to inlining, not a boundary, and is wrong once any client sends string content
+    if not isinstance(content, list):
+        return
+    limit = get_settings().max_file_block_bytes
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "text"):
+            continue
+        text = str(block.get("text", ""))
+        if not text.startswith(_FILE_BLOCK_PREFIX):
+            continue
+        size = len(text.encode("utf-8"))
+        if size > limit:
+            # cut at the first newline too, or a header without "]" echoes the file body
+            name = text[len(_FILE_BLOCK_PREFIX):].split("\n", 1)[0].split("]", 1)[0][:200]
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Attachment '{name}' was sent inline ({size} bytes; a [File: ...] block is "
+                    f"capped at {limit} bytes). This is a client bug: send a reference "
+                    "(attachment_id, size, type and a short preview), not the file's contents. "
+                    "Reload the page and start a new chat; this file was sent in a format the "
+                    "server no longer accepts."
+                ),
+            )
+
+
 def _validate_request_size(messages: list["ChatMessage"]) -> None:
     """Bound the request as a whole. Raises HTTP 413.
 
@@ -222,6 +261,8 @@ def _validate_request_size(messages: list["ChatMessage"]) -> None:
                 f"{settings.max_messages_per_request})."
             ),
         )
+    for m in messages:
+        _reject_inlined_file_blocks(m.content)
     total = sum(_message_text_len(m.content) for m in messages)
     if total > settings.max_request_chars:
         raise HTTPException(
@@ -237,8 +278,9 @@ def _validate_latest_message(messages: list["ChatMessage"]) -> None:
     """Enforce per-message limits on the newest user message.
 
     Caps typed text length (attachment blocks are excluded — bulk data should be
-    uploaded as a file) and the number of attachment blocks. Raises HTTP 413.
-    History/assistant turns are not re-validated; only the message being sent now.
+    uploaded as a file), the size of each [File: reference block, and the number of
+    attachment blocks. Raises HTTP 413. Only the reference-block cap is also applied to
+    history turns, by _validate_request_size.
     """
     settings = get_settings()
     latest = next((m for m in reversed(messages) if m.role == "user"), None)
@@ -249,9 +291,9 @@ def _validate_latest_message(messages: list["ChatMessage"]) -> None:
     if isinstance(content, str):
         text_len, attachment_count = len(content), 0
     else:
-        # The frontend inlines data-file attachments (TSV/CSV/Excel) as text blocks
-        # prefixed with "[File: <name>]" and images as image blocks. Both are
-        # attachments and are excluded from the typed-text length, but counted.
+        _reject_inlined_file_blocks(content)
+        # data files arrive as [File: reference blocks and images as image blocks; both are
+        # attachments, excluded from the typed-text length but counted
         text_blocks = [
             b for b in content if isinstance(b, dict) and b.get("type") == "text"
         ]

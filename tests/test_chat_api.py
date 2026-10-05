@@ -334,18 +334,106 @@ class TestChatEndpoint:
 
         assert response.status_code == 413
 
-    def test_chat_excludes_attachments_from_length(self, test_client):
-        """A large data-file attachment block does not count toward the text limit."""
-        big_file_block = {"type": "text", "text": "[File: data.tsv]\n" + ("a\tb\n" * 100000)}
+    @staticmethod
+    def _reference_block(preview: str = "a\tb\n1\t2\n") -> dict:
+        return {
+            "type": "text",
+            "text": (
+                "[File: data.tsv] attachment_id=0b0e2a5c-1f7e-4c55-9f1e-2c1d3b4a5e6f "
+                f"size=1234567 type=text/tab-separated-values\n{preview}"
+            ),
+        }
+
+    def test_chat_accepts_a_small_reference_block(self, test_client):
         response = test_client.post(
             "/chat/v1/chat",
             json={
-                "messages": [{"role": "user", "content": [big_file_block, {"type": "text", "text": "analyze"}]}],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [self._reference_block(), {"type": "text", "text": "analyze"}],
+                    }
+                ],
                 "enable_tools": False,
             },
         )
-
         # not a 413 (size) error; may be 200/400 depending on provider availability
+        assert response.status_code != 413
+
+    def test_chat_rejects_an_inlined_file_block(self, test_client):
+        """An oversize [File: block is the client inlining the file: refused, not truncated."""
+        from genetics_mcp_server.config import get_settings
+
+        limit = get_settings().max_file_block_bytes
+        inlined = {"type": "text", "text": "[File: data.tsv]\n" + "a\tb\n" * limit}
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [{"role": "user", "content": [inlined, {"type": "text", "text": "hi"}]}],
+                "enable_tools": False,
+            },
+        )
+        assert response.status_code == 413
+        assert "send a reference" in response.json()["detail"]
+        assert "data.tsv" in response.json()["detail"]
+
+    def test_chat_rejects_an_inlined_file_block_in_history(self, test_client):
+        from genetics_mcp_server.config import get_settings
+
+        limit = get_settings().max_file_block_bytes
+        inlined = {"type": "text", "text": "[File: old.tsv]\n" + "x" * limit}
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [
+                    {"role": "user", "content": [inlined]},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "and now?"},
+                ],
+                "enable_tools": False,
+            },
+        )
+        assert response.status_code == 413
+        assert "old.tsv" in response.json()["detail"]
+
+    def test_inlined_file_rejection_never_echoes_the_body(self, test_client):
+        """A header line with no closing bracket must not let the body into the detail."""
+        body = "secretcell\t" * 1000
+        inlined = {"type": "text", "text": "[File: no-closing-bracket\n" + body}
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [{"role": "user", "content": [inlined, {"type": "text", "text": "hi"}]}],
+                "enable_tools": False,
+            },
+        )
+        assert response.status_code == 413
+        detail = response.json()["detail"]
+        assert "no-closing-bracket" in detail
+        assert "secretcell" not in detail
+        assert "Reload the page" in detail
+
+    def test_chat_excludes_a_reference_block_from_typed_length(self, test_client):
+        """A reference block near the cap plus typed text at the limit is still accepted."""
+        from genetics_mcp_server.config import get_settings
+
+        settings = get_settings()
+        block = self._reference_block("p" * 2048)
+        response = test_client.post(
+            "/chat/v1/chat",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            block,
+                            {"type": "text", "text": "x" * settings.max_message_chars},
+                        ],
+                    }
+                ],
+                "enable_tools": False,
+            },
+        )
         assert response.status_code != 413
 
     def test_chat_rejects_too_many_attachments(self, test_client):

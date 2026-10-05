@@ -2203,12 +2203,21 @@ def _install_fetcher(monkeypatch, client=None, unavailable=None):
 
 
 class _FakeAttachment:
-    def __init__(self, attachment_id, session_id, file_name, storage_path, mime_type="text/csv"):
+    def __init__(
+        self,
+        attachment_id,
+        session_id,
+        file_name,
+        storage_path,
+        mime_type="text/csv",
+        text_path=None,
+    ):
         self.id = attachment_id
         self.session_id = session_id
         self.file_name = file_name
         self.storage_path = str(storage_path)
         self.mime_type = mime_type
+        self.text_path = str(text_path) if text_path is not None else None
 
 
 class _FakeAttachmentStore:
@@ -2975,6 +2984,64 @@ class TestRunAnalysisAttachmentInputs:
         assert result["error_type"] == "InputUnreadable"
         assert result["retryable"] is False
         assert "could not be read back" in result["error"]
+        assert sandbox.calls == []
+
+    async def test_an_excel_upload_is_delivered_as_its_tsv_sidecar(
+        self, executor, monkeypatch, tmp_path
+    ):
+        """The sandbox image has no spreadsheet parser, so the raw workbook is unreadable
+        bytes to the script."""
+        raw = tmp_path / "results.xlsx"
+        raw.write_bytes(b"PK\x03\x04 not a parseable workbook")
+        sidecar = tmp_path / "results.xlsx.tsv"
+        sidecar.write_bytes(b"gene\ttrait\nBRCA1\tcancer\n")
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[
+                    _FakeAttachment(
+                        "att-1",
+                        "conv-9",
+                        "results.xlsx",
+                        raw,
+                        mime_type=(
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        ),
+                        text_path=sidecar,
+                    )
+                ],
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        await _run_with_inputs(executor, sandbox, [{"attachment_id": "att-1"}])
+        delivered = sandbox.calls[0]["inputs"][0]
+        assert delivered.name == "results.xlsx.tsv"
+        assert delivered.content == sidecar.read_bytes()
+        assert delivered.content_type == "text/tab-separated-values"
+        assert delivered.expected_sha256 == hashlib.sha256(sidecar.read_bytes()).hexdigest()
+
+    async def test_the_size_cap_applies_to_the_delivered_sidecar(
+        self, executor, monkeypatch, tmp_path
+    ):
+        from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
+
+        raw = tmp_path / "big.xlsx"
+        raw.write_bytes(b"PK small workbook")
+        sidecar = tmp_path / "big.xlsx.tsv"
+        sidecar.write_bytes(b"x" * (MAX_INPUT_BYTES + 1))
+        _install_attachments(
+            monkeypatch,
+            _FakeAttachmentStore(
+                owner="u@finngen.fi",
+                session_id="conv-9",
+                rows=[_FakeAttachment("att-1", "conv-9", "big.xlsx", raw, text_path=sidecar)],
+            ),
+        )
+        sandbox = _StubSandbox(result=_result_body())
+        result = await _run_with_inputs(executor, sandbox, [{"attachment_id": "att-1"}])
+        assert result["error_type"] == "InputTooLarge"
         assert sandbox.calls == []
 
     def test_the_resolver_needs_both_the_owner_and_the_session(self, upload):

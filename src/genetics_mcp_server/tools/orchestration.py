@@ -2084,8 +2084,12 @@ class ServerToolExecutor(ToolExecutor):
                                 "InputNotFound",
                             ),
                         )
+                    # the sandbox image ships no spreadsheet parser, so an Excel upload is
+                    # delivered as the TSV sidecar the upload route wrote; the size checks
+                    # below then apply to that TSV, which is what the script receives
+                    sidecar = attachment.text_path
                     try:
-                        with open(attachment.storage_path, "rb") as handle:
+                        with open(sidecar or attachment.storage_path, "rb") as handle:
                             content = handle.read(MAX_INPUT_BYTES + 1)
                     except OSError as e:
                         logger.error(
@@ -2102,9 +2106,13 @@ class ServerToolExecutor(ToolExecutor):
                                 "InputUnreadable",
                             ),
                         )
-                    source_name = attachment.file_name
+                    if sidecar:
+                        source_name = f"{attachment.file_name}.tsv"
+                        content_type = "text/tab-separated-values"
+                    else:
+                        source_name = attachment.file_name
+                        content_type = attachment.mime_type
                     digest = hashlib.sha256(content).hexdigest()
-                    content_type = attachment.mime_type
 
                 if len(content) > MAX_INPUT_BYTES:
                     return (

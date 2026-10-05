@@ -370,6 +370,12 @@ class Settings:
     max_attachments_per_message: int = field(
         default_factory=lambda: int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
     )
+    # cap on one "[File: ...]" reference block, in UTF-8 bytes, in any turn. The block is a
+    # reference plus a short preview the browser bounds, so one over this
+    # is a client inlining the whole file again
+    max_file_block_bytes: int = field(
+        default_factory=lambda: int(os.environ.get("MAX_FILE_BLOCK_BYTES", "8192"))
+    )
     # caps on the request as a whole. The per-message caps above only ever saw the newest user
     # message, so a client-sent assistant turn and every replayed history turn were unbounded
     # (genetics-results-suite-e0u). Deliberately generous: replayed tool results are legitimately

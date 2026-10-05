@@ -30,6 +30,7 @@ from genetics_mcp_server.memory_gate import (
     is_identifiable_user,
     memory_setting_on,
 )
+from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
 from genetics_mcp_server.turns import get_turn_registry
 
 logger = logging.getLogger(__name__)
@@ -1023,6 +1024,26 @@ async def upload_attachment(
             raise HTTPException(
                 status_code=400,
                 detail="Could not read this Excel file. Please re-save it or upload as CSV/TSV.",
+            )
+
+    # a data file is only ever analysed by delivering it to the sandbox, so one over the
+    # sandbox's per-input cap is refused now rather than accepted and failed on first use.
+    # Excel is measured on its TSV sidecar, not the workbook: the sidecar is what the sandbox
+    # receives, and the zipped workbook's size bounds it from neither side
+    if file_type != "image":
+        delivered_size = (
+            len(parsed_tsv.encode("utf-8")) if parsed_tsv is not None else file_size
+        )
+        if delivered_size > MAX_INPUT_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"File too large to analyse here ({delivered_size / (1024 * 1024):.1f} MiB"
+                    f"{' as TSV' if parsed_tsv is not None else ''}; the limit for data files "
+                    f"is {MAX_INPUT_BYTES // (1024 * 1024)} MiB). A complete summary-statistics "
+                    "file is always over it: upload the region, gene or "
+                    "genome-wide-significant rows the question needs instead."
+                ),
             )
 
     # generate unique ID and storage path
