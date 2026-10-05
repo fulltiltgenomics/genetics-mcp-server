@@ -8,6 +8,15 @@ both and re-handshake TLS every time.
 
 Using a separate loop (rather than the caller's, if any) means the sync API also works from
 inside an already-running loop, where asyncio.run() would raise.
+
+THE SHARED CLIENT'S COROUTINES RUN HERE TOO, whichever loop awaits them. A script that fans
+out does `c = get_client()` and `asyncio.run(main())`, which is a second loop over the same
+connection pool, and an httpx connection belongs to the loop that opened it. Measured, with
+the awaited methods left on the caller's loop: a connection the sync functions had left in
+the pool failed the request that reused it from the script's loop ("bound to a different
+event loop" — one or two of sixteen concurrent calls), and once `asyncio.run` had returned,
+every later call failed on connections whose loop was gone ("Event loop is closed"). `hop`
+is what keeps the pool on one loop: the caller's loop awaits, this one does the I/O.
 """
 
 import asyncio
@@ -41,6 +50,23 @@ class LoopRunner:
 
     def run(self, coro: Coroutine[Any, Any, T]) -> T:
         return asyncio.run_coroutine_threadsafe(coro, self._ensure_loop()).result()
+
+    def on_loop(self) -> bool:
+        """Whether the caller is already running on this runner's loop."""
+        try:
+            return asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            return False
+
+    async def hop(self, coro: Coroutine[Any, Any, T]) -> T:
+        """Await, from another loop, a coroutine that runs on this one.
+
+        Cancelling the awaiting task cancels the work here as well, so a script's
+        `asyncio.wait_for` still stops the request it gave up on.
+        """
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(coro, self._ensure_loop())
+        )
 
     def shutdown(self) -> None:
         with self._lock:

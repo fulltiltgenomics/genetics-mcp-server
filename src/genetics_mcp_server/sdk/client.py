@@ -192,7 +192,16 @@ class GeneticsClient:
         # legitimately inject a configured one.
         self._executor = executor or ToolExecutor(row_limit=None, expose_columns=True)
 
+    # Set by `sdk.get_client()` on the process-wide client and on no other: the runner whose
+    # loop this client's requests are made on. That client is shared with the synchronous
+    # functions, so its connection pool must stay on their loop whoever awaits it (see
+    # sdk/_runner.py). A client built directly, or around an injected executor, belongs to
+    # the loop its caller uses it from and is left there.
+    _home: Any = None
+
     async def close(self) -> None:
+        if self._home is not None and not self._home.on_loop():
+            return await self._home.hop(self.close())
         await self._executor.close()
 
     # ------------------------------------------------------------------ plumbing
@@ -1667,6 +1676,9 @@ def _audited(method):
 
     @functools.wraps(method)
     async def wrapper(self, *args: Any, **kwargs: Any):
+        if self._home is not None and not self._home.on_loop():
+            # re-entered on the home loop, which is where the one audit line is written
+            return await self._home.hop(wrapper(self, *args, **kwargs))
         summary = _summarize_arguments(signature, args, kwargs)
         try:
             result = await method(self, *args, **kwargs)
