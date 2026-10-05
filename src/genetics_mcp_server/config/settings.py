@@ -372,7 +372,7 @@ class Settings:
     )
     # cap on one "[File: ...]" reference block, in UTF-8 bytes, in any turn. The block is a
     # reference plus a short preview the browser bounds, so one over this
-    # is a client inlining the whole file again
+    # is a client inlining the whole file
     max_file_block_bytes: int = field(
         default_factory=lambda: int(os.environ.get("MAX_FILE_BLOCK_BYTES", "8192"))
     )

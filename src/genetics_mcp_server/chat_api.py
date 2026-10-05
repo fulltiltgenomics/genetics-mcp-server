@@ -137,7 +137,7 @@ def _classify_error(e: Exception) -> str:
 # The model pulls the file itself through run_analysis inputs ({"attachment_id": ...}). The
 # whole block is capped at settings.max_file_block_bytes (MAX_FILE_BLOCK_BYTES, mirrored by the
 # browser), which leaves room for the header line beside a full preview; a block over it is a
-# client that has gone back to inlining the file, and is refused rather than truncated
+# client inlining the file, and is refused rather than truncated
 _FILE_BLOCK_PREFIX = "[File: "
 
 # the frontend carries a generated plot inside the assistant's TEXT as
@@ -210,11 +210,11 @@ def _message_text_len(content) -> int:
 def _reject_inlined_file_blocks(content: Any) -> None:
     """Raise HTTP 413 for any [File: block over the reference-block cap.
 
-    Inlined files are what made every upload fail: replayed each turn, a single table pushed
-    the conversation past the request cap or the model's context.
+    An inlined file is replayed on every turn, so a single table pushes the conversation past
+    the request cap or the model's context.
     """
-    # string content is held only by max_request_chars: this is a tripwire for a client going
-    # back to inlining, not a boundary, and is wrong once any client sends string content
+    # string content is held only by max_request_chars: this is a tripwire for a client
+    # inlining files, not a boundary, and is wrong once any client sends string content
     if not isinstance(content, list):
         return
     limit = get_settings().max_file_block_bytes

@@ -653,7 +653,7 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
         "cut, that is the 64 KiB stdout window — print less rather than printing again wider.\n",
         requires_any=_fs("run_analysis"),
     ),
-    # THE FOUR INPUTS RULES (genetics-results-suite-vxtv.16). Gated on run_analysis rather
+    # THE INPUTS RULES. Gated on run_analysis rather
     # than on the presence of the `inputs` param itself — the text-derived gate cannot see
     # into a schema — but the rule this exists for (untrusted content, retrying a refusal)
     # only ever bites AFTER a fetch the model chose to make, so nothing here is emitted on
