@@ -160,6 +160,7 @@ def get_client() -> GeneticsClient:
     global _client
     if _client is None:
         _client = GeneticsClient()
+        _client._home = _runner._runner
     return _client
 
 

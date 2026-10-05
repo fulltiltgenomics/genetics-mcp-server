@@ -1173,7 +1173,10 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
 - **Sync by default.** Module-level functions are synchronous wrappers that run the coroutine
   on a dedicated background event loop (`sdk/_runner.py`), which keeps the HTTP connection pool
   warm across calls and works from inside an already-running loop. `GeneticsClient` exposes the
-  same functions as awaitables.
+  same functions as awaitables, and on the process-wide client (`get_client()`) those run on
+  that same background loop whichever loop awaits them: a script's `asyncio.run` fan-out is a
+  second loop over one connection pool, and a connection used from a loop other than the one
+  that opened it fails. A client built directly stays on its caller's loop.
 - **Every call through the SDK surface is audited — `_executor` is not**
   (`genetics-results-suite-4h6.12`). Each `GeneticsClient` coroutine method that reaches the
   executor is wrapped at import time (`_instrument` in `sdk/client.py`; `close` and `show` are
@@ -2262,7 +2265,7 @@ src/genetics_mcp_server/
 ├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
 │   ├── __init__.py      # sync module-level functions, shared client lifecycle
 │   ├── client.py        # GeneticsClient: one async method per data product
-│   ├── _runner.py       # background event loop backing the sync facade
+│   ├── _runner.py       # background event loop: the sync facade and the shared client's awaited calls both run on it
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
 │   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest, volcano)
 │   └── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
