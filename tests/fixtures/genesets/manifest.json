@@ -1,0 +1,28 @@
+{
+ "fixture": true,
+ "release_id": "20990101",
+ "bundle": {
+  "release_id": "20990101.fixture"
+ },
+ "collections": [
+  {
+   "collection": "coll.a",
+   "spdx_license": "CC-BY-4.0",
+   "upstream_release": "1.0",
+   "go_release": "GO-basic obo file released on 2099-01-01",
+   "attribution": "Fixture collection A, CC BY 4.0. GO release 2099-01-01."
+  },
+  {
+   "collection": "coll.b",
+   "spdx_license": "LicenseRef-HPO",
+   "upstream_release": "1.0",
+   "hpo_release": "2099-01-02",
+   "licence_url": "https://example.org/hpo-licence",
+   "attribution": "Fixture collection B. HPO version 2099-01-02; cite the consortium."
+  }
+ ],
+ "staging": {
+  "profile": "fixture",
+  "dropped": []
+ }
+}
