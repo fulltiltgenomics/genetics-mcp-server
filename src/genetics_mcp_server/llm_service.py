@@ -531,6 +531,12 @@ def _describe_shape(value: Any, depth: int = 0) -> str:
     return type(value).__name__
 
 
+def _tsv_cell(value: Any) -> Any:
+    # a STRUCT or ARRAY column (db-api keeps them as dicts and lists) would otherwise be
+    # written as its Python repr, which nothing downstream can parse back
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+
+
 def _convert_to_tsv(download_info: dict) -> bytes:
     """Convert download data to TSV bytes.
 
@@ -575,7 +581,7 @@ def _convert_to_tsv(download_info: dict) -> bytes:
                     "_download_data 'rows' must hold positional lists (one per row); "
                     f"got {_describe_shape(download_info)}"
                 )
-            writer.writerow(row)
+            writer.writerow([_tsv_cell(v) for v in row])
     elif "results" in download_info:
         results = download_info["results"]
         if not isinstance(results, (list, tuple)):
@@ -594,7 +600,7 @@ def _convert_to_tsv(download_info: dict) -> bytes:
         headers = list(results[0].keys())
         writer.writerow(headers)
         for row in results:
-            writer.writerow([row.get(h, "") for h in headers])
+            writer.writerow([_tsv_cell(row.get(h, "")) for h in headers])
     else:
         raise DownloadShapeError(
             "_download_data must carry either 'results' or both 'columns' and 'rows'; "

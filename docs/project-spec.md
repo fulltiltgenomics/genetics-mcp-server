@@ -115,7 +115,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
 | `get_dosage_sensitivity` | pHaplo / pTriplo dosage-sensitivity scores for a list of genes (Collins et al. 2022, 18,641 autosomal protein-coding genes from rare CNVs in 950,278 individuals). Executor-side SQL over BigQuery `dosage_sensitivity_v`. Symbols are matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published and the Ensembl ID in one pass, so a gene renamed since 2013 still resolves. `haploinsufficient`/`triplosensitive` are the paper's own cutoffs (0.86 / 0.94) returned as columns |
 | `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL in every statistic column, `beta` through `mlog10_fdr_q_secondary`) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
-| `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants. `version` is the source's release, relayed from results-api's `X-Dataset-Version` header |
+| `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants. `source` is `finngen` (default) or `gnomad` (4.1.1); the gnomad row's `consequences` is a JSON string, `NA` when none, with the same keys as the typed array in the `gnomad_variant_annotation_v` view — the view is the route for joins and bulk questions. `version` is the source's release, relayed from results-api's `X-Dataset-Version` header |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
 ### LD tools (FinnGen LD Server)
@@ -2024,8 +2024,12 @@ tool cannot leave the gate behind.
 
 **A prohibition is emitted with a route or not at all, and the route it names must be true on the
 surface that gets it** (`genetics-results-suite-4h6.76`). The "NEVER query the database for
-consequence / allele frequency / rsID / pathogenicity" block is gated on `query_database` or
-`run_analysis`, but the sentence naming where those annotations DO come from names
+pathogenicity / clinical significance or FinnGen's own per-variant AF and enrichment" block is
+gated on `query_database` or `run_analysis` — the same block routes gnomAD 4.1.1 frequencies,
+consequence and gene to `gnomad_variant_annotation_v` for joins and bulk questions, to a
+per-variant lookup for a handful of variants, and to the proxied gnomAD MCP tools for live
+browser detail the view does not hold — but the sentence naming where the excluded annotations
+DO come from names
 `get_variant_annotations` and `get_myvariant_annotations` — so the text gate dropped the remedy on
 `bigquery` and on `code` and left the prohibition standing with no way out. Four variants now
 follow it, split by the two capabilities that differ across those surfaces — the sandbox, and

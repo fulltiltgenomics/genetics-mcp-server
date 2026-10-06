@@ -14,6 +14,8 @@ These go through a fake httpx transport rather than a fake executor, because the
 that was missing spans all three layers and a fake executor would pin only the last one.
 """
 
+import io
+
 import httpx
 import polars as pl
 import pytest
@@ -198,6 +200,59 @@ def test_mixed_type_columns_still_take_the_strict_false_fallback():
     """The reason `empty_columns` is not merged into `columns`: dicts keep from_dicts."""
     rows = [{"x": 1}, {"x": "two"}]
     assert _frame(rows, empty_columns=["x"]).height == 2
+
+
+# ------------------------------------------------------------------ ARRAY<STRUCT> cells
+#
+# `gnomad_variant_annotation_v.consequences` is the shape: a list of structs per cell, empty
+# (never NULL) for a variant with no annotation, and one struct field named like the column
+# itself. db-api hands the cell through as a list of dicts. These pin why the SDK docs send
+# the flattening to SQL rather than to `explode().unnest()`.
+
+_CONSEQUENCE = {
+    "gene_symbol": "PCSK9",
+    "gene_id": "ENSG00000169174",
+    "consequences": ["missense_variant"],
+    "gene_symbol_source": "HGNC",
+    "canonical": 1,
+    "biotype": "protein_coding",
+}
+_NESTED_COLUMNS = ["variant", "consequences"]
+
+
+def test_an_annotated_row_gives_a_typed_struct_column_that_csv_refuses():
+    frame = _frame([["1:1:A:T", [_CONSEQUENCE]], ["1:2:A:T", []]], columns=_NESTED_COLUMNS)
+    assert frame.schema["consequences"] == pl.List(pl.Struct(frame.schema["consequences"].inner.fields))
+    flat = frame.explode("consequences").unnest("consequences")
+    assert flat["gene_symbol"].to_list() == ["PCSK9", None]
+    with pytest.raises(pl.exceptions.ComputeError, match="nested"):
+        frame.write_csv(io.BytesIO())
+    # the inner `consequences` list keeps the flattened frame nested too
+    with pytest.raises(pl.exceptions.ComputeError, match="nested"):
+        flat.write_csv(io.BytesIO())
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [[["1:1:A:T", []], ["1:2:A:T", []]], []],
+    ids=["every_array_empty", "zero_rows"],
+)
+def test_a_result_with_no_annotation_loses_the_struct_dtype(rows):
+    """The dtype is inferred from the cells, so nothing found means nothing to unnest."""
+    frame = _frame(rows, columns=_NESTED_COLUMNS)
+    assert frame.schema["consequences"] in (pl.List(pl.Null), pl.Null)
+    with pytest.raises(pl.exceptions.InvalidOperationError, match="Struct"):
+        frame.explode("consequences").unnest("consequences")
+
+
+def test_unnest_refuses_a_struct_field_named_like_a_kept_column():
+    """`SELECT variant, consequences, c FROM v, UNNEST(v.consequences) AS c`: the struct's
+    inner `consequences` collides with the array it came from."""
+    frame = _frame(
+        [["1:1:A:T", [_CONSEQUENCE], _CONSEQUENCE]], columns=[*_NESTED_COLUMNS, "c"]
+    )
+    with pytest.raises(pl.exceptions.DuplicateError, match="consequences"):
+        frame.unnest("c")
 
 
 # ------------------------------------ the four that compute their JSON (suite-8a1)

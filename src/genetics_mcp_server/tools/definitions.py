@@ -1930,7 +1930,7 @@ Use this tool when:
 Query by exactly ONE of: a single variant, a genomic region, or a gene name.
 For batch lookups of multiple specific variants, use the 'variants' parameter instead.
 
-Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), alt allele counts carried in heterozygotes and in homozygotes (AC_Het, AC_Hom: a homozygote contributes 2, so homozygous individuals = AC_Hom / 2), most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values. source=gnomad returns a different row: per-population AF_* columns, AN, filters, rsids and consequences, with no counts or enrichment. Every value arrives as a string on both sources. `version` in the result is the release of the source the rows come from.""",
+Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, allele frequency (AF), alt allele counts carried in heterozygotes and in homozygotes (AC_Het, AC_Hom: a homozygote contributes 2, so homozygous individuals = AC_Hom / 2), most severe consequence, gene for most severe consequence, rsID, and exome/genome enrichment values. source=gnomad returns a different row: per-ancestry-group AF_* columns, AN, filters, rsids and consequences, with no counts or enrichment; `consequences` is a JSON string (`NA` when the variant has no annotation) with the same keys as the typed array in the `gnomad_variant_annotation_v` view, which is the route for joins and bulk questions over the same data. Every value arrives as a string on both sources. `version` in the result is the release of the source the rows come from.""",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -1951,7 +1951,7 @@ Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, all
             },
             "source": {
                 "type": "string",
-                "description": "Annotation source (default 'finngen')",
+                "description": "Annotation source: 'finngen' (default) or 'gnomad' (gnomAD 4.1.1 genomes+exomes, VEP 115)",
                 "default": "finngen",
             },
         },
@@ -1970,7 +1970,7 @@ Use this tool when:
 - The user asks "is this variant pathogenic?" or "what is the clinical interpretation?"
 
 Do NOT use this tool for:
-- Population allele frequencies → use gnomAD MCP tools instead
+- Population allele frequencies → use get_variant_annotations with source='gnomad' (or the gnomad_variant_annotation_v view for a list of variants) instead
 - Gene constraint scores (pLI, LOEUF) → use gnomAD MCP get_gene instead
 - FinnGen-specific annotations (AF, consequence, enrichment) → use get_variant_annotations instead
 
@@ -2111,7 +2111,10 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "cwd is a scratch directory that is DISCARDED — a relative `savefig(\"x.png\")` or "
             "`write_csv(\"x.csv\")` is thrown away and reported as no artifact at all. Write to "
             "`os.path.join(os.environ[\"SANDBOX_ARTIFACTS_DIR\"], name)`, or use a "
-            "`genetics.plots` helper, which resolves a relative path there for you.\n\n"
+            "`genetics.plots` helper, which resolves a relative path there for you. "
+            "`write_csv` refuses a nested column (an ARRAY<STRUCT> such as "
+            "`gnomad_variant_annotation_v.consequences`): UNNEST it in the SQL, or "
+            "`write_ndjson`.\n\n"
             "Files in the artifacts directory are reported as a manifest of names and sizes. An "
             "IMAGE artifact is fetched and shown to the user automatically — save a figure and "
             "it appears, so do not also render the plot as text or emit a "

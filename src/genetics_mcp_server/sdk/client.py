@@ -55,6 +55,15 @@ def _frame(
     is needed only when there are none; routing a non-empty results-api result through the
     positional constructor above would give up `from_dicts`' strict=False fallback for the
     mixed-type columns that upstream does produce.
+
+    An ARRAY<STRUCT> column (`gnomad_variant_annotation_v.consequences`) arrives as a list
+    of dicts per cell and is inferred as List(Struct) only when some row has an element:
+    with every array empty the dtype is List(Null), and with zero rows it is Null, so
+    `explode().unnest()` raises InvalidOperationError on exactly the results that found
+    nothing. `unnest` also raises DuplicateError when a struct field shares a name with a
+    top-level column, which the inner `consequences` list does whenever the array is kept
+    beside it. Flatten in SQL — `FROM v, UNNEST(v.consequences) AS c` selecting `c.<field>`
+    — and the frame is flat and typed whatever the row count.
     """
     if not rows and not columns and empty_columns:
         return pl.DataFrame({c: [] for c in empty_columns})
@@ -795,10 +804,14 @@ class GeneticsClient:
         """Variant annotations (consequence, AF, gene) for one variant, a region, a gene or a batch.
 
         The columns depend on `source`: finngen rows carry AF, AC_Het/AC_Hom, rsid and the
-        exome/genome enrichment values; gnomad rows carry per-population AF_* columns,
+        exome/genome enrichment values; gnomad rows carry per-ancestry-group AF_* columns,
         AN, filters, rsids and consequences, and no counts or enrichment. Every value is
         a string on both sources (pos, AF included), so cast before comparing or doing
-        arithmetic.
+        arithmetic. The gnomad `consequences` cell is a JSON string (`NA` when the variant
+        has no annotation) with the same keys as the typed ARRAY<STRUCT> column of
+        `gnomad_variant_annotation_v`; `json.loads` the non-`NA` cells, or — for a list
+        of variants, or anything that joins — query the view through `sql()` instead,
+        where the array is typed and UNNEST works.
         """
         _one_of(variant=variant, region=region, gene=gene, variants=variants)
         return self._rows(
@@ -986,6 +999,13 @@ class GeneticsClient:
 
         So aggregate, filter or add the partition predicate in SQL rather than fetching
         every row and reducing in polars.
+
+        Flatten an ARRAY<STRUCT> column in SQL too (`FROM v, UNNEST(v.consequences) AS c`,
+        selecting `c.gene_symbol` etc.; LEFT JOIN UNNEST keeps rows whose array is empty).
+        Returned as-is it is a List(Struct) column that `write_csv` refuses ("CSV format
+        does not support nested data") and whose client-side `explode().unnest()` fails
+        on an all-empty or zero-row result and on a field name shared with a top-level
+        column; `write_ndjson` or `write_parquet` take nested columns if one must be kept.
         """
         return await self._query(query, max_rows=max_rows)
 
@@ -1112,7 +1132,11 @@ class GeneticsClient:
 
         A column whose allowed values depend on another column carries
         `allowed_values_by_<column>` (a dict keyed by that column's value, e.g.
-        `allowed_values_by_resource`) in place of `allowed_values`.
+        `allowed_values_by_resource`) in place of `allowed_values`. A STRUCT column
+        (`type` RECORD, such as `gnomad_variant_annotation_v.consequences`) carries
+        `fields`: its leaves as `{"name", "type", "mode", "description"}` entries, nested
+        again under `fields` where a leaf is itself a STRUCT — the names to spell after
+        `UNNEST(col) AS c` as `c.<name>`.
 
         Columns are therefore `schema(table)["tables"][0]["columns"]`, and every table is
         `{t["name"]: t for t in schema()["tables"]}`.

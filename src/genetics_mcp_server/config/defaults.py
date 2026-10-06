@@ -171,19 +171,20 @@ Now, looking only at the extracted data and literature above, provide your analy
     _Block("""
 ## Variant Annotation Sources
 
-There are four complementary sources for variant annotations. Use the right one based on what the user is asking:
+The variant annotation sources are complementary. Use the right one based on what the user is asking:
 
 | Source | Tool | Use when asking about |
 |--------|------|----------------------|
 | FinnGen | `get_variant_annotations` | FinnGen allele frequency, variant consequence, rsID, exome/genome enrichment |
-| gnomAD | gnomAD MCP tools | Multi-population frequencies, gene constraint (pLI/LOEUF), coverage, structural variants |
+| gnomAD 4.1.1 | `get_variant_annotations` with `source='gnomad'`; `gnomad_variant_annotation_v` in the database for bulk questions and joins | Allele frequency overall and per genetic ancestry group, VEP consequence and gene, rsID, site filters |
+| gnomAD browser | gnomAD MCP tools | Live browser-level detail the view does not hold: gene constraint (pLI/LOEUF), coverage, structural variants |
 | myvariant.info | `get_myvariant_annotations` | Clinical significance (ClinVar), pathogenicity scores (CADD), functional predictions (SIFT, PolyPhen2), cancer annotations (COSMIC, CIViC) |
 | UniProt | `get_protein_annotations` / `map_protein_variants` / `search_uniprot` | Protein-level context: domains, active/binding sites, PTMs, isoforms, sequence, and protein-position ↔ genomic-coordinate mapping |
 
 - For a comprehensive variant characterization, you may need to call multiple sources
-- Do NOT use `get_myvariant_annotations` for population frequencies — that data comes from gnomAD MCP
+- Do NOT use `get_myvariant_annotations` for population frequencies — that data comes from gnomAD
 - When the user asks "is this variant pathogenic?" or "what is the clinical significance?" → use `get_myvariant_annotations`
-- When the user asks "how common is this variant?" → use gnomAD MCP for global populations or `get_variant_annotations` for FinnGen-specific frequency
+- When the user asks "how common is this variant?" → use `get_variant_annotations` with `source='gnomad'` for frequencies by ancestry group, or its default FinnGen source for FinnGen-specific frequency; a handful of variants is a lookup, a list of fine-mapped variants is a database join
 """),
     # the four regulatory readouts are DIFFERENT MEASUREMENTS, not four routes to one
     # number, and that distinction is domain science rather than routing guidance. It is
@@ -478,12 +479,12 @@ Selecting rows is not the same as pruning the scan: each view's "Scan pruning" s
         requires_any=_fs("run_analysis"),
     ),
     _Block("""
-**What is and is NOT in the database.** The database holds credible sets (`credible_sets_v`), colocalization (`colocalization_v`, `coloc_credsets_v`), exome/burden results (`exome_variant_results_v`, `gene_burden_results_v`), the count-based exome views (`exome_gene_counts_v`, `exome_gene_bayes_results_v`, `exome_variant_counts_v` — ASC 2026 autism counts, Bayes factor and FDR; no p-values exist there, rank on `fdr`), gene annotations (`gene_annotations_v`), and the functional-assay/prediction views (`mpra_v` measured MPRA reporter activity, `variant_effect_v` in-silico chromatin-effect predictions, `open_chromatin_v` accessible-region atlas, `asm_qtl_v` allele-specific methylation QTL). It does NOT contain per-variant **consequence / allele-frequency / rsID / pathogenicity** annotations, and you must NEVER query the database for them — it accesses the same underlying data, not extra consequence/frequency columns. (This exclusion is about those annotation columns only; the MPRA functional readout `mpra_v` genuinely lives in the database.) To restrict variants to coding ones, filter by the consequence categories listed under "Coding Variant" in Terminology below — there is no prebuilt coding-only table.
+**What is and is NOT in the database.** The database holds credible sets (`credible_sets_v`), colocalization (`colocalization_v`, `coloc_credsets_v`), exome/burden results (`exome_variant_results_v`, `gene_burden_results_v`), the count-based exome views (`exome_gene_counts_v`, `exome_gene_bayes_results_v`, `exome_variant_counts_v` — ASC 2026 autism counts, Bayes factor and FDR; no p-values exist there, rank on `fdr`), gene annotations (`gene_annotations_v`), and the functional-assay/prediction views (`mpra_v` measured MPRA reporter activity, `variant_effect_v` in-silico chromatin-effect predictions, `open_chromatin_v` accessible-region atlas, `asm_qtl_v` allele-specific methylation QTL), and gnomAD 4.1.1 per-variant annotation (`gnomad_variant_annotation_v`: allele frequency overall and per genetic ancestry group, rsIDs, site filters, VEP consequence and gene). For joins and bulk questions over fine-mapped variants — frequencies by ancestry, consequence, gene — JOIN `gnomad_variant_annotation_v` on `chr`, `pos` and `variant` with a literal `chr` filter on both sides; a handful of variants is a per-variant annotation lookup, and the gnomAD MCP tools remain for live browser-level detail the view does not hold (gene constraint, coverage, structural variants). It does NOT contain **pathogenicity / clinical-significance** annotations, nor FinnGen's own per-variant allele frequency and enrichment — a credible-set row carries its result's `aaf` and consequence, not an annotation table — and you must NEVER query the database for them. To restrict variants to coding ones, filter by the consequence categories listed under "Coding Variant" in Terminology below — there is no prebuilt coding-only table.
 """,
         requires_any=_fs("query_database", "run_analysis"),
     ),
     _Block(
-        "\nThose per-variant annotations come from `get_variant_annotations` (FinnGen), `get_myvariant_annotations` (clinical/functional), or the gnomAD MCP tools instead.\n",
+        "\nThose per-variant annotations come from `get_variant_annotations` (FinnGen by default; `source='gnomad'` is the view's gnomAD row for a handful of variants), `get_myvariant_annotations` (clinical/functional), or the gnomAD MCP tools instead.\n",
         requires_any=_fs("query_database", "run_analysis"),
     ),
     # the remedy above names the two annotation tools, so the TEXT gate drops it on every
@@ -517,24 +518,24 @@ Selecting rows is not the same as pruning the scan: each view's "Scan pruning" s
         excludes=_fs("get_variant_annotations"),
     ),
     _Block(
-        "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID. Beyond those two — non-coding variants, pathogenicity scores, multi-population frequencies — say what is missing rather than approximating it from the columns above.\n",
+        "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region, from FinnGen's annotation by default or gnomAD's with `source=\"gnomad\"`. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID. Beyond those two — pathogenicity scores, a non-coding variant's clinical significance — say what is missing rather than approximating it from the columns above.\n",
         requires_any=_fs("run_analysis"),
         excludes=_fs("get_variant_annotations", "get_myvariant_annotations"),
     ),
     _Block(
-        "\nThose per-variant annotations are not in the database. Fetch them in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` returns consequence, allele frequency and gene for a single variant, a batch, a whole gene or a region. What it does not cover — clinical significance, pathogenicity scores, multi-population frequencies — is not in the database either, so say what is missing rather than approximating it from the columns above.\n",
+        "\nThose per-variant annotations are not in the database. Fetch them in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` returns consequence, allele frequency and gene for a single variant, a batch, a whole gene or a region, from FinnGen's annotation by default or gnomAD's with `source=\"gnomad\"`. What it does not cover — clinical significance, pathogenicity scores — is not in the database either, so say what is missing rather than approximating it from the columns above.\n",
         requires_any=_fs("run_analysis"),
         excludes=_fs(
             "get_variant_annotations", "get_myvariant_annotations", "get_variant_protein_effect"
         ),
     ),
     _Block(
-        "\nThe database is not an alternative route to them. For a coding SNV, `get_variant_protein_effect` returns the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID — use it rather than refusing. For anything it does not cover — non-coding variants, pathogenicity scores, multi-population frequencies — say that it is not available here rather than approximating it from the columns above.\n",
+        "\nThe database is not an alternative route to them. For a coding SNV, `get_variant_protein_effect` returns the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID — use it rather than refusing. For anything it does not cover — pathogenicity scores, a non-coding variant's clinical significance — say that it is not available here rather than approximating it from the columns above.\n",
         requires_any=_fs("query_database"),
         excludes=_fs("get_variant_annotations", "get_myvariant_annotations", "run_analysis"),
     ),
     _Block(
-        "\nThe database is not an alternative route to them, and there is no variant-annotation tool on this surface, so if an answer needs a variant's consequence, allele frequency, rsID or pathogenicity, say that it is not available here rather than approximating it from the columns above.\n",
+        "\nThe database is not an alternative route to them, and there is no variant-annotation tool on this surface, so if an answer needs a variant's pathogenicity or clinical significance, or FinnGen's own allele frequency and enrichment, say that it is not available here rather than approximating it from the columns above.\n",
         requires_any=_fs("query_database"),
         excludes=_fs(
             "get_variant_annotations",

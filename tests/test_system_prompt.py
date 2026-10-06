@@ -793,15 +793,28 @@ _ANNOTATION_ROUTES = (
 # shipped on `bigquery`, which has `get_variant_protein_effect`.
 _REFUSAL_CONTRADICTED_BY = {
     _ANNOTATION_NO_ROUTE: "get_variant_protein_effect",
-    "What it does not cover — clinical significance, pathogenicity scores, multi-population"
-    " frequencies — is not in the database either": "get_variant_protein_effect",
+    "What it does not cover — clinical significance, pathogenicity scores — is not in the"
+    " database either": "get_variant_protein_effect",
 }
+
+# the database half of the annotation routing: gnomAD frequencies by ancestry group,
+# consequence and gene live in `gnomad_variant_annotation_v`, so a prohibition that still
+# called them absent would send a bulk question to a per-variant lookup, or to a refusal
+_GNOMAD_VIEW_ROUTE = (
+    "JOIN `gnomad_variant_annotation_v` on `chr`, `pos` and `variant` with a literal `chr`"
+    " filter on both sides"
+)
+_RETIRED_ANNOTATION_CLAIMS = (
+    "does NOT contain per-variant **consequence / allele-frequency / rsID / pathogenicity**",
+    "multi-population frequencies",
+    "needs a variant's consequence, allele frequency, rsID or pathogenicity",
+)
 
 
 class TestTheAnnotationProhibitionAlwaysCarriesARoute:
     """genetics-results-suite-4h6.76.
 
-    The prohibition ("NEVER query the database for consequence / AF / rsID") is gated on
+    The prohibition ("NEVER query the database for pathogenicity / FinnGen's own AF") is gated on
     `query_database` or `run_analysis`; its remedy NAMES the two annotation tools, so the
     text gate dropped the remedy on every surface without them — measured on `bigquery` and
     on `code` — leaving a dead end. Each surface must now get the route it has, or be told
@@ -830,6 +843,20 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
             assert not (refusal in prompt and tool in prompt), (
                 f"{profile}/{sandbox}: prompt refuses what {tool} returns"
             )
+
+    @pytest.mark.parametrize("variant", ["condensed", "legacy"])
+    @pytest.mark.parametrize("sandbox", [True, False], ids=["sandbox_on", "sandbox_off"])
+    @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
+    def test_the_prohibition_routes_gnomad_to_the_view_and_never_calls_it_absent(
+        self, profile, sandbox, variant
+    ):
+        """The prohibition is scoped to what the database still lacks; the gnomAD view
+        guidance travels with it, and no variant may keep the pre-view wording."""
+        available = resolve(profile, subagents=False, sandbox=sandbox)
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        assert (_GNOMAD_VIEW_ROUTE in prompt) is (_ANNOTATION_PROHIBITION in prompt)
+        for claim in _RETIRED_ANNOTATION_CLAIMS:
+            assert claim not in prompt, f"{profile}/{sandbox}/{variant}: {claim!r}"
 
     @pytest.mark.parametrize("profile", [None, "api"], ids=["None", "api"])
     def test_surfaces_with_the_annotation_tools_are_pointed_at_them(self, profile):

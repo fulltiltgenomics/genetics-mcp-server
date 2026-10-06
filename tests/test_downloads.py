@@ -1,5 +1,7 @@
 """Tests for download store, TSV conversion, and download endpoint."""
 
+import csv
+import io
 import json
 import logging
 import os
@@ -94,6 +96,18 @@ class TestConvertToTsv:
         lines = tsv.decode("utf-8").strip().split("\n")
         assert lines[0] == "variant\tbeta\tpvalue"
         assert len(lines) == 3
+
+    def test_nested_cells_are_json_in_both_shapes(self):
+        """A STRUCT/ARRAY cell arrives as a dict/list; its Python repr is not parseable
+        back, and ensure_ascii=False keeps a non-ASCII value readable in the file."""
+        cell = [{"gene_symbol": "Ä", "consequences": ["missense_variant"], "canonical": None}]
+        columnar = _convert_to_tsv({"columns": ["v", "c"], "rows": [["1:1:A:T", cell]]})
+        rows = _convert_to_tsv({"results": [{"v": "1:1:A:T", "c": cell}]})
+        for tsv in (columnar, rows):
+            _, (variant, written) = csv.reader(io.StringIO(tsv.decode("utf-8")), delimiter="\t")
+            assert variant == "1:1:A:T"
+            assert "Ä" in written and "None" not in written
+            assert json.loads(written) == cell
 
     def test_empty_results(self):
         """A recognized-but-empty payload is not a defect: there is simply nothing to download."""
