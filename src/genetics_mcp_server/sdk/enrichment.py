@@ -38,8 +38,8 @@ set sizes after that restriction.
 
 - `universe_mode="annotated"` (default) further intersects U with the genes annotated to any
   set in the collection, as clusterProfiler does; `"given"` uses U exactly as supplied, as
-  `fgsea::fora` does. They differ by tens of percent in p on realistic inputs; say which
-  was used.
+  `fgsea::fora` does. The two can give materially different p (by about a factor of two on the
+  test fixture); say which was used.
 - Without `universe`, U is every gene annotated to any set, under either mode.
 
 For `gsea_preranked` and `competitive` the universe is the genes that carry a statistic;
@@ -765,7 +765,9 @@ def gsea_preranked(
     `set_id`, `size`, `es`, `nes`, `pval`, `padj`, `n_more_extreme` (same-sign permutation
     ESs at least as extreme) and `leading_edge` (the genes up to the running-sum peak, most
     extreme first). `parameters` states the universe, `n_genes`, `tied_stats` (non-zero
-    statistics repeating an earlier value), `nperm`, `seed`, `weight`, the size filter,
+    statistics repeating an earlier value — zeros are not counted, yet their input order
+    still places set genes in the ranking: with every statistic zero, input order alone
+    yields a significant-looking ES, as in fgsea), `nperm`, `seed`, `weight`, the size filter,
     `sets_given` and `sets_tested`. With a collection name, as for `ora`: `name`,
     `collection` and `leading_edge_symbols` columns, `parameters["id_resolution"]` (keys that
     resolve to no gene are dropped before ranking) and an `"attribution"` key.
