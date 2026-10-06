@@ -309,7 +309,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "phenotype": {
                 "type": "string",
-                "description": "Phenotype code (e.g., 'K11_IBD_STRICT')",
+                "description": "Phenotype code: the `trait_original` value of a credible-set row (e.g. 'K11_IBD_STRICT', or the GWAS Catalog accession for Open Targets), never the display `trait`",
                 "required": True,
             },
             "credible_set_id": {
