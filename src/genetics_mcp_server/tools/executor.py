@@ -5674,7 +5674,7 @@ class ToolExecutor:
 # the modules a script sees, in the order the index reports them. They are the ones the
 # sandbox stubs are generated from (sandbox/stubs/*.pyi), so the tool and the shipped
 # reference describe the same surface.
-_SDK_MODULES = ("genetics", "client", "errors", "plots", "linemodels", "mr")
+_SDK_MODULES = ("genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment")
 
 # one-line labels written here rather than taken from each module's __doc__. The catalogue
 # renders per-function signatures and docstrings only: module docstrings describe the
@@ -5693,6 +5693,10 @@ _SDK_MODULE_SUMMARIES = {
     "mr": (
         "Mendelian randomization from fine-mapped exposures to outcomes with summary "
         "statistics: instruments, harmonisation, estimates and checks in one call"
+    ),
+    "enrichment": (
+        "gene set enrichment (over-representation, preranked GSEA, competitive gene-level "
+        "test) against the gene set collections this deployment ships"
     ),
 }
 
@@ -5757,7 +5761,7 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
             for n in names
             if hasattr(sdk_client.GeneticsClient, n)
         ]
-    if module in ("plots", "linemodels", "mr"):
+    if module in ("plots", "linemodels", "mr", "enrichment"):
         # __all__ rather than a name list here: the module's own export list is what the
         # generated stub reads too, so the catalogue and the stub cannot disagree about
         # which functions exist
@@ -5802,6 +5806,7 @@ _SDK_CALL_PREFIXES = {
     "plots": "genetics.plots.",
     "linemodels": "genetics.linemodels.",
     "mr": "genetics.mr.",
+    "enrichment": "genetics.enrichment.",
 }
 
 

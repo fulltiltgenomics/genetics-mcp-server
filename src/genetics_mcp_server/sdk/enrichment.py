@@ -1,65 +1,49 @@
 """Gene set enrichment: which gene sets a list of genes, or a gene-level statistic, points at.
 
     import genetics
-    res = genetics.enrichment.ora(my_genes, gene_sets, universe=background_genes)
-    res["results"]     # one row per tested set: size, overlap, expected, p, BH q, overlap genes
-    res["parameters"]  # the universe convention, |U|, the list size and size filter used
+    genetics.enrichment.collections()   # gene-set collections in this deployment, with licences
+    res = genetics.enrichment.ora(["LDLR", "APOB", "PCSK9"], "reactome", universe=tested)
+    res["results"]      # one row per tested set: size, overlap, expected, p, BH q, overlap genes
+    res["parameters"]   # universe convention, |U|, list size, size filter and id resolution used
+    res["attribution"]  # bundle release and, per collection used, the text to cite
 
-Three analyses, each validated against R on the fixtures in the package's tests:
+Three analyses:
 
-- `ora(genes, gene_sets, universe)` — over-representation of a gene LIST (`phyper`,
-  `fgsea::fora` 1.32.4).
+- `ora(genes, gene_sets, universe)` — over-representation of a gene LIST: do more of the
+  genes fall in a set than chance would put there (hypergeometric upper tail)? Use for a
+  hit list such as significant genes or a credible-set gene list.
 - `gsea_preranked(stats, gene_sets)` — preranked GSEA on one statistic per gene, signed so
-  that large positive and large negative are both interesting (`fgsea::fgseaSimple`).
+  that large positive and large negative are both interesting. Use when every tested gene
+  has a value and no cut-off is wanted.
 - `competitive(gene_stats, gene_sets)` — MAGMA-style competitive test: are the set's gene
   z-scores higher than other genes', optionally adjusting for covariates such as gene
-  length (`lm`, one-sided `pt`).
+  length. Use for gene-level z-scores from a burden test or your own per-gene analysis;
+  turning GWAS variant statistics into gene statistics needs an LD reference that is not here.
 
-For the two statistic-based tests the universe is the genes that carry a statistic: every
-set is restricted to them before the size filter, as for ORA. They are not GWAS gene-level
-tests — a z from a burden test or a user's own per-gene analysis is fine; turning GWAS
-variant statistics into gene statistics needs an LD reference that is not here.
+GENE SETS. `gene_sets` is a collection name, a list of names, or a mapping
+{set name: gene ids} used exactly as given. Names refer to this deployment's bundle
+(`GENETICS_GENESETS_DIR`); `collections()` lists what is present, with licence, upstream
+release and attribution text, and `gene_sets(collection)` fetches one. Which collections
+exist differs between deployments. With a collection name, gene ids may be HGNC symbols,
+NCBI Entrez ids (as strings) or Ensembl gene ids with or without a version suffix, mixed
+freely; unresolvable inputs are dropped and counted in `parameters["id_resolution"]`, and
+results also carry each set's `name` and `collection` and the overlap genes as symbols.
+Always cite the `attribution` entry of a result that used bundled collections.
 
-ORA — the rest of this docstring.
+THE UNIVERSE IS THE ANALYSIS. ORA's background U is the genes that COULD have made the
+list — every gene tested in the study, not the genome; a list of protein-coding genes tested
+against all ~60k genes looks enriched for everything protein-coding. Everything outside U
+is dropped from the list and from every set before counting, and the size filter applies to
+set sizes after that restriction.
 
-Over-representation analysis (ORA) asks, for each gene set, whether more of the list's genes
-fall in it than chance would put there.
-
-THE UNIVERSE IS THE ANALYSIS. The p-value is the hypergeometric upper tail
-P(X >= k), X ~ Hypergeom(|U|, |set ∩ U|, |list ∩ U|): drawing the list's genes from a
-background U, how often would a set catch k or more? Everything outside U is dropped from
-the list and from every set before anything is counted, and the size filter applies to the
-sets' sizes AFTER that restriction. Getting U wrong moves p-values by far more than any
-numerical detail: a list of protein-coding genes tested against all ~60k genes looks
-enriched for everything protein-coding.
-
-- `universe` should be the genes that COULD have made the list — every gene tested in the
-  study, or every gene near a variant that was tested — not the genome.
 - `universe_mode="annotated"` (default) further intersects U with the genes annotated to any
-  set in the collection, as clusterProfiler and most published ORA do: an unannotated gene
-  cannot fall in a set, so counting it in U only dilutes. `"given"` uses U exactly as
-  supplied, as `fgsea::fora` does. The two differ by tens of percent in p on realistic
-  inputs; say which one was used.
+  set in the collection, as clusterProfiler does; `"given"` uses U exactly as supplied, as
+  `fgsea::fora` does. They differ by tens of percent in p on realistic inputs; say which
+  was used.
 - Without `universe`, U is every gene annotated to any set, under either mode.
 
-Returns a dict of a polars DataFrame and the parameters used, so a defaulted analysis can be
-restated exactly.
-
-GENE SETS SHIPPED WITH THIS DEPLOYMENT. `collections()` lists the collections this image
-holds, with licence, upstream release and the attribution text to cite; which collections
-are present differs between deployments. Pass a collection name, or a list of names, as
-`gene_sets` to any of the three analyses, or fetch one with `gene_sets(collection)`:
-
-    genetics.enrichment.collections()
-    res = genetics.enrichment.ora(["LDLR", "APOB", "PCSK9"], "reactome", universe=tested)
-    res["attribution"]  # bundle release id and, per collection used, the text to cite
-
-With a collection name, gene ids may be HGNC symbols, NCBI Entrez ids (as strings) or
-Ensembl gene ids with or without a version suffix, mixed freely; they are resolved to
-unversioned Ensembl through the bundle's gene table, and inputs that resolve to nothing are
-dropped and counted in `parameters["id_resolution"]`. Results then also carry each set's
-`name` and `collection`, and the overlap / leading-edge genes as symbols too. A mapping
-`gene_sets` is used as given, with no translation.
+For `gsea_preranked` and `competitive` the universe is the genes that carry a statistic;
+sets are restricted to them before the size filter.
 """
 
 from __future__ import annotations

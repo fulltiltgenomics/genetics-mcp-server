@@ -306,6 +306,7 @@ SHIPPED_OUTSIDE_CLOSURE = (
     "genetics_mcp_server.sdk.linemodels",
     "genetics_mcp_server.sdk.mr",
     "genetics_mcp_server.sdk._mr_estimators",
+    "genetics_mcp_server.sdk.enrichment",
 )
 
 
