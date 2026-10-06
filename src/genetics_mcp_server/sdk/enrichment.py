@@ -7,18 +7,31 @@
     res["parameters"]   # universe convention, |U|, list size, size filter and id resolution used
     res["attribution"]  # bundle release and, per collection used, the text to cite
 
-Three analyses:
+Four analyses:
 
 - `ora(genes, gene_sets, universe)` — over-representation of a gene LIST: do more of the
   genes fall in a set than chance would put there (hypergeometric upper tail)? Use for a
-  hit list such as significant genes or a credible-set gene list.
+  hit list such as significant genes from a gene-level test. Not for nearest genes of GWAS
+  leads: an isolated gene in a gene-sparse region is the nearest gene of far more of the
+  genome than one in a dense cluster, so sets rich in isolated genes look enriched; and a
+  cluster of related genes at one signal counts several times — use `locus_enrichment`.
 - `gsea_preranked(stats, gene_sets)` — preranked GSEA on one statistic per gene, signed so
   that large positive and large negative are both interesting. Use when every tested gene
   has a value and no cut-off is wanted.
 - `competitive(gene_stats, gene_sets)` — MAGMA-style competitive test: are the set's gene
   z-scores higher than other genes', optionally adjusting for covariates such as gene
   length. Use for gene-level z-scores from a burden test or your own per-gene analysis;
-  turning GWAS variant statistics into gene statistics needs an LD reference that is not here.
+  turning GWAS variant statistics into gene statistics needs an LD reference that is not
+  here, and z-scores built from credible-set variants alone are not MAGMA (nearly every gene
+  is 0, and genes sharing one signal count as independent) — for GWAS leads or credible sets
+  use `locus_enrichment`.
+- `locus_enrichment(loci, gene_sets)` — for GWAS lead variants (e.g. credible-set leads):
+  how many independent loci map to a gene in the set, against random loci of matched local
+  gene density. Needs only lead positions; `genes_for_loci(loci)` shows the mapping it uses
+  (nearest gene or a window, from the bundle's GRCh38 gene coordinates) without testing.
+
+`simplify(result)` collapses the significant sets of any of these results whose member genes
+overlap heavily (e.g. nested GO terms) into one representative each.
 
 GENE SETS. `gene_sets` is a collection name, a list of names, or a mapping
 {set name: gene ids} used exactly as given. Names refer to this deployment's bundle
@@ -64,7 +77,16 @@ from scipy.stats import t as t_dist
 
 from genetics_mcp_server.sdk.errors import GeneticsUsageError
 
-__all__ = ["collections", "competitive", "gene_sets", "gsea_preranked", "ora"]
+__all__ = [
+    "collections",
+    "competitive",
+    "gene_sets",
+    "genes_for_loci",
+    "gsea_preranked",
+    "locus_enrichment",
+    "ora",
+    "simplify",
+]
 
 _UNIVERSE_MODES = ("annotated", "given")
 
@@ -105,6 +127,7 @@ class _Bundle:
         self.order = [c for c in self.meta if c in held]
         self._members: dict[str, pl.DataFrame] = {}
         self._genes: _GeneIndex | None = None
+        self.coords: dict[bool, _Coords] = {}
 
     def members(self, collection: str) -> pl.DataFrame:
         if collection not in self._members:
@@ -1023,3 +1046,894 @@ def competitive(
         },
     }
     return bundled.finish(out, ()) if bundled else out
+
+
+# GRCh38 extended MHC, inclusive; its long-range LD and gene density make one signal look
+# like dozens of loci
+_MHC = (6, 25_000_000, 34_000_000)
+# GENCODE's main annotation (`gencode.v<N>.annotation`) is on GRCh38; the bundle's coordinates
+# come from it, so leads must be GRCh38 too
+_GENOME_BUILD = "GRCh38"
+_PROTEIN_CODING = "HGNC locus_group == 'protein-coding gene'"
+_CHROMS = {**{str(i): i for i in range(1, 25)}, "26": 26, "X": 23, "Y": 24, "M": 26, "MT": 26}
+_CHROM_LABEL = {23: "X", 24: "Y", 26: "MT"}
+_VARIANT = re.compile(
+    r"(?:chr)?([0-9]{1,2}|X|Y|MT?)[:_-](\d+)(?:[:_-][A-Z*]+[:_-][A-Z*,]+)?", re.IGNORECASE
+)
+_LEAD_ID_COLUMNS = ("id", "cs_id", "variant")
+_LOCUS_MODES = ("nearest", "window")
+
+
+class _Chrom:
+    """One chromosome's genes sorted by (start, end, Ensembl id), for interval lookups."""
+
+    def __init__(self, offset: int, start: np.ndarray, end: np.ndarray) -> None:
+        self.offset, self.start, self.end = offset, start, end
+        # running maximum of the ends: the first index where it reaches p is the earliest
+        # gene (in sort order) whose body extends to p from the left
+        self.reach = np.maximum.accumulate(end)
+        self.end_sorted = np.sort(end)
+        self.max_len = int((end - start).max())
+
+    def nearest(self, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Nearest gene (local index) and distance per position; 0 inside a body, ties to the
+        gene earliest in sort order."""
+        n = self.start.size
+        k = np.searchsorted(self.start, p, "right")  # genes [0, k) start at or before p
+        first = np.searchsorted(self.reach, p, "left")
+        inside = first < k
+        last = np.maximum(k - 1, 0)
+        big = np.iinfo(np.int64).max
+        d_left = np.where(k > 0, p - self.reach[last], big)
+        left = np.searchsorted(self.reach, self.reach[last], "left")
+        d_right = np.where(k < n, self.start[np.minimum(k, n - 1)] - p, big)
+        gene = np.where(inside, first, np.where(d_left <= d_right, left, k))
+        return gene, np.where(inside, 0, np.minimum(d_left, d_right))
+
+    def window(
+        self, p: np.ndarray, w: int, chunk: int = 50_000
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(position index, local gene index, distance) for every gene body overlapping
+        [p - w, p + w]."""
+        out_q, out_g, out_d = [], [], []
+        for c0 in range(0, p.size, chunk):
+            pc = p[c0 : c0 + chunk]
+            # a gene reaching p - w starts no earlier than p - w - max_len
+            lo = np.searchsorted(self.start, pc - w - self.max_len, "left")
+            hi = np.searchsorted(self.start, pc + w, "right")
+            counts = hi - lo
+            q = np.repeat(np.arange(pc.size), counts)
+            first = np.repeat(np.cumsum(counts) - counts, counts)
+            g = np.repeat(lo, counts) + np.arange(q.size) - first
+            keep = self.end[g] >= pc[q] - w
+            q, g = q[keep], g[keep]
+            d = np.maximum(np.maximum(self.start[g] - pc[q], pc[q] - self.end[g]), 0)
+            out_q.append(q + c0)
+            out_g.append(g)
+            out_d.append(d)
+        if not out_q:
+            e = np.empty(0, dtype=np.int64)
+            return e, e, e
+        return np.concatenate(out_q), np.concatenate(out_g), np.concatenate(out_d)
+
+    def density(self, p: np.ndarray, dw: int) -> np.ndarray:
+        # genes ending before p - dw all start before p + dw, so the difference counts overlaps
+        return np.searchsorted(self.start, p + dw, "right") - np.searchsorted(
+            self.end_sorted, p - dw, "left"
+        )
+
+
+class _Coords:
+    """The bundle's genes with coordinates (optionally protein-coding only), indexed 0..n-1 in
+    (chr, start, end, Ensembl id) order."""
+
+    def __init__(self, genes: pl.DataFrame, protein_coding: bool) -> None:
+        g = genes.drop_nulls(["chr", "gene_start", "gene_end"])
+        if protein_coding:
+            g = g.filter(pl.col("locus_group") == "protein-coding gene")
+        g = g.sort("chr", "gene_start", "gene_end", "ensembl_gene_id")
+        self.ensembl = g["ensembl_gene_id"].to_list()
+        self.symbol = [s or e for s, e in zip(g["symbol"].to_list(), self.ensembl, strict=True)]
+        self.index = {e: i for i, e in enumerate(self.ensembl)}
+        chrom = g["chr"].to_numpy()
+        start = g["gene_start"].to_numpy().astype(np.int64)
+        end = g["gene_end"].to_numpy().astype(np.int64)
+        self.by_chr: dict[int, _Chrom] = {}
+        for c in np.unique(chrom):
+            lo, hi = np.searchsorted(chrom, c, "left"), np.searchsorted(chrom, c, "right")
+            self.by_chr[int(c)] = _Chrom(int(lo), start[lo:hi], end[lo:hi])
+
+    def map(
+        self, chrom: np.ndarray, pos: np.ndarray, mode: str, window: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(query index, gene index, distance) under the mapping rule."""
+        qs, gs, ds = [], [], []
+        for c in np.unique(chrom):
+            ch = self.by_chr.get(int(c))
+            if ch is None:
+                continue
+            sel = np.flatnonzero(chrom == c)
+            if mode == "nearest":
+                g, d = ch.nearest(pos[sel])
+                q = sel
+            else:
+                qi, g, d = ch.window(pos[sel], window)
+                q = sel[qi]
+            qs.append(q)
+            gs.append(g + ch.offset)
+            ds.append(d)
+        if not qs:
+            e = np.empty(0, dtype=np.int64)
+            return e, e, e
+        return np.concatenate(qs), np.concatenate(gs), np.concatenate(ds)
+
+
+def _coords(bundle: _Bundle, protein_coding: bool) -> _Coords:
+    if protein_coding not in bundle.coords:
+        genes = pl.read_parquet(bundle.path / "genes.parquet")
+        bundle.coords[protein_coding] = _Coords(genes, protein_coding)
+    return bundle.coords[protein_coding]
+
+
+def _chrom_code(value: Any) -> int | None:
+    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        value = str(int(value))
+    if not isinstance(value, str):
+        return None
+    v = value.strip().upper()
+    return _CHROMS.get(v[3:] if v.startswith("CHR") else v)
+
+
+def _leads(loci: Any, id_col: str | None) -> pl.DataFrame:
+    """Lead variants as (id, chr, pos), chr coded 1-22, X = 23, Y = 24, MT = 26."""
+    if isinstance(loci, pl.DataFrame):
+        missing = [c for c in ("chr", "pos") if c not in loci.columns]
+        if missing:
+            raise GeneticsUsageError(
+                f"loci needs columns 'chr' and 'pos' (and optionally an id column); it has "
+                f"{loci.columns}"
+            )
+        if id_col is None:
+            id_col = next((c for c in _LEAD_ID_COLUMNS if c in loci.columns), None)
+        elif id_col not in loci.columns:
+            raise GeneticsUsageError(f"id_col {id_col!r} is not a column of loci")
+        if loci["chr"].null_count() or loci["pos"].null_count():
+            raise GeneticsUsageError("loci holds a null chr or pos")
+        if not loci["pos"].dtype.is_integer():
+            raise GeneticsUsageError(f"loci's pos must be integers, got {loci['pos'].dtype}")
+        raw_chr = loci["chr"].to_list()
+        pos = loci["pos"].cast(pl.Int64).to_list()
+        ids = (
+            [str(v) for v in loci[id_col].to_list()]
+            if id_col
+            else [f"{c}:{p}" for c, p in zip(raw_chr, pos, strict=True)]
+        )
+    elif isinstance(loci, (list, tuple, pl.Series)) and not isinstance(loci, str):
+        ids, raw_chr, pos = [], [], []
+        for v in loci:
+            m = _VARIANT.fullmatch(v.strip()) if isinstance(v, str) else None
+            if m is None:
+                raise GeneticsUsageError(
+                    f"cannot read {v!r} as a variant: give 'chr:pos', 'chr:pos:ref:alt' or "
+                    "'chr_pos_ref_alt' strings, or a DataFrame with chr and pos columns"
+                )
+            ids.append(v)
+            raw_chr.append(m.group(1))
+            pos.append(int(m.group(2)))
+    else:
+        raise GeneticsUsageError(
+            "loci must be a polars DataFrame with chr and pos columns or a list of variant "
+            f"strings like '19:44908684:T:C'; got {type(loci).__name__}"
+        )
+    if not ids:
+        raise GeneticsUsageError("loci is empty")
+    chrom = [_chrom_code(c) for c in raw_chr]
+    bad = sorted({str(r) for r, c in zip(raw_chr, chrom, strict=True) if c is None})
+    if bad:
+        raise GeneticsUsageError(
+            f"unrecognised chromosome(s) {bad[:5]}: use 1-22, X (or 23), Y, MT, with or "
+            "without a 'chr' prefix"
+        )
+    if min(pos) < 1:
+        raise GeneticsUsageError("loci positions must be >= 1")
+    return pl.DataFrame(
+        {"id": ids, "chr": chrom, "pos": pos},
+        schema={"id": pl.Utf8, "chr": pl.Int64, "pos": pl.Int64},
+    )
+
+
+def _check_loci_args(mode: str, window: Any, merge_distance: Any) -> None:
+    if mode not in _LOCUS_MODES:
+        raise GeneticsUsageError(f"mode must be one of {_LOCUS_MODES}, got {mode!r}")
+    for name, v in (("window", window), ("merge_distance", merge_distance)):
+        if not _is_int(v) or v < 0:
+            raise GeneticsUsageError(f"{name} must be a non-negative integer, got {v!r}")
+
+
+def _in_mhc(leads: pl.DataFrame) -> pl.Series:
+    c, lo, hi = _MHC
+    return (leads["chr"] == c) & leads["pos"].is_between(lo, hi)
+
+
+def _merge(leads: pl.DataFrame, merge_distance: int) -> pl.DataFrame:
+    """Adds `locus` (0-based, genomic order): single-linkage over sorted positions."""
+    leads = leads.sort("chr", "pos", "id")
+    chrom, pos = leads["chr"].to_numpy(), leads["pos"].to_numpy()
+    new = np.ones(pos.size, dtype=bool)
+    if merge_distance > 0:
+        new[1:] = (chrom[1:] != chrom[:-1]) | (np.diff(pos) > merge_distance)
+    return leads.with_columns(locus=pl.Series(np.cumsum(new) - 1, dtype=pl.Int64))
+
+
+def _coordinates_meta(bundle: _Bundle) -> dict[str, Any]:
+    raw = json.loads((bundle.path / "manifest.json").read_text())
+    gencode = (raw.get("bundle", {}).get("gencode") or {}).get("version")
+    return {"release_id": bundle.release_id, "gencode": gencode, "genome_build": _GENOME_BUILD}
+
+
+def _map_loci(
+    leads: pl.DataFrame, coords: _Coords, mode: str, window: int, merge_distance: int
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """(leads with locus, loci frame, genes frame) for leads already filtered."""
+    leads = _merge(leads, merge_distance)
+    qi, gi, dist = coords.map(leads["chr"].to_numpy(), leads["pos"].to_numpy(), mode, window)
+    locus = leads["locus"].to_numpy()
+    genes = (
+        pl.DataFrame({
+            "locus": locus[qi], "gene": gi.astype(np.int64), "distance": dist.astype(np.int64)
+        })
+        .group_by("locus", "gene")
+        .agg(pl.col("distance").min())
+    )
+    genes = (
+        genes.with_columns(
+            ensembl_gene_id=pl.Series(coords.ensembl, dtype=pl.Utf8).gather(genes["gene"]),
+            symbol=pl.Series(coords.symbol, dtype=pl.Utf8).gather(genes["gene"]),
+        )
+        .sort("locus", "distance", "symbol")
+    )
+    label = pl.col("chr").replace_strict(
+        _CHROM_LABEL, default=pl.col("chr").cast(pl.Utf8), return_dtype=pl.Utf8
+    )
+    loci = (
+        leads.group_by("locus", maintain_order=True)
+        .agg(
+            pl.col("chr").first(),
+            start=pl.col("pos").min(),
+            end=pl.col("pos").max(),
+            n_leads=pl.len().cast(pl.Int64),
+            lead_ids=pl.col("id"),
+        )
+        .with_columns(
+            locus_id=pl.format("{}:{}-{}", label, pl.col("start"), pl.col("end"))
+        )
+        # identical positions stay separate loci only with merge_distance=0
+        .with_columns(
+            locus_id=pl.when(pl.col("locus_id").cum_count().over("locus_id") > 1)
+            .then(pl.format("{}#{}", "locus_id", pl.col("locus_id").cum_count().over("locus_id")))
+            .otherwise("locus_id")
+        )
+        .join(
+            genes.group_by("locus", maintain_order=True).agg(gene_symbols=pl.col("symbol")),
+            on="locus",
+            how="left",
+        )
+        .with_columns(pl.col("gene_symbols").fill_null(pl.lit([], dtype=pl.List(pl.Utf8))))
+        .sort("locus")
+    )
+    genes = genes.join(loci.select("locus", "locus_id"), on="locus").select(
+        "locus", "locus_id", "gene", "ensembl_gene_id", "symbol", "distance"
+    )
+    return leads, loci, genes
+
+
+def genes_for_loci(
+    loci: Any,
+    *,
+    mode: str = "nearest",
+    window: int = 50_000,
+    merge_distance: int = 500_000,
+    protein_coding: bool = True,
+    exclude_mhc: bool = False,
+    id_col: str | None = None,
+) -> dict[str, Any]:
+    """Map lead variants to genes with the bundle's gene coordinates (no network).
+
+    `loci` — a polars DataFrame with `chr` (1-22, X/23, Y, MT; a `chr` prefix is fine) and
+    `pos` (GRCh38) columns, plus an optional id column carried through (`id_col`; by default
+    the first of `id`, `cs_id`, `variant` present), or a list of variant strings such as
+    `"19:44908684"`, `"19:44908684:T:C"` or `"chr19_44908684_T_C"`.
+    `merge_distance` — leads on one chromosome within this many bp of the next one form one
+    locus (single linkage on sorted positions), so several credible sets at one signal count
+    once; 0 keeps every lead its own locus.
+    `mode` — `"nearest"`: each lead's nearest gene (distance 0 inside a gene body, otherwise to
+    the nearer end; ties go to the gene earliest by start, then end, then Ensembl id — so a gene
+    nested inside a longer one that starts earlier is never a lead's nearest gene; window mode
+    sees it). A locus's genes are the union over its leads. `"window"`: every gene whose body
+    overlaps [pos - window, pos + window] of any lead.
+    `protein_coding` — map to protein-coding genes only, as HGNC classifies them
+    (`locus_group == "protein-coding gene"`, the bundle's gene identity being HGNC's).
+    `exclude_mhc` — drop leads in GRCh38 chr6:25,000,000-34,000,000 (counted in parameters).
+
+    Returns `{"loci", "genes", "parameters"}`. `loci`: one row per locus — `locus_id`
+    (`chr:start-end` of its leads), `chr` (23 = X), `start`, `end`, `n_leads`, `lead_ids`,
+    `gene_symbols` (nearest first). `genes`: one row per (locus, gene) — `locus_id`,
+    `ensembl_gene_id`, `symbol`, `distance` (bp from the closest lead). `parameters`: the
+    mapping settings, lead and locus counts, and the bundle release and genome build the
+    coordinates come from.
+    """
+    _check_loci_args(mode, window, merge_distance)
+    leads = _leads(loci, id_col)
+    bundle = _bundle()
+    coords = _coords(bundle, bool(protein_coding))
+    mhc = _in_mhc(leads) if exclude_mhc else pl.Series([False] * leads.height)
+    leads = leads.filter(~mhc)
+    if leads.height == 0:
+        raise GeneticsUsageError("no leads remain after dropping the MHC")
+    _, loci_df, genes = _map_loci(leads, coords, mode, int(window), int(merge_distance))
+    return {
+        "loci": loci_df.drop("locus"),
+        "genes": genes.drop("locus", "gene"),
+        "parameters": {
+            "mode": mode,
+            "window": int(window) if mode == "window" else None,
+            "merge_distance": int(merge_distance),
+            "protein_coding": bool(protein_coding),
+            "gene_type": _PROTEIN_CODING if protein_coding else "all genes with coordinates",
+            "exclude_mhc": bool(exclude_mhc),
+            "mhc_region": f"chr{_MHC[0]}:{_MHC[1]}-{_MHC[2]}",
+            "leads_given": int(mhc.len()),
+            "leads_dropped_mhc": int(mhc.sum()),
+            "n_loci": loci_df.height,
+            "loci_without_gene": int((loci_df["gene_symbols"].list.len() == 0).sum()),
+            "n_genes": genes["gene"].n_unique(),
+            "coordinates": _coordinates_meta(bundle),
+        },
+    }
+
+
+def _null_q(
+    coords: _Coords,
+    mt: sparse.csr_matrix,
+    chrom: np.ndarray,
+    centre: np.ndarray,
+    offsets: np.ndarray,
+    group: np.ndarray,
+    n_groups: int,
+    mode: str,
+    window: int,
+) -> np.ndarray:
+    """(n_groups, n_sets): per group of placements, the fraction whose mapped genes hit each
+    set. A placement puts a locus's leads at `centre + offsets`.
+
+    Placements with the same gene tuple in one group are counted once with a weight, which is
+    what keeps a 30k-placement group to a few thousand rows."""
+    n_lead = offsets.size
+    qi, gi, _ = coords.map(
+        np.repeat(chrom, n_lead), (centre[:, None] + offsets[None, :]).ravel(), mode, window
+    )
+    out = np.zeros((n_groups, mt.shape[1]))
+    if qi.size == 0:
+        return out
+    place = qi // n_lead
+    per_place = (
+        pl.DataFrame({"place": place, "gene": gi.astype(np.int64)})
+        .unique()
+        .group_by("place")
+        .agg(pl.col("gene").sort())
+    )
+    tuples = (
+        per_place.with_columns(group=group[per_place["place"].to_numpy()])
+        .group_by("group", "gene")
+        .len()
+        .with_row_index("r")
+    )
+    flat = tuples.select("r", "gene").explode("gene")
+    t = sparse.csr_matrix(
+        (np.ones(flat.height), (flat["r"].to_numpy(), flat["gene"].to_numpy())),
+        shape=(tuples.height, mt.shape[0]),
+    )
+    hit = (t @ mt).tocsr()
+    hit.data[:] = 1.0
+    n = np.bincount(group, minlength=n_groups).astype(np.float64)
+    g = tuples["group"].to_numpy()
+    w = sparse.csr_matrix(
+        (tuples["len"].to_numpy() / n[g], (g, tuples["r"].to_numpy())),
+        shape=(n_groups, tuples.height),
+    )
+    return (w @ hit).toarray()
+
+
+def _poisson_binomial_sf(q: np.ndarray, obs: np.ndarray, chunk: int = 1024) -> np.ndarray:
+    """P(X >= obs) for X = sum of independent Bernoulli(q[i, s]) over rows, per column s.
+
+    Dynamic programming over rows with states 0..K-1 exact and K absorbing "at least K"; the
+    tail is then a sum of non-negative terms, so tiny p keeps its relative precision where
+    1 - CDF would cancel to zero. Columns are processed sorted by `obs`, so a chunk's K is its
+    own largest observation rather than the call's."""
+    out = np.ones(obs.size)
+    todo = np.flatnonzero(obs > 0)
+    todo = todo[np.argsort(obs[todo], kind="stable")]
+    for c0 in range(0, todo.size, chunk):
+        cols = todo[c0 : c0 + chunk]
+        k_max = int(obs[cols].max())
+        dp = np.zeros((k_max + 1, cols.size))
+        dp[0] = 1.0
+        for qi in q[:, cols]:
+            top = dp[k_max] + dp[k_max - 1] * qi
+            if k_max > 1:
+                dp[1:k_max] = dp[1:k_max] * (1 - qi) + dp[: k_max - 1] * qi
+            dp[0] *= 1 - qi
+            dp[k_max] = top
+        tail = np.cumsum(dp[::-1], axis=0)[::-1]
+        out[cols] = np.minimum(1.0, tail[obs[cols], np.arange(cols.size)])
+    return out
+
+
+def _quantile_edges(density: np.ndarray, n_bins: int) -> np.ndarray:
+    return np.unique(np.quantile(density, np.linspace(0, 1, n_bins + 1)[1:-1], method="lower"))
+
+
+def locus_enrichment(
+    loci: Any,
+    gene_sets: Mapping[str, Iterable[str]] | str | list[str],
+    *,
+    mode: str = "nearest",
+    window: int = 50_000,
+    merge_distance: int = 500_000,
+    density_window: int = 500_000,
+    protein_coding: bool = True,
+    exclude_mhc: bool = True,
+    min_size: int = 5,
+    max_size: int = 300,
+    grid_step: int = 10_000,
+    density_bins: int = 20,
+    id_col: str | None = None,
+) -> dict[str, Any]:
+    """Locus-level gene set enrichment for GWAS leads, matched on local gene density
+    (INRICH-style). Use this, not `ora` on nearest genes or `competitive` on credible-set z,
+    when all you have is lead variants: it counts loci rather than genes, so a cluster of
+    related genes at one signal (APOE/APOC1/TOMM40) counts once, and it compares each locus
+    with random loci of matched local gene density. Density matters both ways: with nearest
+    genes, an isolated gene in a sparse region is the nearest gene of a large territory and is
+    picked by chance far more often than a gene in a dense cluster; with a window or a
+    multi-lead locus, a locus in a dense region maps to more genes and hits more sets.
+
+    `loci`, `mode`, `window`, `merge_distance`, `protein_coding`, `id_col` — as
+    `genes_for_loci`. `exclude_mhc` defaults to True here (False there): leads in GRCh38
+    chr6:25-34 Mb are dropped and the region is left out of the null. Leads on chromosomes
+    other than 1-22 and X are dropped and counted (`genes_for_loci` keeps Y and MT). So
+    `genes_for_loci(loci, exclude_mhc=True)` with the same mapping arguments shows the mapping
+    used here, once any Y and MT leads are left out.
+    `gene_sets` — a shipped collection name or list of names, or a mapping of set id -> gene
+    ids (symbols, Entrez or Ensembl, resolved through the bundle's gene table, since the loci
+    map to the bundle's genes). Sets are restricted to genes with coordinates of the gene type
+    before the `min_size`/`max_size` filter.
+
+    The test, per set S: the observed statistic is the number of loci with at least one mapped
+    gene in S. Each locus i is compared with every placement of a locus of the same shape (its
+    leads' offsets from the midpoint of its first and last lead) centred on a `grid_step` grid,
+    among grid points of the same chromosome class (autosomes, or X for a locus on X) and the
+    same gene-density stratum: density is the number of genes of the gene type overlapping
+    centre ± `density_window`, and the strata are `density_bins` quantile bins of the
+    autosomal grid's density (fewer where quantiles tie), so autosomal results do not depend on
+    whether a locus is on X. A multi-lead placement is dropped when any of its leads would fall
+    outside the chromosome's gene span or, with `exclude_mhc`, in the MHC. Grid points with no gene
+    within `density_window` are left out — the bundle cannot tell assembly gaps and centromeres,
+    where no lead can sit, from gene deserts; a real locus there is matched to the lowest
+    stratum. q_iS is the fraction of placements, counting the real one, that hit S, and the
+    p-value is the exact upper tail P(X >= observed) of X = sum of independent Bernoulli(q_iS)
+    (Poisson-binomial), so it is not floored by a permutation count and survives BH over
+    thousands of sets. Approximations: loci are treated as independent, and the null ignores
+    that real loci cannot overlap one another. `padj` is BH over tested sets.
+
+    Returns `{"results", "loci", "parameters"}` (and `"attribution"` with a collection name).
+    `results`, one row per tested set ordered by p: `set_id`, `size`, `n_loci_hit`, `expected`
+    (sum of q_iS), `fold_enrichment`, `pval`, `padj`, `hit_loci` (locus ids), `hit_genes` and
+    `hit_symbols`; with a collection name also `name` and `collection`. `loci` is
+    `genes_for_loci`'s frame plus each locus's `density` and `density_bin`. `parameters` states
+    the mapping, the null (grid, density window, bin edges, placements per stratum,
+    independence), lead and locus counts, set members dropped for lacking coordinates or being
+    of another gene type, the coordinates' release and build, and the size filter.
+    """
+    _check_loci_args(mode, window, merge_distance)
+    _check_sizes(min_size, max_size)
+    for name, v, lo in (
+        ("density_window", density_window, 0),
+        ("grid_step", grid_step, 1),
+        ("density_bins", density_bins, 1),
+    ):
+        if not _is_int(v) or v < lo:
+            raise GeneticsUsageError(f"{name} must be an integer >= {lo}, got {v!r}")
+    window, merge_distance, density_window = int(window), int(merge_distance), int(density_window)
+    leads = _leads(loci, id_col)
+    bundled = _bundled(gene_sets)
+    bundle = bundled.bundle if bundled else _bundle()
+    coords = _coords(bundle, bool(protein_coding))
+
+    n_given = leads.height
+    mhc = _in_mhc(leads) if exclude_mhc else pl.Series([False] * n_given)
+    leads = leads.filter(~mhc)
+    usable = leads["chr"].is_between(1, 23) & leads["chr"].is_in(list(coords.by_chr))
+    dropped_chrom = int((~usable).sum())
+    leads = leads.filter(usable)
+    if leads.height == 0:
+        raise GeneticsUsageError(
+            "no leads remain after dropping the MHC and chromosomes other than 1-22 and X"
+        )
+    leads, loci_df, obs_genes = _map_loci(leads, coords, mode, window, merge_distance)
+    n_loci = loci_df.height
+
+    # sets over the genes with coordinates of the gene type
+    set_ids, flat = bundled.flat() if bundled else _flatten(gene_sets)
+    if not bundled:
+        uniq = flat["gene"].unique(maintain_order=True)
+        resolved, report = bundle.genes.resolve(uniq.to_list(), "gene_sets")
+        del report["what"]
+        flat = flat.join(
+            pl.DataFrame({"gene": uniq, "ens": pl.Series(resolved, dtype=pl.Utf8)}), on="gene"
+        ).select("row", pl.col("ens").alias("gene")).drop_nulls()
+    m = _membership(flat, len(set_ids), coords.index)
+    unplaced = flat.filter(~pl.col("gene").is_in(list(coords.index)))
+    sizes = np.diff(m.indptr)
+    tested = np.flatnonzero((sizes >= min_size) & (sizes <= max_size))
+    mt = m[tested].T.tocsr().astype(np.float64)
+
+    # observed: loci x sets, a locus counting once however many of its genes are in a set
+    lg = sparse.csr_matrix(
+        (np.ones(obs_genes.height), (obs_genes["locus"].to_numpy(), obs_genes["gene"].to_numpy())),
+        shape=(n_loci, len(coords.ensembl)),
+    )
+    obs_hit = (lg @ mt).tocsr()
+    obs_hit.data[:] = 1.0
+    obs = np.asarray(obs_hit.sum(axis=0)).ravel().astype(np.int64)
+
+    # the null grid; X is gridded only for a locus on X, and is its own class, so autosomal
+    # strata and placements are the same whether or not an X locus is present
+    chroms = list(range(1, 23)) + ([23] if (loci_df["chr"] == 23).any() else [])
+    chroms = [c for c in chroms if c in coords.by_chr]
+    span = {c: (int(coords.by_chr[c].start[0]), int(coords.by_chr[c].end.max())) for c in chroms}
+    g_chr, g_pos, g_den = [], [], []
+    for c in chroms:
+        ch = coords.by_chr[c]
+        p = np.arange(span[c][0], span[c][1] + 1, int(grid_step), dtype=np.int64)
+        d = ch.density(p, density_window)
+        keep = d > 0
+        if exclude_mhc and c == _MHC[0]:
+            keep &= ~((p >= _MHC[1]) & (p <= _MHC[2]))
+        g_chr.append(np.full(int(keep.sum()), c, dtype=np.int64))
+        g_pos.append(p[keep])
+        g_den.append(d[keep])
+    g_chr, g_pos, g_den = np.concatenate(g_chr), np.concatenate(g_pos), np.concatenate(g_den)
+    g_x = g_chr == 23
+    edges = _quantile_edges(g_den[~g_x] if (~g_x).any() else g_den, int(density_bins))
+    n_bins = edges.size + 1
+    # stratum key: chromosome class * n_bins + density bin
+    g_key = np.searchsorted(edges, g_den, "right") + n_bins * g_x
+    per_key = np.bincount(g_key, minlength=2 * n_bins)
+
+    # each locus by its leads' offsets from its centre
+    lead_pos = leads.group_by("locus", maintain_order=True).agg(pl.col("pos")).sort("locus")
+    centre = ((loci_df["start"] + loci_df["end"]) // 2).to_numpy()
+    l_chr = loci_df["chr"].to_numpy()
+    l_den = np.array([
+        int(coords.by_chr[int(c)].density(np.array([x]), density_window)[0])
+        for c, x in zip(l_chr, centre, strict=True)
+    ])
+    l_bin = np.searchsorted(edges, l_den, "right")
+    l_key = l_bin + n_bins * (l_chr == 23)
+    for i in np.flatnonzero(per_key[l_key] == 0):
+        # an empty stratum (bin 0 always is; X, on autosomal edges, can have others): the
+        # nearest non-empty bin of the locus's class, the lower one on a tie
+        cls, b = divmod(int(l_key[i]), n_bins)
+        filled = np.flatnonzero(per_key[cls * n_bins : (cls + 1) * n_bins])
+        l_key[i] = cls * n_bins + int(filled[np.argmin(np.abs(filled - b))])
+    l_bin = l_key % n_bins
+
+    q = np.empty((n_loci, tested.size))
+    n_place = per_key[l_key].astype(np.float64)
+    single = loci_df["n_leads"].to_numpy() == 1
+    if single.any():
+        sel = np.flatnonzero(np.isin(g_key, np.unique(l_key[single])))
+        q_key = _null_q(
+            coords, mt, g_chr[sel], g_pos[sel], np.zeros(1, dtype=np.int64), g_key[sel],
+            2 * n_bins, mode, window,
+        )
+        q[single] = q_key[l_key[single]]
+    clipped = 0
+    for i in np.flatnonzero(~single):
+        offsets = np.asarray(lead_pos["pos"][int(i)].to_list(), dtype=np.int64) - centre[i]
+        sel = np.flatnonzero(g_key == l_key[i])
+        # a lead placed past either end gene maps to that end gene whatever the offset, which
+        # would inflate the end gene's q; and with exclude_mhc no lead may sit in the MHC, as
+        # no real lead does
+        at = g_pos[sel, None] + offsets[None, :]
+        lo = np.array([span[int(c)][0] for c in g_chr[sel]])[:, None]
+        hi = np.array([span[int(c)][1] for c in g_chr[sel]])[:, None]
+        ok = ((at >= lo) & (at <= hi)).all(axis=1)
+        if exclude_mhc:
+            ok &= ~((g_chr[sel, None] == _MHC[0]) & (at >= _MHC[1]) & (at <= _MHC[2])).any(axis=1)
+        clipped += int((~ok).sum())
+        sel = sel[ok]
+        n_place[i] = sel.size
+        q[i] = _null_q(
+            coords, mt, g_chr[sel], g_pos[sel], offsets, np.zeros(sel.size, dtype=np.int64), 1,
+            mode, window,
+        )[0] if sel.size else 0.0
+    # each locus's own position counts as one of its placements, so q_iS > 0 for every set
+    # the locus hits and no p-value can be 0
+    q *= n_place[:, None]
+    own = obs_hit.tocoo()
+    q[own.row, own.col] += 1.0
+    q /= n_place[:, None] + 1
+
+    pval = _poisson_binomial_sf(q, obs)
+    expected = q.sum(axis=0)
+
+    hit_coo = obs_hit.tocoo()
+    locus_ids = loci_df["locus_id"]
+    order = np.lexsort((hit_coo.row, hit_coo.col))
+    hit_loci = (
+        pl.DataFrame({
+            "col": hit_coo.col[order].astype(np.int64),
+            "locus_id": locus_ids.gather(hit_coo.row[order]),
+        })
+        .group_by("col", maintain_order=True)
+        .agg(hit_loci=pl.col("locus_id"))
+    )
+    observed_genes = np.zeros(len(coords.ensembl), dtype=bool)
+    observed_genes[obs_genes["gene"].to_numpy()] = True
+    sub = m[tested].tocoo()
+    keep = observed_genes[sub.col]
+    hit_genes = (
+        pl.DataFrame({
+            "col": sub.row[keep].astype(np.int64),
+            "gene": pl.Series(coords.ensembl, dtype=pl.Utf8).gather(sub.col[keep]),
+        })
+        .sort("col", "gene")
+        .group_by("col", maintain_order=True)
+        .agg(hit_genes=pl.col("gene"))
+    )
+    empty = pl.lit([], dtype=pl.List(pl.Utf8))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fold = obs / expected
+    results = (
+        pl.DataFrame({
+            "col": np.arange(tested.size, dtype=np.int64),
+            "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
+            "size": sizes[tested].astype(np.int64),
+            "n_loci_hit": obs,
+            "expected": expected,
+            "fold_enrichment": fold,
+            "pval": pval,
+            "padj": _bh(pval),
+        })
+        .join(hit_loci, on="col", how="left")
+        .join(hit_genes, on="col", how="left")
+        .with_columns(pl.col("hit_loci").fill_null(empty), pl.col("hit_genes").fill_null(empty))
+        .drop("col")
+        .sort(["pval", "set_id"])
+    )
+    if not bundled:
+        sym = dict(zip(coords.ensembl, coords.symbol, strict=True))
+        results = results.with_columns(
+            hit_symbols=pl.col("hit_genes").list.eval(pl.element().replace(sym))
+        )
+    multi = int((~single).sum())
+    out = {
+        "results": results,
+        "loci": loci_df.drop("locus").with_columns(
+            density=pl.Series(l_den, dtype=pl.Int64), density_bin=pl.Series(l_bin, dtype=pl.Int64)
+        ),
+        "parameters": {
+            "mode": mode,
+            "window": window if mode == "window" else None,
+            "merge_distance": merge_distance,
+            "protein_coding": bool(protein_coding),
+            "gene_type": _PROTEIN_CODING if protein_coding else "all genes with coordinates",
+            "exclude_mhc": bool(exclude_mhc),
+            "mhc_region": f"chr{_MHC[0]}:{_MHC[1]}-{_MHC[2]}",
+            "leads_given": n_given,
+            "leads_dropped_mhc": int(mhc.sum()),
+            "leads_dropped_chromosome": dropped_chrom,
+            "n_loci": n_loci,
+            "n_loci_multi_lead": multi,
+            "null": {
+                "statistic": "loci with >= 1 mapped gene in the set",
+                "placements": (
+                    "grid points of the locus's chromosome class (autosomes or X) and density "
+                    "stratum, plus the locus itself"
+                ),
+                "grid_step": int(grid_step),
+                "grid_chromosomes": [_CHROM_LABEL.get(c, str(c)) for c in chroms],
+                "grid_points": int(g_pos.size),
+                "density_window": density_window,
+                "density": "genes of the gene type overlapping centre ± density_window",
+                "density_bins": n_bins,
+                "density_bin_edges": edges.astype(np.int64).tolist(),
+                "edges_from": "autosomal grid",
+                "placements_per_bin": per_key[:n_bins].astype(np.int64).tolist(),
+                "placements_per_bin_x": (
+                    per_key[n_bins:].astype(np.int64).tolist() if 23 in chroms else None
+                ),
+                "multi_lead_placements_dropped": clipped,
+                "p_value": "exact Poisson-binomial upper tail over loci",
+                "approximations": (
+                    "loci independent; the null ignores that real loci cannot overlap"
+                ),
+            },
+            "n_genes": len(coords.ensembl),
+            "set_members_dropped": {
+                "reason": "no coordinates in the bundle, or not of the gene type",
+                "memberships": unplaced.height,
+                "genes": unplaced["gene"].n_unique(),
+            },
+            "min_size": int(min_size),
+            "max_size": int(max_size),
+            "sets_given": len(set_ids),
+            "sets_tested": int(tested.size),
+            "coordinates": _coordinates_meta(bundle),
+        },
+    }
+    if bundled:
+        return bundled.finish(out, ("hit_genes",))
+    out["parameters"]["id_resolution"] = {"gene_sets": report}
+    return out
+
+
+_HIT_COLUMNS = ("overlap_genes", "hit_genes", "leading_edge")
+_SIMPLIFY_BASES = ("hits", "members")
+_SIMPLIFY_MEASURES = ("containment", "overlap", "jaccard")
+
+
+def simplify(
+    result: Mapping[str, Any],
+    *,
+    padj: float = 0.05,
+    cutoff: float = 0.7,
+    basis: str = "hits",
+    measure: str = "containment",
+    gene_sets: Mapping[str, Iterable[str]] | None = None,
+) -> dict[str, Any]:
+    """Collapse redundant significant sets in an `ora`, `gsea_preranked`, `competitive` or
+    `locus_enrichment` result.
+
+    The sets with `padj <= padj` are taken in order of p (then padj, then set id); the best is
+    kept as a representative and every remaining set whose similarity to it (`measure`) is at
+    least `cutoff` is absorbed into it; then the best remaining set, and so on.
+
+    `basis` — which genes are compared. `"hits"` (default): the genes driving each set's
+    result — `ora`'s `overlap_genes`, `locus_enrichment`'s `hit_genes`, `gsea_preranked`'s
+    `leading_edge` — so sets significant because of the same hits collapse. A result with no
+    per-set hits (`competitive`) falls back to `"members"`, and `parameters` says so.
+    `"members"`: the sets' full membership, from the bundle for a result over shipped
+    collections or from `gene_sets` (set id -> gene ids) for one over a caller's mapping, not
+    restricted to the genes that analysis tested.
+    `measure` — how much of candidate A the representative R already accounts for.
+    `"containment"` (default): |A ∩ R| / |A|, the fraction of A's own genes R holds — so a set
+    is absorbed only into a representative that explains most of it, never into a better-p
+    set whose few genes merely nest inside it. `"overlap"`: |A ∩ R| / min(|A|, |R|), symmetric,
+    which does absorb a large set into a small nested one. `"jaccard"`: |A ∩ R| / |A ∪ R|.
+
+    The bundle holds no GO graph, so gene overlap is the only similarity available: nested GO
+    terms collapse because their genes nest, not because of the ontology.
+
+    Returns a copy of `result` whose `results` holds the representatives only, with
+    `n_absorbed`, `absorbed_ids` (and `absorbed_names` where the result has names) added;
+    `clusters`, one row per significant set: `set_id`, `representative`, `similarity` (to its
+    representative); and `parameters["simplify"]` recording `padj`, `cutoff`, `basis` (asked
+    and used), `measure` and where the genes came from.
+    """
+    if not isinstance(result, Mapping) or not isinstance(result.get("results"), pl.DataFrame):
+        raise GeneticsUsageError("simplify takes the dict an enrichment function returned")
+    res = result["results"]
+    missing_cols = [c for c in ("set_id", "pval", "padj") if c not in res.columns]
+    if missing_cols:
+        raise GeneticsUsageError(
+            f"the result's results need set_id, pval and padj columns; missing {missing_cols}"
+        )
+    for name, v in (("padj", padj), ("cutoff", cutoff)):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 1:
+            raise GeneticsUsageError(f"{name} must be a number in (0, 1], got {v!r}")
+    if basis not in _SIMPLIFY_BASES:
+        raise GeneticsUsageError(f"basis must be one of {_SIMPLIFY_BASES}, got {basis!r}")
+    if measure not in _SIMPLIFY_MEASURES:
+        raise GeneticsUsageError(f"measure must be one of {_SIMPLIFY_MEASURES}, got {measure!r}")
+    if gene_sets is not None and not isinstance(gene_sets, Mapping):
+        raise GeneticsUsageError("gene_sets= must be a mapping of set id -> gene ids")
+    sig = res.filter(pl.col("padj") <= padj).sort("pval", "padj", "set_id")
+    ids = sig["set_id"].to_list()
+
+    hit_col = next((c for c in _HIT_COLUMNS if c in res.columns), None)
+    used = basis if hit_col else "members"
+    if used == "hits":
+        flat = (
+            sig.select(pl.col(hit_col).alias("gene"))
+            .with_row_index("row")
+            .explode("gene")
+            .drop_nulls()
+            .select(pl.col("row").cast(pl.Int64), "gene")
+        )
+        source = f"the result's {hit_col}"
+    elif gene_sets is not None:
+        missing = [s for s in ids if s not in gene_sets]
+        if missing:
+            raise GeneticsUsageError(f"gene_sets has no members for {missing[:3]}")
+        _, flat = _flatten({s: gene_sets[s] for s in ids})
+        source = "gene_sets mapping as given"
+    elif "attribution" in result and "collection" in res.columns:
+        names = sorted(set(sig["collection"].to_list()))
+        bundle = _bundle()
+        bundle.check_names(names)
+        rows = pl.DataFrame({"set_id": pl.Series(ids, dtype=pl.Utf8)}).with_row_index("row")
+        members = (
+            pl.concat([bundle.members(n) for n in names])
+            if names
+            else pl.DataFrame(schema={"set_id": pl.Utf8, "ensembl_gene_id": pl.Utf8})
+        )
+        flat = members.join(rows, on="set_id").select(
+            pl.col("row").cast(pl.Int64), pl.col("ensembl_gene_id").alias("gene")
+        )
+        source = "full bundled membership"
+    else:
+        raise GeneticsUsageError(
+            "this result is over a caller's mapping: pass the same mapping as gene_sets="
+        )
+    genes = flat["gene"].unique(maintain_order=True).to_list()
+    m = _membership(flat, len(ids), {g: i for i, g in enumerate(genes)}).astype(np.float64)
+    size = np.asarray(m.sum(axis=1)).ravel()
+
+    rep_of = np.full(len(ids), -1)
+    sim = np.zeros(len(ids))
+    for i in range(len(ids)):
+        if rep_of[i] >= 0:
+            continue
+        rep_of[i], sim[i] = i, 1.0
+        inter = np.asarray((m @ m[i].T).todense()).ravel()
+        denom = {
+            "containment": size,
+            "overlap": np.minimum(size, size[i]),
+            "jaccard": size + size[i] - inter,
+        }[measure]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = np.where(denom > 0, inter / denom, 0.0)
+        take = (rep_of < 0) & (s >= cutoff)
+        rep_of[take], sim[take] = i, s[take]
+
+    clusters = pl.DataFrame({
+        "set_id": pl.Series(ids, dtype=pl.Utf8),
+        "representative": pl.Series([ids[r] for r in rep_of], dtype=pl.Utf8),
+        "similarity": sim,
+    })
+    named = "name" in sig.columns
+    other = pl.col("set_id") != pl.col("representative")
+    agg = [pl.col("set_id").filter(other).alias("absorbed_ids")]
+    if named:
+        agg.append(pl.col("name").filter(other).alias("absorbed_names"))
+    absorbed = (
+        clusters.join(sig.select(["set_id"] + (["name"] if named else [])), on="set_id")
+        .group_by("representative", maintain_order=True)
+        .agg(*agg)
+        .with_columns(n_absorbed=pl.col("absorbed_ids").list.len().cast(pl.Int64))
+    )
+    reps = sig.join(absorbed, left_on="set_id", right_on="representative", how="inner")
+    out = dict(result)
+    out["results"] = reps.select(
+        list(sig.columns) + ["n_absorbed", "absorbed_ids"]
+        + (["absorbed_names"] if named else [])
+    ).sort("pval", "padj", "set_id")
+    out["clusters"] = clusters
+    out["parameters"] = {
+        **result.get("parameters", {}),
+        "simplify": {
+            "padj": float(padj),
+            "cutoff": float(cutoff),
+            "basis": basis,
+            "basis_used": used,
+            "measure": measure,
+            "genes_from": source,
+            "n_significant": len(ids),
+            "n_representatives": out["results"].height,
+        },
+    }
+    return out

@@ -5696,7 +5696,8 @@ _SDK_MODULE_SUMMARIES = {
     ),
     "enrichment": (
         "gene set enrichment (over-representation, preranked GSEA, competitive gene-level "
-        "test) against the gene set collections this deployment ships"
+        "test, a density-matched locus test for GWAS leads, and collapsing redundant sets) "
+        "against the gene set collections this deployment ships"
     ),
 }
 

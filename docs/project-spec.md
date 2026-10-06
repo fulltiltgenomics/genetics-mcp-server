@@ -1001,7 +1001,7 @@ cannot establish — are the module docstring's subject and are summarised in th
 
 ### Gene set enrichment (`genetics.enrichment`)
 
-`sdk/enrichment.py` runs three standard analyses over gene-set collections: `ora`
+`sdk/enrichment.py` runs standard analyses over gene-set collections: `ora`
 (hypergeometric over-representation with BH), `gsea_preranked` (`fgsea::fgseaSimple`) and
 `competitive` (MAGMA's competitive test: OLS of gene z-scores on set membership and
 covariates). Each is held to R outputs (`phyper`, `fgsea::fora`, fgsea, `lm`) on a synthetic
@@ -1009,6 +1009,20 @@ fixture (`tests/fixtures/enrichment/`, with the Dockerfile and scripts that
 regenerate it); `tests/test_sdk_enrichment.py` is the match. The module docstring is the
 user-facing spec — the universe conventions in particular — and is what
 `list_capabilities(module="enrichment")` and the shipped stub carry.
+
+For GWAS leads, `locus_enrichment` is an INRICH-style locus test that needs only lead
+positions: leads are merged into loci and mapped to genes with the bundle's own GRCh38
+coordinates (`genes_for_loci` exposes that mapping), and each set's count of hit loci is
+compared with an exact Poisson-binomial null whose per-locus probabilities come from
+same-shaped placements on a genome grid in the locus's chromosome class and gene-density
+stratum. It exists because `ora` on nearest genes and `competitive` on credible-set-only
+z-scores both ignore gene density (gene territory for nearest genes, gene count for windows
+and multi-lead loci) and count a gene cluster at one signal several times. `simplify`
+collapses significant sets driven by the same hit genes, by gene overlap (the bundle has no
+GO graph). There is no R reference for these; `tests/test_sdk_enrichment_loci.py` holds them
+to hand-checked mappings, an independent brute-force implementation of the null,
+enumeration and Monte Carlo of the tail, a calibration run under the null, and a planted
+signal. The function docstrings state the null's approximations.
 
 The collections come from a bundle baked into the sandbox image at `GENETICS_GENESETS_DIR`
 (`collections()`, `gene_sets()`); `tests/test_sdk_enrichment_bundle.py` reads the fixture
