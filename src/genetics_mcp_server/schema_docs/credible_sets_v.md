@@ -44,8 +44,8 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `cs_size` | `INT64` | Number of variants in this credible set |
 | `cs_min_r2` | `FLOAT64` | Minimum pairwise LD r² within the credible set |
 | `aaf` | `FLOAT64` | Alternative allele frequency. Prefer maf column for minor allele frequency |
-| `most_severe` | `STRING` | Most severe VEP-predicted variant consequence |
-| `gene_most_severe` | `STRING` | Gene symbol associated with the most severe consequence |
+| `most_severe` | `STRING` | Most severe VEP-predicted variant consequence. FinnGen-cohort and FinnGen meta-analysis rows and the pseudo credible sets carry the FinnGen variant annotation; eQTL Catalogue, Open Targets, NMR (UKBB+EstBB), PGC SCZ fine-mapping and UKB-PPP rows are stamped from gnomAD 4.1.1 (VEP 115, GENCODE 49), the same annotation gnomad_variant_annotation_v holds, and are NULL for a variant gnomAD does not hold |
+| `gene_most_severe` | `STRING` | Gene symbol associated with the most severe consequence; NULL when no named gene carries it, which gnomAD's GENCODE 49 annotation leaves more often than FinnGen's |
 | `variant` | `STRING` | Variant identifier as chr:pos:ref:alt, chromosome X is 23 |
 | `maf` | `FLOAT64` | Minor allele frequency = LEAST(aaf, 1-aaf). Use directly instead of computing from aaf |
 | `resource` | `STRING` | Data source identifier (lowercase). Always filter by this column, not dataset |

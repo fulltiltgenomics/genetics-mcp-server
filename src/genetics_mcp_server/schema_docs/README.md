@@ -20,12 +20,13 @@ fetching every row, and add the partition predicate each view's section names.
 
 Every view's section below is laid out the same way. The `Columns` table's types are that
 view's own BigQuery types — match the literal to the type: a quoted string never compares
-equal to a numeric column, and an ARRAY column has to go through UNNEST (`<value> IN
-UNNEST(<column>)`), never a bare `=`. `SELECT DISTINCT` the columns listed under `Columns
-with a small, enumerable set of values` before filtering on them rather than guessing a
-value; a parent there means the values are scoped by that column, so enumerate the pair. The
-worked examples run as written — copy the shape rather than inventing one; each shows the
-filters that view expects.
+equal to a numeric column, and an ARRAY column has to go through UNNEST, never a bare `=`:
+`<value> IN UNNEST(<column>)` for an array of scalars, `FROM <view>, UNNEST(<column>) AS c`
+and then `c.<field>` for an array of STRUCTs. `SELECT DISTINCT` the columns listed under
+`Columns with a small, enumerable set of values` before filtering on them rather than
+guessing a value; a parent there means the values are scoped by that column, so enumerate
+the pair. The worked examples run as written — copy the shape rather than inventing one;
+each shows the filters that view expects.
 
 | view | summary |
 | --- | --- |
@@ -48,6 +49,7 @@ filters that view expects.
 | `rcnv_segments_v` | Disease-associated rare-CNV segments |
 | `rcnv_window_associations_v` | Sliding-window rare-CNV associations |
 | `variant_annotation_v` | Per-variant annotation, rsIDs, FinnGen frequencies |
+| `gnomad_variant_annotation_v` | gnomAD per-variant frequencies by ancestry group and VEP annotation |
 | `peak_to_gene_v` | Peak-to-gene links (makes caQTL gene-based) |
 | `phenotypes_v` | Phenotype metadata behind trait codes |
 | `datasets_v` | Dataset registry: resource, version, caveats |
