@@ -775,11 +775,15 @@ _ANNOTATION_SDK_ONLY = "Fetch them in a script instead: `genetics.variant_annota
 _ANNOTATION_DB_PROTEIN_ROUTE = "The database is not an alternative route to them. For a coding SNV"
 _ANNOTATION_NO_ROUTE = "there is no variant-annotation tool on this surface"
 # the code surface's route: it carries myvariant (an outside resource) without the FinnGen
-# annotation tool, a shape no profile produced before the collapse
-_ANNOTATION_MYVARIANT_ROUTE = "`get_myvariant_annotations` returns a variant's consequence"
+# annotation tool, a shape no profile produced before the collapse. The SDK leads and
+# myvariant is the last resort, never the source for consequence or frequency
+_ANNOTATION_MYVARIANT_ROUTE = "Use `get_myvariant_annotations` only for what those two do not cover"
+# the same shape without a script; no shipped profile, so only the assembly reaches it
+_ANNOTATION_DB_MYVARIANT_ROUTE = "Consequence and allele frequency come from `gnomad_variant_annotation_v` above"
 _ANNOTATION_ROUTES = (
     _ANNOTATION_TOOL_ROUTE,
     _ANNOTATION_MYVARIANT_ROUTE,
+    _ANNOTATION_DB_MYVARIANT_ROUTE,
     _ANNOTATION_SDK_AND_PROTEIN,
     _ANNOTATION_SDK_ONLY,
     _ANNOTATION_DB_PROTEIN_ROUTE,
@@ -864,6 +868,31 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert "get_variant_annotations" in available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
         assert _ANNOTATION_TOOL_ROUTE in prompt
+
+    @pytest.mark.parametrize("variant", ["condensed", "legacy"])
+    def test_the_code_surface_leads_with_the_sdk_not_myvariant(self, variant):
+        """genetics-mcp-server-1ly: the code surface's route named myvariant as the source of
+        consequence and population frequencies, which its own tool description refuses."""
+        available = resolve("code", subagents=False)
+        assert {"run_analysis", "get_myvariant_annotations"} <= available
+        assert "get_variant_annotations" not in available
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        assert _ANNOTATION_MYVARIANT_ROUTE in prompt
+        route = prompt[prompt.index("Those per-variant annotations are not in the database"):]
+        assert route.index("genetics.variant_annotation(") < route.index("get_myvariant_annotations")
+        assert "`get_myvariant_annotations` returns a variant's consequence" not in prompt
+
+    @pytest.mark.parametrize("variant", ["condensed", "legacy"])
+    def test_a_database_surface_with_myvariant_gets_the_gnomad_view_route(self, variant):
+        available = resolve("nocode", subagents=False, sandbox=False) - {
+            "get_variant_annotations"
+        }
+        assert "get_myvariant_annotations" in available
+        assert "run_analysis" not in available
+        prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
+        assert _ANNOTATION_PROHIBITION in prompt
+        assert sum(r in prompt for r in _ANNOTATION_ROUTES) == 1
+        assert _ANNOTATION_DB_MYVARIANT_ROUTE in prompt
 
     def test_the_sandbox_surface_with_the_protein_tool_gets_both_halves(self):
         """A script surface without either annotation tool: the SDK covers

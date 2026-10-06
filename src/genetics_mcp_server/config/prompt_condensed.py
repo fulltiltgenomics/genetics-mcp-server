@@ -194,10 +194,15 @@ Those per-variant annotations come from `get_variant_annotations` (FinnGen by de
 """,
            requires_any=_fs('query_database', 'run_analysis')),
     _Block("""
-Those per-variant annotations are not in the database. `get_myvariant_annotations` returns a variant's consequence, clinical significance, pathogenicity scores and population frequencies; for a coding SNV `get_variant_protein_effect` adds the amino-acid change. Beyond those, say what is missing rather than approximating it from the columns above.
+Those per-variant annotations are not in the database. Fetch consequence, allele frequency and gene with a script: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a gene or a region, from FinnGen's annotation by default or gnomAD's with `source="gnomad"`. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar significance, population frequency and rsID. Use `get_myvariant_annotations` only for what those two do not cover — pathogenicity scores, functional predictions, a non-coding variant's clinical significance — never for consequence or allele frequency. Beyond those, say what is missing rather than approximating it from the columns above.
 """,
-           requires_any=_fs('query_database', 'run_analysis'),
+           requires_any=_fs('run_analysis'),
            excludes=_fs('get_variant_annotations')),
+    _Block("""
+Those per-variant annotations are not in the database: `get_myvariant_annotations` returns clinical significance and pathogenicity scores, and for a coding SNV `get_variant_protein_effect` adds the amino-acid change. Consequence and allele frequency come from `gnomad_variant_annotation_v` above, never from `get_myvariant_annotations`. Beyond those, say what is missing rather than approximating it from the columns above.
+""",
+           requires_any=_fs('query_database'),
+           excludes=_fs('get_variant_annotations', 'run_analysis')),
     _Block("""
 Those per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a gene or a region, from FinnGen's annotation by default or gnomAD's with `source="gnomad"`. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar significance, population frequency and rsID. Beyond those two — pathogenicity scores, a non-coding variant's clinical significance — say what is missing rather than approximating it from the columns above.
 """,

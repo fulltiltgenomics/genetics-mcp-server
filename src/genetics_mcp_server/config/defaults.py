@@ -510,12 +510,21 @@ Selecting rows is not the same as pruning the scan: each view's "Scan pruning" s
     # the code surface carries `get_myvariant_annotations` (an outside resource no script
     # can reach) without `get_variant_annotations`, and both SDK variants below exclude it,
     # so without this the prohibition above reaches that surface with no route at all.
+    # myvariant comes last on purpose: the SDK and the protein-effect tool are the sources
+    # for consequence and frequency, and myvariant's own description refuses frequencies.
     # Self-gating on the protein-effect tool through the text rule, which is why a surface
     # with myvariant but no protein-effect tool would fall through — none exists.
     _Block(
-        "\nThose per-variant annotations are not in the database. `get_myvariant_annotations` returns a variant's consequence, clinical significance, pathogenicity scores and population frequencies, and for a coding SNV `get_variant_protein_effect` adds the amino-acid change. Beyond those, say what is missing rather than approximating it from the columns above.\n",
-        requires_any=_fs("query_database", "run_analysis"),
+        "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene with a script: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region, from FinnGen's annotation by default or gnomAD's with `source=\"gnomad\"`. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar significance, population frequency and rsID. Use `get_myvariant_annotations` only for what those two do not cover — pathogenicity scores, functional predictions, a non-coding variant's clinical significance — never for consequence or allele frequency. Beyond those, say what is missing rather than approximating it from the columns above.\n",
+        requires_any=_fs("run_analysis"),
         excludes=_fs("get_variant_annotations"),
+    ),
+    # the same shape without a script: no shipped profile is this today, but the
+    # prohibition would reach it, so it gets the database's gnomAD view as its route
+    _Block(
+        "\nThose per-variant annotations are not in the database: `get_myvariant_annotations` returns clinical significance and pathogenicity scores, and for a coding SNV `get_variant_protein_effect` adds the amino-acid change. Consequence and allele frequency come from `gnomad_variant_annotation_v` above, never from `get_myvariant_annotations`. Beyond those, say what is missing rather than approximating it from the columns above.\n",
+        requires_any=_fs("query_database"),
+        excludes=_fs("get_variant_annotations", "run_analysis"),
     ),
     _Block(
         "\nThose per-variant annotations are not in the database. Fetch consequence, allele frequency and gene in a script instead: `genetics.variant_annotation(variant=..., variants=[...], gene=..., region=...)` takes a single variant, a batch, a whole gene or a region, from FinnGen's annotation by default or gnomAD's with `source=\"gnomad\"`. For a coding SNV, `get_variant_protein_effect` adds the amino-acid change with its curated ClinVar clinical significance, population frequency and rsID. Beyond those two — pathogenicity scores, a non-coding variant's clinical significance — say what is missing rather than approximating it from the columns above.\n",
