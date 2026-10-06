@@ -38,3 +38,23 @@ z <- 0.1 * (log_len - mean(log_len)) + rnorm(length(universe))
 z[universe %in% sets$SET15] <- z[universe %in% sets$SET15] + 0.8
 write.table(data.frame(gene = universe, z = round(z, 6), log_len = log_len),
             file.path(out, "gene_stats.tsv"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+# sets that cross the size filter only through universe restriction, for ORA only: a separate
+# file, so the GSEA and competitive outputs over gene_sets.gmt are untouched, and built without
+# the RNG so the inputs above are unchanged. SET31/SET32 are 4/5 universe genes plus 3 X*
+# (sizes 7/8 as given), SET33/SET34 are 300/301 plus 5 X*. Members come from genes already
+# in a set, so the annotated universe is unchanged too
+in_sets <- sort(unique(unlist(sets)))
+ann_u <- intersect(in_sets, universe)
+ann_x <- setdiff(in_sets, universe)
+hit_u <- intersect(ann_u, hits)
+non_hit <- setdiff(ann_u, hits)
+bnd <- list(
+  SET31 = c(hit_u[1:2], non_hit[1:2], ann_x[1:3]),
+  SET32 = c(hit_u[1:3], non_hit[1:2], ann_x[1:3]),
+  SET33 = c(ann_u[1:300], ann_x[1:5]),
+  SET34 = c(ann_u[1:301], ann_x[1:5])
+)
+bnd <- lapply(bnd, sort)
+gmt <- vapply(names(bnd), function(n) paste(c(n, "synthetic", bnd[[n]]), collapse = "\t"), "")
+writeLines(gmt, file.path(out, "gene_sets_boundary.gmt"))

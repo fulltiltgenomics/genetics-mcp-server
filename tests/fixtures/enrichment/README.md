@@ -11,6 +11,10 @@ Bioconductor 3.20, fgsea 1.32.4, BiocParallel 1.40.2. `reference.log` ends with 
 - `gene_sets.gmt` — 30 sets drawn from `G0001..G0800` and `X001..X100`.
 - `universe.txt` — `G0001..G0900`. `G0801..G0900` are in no set; `X*` genes are in sets but
   outside the universe.
+- `gene_sets_boundary.gmt` — ORA only: `SET31`..`SET34` have 7, 8, 305 and 306 genes as
+  given and 4, 5, 300, 301 inside the universe, so they cross the size filter only through
+  universe restriction (`SET32`, `SET33` are tested; `SET31`, `SET34` are not). A separate
+  file so the GSEA and competitive outputs over `gene_sets.gmt` do not depend on them.
 - `gene_list.txt` — the ORA query, enriched for `SET10` and `SET20`, with five `X*` genes.
 - `ranked_stats.tsv` — one statistic per universe gene, `SET16` shifted up, `SET17` down.
 - `gene_stats.tsv` — gene `z` and a size-like covariate `log_len`, `SET15` shifted up.
@@ -38,7 +42,7 @@ than 1e-6.
 
 ## Outputs
 
-- `ora_phyper.tsv`, `ora_fora.tsv` — ORA as above (deterministic).
+- `ora_phyper.tsv`, `ora_fora.tsv` — ORA as above over both GMT files (deterministic).
 - `gsea_fgseaSimple_nperm10000_seed1.tsv` — `fgseaSimple`, `nperm = 10000`, `gseaParam = 1`,
   `set.seed(1)`, serial `BiocParallel`. `ES` and `leadingEdge` are deterministic. `NES` is **not**:
   it divides `ES` by the mean of the same-signed permutation ESs, so it carries Monte Carlo

@@ -1,5 +1,5 @@
 Warning message:
-In fora(pathways, genes, universe, minSize = min_size, maxSize = max_size) :
+In fora(ora_sets, genes, universe, minSize = min_size, maxSize = max_size) :
   Not all of the input genes belong to the universe, such genes were removed
 ORA convention A (given):     N = 900  n = 58 
 ORA convention B (annotated): N = 759  n = 52 

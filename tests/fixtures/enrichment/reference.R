@@ -21,10 +21,11 @@ write_tsv <- function(df, name) {
 # --- ORA ---------------------------------------------------------------------------------
 # hypergeometric upper tail P(X >= k): sets and the gene list are restricted to `u`, and BH
 # runs over the sets that pass the size filter after that restriction
+ora_sets <- c(pathways, gmtPathways(file.path(out, "gene_sets_boundary.gmt")))
 ora_phyper <- function(u) {
   hits <- intersect(genes, u)
-  rows <- lapply(names(pathways), function(p) {
-    s <- intersect(pathways[[p]], u)
+  rows <- lapply(names(ora_sets), function(p) {
+    s <- intersect(ora_sets[[p]], u)
     k <- length(intersect(s, hits))
     data.frame(pathway = p, size = length(s), overlap = k,
                pval = phyper(k - 1, length(s), length(u) - length(s), length(hits),
@@ -42,7 +43,7 @@ ora_phyper <- function(u) {
 a <- ora_phyper(universe)
 # convention B: the universe intersected with genes annotated to any set in the collection,
 # before size filtering (what clusterProfiler::enricher and GOseq-style tools do)
-annotated <- unique(unlist(pathways))
+annotated <- unique(unlist(ora_sets))
 b <- ora_phyper(intersect(universe, annotated))
 
 ora <- merge(a[, c("pathway", "size", "overlap", "pval", "padj")],
@@ -50,7 +51,7 @@ ora <- merge(a[, c("pathway", "size", "overlap", "pval", "padj")],
              by = "pathway", suffixes = c("_given", "_annotated"), all = TRUE)
 write_tsv(ora, "ora_phyper.tsv")
 
-fr <- as.data.frame(fora(pathways, genes, universe, minSize = min_size, maxSize = max_size))
+fr <- as.data.frame(fora(ora_sets, genes, universe, minSize = min_size, maxSize = max_size))
 fr$overlapGenes <- vapply(fr$overlapGenes, paste, "", collapse = ",")
 write_tsv(fr[order(fr$pathway), ], "ora_fora.tsv")
 
