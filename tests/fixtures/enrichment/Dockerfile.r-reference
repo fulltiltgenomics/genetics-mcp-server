@@ -1,0 +1,7 @@
+# rocker/r-ver pins CRAN to a dated p3m snapshot for its R release; Bioconductor 3.20 is the
+# release that pairs with R 4.4
+FROM rocker/r-ver:4.4.3
+RUN Rscript -e 'install.packages("BiocManager")' \
+ && Rscript -e 'BiocManager::install(version = "3.20", ask = FALSE, update = FALSE)' \
+ && Rscript -e 'BiocManager::install("fgsea", ask = FALSE, update = FALSE)' \
+ && Rscript -e 'library(fgsea); print(packageVersion("fgsea"))'
