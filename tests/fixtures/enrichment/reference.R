@@ -78,6 +78,15 @@ multi <- fgseaMultilevel(pathways, stats, minSize = min_size, maxSize = max_size
                          gseaParam = 1, eps = 0,
                          BPPARAM = BiocParallel::SerialParam(progressbar = FALSE))
 write_tsv(le(multi), "gsea_fgseaMultilevel_eps0_seed1.tsv")
+# ES under other weights: deterministic, so a few permutations suffice; the seed only keeps
+# the run reproducible
+es_weight <- do.call(rbind, lapply(c(0, 2), function(g) {
+  set.seed(1)
+  r <- fgseaSimple(pathways, stats, nperm = 10, minSize = min_size, maxSize = max_size,
+                   gseaParam = g, BPPARAM = BiocParallel::SerialParam(progressbar = FALSE))
+  data.frame(pathway = r$pathway, gseaParam = g, ES = r$ES)
+}))
+write_tsv(es_weight[order(es_weight$gseaParam, es_weight$pathway), ], "gsea_es_gseaParam0_2.tsv")
 
 # --- competitive gene-level test (MAGMA-style) -------------------------------------------
 # z ~ in_set + log_len over every gene with a statistic; one-sided p for a positive

@@ -47,6 +47,8 @@ than 1e-6.
   `set.seed(1)`, serial `BiocParallel`. `ES` and `leadingEdge` are deterministic. `NES` is **not**:
   it divides `ES` by the mean of the same-signed permutation ESs, so it carries Monte Carlo
   noise like `pval`.
+- `gsea_es_gseaParam0_2.tsv` — `ES` from `fgseaSimple` with `gseaParam = 0` and `2`, to hold
+  the weight exponent to R (deterministic).
 - `gsea_fgseaMultilevel_eps0_seed1.tsv` — `fgseaMultilevel`, `eps = 0`, `set.seed(1)`: a
   more accurate p-value for small p, to compare permutation p-values against within noise.
 - `competitive_lm.tsv` — per set, `lm(z ~ in_set + log_len)` over every gene in
