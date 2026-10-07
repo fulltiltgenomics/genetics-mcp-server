@@ -222,6 +222,31 @@ class TestHttpBehaviour:
         assert result["_error"].startswith("ChEMBL HTTP 404: ")
         assert len(result["_error"]) == len("ChEMBL HTTP 404: ") + 200
 
+    async def test_a_read_that_hangs_is_a_sentinel_and_not_a_traceback(self):
+        """The connection succeeds and the read then hangs, which the resilient client's
+        ConnectError path never sees; measured in production as an ERROR traceback per
+        gene and "internal error" to the user during one EBI slowdown."""
+
+        def hang(url):
+            raise httpx.ReadTimeout("read timed out")
+
+        patcher, calls = self._patch_get(hang)
+        with patcher:
+            result = await self.client._get("target", {"organism": "Homo sapiens"}, ["pref_name"])
+            again = await self.client._get("target", {"organism": "Homo sapiens"}, ["pref_name"])
+        assert result["_status"] is None
+        assert result["_error"].startswith("ChEMBL did not respond within")
+        assert again["_status"] is None and len(calls) == 2
+
+    async def test_a_connection_dropped_mid_body_is_a_sentinel_naming_the_fault(self):
+        def drop(url):
+            raise httpx.RemoteProtocolError("peer closed connection")
+
+        patcher, _calls = self._patch_get(drop)
+        with patcher:
+            result = await self.client._get("target", {"organism": "Homo sapiens"}, ["pref_name"])
+        assert result == {"_error": "ChEMBL unreachable: RemoteProtocolError", "_status": None}
+
     async def test_a_500_is_a_sentinel_and_is_not_cached(self):
         patcher, calls = self._patch_get(lambda url: _resp(status=500, text="boom"))
         with patcher:

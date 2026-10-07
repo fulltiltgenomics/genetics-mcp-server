@@ -909,14 +909,27 @@ class ChEMBLClient:
         cached = _CACHE.get(cache_key)
         if cached is not _TTLCache._MISS:
             return cached
-        resp = await self._client.get(
-            url,
-            headers={"Accept": "application/json"},
-            timeout=_TIMEOUT,
-            # stated rather than inherited from the client's default: the origin pin above
-            # only holds if the hop it approves is the only one made
-            follow_redirects=False,
-        )
+        try:
+            resp = await self._client.get(
+                url,
+                headers={"Accept": "application/json"},
+                timeout=_TIMEOUT,
+                # stated rather than inherited from the client's default: the origin pin
+                # above only holds if the hop it approves is the only one made
+                follow_redirects=False,
+            )
+        except httpx.TimeoutException:
+            # the connection succeeds and the read then hangs, so the resilient client's
+            # ConnectError path never fires; without this a ChEMBL stall reaches the
+            # executor's generic handler as a traceback and the user as an internal error
+            logger.warning(f"ChEMBL did not respond within {_TIMEOUT:.0f}s: {url}")
+            return {
+                "_error": f"ChEMBL did not respond within {_TIMEOUT:.0f}s",
+                "_status": None,
+            }
+        except httpx.TransportError as exc:
+            logger.warning(f"ChEMBL request failed: {url} -> {type(exc).__name__}")
+            return {"_error": f"ChEMBL unreachable: {type(exc).__name__}", "_status": None}
         if resp.status_code != 200:
             return self._error_sentinel(resp, url)
         try:

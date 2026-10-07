@@ -1804,6 +1804,30 @@ class TestClassifyErrorSubclasses:
         assert "too long" in message.lower()
         assert "invalid request" not in message.lower()
 
+    def test_an_oversized_image_is_named_rather_than_reported_as_invalid(self):
+        """The same 400 as a context overflow, and as misleading when reported generically:
+        the image rides in the first message, so every later turn fails the same way."""
+        import anthropic
+        import httpx
+
+        from genetics_mcp_server import chat_api
+
+        detail = (
+            "messages.0.content.0.image.source.base64.data: At least one of the image "
+            "dimensions exceed max allowed size: 8000 pixels"
+        )
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        err = anthropic.BadRequestError(
+            detail,
+            response=httpx.Response(400, request=req),
+            body={"error": {"type": "invalid_request_error", "message": detail}},
+        )
+
+        message = chat_api._classify_error(err)
+
+        assert "image" in message.lower() and "8000" in message
+        assert "invalid request" not in message.lower()
+
     def test_other_bad_requests_keep_the_generic_message(self):
         import anthropic
         import httpx

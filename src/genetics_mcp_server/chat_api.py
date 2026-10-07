@@ -113,6 +113,14 @@ def _classify_error(e: Exception) -> str:
                 "This conversation is too long for the model's context window. "
                 "Start a new chat to continue."
             )
+        # the same 400 for an attached image over the model's pixel cap; the image is
+        # replayed on every turn, so the conversation stays stuck until it is gone
+        if "image dimensions exceed" in str(e):
+            return (
+                "An attached image is larger than the model accepts (over 8000 pixels on "
+                "a side), and it is resent on every turn. Start a new chat and attach a "
+                "smaller copy."
+            )
         return "Invalid request sent to LLM service."
     if name == "InternalServerError" or err_type in ("api_error", "internal_server_error"):
         return "Claude had a temporary upstream error. Please try again."
