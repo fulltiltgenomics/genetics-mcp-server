@@ -59,7 +59,6 @@ UPDATE_ENV_VAR = "UPDATE_TOOL_SURFACE_GOLDEN"
 # from .env would make the recorded baseline that machine's, not the deployment's.
 _DISABLED_TOOLS_ENV_VARS = (
     "ENABLE_CREDIBLE_SETS_STATS",
-    "ENABLE_PHENOTYPE_REPORT",
     "ENABLE_SUBAGENTS",
     "ENABLE_LITERATURE_SEARCH",
     "SANDBOX_ENABLED",
@@ -68,9 +67,9 @@ _DISABLED_TOOLS_ENV_VARS = (
 )
 
 # read off k8s/deployments/chat-backend.yaml and mcp-server.yaml in genetics-results-suite.
-# "unset" is the operative half: those manifests name neither ENABLE_CREDIBLE_SETS_STATS,
-# ENABLE_PHENOTYPE_REPORT nor ENABLE_LITERATURE_SEARCH, and mcp-server does not name
-# SANDBOX_ENABLED either, so each takes its settings.py default in the cluster.
+# "unset" is the operative half: those manifests name neither ENABLE_CREDIBLE_SETS_STATS nor
+# ENABLE_LITERATURE_SEARCH, and mcp-server does not name SANDBOX_ENABLED either, so each
+# takes its settings.py default in the cluster.
 # ALPHAGENOME_ENABLED and ALPHAGENOME_API_KEY together gate the AlphaGenome tools:
 # ALPHAGENOME_ENABLED is the deployment's own switch (envsubst'd from terraform at deploy
 # time), and ALPHAGENOME_API_KEY is an OPTIONAL secret key on top of it. The baseline

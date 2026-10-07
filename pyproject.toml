@@ -10,6 +10,9 @@ dependencies = [
     "polars==1.40.1",
     "python-dotenv==1.2.2",
     "matplotlib==3.10.9",
+    # chat_api.py downscales attached images with it; also a matplotlib dependency, which
+    # is how it arrived before it was used directly
+    "pillow==12.1.1",
     # used only by sdk/linemodels.py (the EM optimiser) and sdk/plots.py (the line-models
     # region), both lazily; declared so the tests run it on purpose rather than through
     # alphagenome's transitive closure. The sandbox image pins its own copy in

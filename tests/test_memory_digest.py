@@ -64,7 +64,7 @@ def test_run_analysis_script_text():
 def test_phenotype_and_gene_lookup_parameters():
     found = extract_entities(
         blocks(
-            tool_use("get_phenotype_report", resource="finngen", phenotype_code="E4_DM2"),
+            tool_use("get_credible_sets_by_phenotype", resource="finngen", phenotype="E4_DM2"),
             tool_use("lookup_phenotype_names", codes=["I9_CHD", "J10_ASTHMA"]),
             tool_use("search_phenotypes", query="type 2 diabetes"),
             tool_use("search_genes", query="APOE, LDLR"),
@@ -388,9 +388,9 @@ def build_cluster_db(path):
         tool_use("search_genes", query="APOE"),
         tool_use("search_genes", query="APOE, LDLR"),
         tool_use("search_genes", query="LDLR"),
-        tool_use("get_phenotype_report", phenotype_code="I9_CHD"),
+        tool_use("get_credible_sets_by_phenotype", phenotype="I9_CHD"),
         tool_use("lookup_phenotype_names", codes=["I9_CHD"]),
-        tool_use("get_phenotype_report", phenotype_code="I9_CHD"),
+        tool_use("get_credible_sets_by_phenotype", phenotype="I9_CHD"),
         tool_use("search_genes", query="APOE"),
     ]
     firsts = ["start here"] * 6 + ["back to apoe — any coding variants?"]

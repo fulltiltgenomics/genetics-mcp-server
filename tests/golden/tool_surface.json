@@ -8,12 +8,10 @@
     },
     "deployed_flags_unset": [
       "ENABLE_CREDIBLE_SETS_STATS",
-      "ENABLE_LITERATURE_SEARCH",
-      "ENABLE_PHENOTYPE_REPORT"
+      "ENABLE_LITERATURE_SEARCH"
     ],
     "disabled_tools": [
       "get_credible_sets_stats",
-      "get_phenotype_report",
       "launch_subagents"
     ],
     "profiles": {
@@ -430,7 +428,7 @@
   "local_tool_definitions": {
     "by_category": {
       "api": {
-        "count": 46,
+        "count": 45,
         "tools": [
           "analyze_variant_list",
           "get_asm_qtl_by_gene",
@@ -470,7 +468,6 @@
           "get_open_chromatin_by_region",
           "get_open_chromatin_by_variant",
           "get_peak_to_genes",
-          "get_phenotype_report",
           "get_rcnv_associations",
           "get_summary_stats",
           "get_summary_stats_by_region",
@@ -524,7 +521,7 @@
         ]
       }
     },
-    "count": 74
+    "count": 73
   },
   "mcp_server": {
     "deployed_flags_set": {
@@ -535,7 +532,6 @@
       "ALPHAGENOME_ENABLED",
       "ENABLE_CREDIBLE_SETS_STATS",
       "ENABLE_LITERATURE_SEARCH",
-      "ENABLE_PHENOTYPE_REPORT",
       "SANDBOX_ENABLED"
     ],
     "hardcoded_exclusions": [
@@ -620,7 +616,6 @@
       "compare_alphagenome_with_measured",
       "get_alphagenome_variant_predictions",
       "get_credible_sets_stats",
-      "get_phenotype_report",
       "launch_subagents",
       "run_analysis"
     ]

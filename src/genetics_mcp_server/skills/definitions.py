@@ -82,7 +82,6 @@ _GENETICS_API_TOOLS = frozenset({
     "get_open_chromatin_by_region",
     "get_open_chromatin_by_variant",
     "get_peak_to_genes",
-    "get_phenotype_report",
     "get_rcnv_associations",
     "get_summary_stats",
     "get_summary_stats_by_region",

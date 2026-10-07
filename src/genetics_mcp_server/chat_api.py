@@ -9,6 +9,8 @@ Run with: uvicorn genetics_mcp_server.chat_api:app --port 8000
 """
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
@@ -22,6 +24,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from PIL import Image
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -186,6 +189,74 @@ def _strip_image_markers(content: Any) -> Any:
             block = {**block, "text": sub(block["text"])}
         out.append(block)
     return out
+
+
+# Anthropic downscales an image whose long edge exceeds this before the model sees it, and
+# refuses one over 8000 px outright with a 400 — which, because the browser replays the
+# original attachment in every later turn, broke the whole conversation, not just one turn.
+# Shrinking to this size here therefore loses nothing the model would have seen
+_MAX_IMAGE_EDGE = 1568
+# decoding is what costs memory (4 bytes a pixel), so a picture above this is refused from
+# its header alone rather than decoded; a 50 MB upload can still be a compression bomb
+_MAX_IMAGE_PIXELS = 100_000_000
+
+
+def _shrink_image_block(block: dict) -> dict:
+    """Return `block` with its base64 image downscaled to _MAX_IMAGE_EDGE, if it exceeds it.
+
+    A block this cannot decode is returned unchanged for the provider to judge.
+    """
+    source = block.get("source")
+    if not (
+        isinstance(source, dict)
+        and source.get("type") == "base64"
+        and isinstance(source.get("data"), str)
+    ):
+        return block
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(source["data"]))) as img:
+            width, height = img.size
+            if max(width, height) <= _MAX_IMAGE_EDGE:
+                return block
+            if width * height > _MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"Image too large ({width}x{height} pixels). Please attach a "
+                        "smaller or cropped image."
+                    ),
+                )
+            is_jpeg = img.format == "JPEG"
+            img.thumbnail((_MAX_IMAGE_EDGE, _MAX_IMAGE_EDGE))
+            out = io.BytesIO()
+            if is_jpeg:
+                img.convert("RGB").save(out, "JPEG", quality=90)
+            else:
+                if img.mode not in ("1", "L", "LA", "P", "RGB", "RGBA"):
+                    img = img.convert("RGBA")
+                img.save(out, "PNG")
+    except (ValueError, OSError, Image.DecompressionBombError) as e:
+        logger.warning(f"Could not check an attached image's size, sending it as is: {e}")
+        return block
+    logger.info(f"Downscaled a {width}x{height} attached image to fit {_MAX_IMAGE_EDGE} px")
+    return {
+        **block,
+        "source": {
+            **source,
+            "media_type": "image/jpeg" if is_jpeg else "image/png",
+            "data": base64.b64encode(out.getvalue()).decode("ascii"),
+        },
+    }
+
+
+def _shrink_images(content: Any) -> Any:
+    """Downscale every base64 image block in one message's content."""
+    if not isinstance(content, list):
+        return content
+    return [
+        _shrink_image_block(b) if isinstance(b, dict) and b.get("type") == "image" else b
+        for b in content
+    ]
 
 
 def _message_text_len(content) -> int:
@@ -914,6 +985,10 @@ async def stream_chat(
         {"role": msg.role, "content": _strip_image_markers(msg.content)}
         for msg in request.messages
     ]
+    # decoding a large image takes long enough to stall every other stream on this worker
+    messages = await asyncio.to_thread(
+        lambda: [{**m, "content": _shrink_images(m["content"])} for m in messages]
+    )
     stripped_chars = sum(
         _message_text_len(m.content) for m in request.messages
     ) - sum(_message_text_len(m["content"]) for m in messages)

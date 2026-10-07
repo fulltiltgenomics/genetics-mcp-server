@@ -876,24 +876,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "get_phenotype_report", # TODO WHEN DISCUSSING SAMPLE SIZE, INCLUDE NUMBERS OF CASES AND CONTROLS
-        "category": "api",
-        "sdk_replaceable": True,
-        "description": "Get a detailed markdown report for a phenotype. Returns a markdown report with credible sets and gene evidence summaries in those credible sets. This is the first line of phenotype-based inquiry and should be called first before calling other tools.",
-        "parameters": {
-            "resource": {
-                "type": "string",
-                "description": "Data resource: 'finngen', 'ukbb', 'open_targets' (default 'finngen')",
-                "default": "finngen",
-            },
-            "phenotype_code": {
-                "type": "string",
-                "description": "Phenotype code (e.g., 'I9_CHD', 'T2D')",
-                "required": True,
-            },
-        },
-    },
-    {
         "name": "lookup_phenotype_names",
         "category": "general",
         "sdk_replaceable": True,
@@ -2995,11 +2977,6 @@ def register_mcp_tools(
     async def get_gene_based_results_by_phenotype(resource: str, phenotype: str) -> dict:
         """Get the complete unfiltered gene burden results for one phenotype."""
         return await executor.get_gene_based_results_by_phenotype(resource, phenotype)
-
-    @_tool()
-    async def get_phenotype_report(resource: str, phenotype_code: str) -> dict:
-        """Get a detailed markdown report for a phenotype."""
-        return await executor.get_phenotype_report(resource, phenotype_code)
 
     @_tool()
     async def lookup_phenotype_names(codes: list[str]) -> dict:

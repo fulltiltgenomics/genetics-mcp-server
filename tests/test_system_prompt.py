@@ -3,8 +3,7 @@
 genetics-results-suite-4h6.69: the prompt and the tool list used to be assembled
 independently and nothing checked them against each other, so the prompt documented
 `launch_subagents` at length while ENABLE_SUBAGENTS defaults false and removes it from the
-tool list, described `get_phenotype_report` behind another flag defaulting false, and never
-mentioned `run_analysis` at all.
+tool list, and never mentioned `run_analysis` at all.
 
 The scan below is deliberately NOT `defaults.tools_named_in` — that function is what
 DECIDES which blocks are emitted, so using it here would make the test assert that the
@@ -154,7 +153,7 @@ class TestPromptNamesOnlyAvailableTools:
         """tool_names=None keeps the pre-4h6.69 behaviour for callers with no tool list."""
         full = default_system_prompt("FinnGenie")
         assert "launch_subagents" in full
-        assert "get_phenotype_report" in full
+        assert "get_alphagenome_variant_predictions" in full
         assert "run_analysis" in full
 
 

@@ -250,11 +250,6 @@ class Settings:
             "ENABLE_CREDIBLE_SETS_STATS", "false"
         ).lower() in ("1", "true", "yes")
     )
-    enable_phenotype_report: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_PHENOTYPE_REPORT", "false"
-        ).lower() in ("1", "true", "yes")
-    )
 
     # NOT one of the "optional tools" above: literature search is part of the shipped
     # surface, so this defaults TRUE and exists only to take it back out. The case it was
@@ -520,8 +515,6 @@ class Settings:
         disabled = set()
         if not self.enable_credible_sets_stats:
             disabled.add("get_credible_sets_stats")
-        if not self.enable_phenotype_report:
-            disabled.add("get_phenotype_report")
         if not self.enable_subagents:
             disabled.add("launch_subagents")
         if not self.enable_literature_search:
