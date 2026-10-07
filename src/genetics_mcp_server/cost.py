@@ -7,22 +7,23 @@ import re
 # and the first row whose floor the model meets wins, so a new minor release inherits its
 # family's latest row until a price change adds one above it.
 #
-# cache_creation is the 5-minute TTL write (1.25x input); the 1-hour TTL writes at 2x, but
-# nothing here sends `ttl: "1h"`. Cache reads are 0.1x input everywhere except Fable 5.1,
-# where Anthropic cut them to 0.025x.
+# cache_creation is the 1-hour TTL write (2x input), because every breakpoint the chat
+# path sends asks for that TTL (`_CACHE_CONTROL` in llm_service.py); the 5-minute write
+# would be 1.25x. Cache reads are 0.1x input everywhere except Fable 5.1, where Anthropic
+# cut them to 0.025x.
 _PRICING: list[tuple[str, tuple[int, int], tuple[float, float, float, float]]] = [
-    ("fable",  (5, 1), (10.0, 50.0, 0.25, 12.5)),
-    ("fable",  (5, 0), (10.0, 50.0, 1.0,  12.5)),
-    ("opus",   (4, 5), (5.0,  25.0, 0.50, 6.25)),
-    ("opus",   (0, 0), (15.0, 75.0, 1.50, 18.75)),
-    ("sonnet", (5, 0), (2.0,  10.0, 0.20, 2.5)),
-    ("sonnet", (0, 0), (3.0,  15.0, 0.30, 3.75)),
-    ("haiku",  (4, 5), (1.0,  5.0,  0.10, 1.25)),
-    ("haiku",  (0, 0), (0.80, 4.0,  0.08, 1.0)),
+    ("fable",  (5, 1), (10.0, 50.0, 0.25, 20.0)),
+    ("fable",  (5, 0), (10.0, 50.0, 1.0,  20.0)),
+    ("opus",   (4, 5), (5.0,  25.0, 0.50, 10.0)),
+    ("opus",   (0, 0), (15.0, 75.0, 1.50, 30.0)),
+    ("sonnet", (5, 0), (2.0,  10.0, 0.20, 4.0)),
+    ("sonnet", (0, 0), (3.0,  15.0, 0.30, 6.0)),
+    ("haiku",  (4, 5), (1.0,  5.0,  0.10, 2.0)),
+    ("haiku",  (0, 0), (0.80, 4.0,  0.08, 1.6)),
 ]
 
 # what an unrecognised model is priced at; `has_pricing` lets callers refuse instead
-_FALLBACK_PRICING = (3.0, 15.0, 0.30, 3.75)
+_FALLBACK_PRICING = (3.0, 15.0, 0.30, 6.0)
 
 _CONTEXT_WINDOWS: dict[str, int] = {
     "fable":  1_000_000,

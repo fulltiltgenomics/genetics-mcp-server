@@ -1137,8 +1137,8 @@ async def test_cache_split_prices_the_turn_exactly(stub_server, tmp_path):
     # is measuring something other than what its name says
     assert turn["cached_input_tokens"] == 70_000 + 8_000
 
-    # opus pricing per Mtok: 5 in / 25 out / 0.5 cache read / 6.25 cache creation
-    expected = (22_000 * 5 + 800 * 25 + 70_000 * 0.5 + 8_000 * 6.25) / 1e6
+    # opus pricing per Mtok: 5 in / 25 out / 0.5 cache read / 10 cache creation (1-hour TTL)
+    expected = (22_000 * 5 + 800 * 25 + 70_000 * 0.5 + 8_000 * 10.0) / 1e6
     assert turn["cost_usd"] == pytest.approx(expected)
     assert turn["cost_basis"] == "exact"
     # the exact figure sits inside the bracket the harness used to report on its own

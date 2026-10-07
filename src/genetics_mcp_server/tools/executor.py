@@ -419,6 +419,22 @@ def _ld_failure(resp: Any) -> dict[str, Any]:
     return failure
 
 
+
+# the index's ranking diagnostics on every hit: the strings it matched on and three
+# scores the model never acts on. A hit is 470 characters with them and about half that
+# without, and search_phenotypes was the largest replayed tool output in production
+# (16.6M characters over 455 results, 36K per result on average)
+_RANKING_FIELDS = frozenset({"search_strings", "match_score", "rank_score", "matched_key"})
+
+
+def _without_ranking_fields(hits: Any) -> Any:
+    if not isinstance(hits, list):
+        return hits
+    return [
+        {k: v for k, v in hit.items() if k not in _RANKING_FIELDS} if isinstance(hit, dict) else hit
+        for hit in hits
+    ]
+
 def _seg(value: Any) -> str:
     """Percent-encode a caller-supplied value for use as a URL *path segment*.
 
@@ -1158,7 +1174,11 @@ class ToolExecutor:
             params["resources"] = resource
         resp = await self.client.get(f"{self.base_url}/v1/search", params=params)
         if resp.status_code == 200:
-            return {"success": True, **self._columns_meta(resp), "results": resp.json()}
+            return {
+                "success": True,
+                **self._columns_meta(resp),
+                "results": _without_ranking_fields(resp.json()),
+            }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def search_genes(self, query: str, limit: int = 10) -> dict[str, Any]:

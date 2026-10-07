@@ -244,6 +244,23 @@ class Settings:
     mcp_max_iterations: int = 25
     mcp_max_result_size: int = 50000
 
+    # replayed tool results are cleared from the model's view, oldest first, once the
+    # history the client sends passes the trigger, down to the target; the last
+    # `keep_turns` assistant turns keep theirs. Measured over production: tool results
+    # were 81% of the replayed history in every session that passed a quarter of the
+    # window, and a 500k-token history re-sent after a 5-minute pause costs about $3
+    # before the model has read the question. Characters, not tokens: the server has no
+    # tokenizer, and JSON tool output runs about 3 characters per token. 0 disables it
+    history_prune_trigger_chars: int = field(
+        default_factory=lambda: int(os.environ.get("HISTORY_PRUNE_TRIGGER_CHARS", "900000"))
+    )
+    history_prune_target_chars: int = field(
+        default_factory=lambda: int(os.environ.get("HISTORY_PRUNE_TARGET_CHARS", "600000"))
+    )
+    history_prune_keep_turns: int = field(
+        default_factory=lambda: int(os.environ.get("HISTORY_PRUNE_KEEP_TURNS", "2"))
+    )
+
     # optional tools (disabled by default)
     enable_credible_sets_stats: bool = field(
         default_factory=lambda: os.environ.get(

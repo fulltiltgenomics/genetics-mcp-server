@@ -254,6 +254,91 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
     return result
 
 
+# every breakpoint asks for the 1-hour cache. Measured over four months of production:
+# cache writes were 52% of all model spend, and 742 turns started 5 to 60 minutes after
+# the previous call and rewrote their whole history under the 5-minute TTL (152M tokens).
+# The hour costs 2x base per written token against 1.25x, which the writes inside a
+# tool-heavy turn pay for nothing, and the priced counterfactual still came out ahead
+_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
+
+_CLEARED_RESULT_NOTE = (
+    "[CLEARED: the {size:,}-character result of {tool} was removed from this conversation "
+    "to keep it within its context budget; the answer that followed it was written from "
+    "it. Call the tool again if the data is needed now.]"
+)
+
+
+def _prune_replayed_tool_results(
+    messages: list[dict], *, trigger_chars: int, target_chars: int, keep_turns: int
+) -> tuple[int, int]:
+    """Replace the oldest replayed tool results with a one-line note once the history
+    passes `trigger_chars`, until it is under `target_chars`.
+
+    Returns (results cleared, characters removed). Mutates list slots, never the dicts.
+
+    The gap between trigger and target is what keeps the prompt cache useful: a pass
+    changes the oldest live result and everything after it is re-cached, so pruning in
+    one chunk per crossing costs one rewrite per `trigger - target` characters of
+    growth, where pruning to the trigger on every turn would cost one per turn. The
+    pass is oldest-first and the history only grows, so a result cleared once stays
+    cleared and the cached prefix ahead of the next victim survives.
+
+    The last `keep_turns` assistant turns keep their results whatever the size: the
+    model is answering a follow-up to them, and the note tells it to re-run a tool
+    rather than guess.
+    """
+    if trigger_chars <= 0 or not messages:
+        return 0, 0
+    size = sum(len(json.dumps(m, separators=(",", ":"))) for m in messages)
+    if size <= trigger_chars:
+        return 0, 0
+    names: dict[str, str] = {}
+    for m in messages:
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+            for b in m["content"]:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    names[b.get("id", "")] = b.get("name", "tool")
+    # a turn's results sit in the user message after its assistant message, so the
+    # kept turns start at the keep_turns-th last assistant message
+    assistant_idx = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+    if keep_turns > 0:
+        if len(assistant_idx) < keep_turns:
+            return 0, 0
+        frozen_from = assistant_idx[-keep_turns]
+    else:
+        frozen_from = len(messages)
+    cleared = removed = 0
+    for i, m in enumerate(messages[:frozen_from]):
+        if size <= target_chars:
+            break
+        content = m.get("content")
+        if m.get("role") != "user" or not isinstance(content, list):
+            continue
+        new_content = []
+        changed = False
+        for b in content:
+            if (
+                isinstance(b, dict)
+                and b.get("type") == "tool_result"
+                and isinstance(b.get("content"), str)
+                and not b["content"].startswith("[CLEARED:")
+            ):
+                before = len(b["content"])
+                note = _CLEARED_RESULT_NOTE.format(
+                    size=before, tool=names.get(b.get("tool_use_id", ""), "a tool")
+                )
+                new_content.append({**b, "content": note})
+                size -= before - len(note)
+                removed += before - len(note)
+                cleared += 1
+                changed = True
+            else:
+                new_content.append(b)
+        if changed:
+            messages[i] = {**m, "content": new_content}
+    return cleared, removed
+
+
 def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
     """Move the history's cache_control breakpoint to the last block of the last message.
 
@@ -291,7 +376,7 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
     if isinstance(content, list) and content and isinstance(content[-1], dict):
-        content = [*content[:-1], {**content[-1], "cache_control": {"type": "ephemeral"}}]
+        content = [*content[:-1], {**content[-1], "cache_control": dict(_CACHE_CONTROL)}]
         messages[-1] = {**last, "content": content}
 
 
@@ -1353,6 +1438,17 @@ class LLMService:
         # so anything that wants a new one has to take it from these. The tool loop below moves
         # this one onto each turn's newest message, so within a tool-heavy turn every call reads
         # the previous iterations' tool results from cache rather than re-sending them.
+        cleared, removed = _prune_replayed_tool_results(
+            anthropic_messages,
+            trigger_chars=settings.history_prune_trigger_chars,
+            target_chars=settings.history_prune_target_chars,
+            keep_turns=settings.history_prune_keep_turns,
+        )
+        if cleared:
+            logger.info(
+                f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
+                f"Cleared {cleared} replayed tool results ({removed:,} chars) from the history"
+            )
         _mark_history_cache_breakpoint(anthropic_messages)
 
         # prepare request parameters
@@ -1402,14 +1498,14 @@ class LLMService:
         system_blocks: list[dict[str, Any]] = []
         if system_prompt:
             system_blocks.append(
-                {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
+                {"type": "text", "text": system_prompt, "cache_control": dict(_CACHE_CONTROL)}
             )
         user_block = "\n\n".join(
             part for part in (user_instructions, memory_envelope(user_memory or "")) if part
         )
         if user_block:
             system_blocks.append(
-                {"type": "text", "text": user_block, "cache_control": {"type": "ephemeral"}}
+                {"type": "text", "text": user_block, "cache_control": dict(_CACHE_CONTROL)}
             )
         if system_blocks:
             request_params["system"] = system_blocks
@@ -1455,7 +1551,7 @@ class LLMService:
             if tool_definitions:
                 tool_definitions[-1] = {
                     **tool_definitions[-1],
-                    "cache_control": {"type": "ephemeral"},
+                    "cache_control": dict(_CACHE_CONTROL),
                 }
             request_params["tools"] = tool_definitions
             advertised_tools = {t["name"] for t in tool_definitions}

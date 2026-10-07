@@ -34,6 +34,7 @@ from genetics_mcp_server.llm_service import (
     ResolvedLocalTools,
     _count_result_items,
     _mark_history_cache_breakpoint,
+    _prune_replayed_tool_results,
     _sanitize_tool_blocks,
     _strip_tool_use_markers,
     _truncation_notice,
@@ -186,7 +187,7 @@ class TestMarkHistoryCacheBreakpoint:
     def test_marks_last_block_of_last_message(self):
         messages = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
         _mark_history_cache_breakpoint(messages)
-        assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     def test_normalizes_string_content(self):
         messages = [{"role": "user", "content": "hello"}]
@@ -194,12 +195,120 @@ class TestMarkHistoryCacheBreakpoint:
         last = messages[-1]["content"]
         assert isinstance(last, list)
         assert last[-1]["type"] == "text"
-        assert last[-1]["cache_control"] == {"type": "ephemeral"}
+        assert last[-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     def test_empty_messages_noop(self):
         messages = []
         _mark_history_cache_breakpoint(messages)
         assert messages == []
+
+
+def _turn(i: int, result: str, tool: str = "search_phenotypes") -> list[dict]:
+    """One replayed turn in the shape the browser sends: the assistant message carries
+    the turn's tool_use and text blocks, the synthetic user message after it the results."""
+    return [
+        {"role": "user", "content": f"question {i}"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": f"t{i}", "name": tool, "input": {}},
+                {"type": "text", "text": f"answer {i}"},
+            ],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": result}]},
+    ]
+
+
+def _history(turns: int, result_chars: int) -> list[dict]:
+    """`turns` turns, each calling one tool and getting a result of `result_chars`."""
+    messages: list[dict] = []
+    for i in range(turns):
+        messages.extend(_turn(i, "x" * result_chars))
+    messages.append({"role": "user", "content": "next question"})
+    return messages
+
+
+def _results(messages: list[dict]) -> list[str]:
+    return [
+        b["content"]
+        for m in messages
+        if isinstance(m["content"], list)
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "tool_result"
+    ]
+
+
+class TestPruneReplayedToolResults:
+    def test_nothing_happens_under_the_trigger(self):
+        messages = _history(3, 1000)
+        before = [dict(m) for m in messages]
+        assert _prune_replayed_tool_results(
+            messages, trigger_chars=100_000, target_chars=50_000, keep_turns=2
+        ) == (0, 0)
+        assert messages == before
+
+    def test_the_oldest_results_go_first_and_the_kept_turns_never_do(self):
+        messages = _history(6, 10_000)
+        cleared, removed = _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
+        )
+        results = _results(messages)
+        # 60K of results over a 50K trigger: the oldest go until the history is under 25K
+        assert cleared == 4 and removed > 0
+        assert all(r.startswith("[CLEARED:") for r in results[:4])
+        assert all(r == "x" * 10_000 for r in results[4:])
+        note = results[0]
+        assert "10,000-character result of search_phenotypes" in note
+        assert "Call the tool again" in note
+
+    def test_the_last_turns_keep_their_results_even_when_still_over_target(self):
+        messages = _history(3, 30_000)
+        cleared, _ = _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=10_000, keep_turns=2
+        )
+        results = _results(messages)
+        assert cleared == 1
+        assert results[0].startswith("[CLEARED:")
+        assert results[1] == results[2] == "x" * 30_000
+
+    def test_a_second_pass_clears_nothing_new_while_under_the_trigger(self):
+        """Between crossings the history is byte-identical to the last request's, so the
+        prompt cache serves it; a pass that re-pruned to the trigger each turn would not."""
+        messages = _history(6, 10_000)
+        _prune_replayed_tool_results(messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2)
+        after_first = [dict(m) for m in messages]
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": "short"}]})
+        messages.append({"role": "user", "content": "and another"})
+        cleared, _ = _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
+        )
+        assert cleared == 0
+        assert messages[: len(after_first)] == after_first
+
+    def test_a_cleared_note_is_not_cleared_again(self):
+        messages = _history(6, 10_000)
+        _prune_replayed_tool_results(messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2)
+        notes = _results(messages)[:4]
+        # grow past the trigger again: the old notes survive untouched, the next-oldest goes
+        for i in range(6, 9):
+            messages[-1:] = [*_turn(i, "y" * 10_000, tool="query_database"), {"role": "user", "content": "next"}]
+        cleared, _ = _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
+        )
+        assert cleared == 3
+        assert _results(messages)[:4] == notes
+
+    def test_disabled_by_a_zero_trigger(self):
+        messages = _history(6, 10_000)
+        assert _prune_replayed_tool_results(
+            messages, trigger_chars=0, target_chars=0, keep_turns=2
+        ) == (0, 0)
+
+    def test_fewer_turns_than_kept_is_left_alone(self):
+        messages = _history(1, 100_000)
+        assert _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=10_000, keep_turns=2
+        ) == (0, 0)
 
 
 class TestTruncationNotice:
@@ -419,6 +528,9 @@ class TestTurnMetrics:
                 mcp_enabled=False,
                 mcp_max_iterations=3,
                 mcp_max_result_size=100_000,
+                history_prune_trigger_chars=0,
+                history_prune_target_chars=0,
+                history_prune_keep_turns=2,
                 max_continuations=1,
                 max_turn_cost_usd=20.0,
                 max_turn_cost_hard_usd=50.0,
@@ -1433,9 +1545,9 @@ class TestHistoryBreakpointFollowsTheTurn:
         _mark_history_cache_breakpoint(messages)
 
         assert "cache_control" not in messages[1]["content"][-1]
-        assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
         # the request already sent keeps its own record of where the mark was
-        assert first_request[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        assert first_request[1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     @pytest.mark.asyncio
     async def test_every_request_of_a_tool_turn_marks_only_its_newest_message(self):

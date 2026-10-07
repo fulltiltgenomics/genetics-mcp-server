@@ -1354,7 +1354,7 @@ class TestTwoBlockSystemPrompt:
         # both breakpoints are needed: without one on block 0 the shared ~7.4K tokens go
         # uncached, and without one on block 1 the envelope is re-read every iteration
         assert all(
-            block["cache_control"] == {"type": "ephemeral"} for block in blocks
+            block["cache_control"] == {"type": "ephemeral", "ttl": "1h"} for block in blocks
         )
 
     @pytest.mark.asyncio
