@@ -5,10 +5,9 @@ The system prompt is assembled from BLOCKS rather than stored as one string, and
 assembly is driven by the tool list actually in force for the request. Before this, the
 prompt and the tool list were built independently and nothing checked them against each
 other (genetics-results-suite-4h6.69): the prompt documented `launch_subagents` at length
-while `ENABLE_SUBAGENTS` defaults false and removes it from the tool list, described
-`get_phenotype_report` behind another flag defaulting false, and never mentioned
-`run_analysis` at all — so the arbitration between "use an API tool" and "write a script"
-lived only inside a tool description, invisible to anyone reading the prompt.
+while `ENABLE_SUBAGENTS` defaults false and removes it from the tool list, and never
+mentioned `run_analysis` at all — so the arbitration between "use an API tool" and "write a
+script" lived only inside a tool description, invisible to anyone reading the prompt.
 
 Gating is DERIVED FROM THE TEXT: a block is emitted only if every tool name appearing in
 it is in the available set. That is what makes the property self-maintaining — a block
@@ -776,20 +775,6 @@ Before highlighting a finding as "striking", "notable", "a promising drug target
 - **mlog10p**: -log10(p-value), higher values = more significant (e.g., 8 = p = 1e-8)
 - **beta**: Effect size, positive = risk-increasing, negative = protective
 - **CS** (Credible Set): Set of variants that contains the causal variant with 95% probability
-"""),
-    _Block("""
-## Phenotype Reports
-
-When a user asks for a phenotype report, show the report to the user DIRECTLY AS THE MARKDOWN IS.
-
-When interpreting phenotype reports from get_phenotype_report, use the following terminology:
-
-**Gene Tiers** (evidence for causal gene assignment):
-- **TIER 1**: Gene has a coding variant in the credible set with PIP > 0.05
-- **TIER 2**: Gene has eQTL, pQTL or caQTL evidence
-- **TIER 3**: Gene assignment based on proximity
-
-Score for each gene is an estimate between 0 and 1 for the probability that the gene is causal for the phenotype. This score is crude and based on coding variant / eQTL / pQTL / caQTL evidence for the gene as well as the gene's distance to the lead variant.
 """),
     # LAST, and large. Two reasons for the position rather than one: a ~21k-token block
     # that never varies belongs at the end of the cacheable prefix, and the instructions

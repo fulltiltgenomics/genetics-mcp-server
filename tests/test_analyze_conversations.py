@@ -136,8 +136,8 @@ class TestParseToolCalls:
         ]
 
     def test_ellipsis_marker(self):
-        content = "*[Using tool: get_phenotype_report...]*"
-        assert parse_tool_calls(content) == ["get_phenotype_report"]
+        content = "*[Using tool: get_credible_sets_by_phenotype...]*"
+        assert parse_tool_calls(content) == ["get_credible_sets_by_phenotype"]
 
     def test_no_tools(self):
         content = "Here is some plain text with no tool calls."

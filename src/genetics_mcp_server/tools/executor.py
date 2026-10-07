@@ -2863,27 +2863,6 @@ class ToolExecutor:
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
-    async def get_phenotype_report(self, resource: str, phenotype_code: str) -> dict[str, Any]:
-        """Get phenotype markdown report."""
-        resp = await self.client.get(
-            f"{self.base_url}/v1/phenotype/{_seg(resource)}/{_seg(phenotype_code)}/markdown",
-        )
-        if resp.status_code == 200:
-            return {
-                "success": True,
-                "resource": resource,
-                "phenotype_code": phenotype_code,
-                "content": resp.text,
-            }
-        elif resp.status_code == 404:
-            return {
-                "success": False,
-                "resource": resource,
-                "phenotype_code": phenotype_code,
-                "error": f"No report found for phenotype: {phenotype_code} in resource: {resource}",
-            }
-        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
-
     async def get_available_resources(self) -> dict[str, Any]:
         """Get catalog of available data resources."""
         resp = await self.client.get(f"{self.base_url}/v1/resources")

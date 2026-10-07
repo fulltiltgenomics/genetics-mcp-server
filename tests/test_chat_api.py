@@ -2418,3 +2418,107 @@ class TestResolvedPromptVariant:
         assert body["prompt_variant"] == defaults.DEFAULT_PROMPT_VARIANT, (
             "a benchmark arm pointed here is measuring the default, and must be told so"
         )
+
+
+def _image_block(width: int, height: int, fmt: str = "PNG", mode: str = "RGB") -> dict:
+    import base64
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new(mode, (width, height)).save(out, fmt)
+    media_type = "image/jpeg" if fmt == "JPEG" else "image/png"
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64.b64encode(out.getvalue()).decode("ascii"),
+        },
+    }
+
+
+def _decoded_size(block: dict) -> tuple[tuple[int, int], str]:
+    import base64
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(base64.b64decode(block["source"]["data"]))) as img:
+        return img.size, img.format
+
+
+class TestImageShrinking:
+    """Attached images over Anthropic's resize edge are downscaled before the provider call."""
+
+    def test_oversized_png_is_downscaled_keeping_aspect(self):
+        from genetics_mcp_server.chat_api import _MAX_IMAGE_EDGE, _shrink_image_block
+
+        shrunk = _shrink_image_block(_image_block(9000, 3000))
+
+        (width, height), fmt = _decoded_size(shrunk)
+        assert (width, round(width / height), fmt) == (_MAX_IMAGE_EDGE, 3, "PNG")
+        assert shrunk["source"]["media_type"] == "image/png"
+
+    def test_jpeg_stays_jpeg(self):
+        from genetics_mcp_server.chat_api import _MAX_IMAGE_EDGE, _shrink_image_block
+
+        shrunk = _shrink_image_block(_image_block(2000, 8500, fmt="JPEG"))
+
+        (width, height), fmt = _decoded_size(shrunk)
+        assert (height, fmt) == (_MAX_IMAGE_EDGE, "JPEG")
+        assert shrunk["source"]["media_type"] == "image/jpeg"
+
+    def test_small_image_is_passed_through_untouched(self):
+        from genetics_mcp_server.chat_api import _shrink_image_block
+
+        block = _image_block(800, 600)
+
+        assert _shrink_image_block(block) is block
+
+    def test_undecodable_image_is_left_for_the_provider(self):
+        from genetics_mcp_server.chat_api import _shrink_image_block
+
+        block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x"}}
+
+        assert _shrink_image_block(block) is block
+
+    def test_pixel_bomb_is_refused_without_decoding(self):
+        from fastapi import HTTPException
+
+        from genetics_mcp_server.chat_api import _shrink_image_block
+
+        with pytest.raises(HTTPException) as exc:
+            _shrink_image_block(_image_block(12000, 9000, mode="1"))
+        assert exc.value.status_code == 413
+
+    def test_provider_receives_the_downscaled_image_in_history_too(self, test_client, _no_live_provider):
+        from genetics_mcp_server.chat_api import _MAX_IMAGE_EDGE
+
+        seen = {}
+
+        async def stream(**kwargs):
+            seen["messages"] = kwargs["messages"]
+            yield StreamChunk(
+                type="done", content="", message_content=[{"type": "text", "text": "ok"}]
+            )
+
+        big = _image_block(8500, 100)
+        with patch.object(_no_live_provider, "stream_chat", stream):
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [
+                        {"role": "user", "content": [big, {"type": "text", "text": "what is this"}]},
+                        {"role": "assistant", "content": "a plot"},
+                        {"role": "user", "content": "and now?"},
+                    ],
+                    "enable_tools": False,
+                },
+            )
+            response.read()
+
+        assert response.status_code == 200
+        replayed = seen["messages"][0]["content"][0]
+        assert _decoded_size(replayed)[0][0] == _MAX_IMAGE_EDGE

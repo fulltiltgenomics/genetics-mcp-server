@@ -24,6 +24,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **Per-user rate limiting**: Sliding window rate limit on chat requests, keyed by user email
 - **Per-message size limits**: `_validate_latest_message` (in `chat_api.py`) caps the newest user message's typed-text length (`MAX_MESSAGE_CHARS`, default 50K) and attachment count (`MAX_ATTACHMENTS_PER_MESSAGE`, default 10), rejecting with HTTP 413 before any model call. `_validate_request_size` bounds the request as a whole — total text across **all** messages (`MAX_REQUEST_CHARS`, default 2M, images excluded) and message count (`MAX_MESSAGES_PER_REQUEST`, default 500) — because the per-message check only ever inspects the newest *user* message, leaving a client-sent assistant turn and every replayed history turn unbounded (`genetics-results-suite-e0u`). Applying the per-message cap to every message would have been the tighter rule and the wrong one: replayed tool results are routinely larger than any typed message, so it would reject ordinary long conversations. Attachments are excluded from the text cap: images arrive as `image` blocks and data files (TSV/CSV/Excel) as **reference** text blocks — `[File: <name>] attachment_id=<id> size=<bytes> type=<mime>` plus a short head of the file as a preview, bounded by the browser (contract beside `_FILE_BLOCK_PREFIX` in `chat_api.py`) — both counted toward the attachment limit, not the character limit. The model reads the file itself through `run_analysis` inputs. A `[File:` block over `MAX_FILE_BLOCK_BYTES`, in the newest message or any replayed turn, is refused with 413 naming the client bug: a client that inlines the whole file is caught here rather than at the request cap or the model's context limit. The frontend mirrors these limits for immediate feedback (`LLMChat.tsx`; the block cap in `fileReference.ts`). Bulk data should be attached as a file rather than pasted
 - **Inline image markers are stripped before the model call**: the frontend carries a generated plot inside the assistant's *text* as `[IMAGE:<format>:<alt>:<base64>]`, one marker shape that survives both rendering and persistence. Replayed verbatim that is base64 the model cannot read, charged as text on every later turn — measured at ~180k tokens added per plotted turn, reaching the 1M window in six turns and failing with `prompt is too long`. `_strip_image_markers` (in `chat_api.py`) replaces each payload with `[image shown to the user: <alt>]` for every role, mirroring what `llm_service` already does to a tool result's image bytes. It is a belt, not the fix, and the client-side causes were two: `ChatPage` attached `content_json` only to the copy it saved, so a **live** session replayed `content` while a reloaded one (which comes back with `content_json`) did not; and a turn that never delivered `done` — stopped by the user, or a dropped connection — is stored with `content_json` NULL and therefore replays `content` however it is loaded. Both are fixed in `LLMChat.tsx`, but only the belt covers a client that is not this frontend. `MAX_REQUEST_CHARS` does count these markers, but at 2M characters it sits above what the model will accept for base64-heavy text, which tokenises at roughly one token per character
+- **Attached images are downscaled before the model call**: `_shrink_image_block` (in `chat_api.py`) re-encodes any base64 `image` block whose long edge exceeds `_MAX_IMAGE_EDGE` (1568 px, the size Anthropic itself resizes down to) — JPEG stays JPEG, everything else becomes PNG — off the event loop via `asyncio.to_thread`. Anthropic refuses an image over 8000 px with a 400, and since the browser replays the original attachment bytes on every later turn, one such image failed every turn after it in that conversation (seen in production 2026-10-06). A picture over `_MAX_IMAGE_PIXELS` is refused with 413 from its header before decoding; an image Pillow cannot decode is passed through unchanged for the provider to judge. Pillow is pinned directly in `pyproject.toml` for this
 - **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. A data file (`tsv` or `excel`) over `sandbox_client.MAX_INPUT_BYTES` is refused with HTTP 400 and an ask for an extract, because a data file is only analysed by delivering it to the sandbox; Excel is measured on its TSV sidecar, which is what is delivered. Images keep `MAX_ATTACHMENT_SIZE`. `run_analysis` delivers an Excel attachment as that sidecar, with type `text/tab-separated-values` and the name the script asked for, or `<file_name>.tsv` when it gave none, passed through `_sanitised_input_name` like any delivered name (so the model reads it by the name `inputs_delivered` reports), since the sandbox image has no spreadsheet parser. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The frontend uploads every attachment before the turn is sent, because the upload is what produces the `attachment_id` the model reads the file by; it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) only for the preview and the size check, so the server-side parse is what the sandbox is delivered. `?as=text` is available for any client that wants the parsed text back
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model families to context window sizes (tokens); pricing in the same module is keyed by family and version, so a price change between releases (Sonnet 5, Haiku 4.5, Fable 5.1's cache reads) is a row, not a rename. During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar. The browser acts on the reading: past 50% of the window it advises a new chat and says why (a bigger context makes every answer slower, dearer and less accurate), and past 90% it refuses to send until one is started
@@ -108,7 +109,6 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_colocalization_by_credible_set` | Colocalizations of ONE credible set (resource + phenotype + `cs_id`), so the result is that signal's partners rather than everything at the position. `dual_format` returns both traits' columns |
 | `get_resource_metadata` | Harmonized per-trait metadata for a resource, or of the codes named in optional `phenotypes` — one named trait of a large resource, which the row cap would otherwise truncate (trait names, sample sizes, sub-studies of a collection) — the per-trait rows behind `list_datasets`' aggregates |
 | `get_dataset_display_names` | Display-name overrides keyed by the raw `dataset` column value, for rendering results |
-| `get_phenotype_report` | Get detailed markdown report for a phenotype. Disabled by default — enable with `ENABLE_PHENOTYPE_REPORT` |
 | `list_datasets` | List all datasets with descriptions, provenance, sample-size stats, and supported products |
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs; a sandbox custom GWAS run is reached with its release's resource and the run name as the phenotype, named in the hint where the deployment serves one |
 | `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
@@ -864,7 +864,7 @@ by it, via `tool_category()`). **No surface decision reads it.**
 | Category | Description |
 |----------|-------------|
 | `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, compare_alphagenome_with_measured, get_gene_group_members, normalize_gene_symbols |
-| `api` | Local genetics API tools: credible sets, gene data, colocalization, phenotype report, variant annotations, etc. |
+| `api` | Local genetics API tools: credible sets, gene data, colocalization, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |
 
@@ -906,21 +906,20 @@ That default is the *request's*: a null `tool_profile` resolves to the no-code s
 An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
 genetics data programmatically rather than through a tool schema. It is the data half of the
 code-execution agent: a script in the sandbox imports it instead of the agent calling the
-API-category tools one at a time. It wraps 40 of the 44; the four `api`-category tools it does
-**not** wrap are `get_phenotype_report`, `get_credible_sets_stats`, `analyze_variant_list` and
+API-category tools one at a time. It wraps all but three of them; the `api`-category tools it
+does **not** wrap are `get_credible_sets_stats`, `analyze_variant_list` and
 `get_myvariant_annotations`. The "Deliberately **not** in the SDK" section below gives the
 reasoning, but it is written across categories — its list also names `general`-category tools
-such as `search_uniprot`, which was never one of the 44 — so it is not a substitute for
-the four named here.
+such as `search_uniprot`, which was never `api`-category — so it is not a substitute for
+the three named here.
 
-The four are excluded deliberately, but not for one shared reason, and the axis that separates
+The three are excluded deliberately, but not for one shared reason, and the axis that separates
 them is **not** whether the endpoint computes something server-side. It is whether the rows the
 answer is built from sit somewhere a sandboxed script can read.
 
 `analyze_variant_list` is a rollup over endpoints the SDK already wraps, so a script composes it
 from primitives. `get_credible_sets_stats` aggregates nothing server-side at all — results-api
-streams a pre-generated TSV out of GCS, the same storage pattern as the phenotype report — yet
-its underlying rows are `credible_sets_v`, which `sql()` reaches, so a script can compute the
+streams a pre-generated TSV out of GCS — yet its underlying rows are `credible_sets_v`, which `sql()` reaches, so a script can compute the
 same class of counts itself. Read "itself" strictly: the view carries the PIP, effect-size and
 consequence columns the counts are built from, but the upstream's risk/protective convention
 (taking the sign of the lead variant's beta is an inference, not a documented rule) and which
@@ -929,18 +928,9 @@ can see. Expect a script to produce defensible statistics, not necessarily *thes
 
 `get_myvariant_annotations` is the one genuine unavailability: it targets a third-party host,
 and no third-party target is permitted by the sandbox egress policy, so a wrapper for it would
-be a function that cannot connect. `get_phenotype_report` is **not** in that class, and an
-earlier version of this passage was wrong to put it there. Its gene scores and tier assignments
-exist in no allow-listed view, so a script cannot recompute them — but results-api is a
-permitted egress target, results-api is what serves the markdown, and the sandbox's credential
-is not scoped per route, so the document is reachable from a script by a hand-rolled HTTP call.
-What the SDK's omission costs is the affordance, not the data: neither the SDK nor the sandbox
-stubs name that route, so a model would have to invent the request rather than call something
-put in front of it. That is a discoverability and convenience asymmetry, not an availability
-one, and inventing the call is not the intended way to use the sandbox.
-Any A/B over these arms should still exclude or explicitly book questions that lean on
-either tool — but for those two different reasons, and without scoring the code-execution arm
-down as though both were unreachable. That instruction was written for
+be a function that cannot connect.
+Any A/B over these arms should still exclude or explicitly book questions that lean on it,
+since the code-execution arm genuinely cannot reach it. That instruction was written for
 `genetics-results-suite-4h6.23`, which was descoped on 2026-08-30 without running; it now applies
 to whatever manual benchmarking is done instead. The egress allow-list and the credential's scope are
 specified and maintained in `genetics-results-suite` `docs/code-execution-security.md`; treat
@@ -1052,12 +1042,10 @@ via the `X-Columns` response header results-api added for
 `genetics-results-suite-6uk` (see "Empty results keep their schema").
 
 Deliberately **not** in the SDK: the external/third-party tools (literature, web search, MGI,
-cBioPortal, myvariant, UniProt, ChEMBL), the presentation tools (`analyze_variant_list`,
-`get_credible_sets_stats`) and `get_phenotype_report`. The first group is
+cBioPortal, myvariant, UniProt, ChEMBL) and the presentation tools (`analyze_variant_list`,
+`get_credible_sets_stats`). The first group is
 not genetics-results data; the second is model-facing summarisation that a script writes for
-itself. `get_phenotype_report` sits next to that second group but does not belong to it: its gene
-scores and tier flags are in no view a script can query, so a script cannot write the report for
-itself — it can only fetch the document results-api serves.
+itself.
 
 **"Not in the SDK" does not mean "not reachable", and this list is not an enforcement boundary.**
 `GeneticsClient` keeps a `ToolExecutor` on `._executor` — and reaching it needs no client
@@ -1083,11 +1071,12 @@ Reachability therefore divides this list along a different axis than the one tha
 it. The third-party tools **are** genuinely unreachable from a sandboxed script — but for the
 network reason, not the SDK one: no permitted egress target serves myvariant.info, Europe PMC,
 MGI, cBioPortal, UniProt, ChEMBL or a web-search API (Perplexity/Tavily), so reaching
-`get_myvariant_annotations` through `._executor` still fails to connect. The presentation tools and `get_phenotype_report` are **reachable**: results-api is a
+`get_myvariant_annotations` through `._executor` still fails to connect. The presentation tools are **reachable**: results-api is a
 permitted target and the sandbox credential is not scoped per route, so `._executor` or a
 hand-rolled httpx call gets them. For those, what the omission costs is the affordance and not
-the data — the discoverability and convenience asymmetry the SDK coverage passage above
-describes, not an availability one. Same list, two different reasons, and the reason is the
+the data: neither the SDK nor the sandbox stubs name those routes, so a model has to compose
+the request rather than call something put in front of it — a discoverability and convenience
+asymmetry, not an availability one. Same list, two different reasons, and the reason is the
 point (`genetics-results-suite-4h6.33`).
 
 `credible_sets`, `summary_stats` and `gene_burden` all return trait **codes** (`I9_CHD`), and
@@ -1961,8 +1950,7 @@ while getting no tools at all — pre-existing, and unchanged by 4h6.69, but unr
 `genetics-results-suite-c4s` 400s `provider="openai"` before the stream opens; the mismatch is
 still described because the code path is still there. Consequences on the
 Anthropic path: the "Subagent Orchestration" section and the "variant_list_analysis skill"
-reference disappear with `ENABLE_SUBAGENTS=false`, "Phenotype Reports" with
-`ENABLE_PHENOTYPE_REPORT=false`, and every per-tool routing section under `tool_profile="code"`.
+reference disappear with `ENABLE_SUBAGENTS=false`, and every per-tool routing section under `tool_profile="code"`.
 `tool_names=None` skips the filtering entirely and emits every block.
 
 **One block's text is not written in either prompt module.** A `_Block` may carry `render`, a
@@ -3075,7 +3063,6 @@ Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) 
 | `EXTERNAL_MCP_EXCLUDE_TOOLS` | Tool names to exclude from proxying |
 | `EXTERNAL_MCP_STATE_DIR` | Directory where a rotated OAuth refresh token is persisted for `oauth=` entries; unset, a rotation dies with the process |
 | `ENABLE_CREDIBLE_SETS_STATS` | Enable `get_credible_sets_stats` tool (default `false`) |
-| `ENABLE_PHENOTYPE_REPORT` | Enable `get_phenotype_report` tool (default `false`) |
 | `ENABLE_LITERATURE_SEARCH` | Enable `search_scientific_literature` (default **`true`** — the only flag here that is on by default, so it removes a shipped tool rather than adding an optional one). Set `false` to measure the genetics tools without an external literature API's key, latency or spend in the comparison |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. Enables `run_analysis` (default `false`) |
 | `RAG_MCP_SERVER` | URL of the always-on RAG MCP server |

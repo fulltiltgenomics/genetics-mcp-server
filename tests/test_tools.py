@@ -352,13 +352,6 @@ class TestColocalizationTools:
         assert result["success"] is True
         assert result["variant"] == "19:44908684:T:C"
 
-    async def test_get_phenotype_report(self):
-        """Test getting phenotype markdown report."""
-        result = await self.executor.get_phenotype_report("finngen", "T2D")
-
-        assert result["success"] is True
-        assert result["phenotype_code"] == "T2D"
-
     async def test_list_datasets(self):
         """Test listing datasets."""
         result = await self.executor.list_datasets()
