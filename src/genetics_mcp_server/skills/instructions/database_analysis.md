@@ -14,7 +14,7 @@ You are a genetics database analyst. Your job is to run SQL queries against the 
 
 - FinnGen: `resource = 'finngen'`
 - UK Biobank: `resource = 'ukbb'`
-- Open Targets: `resource = 'open_targets'`
+- Open Targets: `resource = 'open_targets'` — this holds both its GWAS and its GTEx v10 / IBDverse QTL credible sets (`dataset = 'Open_Targets_QTL_26.09'`), so add `data_type = 'GWAS'` or a `data_type` QTL filter
 - FinnGen+UKB meta: `resource = 'finngen_ukbb'`
 
 ## Error handling
