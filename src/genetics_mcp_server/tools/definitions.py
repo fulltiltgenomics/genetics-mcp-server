@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from genetics_mcp_server import schema_docs
-from genetics_mcp_server.tools.executor import LD_MAX_PAIR_DISTANCE
+from genetics_mcp_server.tools.executor import LD_STATISTICS
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -91,6 +91,21 @@ _ALPHAGENOME_VALIDATION_RULES = """READ THE `validation` BLOCK BEFORE QUOTING A 
 
 _ALPHAGENOME_SIDE_BY_SIDE = """SIDE BY SIDE WITH MEASURED DATA the labelling matters MORE, not less: label every number from this tool as predicted, name the source of every measured number, never merge or average the two into one figure, and where they disagree say that they disagree."""
 
+
+# LD panels a call may name. The three upstream names are the FinnGen LD server's reference
+# panels; finngen_r12 is served by results-api from the suite's own matrices on the profiles
+# that configure it (`GET /ld/panels`), and elsewhere is refused by name like any unknown one.
+_LD_PANELS = ("sisu42", "sisu4", "sisu3", "finngen_r12")
+_LD_PANEL_DOC = (
+    "LD panel: 'sisu42' (FinnGen LD server, latest reference panel, r2 and D'), 'sisu4', "
+    "'sisu3', or 'finngen_r12' (FinnGen R12 in-sample LD with signed r and r2; the only panel "
+    "with r, available where the deployment serves it)"
+)
+_LD_FIELDS_DOC = (
+    "Statistics to return on each entry, any of r, r2, d_prime; default every statistic the "
+    "panel carries. Asking for one the panel lacks is refused naming what it has — r needs "
+    "panel 'finngen_r12'."
+)
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     # The three entity lookups that open this list — search_phenotypes, search_genes,
@@ -1586,8 +1601,14 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
         "name": "get_ld_between_variants",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get linkage disequilibrium (LD) statistics between two specific variants. Returns r2 and D' values from the FinnGen reference panel. Both variants must be on the same chromosome and within "
-        f"{LD_MAX_PAIR_DISTANCE / 1e6:g} Mb of each other.",
+        "description": "Get linkage disequilibrium (LD) statistics between two specific variants. "
+        "The FinnGen LD server panels (sisu42, sisu4, sisu3) give r2 and D'; the 'finngen_r12' "
+        "panel, FinnGen R12 in-sample LD served from the suite's own matrices where configured, "
+        "gives signed r and r2 for the alt alleles as spelled in the two ids, down to r2 0.01 "
+        "within 3 Mb. Both variants must be on the same chromosome and within the panel's reach "
+        "(2 Mb on the LD server, 3 Mb on finngen_r12); a pair further apart is refused naming the "
+        "reach. On finngen_r12 an empty answer means both variants are in the panel and the pair "
+        "is below the floor, i.e. independent rather than unknown.",
         "parameters": {
             "variant1": {
                 "type": "string",
@@ -1601,14 +1622,19 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
             },
             "r2_threshold": {
                 "type": "number",
-                "description": "Minimum r2 threshold to consider variants in LD (default 0.1)",
+                "description": "Minimum r2 threshold to consider variants in LD (default 0.1); 0 returns the pair whenever the panel holds it",
                 "default": 0.1,
             },
             "panel": {
                 "type": "string",
-                "description": "LD reference panel: 'sisu42' (latest, freeze 10+), 'sisu4', or 'sisu3'",
+                "description": _LD_PANEL_DOC,
                 "default": "sisu42",
-                "enum": ["sisu3", "sisu4", "sisu42"],
+                "enum": list(_LD_PANELS),
+            },
+            "fields": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(LD_STATISTICS)},
+                "description": _LD_FIELDS_DOC,
             },
         },
     },
@@ -1616,7 +1642,7 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
         "name": "get_variants_in_ld",
         "category": "api",
         "sdk_replaceable": True,
-        "description": "Get all variants in linkage disequilibrium (LD) with a given variant. Returns variants within the specified window that exceed the r2 threshold, useful for finding proxy variants or understanding LD structure.",
+        "description": "Get all variants in linkage disequilibrium (LD) with a given variant. Returns variants within the specified window that exceed the r2 threshold, useful for finding proxy variants or understanding LD structure. The FinnGen LD server panels give r2 and D'; the 'finngen_r12' panel (FinnGen R12 in-sample LD, where configured) gives signed r and r2 down to r2 0.01 within 3 Mb.",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -1635,9 +1661,14 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
             },
             "panel": {
                 "type": "string",
-                "description": "LD reference panel: 'sisu42' (latest, freeze 10+), 'sisu4', or 'sisu3'",
+                "description": _LD_PANEL_DOC,
                 "default": "sisu42",
-                "enum": ["sisu3", "sisu4", "sisu42"],
+                "enum": list(_LD_PANELS),
+            },
+            "fields": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(LD_STATISTICS)},
+                "description": _LD_FIELDS_DOC,
             },
         },
     },
@@ -3198,10 +3229,11 @@ def register_mcp_tools(
         variant2: str,
         r2_threshold: float = 0.1,
         panel: str = "sisu42",
+        fields: list[str] | None = None,
     ) -> dict:
-        """Get LD statistics between two specific variants from FinnGen reference panel."""
+        """Get LD statistics between two specific variants (r2 and D' from the FinnGen LD server; signed r and r2 from panel finngen_r12)."""
         return await executor.get_ld_between_variants(
-            variant1, variant2, r2_threshold, panel
+            variant1, variant2, r2_threshold, panel, fields=fields
         )
 
     @_tool()
@@ -3210,9 +3242,12 @@ def register_mcp_tools(
         window: int = 1500000,
         r2_threshold: float = 0.6,
         panel: str = "sisu42",
+        fields: list[str] | None = None,
     ) -> dict:
-        """Get all variants in LD with a given variant from FinnGen reference panel."""
-        return await executor.get_variants_in_ld(variant, window, r2_threshold, panel)
+        """Get all variants in LD with a given variant (r2 and D' from the FinnGen LD server; signed r and r2 from panel finngen_r12)."""
+        return await executor.get_variants_in_ld(
+            variant, window, r2_threshold, panel, fields=fields
+        )
 
     @_tool()
     async def analyze_variant_list(

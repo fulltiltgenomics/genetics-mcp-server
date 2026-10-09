@@ -94,6 +94,10 @@ def _pairs(row: Any) -> str:
     return " | ".join(f"{k}={v}" for k, v in row.items())
 
 
+# the statistics an LD entry can carry, in row order; mirrors executor.LD_STATISTICS
+_LD_STATISTICS = ("r", "r2", "d_prime")
+
+
 def _one_of(**candidates: Any) -> tuple[str, Any]:
     """Return the single supplied argument, or raise. This is the grid collapse."""
     given = [(k, v) for k, v in candidates.items() if v is not None]
@@ -913,12 +917,28 @@ class GeneticsClient:
         window: int | None = None,
         r2_threshold: float | None = None,
         panel: str = "sisu42",
+        fields: str | list[str] | None = None,
     ) -> pl.DataFrame:
-        """LD from the FinnGen LD server, proxied rather than called directly.
+        """LD through results-api: the suite's own panels, or the FinnGen LD server proxied.
 
-        With `other`, one row for that pair; without it, every variant in LD above the
-        threshold. Defaults differ per shape and match the tool layer (0.1 for a named
-        pair, 0.6 for a neighbourhood scan).
+        With `other`, one row for that pair (`variant1`, `variant2`, `in_ld`, the statistics,
+        `panel`); without it, one row per variant in LD above the threshold (`variant` and
+        the statistics), strongest first. Defaults differ per shape and match the tool layer
+        (0.1 for a named pair, 0.6 for a neighbourhood scan); pass `r2_threshold=0` to get a
+        pair whenever the panel holds it.
+
+        WHICH STATISTICS COME BACK depends on the panel, and `ld_panels()` says which panels
+        this deployment serves. The LD server's panels (`sisu42`, the default) carry `r2` and
+        `d_prime`. `finngen_r12` — FinnGen R12 in-sample LD from the suite's own matrices, where
+        configured — carries SIGNED `r` and `r2`, for the alt alleles as spelled in the ids, for
+        every pair within 3 Mb at r2 >= 0.01. It is the only source of r, which a correlated-
+        instrument estimator needs and r2 cannot give; a swapped ref/alt is an error naming the
+        panel's spelling, never a silently negated r. `fields` picks a subset ("r", or
+        ["r", "r2"]); asking a panel for a statistic it lacks raises, naming what it carries.
+
+        On `finngen_r12` an empty pair answer (`in_ld` False) means both variants are in the
+        panel and the pair is below the floor — independent, not unknown — because a variant
+        the panel lacks raises instead. On the LD server the two cannot be told apart.
 
         The proxy is what makes this callable from a sandbox script at all: the LD server is
         on the public internet and the sandbox has no DNS and no internet egress, so a direct
@@ -929,15 +949,17 @@ class GeneticsClient:
             result = self._payload(
                 await self._executor.get_ld_between_variants(
                     variant, other, r2_threshold=0.1 if r2_threshold is None else r2_threshold,
-                    panel=panel,
+                    panel=panel, fields=fields,
                 )
             )
+            statistics = result.get("fields") or [
+                f for f in _LD_STATISTICS if f in result
+            ] or list(_LD_STATISTICS)
             return _frame([{
                 "variant1": result["variant1"],
                 "variant2": result["variant2"],
                 "in_ld": result["in_ld"],
-                "r2": result.get("r2"),
-                "d_prime": result.get("d_prime"),
+                **{f: result.get(f) for f in statistics},
                 "panel": panel,
             }])
         return self._rows(
@@ -946,9 +968,17 @@ class GeneticsClient:
                 window=1_500_000 if window is None else window,
                 r2_threshold=0.6 if r2_threshold is None else r2_threshold,
                 panel=panel,
+                fields=fields,
             ),
             key="variants",
         )
+
+    async def ld_panels(self) -> pl.DataFrame:
+        """The LD panels this deployment serves from its own matrices, one row each:
+        `panel`, `fields` (the statistics it carries), `r2_floor`, `max_distance`,
+        `n_samples`, `description`. Any other panel name goes to the FinnGen LD server,
+        which carries r2 and D' only. Empty where no own panel is configured."""
+        return self._rows(await self._executor.get_ld_panels(), key="panels")
 
     # ------------------------------------------------------------------ search / SQL
 

@@ -265,12 +265,12 @@ class TestLDTools:
         assert "same chromosome" in result["error"].lower()
 
     async def test_get_ld_between_variants_too_far_apart(self):
-        """Test error when variants are further apart than the LD server's window reaches."""
+        """Test error when variants are further apart than the panel's window reaches."""
         result = await self.executor.get_ld_between_variants(
             "6:10000000:A:G", "6:20000000:C:T"
         )
         assert result["success"] is False
-        assert "too far apart" in result["error"].lower()
+        assert "bp apart" in result["error"].lower()
 
     async def test_get_ld_between_variants_invalid_format(self):
         """Test error with invalid variant format."""

@@ -119,12 +119,19 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants. `source` is `finngen` (default) or `gnomad` (4.1.1); the gnomad row's `consequences` is a JSON string, `NA` when none, with the same keys as the typed array in the `gnomad_variant_annotation_v` view — the view is the route for joins and bulk questions. `version` is the source's release, relayed from results-api's `X-Dataset-Version` header |
 | `get_myvariant_annotations` | Get clinical/functional annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data). Chat-backend only — excluded from MCP server |
 
-### LD tools (FinnGen LD Server)
+### LD tools (through results-api)
 
 | Tool | Description |
 |------|-------------|
-| `get_ld_between_variants` | Get LD (r2, D') between two specific variants using FinnGen reference panel |
-| `get_variants_in_ld` | Get all variants in LD with a query variant within a specified window |
+| `get_ld_between_variants` | LD between two specific variants: r2 and D' from the FinnGen LD server's panels (`sisu42` default), signed r and r2 from `finngen_r12` where results-api serves it. Results-api's pair route, so an empty answer on an own panel means below the floor with both variants present |
+| `get_variants_in_ld` | All variants in LD with a query variant within a window, same panels and statistics |
+
+Both take `fields` (any of `r`, `r2`, `d_prime`; default every statistic the panel carries)
+and relay results-api's refusal when a panel lacks one. The executor adds no LD semantics of
+its own beyond the "other variant" extraction and the strongest-first sort: which pairs a
+panel holds, how far apart a pair may be and what an empty answer means are results-api's
+(`GET /ld/panels` states each own panel's `r2_floor` and `max_distance`, echoed on every
+result as `fields`, `r2_floor`, `max_distance`, null for the upstream).
 
 ### Visualization tools
 
@@ -1006,7 +1013,8 @@ winner.
 | `expression(gene)` | `get_gene_expression` |
 | `gene_disease(gene)` | `get_gene_disease_associations` |
 | `summary_stats(phenotypes=, variants=\|region=)` | `get_summary_stats`, `get_summary_stats_by_region` |
-| `ld(variant[, other])` | `get_variants_in_ld`, `get_ld_between_variants` |
+| `ld(variant[, other][, panel=, fields=])` | `get_variants_in_ld`, `get_ld_between_variants` — signed `r` only on panel `finngen_r12` |
+| `ld_panels()` | `get_ld_panels` — the panels results-api serves itself, with `fields`, `r2_floor`, `max_distance` |
 | `search(query=[, kind=]\|rsids=)` | `search_phenotypes`, `search_genes`, `lookup_variants_by_rsid` |
 | `lookup_phenotype_names(codes)` | `lookup_phenotype_names` |
 | `phenotypes(codes=\|dataset=\|resource=)` | — no tool: a typed query over `phenotypes_v` (name, trait type, the source's own `category`, sample sizes), keyed on `trait_original`; what `plots.phewas` groups by |

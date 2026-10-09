@@ -376,15 +376,35 @@ _KEEP_DEFAULT_ROW_LIMIT = object()
 # upstream that changes its bounds falsifies both.
 LD_MAX_WINDOW = 5_000_000
 
-# Asked for beyond twice a pair's distance. The server's window is the total span centred on
-# the query variant, but its right-hand reach falls short of half of it: measured at
-# 12:49272869:C:T, a partner 291,680 bp to the right is missed at twice the distance plus
-# 8 kb and found at plus 12 kb. How that shortfall grows with the window is not known, so the
-# margin is far larger than the one measurement needs.
-_LD_PAIR_MARGIN = 1_000_000
+# the statistics an LD entry can carry, in the order a row lays them out. Which of them a
+# panel has is results-api's to say (`GET /ld/panels`): the upstream carries r2 and d_prime,
+# the suite's own matrices signed r and r2.
+LD_STATISTICS = ("r", "r2", "d_prime")
 
-# the furthest apart two variants can be and still be asked about with the whole margin
-LD_MAX_PAIR_DISTANCE = (LD_MAX_WINDOW - _LD_PAIR_MARGIN) // 2
+
+def _ld_fields_param(fields: str | list[str] | None) -> str | None:
+    """The `fields=` query value, or None for everything the panel carries. Names are not
+    checked here: results-api refuses an unknown one, and one the panel lacks, with a 422
+    that says what it does carry."""
+    if fields is None:
+        return None
+    names = fields.split(",") if isinstance(fields, str) else list(fields)
+    return ",".join(n.strip() for n in names if n and n.strip()) or None
+
+
+def _ld_statistics(entry: dict[str, Any]) -> dict[str, Any]:
+    """The statistics an entry carries, in LD_STATISTICS order — exactly the ones the
+    caller asked for, or every one the panel has."""
+    return {f: entry[f] for f in LD_STATISTICS if f in entry}
+
+
+def _ld_strength(stats: dict[str, Any]) -> float:
+    """r² for sorting, from r2 or from r when only r was asked for."""
+    if stats.get("r2") is not None:
+        return float(stats["r2"])
+    if stats.get("r") is not None:
+        return float(stats["r"]) ** 2
+    return 0.0
 
 
 def _ld_error(resp: Any) -> str:
@@ -2638,7 +2658,13 @@ class ToolExecutor:
         return chr_str, pos, ref, alt
 
     async def _ld_request(
-        self, variant: str, *, window: int, r2_threshold: float, panel: str
+        self,
+        variant: str,
+        *,
+        window: int,
+        r2_threshold: float,
+        panel: str,
+        fields: str | list[str] | None = None,
     ):
         """One LD call, through results-api rather than straight to the LD server.
 
@@ -2657,13 +2683,70 @@ class ToolExecutor:
         """
         return await self.client.get(
             f"{self.base_url}/v1/ld/{_seg(variant)}",
-            params={
-                "window": window,
-                "r2_threshold": r2_threshold,
-                "panel": panel,
-            },
+            params=self._ld_params(
+                window=window, r2_threshold=r2_threshold, panel=panel, fields=fields
+            ),
             timeout=30.0,
         )
+
+    async def _ld_pair_request(
+        self,
+        variant: str,
+        other: str,
+        *,
+        r2_threshold: float,
+        panel: str,
+        fields: str | list[str] | None = None,
+    ):
+        """One pair through results-api's pair route, same path discipline as _ld_request.
+
+        results-api owns what a pair means per source: on one of its own panels it reads
+        both variants' blocks, so an empty answer is "below the panel's floor" with both
+        variants present, and a pair further apart than the panel computes is refused
+        before any read; on the upstream it is the window query that just reaches the
+        other variant. Doing that here would have to know which panel is which.
+        """
+        return await self.client.get(
+            f"{self.base_url}/v1/ld/{_seg(variant)}/{_seg(other)}",
+            params=self._ld_params(r2_threshold=r2_threshold, panel=panel, fields=fields),
+            timeout=30.0,
+        )
+
+    @staticmethod
+    def _ld_params(**values: Any) -> dict[str, Any]:
+        params = {k: v for k, v in values.items() if k != "fields"}
+        fields = _ld_fields_param(values.get("fields"))
+        if fields is not None:
+            params["fields"] = fields
+        return params
+
+    @staticmethod
+    def _ld_envelope(data: dict[str, Any]) -> dict[str, Any]:
+        """What results-api says about the source: which statistics are on every entry, and
+        for one of its own panels the floor and cap that make absence mean "below the floor"
+        rather than "not computed" (both null for the upstream, which states neither)."""
+        return {
+            "fields": data.get("fields"),
+            "r2_floor": data.get("r2_floor"),
+            "max_distance": data.get("max_distance"),
+        }
+
+    async def get_ld_panels(self) -> dict[str, Any]:
+        """The LD panels results-api serves from its own matrices, with their semantics."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/v1/ld/panels", timeout=30.0)
+            if resp.status_code != 200:
+                return {"success": False, "error": f"LD panel listing failed: HTTP {resp.status_code}"}
+            data = resp.json()
+            return {
+                "success": True,
+                "panels": data.get("panels", []),
+                "default_panel": data.get("default_panel"),
+                "upstream_fields": data.get("upstream_fields"),
+            }
+        except Exception as e:
+            logger.error(f"Error in get_ld_panels: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
 
     async def get_ld_between_variants(
         self,
@@ -2671,12 +2754,13 @@ class ToolExecutor:
         variant2: str,
         r2_threshold: float = 0.1,
         panel: str = "sisu42",
+        fields: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Get LD statistics between two specific variants."""
         try:
             try:
-                chr1, pos1, _, _ = self._parse_variant(variant1)
-                chr2, pos2, _, _ = self._parse_variant(variant2)
+                chr1, _, _, _ = self._parse_variant(variant1)
+                chr2, _, _, _ = self._parse_variant(variant2)
             except ValueError as e:
                 return {"success": False, "error": str(e)}
 
@@ -2690,56 +2774,50 @@ class ToolExecutor:
                     "error": f"Variants must be on same chromosome. Got chr{chr1_norm} and chr{chr2_norm}",
                 }
 
-            distance = abs(pos2 - pos1)
-
-            if distance > LD_MAX_PAIR_DISTANCE:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Variants are too far apart ({distance:,} bp). Maximum allowed "
-                        f"distance is {LD_MAX_PAIR_DISTANCE / 1e6:g} Mb, the furthest the LD "
-                        "server's window reaches."
-                    ),
-                }
-
-            window = 2 * distance + _LD_PAIR_MARGIN
-
-            resp = await self._ld_request(
-                variant1, window=window, r2_threshold=r2_threshold, panel=panel
+            resp = await self._ld_pair_request(
+                variant1, variant2, r2_threshold=r2_threshold, panel=panel, fields=fields
             )
 
             if resp.status_code != 200:
                 return _ld_failure(resp)
 
             data = resp.json()
+            envelope = self._ld_envelope(data)
             ld_results = data.get("ld", [])
 
-            # find variant2 in results (could be in variation1 or variation2 field)
-            match = None
-            for entry in ld_results:
-                v1 = entry.get("variation1", "")
-                v2 = entry.get("variation2", "")
-                if v2 == variant2 or v1 == variant2:
-                    match = entry
-                    break
-
-            if not match:
+            if not ld_results:
+                if envelope["r2_floor"] is not None:
+                    # both variants are in this panel, or the answer would have been a 404
+                    message = (
+                        f"Both variants are in the panel; the pair is below r2 "
+                        f"{max(r2_threshold, envelope['r2_floor']):g} (the panel holds pairs "
+                        f"at r2 >= {envelope['r2_floor']:g}; below that is independent, "
+                        f"not unknown)"
+                    )
+                else:
+                    message = (
+                        f"No LD found between variants (r2 < {r2_threshold} or variant not "
+                        f"in reference panel)"
+                    )
                 return {
                     "success": True,
                     "variant1": variant1,
                     "variant2": variant2,
                     "in_ld": False,
-                    "message": f"No LD found between variants (r2 < {r2_threshold} or variant not in reference panel)",
+                    "panel": panel,
+                    **envelope,
+                    "message": message,
                 }
 
+            match = ld_results[0]
             return {
                 "success": True,
                 "variant1": variant1,
                 "variant2": variant2,
                 "in_ld": True,
-                "r2": match.get("r2"),
-                "d_prime": match.get("d_prime"),
+                **_ld_statistics(match),
                 "panel": panel,
+                **envelope,
             }
 
         except Exception as e:
@@ -2754,6 +2832,7 @@ class ToolExecutor:
         window: int = 1_500_000,
         r2_threshold: float = 0.6,
         panel: str = "sisu42",
+        fields: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Get all variants in LD with a given variant."""
         try:
@@ -2763,13 +2842,14 @@ class ToolExecutor:
                 return {"success": False, "error": str(e)}
 
             resp = await self._ld_request(
-                variant, window=window, r2_threshold=r2_threshold, panel=panel
+                variant, window=window, r2_threshold=r2_threshold, panel=panel, fields=fields
             )
 
             if resp.status_code != 200:
                 return _ld_failure(resp)
 
             data = resp.json()
+            envelope = self._ld_envelope(data)
             ld_results = data.get("ld", [])
 
             # extract variants in LD (the "other" variant from each pair)
@@ -2778,14 +2858,10 @@ class ToolExecutor:
                 v1 = entry.get("variation1", "")
                 v2 = entry.get("variation2", "")
                 other_variant = v2 if v1 == variant else v1
-                variants_in_ld.append({
-                    "variant": other_variant,
-                    "r2": entry.get("r2"),
-                    "d_prime": entry.get("d_prime"),
-                })
+                variants_in_ld.append({"variant": other_variant, **_ld_statistics(entry)})
 
             # sort by r2 descending
-            variants_in_ld.sort(key=lambda x: x.get("r2") or 0, reverse=True)
+            variants_in_ld.sort(key=_ld_strength, reverse=True)
 
             result: dict[str, Any] = {
                 "success": True,
@@ -2793,6 +2869,7 @@ class ToolExecutor:
                 "window": window,
                 "r2_threshold": r2_threshold,
                 "panel": panel,
+                **envelope,
                 "n_variants": len(variants_in_ld),
                 "variants": variants_in_ld,
             }

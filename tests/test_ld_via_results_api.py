@@ -68,38 +68,137 @@ async def test_variants_in_ld_asks_results_api_and_not_the_ld_server():
     assert "finngen.fi" not in url
 
 
-async def test_the_pair_lookup_uses_the_same_path():
+async def test_the_pair_lookup_uses_results_apis_pair_route():
+    """Not a window query filtered here: results-api's pair route is what knows, per panel,
+    whether an empty answer means below the floor or possibly absent, and how far a pair
+    may be apart."""
     capture = {}
-    async with executor_with(capture=capture) as executor:
+    pair = {"variation1": "6:44693011:A:G", "variation2": "6:44682355:C:G", "r2": 0.81, "d_prime": 0.94}
+    async with executor_with(FakeResponse(payload={"ld": [pair]}), capture=capture) as executor:
         result = await executor.get_ld_between_variants("6:44693011:A:G", "6:44682355:C:G")
 
     assert result["success"] is True
     assert result["in_ld"] is True
     assert result["r2"] == 0.81
-    assert urlsplit(capture["url"]).path.startswith("/api/v1/ld/")
+    assert result["d_prime"] == 0.94
+    assert "r" not in result
+    assert urlsplit(capture["url"]).path == "/api/v1/ld/6%3A44693011%3AA%3AG/6%3A44682355%3AC%3AG"
+    assert capture["kwargs"]["params"] == {"r2_threshold": 0.1, "panel": "sisu42"}
 
 
-async def test_a_pair_is_never_asked_about_over_a_window_the_ld_server_refuses():
-    """The cap was 5 Mb against a server whose window stops at 5 Mb in total, so every pair
-    more than 2 Mb apart was sent and refused."""
-    from genetics_mcp_server.tools.executor import LD_MAX_PAIR_DISTANCE, LD_MAX_WINDOW
+async def test_a_pair_too_far_apart_is_results_apis_refusal_relayed():
+    """The distance a pair may span is the panel's (2 Mb on the LD server, 3 Mb on the
+    suite's own matrices), so it is not second-guessed here with one number."""
+    async with executor_with(
+        FakeResponse(
+            status_code=422,
+            payload={"detail": "6:10000000:A:G and 6:13000001:C:G are 3,000,001 bp apart; LD panel finngen_r12 holds pairs up to 3,000,000 bp apart"},
+        )
+    ) as executor:
+        refused = await executor.get_ld_between_variants("6:10000000:A:G", "6:13000001:C:G")
 
+    assert refused["success"] is False
+    assert "3,000,000 bp apart" in refused["error"]
+
+
+async def test_a_pair_on_two_chromosomes_is_refused_without_a_request():
     capture = {}
     async with executor_with(capture=capture) as executor:
-        await executor.get_ld_between_variants(
-            "6:10000000:A:G", f"6:{10_000_000 + LD_MAX_PAIR_DISTANCE}:C:G"
-        )
-        furthest = capture["kwargs"]["params"]["window"]
-        capture.clear()
-        refused = await executor.get_ld_between_variants(
-            "6:10000000:A:G", f"6:{10_000_000 + LD_MAX_PAIR_DISTANCE + 1}:C:G"
-        )
-
-    assert furthest == LD_MAX_WINDOW
+        refused = await executor.get_ld_between_variants("6:44693011:A:G", "7:44682355:C:G")
     assert refused["success"] is False
-    assert "too far apart" in refused["error"]
-    assert f"{LD_MAX_PAIR_DISTANCE / 1e6:g} Mb" in refused["error"]
-    assert capture == {}, "a pair past the limit still reached results-api"
+    assert "same chromosome" in refused["error"]
+    assert capture == {}
+
+
+async def test_signed_r_comes_back_when_the_panel_carries_it():
+    """The suite's own panels carry r with its sign, and the sign is the whole point: an
+    estimator over correlated instruments cannot recover it from r2."""
+    entries = [
+        {"variation1": "6:44693011:A:G", "variation2": "6:44682355:C:G", "r": -0.9, "r2": 0.81},
+        {"variation1": "6:44693011:A:G", "variation2": "6:44690000:T:C", "r": 0.6481, "r2": 0.42},
+    ]
+    payload = {"ld": entries, "fields": ["r", "r2"], "r2_floor": 0.01, "max_distance": 3_000_000}
+    capture = {}
+    async with executor_with(FakeResponse(payload=payload), capture=capture) as executor:
+        result = await executor.get_variants_in_ld("6:44693011:A:G", panel="finngen_r12")
+
+    assert capture["kwargs"]["params"]["panel"] == "finngen_r12"
+    assert result["variants"] == [
+        {"variant": "6:44682355:C:G", "r": -0.9, "r2": 0.81},
+        {"variant": "6:44690000:T:C", "r": 0.6481, "r2": 0.42},
+    ]
+    assert (result["fields"], result["r2_floor"], result["max_distance"]) == (["r", "r2"], 0.01, 3_000_000)
+
+
+async def test_fields_are_passed_through_and_only_those_come_back():
+    entries = [
+        {"variation1": "6:44693011:A:G", "variation2": "6:44690000:T:C", "r": 0.6481},
+        {"variation1": "6:44693011:A:G", "variation2": "6:44682355:C:G", "r": -0.9},
+    ]
+    payload = {"ld": entries, "fields": ["r"], "r2_floor": 0.01, "max_distance": 3_000_000}
+    capture = {}
+    async with executor_with(FakeResponse(payload=payload), capture=capture) as executor:
+        result = await executor.get_variants_in_ld(
+            "6:44693011:A:G", panel="finngen_r12", fields=["r"]
+        )
+        params = dict(capture["kwargs"]["params"])
+        await executor.get_ld_between_variants(
+            "6:44693011:A:G", "6:44682355:C:G", panel="finngen_r12", fields="r, r2"
+        )
+        pair_params = dict(capture["kwargs"]["params"])
+
+    assert params["fields"] == "r"
+    assert pair_params["fields"] == "r,r2"
+    # strongest first even with no r2 on the entry: |r| orders them
+    assert [v["variant"] for v in result["variants"]] == ["6:44682355:C:G", "6:44690000:T:C"]
+    assert all(set(v) == {"variant", "r"} for v in result["variants"])
+
+
+async def test_an_empty_pair_on_an_own_panel_says_independent_not_unknown():
+    """results-api reads both variants' blocks on its own panels, so an empty answer with a
+    floor stated means both were found and the pair is below it."""
+    own = {"ld": [], "fields": ["r", "r2"], "r2_floor": 0.01, "max_distance": 3_000_000}
+    async with executor_with(FakeResponse(payload=own)) as executor:
+        result = await executor.get_ld_between_variants(
+            "6:44693011:A:G", "6:44682355:C:G", r2_threshold=0.0, panel="finngen_r12"
+        )
+    assert result["in_ld"] is False
+    assert "independent" in result["message"]
+    assert "0.01" in result["message"]
+    assert result["r2_floor"] == 0.01
+
+    upstream = {"ld": [], "fields": ["r2", "d_prime"], "r2_floor": None, "max_distance": None}
+    async with executor_with(FakeResponse(payload=upstream)) as executor:
+        result = await executor.get_ld_between_variants("6:44693011:A:G", "6:44682355:C:G")
+    assert result["in_ld"] is False
+    assert "not in reference panel" in result["message"]
+
+
+async def test_a_statistic_the_panel_lacks_is_refused_by_name():
+    async with executor_with(
+        FakeResponse(
+            status_code=422,
+            payload={"detail": "LD panel sisu42 does not carry r; it carries r2, d_prime"},
+        )
+    ) as executor:
+        result = await executor.get_variants_in_ld("6:44693011:A:G", fields="r")
+    assert result["success"] is False
+    assert "does not carry r" in result["error"]
+
+
+async def test_the_panel_listing_is_relayed():
+    capture = {}
+    payload = {
+        "panels": [{"panel": "finngen_r12", "fields": ["r", "r2"], "r2_floor": 0.01, "max_distance": 3_000_000, "n_samples": 520_210, "description": "..."}],
+        "default_panel": "sisu42",
+        "upstream_fields": ["r2", "d_prime"],
+    }
+    async with executor_with(FakeResponse(payload=payload), capture=capture) as executor:
+        result = await executor.get_ld_panels()
+    assert urlsplit(capture["url"]).path == "/api/v1/ld/panels"
+    assert result["success"] is True
+    assert result["panels"][0]["panel"] == "finngen_r12"
+    assert result["default_panel"] == "sisu42"
 
 
 async def test_the_proxys_parameter_names_are_sent_not_the_upstreams():

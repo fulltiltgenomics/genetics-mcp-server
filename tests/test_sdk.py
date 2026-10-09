@@ -155,6 +155,47 @@ async def test_ld_dispatches_pair_vs_neighbourhood_with_shape_specific_defaults(
     assert executor.last[2]["r2_threshold"] == 0.6
 
 
+async def test_ld_passes_fields_and_panel_through_and_frames_what_came_back():
+    client, executor = make_client({
+        "success": True, "variant1": "1:1:A:G", "variant2": "1:2:C:T", "in_ld": True,
+        "r": -0.95, "r2": 0.9025, "panel": "finngen_r12", "fields": ["r", "r2"],
+        "r2_floor": 0.01, "max_distance": 3_000_000,
+    })
+    frame = await client.ld("1:1:A:G", "1:2:C:T", r2_threshold=0, panel="finngen_r12", fields=["r", "r2"])
+    assert executor.last[2] == {"r2_threshold": 0, "panel": "finngen_r12", "fields": ["r", "r2"]}
+    assert frame.columns == ["variant1", "variant2", "in_ld", "r", "r2", "panel"]
+    assert frame["r"][0] == -0.95
+
+    # a pair below the floor keeps the statistic columns, as nulls, so a script can
+    # read `r` off every answer in a loop without checking the shape first
+    client, executor = make_client({
+        "success": True, "variant1": "1:1:A:G", "variant2": "1:2:C:T", "in_ld": False,
+        "panel": "finngen_r12", "fields": ["r"], "r2_floor": 0.01, "max_distance": 3_000_000,
+        "message": "...",
+    })
+    frame = await client.ld("1:1:A:G", "1:2:C:T", panel="finngen_r12", fields="r")
+    assert frame.columns == ["variant1", "variant2", "in_ld", "r", "panel"]
+    assert frame["r"][0] is None
+
+    client, executor = make_client()
+    await client.ld("1:1:A:G", fields="r")
+    assert executor.last[0] == "get_variants_in_ld"
+    assert executor.last[2]["fields"] == "r"
+
+
+async def test_ld_panels_is_one_row_per_own_panel():
+    client, executor = make_client({
+        "success": True,
+        "panels": [{"panel": "finngen_r12", "fields": ["r", "r2"], "r2_floor": 0.01,
+                    "max_distance": 3_000_000, "n_samples": 520_210, "description": "d"}],
+        "default_panel": "sisu42", "upstream_fields": ["r2", "d_prime"],
+    })
+    frame = await client.ld_panels()
+    assert executor.last[0] == "get_ld_panels"
+    assert frame["panel"].to_list() == ["finngen_r12"]
+    assert frame["fields"][0].to_list() == ["r", "r2"]
+
+
 async def test_search_dispatches_between_index_and_rsid_lookup():
     client, executor = make_client()
     await client.search("diabetes")
