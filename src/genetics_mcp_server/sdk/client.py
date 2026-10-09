@@ -1202,11 +1202,18 @@ class GeneticsClient:
             {"dataset_id", "resource", "version", "description", "author",
              "publication_date", "trait_type", "data_type", "products", "dataset"?,
              "qtl_types"?, "n_samples"?, "n_phenotypes"?, "pseudo_credible_sets"?,
-             "collection"?, "subdataset_id_field"?, "stats"?, "metadata_endpoint"?}
+             "cohorts"?, "collection"?, "subdataset_id_field"?, "stats"?, "metadata_endpoint"?}
 
         The trailing `?` keys are present only when the registry sets them, so read them
         with `.get`. Filter it as a list comprehension over `data_type` or `resource`
         rather than walking it for nested dicts.
+
+        `cohorts` is a list of lowercase tokens naming the sample collections whose
+        individuals contributed (["finngen", "ukb"]). Two datasets sharing a token may share
+        samples (the overlap fraction is not recorded); a missing key means the provenance is
+        unrecorded, not that there is no overlap. Disjoint lists do not establish independent
+        samples: consortium tokens such as "iibdgc" or "pgc" may contain FinnGen or UK Biobank
+        individuals.
 
         `dataset_id` is the registry key and `dataset` is the value the results views hold
         in their `dataset` column ("finngen_somascan" vs "FinnGen_SomaScan"): a SQL filter
