@@ -124,8 +124,9 @@ from genetics_mcp_server.sdk._mr_estimators import (
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.sdk.plots import _CODING_CONSEQUENCES
 
-__all__ = ["Harmonised", "Instruments", "MRResult", "MRBatch", "harmonise", "checks",
-           "instruments", "run", "sample_overlap_statement", *_ESTIMATORS]
+# run first: the catalogue's call-path example and the stub both follow this order
+__all__ = ["run", "instruments", "harmonise", "checks", "sample_overlap_statement",
+           "MRResult", "MRBatch", "Harmonised", "Instruments", *_ESTIMATORS]
 
 AF_TOLERANCE = 0.2
 F_WEAK = 10.0
@@ -1463,7 +1464,7 @@ def run(
     REFUSED: the same dataset and trait on both sides; an outcome dataset without summary
     statistics; an outcome where no instrument (lead or r2 >= 0.8 proxy) is found; more
     than `MAX_IN_FLIGHT` in flight; and a batch whose estimated requests exceed
-    `REQUEST_CAP` (instrument selection + phenotypes + summary_stats chunks + coloc, the
+    `REQUEST_CAP` (1,000 requests per execution: instrument selection + phenotypes + summary_stats chunks + coloc, the
     annotation lookups for rows without a frequency not included). instruments() adds the
     no-cis-set (D6) and pseudo-credible-set refusals. In a batch, an outcome that fails is
     listed in `.failed` with the reason instead of stopping the others.

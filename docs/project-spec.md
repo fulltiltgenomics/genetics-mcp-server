@@ -480,7 +480,7 @@ exception that would cost the user the turn.
 | Tool | Description |
 |------|-------------|
 | `run_analysis` | Run one Python script in the sandbox and return what it printed. Takes `code`, an optional `timeout_s` (1–120, default 60) and an optional `inputs` list (at most `sandbox_client.MAX_INPUTS` items, each naming exactly one source — a `url` fetched through url-fetcher, or the `attachment_id` of a file the user uploaded to this session — with an optional `name`; resolved to bytes before any credential is minted, and the names they were delivered under come back in the result for `genetics.open_input`) — **and no identity**: the authenticated user and the chat session id are injected by the caller — `llm_service._execute_tool` on the main path, `subagent._execute_subagent_tool` on the subagent path — each stripping any same-named key the model emitted first. Image artifacts the script writes are fetched and shown to the user automatically (see below); every other artifact is listed and can be read back by name with `read_artifact` within the sandbox's 300-second retention window. Chat-backend only; not registered on the MCP server at all |
-| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`, `linemodels`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — and `linemodels` the line-model fits; each one's members come from its module's `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of the five. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
+| `list_capabilities` | SDK catalogue, one module at a time (`genetics`, `client`, `errors`, `plots`, `linemodels`, `mr`); omit the argument for an index of module names and their exports. `plots` is the standard-figure surface — functions that draw rather than fetch — `linemodels` the line-model fits and `mr` Mendelian randomization; each one's members come from its module's `__all__`, which is also what the shipped stub is generated from and gated against. **Every** response carries a `usage` line with the exact import statement — the only reachable statement of it, since the catalogue strips module docstrings and `sdk.__doc__` is where the line otherwise lives (`genetics-results-suite-706`) — and, for a named module, the call path written against one of that module's real exports, because the import line alone reads as `genetics.<name>(...)` and that is right for exactly one of them. Signatures and docstrings are rendered from the live SDK objects with `inspect`, not from a checked-in copy, so a new dataset function appears without a doc edit and cannot drift. This is what makes the catalogue cost zero per-turn context: the model carries one tool description instead of a signature per data product |
 | `read_artifact` | Read one artifact **of a `run_analysis` run in this chat session**, proxied over the sandbox's `GET /artifact` (`genetics-results-suite-4h6.52`). Takes a bare artifact **name** — never a path, never an execution id, which chat-backend resolves server-side against the executions it recorded for the authenticated **`(sub, session_id)`** pair (`genetics-results-suite-dh3` — `session_id` alone is client-supplied and authorizes nothing); another user's or another session's name is `404`, indistinguishable from one that never existed. Text is returned inline (100k chars, `truncated` flag), binary base64-encoded with its content type; over the transport's 512 KiB cap is refused rather than cut, because a truncated PNG is garbage rather than a short answer. Readable for `RETENTION_S` (300 s) after the run. Chat-backend only — excluded from MCP server |
 
 **All three live in `CODE_EXECUTION_TOOL_DEFINITIONS`**, the list `resolve_tools` includes
@@ -986,6 +986,19 @@ Every return value is a dict of polars frames and its `models` frame states the 
 actually used, so a defaulted analysis can be restated exactly. `genetics.plots.linemodels`
 draws the result.
 
+### Mendelian randomization (`genetics.mr`)
+
+`sdk/mr.py` is two-sample MR over the suite's own data: `run(exposure, outcome)` picks
+instruments from the exposure dataset's credible sets (`instruments()`), fetches the outcome's
+summary statistics for them and their LD proxies, harmonises the two sides with the
+allele-frequency check (`harmonise()`), estimates, and judges the result (`checks()`). The
+estimators live in `sdk/_mr_estimators.py`, re-exported as `genetics.mr.<name>`, and are held
+to MendelianRandomization and TwoSampleMR outputs on fixed harmonised tables
+(`tests/fixtures/mr/`). The rulings the module enforces — the lead rule and MAF floor, the
+cis prune and correlated IVW, the refusals, and what the sample-overlap statement can and
+cannot establish — are the module docstring's subject and are summarised in the suite repo's
+`docs/project-spec.md`; `genetics.plots.mr` draws a result.
+
 ### The grid collapse
 
 The by-gene / by-variant / by-region / by-phenotype split that produced the near-duplicate
@@ -1337,9 +1350,9 @@ carry — without it a script cannot canonicalise a user-supplied gene list befo
   installs this distribution and then deletes every `genetics_mcp_server` file outside the
   closure — a prompt-injected script *reads* source, it does not need it to import. The closure
   is ten modules: the package `__init__`; `sdk/{__init__,_runner,client,errors}`;
-  `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py` and `sdk/linemodels.py`
-  ship too but sit outside the closure, resolved lazily so the servers never import
-  matplotlib or numpy.
+  `tools/{__init__,chembl,executor,sql_safety,uniprot}`. `sdk/plots.py`, `sdk/linemodels.py`, `sdk/mr.py`
+  and the `sdk/_mr_estimators.py` it imports ship too but sit outside the closure, resolved
+  lazily so the servers never import matplotlib or numpy.
   `config/settings.py` was in it until `genetics-results-suite-l41` — it names every internal
   environment variable of the suite — so `uniprot.py` and `chembl.py` import `Settings` under
   `if TYPE_CHECKING` and `ToolExecutor` resolves settings through `_resolve_settings()` at
@@ -2280,8 +2293,10 @@ src/genetics_mcp_server/
 │   ├── client.py        # GeneticsClient: one async method per data product
 │   ├── _runner.py       # background event loop: the sync facade and the shared client's awaited calls both run on it
 │   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest, volcano)
-│   └── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
+│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest, volcano, mr)
+│   ├── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
+│   ├── mr.py            # genetics.mr: Mendelian randomization — instruments, harmonise, run, checks
+│   └── _mr_estimators.py # the MR estimators mr.py re-exports, held to the R packages' outputs
 ├── subagent.py             # parallel subagent service
 ├── scripts/
 │   ├── analyze_variants.py # standalone variant list analysis CLI

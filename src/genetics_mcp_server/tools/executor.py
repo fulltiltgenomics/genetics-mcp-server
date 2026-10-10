@@ -5674,7 +5674,7 @@ class ToolExecutor:
 # the modules a script sees, in the order the index reports them. They are the ones the
 # sandbox stubs are generated from (sandbox/stubs/*.pyi), so the tool and the shipped
 # reference describe the same surface.
-_SDK_MODULES = ("genetics", "client", "errors", "plots", "linemodels")
+_SDK_MODULES = ("genetics", "client", "errors", "plots", "linemodels", "mr")
 
 # one-line labels written here rather than taken from each module's __doc__. The catalogue
 # renders per-function signatures and docstrings only: module docstrings describe the
@@ -5689,6 +5689,10 @@ _SDK_MODULE_SUMMARIES = {
     "linemodels": (
         "cluster variants by the linear relationship between their effects in two or more "
         "GWAS (Pirinen's linemodels); the defaults it derives are reported back"
+    ),
+    "mr": (
+        "Mendelian randomization from fine-mapped exposures to outcomes with summary "
+        "statistics: instruments, harmonisation, estimates and checks in one call"
     ),
 }
 
@@ -5753,7 +5757,7 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
             for n in names
             if hasattr(sdk_client.GeneticsClient, n)
         ]
-    if module in ("plots", "linemodels"):
+    if module in ("plots", "linemodels", "mr"):
         # __all__ rather than a name list here: the module's own export list is what the
         # generated stub reads too, so the catalogue and the stub cannot disagree about
         # which functions exist
@@ -5797,6 +5801,7 @@ _SDK_CALL_PREFIXES = {
     "errors": "except genetics.",
     "plots": "genetics.plots.",
     "linemodels": "genetics.linemodels.",
+    "mr": "genetics.mr.",
 }
 
 

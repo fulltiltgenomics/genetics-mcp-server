@@ -258,14 +258,14 @@ del _name
 
 # the submodules a script reaches as `genetics.<name>`, resolved on first use and never
 # imported by this package: they are the analysis surfaces, not the data client
-_LAZY_MODULES = ("plots", "linemodels")
+_LAZY_MODULES = ("plots", "linemodels", "mr")
 
 
 def __getattr__(name: str):
-    """`genetics.plots` and `genetics.linemodels` resolve on first use, and only then.
+    """`genetics.plots`, `genetics.linemodels` and `genetics.mr` resolve on first use, and only then.
 
     Deliberately lazy rather than an import at the top of this file: plots imports
-    matplotlib.pyplot and linemodels numpy, and this package is imported by chat-backend and
+    matplotlib.pyplot and linemodels and mr numpy, and this package is imported by chat-backend and
     mcp-server, where a figure is never drawn and no mixture is fitted. In the sandbox the
     cost is already paid — the supervisor prewarms both before the first fork — so the
     laziness buys the servers an import they do not need and costs a script nothing.
