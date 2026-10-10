@@ -90,6 +90,23 @@ def test_units_unknown_without_datasets_and_mixed_resolved_by_case_counts():
     assert h.units == {"exposure": "SD (quantitative)", "outcome": "log OR (binary)"}
 
 
+def test_units_follow_the_rows_then_the_phenotypes_row_then_trait_type():
+    x = exposure([("1:100:A:G", 0.5, 0.05, 0.7, None)])
+    y = outcome([("1:100:A:G", 0.1, 0.02, 0.68)])
+    # FinnGen's trait_type is binary; a quantitative endpoint's phenotypes() row has no cases
+    quant = {"dataset": "FG", "trait_original": "BMI_IRN", "n_cases": None, "n_controls": None}
+    h = mr.harmonise(x, y, exposure_dataset=FG_R14, outcome_dataset=FG_R14,
+                     exposure_meta=quant, annotation=no_lookup)
+    assert h.units == {"exposure": "SD (quantitative)", "outcome": "log OR (binary)"}
+    h = mr.harmonise(x.with_columns(pl.lit("500").alias("n_cases")), y,
+                     exposure_dataset=FG_R14, exposure_meta=quant, annotation=no_lookup)
+    assert h.units["exposure"] == "log OR (binary)"
+    h = mr.harmonise(x, y.drop("n_cases", "n_controls"), exposure_dataset=FG_R14,
+                     outcome_dataset=FG_R14, outcome_meta=quant, annotation=no_lookup)
+    # mixed, with neither rows nor a phenotypes() row to decide it
+    assert h.units == {"exposure": "unknown", "outcome": "SD (quantitative)"}
+
+
 def test_swapped_outcome_rows_are_never_used_and_stay_counted():
     # an SNV swap and an insertion-vs-deletion swap: neither is flipped
     h = mr.harmonise(
@@ -620,6 +637,26 @@ def test_a_lead_the_panel_lacks_is_listed_as_ld_unknown_never_kept():
     assert reasons(result)[("b", b)] == f"LD unknown: not in panel finngen_r12: {b} not in panel"
 
 
+def test_d6_refuses_when_every_lead_is_missing_from_the_panel():
+    frame = cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3), ("1:1000200:A:G", "b", 0.9, 20.0, 0.3)])
+    with pytest.raises(GeneticsUsageError) as err:
+        run_instruments(frame, ld=FakeLD(panel=set()))
+    text = str(err.value)
+    assert "PROT" in text and "chr1:0-2010000" in text
+    assert "of its 2 lead(s)" in text and "(2 sets)" in text and "finngen_r12" in text
+    assert "no LD scan in panel finngen_r12 for any of them" in text
+    assert "spelled differently, or no partner above the r2 floor" in text
+    assert text.endswith("first: LD unknown: not in panel finngen_r12: "
+                         "1:1000100:A:G not in panel")
+
+
+def test_cis_refuses_a_gene_row_without_a_chromosome():
+    gene = {**GENE, "chr": None}
+    with pytest.raises(GeneticsUsageError, match=r"PROT's position.*carries no chr\b"):
+        run_instruments(cs([("1:1000100:A:G", "a", 0.9, 20.0, 0.3)]),
+                        sql=FakeSQL(genes=[gene]))
+
+
 def test_other_ld_errors_propagate():
     def broken(*_, **__):
         raise GeneticsError("server down")
@@ -987,6 +1024,31 @@ def test_genome_wide_reports_the_full_method_set_at_the_tighter_prune():
                                   "weighted_mode", "simple_mode"}
     assert res.parameters["r2_prune"] == 0.01 and res.parameters["mode"] == "genome_wide"
     assert not any("gene_annotations_v" in q for q in sql.queries)
+
+
+def test_a_quantitative_finngen_exposure_is_labelled_sd_from_its_phenotypes_row():
+    far = ["2:5000000:A:G", "3:5000000:C:T", "4:5000000:G:A"]
+    frame = cs([(v, f"s{i}", 0.9, 30.0 - i, 0.3) for i, v in enumerate(far)],
+               trait="BMI_IRN", dataset="FG")
+    calls = []
+
+    def phenotypes(*, codes, resource):
+        calls.append((resource, tuple(codes)))
+        out = fake_phenotypes(codes=[c for c in codes if c != "BMI_IRN"], resource=resource)
+        if "BMI_IRN" in codes:
+            out = pl.concat([out, pl.DataFrame(
+                [{"dataset": "FG", "trait_original": "BMI_IRN", "n_cases": None,
+                  "n_controls": None}],
+                schema={"dataset": pl.String, "trait_original": pl.String,
+                        "n_cases": pl.Int64, "n_controls": pl.Int64})], how="vertical_relaxed")
+        return out
+
+    res = mr.run(frame, ("finngen", "P1"), instruments="genome_wide", ld=FakeLD(),
+                 sql=RunSQL(), ld_panels=lambda: PANELS, annotation=FakeAnnotation(),
+                 datasets=lambda include_stats: REGISTRY, phenotypes=phenotypes,
+                 summary_stats=FakeStats(effects(*far)))
+    assert res.harmonised.units == {"exposure": "SD (quantitative)", "outcome": "log OR (binary)"}
+    assert calls == [("finngen", ("BMI_IRN", "P1"))]
 
 
 def test_sample_prevalence_is_used_and_noted_unless_one_is_given():

@@ -214,14 +214,30 @@ def _is_finnish(dataset: dict[str, Any] | None) -> bool:
     return bool(dataset) and "finngen" in (dataset.get("cohorts") or [])
 
 
-def _unit(dataset: dict[str, Any] | None, binary_rows: bool) -> str:
-    if not dataset:
+def _has_cases(frame: pl.DataFrame) -> bool:
+    return "n_cases" in frame.columns and frame.select(_num(frame, "n_cases")).drop_nulls().height > 0
+
+
+def _unit(dataset: dict[str, Any] | None, binary_rows: bool,
+          meta: dict[str, Any] | None = None) -> str:
+    """Per side: the rows' case counts first, then the phenotypes() row, then the dataset's
+    trait_type. A dataset's trait_type describes the release, not the phenotype: FinnGen's
+    is binary although it serves quantitative endpoints such as inverse-rank BMI, whose
+    phenotypes() row has a null n_cases."""
+    if not dataset and meta is None:
         return "unknown"
-    data_type = (dataset.get("data_type") or "").lower()
-    trait_type = (dataset.get("trait_type") or "").lower()
+    data_type = ((dataset or {}).get("data_type") or "").lower()
+    trait_type = ((dataset or {}).get("trait_type") or "").lower()
     if data_type in _MOLECULAR_QTL:
         return "SD (normalised molecular level)"
-    if trait_type == "binary" or (trait_type == "mixed" and binary_rows):
+    if binary_rows:
+        return "log OR (binary)"
+    if meta is not None and "n_cases" in meta:
+        n = meta["n_cases"]
+        if n is None or (isinstance(n, float) and math.isnan(n)):
+            return "SD (quantitative)"
+        return "log OR (binary)"
+    if trait_type == "binary":
         return "log OR (binary)"
     if trait_type == "quantitative":
         return "SD (quantitative)"
@@ -265,6 +281,8 @@ def harmonise(
     outcome_dataset: dict[str, Any] | None = None,
     annotation: AnnotationFn | None = None,
     af_tolerance: float = AF_TOLERANCE,
+    exposure_meta: dict[str, Any] | None = None,
+    outcome_meta: dict[str, Any] | None = None,
 ) -> Harmonised:
     """Join exposure instruments to one outcome's rows and check each instrument's alleles.
 
@@ -274,6 +292,8 @@ def harmonise(
     `outcome` is one phenotype's summary-statistic rows (`beta`, `se`, `af`, `n_cases`,
     `n_controls`, ...). `*_dataset` are rows of `genetics.datasets()`; they give the units,
     the exposure's Finnish-ness for the AF reference, and the overlap statement in `checks`.
+    `*_meta` are each side's `genetics.phenotypes()` row; a null `n_cases` there marks a
+    quantitative phenotype of a dataset whose trait_type says binary.
     `annotation(variants=, source=)` defaults to `genetics.variant_annotation` and is called
     only for instruments whose outcome row has no frequency.
 
@@ -382,10 +402,10 @@ def harmonise(
         "in_outcome", "outcome_match", "af_checked_against", "af_reference", "af_scale",
         "af_diff", "af_flag", "palindromic", "orientation_unverifiable", "coding",
     ]
-    binary_rows = merged["n_cases"].drop_nulls().len() > 0
     units = {
-        "exposure": _unit(exposure_dataset, False),
-        "outcome": _unit(outcome_dataset, binary_rows),
+        "exposure": _unit(exposure_dataset, _has_cases(exposure), exposure_meta),
+        "outcome": _unit(outcome_dataset, merged["n_cases"].drop_nulls().len() > 0,
+                         outcome_meta),
     }
     return Harmonised(
         frame=merged.select(columns),
@@ -863,6 +883,11 @@ def instruments(
                 f"cis mode reads the trait {trait!r} as an HGNC symbol and gene_annotations_v "
                 f"has {genes.height} rows for it; use mode='genome_wide' or a symbol trait")
         g = genes.to_dicts()[0]
+        missing = [c for c in ("chr", "gene_start", "gene_end") if g[c] is None]
+        if missing:
+            raise GeneticsUsageError(
+                f"cis mode needs {trait}'s position, and its gene_annotations_v row carries no "
+                f"{' / '.join(missing)}; use mode='genome_wide'")
         region = {"gene": trait, "chr": int(g["chr"]),
                   "start": max(0, int(g["gene_start"]) - cis_window),
                   "end": int(g["gene_end"]) + cis_window, "cis_window": cis_window}
@@ -943,9 +968,9 @@ def instruments(
         else:
             candidates.append(lead)
 
+    where = (f"cis window chr{region['chr']}:{region['start']}-{region['end']} "
+             f"({trait} ± {cis_window:,})" if region else "genome-wide")
     if not candidates:
-        where = (f"cis window chr{region['chr']}:{region['start']}-{region['end']} "
-                 f"({trait} ± {cis_window:,})" if region else "genome-wide")
         if not sets:
             if fetched_only_window:
                 reason = "no credible set fine-mapped within the window"
@@ -1006,6 +1031,15 @@ def instruments(
                             "reason": f"r2 {hit[1]:.3f} with stronger lead {hit[0]}"})
             continue
         kept.append(lead)
+
+    if not kept:
+        first = next((d["reason"] for d in dropped
+                      if d["reason"].startswith("LD unknown:")), "no reason recorded")
+        raise GeneticsUsageError(
+            f"no instrument for {trait} in {dataset}, {where}: of its {len(unique)} lead(s) "
+            f"passing the MAF floor and p threshold ({len(sets)} sets), results-api has no LD "
+            f"scan in panel {panel} for any of them (absent, spelled differently, or no "
+            f"partner above the r2 floor), so none can be pruned or used; first: {first}")
 
     order = [k["variant"] for k in kept]
     r_matrix, asym = _r_matrix(order, scans)
@@ -1531,9 +1565,16 @@ def run(
     if exposure_dataset is None and (x_dataset_name or x_resource):
         exposure_dataset = _dataset_row(datasets, x_dataset_name, x_resource)
 
+    # the exposure's phenotypes() row decides its unit where the dataset's trait_type cannot;
+    # it rides on an outcome's call when the resources match
+    x_meta_resource = None
+    if trait and exposure_dataset and (exposure_dataset.get("data_type") or "").lower() \
+            not in _MOLECULAR_QTL:
+        x_meta_resource = exposure_dataset.get("resource")
     meta_by_resource: dict[str, pl.DataFrame | None] = {}
-    for resource in sorted({s["resource"] for s in specs}):
-        codes = sorted({s["phenotype"] for s in specs if s["resource"] == resource})
+    for resource in sorted({s["resource"] for s in specs} | ({x_meta_resource} - {None})):
+        codes = sorted({s["phenotype"] for s in specs if s["resource"] == resource}
+                       | ({trait} if resource == x_meta_resource else set()))
         meta_by_resource[resource] = _try(
             notes, f"phenotypes() metadata for {resource}",
             lambda r=resource, c=codes: phenotypes_fn(codes=c, resource=r), GeneticsError)
@@ -1574,6 +1615,14 @@ def run(
     for kind, n in inst.requests.items():
         if kind != "total":
             counts[f"instruments.{kind}"] = n
+
+    x_meta = None
+    x_metas = meta_by_resource.get(x_meta_resource) if x_meta_resource else None
+    if x_metas is not None and not x_metas.is_empty() and "trait_original" in x_metas.columns:
+        names = (exposure_dataset or {}).get("dataset")
+        names = names if isinstance(names, list) else [names]
+        x_meta = next((m for m in x_metas.filter(pl.col("trait_original") == trait).to_dicts()
+                       if m.get("dataset") in names), None)
 
     base = inst.frame
     leads = base["variant"].to_list()
@@ -1640,6 +1689,7 @@ def run(
             results.append(_one_outcome(
                 exposure_label=f"{x_dataset_name or x_resource} {trait}", spec=s,
                 inst=inst, scans=scans, rows=rows, meta=meta, exposure_dataset=exposure_dataset,
+                x_meta=x_meta,
                 y_dataset=y_dataset, mode=mode, prevalence=prevalence, annotation=annotation,
                 coloc=coloc_all, x_trait=trait, partnered=_coloc_partnered(exposure_dataset, y_dataset),
                 attach_coloc=attach_coloc,
@@ -1730,6 +1780,7 @@ def _coloc_query(sql: Callable[..., pl.DataFrame], x: dict | None, trait: str,
 
 def _one_outcome(*, exposure_label: str, spec: dict, inst: Instruments, scans: dict,
                  rows: pl.DataFrame, meta: dict | None, exposure_dataset: dict | None,
+                 x_meta: dict | None,
                  y_dataset: dict | None, mode: str, prevalence: float | None,
                  annotation: AnnotationFn | None, coloc: pl.DataFrame | None, partnered: bool,
                  x_trait: str | None,
@@ -1761,6 +1812,7 @@ def _one_outcome(*, exposure_label: str, spec: dict, inst: Instruments, scans: d
             "and their proxies; check the phenotype code (phenotypes(codes=[...], resource=...) "
             "lists the codes a resource serves)")
     h = harmonise(frame, rows, exposure_dataset=exposure_dataset, outcome_dataset=y_dataset,
+                  exposure_meta=x_meta, outcome_meta=meta,
                   **({"annotation": annotation} if annotation else {}))
     used = h.frame.filter(pl.col("in_outcome"))
     if used.is_empty():
