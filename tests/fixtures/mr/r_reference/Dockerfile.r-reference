@@ -1,0 +1,19 @@
+FROM rocker/r-ver:4.5.1
+# CRAN (and every CRAN dependency of the GitHub packages below) comes from one dated Posit
+# Package Manager snapshot, which serves Ubuntu noble binaries. TwoSampleMR and its non-CRAN
+# imports are not snapshot-able on r-universe, so they are installed from GitHub at the commit
+# r-universe built (mrcieu.r-universe.dev, read 2026-10-10); CRAN's ieugwasr (1.1.0) is older
+# than TwoSampleMR 0.7.12 requires.
+ARG SNAPSHOT=2026-10-01
+RUN echo "options(repos = c(CRAN = 'https://p3m.dev/cran/__linux__/noble/${SNAPSHOT}'), Ncpus = 2)" \
+      >> /usr/local/lib/R/etc/Rprofile.site \
+ && Rscript -e 'install.packages(c("MendelianRandomization", "remotes"))' \
+ && Rscript -e 'for (r in c("MRCIEU/ieugwasr@90cafe1ebac37233dec1331d412079b46e6952de", \
+                            "gqi/MRMix@56afdb2bc96760842405396f5d3f02e60e305039", \
+                            "rondolab/MR-PRESSO@3e3c92d7eda6dce0d1d66077373ec0f7ff4f7e87", \
+                            "WSpiller/RadialMR@7ca35c052489001890347871e38998ca53a02b03", \
+                            "MRCIEU/TwoSampleMR@fe1024224d1917e26dc255d17924eb47d4f7f826")) \
+                  remotes::install_github(r, upgrade = "never", dependencies = NA)' \
+ && Rscript -e 'stopifnot(packageVersion("TwoSampleMR") == "0.7.12", \
+                          packageVersion("MendelianRandomization") == "0.10.0"); \
+                library(TwoSampleMR); library(MendelianRandomization); sessionInfo()'
