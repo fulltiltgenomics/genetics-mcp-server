@@ -786,3 +786,401 @@ def test_cis_mode_on_a_frame_notes_the_rows_outside_the_window():
     result = run_instruments(frame)
     assert any("1 credible-set row(s) outside the cis window chr1:0-2010000" in n
                for n in result.notes)
+
+
+# --------------------------------------------------------------------------- run()
+
+import asyncio  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from genetics_mcp_server.sdk import _mr_estimators as est  # noqa: E402
+
+X_ROW = {"dataset_id": "ukbb_pqtl", "resource": "ukbb", "dataset": "SETS", "data_type": "pqtl",
+         "trait_type": "quantitative", "version": "PPP", "n_samples": 40000, "cohorts": ["ukb"],
+         "pseudo_credible_sets": False,
+         "products": {"credible_sets": True, "colocalization": {"partners": ["fg_gwas"]}}}
+FG_ROW = {"dataset_id": "fg_gwas", "resource": "finngen", "dataset": "FG", "data_type": "gwas",
+          "trait_type": "binary", "version": "R14", "cohorts": ["finngen"],
+          "products": {"credible_sets": True, "summary_stats": True}}
+FG_OLD = {"dataset_id": "fg_gwas_r12", "resource": "finngen", "dataset": "FG12",
+          "data_type": "gwas", "trait_type": "binary", "cohorts": ["finngen"],
+          "products": {"colocalization": {"partners": []}}}
+IBD_ROW = {"dataset_id": "ibd", "resource": "ibd_gwas", "dataset": "IIBDGC", "data_type": "gwas",
+           "trait_type": "binary", "version": "2026", "cohorts": ["iibdgc"],
+           "products": {"credible_sets": True, "summary_stats": True}}
+SETS_ONLY = {"dataset_id": "sets_only", "resource": "setsres", "dataset": "SO",
+             "data_type": "gwas", "trait_type": "binary", "products": {"credible_sets": True}}
+REGISTRY = [X_ROW, FG_ROW, FG_OLD, IBD_ROW, SETS_ONLY]
+META = {("finngen", "FG"): (1000, 9000), ("finngen", "FG12"): (900, 9000),
+        ("ibd_gwas", "IIBDGC"): (2000, 8000), ("setsres", "SO"): (10, 90)}
+
+
+class FakeStats:
+    """summary_stats over {phenotype: {variant: (beta, se, af)}}; FinnGen-like rows carry no
+    case counts unless `cases` is set. Async when asked, recording the peak concurrency."""
+
+    def __init__(self, table, cases=None, is_async=False):
+        self.table, self.cases, self.is_async = table, cases, is_async
+        self.calls, self.active, self.peak = [], 0, 0
+
+    def rows(self, phenotypes, variants, resource, data_type):
+        self.calls.append((tuple(phenotypes), tuple(variants), resource, data_type))
+        out = []
+        for p in phenotypes:
+            for v, (b, s, f) in self.table.get(p, {}).items():
+                if v in variants:
+                    c, pos, ref, alt = v.split(":")
+                    row = {"resource": resource, "version": "R14", "phenotype": p, "chr": int(c),
+                           "pos": int(pos), "ref": ref, "alt": alt, "beta": b, "se": s, "af": f}
+                    if self.cases:
+                        row.update(n_cases=str(self.cases[0]), n_controls=str(self.cases[1]))
+                    out.append(row)
+        return pl.DataFrame(out) if out else pl.DataFrame()
+
+    def __call__(self, *, phenotypes, variants, resource, data_type):
+        if not self.is_async:
+            return self.rows(phenotypes, variants, resource, data_type)
+
+        async def go():
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return self.rows(phenotypes, variants, resource, data_type)
+        return go()
+
+
+def fake_phenotypes(*, codes, resource):
+    rows = [{"dataset": ds, "trait_original": c, "n_cases": n[0], "n_controls": n[1]}
+            for c in codes for (res, ds), n in META.items() if res == resource]
+    return pl.DataFrame(rows)
+
+
+class RunSQL(FakeSQL):
+    def __init__(self, coloc=None, **kw):
+        super().__init__(**kw)
+        self.coloc = coloc
+
+    def __call__(self, query, *, max_rows):
+        if "colocalization_v" in query:
+            self.queries.append(query)
+            return self.coloc if self.coloc is not None else pl.DataFrame()
+        return super().__call__(query, max_rows=max_rows)
+
+
+A, B, C, D = "1:1000100:A:G", "1:1000200:C:T", "1:1000300:G:A", "1:1300000:T:C"
+
+
+def three_leads():
+    return cs([(A, "a", 0.9, 30.0, 0.3), (B, "b", 0.9, 20.0, 0.3), (C, "c", 0.9, 15.0, 0.3)])
+
+
+def effects(*variants, slope=0.5, phenotype="P1"):
+    return {phenotype: {v: (slope * 0.1 * (i + 1) + 0.002 * (-1) ** i, 0.01, 0.3)
+                        for i, v in enumerate(variants)}}
+
+
+def mr_run(exposure, outcome=("finngen", "P1"), *, stats=None, ld=None, sql=None, **kw):
+    return mr.run(exposure, outcome, ld=ld or FakeLD(), sql=sql or RunSQL(),
+                  ld_panels=lambda: PANELS, annotation=FakeAnnotation(),
+                  datasets=lambda include_stats: REGISTRY, phenotypes=fake_phenotypes,
+                  summary_stats=stats or FakeStats(effects(A, B, C)), **kw)
+
+
+def test_estimators_are_re_exported():
+    assert all(getattr(mr, name) is getattr(est, name) for name in est.__all__)
+    assert set(est.__all__) <= set(mr.__all__)
+
+
+def test_cis_with_three_correlated_instruments_heads_with_the_correlated_ivw():
+    ld = FakeLD({(A, B): 0.25, (B, C): -0.2})
+    res = mr_run(three_leads(), ld=ld)
+    assert res.headline == "ivw_correlated"
+    assert set(res.estimates) == {"ivw_correlated", "ivw", "egger"}
+    used = res.harmonised.frame.filter(pl.col("in_outcome"))
+    assert res.instruments.r.drop("variant").to_numpy()[0, 1] == pytest.approx(0.25)
+    want = est.ivw(used, correl=res.instruments.r)
+    assert res.estimates["ivw_correlated"]["estimate"] == pytest.approx(want["estimate"], rel=1e-12)
+    assert res.estimates["ivw_correlated"]["method"] == "ivw_correlated"
+    assert res.estimates["ivw"]["estimate"] == pytest.approx(est.ivw(used)["estimate"], rel=1e-12)
+    assert res.estimates["ivw"]["estimate"] != pytest.approx(want["estimate"], rel=1e-9)
+    assert res.parameters["r2_prune"] == 0.1 and res.parameters["mode"] == "cis"
+    assert res.parameters["attach_coloc"] is True
+    assert res.parameters["max_in_flight"] == mr.MAX_IN_FLIGHT
+    assert res.parameters["outcome_chunk"] == mr.OUTCOME_CHUNK
+    assert res.sensitivity["leave_one_out"].height == 4
+    assert any("treat the instruments as independent" in n for n in res.notes)
+
+
+PROXY = "1:1000150:G:C"
+PROXY_STATS = {"P1": {PROXY: (-0.05, 0.01, 0.3), B: (0.1, 0.01, 0.3), C: (0.16, 0.01, 0.3)}}
+
+
+def test_a_proxied_instrument_reaches_the_correlated_ivw_with_the_chain_r():
+    ld = FakeLD({(A, B): 0.25, (A, C): 0.1, (A, PROXY): -0.95})
+    stats = FakeStats(PROXY_STATS)
+    res = mr_run(three_leads(), ld=ld, stats=stats)
+    used = res.harmonised.frame.filter(pl.col("in_outcome"))
+    assert PROXY in used["variant"].to_list()
+    assert len(stats.calls) == 1 and PROXY in stats.calls[0][1]
+    assert res.headline == "ivw_correlated"
+    assert not any("no LD r" in n for n in res.notes)
+    assert any(PROXY in n and "chain" in n for n in res.notes)
+    r = mr._r_for(used.join(res.instruments.frame.select("variant", "proxy_for", "proxy_r"),
+                            on="variant", how="left"), res.instruments.r, {})
+    # r(A, B) * r(proxy, A): B's scan does not hold the proxy
+    assert r.filter(pl.col("variant") == PROXY)[B].item() == pytest.approx(0.25 * -0.95)
+    assert r.filter(pl.col("variant") == PROXY)[PROXY].item() == 1.0
+    want = est.ivw(used, correl=r)
+    assert res.estimates["ivw_correlated"]["estimate"] == pytest.approx(want["estimate"],
+                                                                         rel=1e-12)
+
+
+def test_a_proxied_instruments_r_prefers_the_other_leads_own_scan_value():
+    ld = FakeLD({(A, B): 0.25, (A, PROXY): -0.95, (B, PROXY): -0.3})
+    res = mr_run(three_leads(), ld=ld, stats=FakeStats(PROXY_STATS))
+    assert res.headline == "ivw_correlated"
+    used = res.harmonised.frame.filter(pl.col("in_outcome"))
+    scans = {B: {PROXY: (-0.3, 0.09)}}
+    r = mr._r_for(used.join(res.instruments.frame.select("variant", "proxy_for", "proxy_r"),
+                            on="variant", how="left"), res.instruments.r, scans)
+    assert r.filter(pl.col("variant") == PROXY)[B].item() == pytest.approx(-0.3)
+    assert res.estimates["ivw_correlated"]["estimate"] == pytest.approx(
+        est.ivw(used, correl=r)["estimate"], rel=1e-12)
+
+
+def test_binary_steiger_runs_on_the_instruments_the_outcome_has():
+    stats = FakeStats({"P1": {A: (0.05, 0.01, 0.3), B: (0.1, 0.01, 0.3)}})
+    res = mr_run(three_leads(), stats=stats)
+    assert res.harmonised.frame.filter(~pl.col("in_outcome")).height == 1
+    assert res.sensitivity["steiger"] is not None
+    assert res.sensitivity["steiger"]["per_variant"].height == 2
+    assert not any("Steiger not computed" in n for n in res.notes)
+
+
+def test_steiger_note_names_a_case_control_consortium():
+    res = mr_run(three_leads(), ("ibd_gwas", "P1"))
+    note = next(n for n in res.notes if "not the population prevalence" in n)
+    assert "case-control consortium collection (iibdgc)" in note
+    fg = mr_run(three_leads())
+    note = next(n for n in fg.notes if "not the population prevalence" in n)
+    assert "close for a population cohort" in note
+
+
+def test_one_instrument_is_the_wald_ratio_with_the_sensitivity_skipped_and_said():
+    stats = FakeStats({"P1": {A: (0.05, 0.01, 0.3)}})
+    res = mr_run(cs([(A, "a", 0.9, 30.0, 0.3)]), stats=stats)
+    assert res.headline == "wald" and set(res.estimates) == {"wald"}
+    assert res.estimates["wald"]["estimate"] == pytest.approx(0.05 / 0.1)
+    assert res.sensitivity["leave_one_out"] is None and res.sensitivity["heterogeneity"] is None
+    assert res.sensitivity["single_snp"].height == 3
+    assert any("leave-one-out needs 3" in n for n in res.notes)
+
+
+def test_genome_wide_reports_the_full_method_set_at_the_tighter_prune():
+    far = ["2:5000000:A:G", "3:5000000:C:T", "4:5000000:G:A", "5:5000000:T:C"]
+    frame = cs([(v, f"s{i}", 0.9, 30.0 - i, 0.3) for i, v in enumerate(far)])
+    sql = RunSQL()
+    res = mr_run(frame, instruments="genome_wide", stats=FakeStats(effects(*far)), sql=sql)
+    assert res.headline == "ivw"
+    assert set(res.estimates) == {"ivw", "egger", "weighted_median", "simple_median",
+                                  "weighted_mode", "simple_mode"}
+    assert res.parameters["r2_prune"] == 0.01 and res.parameters["mode"] == "genome_wide"
+    assert not any("gene_annotations_v" in q for q in sql.queries)
+
+
+def test_sample_prevalence_is_used_and_noted_unless_one_is_given():
+    res = mr_run(three_leads())
+    assert res.parameters["prevalence"] == pytest.approx(1000 / 10000)
+    assert res.parameters["prevalence_source"] == "sample"
+    assert any("not the population prevalence" in n for n in res.notes)
+    assert any("taken from phenotypes()" in n for n in res.notes)
+    assert res.sensitivity["steiger"]["options"]["prevalence"] == pytest.approx(0.1)
+    given = mr_run(three_leads(), prevalence=0.01)
+    assert given.parameters["prevalence_source"] == "given"
+    assert given.sensitivity["steiger"]["options"]["prevalence"] == 0.01
+    assert not any("not the population prevalence" in n for n in given.notes)
+
+
+def test_outcome_dataset_is_the_one_serving_summary_statistics_and_the_counts_come_from_it():
+    res = mr_run(three_leads())
+    assert res.harmonised.outcome_dataset["dataset_id"] == "fg_gwas"
+    assert res.harmonised.frame["n_cases"].unique().to_list() == [1000.0]
+    assert res.versions["outcome"] == {"dataset_id": "fg_gwas", "version": "R14"}
+    assert res.versions["outcome_rows"] == ["R14"]
+
+
+def test_refuses_the_same_trait_in_the_same_dataset():
+    with pytest.raises(GeneticsUsageError, match="same trait PROT in the same dataset fg_gwas"):
+        mr_run(three_leads(), ("finngen", "PROT"), exposure_dataset=FG_ROW,
+               stats=FakeStats(effects(A, B, C, phenotype="PROT")))
+
+
+def test_refuses_an_outcome_dataset_without_summary_statistics_naming_what_it_has():
+    with pytest.raises(GeneticsUsageError, match="sets_only serves no summary statistics "
+                                                 r"\(it has credible_sets\)"):
+        mr_run(three_leads(), ("setsres", "P1"))
+
+
+def test_refuses_when_no_instrument_reaches_the_outcome_naming_the_counts():
+    # a row whose beta is NA is no outcome effect: the instrument counts as absent
+    stats = FakeStats({"P1": {A: (None, 0.01, 0.3)}})
+    with pytest.raises(GeneticsUsageError, match=r"3 instrument\(s\), 3 absent"):
+        mr_run(three_leads(), stats=stats)
+    with pytest.raises(GeneticsUsageError, match="returned no rows .* check the phenotype code"):
+        mr_run(three_leads(), stats=FakeStats({}))
+
+
+def test_refuses_many_exposures_naming_the_lead_only_wald_form_and_bad_arguments():
+    with pytest.raises(GeneticsUsageError, match="lead-only Wald"):
+        mr.run([{"dataset": "SETS", "trait": "A"}, {"dataset": "SETS", "trait": "B"}],
+               ("finngen", "P1"))
+    with pytest.raises(GeneticsUsageError, match="max_in_flight must be 1-4"):
+        mr_run(three_leads(), max_in_flight=5)
+    with pytest.raises(GeneticsUsageError, match="exactly one of"):
+        mr.run(three_leads())
+    with pytest.raises(GeneticsUsageError, match="unexpected keyword"):
+        mr_run(three_leads(), colour="red")
+
+
+def test_d6_refusal_comes_through_from_instruments():
+    trans = cs([("7:5000000:A:G", "t", 0.9, 30.0, 0.3)])
+    with pytest.raises(GeneticsUsageError, match="trans sets only"):
+        mr_run(trans)
+
+
+def test_many_outcomes_share_one_selection_and_fetch_in_chunks_within_the_cap():
+    codes = [f"P{i}" for i in range(25)]
+    table = {c: effects(A, B, C, slope=0.1 * i, phenotype=c)[c] for i, c in enumerate(codes)}
+    del table["P7"]
+    stats = FakeStats(table, is_async=True)
+    ld = FakeLD()
+    batch = mr.run(three_leads(), outcomes=[("finngen", c) for c in codes], ld=ld,
+                   sql=RunSQL(), ld_panels=lambda: PANELS, annotation=FakeAnnotation(),
+                   datasets=lambda include_stats: REGISTRY, phenotypes=fake_phenotypes,
+                   summary_stats=stats, max_in_flight=2)
+    assert isinstance(batch, mr.MRBatch) and len(batch) == 24
+    assert batch.failed["phenotype"].to_list() == ["P7"]
+    assert [len(c[0]) for c in stats.calls] == [10, 10, 5]
+    assert stats.peak == 2
+    assert len(ld.calls) == 3
+    assert batch.requests["summary_stats"] == 3 and batch.requests["phenotypes"] == 1
+    assert batch.summary().height == 24
+    assert batch.summary()["outcome"].to_list()[:2] == ["finngen P0", "finngen P1"]
+
+
+def test_a_chunk_that_raises_anything_fails_only_its_own_outcomes():
+    codes = [f"P{i}" for i in range(25)]
+    table = {c: effects(A, B, C, slope=0.1 * i, phenotype=c)[c] for i, c in enumerate(codes)}
+    inner = FakeStats(table)
+
+    def stats(*, phenotypes, variants, resource, data_type):
+        if "P10" in phenotypes:
+            raise RuntimeError("connection reset")
+        return inner(phenotypes=phenotypes, variants=variants, resource=resource,
+                     data_type=data_type)
+    batch = mr.run(three_leads(), outcomes=[("finngen", c) for c in codes], ld=FakeLD(),
+                   sql=RunSQL(), ld_panels=lambda: PANELS, annotation=FakeAnnotation(),
+                   datasets=lambda include_stats: REGISTRY, phenotypes=fake_phenotypes,
+                   summary_stats=stats)
+    assert len(batch) == 15
+    assert batch.failed["phenotype"].to_list() == codes[10:20]
+    assert set(batch.failed["reason"]) == {"connection reset"}
+
+
+def test_instruments_given_marks_the_selection_parameters_unused():
+    inst = mr.Instruments(frame=three_leads().select("variant", "beta", "se", "maf", "cs_id"),
+                          dropped=pl.DataFrame(), r=None, panel={}, requests={"total": 0},
+                          cis_region=None)
+    res = mr_run({"dataset": "SETS", "trait": "PROT"}, instruments=inst)
+    for k in ("cis_window", "p_threshold", "maf_floor", "panel", "r2_prune"):
+        assert res.parameters[k] == "not used (instruments given)"
+
+
+def test_budget_refusals_name_the_estimate_and_the_cap(monkeypatch):
+    monkeypatch.setattr(mr, "REQUEST_CAP", 12)
+    ld = FakeLD()
+    with pytest.raises(GeneticsUsageError, match=r"at least \d+ requests .* 12-request cap"):
+        mr.run(three_leads(), outcomes=[("finngen", f"P{i}") for i in range(60)], ld=ld,
+               sql=RunSQL(), ld_panels=lambda: PANELS, datasets=lambda include_stats: REGISTRY,
+               phenotypes=fake_phenotypes, summary_stats=FakeStats({}))
+    assert ld.calls == []
+    # datasets, phenotypes, 1 gene sql + 3 ld + ld_panels, 1 summary_stats, 1 coloc sql
+    monkeypatch.setattr(mr, "REQUEST_CAP", 8)
+    with pytest.raises(GeneticsUsageError, match=r"needs about 9 requests .* 8-request cap"):
+        mr_run(three_leads())
+
+
+def test_coloc_rows_are_attached_for_a_partner_outcome_in_one_query():
+    coloc = pl.DataFrame({
+        "dataset1": ["FG", "FG", "FG"], "trait1": ["P1", "OTHER", "P1"],
+        "cs1_id": ["x", "y", "z"], "dataset2": ["SETS", "SETS", "SETS"],
+        "trait2": ["PROT", "PROT", "PROT"], "cs2_id": ["a", "a", "c"],
+        "PP_H4_abf": [0.95, 0.9, 0.2]})
+    sql = RunSQL(coloc=coloc)
+    res = mr_run(three_leads(), sql=sql)
+    queries = [q for q in sql.queries if "colocalization_v" in q]
+    assert len(queries) == 1 and "'a'" in queries[0] and "'P1'" in queries[0]
+    assert "WHERE chr IN (1) AND (" in queries[0]
+    assert res.coloc.select("instrument", "PP_H4_abf").rows() == [(A, 0.95), (C, 0.2)]
+    assert res.requests["colocalization.sql"] == 1
+
+
+def test_coloc_is_skipped_quietly_for_an_outcome_that_is_not_a_partner():
+    sql = RunSQL(coloc=pl.DataFrame({"x": [1]}))
+    res = mr_run(three_leads(), ("ibd_gwas", "P1"), sql=sql)
+    assert res.coloc is None
+    assert not any("colocalization_v" in q for q in sql.queries)
+    assert any("not a colocalization partner" in n for n in res.notes)
+    off = mr_run(three_leads(), sql=sql, attach_coloc=False)
+    assert off.coloc is None and not any("colocalization_v" in q for q in sql.queries)
+
+
+def test_summary_is_one_row_and_repr_is_short():
+    res = mr_run(three_leads())
+    s = res.summary()
+    assert s.columns == ["exposure", "outcome", "method", "estimate", "se", "p", "ci_low",
+                         "ci_high", "n_instruments", "overlap", "checks_failing"]
+    assert s.height == 1 and s["method"][0] == "ivw_correlated" and s["n_instruments"][0] == 3
+    assert s["exposure"][0] == "SETS PROT" and s["outcome"][0] == "finngen P1"
+    assert s["overlap"][0] == "pass"
+    assert repr(res).startswith("MRResult(SETS PROT -> finngen P1: ivw_correlated")
+    assert "\n" not in repr(res) and len(repr(res)) < 160
+    assert res.requests["total"] == sum(v for k, v in res.requests.items() if k != "total")
+
+
+REF = Path(__file__).parent / "fixtures" / "mr" / "r_reference"
+CIS = pl.read_csv(REF / "input_cis_ibd.csv")
+PROTEINS = sorted(p for p in CIS["protein"].unique().to_list() if (REF / f"ld_{p}.csv").exists()
+                  and CIS.filter(pl.col("protein") == p).height >= 2)
+
+
+@pytest.mark.parametrize("protein", PROTEINS)
+def test_run_headline_equals_the_estimators_on_the_reference_frames(protein):
+    rows = CIS.filter(pl.col("protein") == protein)
+    ld = pl.read_csv(REF / f"ld_{protein}.csv")
+    inst = mr.Instruments(
+        frame=rows.select("variant", pl.col("beta_x").alias("beta"), pl.col("se_x").alias("se"),
+                          pl.col("af_x").alias("af"), pl.col("n_x").alias("n"),
+                          pl.col("rsid").alias("cs_id")),
+        dropped=pl.DataFrame(), r=ld, panel={}, requests={"total": 0},
+        cis_region={"gene": protein})
+    table = {"IBD": {v: (b, s, f) for v, b, s, f in
+                     rows.select("variant", "beta_y", "se_y", "af_y").iter_rows()}}
+    res = mr.run({"dataset": "SETS", "trait": protein}, ("ibd_gwas", "IBD"), instruments=inst,
+                 annotation=FakeAnnotation(), datasets=lambda include_stats: REGISTRY,
+                 phenotypes=fake_phenotypes, summary_stats=FakeStats(table, cases=(125992, 1262229)))
+    frame = rows.rename({"ncase_y": "n_cases", "ncontrol_y": "n_controls"})
+    if not set(rows["variant"]) <= set(ld["variant"]):
+        # a caller's r that misses an instrument is not used to drop it: the IVW goes independent
+        assert res.headline == "ivw" and "ivw_correlated" not in res.estimates
+        assert any("no LD r for these instruments" in n for n in res.notes)
+        assert res.estimates["ivw"]["estimate"] == pytest.approx(est.ivw(frame)["estimate"])
+        return
+    assert res.headline == "ivw_correlated"
+    assert res.estimates["ivw_correlated"]["n_instruments"] == rows.height
+    for key, want in [("ivw_correlated", est.ivw(frame, correl=ld)), ("ivw", est.ivw(frame))] + (
+            [("egger", est.egger(frame, correl=ld))] if rows.height >= 3 else []):
+        assert res.estimates[key]["estimate"] == pytest.approx(want["estimate"], rel=1e-10, abs=1e-14)
+        assert res.estimates[key]["se"] == pytest.approx(want["se"], rel=1e-10)
+    assert res.parameters["prevalence"] == pytest.approx(125992 / (125992 + 1262229))
