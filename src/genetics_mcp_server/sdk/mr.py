@@ -46,6 +46,15 @@ its two alleles' frequencies differ by less than the tolerance, so a mislabelled
 passes the frequency check. With no frequency on either side it falls back to
 `palindromic`; otherwise `palindromic` is information only.
 
+INSTRUMENTS. `instruments(exposure, ...)` picks the leads harmonise() takes, as a function of
+(credible-set rows, LD accessor) so a batch job could reuse it with a file-backed accessor. The
+LD scans run at the panel's floor rather than at `r2_prune`: the kept leads are by definition
+below `r2_prune` with each other, so a scan at that threshold could only ever return an
+identity r matrix. At the default `r2_prune` (equal to finngen_r12's floor of 0.01) the matrix
+is the identity anyway; it carries information only with a looser prune. Pseudo credible sets
+are refused as exposures by default: their satellite and singleton sets put leads tens of kb
+from the real signal (deCODE against UKB_PPP, 2026-10-10).
+
 SAMPLE OVERLAP. A dataset's `cohorts` token names a sample collection, not a sample set. A
 shared token says only "same collection(s), overlap fraction not recorded"; it never
 establishes one-sample MR, and disjoint lists never establish independent samples, because
@@ -56,15 +65,17 @@ at most, never a failure.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import polars as pl
 
-from genetics_mcp_server.sdk.errors import GeneticsUsageError
+from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.sdk.plots import _CODING_CONSEQUENCES
 
-__all__ = ["Harmonised", "harmonise", "checks", "sample_overlap_statement"]
+__all__ = ["Harmonised", "Instruments", "harmonise", "checks", "instruments",
+           "sample_overlap_statement"]
 
 AF_TOLERANCE = 0.2
 F_WEAK = 10.0
@@ -511,3 +522,578 @@ def checks(
         _row("sample_overlap", *overlap),
     ]
     return pl.DataFrame(rows, schema={"check": pl.String, "status": pl.String, "detail": pl.String})
+
+
+# --------------------------------------------------------------------------- instruments
+
+MHC = (6, 25_000_000, 34_000_000)
+LD_SCAN_CAP = 3_000_000
+PROXY_R2 = 0.8
+# results-api refuses a larger variant_annotation batch with a 422
+_ANNOTATION_BATCH = 2000
+_CS_ID_VARIANT = re.compile(r"^chr([0-9XY]+)_([0-9]+)_([A-Za-z]+)_([A-Za-z]+)$")
+_SET_KEY = ("dataset", "trait", "trait_original", "cell_type", "cs_id")
+_LEAD_COLUMNS = [
+    "variant", "chr", "pos", "ref", "alt", "beta", "se", "pip", "cs_id", "mlog10p", "maf",
+    "af_source", "trait", "trait_original", "cell_type", "dataset",
+]
+_CS_SQL_COLUMNS = (
+    "dataset, resource, trait, trait_original, cell_type, cs_id, variant, chr, pos, ref, alt, "
+    "beta, se, pip, mlog10p, maf, aaf"
+)
+_CS_MAX_ROWS = 100_000
+
+
+@dataclass
+class Instruments:
+    """`instruments`' result.
+
+    `frame`: one row per kept instrument. A proxied row describes the proxy's own alleles:
+    its variant, chr, pos, ref and alt, beta = sign(proxy_r) * the lead's beta (se, pip and
+    mlog10p are the lead's), maf null with af_source "proxy: no frequency", and the lead's
+    values in `lead_beta`, `lead_maf`, `proxy_for`, `proxy_r`, `proxy_r2`; `in_outcome` is
+    null when no outcome was given. `dropped`: variant, cs_id,
+    reason for every set or lead left out. `r`: the signed-r matrix of the kept leads (by
+    lead id, which is `proxy_for` on a proxied row), a `variant` column plus one column per
+    lead in the same order, diagonal 1, pairs below the panel floor 0. `panel`: name,
+    r2_floor, max_distance, the scan window and threshold used. `requests`: calls per kind
+    and their total. `notes`: every assumption the call made.
+    """
+
+    frame: pl.DataFrame
+    dropped: pl.DataFrame
+    r: pl.DataFrame
+    panel: dict[str, Any]
+    requests: dict[str, int]
+    notes: list[str] = field(default_factory=list)
+    exposure_dataset: dict[str, Any] | None = None
+    cis_region: dict[str, Any] | None = None
+
+
+class _Counted:
+    def __init__(self, fn: Callable[..., Any], counts: dict[str, int], kind: str) -> None:
+        self.fn, self.counts, self.kind = fn, counts, kind
+        counts.setdefault(kind, 0)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.counts[self.kind] += 1
+        return self.fn(*args, **kwargs)
+
+
+def _sdk(name: str) -> Callable[..., Any]:
+    """The SDK function `name`, looked up at call time so a monkeypatch reaches it."""
+    def call(*args: Any, **kwargs: Any) -> Any:
+        import genetics_mcp_server.sdk as sdk
+
+        return getattr(sdk, name)(*args, **kwargs)
+    return call
+
+
+def _quote(value: str) -> str:
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _dataset_row(rows: list[dict[str, Any]], dataset: str | None,
+                 resource: str | None) -> dict[str, Any] | None:
+    def names(row: dict[str, Any]) -> list[str]:
+        value = row.get("dataset")
+        return value if isinstance(value, list) else [value]
+    if dataset is None:
+        matches = [r for r in rows if resource and r.get("resource") == resource]
+    else:
+        matches = [r for r in rows if dataset in names(r)]
+    if resource and dataset is not None:
+        matches = [r for r in matches if r.get("resource") == resource] or matches
+    if not matches:
+        return None
+    merged = dict(matches[0])
+    # a dataset under two registry entries is pseudo if either says so: refusing is the
+    # cheap mistake, a satellite-set lead is the expensive one
+    merged["pseudo_credible_sets"] = any(m.get("pseudo_credible_sets") for m in matches)
+    return merged
+
+
+def _normalise_sets(frame: pl.DataFrame) -> pl.DataFrame:
+    key = _variant_key(frame)
+    parts = key.str.split(":")
+    text = {c: (pl.col(c).cast(pl.String) if c in frame.columns else pl.lit(None, pl.String))
+            for c in ("dataset", "resource", "trait", "trait_original", "cell_type", "cs_id")}
+    return frame.select(
+        key.alias("variant"),
+        parts.list.get(0).cast(pl.Int64, strict=False).alias("chr"),
+        parts.list.get(1).cast(pl.Int64, strict=False).alias("pos"),
+        parts.list.get(2).alias("ref"),
+        parts.list.get(3).alias("alt"),
+        *(_num(frame, c).alias(c) for c in ("beta", "se", "pip", "mlog10p", "maf", "aaf")),
+        *(e.alias(c) for c, e in text.items()),
+    )
+
+
+def _with_maf(rows: pl.DataFrame, annotation: AnnotationFn, finnish: bool) -> pl.DataFrame:
+    """`maf` and `af_source`: the set's maf, else its aaf folded, else the annotation AF."""
+    rows = rows.with_columns(
+        pl.when(pl.col("maf").is_not_null()).then(pl.lit("credible_set maf"))
+        .when(pl.col("aaf").is_not_null()).then(pl.lit("credible_set aaf"))
+        .otherwise(None).alias("af_source"),
+        pl.coalesce("maf", pl.min_horizontal("aaf", 1 - pl.col("aaf"))).alias("maf"),
+    )
+    need = rows.filter(pl.col("maf").is_null())["variant"].unique().sort().to_list()
+    if not need:
+        return rows
+
+    def lookup(variants: list[str], source: str, columns: tuple[str, ...]) -> dict:
+        out: dict[str, tuple[float, str]] = {}
+        for i in range(0, len(variants), _ANNOTATION_BATCH):
+            out.update(_annotation_af(annotation, variants[i:i + _ANNOTATION_BATCH], source,
+                                      columns))
+        return out
+
+    found = {v: (af, "finngen_annotation")
+             for v, (af, _) in lookup(need, "finngen", ("AF",)).items()}
+    if not finnish:
+        rest = [v for v in need if v not in found]
+        found.update({v: (af, "gnomad_nfe" if col == "AF_nfe" else "gnomad_fin")
+                      for v, (af, col) in lookup(rest, "gnomad", ("AF_nfe", "AF_fin")).items()})
+    ann = pl.DataFrame(
+        {"variant": list(found), "_af": [a for a, _ in found.values()],
+         "_src": [s for _, s in found.values()]},
+        schema={"variant": pl.String, "_af": pl.Float64, "_src": pl.String},
+    )
+    return rows.join(ann, on="variant", how="left").with_columns(
+        pl.coalesce("maf", pl.min_horizontal("_af", 1 - pl.col("_af"))).alias("maf"),
+        pl.coalesce("af_source", "_src").alias("af_source"),
+    ).drop("_af", "_src")
+
+
+def _pick_lead(members: list[dict[str, Any]], floor: float, by_cs_id: bool) -> dict | None:
+    eligible = [m for m in members if m["maf"] is not None and m["maf"] >= floor]
+    if by_cs_id:
+        named = _CS_ID_VARIANT.match(members[0]["cs_id"] or "")
+        if named:
+            wanted = ":".join(named.groups()).upper().replace("X:", "23:", 1)
+            hit = next((m for m in eligible if m["variant"].upper() == wanted), None)
+            if hit:
+                return hit
+    eligible.sort(key=lambda m: (-(m["pip"] or 0), -(m["mlog10p"] or 0), m["variant"]))
+    return eligible[0] if eligible else None
+
+
+def _in_mhc(lead: dict[str, Any]) -> bool:
+    return lead["chr"] == MHC[0] and MHC[1] <= (lead["pos"] or 0) <= MHC[2]
+
+
+def instruments(
+    exposure: pl.DataFrame | dict[str, Any],
+    *,
+    mode: str = "cis",
+    cis_window: int = 1_000_000,
+    p_threshold: float = 5e-8,
+    maf_floor: float = 0.01,
+    r2_prune: float = 0.01,
+    exclude_mhc: bool = True,
+    panel: str = "finngen_r12",
+    allow_pseudo_credible_sets: bool = False,
+    exposure_dataset: dict[str, Any] | None = None,
+    outcome: dict[str, Any] | None = None,
+    ld: Callable[..., pl.DataFrame] | None = None,
+    annotation: AnnotationFn | None = None,
+    outcome_lookup: Callable[..., pl.DataFrame] | None = None,
+    sql: Callable[..., pl.DataFrame] | None = None,
+    ld_panels: Callable[[], pl.DataFrame] | None = None,
+) -> Instruments:
+    """Pick independent credible-set leads of one exposure trait as MR instruments.
+
+    `exposure` is a credible_sets_v-shaped frame of ONE (dataset, trait) — every member row
+    of its sets, not only leads — or a dict {"dataset" and/or "resource", "trait",
+    ["trait_original"]} that this fetches through `sql`. LEAD RULE: per credible set the
+    max-pip variant whose MAF reaches `maf_floor` (ties by mlog10p, then id); a set with
+    none contributes nothing. MAF is the set's `maf`, else its `aaf` folded, else the
+    annotation AF (FinnGen first; gnomAD AF_nfe only for a non-Finnish exposure), with the
+    source in `af_source`. A lead must reach `p_threshold` and, with `exclude_mhc`, lie
+    outside chr6:25-34 Mb. `mode="cis"` keeps rows within `cis_window` of the gene whose
+    HGNC symbol equals the trait, and REFUSES when no cis set survives (no fallback).
+    `cis_window` is 1 Mb either side of the gene, not the investigation doc's 500 kb: 1 Mb
+    is what Zhang 2025 and the kill measurement used.
+
+    COST: a cis dict exposure costs two `sql` calls, the gene lookup then the fetch (a
+    literal chr and pos range, which prunes the partition). `mode="genome_wide"` on a dict
+    skips the gene lookup and fetches every credible-set row of the trait, which is allowed
+    but costs a whole-table scan and an `ld` scan per independent lead (live, UKB_PPP IL12B:
+    34 kept, 42 requests).
+
+    The exposure's registry row decides pseudo-ness and Finnish-ness. It is looked up by the
+    rows' `dataset` label (by `resource` when the rows carry none); rows holding more than one
+    dataset are refused, and a dataset with no registry row is treated as non-Finnish and not
+    pseudo, with a note.
+
+    Pseudo-credible-set datasets are refused unless `allow_pseudo_credible_sets`; then the
+    lead is the variant `cs_id` names when it passes the floor, else the max-pip one.
+
+    PRUNING: greedy by mlog10p, one `ld` neighbourhood scan per lead considered; a lead
+    with r2 >= `r2_prune` to a kept one is dropped, and one the panel lacks is dropped as
+    "LD unknown", never kept as independent. The kept leads' scans give the signed-r matrix;
+    a pair whose two scans disagree in sign or by more than 1e-6 raises GeneticsError.
+
+    PROXIES (when `outcome` {"phenotype", "resource"[, "data_type"]} or `outcome_lookup`
+    is given): a kept lead absent from the outcome is replaced by its highest-r2 neighbour
+    at r2 >= 0.8 that the outcome has, from the same scans, in one batched lookup; its beta
+    is sign(proxy_r) times the lead's, so the row is on the proxy's alt allele.
+
+    Injectables, each defaulting to the SDK function looked up at call time:
+    `ld(variant, *, window, r2_threshold, panel, fields)`, `annotation(variants=, source=)`,
+    `outcome_lookup(variants)` -> rows with a variant key, `sql(query, max_rows=)`,
+    `ld_panels()`. `exposure_dataset` is a `genetics.datasets()` row; looked up when absent.
+    """
+    if mode not in ("cis", "genome_wide"):
+        raise GeneticsUsageError(f"mode must be 'cis' or 'genome_wide', got {mode!r}")
+    counts: dict[str, int] = {}
+    ld = _Counted(ld or _sdk("ld"), counts, "ld")
+    annotation = _Counted(annotation or _sdk("variant_annotation"), counts, "annotation")
+    sql = _Counted(sql or _sdk("sql"), counts, "sql")
+    ld_panels = _Counted(ld_panels or _sdk("ld_panels"), counts, "ld_panels")
+    notes: list[str] = []
+    dropped: list[dict[str, Any]] = []
+    threshold = -math.log10(p_threshold)
+
+    if isinstance(exposure, dict):
+        spec = dict(exposure)
+        trait = spec.get("trait")
+        dataset, resource = spec.get("dataset"), spec.get("resource")
+        if not trait or not (dataset or resource):
+            raise GeneticsUsageError(
+                "an exposure dict needs 'trait' and 'dataset' and/or 'resource'")
+        frame = None
+    else:
+        frame = exposure
+        for column in ("trait", "dataset"):
+            if column in frame.columns and frame[column].n_unique() > 1:
+                raise GeneticsUsageError(
+                    f"instruments() takes one exposure: the frame has {frame[column].n_unique()} "
+                    f"values of `{column}`; filter it to one first")
+        trait = frame["trait"][0] if "trait" in frame.columns and frame.height else None
+        dataset = frame["dataset"][0] if "dataset" in frame.columns and frame.height else None
+        resource = frame["resource"][0] if "resource" in frame.columns and frame.height else None
+        if mode == "cis" and not trait:
+            raise GeneticsUsageError("cis mode needs the frame's `trait` column (the gene symbol)")
+
+    def settle() -> None:
+        pseudo = bool((exposure_dataset or {}).get("pseudo_credible_sets"))
+        if pseudo and not allow_pseudo_credible_sets:
+            raise GeneticsUsageError(
+                f"{dataset or resource} has pseudo credible sets (LD-clumped, not fine-mapped) "
+                "and is refused as an MR exposure: they emit satellite and singleton sets whose "
+                "leads sit tens of kb from the real signal (measured on deCODE against "
+                "UKB_PPP). Pass allow_pseudo_credible_sets=True to use the variant each cs_id "
+                "names instead")
+
+    def registry_row(name: str | None) -> dict[str, Any] | None:
+        datasets = _Counted(_sdk("datasets"), counts, "datasets")
+        return _dataset_row(datasets(include_stats=False), name, resource)
+
+    resolved = exposure_dataset is not None
+    if not resolved and frame is None and dataset:
+        # refused before any SQL: a dict names its dataset, so the registry row is final here
+        exposure_dataset = registry_row(dataset)
+        if exposure_dataset is None:
+            raise GeneticsUsageError(
+                f"dataset {dataset!r} is not in genetics.datasets(); a dict exposure names "
+                "the `dataset` value the results views hold (e.g. 'UKB_PPP')")
+        resolved = True
+    if resolved:
+        settle()
+
+    region = None
+    if mode == "cis":
+        genes = sql(
+            "SELECT symbol, chr, gene_start, gene_end FROM gene_annotations_v "
+            f"WHERE symbol = {_quote(trait)}", max_rows=100)
+        if genes.height != 1:
+            raise GeneticsUsageError(
+                f"cis mode reads the trait {trait!r} as an HGNC symbol and gene_annotations_v "
+                f"has {genes.height} rows for it; use mode='genome_wide' or a symbol trait")
+        g = genes.to_dicts()[0]
+        region = {"gene": trait, "chr": int(g["chr"]),
+                  "start": max(0, int(g["gene_start"]) - cis_window),
+                  "end": int(g["gene_end"]) + cis_window, "cis_window": cis_window}
+        notes.append(f"cis gene: the trait {trait} is read as its HGNC symbol (no "
+                     "trait_original or aptamer mapping)")
+
+    if frame is None:
+        where = [f"trait = {_quote(trait)}"]
+        where += [f"{c} = {_quote(spec[c])}" for c in ("dataset", "resource", "trait_original")
+                  if spec.get(c)]
+        if region:
+            # a literal chr prunes the partition, and joining gene_annotations_v in SQL
+            # instead would cost a scan of both
+            where += [f"chr = {region['chr']}",
+                      f"pos BETWEEN {region['start']} AND {region['end']}"]
+        # sql() raises rather than truncate at max_rows
+        frame = sql(f"SELECT {_CS_SQL_COLUMNS} FROM credible_sets_v WHERE "
+                    + " AND ".join(where), max_rows=_CS_MAX_ROWS)
+        fetched_only_window = region is not None
+    else:
+        fetched_only_window = False
+
+    labels = (sorted(frame["dataset"].drop_nulls().cast(pl.String).unique().to_list())
+              if "dataset" in frame.columns else [])
+    if len(labels) > 1:
+        raise GeneticsUsageError(
+            f"the credible-set rows of {trait} hold {len(labels)} datasets {labels}; "
+            "instruments() takes one exposure: name its `dataset`")
+    if labels:
+        dataset = labels[0]
+    if not resolved:
+        if dataset or resource:
+            exposure_dataset = registry_row(dataset)
+        if exposure_dataset is None:
+            notes.append(f"exposure {dataset or resource or '(unnamed)'} has no "
+                         "genetics.datasets() row: treated as non-Finnish and not pseudo for "
+                         "want of one")
+        settle()
+    pseudo = bool((exposure_dataset or {}).get("pseudo_credible_sets"))
+    if pseudo:
+        notes.append(f"{dataset} has pseudo credible sets: lead = the variant cs_id names when "
+                     f"it reaches MAF {maf_floor}, else the max-pip variant that does")
+    if exposure_dataset is not None and not exposure_dataset.get("cohorts"):
+        notes.append(f"{dataset} records no cohorts: treated as non-Finnish for the AF fallback")
+    finnish = _is_finnish(exposure_dataset)
+
+    rows = _normalise_sets(frame) if frame.height else _normalise_sets(
+        pl.DataFrame(schema={"variant": pl.String}))
+    n_outside = 0
+    if region:
+        inside = (pl.col("chr") == region["chr"]) & pl.col("pos").is_between(
+            region["start"], region["end"])
+        n_outside = rows.filter(~inside).height
+        rows = rows.filter(inside)
+        if n_outside:
+            notes.append(f"{n_outside} credible-set row(s) outside the cis window "
+                         f"chr{region['chr']}:{region['start']}-{region['end']} were left out")
+    rows = _with_maf(rows, annotation, finnish)
+
+    sets: dict[tuple, list[dict[str, Any]]] = {}
+    for r in rows.to_dicts():
+        sets.setdefault(tuple(r[c] for c in _SET_KEY), []).append(r)
+    candidates, n_floor, n_p, n_mhc = [], 0, 0, 0
+    for members in sets.values():
+        lead = _pick_lead(members, maf_floor, by_cs_id=pseudo)
+        cs_id = members[0]["cs_id"]
+        if lead is None:
+            n_floor += 1
+            dropped.append({"variant": None, "cs_id": cs_id,
+                            "reason": f"no variant with MAF >= {maf_floor:g}"})
+        elif (lead["mlog10p"] or 0) < threshold:
+            n_p += 1
+            dropped.append({"variant": lead["variant"], "cs_id": cs_id,
+                            "reason": f"lead p above {p_threshold:g}"})
+        elif exclude_mhc and _in_mhc(lead):
+            n_mhc += 1
+            dropped.append({"variant": lead["variant"], "cs_id": cs_id, "reason": "lead in MHC"})
+        else:
+            candidates.append(lead)
+
+    if not candidates:
+        where = (f"cis window chr{region['chr']}:{region['start']}-{region['end']} "
+                 f"({trait} ± {cis_window:,})" if region else "genome-wide")
+        if not sets:
+            if fetched_only_window:
+                reason = "no credible set fine-mapped within the window"
+            elif n_outside:
+                reason = f"its {n_outside} credible-set rows all lie outside it (trans sets only)"
+            else:
+                reason = "no credible-set rows"
+        else:
+            reason = (f"no credible set with a lead at MAF >= {maf_floor:g} and p <= "
+                      f"{p_threshold:g}{' outside the MHC' if exclude_mhc else ''} "
+                      f"({len(sets)} sets: {n_floor} below the MAF floor, {n_p} above the p "
+                      f"threshold, {n_mhc} in the MHC)")
+        raise GeneticsUsageError(f"no instrument for {trait} in {dataset}, {where}: {reason}")
+
+    candidates.sort(key=lambda m: (-(m["mlog10p"] or 0), -(m["pip"] or 0), m["variant"]))
+    seen: dict[str, dict] = {}
+    unique = []
+    for lead in candidates:
+        if lead["variant"] in seen:
+            dropped.append({"variant": lead["variant"], "cs_id": lead["cs_id"],
+                            "reason": f"same lead as set {seen[lead['variant']]['cs_id']}"})
+        else:
+            seen[lead["variant"]] = lead
+            unique.append(lead)
+
+    panel_info = _panel_info(ld_panels(), panel)
+    window = min(LD_SCAN_CAP, panel_info["max_distance"])
+    scan_r2 = panel_info["r2_floor"]
+    panel_info.update(window=window, scan_r2_threshold=scan_r2)
+    if r2_prune < scan_r2:
+        notes.append(f"r2_prune {r2_prune:g} is below the panel floor {scan_r2:g}: pairs "
+                     "between the two are not served and count as independent")
+
+    kept: list[dict] = []
+    scans: dict[str, dict[str, tuple[float, float]]] = {}
+    for lead in unique:
+        v = lead["variant"]
+        hit = _ld_hit(v, kept, scans, r2_prune)
+        if hit is None:
+            try:
+                scan = ld(v, window=window, r2_threshold=scan_r2, panel=panel,
+                          fields=["r", "r2"])
+            except GeneticsError as exc:
+                if exc.code != "ld_variant_not_in_panel":
+                    raise
+                # results-api's 404 also covers a swapped spelling and a variant with no
+                # partner above the floor; its text says which
+                dropped.append({"variant": v, "cs_id": lead["cs_id"],
+                                "reason": f"LD unknown: not in panel {panel}: {exc}"})
+                continue
+            scans[v] = {} if scan.is_empty() else {
+                k: (r, r2) for k, r, r2 in scan.select(
+                    _variant_key(scan), _num(scan, "r"), _num(scan, "r2")).iter_rows()
+                if k != v}
+            hit = _ld_reverse_hit(v, kept, scans, r2_prune)
+        if hit is not None:
+            dropped.append({"variant": v, "cs_id": lead["cs_id"],
+                            "reason": f"r2 {hit[1]:.3f} with stronger lead {hit[0]}"})
+            continue
+        kept.append(lead)
+
+    order = [k["variant"] for k in kept]
+    r_matrix, asym = _r_matrix(order, scans)
+    if asym:
+        notes.append(f"{asym} lead pair(s) differed between the two scan orderings by at most "
+                     "1e-6 or appeared in one only; the matrix uses their mean")
+
+    out = pl.DataFrame(kept, infer_schema_length=None).select(_LEAD_COLUMNS).with_columns(
+        pl.lit(False).alias("is_proxy"), pl.lit(None, pl.String).alias("proxy_for"),
+        pl.lit(None, pl.Float64).alias("proxy_r"), pl.lit(None, pl.Float64).alias("proxy_r2"),
+        pl.lit(None, pl.Boolean).alias("in_outcome"),
+        pl.lit(None, pl.Float64).alias("lead_beta"), pl.lit(None, pl.Float64).alias("lead_maf"),
+    )
+    if outcome_lookup is None and outcome is not None:
+        outcome_lookup = _default_outcome_lookup(outcome)
+    if outcome_lookup is not None:
+        out = _proxies(out, scans, _Counted(outcome_lookup, counts, "outcome_lookup"), notes)
+
+    counts["total"] = sum(counts.values())
+    return Instruments(
+        frame=out,
+        dropped=pl.DataFrame(dropped, schema={"variant": pl.String, "cs_id": pl.String,
+                                              "reason": pl.String}),
+        r=r_matrix,
+        panel=panel_info,
+        requests=counts,
+        notes=notes,
+        exposure_dataset=exposure_dataset,
+        cis_region=region,
+    )
+
+
+def _panel_info(panels: pl.DataFrame, panel: str) -> dict[str, Any]:
+    rows = [] if panels.is_empty() else panels.filter(pl.col("panel") == panel).to_dicts()
+    if not rows:
+        served = [] if panels.is_empty() else panels["panel"].to_list()
+        raise GeneticsUsageError(
+            f"instruments() needs signed r, which only an own panel serves; {panel!r} is not "
+            f"one of ld_panels() {served}")
+    row = rows[0]
+    return {"name": panel, "r2_floor": float(row["r2_floor"]),
+            "max_distance": int(row["max_distance"])}
+
+
+def _ld_hit(v: str, kept: list[dict], scans: dict, r2_prune: float) -> tuple | None:
+    """(kept lead, r2) for the first kept lead whose scan holds `v` at r2 >= r2_prune."""
+    for k in kept:
+        pair = scans[k["variant"]].get(v)
+        if pair and pair[1] is not None and pair[1] >= r2_prune:
+            return k["variant"], pair[1]
+    return None
+
+
+def _ld_reverse_hit(v: str, kept: list[dict], scans: dict, r2_prune: float) -> tuple | None:
+    for k in kept:
+        pair = scans[v].get(k["variant"])
+        if pair and pair[1] is not None and pair[1] >= r2_prune:
+            return k["variant"], pair[1]
+    return None
+
+
+def _r_matrix(order: list[str], scans: dict) -> tuple[pl.DataFrame, int]:
+    asym = 0
+    values = [[0.0] * len(order) for _ in order]
+    for i, a in enumerate(order):
+        values[i][i] = 1.0
+        for j in range(i + 1, len(order)):
+            b = order[j]
+            ab = (scans[a].get(b) or (None,))[0]
+            ba = (scans[b].get(a) or (None,))[0]
+            if ab is None and ba is None:
+                continue
+            if ab is not None and ba is not None and (ab * ba < 0 or abs(ab - ba) > 1e-6):
+                raise GeneticsError(
+                    f"the two LD scans disagree on r({a}, {b}): {ab} from {a}'s scan, {ba} "
+                    f"from {b}'s; the panel's r is not usable for this pair")
+            if ab is None or ba is None or ab != ba:
+                asym += 1
+            r = (ab if ba is None else ba if ab is None else (ab + ba) / 2)
+            values[i][j] = values[j][i] = r
+    frame = pl.DataFrame({"variant": order, **{v: [row[i] for row in values]
+                                               for i, v in enumerate(order)}},
+                         schema={"variant": pl.String, **{v: pl.Float64 for v in order}})
+    return frame, asym
+
+
+def _default_outcome_lookup(outcome: dict[str, Any]) -> Callable[[list[str]], pl.DataFrame]:
+    if not outcome.get("phenotype") or not outcome.get("resource"):
+        raise GeneticsUsageError("outcome needs 'phenotype' and 'resource'")
+
+    def lookup(variants: list[str]) -> pl.DataFrame:
+        import genetics_mcp_server.sdk as sdk
+
+        return sdk.summary_stats(phenotypes=[outcome["phenotype"]], variants=variants,
+                                 resource=outcome["resource"],
+                                 data_type=outcome.get("data_type", "gwas"))
+    return lookup
+
+
+def _proxies(out: pl.DataFrame, scans: dict, lookup: Callable[..., pl.DataFrame],
+             notes: list[str]) -> pl.DataFrame:
+    """Replace each lead the outcome lacks by its best r2 >= PROXY_R2 neighbour it has."""
+    leads = out["variant"].to_list()
+    options = {v: sorted(((k, r, r2) for k, (r, r2) in scans[v].items()
+                          if r2 is not None and r2 >= PROXY_R2),
+                         key=lambda o: (-o[2], o[0]))
+               for v in leads}
+    wanted = sorted(set(leads) | {k for opts in options.values() for k, _, _ in opts})
+    rows = lookup(wanted)
+    present: set[str] = set()
+    if rows is not None and not rows.is_empty():
+        if "beta" in rows.columns:
+            rows = rows.filter(_num(rows, "beta").is_not_null())
+        present = set(rows.select(_variant_key(rows)).to_series().to_list())
+
+    records = []
+    n_proxied = 0
+    for rec in out.to_dicts():
+        lead = rec["variant"]
+        if lead in present:
+            records.append({**rec, "in_outcome": True})
+            continue
+        best = next((o for o in options[lead] if o[0] in present), None)
+        if best is None:
+            records.append({**rec, "in_outcome": False})
+            continue
+        n_proxied += 1
+        c, p, ref, alt = best[0].split(":")
+        sign = 1.0 if best[1] > 0 else -1.0
+        records.append({**rec, "variant": best[0], "chr": int(c), "pos": int(p), "ref": ref,
+                        "alt": alt, "beta": None if rec["beta"] is None else sign * rec["beta"],
+                        "maf": None, "af_source": "proxy: no frequency",
+                        "lead_beta": rec["beta"], "lead_maf": rec["maf"], "is_proxy": True,
+                        "proxy_for": lead, "proxy_r": best[1], "proxy_r2": best[2],
+                        "in_outcome": True})
+    if n_proxied:
+        notes.append(
+            f"{n_proxied} lead(s) replaced by an outcome-present proxy at r2 >= {PROXY_R2:g}: "
+            "the row carries the proxy's own alleles and beta = sign(proxy_r) * the lead's "
+            "beta (applied here; the lead's is in lead_beta), so the outcome beta read at the "
+            "proxy aligns as is; maf is null, the scan carries no frequency")
+    return pl.DataFrame(records, schema=out.schema)

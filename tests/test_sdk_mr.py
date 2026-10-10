@@ -434,3 +434,355 @@ def test_checks_empty_frame_is_not_computable():
     got = _checks(h)
     assert got["instrument_strength"][0] == "not_computable"
     assert got["af_concordance"][0] == "not_computable"
+
+
+# --------------------------------------------------------------------------- instruments
+
+from genetics_mcp_server.sdk.errors import GeneticsError  # noqa: E402
+
+GENE = {"symbol": "PROT", "chr": 1, "gene_start": 1_000_000, "gene_end": 1_010_000}
+PANELS = pl.DataFrame({"panel": ["finngen_r12"], "fields": [["r", "r2"]], "r2_floor": [0.01],
+                       "max_distance": [3_000_000]})
+NON_FINNISH = {"dataset": "SETS", "cohorts": ["ukb"], "pseudo_credible_sets": False}
+PSEUDO = {"dataset": "SETS", "cohorts": ["iceland"], "pseudo_credible_sets": True}
+
+
+def cs(rows, trait="PROT", dataset="SETS"):
+    """credible_sets_v rows: (variant, cs_id, pip, mlog10p, maf)."""
+    return pl.DataFrame([
+        {"variant": v, "cs_id": c, "pip": p, "mlog10p": m, "maf": f, "beta": 0.1 * (i + 1),
+         "se": 0.01, "trait": trait, "trait_original": trait, "dataset": dataset,
+         "cell_type": None}
+        for i, (v, c, p, m, f) in enumerate(rows)
+    ], schema_overrides={"maf": pl.Float64, "cell_type": pl.String})
+
+
+class FakeLD:
+    """Symmetric pair table {(a, b): r}; variants outside `panel` raise not-in-panel."""
+
+    def __init__(self, pairs=None, panel=None, one_sided=None):
+        self.r = {}
+        for (a, b), r in (pairs or {}).items():
+            self.r[(a, b)] = self.r[(b, a)] = r
+        self.r.update(one_sided or {})
+        self.panel = panel
+        self.calls = []
+
+    def __call__(self, variant, *, window, r2_threshold, panel, fields):
+        self.calls.append((variant, window, r2_threshold, panel, tuple(fields)))
+        if self.panel is not None and variant not in self.panel:
+            exc = GeneticsError(f"{variant} not in panel")
+            exc.code = "ld_variant_not_in_panel"
+            raise exc
+        rows = [{"variant": b, "r": r, "r2": r * r} for (a, b), r in self.r.items()
+                if a == variant and r * r >= r2_threshold]
+        return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
+class FakeSQL:
+    def __init__(self, genes=(GENE,), sets=None):
+        self.genes, self.sets, self.queries = list(genes), sets, []
+
+    def __call__(self, query, *, max_rows):
+        self.queries.append(query)
+        if "gene_annotations_v" in query:
+            return pl.DataFrame(self.genes, schema={"symbol": pl.String, "chr": pl.Int64,
+                                                   "gene_start": pl.Int64, "gene_end": pl.Int64})
+        return self.sets
+
+
+def run_instruments(frame, *, ld=None, sql=None, dataset=NON_FINNISH, annotation=None, **kw):
+    return mr.instruments(
+        frame, exposure_dataset=dataset, ld=ld or FakeLD(), sql=sql or FakeSQL(),
+        annotation=annotation or FakeAnnotation(), ld_panels=lambda: PANELS, **kw)
+
+
+def kept(result):
+    return result.frame["variant"].to_list()
+
+
+def reasons(result):
+    return {(d["cs_id"], d["variant"]): d["reason"] for d in result.dropped.to_dicts()}
+
+
+def test_lead_is_max_pip_above_the_maf_floor_and_a_set_without_one_contributes_nothing():
+    frame = cs([
+        ("1:1000100:A:G", "a", 0.9, 20.0, 0.001),   # rare pip leader of set a
+        ("1:1000200:A:G", "a", 0.1, 15.0, 0.2),
+        ("1:1500000:C:T", "b", 1.0, 30.0, 0.005),   # set b has nothing at the floor
+    ])
+    result = run_instruments(frame)
+    assert kept(result) == ["1:1000200:A:G"]
+    assert result.frame["af_source"].to_list() == ["credible_set maf"]
+    assert reasons(result)[("b", None)] == "no variant with MAF >= 0.01"
+
+
+def test_null_maf_takes_the_annotation_af_finngen_first_then_gnomad_for_non_finnish():
+    frame = cs([("1:1000100:A:G", "a", 0.9, 20.0, None),
+                ("1:1600000:A:G", "b", 0.9, 25.0, None)])
+    ann = FakeAnnotation(finngen={"1:1000100:A:G": {"AF": 0.97}},
+                         gnomad={"1:1600000:A:G": {"AF_nfe": 0.3}})
+    result = run_instruments(frame, annotation=ann)
+    by = {r["variant"]: r for r in result.frame.to_dicts()}
+    assert by["1:1000100:A:G"]["maf"] == pytest.approx(0.03)
+    assert by["1:1000100:A:G"]["af_source"] == "finngen_annotation"
+    assert by["1:1600000:A:G"]["af_source"] == "gnomad_nfe"
+    assert [s for s, _ in ann.calls] == ["finngen", "gnomad"]
+
+
+def test_finnish_exposure_never_consults_gnomad_and_unknown_af_fails_the_floor():
+    frame = cs([("1:1000100:A:G", "a", 0.9, 20.0, None), ("1:1000300:A:G", "a", 0.1, 9.0, 0.4)])
+    ann = FakeAnnotation(gnomad={"1:1000100:A:G": {"AF_nfe": 0.3}})
+    result = run_instruments(frame, annotation=ann,
+                             dataset={"dataset": "SETS", "cohorts": ["finngen"]})
+    assert kept(result) == ["1:1000300:A:G"]
+    assert [s for s, _ in ann.calls] == ["finngen"]
+
+
+def test_pseudo_credible_sets_are_refused_by_default_naming_dataset_and_reason():
+    frame = cs([("1:1000100:A:G", "chr1_1000200_A_G", 0.9, 20.0, 0.2)])
+    with pytest.raises(GeneticsUsageError, match=r"SETS has pseudo credible sets.*tens of kb"):
+        run_instruments(frame, dataset=PSEUDO)
+
+
+def test_allow_pseudo_uses_the_cs_id_variant_when_it_passes_the_floor():
+    frame = cs([
+        ("1:1000100:A:G", "chr1_1000200_A_G", 0.9, 20.0, 0.2),
+        ("1:1000200:A:G", "chr1_1000200_A_G", 0.1, 19.0, 0.2),
+        ("1:1800100:A:G", "chr1_1800200_A_G", 0.9, 20.0, 0.2),
+        ("1:1800200:A:G", "chr1_1800200_A_G", 0.1, 19.0, 0.001),   # named, below the floor
+    ])
+    result = run_instruments(frame, dataset=PSEUDO, allow_pseudo_credible_sets=True)
+    assert sorted(kept(result)) == ["1:1000200:A:G", "1:1800100:A:G"]
+    assert any("pseudo credible sets" in n for n in result.notes)
+
+
+def test_d6_refuses_a_protein_with_trans_sets_only():
+    frame = cs([("7:5000000:A:G", "t", 0.9, 40.0, 0.3)])
+    with pytest.raises(GeneticsUsageError) as err:
+        run_instruments(frame)
+    text = str(err.value)
+    assert "PROT" in text and "chr1:0-2010000" in text and "trans sets only" in text
+
+
+def test_d6_refuses_when_no_cis_lead_passes_floor_and_threshold():
+    frame = cs([("1:1000100:A:G", "a", 0.9, 6.58, 0.3), ("1:1000500:A:G", "b", 0.9, 20.0, 0.001)])
+    with pytest.raises(GeneticsUsageError, match=r"no credible set with a lead at MAF >= 0.01 "
+                                                 r"and p <= 5e-08.*1 below the MAF floor, 1 above"):
+        run_instruments(frame)
+
+
+def test_cis_window_comes_from_the_gene_row_and_the_trait_is_its_symbol():
+    sql = FakeSQL(genes=[{"symbol": "PROT", "chr": 1, "gene_start": 5_000_000,
+                          "gene_end": 5_100_000}])
+    frame = cs([("1:3999999:A:G", "a", 0.9, 30.0, 0.3), ("1:4000000:A:G", "b", 0.9, 20.0, 0.3),
+                ("1:6100000:A:G", "c", 0.9, 20.0, 0.3), ("1:6100001:A:G", "d", 0.9, 50.0, 0.3)])
+    result = run_instruments(frame, sql=sql)
+    assert sorted(kept(result)) == ["1:4000000:A:G", "1:6100000:A:G"]
+    assert "symbol = 'PROT'" in sql.queries[0]
+    assert result.cis_region == {"gene": "PROT", "chr": 1, "start": 4_000_000,
+                                 "end": 6_100_000, "cis_window": 1_000_000}
+    assert any("HGNC symbol" in n for n in result.notes)
+
+
+def test_cis_refuses_a_trait_that_is_not_one_gene_row():
+    with pytest.raises(GeneticsUsageError, match="0 rows"):
+        run_instruments(cs([("1:1000100:A:G", "a", 0.9, 20.0, 0.3)]), sql=FakeSQL(genes=[]))
+
+
+def test_mhc_lead_is_excluded_unless_asked_and_genome_wide_skips_the_gene():
+    frame = cs([("6:30000000:A:G", "m", 0.9, 50.0, 0.3), ("2:100:A:G", "x", 0.9, 9.0, 0.3)])
+    sql = FakeSQL()
+    result = run_instruments(frame, mode="genome_wide", sql=sql)
+    assert kept(result) == ["2:100:A:G"]
+    assert reasons(result)[("m", "6:30000000:A:G")] == "lead in MHC"
+    assert sql.queries == []
+    both = run_instruments(frame, mode="genome_wide", exclude_mhc=False)
+    assert kept(both) == ["6:30000000:A:G", "2:100:A:G"]
+
+
+def test_greedy_pruning_keeps_the_stronger_of_a_correlated_pair_and_skips_its_scan():
+    a, b, c = "1:1000100:A:G", "1:1000200:A:G", "1:1300000:A:G"
+    frame = cs([(a, "a", 0.9, 30.0, 0.3), (b, "b", 0.9, 20.0, 0.3), (c, "c", 0.9, 10.0, 0.3)])
+    ld = FakeLD({(a, b): 0.5})
+    result = run_instruments(frame, ld=ld)
+    assert kept(result) == [a, c]
+    assert reasons(result)[("b", b)] == f"r2 0.250 with stronger lead {a}"
+    assert [call[0] for call in ld.calls] == [a, c]
+    assert ld.calls[0][1:] == (3_000_000, 0.01, "finngen_r12", ("r", "r2"))
+
+
+def test_a_lead_the_panel_lacks_is_listed_as_ld_unknown_never_kept():
+    a, b = "1:1000100:A:G", "1:1000200:A:G"
+    frame = cs([(a, "a", 0.9, 30.0, 0.3), (b, "b", 0.9, 20.0, 0.3)])
+    result = run_instruments(frame, ld=FakeLD(panel={a}))
+    assert kept(result) == [a]
+    assert reasons(result)[("b", b)] == f"LD unknown: not in panel finngen_r12: {b} not in panel"
+
+
+def test_other_ld_errors_propagate():
+    def broken(*_, **__):
+        raise GeneticsError("server down")
+    with pytest.raises(GeneticsError, match="server down"):
+        run_instruments(cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)]), ld=broken)
+
+
+def test_r_matrix_is_square_symmetric_signed_with_zeros_below_the_floor():
+    a, b, c = "1:1000100:A:G", "1:1000200:A:G", "1:1300000:A:G"
+    frame = cs([(a, "a", 0.9, 30.0, 0.3), (b, "b", 0.9, 20.0, 0.3), (c, "c", 0.9, 10.0, 0.3)])
+    result = run_instruments(frame, ld=FakeLD({(a, b): -0.2}), r2_prune=0.1)
+    r = result.r
+    assert r["variant"].to_list() == [a, b, c] == r.columns[1:]
+    m = r.drop("variant").to_numpy()
+    assert (m == m.T).all()
+    assert m.diagonal().tolist() == [1.0, 1.0, 1.0]
+    assert m[0, 1] == pytest.approx(-0.2) and m[0, 2] == 0.0 and m[1, 2] == 0.0
+    assert result.panel == {"name": "finngen_r12", "r2_floor": 0.01, "max_distance": 3_000_000,
+                            "window": 3_000_000, "scan_r2_threshold": 0.01}
+
+
+def test_r_matrix_averages_a_rounding_difference_or_a_one_sided_pair_and_says_so():
+    a, b, c = "1:1000100:A:G", "1:1000200:A:G", "1:1300000:A:G"
+    frame = cs([(a, "a", 0.9, 30.0, 0.3), (b, "b", 0.9, 20.0, 0.3), (c, "c", 0.9, 10.0, 0.3)])
+    ld = FakeLD(one_sided={(a, b): -0.2, (b, a): -0.2000005, (a, c): 0.3})
+    result = run_instruments(frame, ld=ld, r2_prune=0.5)
+    m = result.r.drop("variant").to_numpy()
+    assert m[0, 1] == m[1, 0] == pytest.approx(-0.20000025)
+    assert m[0, 2] == m[2, 0] == pytest.approx(0.3)
+    assert any("2 lead pair(s) differed" in n for n in result.notes)
+
+
+@pytest.mark.parametrize("ab, ba", [(-0.2, 0.2), (-0.2, -0.3)])
+def test_r_matrix_refuses_scans_that_disagree_in_sign_or_beyond_rounding(ab, ba):
+    a, b = "1:1000100:A:G", "1:1000200:A:G"
+    frame = cs([(a, "a", 0.9, 30.0, 0.3), (b, "b", 0.9, 20.0, 0.3)])
+    ld = FakeLD(one_sided={(a, b): ab, (b, a): ba})
+    with pytest.raises(GeneticsError, match=rf"r\({a}, {b}\): {ab} from .* {ba} from"):
+        run_instruments(frame, ld=ld, r2_prune=0.5)
+
+
+def test_proxy_is_the_best_r2_neighbour_the_outcome_has_with_its_sign_recorded():
+    a, b = "1:1000100:A:G", "1:1300000:A:G"
+    best_absent, proxy, weak = "1:1000150:C:T", "1:1000160:G:A", "1:1000170:G:C"
+    frame = cs([(a, "a", 0.9, 30.0, 0.3), (b, "b", 0.9, 20.0, 0.3)])
+    ld = FakeLD({(a, best_absent): 0.99, (a, proxy): -0.95, (a, weak): 0.9})
+    calls = []
+
+    def lookup(variants):
+        calls.append(list(variants))
+        have = [v for v in variants if v in (proxy, weak, b)]
+        return outcome([(v, 0.1, 0.02, 0.3) for v in have])
+
+    result = run_instruments(frame, ld=ld, outcome_lookup=lookup)
+    rows = {r["proxy_for"] or r["variant"]: r for r in result.frame.to_dicts()}
+    assert rows[a]["variant"] == proxy and rows[a]["is_proxy"]
+    assert rows[a]["proxy_r"] == pytest.approx(-0.95)
+    assert rows[a]["proxy_r2"] == pytest.approx(0.9025)
+    assert (rows[a]["chr"], rows[a]["pos"], rows[a]["ref"], rows[a]["alt"]) == (1, 1000160, "G", "A")
+    # r -0.95: the proxy's alt tags the lead's ref, so its beta flips and it has no maf
+    assert rows[a]["beta"] == pytest.approx(-0.1) and rows[a]["lead_beta"] == pytest.approx(0.1)
+    assert rows[a]["maf"] is None and rows[a]["af_source"] == "proxy: no frequency"
+    assert rows[a]["lead_maf"] == pytest.approx(0.3)
+    assert rows[b]["beta"] == pytest.approx(0.2) and rows[b]["lead_beta"] is None
+    assert rows[b]["is_proxy"] is False and rows[b]["in_outcome"] is True
+    assert len(calls) == 1 and set(calls[0]) == {a, b, best_absent, proxy, weak}
+    assert any("sign(proxy_r)" in n and "applied here" in n for n in result.notes)
+    assert result.requests["outcome_lookup"] == 1
+
+
+def test_lead_without_an_outcome_proxy_stays_marked_absent():
+    a = "1:1000100:A:G"
+    result = run_instruments(cs([(a, "a", 0.9, 30.0, 0.3)]), ld=FakeLD({(a, "1:1000150:C:T"): 0.7}),
+                             outcome_lookup=lambda variants: pl.DataFrame())
+    assert result.frame.to_dicts()[0]["in_outcome"] is False
+    assert result.frame["is_proxy"].to_list() == [False]
+
+
+def test_dict_exposure_fetches_partition_pruned_rows_and_counts_every_request():
+    a = "1:1000100:A:G"
+    sql = FakeSQL(sets=cs([(a, "a", 0.9, 30.0, None)]))
+    ann = FakeAnnotation(finngen={a: {"AF": 0.2}})
+    result = run_instruments({"dataset": "SETS", "resource": "res", "trait": "PROT"},
+                             sql=sql, annotation=ann)
+    assert kept(result) == [a]
+    fetch = sql.queries[1]
+    assert "FROM credible_sets_v" in fetch and "chr = 1" in fetch
+    assert "pos BETWEEN 0 AND 2010000" in fetch and "resource = 'res'" in fetch
+    assert result.requests == {"ld": 1, "annotation": 1, "sql": 2, "ld_panels": 1, "total": 5}
+
+
+def test_dict_exposure_with_no_cis_rows_is_refused_without_claiming_trans():
+    sql = FakeSQL(sets=cs([]).clear())
+    with pytest.raises(GeneticsUsageError, match="no credible set fine-mapped within the window"):
+        run_instruments({"dataset": "SETS", "trait": "PROT"}, sql=sql)
+
+
+def test_exposure_dataset_is_looked_up_when_not_given(monkeypatch):
+    import genetics_mcp_server.sdk as sdk
+
+    monkeypatch.setattr(sdk, "datasets", lambda **_: [
+        {"dataset": ["deCODE", "decode"], "resource": "decode", "pseudo_credible_sets": True}],
+        raising=False)
+    frame = cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)], dataset="deCODE")
+    with pytest.raises(GeneticsUsageError, match="deCODE has pseudo credible sets"):
+        mr.instruments(frame, ld=FakeLD(), sql=FakeSQL(), ld_panels=lambda: PANELS)
+
+
+def test_a_panel_without_signed_r_is_refused_and_one_exposure_per_call():
+    frame = cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)])
+    with pytest.raises(GeneticsUsageError, match="'sisu42' is not one of ld_panels"):
+        run_instruments(frame, panel="sisu42")
+    two = pl.concat([frame, cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)], trait="OTHER")])
+    with pytest.raises(GeneticsUsageError, match="2 values of `trait`"):
+        run_instruments(two)
+
+
+def test_dict_exposure_naming_an_unknown_dataset_is_refused(monkeypatch):
+    import genetics_mcp_server.sdk as sdk
+
+    monkeypatch.setattr(sdk, "datasets", lambda **_: [], raising=False)
+    with pytest.raises(GeneticsUsageError, match="'deCODE' is not in genetics.datasets"):
+        mr.instruments({"dataset": "deCODE", "trait": "PROT"}, ld=FakeLD(), sql=FakeSQL(),
+                       ld_panels=lambda: PANELS)
+
+
+@pytest.mark.parametrize("with_dataset_column", [True, False])
+def test_resource_only_dict_of_a_pseudo_dataset_is_refused(monkeypatch, with_dataset_column):
+    import genetics_mcp_server.sdk as sdk
+
+    monkeypatch.setattr(sdk, "datasets", lambda **_: [
+        {"dataset": ["deCODE", "decode"], "resource": "decode", "pseudo_credible_sets": True}],
+        raising=False)
+    sets = cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)], dataset="deCODE")
+    if not with_dataset_column:
+        sets = sets.drop("dataset")
+    with pytest.raises(GeneticsUsageError, match="(deCODE|decode) has pseudo credible sets"):
+        mr.instruments({"resource": "decode", "trait": "PROT"}, ld=FakeLD(),
+                       sql=FakeSQL(sets=sets), annotation=FakeAnnotation(),
+                       ld_panels=lambda: PANELS)
+
+
+def test_a_fetched_frame_holding_two_datasets_is_refused():
+    sets = pl.concat([cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)], dataset="FinnGen_R13_UKBB"),
+                      cs([("1:1000200:A:G", "b", 0.9, 30.0, 0.3)],
+                         dataset="FinnGen_R13_UKBB_labs")])
+    with pytest.raises(GeneticsUsageError, match="2 datasets"):
+        run_instruments({"resource": "finngen_ukbb", "trait": "PROT"}, sql=FakeSQL(sets=sets),
+                        dataset=None)
+
+
+def test_a_dataset_without_a_registry_row_is_noted_as_non_finnish_and_not_pseudo(monkeypatch):
+    import genetics_mcp_server.sdk as sdk
+
+    monkeypatch.setattr(sdk, "datasets", lambda **_: [], raising=False)
+    result = mr.instruments(cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3)]), ld=FakeLD(),
+                            sql=FakeSQL(), annotation=FakeAnnotation(), ld_panels=lambda: PANELS)
+    assert result.exposure_dataset is None
+    assert any("non-Finnish and not pseudo" in n for n in result.notes)
+
+
+def test_cis_mode_on_a_frame_notes_the_rows_outside_the_window():
+    frame = cs([("1:1000100:A:G", "a", 0.9, 30.0, 0.3), ("7:5000000:A:G", "t", 0.9, 40.0, 0.3)])
+    result = run_instruments(frame)
+    assert any("1 credible-set row(s) outside the cis window chr1:0-2010000" in n
+               for n in result.notes)
