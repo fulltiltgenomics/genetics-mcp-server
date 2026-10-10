@@ -65,6 +65,17 @@ asserts the three name the same protein on every row. Per block `<o>` in `ibd`, 
 `<o>_<s>_p` ("P-value"); then `<o>_fdr` ("FDR", which the sheet gives for Combined only). A
 protein marked `No` keeps its row with every MR field empty.
 
+**`zhang2025_data13_decode_mr.tsv`** — Zhang Supplementary Data 13, the replication with
+deCODE (SomaScan) cis-pQTLs. Like Data 9 the sheet has three side-by-side blocks, IBD / CD /
+UC, but each block lists its own proteins in its own order (274 / 146 / 63), so the blocks are
+stacked long: one row per `outcome` (`ibd`, `cd`, `uc`, from the block's header) and
+`protein` ("Proteins"). For each study `<s>` in `iibdgc`, `finngen`, `combined`: `<s>_or_ci`
+(the "OR(95%CI)" string verbatim), `<s>_or`, `<s>_ci_low`, `<s>_ci_high` (parsed out of it),
+and `<s>_p` ("P-value"). The sheet names no instrument SNP and has no FDR or observational
+column. The IBD block's trailing footnote is dropped; the script refuses a block with data
+after its first break or naming a protein twice. A protein with no IIBDGC estimate keeps its
+row with those fields empty.
+
 **`zhou2021_st2_somamer_a2.tsv`** — Zhou Supplementary Table 2, INTERVAL SOMAmer MR on very
 severe COVID-19 (A2). The sheet names no SNP; `n_snp` is the number of independent cis-SNPs
 in the test. Columns: somamer (SOMAmers), method (Method), n_snp (#SNP), beta (Beta), se

@@ -238,6 +238,41 @@ def zhang_data9(book):
     return write_tsv("zhang2025_data9_mr.tsv", header, body)
 
 
+def zhang_data13(book):
+    """Data 13, the deCODE replication: three side-by-side blocks like Data 9's, except that
+    each block lists its own proteins (IBD, CD and UC differ in length and in order), so the
+    blocks are read one at a time and stacked long, one row per outcome and protein."""
+    sheet = "Supplementary Data 13"
+    rows = rows_of(book, sheet)
+    h = find_row(rows, ("Proteins",), sheet=sheet)
+    studies = ("iibdgc", "finngen", "combined")
+    header = ["outcome", "protein"]
+    for study in studies:
+        header += [f"{study}_or_ci", f"{study}_or", f"{study}_ci_low", f"{study}_ci_high",
+                   f"{study}_p"]
+    body = []
+    for offset in (0, 8, 16):
+        outcome = rows[h][offset + 1]
+        if (rows[h][offset] != "Proteins" or outcome not in ("IBD", "CD", "UC")
+                or rows[h + 1][offset + 1:offset + 6:2] != ("IIBDGC", "FinnGen", "Combined")
+                or rows[h + 2][offset + 1:offset + 7] != ("OR(95%CI)", "P-value") * 3):
+            raise FixtureError(f"{sheet}: column block at offset {offset} is not laid out as inspected")
+        block = [row[offset:offset + 7] for row in rows[h + 3:]]
+        data = data_until_break(block, 0)
+        # past the break a block may hold its footnote and nothing else
+        if any(not is_empty(row) and any(row[1:]) for row in block[len(data):]):
+            raise FixtureError(f"{sheet}: the {outcome} block has data after its first break")
+        if len({row[0] for row in data}) != len(data):
+            raise FixtureError(f"{sheet}: the {outcome} block names a protein twice")
+        for row in data:
+            out = [outcome.lower(), row[0]]
+            for k in range(3):
+                text, p = row[1 + 2 * k], row[2 + 2 * k]
+                out += [text, *parse_or(text, f"{sheet} {row[0]} {outcome}"), p]
+            body.append(out)
+    return write_tsv("zhang2025_data13_decode_mr.tsv", header, body)
+
+
 def zhou_st2(book):
     sheet = "Supplementary Table 2"
     rows = rows_of(book, sheet)
@@ -306,7 +341,7 @@ def main():
     try:
         check_expat()
         zhang = open_workbook(root, ZHANG)
-        outputs = [zhang_data8(zhang), zhang_data9(zhang),
+        outputs = [zhang_data8(zhang), zhang_data9(zhang), zhang_data13(zhang),
                    zhou_st2(open_workbook(root, ZHOU))]
         zheng = open_workbook(root, ZHENG)
         outputs += [zheng_s1(zheng), zheng_s9(zheng)]
