@@ -6,6 +6,7 @@
     genetics.plots.upset(sets={"Crohn": cd_ids, "UC": uc_ids})
     genetics.plots.forest(frame, label="cohort", scale="log_ratio", pool="fixed")
     genetics.plots.volcano(frame, label="gene", significance="bonferroni")
+    genetics.plots.mr(res)
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
@@ -49,7 +50,7 @@ import polars as pl
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import LD_MAX_WINDOW
 
-__all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest", "volcano"]
+__all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest", "volcano", "mr"]
 
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
@@ -3669,4 +3670,361 @@ def volcano(
             }
             for i in [int(i) for i in order if up[i] or down[i]][:10]
         ],
+    }
+
+
+# -------------------------------------------------------------------------------------- mr
+
+# Fixed per method rather than per position, so one estimator reads the same in every figure
+# whatever else was fitted beside it: legend name, colour (Okabe–Ito, as on the line-models
+# figure) and dash. A method not listed here still draws, in _MR_OTHER.
+_MR_METHODS: dict[str, tuple[str, str, Any]] = {
+    "wald": ("Wald ratio", "#000000", "-"),
+    "ivw": ("IVW", "#0072B2", "-"),
+    "ivw_correlated": ("IVW (correlated)", "#56B4E9", "-"),
+    "egger": ("MR Egger", "#D55E00", "--"),
+    "weighted_median": ("Weighted median", "#009E73", "-."),
+    "simple_median": ("Simple median", "#009E73", ":"),
+    "weighted_mode": ("Weighted mode", "#CC79A7", "-."),
+    "simple_mode": ("Simple mode", "#CC79A7", ":"),
+}
+_MR_OTHER = ("#E69F00", (0, (5, 1, 1, 1)))
+_MR_PANELS = ("scatter", "forest", "leave_one_out")
+_MR_REQUIRED = ("variant", "beta_x", "se_x", "beta_y", "se_y")
+# inches: the scatter's plot area and its left, bottom and top margins; the figure is at
+# least wide enough for that plus the legend to its right
+_MR_SCATTER_IN = (2.6, 2.4)
+_MR_SCATTER_MARGIN_IN = (0.6, 0.32, 0.12)
+_MR_MIN_WIDTH_IN = 4.8
+_MR_NOTE_IN = 0.25
+_MR_GAP_IN = 0.12
+_MR_TITLE_IN = 0.22
+_MR_Z = statistics.NormalDist().inv_cdf(0.975)
+
+
+def _mr_part(result: Any, name: str) -> Any:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return result.get(name)
+    return getattr(result, name, None)
+
+
+def _mr_float(value: Any) -> float | None:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _mr_fits(estimates: dict[str, Any]) -> list[dict[str, Any]]:
+    """The estimates that can be drawn as a line: a dict with a finite `estimate`.
+
+    Anything else in the dict — a heterogeneity or Steiger result, a method that failed and
+    left an error — is not an estimate of the causal slope and is skipped.
+    """
+    fits = []
+    for method, est in estimates.items():
+        if not isinstance(est, dict):
+            continue
+        b = _mr_float(est.get("estimate"))
+        if b is None:
+            continue
+        se = _mr_float(est.get("se"))
+        lo, hi = _mr_float(est.get("ci_low")), _mr_float(est.get("ci_high"))
+        if (lo is None or hi is None) and se is not None:
+            lo, hi = b - _MR_Z * se, b + _MR_Z * se
+        name, colour, dash = _MR_METHODS.get(method, (str(method), *_MR_OTHER))
+        fits.append({
+            "method": method, "name": name, "colour": colour, "dash": dash, "estimate": b,
+            "se": se, "lower": lo, "upper": hi,
+            "intercept": _mr_float(est.get("intercept")),
+            "intercept_se": _mr_float(est.get("intercept_se")),
+        })
+    return fits
+
+
+def _mr_interval_rows(frame: pl.DataFrame, keep: set[str]) -> list[tuple[str, float | None, float | None, float | None]]:
+    """(variant, estimate, lower, upper) per row of a single-SNP or leave-one-out frame.
+
+    Those frames carry `se` and not the bounds (TwoSampleMR's shape), so the 95% interval is
+    rebuilt from it unless `ci_low`/`ci_high` are there.
+    """
+    rows = []
+    for row in frame.iter_rows(named=True):
+        variant = str(row.get("variant"))
+        if variant not in keep:
+            continue
+        b, se = _mr_float(row.get("estimate")), _mr_float(row.get("se"))
+        lo, hi = _mr_float(row.get("ci_low")), _mr_float(row.get("ci_high"))
+        if (lo is None or hi is None) and b is not None and se is not None:
+            lo, hi = b - _MR_Z * se, b + _MR_Z * se
+        rows.append((variant, b, lo, hi))
+    return rows
+
+
+def _mr_forest_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
+    return pl.DataFrame(rows, schema={
+        "label": pl.Utf8, "group": pl.Utf8, "estimate": pl.Float64, "lower": pl.Float64,
+        "upper": pl.Float64, "summary": pl.Boolean,
+    })
+
+
+def _mr_draw_scatter(ax, bx, sx, by, sy, proxy, fits) -> list[str]:
+    """beta_y on beta_x with 95% bars both ways and one line per fitted estimate.
+
+    Every instrument is turned to a positive beta_x first, beta_y flipped with it — the
+    orientation MR Egger regresses in, and the only one in which its intercept is a line on
+    this plot. A line through the origin is the same line in either orientation.
+    """
+    from matplotlib.lines import Line2D
+
+    sign = np.where(bx < 0, -1.0, 1.0)
+    x, y = np.abs(bx), by * sign
+    ax.axhline(0, color="#000000", linewidth=_AXIS_LINEWIDTH, zorder=1)
+    ax.axvline(0, color="#000000", linewidth=_AXIS_LINEWIDTH, zorder=1)
+    ax.errorbar(x, y, xerr=_MR_Z * sx, yerr=_MR_Z * sy, fmt="none", ecolor=_LINEMODEL_ERRORBAR,
+                elinewidth=0.5, zorder=2)
+    ax.scatter(x[~proxy], y[~proxy], s=12, color=_FOREST_INK, edgecolors="#FFFFFF",
+               linewidths=0.3, zorder=4, gid="mr-instruments")
+    if proxy.any():
+        ax.scatter(x[proxy], y[proxy], s=14, facecolors="#FFFFFF", edgecolors=_FOREST_INK,
+                   linewidths=0.7, zorder=4, gid="mr-proxies")
+    x_hi = float((x + _MR_Z * sx).max()) * 1.05 or 1.0
+    x_lo = min(0.0, float((x - _MR_Z * sx).min()))
+    xs = np.array([0.0, x_hi])
+    drawn = []
+    handles = []
+    for fit in fits:
+        intercept = fit["intercept"] or 0.0
+        label = f"{fit['name']}: {fit['estimate']:.3g}"
+        if fit["se"] is not None:
+            label += f" ({fit['se']:.3g})"
+        if fit["intercept"] is not None:
+            label += f"\n  intercept {fit['intercept']:.3g}"
+            if fit["intercept_se"] is not None:
+                label += f" ({fit['intercept_se']:.3g})"
+        ax.plot(xs, intercept + fit["estimate"] * xs, color=fit["colour"], linestyle=fit["dash"],
+                linewidth=1.0, zorder=3, gid=f"mr-fit:{fit['method']}")
+        handles.append(Line2D([0], [0], color=fit["colour"], linestyle=fit["dash"],
+                              linewidth=1.0, label=label))
+        drawn.append(fit["method"])
+    if proxy.any():
+        handles.append(Line2D([0], [0], marker="o", linestyle="none", markersize=3.5,
+                              markerfacecolor="#FFFFFF", markeredgecolor=_FOREST_INK,
+                              markeredgewidth=0.7, label="proxy (LD partner)"))
+    if handles:
+        ax.legend(handles=handles, fontsize=5, frameon=False, loc="upper left",
+                  bbox_to_anchor=(1.03, 1.0), borderaxespad=0, title="estimate (SE)",
+                  title_fontsize=5, alignment="left")
+    ax.set_xlim(x_lo - 0.02 * (x_hi - x_lo), x_hi)
+    ax.set_xlabel(r"effect on exposure $\beta_x$ (oriented positive)", fontsize=_LABEL_SIZE)
+    ax.set_ylabel(r"effect on outcome $\beta_y$", fontsize=_LABEL_SIZE)
+    ax.grid(True, linewidth=0.3, color="#DDDDDD", zorder=0)
+    _size(ax)
+    return drawn
+
+
+def mr(
+    result: Any = None,
+    *,
+    frame: Any = None,
+    estimates: dict[str, Any] | None = None,
+    sensitivity: dict[str, Any] | None = None,
+    path: str | None = None,
+    title: str | None = None,
+    panels: Any = _MR_PANELS,
+) -> dict[str, Any]:
+    """Mendelian randomization figure: scatter with fitted lines, Wald-ratio forest, leave-one-out.
+
+    `result` is what `genetics.mr.run` returned — anything with `harmonised` (its `.frame`
+    holds `variant`, `beta_x`, `se_x`, `beta_y`, `se_y`, and optionally `in_outcome`,
+    `is_proxy`, `rsid`), `estimates` (method -> dict with `estimate`, `se`, and `intercept`
+    for `egger`) and `sensitivity` (`leave_one_out` and `single_snp` frames). Or pass the three
+    as `frame=`, `estimates=` and `sensitivity=`, which also override the result's own. Rows
+    whose `in_outcome` is False are left out of every panel.
+
+    - `"scatter"` — beta_y on beta_x with 95% bars both ways, every instrument oriented to a
+      positive beta_x (beta_y flipped with it, MR Egger's orientation). One line per estimate
+      present: through the origin for IVW, median, mode and the rest, through its intercept
+      for MR Egger; the legend gives each estimate (SE). Proxies are hollow.
+    - `"forest"` — the per-instrument Wald ratios with 95% CI (the `single_snp` frame when
+      given, else beta_y/beta_x with first-order SE), then each pooled estimate as a diamond.
+    - `"leave_one_out"` — the IVW estimate with each instrument left out, the "All" row as a
+      diamond under a rule. Needs K >= 3; without the frame the figure says why it is absent.
+
+    The forests are `forest()`'s, on a linear scale: an estimate per unit of exposure, a log
+    odds ratio when the outcome is binary. One figure, so there is no `ax=`; draw a single
+    panel into your own axes with `forest()`. `panels=` picks and orders the panels.
+
+    Returns `path`, `panels` (those drawn), `n_instruments`, `n_excluded` (in_outcome False),
+    `n_proxies`, `lines` (methods drawn on the scatter), `forest` and `leave_one_out` (what
+    `forest()` returned for each, or None), `notes` and `size_in`. `path` may be relative, in
+    which case it is written inside the execution's artifacts directory; the default is
+    `mr.png` there.
+    """
+    import matplotlib.pyplot as plt
+
+    if isinstance(panels, str):
+        panels = (panels,)
+    panels = tuple(panels)
+    unknown = [p for p in panels if p not in _MR_PANELS]
+    if not panels or unknown or len(set(panels)) != len(panels):
+        raise GeneticsUsageError(f"panels is a non-empty selection from {_MR_PANELS}; got {panels!r}")
+
+    harmonised = frame if frame is not None else _mr_part(result, "harmonised")
+    if harmonised is not None and not isinstance(harmonised, pl.DataFrame):
+        harmonised = getattr(harmonised, "frame", harmonised)
+    if not isinstance(harmonised, pl.DataFrame):
+        raise GeneticsUsageError(
+            "plots.mr needs the harmonised instruments: a genetics.mr result, or frame= a polars "
+            f"DataFrame with columns {list(_MR_REQUIRED)}"
+        )
+    missing = [c for c in _MR_REQUIRED if c not in harmonised.columns]
+    if missing:
+        raise GeneticsUsageError(f"the instrument frame lacks {missing}; columns are {harmonised.columns}")
+    estimates = estimates if estimates is not None else (_mr_part(result, "estimates") or {})
+    sensitivity = sensitivity if sensitivity is not None else (_mr_part(result, "sensitivity") or {})
+    if not isinstance(estimates, dict) or not isinstance(sensitivity, dict):
+        raise GeneticsUsageError("estimates and sensitivity are dicts, as genetics.mr.run returns them")
+
+    data = harmonised
+    n_excluded = 0
+    if "in_outcome" in data.columns:
+        keep = data["in_outcome"].cast(pl.Boolean, strict=False).fill_null(True)
+        n_excluded = int((~keep).sum())
+        data = data.filter(keep)
+    numbers = {c: data[c].cast(pl.Float64, strict=False).to_numpy() for c in _MR_REQUIRED[1:]}
+    usable = np.all([np.isfinite(v) for v in numbers.values()], axis=0) if data.height else np.array([], bool)
+    data = data.filter(pl.Series(usable))
+    bx, sx, by, sy = (numbers[c][usable] for c in _MR_REQUIRED[1:])
+    if data.is_empty():
+        raise GeneticsUsageError("no instrument with finite effects is in the outcome — nothing to plot")
+    proxy = (
+        data["is_proxy"].cast(pl.Boolean, strict=False).fill_null(False).to_numpy()
+        if "is_proxy" in data.columns else np.zeros(data.height, bool)
+    )
+    variants = [str(v) for v in data["variant"].to_list()]
+    rsids = data["rsid"].to_list() if "rsid" in data.columns else [None] * data.height
+    label_of = {
+        v: (str(r) if r else v) + (" (proxy)" if p else "")
+        for v, r, p in zip(variants, rsids, proxy)
+    }
+    k = len(variants)
+    fits = _mr_fits(estimates)
+    notes: list[str] = []
+
+    blocks: list[tuple[str, Any]] = []
+    for panel in panels:
+        if panel == "scatter":
+            blocks.append(("scatter", None))
+        elif panel == "forest":
+            single = sensitivity.get("single_snp")
+            if isinstance(single, pl.DataFrame):
+                per = _mr_interval_rows(single, set(variants))
+            else:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio = by / bx
+                    se = sy / np.abs(bx)
+                ok = np.isfinite(ratio) & np.isfinite(se)
+                if not ok.all():
+                    notes.append(f"Wald ratio not drawn for {int((~ok).sum())} instrument(s) with beta_x = 0")
+                per = [(v, float(b), float(b - _MR_Z * s), float(b + _MR_Z * s))
+                       for v, b, s, good in zip(variants, ratio, se, ok) if good]
+            rows = [{"label": label_of[v], "group": "Wald ratio per instrument", "estimate": b,
+                     "lower": lo, "upper": hi, "summary": False} for v, b, lo, hi in per]
+            rows += [{"label": f["name"], "group": "Pooled estimates", "estimate": f["estimate"],
+                      "lower": f["lower"], "upper": f["upper"], "summary": True} for f in fits]
+            blocks.append(("forest", _mr_forest_frame(rows)))
+        else:
+            loo = sensitivity.get("leave_one_out")
+            if not isinstance(loo, pl.DataFrame) or loo.is_empty():
+                why = (f"it needs at least 3 instruments and there {'is' if k == 1 else 'are'} {k}"
+                       if k < 3 else "no leave_one_out frame was given")
+                notes.append(f"Leave-one-out not drawn: {why}")
+                blocks.append(("note", notes[-1]))
+                continue
+            per = _mr_interval_rows(loo, set(variants) | {"All"})
+            rows = [{"label": "All instruments" if v == "All" else label_of[v],
+                     "group": "IVW leaving out each instrument", "estimate": b, "lower": lo,
+                     "upper": hi, "summary": v == "All"} for v, b, lo, hi in per]
+            blocks.append(("leave_one_out", _mr_forest_frame(rows)))
+
+    forest_args = {"label": "label", "estimate": "estimate", "se": None, "lower": "lower",
+                   "upper": "upper", "group": "group", "summary": "summary", "pvalue": None,
+                   "sort_by": "estimate", "xlabel": "causal estimate (95% CI)"}
+
+    # forest() sizes itself from its text and expects an axis of that size, so each is
+    # measured on a scratch figure first; its canvas limits are the axis size in inches
+    sizes: list[tuple[float, float, float, float]] = []
+    for kind, payload in blocks:
+        if kind == "scatter":
+            left, bottom, top = _MR_SCATTER_MARGIN_IN
+            sizes.append((0.0, bottom + _MR_SCATTER_IN[1] + top, 0.0, 0.0))
+        elif kind == "note":
+            sizes.append((0.0, _MR_NOTE_IN, 0.0, 0.0))
+        else:
+            scratch = plt.figure()
+            canvas = scratch.add_axes((0, 0, 1, 1))
+            measured = forest(payload, ax=canvas, **forest_args)
+            sizes.append((*measured["size_in"], canvas.get_xlim()[1], canvas.get_ylim()[0]))
+            plt.close(scratch)
+    width = max([_MR_MIN_WIDTH_IN] + [s[0] for s in sizes])
+    if any(kind == "scatter" for kind, _ in blocks):
+        # the legend hangs outside the axes, so only a drawn copy says how far right it reaches
+        scratch = plt.figure(figsize=(width, 3))
+        left, margin_b, _ = _MR_SCATTER_MARGIN_IN
+        probe = scratch.add_axes((left / width, 0.1, _MR_SCATTER_IN[0] / width, 0.8))
+        _mr_draw_scatter(probe, bx, sx, by, sy, proxy, fits)
+        renderer, legend = _renderer(scratch), probe.get_legend()
+        if renderer is not None and legend is not None:
+            right_in = legend.get_window_extent(renderer).x1 / scratch.dpi
+            width = max(width, right_in + _MR_GAP_IN)
+        plt.close(scratch)
+    head = _MR_TITLE_IN if title else 0.0
+    height = head + sum(s[1] for s in sizes) + _MR_GAP_IN * (len(sizes) - 1) + 0.05
+
+    figure = plt.figure(figsize=(width, height))
+    if title:
+        figure.text(_MR_SCATTER_MARGIN_IN[0] / width, 1 - 0.04 / height, _plain(title, 120),
+                    ha="left", va="top", fontsize=_TITLE_SIZE)
+    top = height - head
+    lines: list[str] = []
+    drawn: list[str] = []
+    returned: dict[str, Any] = {"forest": None, "leave_one_out": None}
+    for (kind, payload), (_, box_h, canvas_w, canvas_h) in zip(blocks, sizes):
+        bottom = top - box_h
+        if kind == "scatter":
+            left, margin_b, _ = _MR_SCATTER_MARGIN_IN
+            ax = figure.add_axes((left / width, (bottom + margin_b) / height,
+                                  _MR_SCATTER_IN[0] / width, _MR_SCATTER_IN[1] / height))
+            lines = _mr_draw_scatter(ax, bx, sx, by, sy, proxy, fits)
+            drawn.append(kind)
+        elif kind == "note":
+            figure.text(_MR_SCATTER_MARGIN_IN[0] / width, (bottom + box_h / 2) / height, payload,
+                        ha="left", va="center", fontsize=_LABEL_SIZE, color=_FOREST_MUTED)
+        else:
+            # the axis sits at the top of its box; everything forest() reserves for its tick
+            # labels and axis label hangs below it
+            ax = figure.add_axes((_FOREST_SIDE_IN / width, (top - canvas_h) / height,
+                                  canvas_w / width, canvas_h / height))
+            returned[kind] = forest(payload, ax=ax, **forest_args)
+            drawn.append(kind)
+        top = bottom - _MR_GAP_IN
+
+    written = _resolve_path(path, "mr.png")
+    figure.savefig(written)
+    plt.close(figure)
+    return {
+        "path": written,
+        "panels": drawn,
+        "n_instruments": k,
+        "n_excluded": n_excluded,
+        "n_proxies": int(proxy.sum()),
+        "lines": lines,
+        "forest": returned["forest"],
+        "leave_one_out": returned["leave_one_out"],
+        "notes": notes,
+        "size_in": (width, height),
     }

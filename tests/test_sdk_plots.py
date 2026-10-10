@@ -11,6 +11,7 @@ asserts that no STYLE is baked in: scienceplots ships in the image but a script 
 
 import math
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -2909,3 +2910,237 @@ def test_an_empty_frame_is_refused_rather_than_drawn_as_an_empty_volcano():
         plots.volcano(burden_frame().head(0), significance=1e-6)
     with pytest.raises(GeneticsUsageError, match="polars DataFrame"):
         plots.volcano([{"beta": 1}], significance=1e-6)
+
+
+# ---------------------------------------------------------------------------------------- mr
+
+from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from genetics_mcp_server.sdk import _mr_estimators as mr_est  # noqa: E402
+
+_MR_FIXTURES = Path(__file__).parent / "fixtures" / "mr" / "r_reference"
+
+
+def mr_protein(protein):
+    return pl.read_csv(_MR_FIXTURES / "input_cis_ibd.csv").filter(pl.col("protein") == protein)
+
+
+def mr_synthetic():
+    return pl.read_csv(_MR_FIXTURES / "input_synthetic.csv")
+
+
+def mr_estimates(frame):
+    """Real estimator outputs; few bootstrap iterations, since only the points are drawn."""
+    return {
+        "ivw": mr_est.ivw(frame),
+        "egger": mr_est.egger(frame),
+        "weighted_median": mr_est.weighted_median(frame, iterations=50),
+        "weighted_mode": mr_est.weighted_mode(frame, iterations=50),
+        "heterogeneity": mr_est.heterogeneity(frame),
+    }
+
+
+def mr_result(frame):
+    return SimpleNamespace(
+        harmonised=SimpleNamespace(frame=frame),
+        estimates=mr_estimates(frame),
+        sensitivity={"leave_one_out": mr_est.leave_one_out(frame),
+                     "single_snp": mr_est.single_snp(frame)},
+    )
+
+
+@pytest.fixture
+def kept_figures(monkeypatch):
+    """The figures mr() would have closed, so the test can count what was drawn on them."""
+    import matplotlib.pyplot as plt
+
+    kept = []
+    real_close = plt.close
+    monkeypatch.setattr(plt, "close", lambda fig=None: kept.append(fig))
+    yield kept
+    for fig in kept:
+        real_close(fig)
+
+
+def fit_lines(figure):
+    return [
+        line.get_gid().split(":", 1)[1]
+        for ax in figure.axes for line in ax.get_lines()
+        if (line.get_gid() or "").startswith("mr-fit:")
+    ]
+
+
+def scatter_offsets(figure, gid):
+    return sum(
+        len(c.get_offsets()) for ax in figure.axes for c in ax.collections if c.get_gid() == gid
+    )
+
+
+def test_mr_draws_all_three_panels_from_real_estimates(tmp_path, kept_figures):
+    frame = mr_protein("IL12B")
+    result = plots.mr(mr_result(frame), path=str(tmp_path / "il12b.png"), title="IL12B -> IBD")
+
+    assert result["path"] == str(tmp_path / "il12b.png") and Path(result["path"]).stat().st_size
+    assert result["panels"] == ["scatter", "forest", "leave_one_out"]
+    assert result["n_instruments"] == 7 and result["n_excluded"] == 0 and result["notes"] == []
+    # heterogeneity carries no causal estimate, so it is no line and no pooled row
+    assert result["lines"] == ["ivw", "egger", "weighted_median", "weighted_mode"]
+    rows = result["forest"]["rows"]
+    assert rows[-4:] == ["IVW", "MR Egger", "Weighted median", "Weighted mode"]
+    assert set(rows[:-4]) == set(frame["rsid"].to_list())
+    assert result["leave_one_out"]["rows"][-1] == "All instruments"
+    assert len(result["leave_one_out"]["rows"]) == 8
+    assert scatter_offsets(kept_figures[-1], "mr-instruments") == 7
+
+
+def test_mr_scatter_orients_every_instrument_positive_beta_x(kept_figures, tmp_path):
+    frame = mr_synthetic()
+    assert (frame["beta_x"] < 0).sum() == 20
+    plots.mr(mr_result(frame), panels=["scatter"], path=str(tmp_path / "o.png"))
+    (offsets,) = [
+        c.get_offsets() for ax in kept_figures[-1].axes for c in ax.collections
+        if c.get_gid() == "mr-instruments"
+    ]
+    bx, by = frame["beta_x"].to_numpy(), frame["beta_y"].to_numpy()
+    assert np.allclose(offsets[:, 0], np.abs(bx)) and np.allclose(offsets[:, 1], by * np.sign(bx))
+
+
+def test_mr_scatter_legend_stays_inside_a_narrow_figure(kept_figures, tmp_path):
+    frame = mr_synthetic().head(4)
+    result = plots.mr(
+        frame=frame, estimates={"a_very_long_method_label_that_overruns_the_default_width": mr_est.ivw(frame)},
+        path=str(tmp_path / "narrow.png"),
+    )
+    figure = kept_figures[-1]
+    legend = next(ax.get_legend() for ax in figure.axes if ax.get_legend() is not None)
+    right = legend.get_window_extent(figure.canvas.get_renderer()).x1 / figure.dpi
+    assert result["size_in"][0] > 4.8
+    assert right <= result["size_in"][0] == figure.get_figwidth()
+
+
+def test_mr_egger_line_carries_its_intercept_and_the_others_pass_through_the_origin(kept_figures, tmp_path):
+    frame = mr_synthetic()
+    res = mr_result(frame)
+    plots.mr(res, path=str(tmp_path / "syn.png"))
+    lines = {
+        line.get_gid().split(":", 1)[1]: line
+        for ax in kept_figures[-1].axes for line in ax.get_lines()
+        if (line.get_gid() or "").startswith("mr-fit:")
+    }
+    assert lines["egger"].get_ydata()[0] == pytest.approx(res.estimates["egger"]["intercept"])
+    for method in ("ivw", "weighted_median", "weighted_mode"):
+        x, y = lines[method].get_data()
+        assert y[0] == 0 and y[1] == pytest.approx(res.estimates[method]["estimate"] * x[1])
+
+
+def test_each_fitted_estimate_is_drawn_exactly_once(kept_figures, tmp_path):
+    frame = mr_synthetic()
+    estimates = {
+        **mr_estimates(frame),
+        "simple_median": mr_est.simple_median(frame, iterations=50),
+        "simple_mode": mr_est.simple_mode(frame, iterations=50),
+        "ivw_correlated": {**mr_est.ivw(frame), "method": "ivw_correlated"},
+        "failed": {"error": "not computed"},
+    }
+    result = plots.mr(frame=frame, estimates=estimates, path=str(tmp_path / "all.png"))
+    drawn = fit_lines(kept_figures[-1])
+    expected = ["ivw", "egger", "weighted_median", "weighted_mode", "simple_median",
+                "simple_mode", "ivw_correlated"]
+    assert sorted(drawn) == sorted(expected)
+    assert result["lines"] == expected
+
+
+def test_two_instruments_draw_the_forest_from_wald_ratios_and_say_why_loo_is_absent(tmp_path, kept_figures):
+    frame = mr_protein("RSPO3")
+    assert frame.height == 2
+    result = plots.mr(frame=frame, estimates={"ivw": mr_est.ivw(frame)}, path=str(tmp_path / "k2.png"))
+    assert result["panels"] == ["scatter", "forest"]
+    assert result["leave_one_out"] is None
+    assert result["notes"] == ["Leave-one-out not drawn: it needs at least 3 instruments and there are 2"]
+    assert result["forest"]["rows"][-1] == "IVW"
+    assert result["forest"]["n_estimates"] == 3
+    assert fit_lines(kept_figures[-1]) == ["ivw"]
+
+
+def test_one_instrument_still_draws_and_says_there_is_one(tmp_path):
+    frame = mr_protein("IL12B").head(1)
+    result = plots.mr(frame=frame, estimates={"ivw": mr_est.ivw(frame)}, path=str(tmp_path / "k1.png"))
+    assert result["n_instruments"] == 1
+    assert result["notes"][0].endswith("there is 1")
+    assert result["panels"] == ["scatter", "forest"]
+
+
+def test_without_a_single_snp_frame_the_wald_ratios_are_computed_first_order(tmp_path, monkeypatch):
+    frame = mr_protein("CD6")
+    seen = []
+    real_forest = plots.forest
+    monkeypatch.setattr(plots, "forest", lambda data, **kw: seen.append(data) or real_forest(data, **kw))
+    result = plots.mr(frame=frame, panels=("forest",), path=str(tmp_path / "w.png"))
+    assert result["panels"] == ["forest"] and result["lines"] == []
+    wald = mr_est.wald(frame)
+    drawn = seen[-1]
+    assert drawn["label"].to_list() == frame["rsid"].to_list()
+    assert drawn["estimate"].to_list() == pytest.approx(wald["estimate"].to_list(), rel=1e-12)
+    assert drawn["lower"].to_list() == pytest.approx(wald["ci_low"].to_list(), rel=1e-9)
+    assert drawn["upper"].to_list() == pytest.approx(wald["ci_high"].to_list(), rel=1e-9)
+
+
+def test_rows_not_in_the_outcome_are_left_out_of_every_panel(tmp_path, kept_figures):
+    frame = mr_protein("IL12B")
+    dropped = frame["variant"][2]
+    flagged = frame.with_columns(in_outcome=pl.col("variant") != dropped)
+    kept = frame.filter(pl.col("variant") != dropped)
+    result = plots.mr(
+        frame=flagged, estimates=mr_estimates(kept),
+        sensitivity={"leave_one_out": mr_est.leave_one_out(frame), "single_snp": mr_est.single_snp(frame)},
+        path=str(tmp_path / "in.png"),
+    )
+    name = frame["rsid"][2]
+    assert result["n_excluded"] == 1 and result["n_instruments"] == 6
+    assert name not in result["forest"]["rows"]
+    assert name not in result["leave_one_out"]["rows"]
+    assert scatter_offsets(kept_figures[-1], "mr-instruments") == 6
+
+
+def test_proxies_are_hollow_on_the_scatter_and_named_in_the_forest(tmp_path, kept_figures):
+    frame = mr_protein("IL12B").with_columns(is_proxy=pl.Series([True, False, True, False, False, False, False]))
+    result = plots.mr(mr_result(frame), path=str(tmp_path / "proxy.png"))
+    figure = kept_figures[-1]
+    assert result["n_proxies"] == 2
+    assert scatter_offsets(figure, "mr-proxies") == 2
+    assert scatter_offsets(figure, "mr-instruments") == 5
+    legend_texts = [t.get_text() for ax in figure.axes if ax.get_legend() for t in ax.get_legend().get_texts()]
+    assert "proxy (LD partner)" in legend_texts
+    assert sum(r.endswith("(proxy)") for r in result["forest"]["rows"]) == 2
+
+
+def test_keyword_inputs_override_the_result(tmp_path):
+    frame = mr_protein("IL12B")
+    result = plots.mr(
+        mr_result(frame), estimates={"ivw": mr_est.ivw(frame)}, sensitivity={},
+        path=str(tmp_path / "kw.png"),
+    )
+    assert result["lines"] == ["ivw"]
+    assert result["leave_one_out"] is None
+    assert result["notes"] == ["Leave-one-out not drawn: no leave_one_out frame was given"]
+
+
+def test_mr_paths_resolve_into_the_artifacts_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    frame = mr_protein("CD6")
+    assert plots.mr(frame=frame)["path"] == str(tmp_path / "mr.png")
+    assert plots.mr(frame=frame, path="cd6.png")["path"] == str(tmp_path / "cd6.png")
+    assert (tmp_path / "mr.png").exists() and (tmp_path / "cd6.png").exists()
+
+
+def test_mr_refuses_what_it_cannot_draw():
+    frame = mr_protein("CD6")
+    with pytest.raises(GeneticsUsageError, match="panels"):
+        plots.mr(frame=frame, panels=("scatter", "funnel"))
+    with pytest.raises(GeneticsUsageError, match="lacks"):
+        plots.mr(frame=frame.drop("se_y"))
+    with pytest.raises(GeneticsUsageError, match="harmonised"):
+        plots.mr()
+    with pytest.raises(GeneticsUsageError, match="nothing to plot"):
+        plots.mr(frame=frame.with_columns(in_outcome=pl.lit(False)))
