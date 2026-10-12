@@ -440,7 +440,7 @@ class GeneticsClient:
                      gene tested in this trait and what came out" needs. Codes are
                      `trait_original` values (`search_phenotypes` / `phenotypes()` return
                      them), and a BRaVa ancestry stratum is its own code — 'AFib' is the
-                     cross-ancestry meta, 'AFib|EUR' the EUR stratum; results-api bounds how
+                     cross-ancestry meta, 'AFib|EUR' the EUR stratum; the server bounds how
                      many one call may name and answers 422 over it.
         phenotype  — every gene tested in one trait, unfiltered, from `resource`
                      (default 'finngen'). A Genebass trait is every gene x annotation and
@@ -919,7 +919,7 @@ class GeneticsClient:
         panel: str = "sisu42",
         fields: str | list[str] | None = None,
     ) -> pl.DataFrame:
-        """LD through results-api: the suite's own panels, or the FinnGen LD server proxied.
+        """LD from the suite's own panels, or from the FinnGen LD server proxied.
 
         With `other`, one row for that pair (`variant1`, `variant2`, `in_ld`, the statistics,
         `panel`); without it, one row per variant in LD above the threshold (`variant` and
