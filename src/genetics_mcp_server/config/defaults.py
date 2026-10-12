@@ -382,9 +382,9 @@ Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQ
 
 ### Pseudo Credible Sets
 
-Results from meta-analysis datasets whose `dataset_id` begins with `finngen_ukbb` or `finngen_mvp_ukbb` are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data."""),
+Results from datasets whose registry `pseudo_credible_sets` flag is true (`datasets_v.pseudo_credible_sets` in SQL) are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data."""),
     # continues the sentence above
-    _Block(" (`list_datasets` flags this in the description field.)"),
+    _Block(" (`list_datasets` shows the flag as `pseudo_credible_sets` and in the description field.)"),
     _Block("""
 
 Pseudo credible sets are approximate credible sets constructed from GWAS summary statistics and LD information, without formal statistical fine-mapping (like SuSiE or FINEMAP). Each set is built around a lead variant from a GWAS locus. **All pseudo credible sets are computed using the FinnGen LD reference panel**, regardless of the meta-analysis dataset they come from.

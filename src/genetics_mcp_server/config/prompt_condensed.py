@@ -264,8 +264,8 @@ Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQ
 
 ### Pseudo Credible Sets
 
-Datasets whose `dataset_id` begins with `finngen_ukbb` or `finngen_mvp_ukbb` return **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data."""),
-    _Block("""  (`list_datasets` flags this in the description field.)"""),
+Datasets whose `pseudo_credible_sets` flag is true (`datasets_v.pseudo_credible_sets` in SQL) return **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data."""),
+    _Block("""  (`list_datasets` shows the flag as `pseudo_credible_sets` and in the description field.)"""),
     _Block("""
 
 They are approximate sets built around a GWAS lead variant from summary statistics and LD, with no formal fine-mapping (SuSiE, FINEMAP), and **always computed with the FinnGen LD reference panel** whatever dataset they come from. A variant is a member if it is the lead itself, or r² > 0.95 to the lead (regardless of p-value), or r² > 0.6 to the lead with |lead_mlog10p − variant_mlog10p| < 3.0. Each member gets a pseudo PIP proportional to 10^mlog10p, normalized so the set sums to ~0.99 and floored at 0.01. A proximity filter suppresses redundant nearby loci; an HLA filter keeps only the top signal in chr6:25–34 Mb.

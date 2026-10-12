@@ -1430,3 +1430,24 @@ class TestRunAnalysisInputsRules:
         text = tool["description"]
         assert "inputs_delivered" in text
         assert "open_input" in text
+
+
+class TestPseudoCredibleSetCaveatIsKeyedOnTheRegistryFlag:
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_caveat_names_the_flag_and_no_resource_id(self, variant):
+        """A resource id in the caveat is a list a new resource silently misses; the
+        registry's `pseudo_credible_sets` flag reaches the model through list_datasets."""
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False), variant=variant)
+        assert "`pseudo_credible_sets` flag is true" in prompt
+        assert not re.search(r"finngen_(mvp_)?ukbb", prompt.split("### Pseudo Credible Sets")[1].split("###")[0])
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_the_duty_survives_a_surface_without_list_datasets(self, variant):
+        """The labelling duty is ungated: `code` reaches credible_sets_v through the SDK
+        and can surface pseudo sets with no list_datasets tool."""
+        tools = resolve(None, subagents=False) - {"list_datasets"}
+        prompt = default_system_prompt("FinnGenie", tool_names=tools, variant=variant)
+        assert "list_datasets" not in prompt.split("### Pseudo Credible Sets")[1].split("###")[0].split("(`")[0]
+        assert "### Pseudo Credible Sets" in prompt
+        assert "tell the user explicitly" in prompt
+        assert "`pseudo_credible_sets` flag is true" in prompt

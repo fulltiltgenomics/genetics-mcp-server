@@ -943,7 +943,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "category": "general",
         # the per-trait half of the catalogue; see list_datasets
         "sdk_replaceable": False,
-        "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes, author and date, and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them. For one named trait pass its code in `phenotypes`: a large resource is truncated by the row cap before an alphabetically late code.",
+        "description": "Get the harmonized per-trait metadata of one resource: every phenotype/study it serves with its trait name, sample sizes, author and date, and (for collections like eQTL Catalogue) the sub-studies. Use this after list_datasets when the question is about a resource's contents — which traits exist, how many, what a trait code means, or how large a study is. For a multi-cohort meta-analysis resource such as finngen_mvp_ukbb_aou each row also carries `contributing_cohorts` (the ancestry-split cohorts that went into that trait's result, e.g. fg, aou_eur, mvp_afr, ukbb_eur; it differs per trait, unlike the dataset-level `cohorts` of list_datasets), `cohort_families` (fg/aou/mvp/ukbb) and `n_by_cohort` ({cohort: {n_cases, n_controls}}; for a quantitative trait only n_cases is present and it is the whole sample size, not a case count). list_datasets gives dataset-level aggregates; this gives the per-trait rows behind them. For one named trait pass its code in `phenotypes`: a large resource is truncated by the row cap before an alphabetically late code.",
         "parameters": {
             "resource": {
                 "type": "string",
@@ -1700,7 +1700,7 @@ Do NOT use this as a discovery tool — use credible set tools or PheWAS for tha
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource — use list_datasets to find available resources. Common values: 'finngen', 'finngen_mvp_ukbb', 'finngen_ukbb', 'pgc'",
+                "description": "Data resource — use list_datasets to find available resources. Common values: 'finngen', 'finngen_mvp_ukbb_aou', 'finngen_mvp_ukbb', 'finngen_ukbb', 'pgc'",
                 "default": "finngen",
             },
             "data_type": {
@@ -1887,7 +1887,7 @@ Phenotypes are REQUIRED: summary stats are stored per phenotype, so there is no 
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource — use list_datasets to find available ones. Common: 'finngen', 'finngen_mvp_ukbb', 'finngen_ukbb'",
+                "description": "Data resource — use list_datasets to find available ones. Common: 'finngen', 'finngen_mvp_ukbb_aou', 'finngen_mvp_ukbb', 'finngen_ukbb'",
                 "default": "finngen",
             },
             "data_type": {
