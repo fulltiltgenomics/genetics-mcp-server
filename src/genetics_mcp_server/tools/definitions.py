@@ -1651,7 +1651,7 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
             },
             "window": {
                 "type": "integer",
-                "description": "Window size in base pairs around the variant (default 1500000)",
+                "description": "TOTAL span in base pairs, centred on the variant (default 1500000, i.e. ±750 kb): partners farther than window/2 away are not returned. Unlike the by-gene tools' `window`, this is not a per-side flank — to reach partners D bp away, pass at least 2×D.",
                 "default": 1500000,
             },
             "r2_threshold": {

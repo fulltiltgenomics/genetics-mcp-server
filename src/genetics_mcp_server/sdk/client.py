@@ -927,6 +927,11 @@ class GeneticsClient:
         (0.1 for a named pair, 0.6 for a neighbourhood scan); pass `r2_threshold=0` to get a
         pair whenever the panel holds it.
 
+        `window` (neighbourhood scan only, default 1_500_000) is the TOTAL span centred on
+        `variant`, not a per-side flank as in the by-gene calls: a partner farther than
+        window/2 away is silently absent, not "below threshold" and not cut by a row cap. To
+        build an LD matrix over a set of variants, pass at least twice their full span.
+
         WHICH STATISTICS COME BACK depends on the panel, and `ld_panels()` says which panels
         this deployment serves. The LD server's panels (`sisu42`, the default) carry `r2` and
         `d_prime`. `finngen_r12` — FinnGen R12 in-sample LD from the suite's own matrices, where
