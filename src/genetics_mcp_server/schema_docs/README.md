@@ -31,6 +31,7 @@ each shows the filters that view expects.
 | view | summary |
 | --- | --- |
 | `credible_sets_v` | Fine-mapped credible sets, variant PIPs |
+| `decode_pqtl_signals_v` | deCODE pQTL sets, one row each, strongest-lead-per-2 Mb flag |
 | `colocalization_v` | Colocalization between study pairs (coloc.susie) |
 | `coloc_credsets_v` | Variants inside colocalized credible sets |
 | `exome_variant_results_v` | Single-variant exome association results |
