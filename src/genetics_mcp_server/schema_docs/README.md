@@ -54,3 +54,8 @@ each shows the filters that view expects.
 | `peak_to_gene_v` | Peak-to-gene links (makes caQTL gene-based) |
 | `phenotypes_v` | Phenotype metadata behind trait codes |
 | `datasets_v` | Dataset registry: resource, version, caveats |
+| `cellxgene_summary_v` | Single-cell expression per cell type x tissue, pooled over CELLxGENE datasets |
+| `cellxgene_expression_v` | Single-cell expression per CELLxGENE dataset and cell group, 0 vs not measured |
+| `cellxgene_groups_v` | CELLxGENE cell groups: tissue x cell type x disease x assay per dataset |
+| `cellxgene_datasets_v` | CELLxGENE dataset versions in the loaded release, with citations |
+| `cellxgene_measured_genes_v` | Which genes each CELLxGENE dataset measured |
