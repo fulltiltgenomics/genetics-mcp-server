@@ -5,12 +5,14 @@
 
 CZ CELLxGENE Discover human single-cell expression, pooled across every dataset that
 measured the gene: one row per (gene, rolled-up cell type, tissue_general), normal tissue
-only (disease PATO:0000461, tissue_type 'tissue', no spatial assays). Rank cell types by the
+only (disease PATO:0000461, tissue_type 'tissue'; spatial assays are left out unless the
+release was built with summary_include_spatial, off by default). Rank cell types by the
 PRIMARY metrics mean_log1p_cp10k and frac_expressing. donor_pseudobulk_mean_cp10k is
-SECONDARY: linear-scale CP10k, NULL with fewer than 3 donors, and it does not rank anything.
-Rows below 50 cells or 3 donors are dropped, not shown as 0. Genes are GENCODE v49; chr uses
-X=23, Y=24, MT=26. Always filter on chr: it is the partition column, and a query without it
-scans the whole table. Per-dataset, per-disease detail is in cellxgene_expression_v.
+SECONDARY: linear-scale CP10k, NULL when fewer than the release's min_pseudobulk_donors
+(default 3) donors have a nonzero library, and it does not rank anything. Rows below 50
+cells or 3 donors are dropped, not shown as 0. Genes are GENCODE v49; chr uses X=23, Y=24,
+MT=26. Always filter on chr: it is the partition column, and a query without it scans the
+whole table. Per-dataset, per-disease detail is in cellxgene_expression_v.
 
 ## Scan pruning
 
@@ -35,7 +37,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `n_datasets` | `INT64` | Datasets that measured the gene and contribute cells |
 | `mean_log1p_cp10k` | `FLOAT64` | PRIMARY: cell-level mean of log1p(CP10k), zeros included |
 | `frac_expressing` | `FLOAT64` | PRIMARY: fraction of cells with nonzero counts |
-| `donor_pseudobulk_mean_cp10k` | `FLOAT64` | SECONDARY, does not rank: donor-pseudobulk mean CP10k (linear scale); NULL with fewer than 3 donors |
+| `donor_pseudobulk_mean_cp10k` | `FLOAT64` | SECONDARY, does not rank: donor-pseudobulk mean CP10k (linear scale); NULL when fewer than the release's min_pseudobulk_donors (default 3) donors have a nonzero library |
 | `donor_pseudobulk_n_donors` | `INT64` | SECONDARY: donors behind donor_pseudobulk_mean_cp10k |
 | `tau` | `FLOAT64` | Tissue-specificity index (0 = ubiquitous, 1 = one cell type) over the gene's cell-type profile; the same on every row of the gene |
 
