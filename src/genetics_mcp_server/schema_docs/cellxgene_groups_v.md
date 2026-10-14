@@ -50,10 +50,10 @@ which cell types, tissues and diseases the data covers.
 
 Queries that run against cellxgene_groups_v as written.
 
-### Cells and donors per disease for one rolled-up cell type
+### Cells per disease for one rolled-up cell type; donor_groups_summed adds n_donors over groups, so a donor in several groups counts once per group
 
 ```sql
-SELECT disease, SUM(n_cells) AS cells, SUM(n_donors) AS donors,
+SELECT disease, SUM(n_cells) AS cells, SUM(n_donors) AS donor_groups_summed,
        COUNT(DISTINCT dataset_id) AS datasets
 FROM cellxgene_groups_v WHERE cell_type_rollup = 'T cell' GROUP BY disease ORDER BY cells DESC
 ```
