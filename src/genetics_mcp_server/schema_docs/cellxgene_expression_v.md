@@ -8,10 +8,12 @@ type x disease x assay), every disease, tissue_type and assay, with the native a
 labels. DENSE over measured genes: a gene the dataset measured but never detected in a group
 has a row with mean_log1p_cp10k = 0 and frac_expressing = 0; a dataset that did NOT measure
 the gene has no row at all — absence means not measured, never 0. Groups below 50 cells or 3
-donors are left out. PRIMARY metrics: mean_log1p_cp10k and frac_expressing;
-donor_pseudobulk_mean_cp10k is SECONDARY (linear scale, NULL when fewer than the release's
-min_pseudobulk_donors (default 3) donors have a nonzero library, does not rank). Genes are
-GENCODE v49; chr uses X=23, Y=24, MT=26. Always filter on chr.
+donors (release defaults; the view applies each release's min_cells/min_donors) are left
+out. PRIMARY metrics: mean_log1p_cp10k and frac_expressing; donor_pseudobulk_mean_cp10k is
+SECONDARY (linear scale, does not rank) and is NULL on every zero-filled row (measured, not
+detected), and otherwise when fewer than the release's min_pseudobulk_donors (default 3)
+donors have a nonzero library. Genes are GENCODE v49; chr uses X=23, Y=24, MT=26. Always
+filter on chr.
 
 ## Scan pruning
 
@@ -47,7 +49,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `n_donors` | `INT64` | Donors in the group |
 | `mean_log1p_cp10k` | `FLOAT64` | PRIMARY: cell-level mean of log1p(CP10k), zeros included; 0 = measured, not detected |
 | `frac_expressing` | `FLOAT64` | PRIMARY: fraction of the group's cells with nonzero counts |
-| `donor_pseudobulk_mean_cp10k` | `FLOAT64` | SECONDARY, does not rank: donor-pseudobulk mean CP10k (linear scale); NULL when fewer than the release's min_pseudobulk_donors (default 3) donors have a nonzero library |
+| `donor_pseudobulk_mean_cp10k` | `FLOAT64` | SECONDARY, does not rank: donor-pseudobulk mean CP10k (linear scale); NULL on a zero-filled row (measured, not detected), and otherwise when fewer than the release's min_pseudobulk_donors (default 3) donors have a nonzero library |
 | `dataset_key` | `INT64` | Release-local key into cellxgene_datasets_v; do not compare across releases |
 | `group_key` | `INT64` | Release-local key into cellxgene_groups_v; do not compare across releases |
 
