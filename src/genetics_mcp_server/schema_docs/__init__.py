@@ -18,7 +18,12 @@ the prompt no longer *instructs* a read, because the answer is already above it.
 """
 
 import functools
+import json
+import logging
 import os
+import re
+
+logger = logging.getLogger(__name__)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 # the generator writes exactly one file per view plus this index; README is rendered
@@ -27,18 +32,70 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 _INDEX = "README.md"
 
 
-def view_names() -> list[str]:
-    """The views documented here, derived from the directory rather than listed."""
+_AVAILABILITY = "_availability.json"
+# deliberately not `PROFILE`: DEFAULT_TOOL_PROFILE is an unrelated tool-set selector
+_PROFILE_ENV = "CONFIG_PROFILE"
+
+
+def _profile() -> str | None:
+    return os.environ.get(_PROFILE_ENV) or None
+
+
+@functools.lru_cache(maxsize=None)
+def _hidden_views(profile: str | None) -> frozenset[str]:
+    """Gated views the deployment `profile` may not see.
+
+    Mirrors `filter_schema_docs` in genetics-results-suite's `scripts/gen-sandbox-docs.py`.
+    Fails closed on the profile: unset or unknown hides every gated view and logs an
+    ERROR (once per distinct value, via the cache), so a misconfigured pod loses a view
+    rather than advertising one its data backend lacks. A missing or unparseable json
+    raises instead of meaning "no gating": images are built from git clones, so a json
+    left out of a commit would otherwise advertise every gated view on every profile.
+    Ungated views are never affected by the profile.
+    """
+    try:
+        with open(os.path.join(_DIR, _AVAILABILITY)) as fh:
+            availability = json.load(fh)
+        availability["profiles"], availability["views"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"schema_docs/{_AVAILABILITY} is missing or malformed ({exc!r}); it is generated "
+            "by genetics-results-suite scripts/gen-sandbox-docs.py and must be committed"
+        ) from exc
+    known = profile in availability["profiles"]
+    gated = availability["views"]
+    if not known and gated:
+        logger.error(
+            "%s=%r is not one of %s; hiding gated schema views %s",
+            _PROFILE_ENV, profile, availability["profiles"], sorted(gated),
+        )
+    return frozenset(v for v, allowed in gated.items() if not known or profile not in allowed)
+
+
+def _visible(hidden: frozenset[str]) -> list[str]:
     return sorted(
-        f[:-3] for f in os.listdir(_DIR) if f.endswith(".md") and f != _INDEX
+        f[:-3] for f in os.listdir(_DIR)
+        if f.endswith(".md") and f != _INDEX and f[:-3] not in hidden
     )
 
 
-@functools.lru_cache(maxsize=1)
-def schema_reference() -> str:
-    """Every view's documentation as ONE prompt section.
+def view_names() -> list[str]:
+    """The views documented here and visible to this deployment's profile."""
+    return _visible(_hidden_views(_profile()))
 
-    Headings are demoted one level on the way in. As files each view's doc is its own
+
+def schema_reference() -> str:
+    """Every visible view's documentation as ONE prompt section.
+
+    Built once per distinct `CONFIG_PROFILE`; an env that never changes in-process (the
+    deployed case) therefore costs one build, as before.
+    """
+    return _reference(_profile())
+
+
+@functools.lru_cache(maxsize=None)
+def _reference(profile: str | None) -> str:
+    """Headings are demoted one level on the way in. As files each view's doc is its own
     document and starts at `#`; concatenated into a prompt whose own sections are `##`,
     seventeen `#` headings would read as seventeen top-level sections competing with
     "Response Style" and "Prohibited" rather than as one reference under one of them.
@@ -48,12 +105,26 @@ def schema_reference() -> str:
     Cached: the bytes are fixed at build time, and `default_system_prompt` is called per
     request.
     """
+    hidden = _hidden_views(profile)
     # the index's own title becomes a near-duplicate of the prompt section heading above
     # it ("BigQuery views" under "BigQuery view reference"), so it is dropped and its
     # body — the cross-view rules and the view list — sits directly under that heading
-    parts = [_strip_title(_demote(_read(_INDEX)))]
-    parts += [_demote(_read(f"{name}.md")) for name in view_names()]
+    parts = [_strip_title(_demote(_drop_rows(_read(_INDEX), hidden)))]
+    parts += [_demote(_read(f"{name}.md")) for name in _visible(hidden)]
     return "\n\n".join(parts)
+
+
+def _drop_rows(text: str, hidden: frozenset[str]) -> str:
+    """Remove each hidden view's index row (`| `<view>` | ...`).
+
+    The shape is the generator's; its test asserts no surviving file names a hidden view,
+    which is what catches the index mentioning one in any other form.
+    """
+    rows = [re.compile(rf"^\| `{re.escape(v)}` \|") for v in hidden]
+    return "".join(
+        line for line in text.splitlines(keepends=True)
+        if not any(row.match(line) for row in rows)
+    )
 
 
 def _strip_title(text: str) -> str:
