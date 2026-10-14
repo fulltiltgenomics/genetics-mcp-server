@@ -47,6 +47,7 @@ Clustered on `dataset`, `trait_original`: an equality on these cuts the bytes bi
 | `publication_date` | `DATE` | Publication date; NULL rather than invented when the source gives only a year |
 | `version` | `STRING` | Dataset version label (R14, R12, 26.06, ...) |
 | `coloc_partner_only` | `BOOL` | TRUE for traits whose dataset exists only as a colocalization partner (FinnGen R12 core and R12 Kanta). They appear in colocalization_v but not credible_sets_v; add `AND NOT coloc_partner_only` to mirror what phenotype search returns |
+| `contributing_cohorts` | `ARRAY<STRING>` | Per-phenotype ancestry-split cohorts that contributed to the meta-analysis, e.g. fg, aou_eur, ukbb_eur, mvp_afr. Populated only for the R14 meta-analysis (resource finngen_mvp_ukbb_aou) and empty for every other dataset, multi-cohort ones included. Not the dataset-level `cohorts` field. Test membership with `'mvp_afr' IN UNNEST(contributing_cohorts)` |
 
 ## Columns with a small, enumerable set of values
 
@@ -88,6 +89,14 @@ SELECT trait_original, trait_name, n_cases, n_controls FROM phenotypes_v WHERE d
   AND category LIKE 'IX Diseases of the circulatory system%'
   AND n_cases >= 5000
 ORDER BY n_cases DESC
+```
+
+### R14 meta-analysis phenotypes that include an MVP cohort
+
+```sql
+SELECT trait_original, trait_name, n_samples, contributing_cohorts FROM phenotypes_v WHERE resource = 'finngen_mvp_ukbb_aou'
+  AND EXISTS (SELECT 1 FROM UNNEST(contributing_cohorts) c WHERE c LIKE 'mvp%')
+ORDER BY n_samples DESC LIMIT 100
 ```
 
 ### Name both sides of a colocalization (note the _original columns)
