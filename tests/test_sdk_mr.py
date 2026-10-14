@@ -562,16 +562,16 @@ def test_pseudo_credible_sets_are_refused_by_default_naming_dataset_and_reason()
         run_instruments(frame, dataset=PSEUDO)
 
 
-def test_allow_pseudo_uses_the_cs_id_variant_when_it_passes_the_floor():
+def test_pseudo_credible_sets_are_always_refused_and_no_flag_is_offered():
     frame = cs([
         ("1:1000100:A:G", "chr1_1000200_A_G", 0.9, 20.0, 0.2),
         ("1:1000200:A:G", "chr1_1000200_A_G", 0.1, 19.0, 0.2),
-        ("1:1800100:A:G", "chr1_1800200_A_G", 0.9, 20.0, 0.2),
-        ("1:1800200:A:G", "chr1_1800200_A_G", 0.1, 19.0, 0.001),   # named, below the floor
     ])
-    result = run_instruments(frame, dataset=PSEUDO, allow_pseudo_credible_sets=True)
-    assert sorted(kept(result)) == ["1:1000200:A:G", "1:1800100:A:G"]
-    assert any("pseudo credible sets" in n for n in result.notes)
+    with pytest.raises(GeneticsUsageError, match="pseudo credible sets") as err:
+        run_instruments(frame, dataset=PSEUDO)
+    assert "allow_pseudo" not in str(err.value) and "=True" not in str(err.value)
+    with pytest.raises(TypeError):
+        run_instruments(frame, dataset=PSEUDO, allow_pseudo_credible_sets=True)
 
 
 def test_d6_refuses_a_protein_with_trans_sets_only():
@@ -1171,6 +1171,38 @@ def test_budget_refusals_name_the_estimate_and_the_cap(monkeypatch):
     monkeypatch.setattr(mr, "REQUEST_CAP", 8)
     with pytest.raises(GeneticsUsageError, match=r"needs about 9 requests .* 8-request cap"):
         mr_run(three_leads())
+
+
+def _never(*a, **k):
+    pytest.fail("a fetch ran before the outcome-count refusal")
+
+
+def test_a_screen_over_the_outcome_cap_is_refused_before_any_fetch(monkeypatch):
+    monkeypatch.setattr(mr, "OUTCOME_CAP", 5)
+    with pytest.raises(GeneticsUsageError, match=r"6 outcomes exceed the 5-outcome cap.*split"):
+        mr.run({"dataset": "SETS", "trait": "PROT"},
+               outcomes=[("finngen", f"P{i}") for i in range(6)], ld=_never, sql=_never,
+               ld_panels=_never, datasets=_never, phenotypes=_never, summary_stats=_never)
+
+
+def test_a_generator_of_outcomes_over_the_cap_gets_the_usage_refusal(monkeypatch):
+    monkeypatch.setattr(mr, "OUTCOME_CAP", 5)
+    with pytest.raises(GeneticsUsageError, match=r"6 outcomes exceed the 5-outcome cap"):
+        mr.run({"dataset": "SETS", "trait": "PROT"},
+               outcomes=(("finngen", f"P{i}") for i in range(6)), ld=_never, sql=_never,
+               ld_panels=_never, datasets=_never, phenotypes=_never, summary_stats=_never)
+
+
+def test_a_screen_at_the_outcome_cap_passes_that_check(monkeypatch):
+    monkeypatch.setattr(mr, "OUTCOME_CAP", 5)
+    monkeypatch.setattr(mr, "REQUEST_CAP", 1)
+    # the request-cap refusal comes after the outcome-count check, so reaching it proves
+    # exactly OUTCOME_CAP outcomes got past
+    with pytest.raises(GeneticsUsageError, match="request cap|-request cap") as err:
+        mr.run({"dataset": "SETS", "trait": "PROT"},
+               outcomes=[("finngen", f"P{i}") for i in range(5)], ld=_never, sql=_never,
+               ld_panels=_never, datasets=_never, phenotypes=_never, summary_stats=_never)
+    assert "outcome cap" not in str(err.value)
 
 
 def test_coloc_rows_are_attached_for_a_partner_outcome_in_one_query():

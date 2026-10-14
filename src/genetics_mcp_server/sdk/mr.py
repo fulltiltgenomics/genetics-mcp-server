@@ -62,7 +62,7 @@ below `r2_prune` with each other, so a scan at that threshold could only ever re
 identity r matrix. At instruments()' default `r2_prune` (equal to finngen_r12's floor of
 0.01) the matrix is the identity anyway; it carries information only with a looser prune,
 which is why run()'s cis default is 0.1. Pseudo credible sets
-are refused as exposures by default: their satellite and singleton sets put leads tens of kb
+are refused as exposures: their satellite and singleton sets put leads tens of kb
 from the real signal (deCODE against UKB_PPP, 2026-10-10).
 
 RUN. `run()` is instruments() -> one batched summary_stats per chunk of outcomes (leads and
@@ -96,7 +96,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
@@ -602,7 +601,6 @@ LD_SCAN_CAP = 3_000_000
 PROXY_R2 = 0.8
 # results-api refuses a larger variant_annotation batch with a 422
 _ANNOTATION_BATCH = 2000
-_CS_ID_VARIANT = re.compile(r"^chr([0-9XY]+)_([0-9]+)_([A-Za-z]+)_([A-Za-z]+)$")
 _SET_KEY = ("dataset", "trait", "trait_original", "cell_type", "cs_id")
 _LEAD_COLUMNS = [
     "variant", "chr", "pos", "ref", "alt", "beta", "se", "pip", "cs_id", "mlog10p", "maf",
@@ -736,15 +734,8 @@ def _with_maf(rows: pl.DataFrame, annotation: AnnotationFn, finnish: bool) -> pl
     ).drop("_af", "_src")
 
 
-def _pick_lead(members: list[dict[str, Any]], floor: float, by_cs_id: bool) -> dict | None:
+def _pick_lead(members: list[dict[str, Any]], floor: float) -> dict | None:
     eligible = [m for m in members if m["maf"] is not None and m["maf"] >= floor]
-    if by_cs_id:
-        named = _CS_ID_VARIANT.match(members[0]["cs_id"] or "")
-        if named:
-            wanted = ":".join(named.groups()).upper().replace("X:", "23:", 1)
-            hit = next((m for m in eligible if m["variant"].upper() == wanted), None)
-            if hit:
-                return hit
     eligible.sort(key=lambda m: (-(m["pip"] or 0), -(m["mlog10p"] or 0), m["variant"]))
     return eligible[0] if eligible else None
 
@@ -763,7 +754,6 @@ def instruments(
     r2_prune: float = 0.01,
     exclude_mhc: bool = True,
     panel: str = "finngen_r12",
-    allow_pseudo_credible_sets: bool = False,
     exposure_dataset: dict[str, Any] | None = None,
     outcome: dict[str, Any] | None = None,
     ld: Callable[..., pl.DataFrame] | None = None,
@@ -797,8 +787,10 @@ def instruments(
     dataset are refused, and a dataset with no registry row is treated as non-Finnish and not
     pseudo, with a note.
 
-    Pseudo-credible-set datasets are refused unless `allow_pseudo_credible_sets`; then the
-    lead is the variant `cs_id` names when it passes the floor, else the max-pip one.
+    Pseudo-credible-set datasets are always refused: the pseudo-set pipeline emits many
+    satellite and singleton sets per signal whose leads sit 12-65 kb from the real one, so
+    the max-pip lead rule picks a satellite set's variant, and the deCODE replication did
+    not reproduce (r 0.29 against Zhang's Data 13).
 
     PRUNING: greedy by mlog10p, one `ld` neighbourhood scan per lead considered; a lead
     with r2 >= `r2_prune` to a kept one is dropped, and one the panel lacks is dropped as
@@ -849,13 +841,13 @@ def instruments(
 
     def settle() -> None:
         pseudo = bool((exposure_dataset or {}).get("pseudo_credible_sets"))
-        if pseudo and not allow_pseudo_credible_sets:
+        if pseudo:
             raise GeneticsUsageError(
                 f"{dataset or resource} has pseudo credible sets (LD-clumped, not fine-mapped) "
                 "and is refused as an MR exposure: they emit satellite and singleton sets whose "
                 "leads sit tens of kb from the real signal (measured on deCODE against "
-                "UKB_PPP). Pass allow_pseudo_credible_sets=True to use the variant each cs_id "
-                "names instead")
+                "UKB_PPP), and an MR on them did not reproduce the published estimates. Use a "
+                "fine-mapped dataset as the exposure")
 
     def registry_row(name: str | None) -> dict[str, Any] | None:
         datasets = _Counted(_sdk("datasets"), counts, "datasets")
@@ -926,10 +918,6 @@ def instruments(
                          "genetics.datasets() row: treated as non-Finnish and not pseudo for "
                          "want of one")
         settle()
-    pseudo = bool((exposure_dataset or {}).get("pseudo_credible_sets"))
-    if pseudo:
-        notes.append(f"{dataset} has pseudo credible sets: lead = the variant cs_id names when "
-                     f"it reaches MAF {maf_floor}, else the max-pip variant that does")
     if exposure_dataset is not None and not exposure_dataset.get("cohorts"):
         notes.append(f"{dataset} records no cohorts: treated as non-Finnish for the AF fallback")
     finnish = _is_finnish(exposure_dataset)
@@ -952,7 +940,7 @@ def instruments(
         sets.setdefault(tuple(r[c] for c in _SET_KEY), []).append(r)
     candidates, n_floor, n_p, n_mhc = [], 0, 0, 0
     for members in sets.values():
-        lead = _pick_lead(members, maf_floor, by_cs_id=pseudo)
+        lead = _pick_lead(members, maf_floor)
         cs_id = members[0]["cs_id"]
         if lead is None:
             n_floor += 1
@@ -1192,6 +1180,12 @@ REQUEST_CAP = 1000
 MAX_IN_FLIGHT = 4
 # phenotypes per summary_stats call when fanning out over many outcomes
 OUTCOME_CHUNK = 10
+# the wall clock, not REQUEST_CAP, bounds a screen: chunking keeps the full FinnGen R14 screen
+# near 270 requests. Measured on daly-staging (PCSK9 UKB_PPP, 5 cis instruments, 120 s wall
+# clock): 60 outcomes took 15.2 s, 400 took 94.3 s, all 2,716 timed out, and the per-outcome
+# cost grew from 0.14 s to 0.23 s between those points. Wrong once instruments per outcome
+# grow, results-api slows, or the execution wall clock changes
+OUTCOME_CAP = 250
 _R2_PRUNE = {"cis": 0.1, "genome_wide": 0.01}
 _INJECTABLES = frozenset({"ld", "annotation", "sql", "ld_panels", "datasets", "summary_stats",
                           "phenotypes", "exposure_dataset"})
@@ -1474,7 +1468,6 @@ def run(
     p_threshold: float = 5e-8,
     maf_floor: float = 0.01,
     panel: str = "finngen_r12",
-    allow_pseudo_credible_sets: bool = False,
     attach_coloc: bool = True,
     max_in_flight: int = MAX_IN_FLIGHT,
     **injectables: Any,
@@ -1497,14 +1490,16 @@ def run(
 
     REFUSED: the same dataset and trait on both sides; an outcome dataset without summary
     statistics; an outcome where no instrument (lead or r2 >= 0.8 proxy) is found; more
-    than `MAX_IN_FLIGHT` in flight; and a batch whose estimated requests exceed
+    than `MAX_IN_FLIGHT` in flight; a batch whose estimated requests exceed
     `REQUEST_CAP` (1,000 requests per execution: instrument selection + phenotypes + summary_stats chunks + coloc, the
-    annotation lookups for rows without a frequency not included). instruments() adds the
+    annotation lookups for rows without a frequency not included); and `outcomes` longer
+    than `OUTCOME_CAP` (250, refused before any fetch: the execution's wall clock, not the
+    request cap, bounds a screen, so split it across executions). instruments() adds the
     no-cis-set (D6) and pseudo-credible-set refusals. In a batch, an outcome that fails is
     listed in `.failed` with the reason instead of stopping the others.
 
     Injectables (each defaults to the SDK function): ld, annotation, sql, ld_panels,
-    datasets, phenotypes, colocalization, summary_stats (sync or async, called with
+    datasets, phenotypes, summary_stats (sync or async, called with
     phenotypes=, variants=, resource=, data_type=), and exposure_dataset (a datasets() row).
     """
     unknown = set(injectables) - _INJECTABLES
@@ -1522,6 +1517,14 @@ def run(
             f"max_in_flight must be 1-{MAX_IN_FLIGHT}: the server refuses a 5th concurrent "
             "request rather than queueing it")
     batch = outcomes is not None
+    if batch:
+        # a generator has no len(); list() iterates exactly as the spec comprehension did
+        outcomes = list(outcomes)
+    if batch and len(outcomes) > OUTCOME_CAP:
+        raise GeneticsUsageError(
+            f"{len(outcomes):,} outcomes exceed the {OUTCOME_CAP}-outcome cap of one execution "
+            "(400 outcomes measured at 94 s of the 120 s wall clock, the full FinnGen screen "
+            "timed out); split the outcomes across executions")
     specs = [_outcome_spec(o) for o in (outcomes if batch else [outcome])]
     if not specs:
         raise GeneticsUsageError("`outcomes` is empty")
@@ -1600,7 +1603,6 @@ def run(
         inst = _select_instruments(
             exposure, mode=mode, cis_window=cis_window, p_threshold=p_threshold,
             maf_floor=maf_floor, r2_prune=r2_prune, panel=panel,
-            allow_pseudo_credible_sets=allow_pseudo_credible_sets,
             exposure_dataset=exposure_dataset, ld=ld, annotation=annotation,
             sql=injectables.get("sql"), ld_panels=injectables.get("ld_panels"))
         exposure_dataset = inst.exposure_dataset or exposure_dataset
@@ -1671,7 +1673,6 @@ def run(
     if given is not None:
         selection = dict.fromkeys(selection, "not used (instruments given)")
     parameters = {"mode": mode, **selection,
-                  "allow_pseudo_credible_sets": allow_pseudo_credible_sets,
                   "af_tolerance": AF_TOLERANCE, "proxy_r2": PROXY_R2,
                   "attach_coloc": attach_coloc, "max_in_flight": max_in_flight,
                   "outcome_chunk": OUTCOME_CHUNK}
