@@ -47,6 +47,7 @@ _GENETICS_API_TOOLS = frozenset({
     "analyze_variant_list",
     "get_asm_qtl_by_gene",
     "get_asm_qtl_by_variant",
+    "get_cell_type_expression",
     "get_colocalization",
     "get_colocalization_by_credible_set",
     "get_credible_set_by_id",

@@ -31,7 +31,7 @@ be installed into a sandbox image on its own.
 
 AN EMPTY RESULT MAY HAVE NO COLUMNS (genetics-results-suite-6uk). The functions backed by
 results-api rather than BigQuery — exome, gene_burden, hla(phenotype=...), summary_stats,
-ld, ld_panels, search, expression, gene_disease, lookup_phenotype_names, resource_metadata — return a bare
+ld, ld_panels, search, expression, cell_type_expression, gene_disease, lookup_phenotype_names, resource_metadata — return a bare
 `[]` with no schema when nothing matches, so the DataFrame comes back 0x0 and `df.filter(pl.col("beta")
 > 0)` raises ColumnNotFoundError instead of yielding an empty frame. Check `df.is_empty()`
 (or `df.height == 0`) before naming a column, rather than assuming the shape of an empty
@@ -96,6 +96,7 @@ _FUNCTIONS = (
     "variant_annotation",
     "gene_annotations",
     "expression",
+    "cell_type_expression",
     "gene_disease",
     "summary_stats",
     "ld",
