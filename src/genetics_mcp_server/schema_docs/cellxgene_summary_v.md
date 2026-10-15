@@ -7,7 +7,8 @@ CZ CELLxGENE Discover human single-cell expression, pooled across every dataset 
 measured the gene: one row per (gene, rolled-up cell type, tissue_general), normal tissue
 only (disease PATO:0000461, tissue_type 'tissue', cell type 'unknown' left out; spatial
 assays are left out unless the release was built with summary_include_spatial, off by
-default). Rank cell types by the PRIMARY metrics mean_log1p_cp10k and frac_expressing.
+default), and broad lineage labels such as 'leukocyte' or 'epithelial cell' left out. Rank
+cell types by the PRIMARY metrics mean_log1p_cp10k and frac_expressing.
 donor_pseudobulk_mean_cp10k is SECONDARY: linear-scale CP10k, NULL when fewer than the
 release's min_pseudobulk_donors (default 3) donors have a nonzero library, and it does not
 rank anything. Rows below 50 cells or 3 donors (release defaults; the view applies each
