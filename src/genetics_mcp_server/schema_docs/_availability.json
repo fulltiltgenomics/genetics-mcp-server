@@ -3,5 +3,21 @@
     "daly",
     "finngen"
   ],
-  "views": {}
+  "views": {
+    "cellxgene_datasets_v": [
+      "daly"
+    ],
+    "cellxgene_expression_v": [
+      "daly"
+    ],
+    "cellxgene_groups_v": [
+      "daly"
+    ],
+    "cellxgene_measured_genes_v": [
+      "daly"
+    ],
+    "cellxgene_summary_v": [
+      "daly"
+    ]
+  }
 }
