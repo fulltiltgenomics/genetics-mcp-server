@@ -52,6 +52,7 @@ _ADVERTISING_PATHS = (
     "/v1/exome_results_by_variant/",
     "/v1/exome_results_by_region/",
     "/v1/exome_results_by_phenotype/",
+    "/v1/cell_type_expression/",
     "/v1/expression_by_gene/",
     "/v1/gene_based_results_by_phenotype/",
     "/v1/gene_disease/",
@@ -128,6 +129,7 @@ async def test_the_original_defect_no_hit_phenotype_then_filter():
         ("peak_to_gene", {"peak": "chr5:35874000-35875000"}),
         ("variant_annotation", {"variant": "5:35874575:T:C"}),
         ("expression", {}),
+        ("cell_type_expression", {}),
         ("summary_stats", {"phenotypes": ["K11_COELIAC"], "variants": ["5:35874575:T:C"]}),
     ],
 )
@@ -137,7 +139,7 @@ async def test_every_wired_results_api_branch_keeps_its_schema_when_empty(call, 
     Through `_api_client`, so a branch whose endpoint does not advertise fails here.
     """
     client = _api_client([])
-    args = ("IL7R",) if call == "expression" else ()
+    args = ("IL7R",) if call in ("expression", "cell_type_expression") else ()
     frame = await getattr(client, call)(*args, **kwargs)
     assert frame.columns == ["phenotype", "mlog10p"], call
     assert frame.height == 0, call

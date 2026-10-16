@@ -75,7 +75,8 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 
 | Tool | Description |
 |------|-------------|
-| `get_gene_expression` | Get tissue-specific gene expression levels |
+| `get_gene_expression` | Get tissue-specific gene expression levels (bulk, e.g. GTEx) |
+| `get_cell_type_expression` | Single-cell expression by cell type from human CZ CELLxGENE Discover datasets with raw integer counts on supported assays, primary cells only, `level` summary or dataset; log1p CP10K. Strips an Ensembl version before calling. Offered only where `CONFIG_PROFILE` is in `CELL_TYPE_EXPRESSION_PROFILES` (`daly`) via `Settings.disabled_tools`; results-api's 404 "not configured" and 503 (no release loaded yet) come back as `error_code` `not_available` / `release_not_loaded`. SDK: `genetics.cell_type_expression()` |
 | `get_gene_disease_associations` | Get Mendelian disease relationships from GenCC curation submissions and the Monarch Initiative KG |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
 | `get_exome_results_by_variant` | Exome results for one specific variant across exome resources — the rare-variant counterpart to `get_credible_sets_by_variant` |

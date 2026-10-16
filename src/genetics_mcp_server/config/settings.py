@@ -12,6 +12,10 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# the profiles whose results-api configures a cell-type expression release; elsewhere the
+# endpoint answers 404 "not configured", so advertising the tool would only invite failures
+CELL_TYPE_EXPRESSION_PROFILES = frozenset({"daly"})
+
 
 @dataclass
 class Settings:
@@ -505,6 +509,13 @@ class Settings:
             return []
         return [u.strip().lower() for u in self.admin_users.split(",") if u.strip()]
 
+    # the deployment's data profile (genetics-results-suite configs/datasets.yaml), the same
+    # env var schema_docs gates views on. Tools whose data only some profiles serve are
+    # withdrawn by `disabled_tools` everywhere else, failing closed when it is unset.
+    config_profile: str | None = field(
+        default_factory=lambda: os.environ.get("CONFIG_PROFILE") or None
+    )
+
     # subagent settings
     enable_subagents: bool = field(
         default_factory=lambda: os.environ.get(
@@ -545,6 +556,8 @@ class Settings:
             # because default_system_prompt is assembled from the resolved tool names.
             disabled.add("get_alphagenome_variant_predictions")
             disabled.add("compare_alphagenome_with_measured")
+        if self.config_profile not in CELL_TYPE_EXPRESSION_PROFILES:
+            disabled.add("get_cell_type_expression")
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a
             # sandbox rather than broken by it, and neither is a tool the prompt prefers

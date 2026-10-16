@@ -3,6 +3,7 @@
     "deployed_flags_set": {
       "ALPHAGENOME_API_KEY": "configured",
       "ALPHAGENOME_ENABLED": "true",
+      "CONFIG_PROFILE": "daly",
       "ENABLE_SUBAGENTS": "false",
       "SANDBOX_ENABLED": "true"
     },
@@ -17,13 +18,14 @@
     "profiles": {
       "api": {
         "local": {
-          "count": 68,
+          "count": 69,
           "tools": [
             "analyze_variant_list",
             "compare_alphagenome_with_measured",
             "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
+            "get_cell_type_expression",
             "get_colocalization",
             "get_colocalization_by_credible_set",
             "get_credible_set_by_id",
@@ -92,13 +94,14 @@
       },
       "bigquery": {
         "local": {
-          "count": 68,
+          "count": 69,
           "tools": [
             "analyze_variant_list",
             "compare_alphagenome_with_measured",
             "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
+            "get_cell_type_expression",
             "get_colocalization",
             "get_colocalization_by_credible_set",
             "get_credible_set_by_id",
@@ -196,13 +199,14 @@
       },
       "nocode": {
         "local": {
-          "count": 68,
+          "count": 69,
           "tools": [
             "analyze_variant_list",
             "compare_alphagenome_with_measured",
             "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
+            "get_cell_type_expression",
             "get_colocalization",
             "get_colocalization_by_credible_set",
             "get_credible_set_by_id",
@@ -271,13 +275,14 @@
       },
       "null": {
         "local": {
-          "count": 68,
+          "count": 69,
           "tools": [
             "analyze_variant_list",
             "compare_alphagenome_with_measured",
             "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
+            "get_cell_type_expression",
             "get_colocalization",
             "get_colocalization_by_credible_set",
             "get_credible_set_by_id",
@@ -346,13 +351,14 @@
       },
       "rag": {
         "local": {
-          "count": 68,
+          "count": 69,
           "tools": [
             "analyze_variant_list",
             "compare_alphagenome_with_measured",
             "get_alphagenome_variant_predictions",
             "get_asm_qtl_by_gene",
             "get_asm_qtl_by_variant",
+            "get_cell_type_expression",
             "get_colocalization",
             "get_colocalization_by_credible_set",
             "get_credible_set_by_id",
@@ -428,11 +434,12 @@
   "local_tool_definitions": {
     "by_category": {
       "api": {
-        "count": 45,
+        "count": 46,
         "tools": [
           "analyze_variant_list",
           "get_asm_qtl_by_gene",
           "get_asm_qtl_by_variant",
+          "get_cell_type_expression",
           "get_colocalization",
           "get_colocalization_by_credible_set",
           "get_credible_set_by_id",
@@ -521,10 +528,11 @@
         ]
       }
     },
-    "count": 73
+    "count": 74
   },
   "mcp_server": {
     "deployed_flags_set": {
+      "CONFIG_PROFILE": "daly",
       "ENABLE_SUBAGENTS": "false"
     },
     "deployed_flags_unset": [
@@ -553,11 +561,12 @@
       "web_search"
     ],
     "registered_tools": {
-      "count": 55,
+      "count": 56,
       "tools": [
         "analyze_variant_list",
         "get_asm_qtl_by_gene",
         "get_asm_qtl_by_variant",
+        "get_cell_type_expression",
         "get_colocalization",
         "get_colocalization_by_credible_set",
         "get_credible_set_by_id",

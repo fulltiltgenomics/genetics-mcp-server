@@ -470,6 +470,17 @@ def _seg(value: Any) -> str:
         return encoded.replace(".", "%2E")
     return encoded
 
+CELL_TYPE_EXPRESSION_LEVELS = ("summary", "dataset")
+
+_VERSIONED_ENSG = re.compile(r"^(ENSG\d+)\.\d+$", re.IGNORECASE)
+
+
+def _unversioned_ensg(gene: str) -> str:
+    """results-api matches ENSG ids unversioned, so `ENSG00000169174.11` would be a 404."""
+    m = _VERSIONED_ENSG.match(gene)
+    return m.group(1).upper() if m else gene
+
+
 # generic error message returned to clients
 INTERNAL_ERROR_MSG = "Internal server error. Check server logs for details."
 
@@ -1638,6 +1649,49 @@ class ToolExecutor:
                 if no_data:
                     out["resources_with_no_data"] = no_data
             return out
+        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    async def get_cell_type_expression(
+        self, gene: str, level: str = "summary"
+    ) -> dict[str, Any]:
+        """Single-cell expression by cell type for one or more genes."""
+        if level not in CELL_TYPE_EXPRESSION_LEVELS:
+            return {
+                "success": False,
+                "error": f"level must be one of {', '.join(CELL_TYPE_EXPRESSION_LEVELS)}, got {level!r}",
+            }
+        genes = ",".join(_unversioned_ensg(g.strip()) for g in gene.split(",") if g.strip())
+        resp = await self.client.get(
+            f"{self.base_url}/v1/cell_type_expression/{_seg(genes)}",
+            params={"level": level, "format": "json"},
+        )
+        if resp.status_code == 200:
+            results = resp.json()
+            return {
+                "success": True, **self._columns_meta(resp), "gene": genes, "level": level,
+                "release": resp.headers.get("X-Dataset-Version"),
+                "results": results,
+                "_download_data": {
+                    "results": results, "filename": f"{genes}_cell_type_expression_{level}.tsv",
+                },
+            }
+        # results-api answers 404 both for an unknown gene and for a deployment with no
+        # cell-type data; only the latter is a statement about the deployment
+        if resp.status_code == 404 and "not configured" in resp.text:
+            return {
+                "success": False,
+                "error_code": "not_available",
+                "error": "Single-cell cell-type expression is not available on this deployment.",
+            }
+        if resp.status_code == 503:
+            return {
+                "success": False,
+                "error_code": "release_not_loaded",
+                "error": (
+                    "Single-cell cell-type expression is temporarily unavailable: the server "
+                    "has not loaded its data release yet. Try again in a few minutes."
+                ),
+            }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
     async def get_asm_qtl_by_variant(
