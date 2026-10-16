@@ -4,7 +4,7 @@
 # hla_associations_v
 
 Classical HLA allele associations from FinnGen R14 — every imputed HLA allele tested against
-every core R14 endpoint (~2,712 phenotypes x 187 alleles across 10 genes). The association
+every core R14 endpoint (2,808 phenotypes x 187 alleles across 10 genes). The association
 unit is an ALLELE (e.g. 'B*27:05'), not a nucleotide variant, so these rows do not join to
 credible_sets_v / variant_annotation_v on chr/pos/ref/alt; every allele of a gene shares
 that gene's single anchor position. This is the only place the cross-phenotype question is
@@ -20,7 +20,7 @@ correct join is phenotypes_v p ON p.dataset = h.dataset AND p.trait_original = h
 (`USING (dataset, trait_original)` does not work here — only the TRAIT column differs;
 `dataset` is present on both sides, so it must be matched explicitly against `phenotype`).
 Without SOME dataset predicate the join fans out across every FinnGen release sharing the
-code space. Background, not an alternative: all 2,712 HLA phenotype codes are also FinnGen
+code space. Background, not an alternative: all 2,808 HLA phenotype codes are also FinnGen
 R14 endpoint codes, so h.dataset is always 'finngen_hla' and the join above is the one to
 write. COLUMN NAMES: the view emits the suite's house spelling — `mlog10p`, `se`, `af`,
 `af_cases`, `af_controls` — which is also what the results-api /v1/hla endpoint returns, so

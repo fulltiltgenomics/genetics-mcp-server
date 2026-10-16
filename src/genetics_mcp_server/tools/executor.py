@@ -2093,7 +2093,7 @@ class ToolExecutor:
         """Get every phenotype an HLA allele is associated with, via BigQuery.
 
         The per-phenotype files results-api serves cannot answer this — it spans all
-        2,712 of them — so it goes through `hla_associations_v`. `min_info` defaults to
+        2,808 of them — so it goes through `hla_associations_v`. `min_info` defaults to
         0.5 because rare, badly-imputed alleles produce huge unstable betas that read as
         spectacular associations; pass 0 to see them anyway.
         """

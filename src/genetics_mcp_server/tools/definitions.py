@@ -1748,7 +1748,7 @@ For the reverse question — which traits an allele is associated with — use g
         "name": "get_hla_by_allele",
         "category": "api",
         "sdk_replaceable": True,
-        "description": """Get every phenotype a classical HLA allele is associated with — the PheWAS view of one HLA allele across all 2,712 FinnGen R14 endpoints.
+        "description": """Get every phenotype a classical HLA allele is associated with — the PheWAS view of one HLA allele across all 2,808 FinnGen R14 endpoints.
 
 Use this when the user names an allele:
 - "What is HLA-B*27:05 associated with?" / "What diseases does DQB1*02:01 predispose to?"
