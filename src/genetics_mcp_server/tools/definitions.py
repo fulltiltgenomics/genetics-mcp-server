@@ -1729,7 +1729,7 @@ Do NOT use this as a discovery tool — use credible set tools or PheWAS for tha
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource — use list_datasets to find available resources. Common values: 'finngen', 'finngen_mvp_ukbb_aou', 'finngen_mvp_ukbb', 'finngen_ukbb', 'pgc'",
+                "description": "Data resource — use list_datasets to find available resources. Common values: 'finngen', 'finngen_mvp_ukbb_aou', 'finngen_ukbb', 'pgc'",
                 "default": "finngen",
             },
             "data_type": {
@@ -1916,7 +1916,7 @@ Phenotypes are REQUIRED: summary stats are stored per phenotype, so there is no 
             },
             "resource": {
                 "type": "string",
-                "description": "Data resource — use list_datasets to find available ones. Common: 'finngen', 'finngen_mvp_ukbb_aou', 'finngen_mvp_ukbb', 'finngen_ukbb'",
+                "description": "Data resource — use list_datasets to find available ones. Common: 'finngen', 'finngen_mvp_ukbb_aou', 'finngen_ukbb'",
                 "default": "finngen",
             },
             "data_type": {
