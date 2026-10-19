@@ -3,6 +3,7 @@
     "deployed_flags_set": {
       "ALPHAGENOME_API_KEY": "configured",
       "ALPHAGENOME_ENABLED": "true",
+      "CELL_TYPE_EXPRESSION_ENABLED": "true",
       "CONFIG_PROFILE": "daly",
       "ENABLE_SUBAGENTS": "false",
       "SANDBOX_ENABLED": "true"
@@ -532,6 +533,7 @@
   },
   "mcp_server": {
     "deployed_flags_set": {
+      "CELL_TYPE_EXPRESSION_ENABLED": "true",
       "CONFIG_PROFILE": "daly",
       "ENABLE_SUBAGENTS": "false"
     },

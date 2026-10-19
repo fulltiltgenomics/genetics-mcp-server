@@ -64,6 +64,7 @@ _DISABLED_TOOLS_ENV_VARS = (
     "SANDBOX_ENABLED",
     "ALPHAGENOME_ENABLED",
     "ALPHAGENOME_API_KEY",
+    "CELL_TYPE_EXPRESSION_ENABLED",
     "CONFIG_PROFILE",
 )
 
@@ -76,17 +77,23 @@ _DISABLED_TOOLS_ENV_VARS = (
 # time), and ALPHAGENOME_API_KEY is an OPTIONAL secret key on top of it. The baseline
 # records the deployment with both set, since the withdrawn direction is the trivial one;
 # mcp-server is never given either, and the tool is withheld from /mcp by `_mcp_disabled`
-# besides. CONFIG_PROFILE is envsubst'd into both manifests; the baseline records the daly
-# profile, the one that serves single-cell expression, so get_cell_type_expression is offered.
+# besides. CONFIG_PROFILE and CELL_TYPE_EXPRESSION_ENABLED are envsubst'd into both manifests;
+# the baseline records the daly profile with the flag on (a deployment that sets the release
+# pointer), so get_cell_type_expression is offered — again the withdrawn direction is trivial.
 DEPLOYED_FLAGS: dict[str, dict[str, str]] = {
     "chat_backend": {
         "SANDBOX_ENABLED": "true",
         "ENABLE_SUBAGENTS": "false",
         "ALPHAGENOME_ENABLED": "true",
         "ALPHAGENOME_API_KEY": "configured",
+        "CELL_TYPE_EXPRESSION_ENABLED": "true",
         "CONFIG_PROFILE": "daly",
     },
-    "mcp_server": {"ENABLE_SUBAGENTS": "false", "CONFIG_PROFILE": "daly"},
+    "mcp_server": {
+        "ENABLE_SUBAGENTS": "false",
+        "CELL_TYPE_EXPRESSION_ENABLED": "true",
+        "CONFIG_PROFILE": "daly",
+    },
 }
 
 # the profile values a chat request can carry. None is not a profile name, so it is keyed as
