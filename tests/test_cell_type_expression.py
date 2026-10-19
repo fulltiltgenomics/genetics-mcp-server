@@ -185,11 +185,20 @@ def test_tool_text_names_no_gated_view():
 
 
 @pytest.mark.parametrize(
-    ("profile", "offered"),
-    [("daly", True), ("finngen", False), (None, False), ("unknown", False)],
+    ("profile", "enabled", "offered"),
+    [
+        ("daly", True, True),
+        ("daly", False, False),
+        ("finngen", True, False),
+        ("finngen", False, False),
+        (None, True, False),
+        ("unknown", True, False),
+    ],
 )
-def test_offered_only_on_profiles_that_serve_the_data(profile, offered):
-    disabled = Settings(config_profile=profile).disabled_tools
+def test_offered_only_where_enabled_on_a_profile_that_serves_the_data(profile, enabled, offered):
+    disabled = Settings(
+        config_profile=profile, cell_type_expression_enabled=enabled
+    ).disabled_tools
     names = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
     assert (TOOL in names) is offered
 
@@ -199,9 +208,15 @@ def test_sdk_replaceable_so_the_code_surface_uses_the_sdk():
     assert TOOL not in names
 
 
-def test_reads_config_profile_from_the_environment(monkeypatch):
+def test_reads_config_profile_and_enabled_flag_from_the_environment(monkeypatch):
     monkeypatch.setenv("CONFIG_PROFILE", "daly")
+    monkeypatch.setenv("CELL_TYPE_EXPRESSION_ENABLED", "true")
     assert TOOL not in Settings().disabled_tools
+    monkeypatch.setenv("CELL_TYPE_EXPRESSION_ENABLED", "false")
+    assert TOOL in Settings().disabled_tools
+    monkeypatch.delenv("CELL_TYPE_EXPRESSION_ENABLED")
+    assert TOOL in Settings().disabled_tools
+    monkeypatch.setenv("CELL_TYPE_EXPRESSION_ENABLED", "true")
     monkeypatch.setenv("CONFIG_PROFILE", "finngen")
     assert TOOL in Settings().disabled_tools
     monkeypatch.delenv("CONFIG_PROFILE")

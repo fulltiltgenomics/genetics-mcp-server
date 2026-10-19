@@ -12,8 +12,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# the profiles whose results-api configures a cell-type expression release; elsewhere the
-# endpoint answers 404 "not configured", so advertising the tool would only invite failures
+# the profiles whose results-api can serve a cell-type expression release at all. Within them
+# a deployment still opts in with CELL_TYPE_EXPRESSION_ENABLED; elsewhere the endpoint answers
+# 404 "not configured", so advertising the tool would only invite failures
 CELL_TYPE_EXPRESSION_PROFILES = frozenset({"daly"})
 
 
@@ -328,6 +329,15 @@ class Settings:
             "ALPHAGENOME_ENABLED", "false"
         ).lower() in ("1", "true", "yes")
     )
+    # whether this deployment's results-api has a cell-type expression release pointer. The
+    # deploy derives it from the same tfvar that sets the pointer, so the tool is offered exactly
+    # where the endpoint can answer; a profile outside CELL_TYPE_EXPRESSION_PROFILES never gets
+    # the tool even with this set.
+    cell_type_expression_enabled: bool = field(
+        default_factory=lambda: os.environ.get(
+            "CELL_TYPE_EXPRESSION_ENABLED", "false"
+        ).lower() in ("1", "true", "yes")
+    )
     # predictions are a deterministic function of the variant and the model, and the Atlas
     # response carries no version identifier, so nothing can detect a model update. A bounded
     # ttl is the only staleness control available; an hour absorbs the repeats inside a chat
@@ -556,7 +566,10 @@ class Settings:
             # because default_system_prompt is assembled from the resolved tool names.
             disabled.add("get_alphagenome_variant_predictions")
             disabled.add("compare_alphagenome_with_measured")
-        if self.config_profile not in CELL_TYPE_EXPRESSION_PROFILES:
+        if (
+            not self.cell_type_expression_enabled
+            or self.config_profile not in CELL_TYPE_EXPRESSION_PROFILES
+        ):
             disabled.add("get_cell_type_expression")
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a

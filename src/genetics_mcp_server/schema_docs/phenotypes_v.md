@@ -14,7 +14,7 @@ gene_burden_results_v for Genebass stores trait='Mean corpuscular volume' with
 trait_original='continuous_30040_both_sexes__irnt', and QTL rows store a gene symbol in
 trait with the Ensembl id in trait_original. Joining on trait returns zero rows silently.
 COVERAGE IS PARTIAL BY DESIGN. Only datasets that ship a phenotype metadata file have rows:
-FinnGen R14/R12/Kanta/drugs, the FinnGen+UKBB and FinnGen+MVP+UKBB meta-analyses, Open
+FinnGen R14/R12/Kanta/drugs, the FinnGen multi-cohort (UKBB, MVP, AoU) meta-analyses, Open
 Targets GWAS, Genebass, BRaVa, COVID-19 HGI and IIBDGC. QTL datasets (FinnGen_snRNAseq,
 FinnGen_ATACseq, FinnGen_Olink*, UKB_PPP, Open_Targets_QTL_*, every QTD*) have NO rows —
 their traits are genes, proteins and peaks, resolved through gene_annotations_v and
