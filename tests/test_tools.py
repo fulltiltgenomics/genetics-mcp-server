@@ -652,7 +652,7 @@ class TestSummaryStatsTools:
         result = await self.executor.get_summary_stats(
             variants=["19:44908684:T:C"],
             phenotypes=["T2D"],
-            resource="finngen_mvp_ukbb",
+            resource="finngen_mvp_ukbb_aou",
             data_type="gwas",
         )
 
