@@ -33,7 +33,7 @@ class AccessGrantItem(BaseModel):
 
 class GrantRequest(BaseModel):
     email: str
-    # the admin has seen the "does not look like a Google or Apple address" warning
+    # the admin has seen the "does not look like a Google, Apple or Microsoft address" warning
     confirm_unknown_provider: bool = False
 
 

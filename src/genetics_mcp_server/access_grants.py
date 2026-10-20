@@ -32,14 +32,18 @@ from genetics_mcp_server.db import get_llm_config_db
 logger = logging.getLogger(__name__)
 
 # consumer domains whose accounts are known to sign in through the respective IdP. Any other
-# address may still be a Google or Apple account — both let a person register an existing
-# address as their login — so a miss here is advice to the admin, never a refusal.
+# address may still be a Google, Apple or Microsoft account — all three let a person register an
+# existing address as their login — so a miss here is advice to the admin, never a refusal.
 GOOGLE_DOMAINS = frozenset({"gmail.com", "googlemail.com"})
 APPLE_DOMAINS = frozenset({"icloud.com", "me.com", "mac.com", "privaterelay.appleid.com"})
-# a domain's mail host tells which IdP its users most likely have: Google Workspace and
-# iCloud+ custom domains both publish distinctive MX records
+MICROSOFT_DOMAINS = frozenset({"outlook.com", "hotmail.com", "live.com", "msn.com"})
+# a domain's mail host tells which IdP its users most likely have: Google Workspace, iCloud+
+# custom domains and Microsoft 365 all publish distinctive MX records; Microsoft's consumer
+# domains outside the set above (hotmail.co.uk, outlook.fr, ...) sit under olc.protection
 GOOGLE_MX_SUFFIXES = ("google.com.", "googlemail.com.")
 APPLE_MX_SUFFIXES = ("mail.icloud.com.",)
+MICROSOFT_CONSUMER_MX_SUFFIXES = ("olc.protection.outlook.com.",)
+MICROSOFT_365_MX_SUFFIXES = ("mail.protection.outlook.com.",)
 DOH_URL = "https://dns.google/resolve"
 
 # good enough to refuse a typo before it is mailed; the IdP decides what an address really is
@@ -78,15 +82,18 @@ def parse_expires_at(value: str) -> datetime | None:
 async def classify_provider(email: str, client: httpx.AsyncClient | None = None) -> str:
     """Which identity provider the address most likely belongs to.
 
-    "google" / "apple" for the consumer domains, "google-workspace" when the domain's MX points
-    at Google (an iCloud+ custom domain reports "apple"), "unknown" otherwise — including when
-    the lookup itself fails, because the answer only steers a confirmation prompt.
+    "google" / "apple" / "microsoft" for the consumer domains, "google-workspace" or
+    "microsoft-365" when the domain's MX points at Google or Microsoft 365 (an iCloud+ custom
+    domain reports "apple", a regional Outlook domain "microsoft"), "unknown" otherwise —
+    including when the lookup itself fails, because the answer only steers a confirmation prompt.
     """
     domain = normalize_email(email).rsplit("@", 1)[-1]
     if domain in GOOGLE_DOMAINS:
         return "google"
     if domain in APPLE_DOMAINS:
         return "apple"
+    if domain in MICROSOFT_DOMAINS:
+        return "microsoft"
     try:
         own = client is None
         client = client or httpx.AsyncClient(timeout=4.0)
@@ -105,6 +112,10 @@ async def classify_provider(email: str, client: httpx.AsyncClient | None = None)
         return "google-workspace"
     if any(h.endswith(APPLE_MX_SUFFIXES) for h in hosts):
         return "apple"
+    if any(h.endswith(MICROSOFT_CONSUMER_MX_SUFFIXES) for h in hosts):
+        return "microsoft"
+    if any(h.endswith(MICROSOFT_365_MX_SUFFIXES) for h in hosts):
+        return "microsoft-365"
     return "unknown"
 
 

@@ -326,14 +326,20 @@ class TestClassifyProvider:
             assert await svc.classify_provider("A@GMAIL.com", client) == "google"
             assert await svc.classify_provider("b@icloud.com", client) == "apple"
             assert await svc.classify_provider("c@privaterelay.appleid.com", client) == "apple"
+            assert await svc.classify_provider("d@outlook.com", client) == "microsoft"
+            assert await svc.classify_provider("e@Hotmail.com", client) == "microsoft"
 
     async def test_mx_decides_for_other_domains(self):
         async with _doh(["aspmx.l.google.com.", "alt1.aspmx.l.google.com."]) as client:
             assert await svc.classify_provider("x@broadinstitute.org", client) == "google-workspace"
         async with _doh(["mx01.mail.icloud.com."]) as client:
             assert await svc.classify_provider("x@custom.example", client) == "apple"
-        async with _doh(["mail.protection.outlook.com."]) as client:
-            assert await svc.classify_provider("x@msft.example", client) == "unknown"
+        async with _doh(["hotmail-co-uk.olc.protection.outlook.com."]) as client:
+            assert await svc.classify_provider("x@hotmail.co.uk", client) == "microsoft"
+        async with _doh(["msft-example.mail.protection.outlook.com."]) as client:
+            assert await svc.classify_provider("x@msft.example", client) == "microsoft-365"
+        async with _doh(["mx.zoho.eu."]) as client:
+            assert await svc.classify_provider("x@zoho.example", client) == "unknown"
 
     async def test_lookup_failure_is_unknown(self):
         async with _doh(None, 503) as client:

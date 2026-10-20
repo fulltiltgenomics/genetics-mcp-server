@@ -3031,10 +3031,12 @@ it is not queried again. The two targets fail independently and are retried next
 
 The endpoints, all under `admin_required` and 404 when the label is unset: `GET /chat/v1/admin/access-grants`
 lists every row with `active`; `POST` with `{email, confirm_unknown_provider?}` normalises the
-address, classifies it (`classify_provider`: `google`/`apple` for the consumer domains, otherwise
-a DNS-over-HTTPS MX lookup — Google-hosted → `google-workspace`, iCloud+ → `apple`, anything else
-or a failed lookup → `unknown`) and, for `unknown` without the confirmation flag, answers
-`granted: false` so the UI can warn that only a Google or Apple identity can sign in; otherwise it
+address, classifies it (`classify_provider`: `google`/`apple`/`microsoft` for the consumer
+domains, otherwise a DNS-over-HTTPS MX lookup — Google-hosted → `google-workspace`, iCloud+ →
+`apple`, Outlook's regional consumer domains → `microsoft`, Microsoft 365 → `microsoft-365`,
+anything else or a failed lookup → `unknown`) and, for `unknown` without the confirmation flag,
+answers `granted: false` so the UI can warn that only a Google, Apple or Microsoft identity can
+sign in; otherwise it
 upserts the row, kicks the reconciler and mails the person, reporting `email_sent`/`email_error`
 without undoing the grant when the mail fails. A re-POST of an active address is idempotent and
 does not mail again. `DELETE /chat/v1/admin/access-grants/{email}` revokes; `POST …/{email}/email`
