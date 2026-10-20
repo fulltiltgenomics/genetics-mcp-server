@@ -288,7 +288,23 @@ def _email_allowed(email: str) -> bool:
             "trusted proxy asserts"
         )
         return True
-    return _matches_allow_list(email, settings)
+    return _matches_allow_list(email, settings) or has_access_grant(email)
+
+
+def has_access_grant(email: str) -> bool:
+    """True when an admin granted the address runtime access that has not ended.
+
+    The grant table is chat-backend's own; results-api and mcp-server reach the same answer
+    through /chat/v1/access-grants/check. A database that cannot be read answers False, so a
+    broken store narrows access rather than widening it.
+    """
+    from genetics_mcp_server.db import get_llm_config_db
+
+    try:
+        return get_llm_config_db().has_active_access_grant(email)
+    except Exception as exc:
+        logger.warning("access-grant lookup failed, treating as not granted: %s", exc)
+        return False
 
 
 def get_authenticated_user(request: Request) -> str | None:

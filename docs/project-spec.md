@@ -3005,6 +3005,49 @@ In deployment, `ALLOWED_EMAILS` and `ALLOWED_EMAIL_DOMAINS` are sourced from the
 | `ENABLE_ADMIN_PAGE` | Enable admin page and API endpoints | `false` |
 | `ADMIN_USERS` | Comma-separated admin email addresses | `""` |
 
+### Runtime access grants
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ACCESS_GRANT_BUTTON_LABEL` | Caption of the admin's grant button in the chat header, and the feature switch: empty shows no button, runs no reconciler and never writes the `access_grants` table (it is still consulted) | `""` |
+| `ACCESS_GRANT_EXPIRES_AT` | Deadline every grant made while it is set receives, ISO 8601 **with an offset**; a naive or malformed value makes `POST /admin/access-grants` 500 and the button advertise `expires_at: null` | `""` |
+| `ACCESS_GRANT_CONFIGMAP` | oauth2-proxy's authenticated-emails ConfigMap the reconciler rewrites through the API server with the pod's projected token; empty, or no token mounted, skips that target | `""` |
+| `KEYCLOAK_ADMIN_URL` | In-cluster base URL of Keycloak for the admin REST API | `""` |
+| `KEYCLOAK_REALM` | Realm whose `allowedEmails` attribute and users the reconciler manages | `genetics` |
+| `KEYCLOAK_ACCESS_GRANTS_CLIENT_ID` / `_SECRET` | Confidential client with `realm-management` roles (`manage-realm`, `manage-users`, `view-users`) the reconciler authenticates as; the secret is the switch for the Keycloak target | `access-grants` / `""` |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` | Authenticated SMTP with STARTTLS for the notification; no host means grants are made but nobody is mailed, and the response says so | `""`, `587` |
+| `ACCESS_GRANT_EMAIL_FROM`, `_REPLY_TO`, `_SUBJECT`, `_BODY_FILE` | The notification's headers and the file holding its plain-text body, in which `{email}` is replaced with the granted address | `""` |
+
+`access_grants.py` owns the feature; `routers/access_grants.py` exposes it. The `access_grants`
+table in `llm_config.db` (one row per address: who granted it, the deadline, revocation, e-mail
+outcome, and a deactivation mark) is the **record**; the oauth2-proxy file and the Keycloak realm
+attribute are **derived** from it by `AccessGrantReconciler` — on every grant and revocation, every
+30 s, and at startup — as the static `ALLOWED_EMAILS` plus the active rows, so a deploy that
+re-renders either copy from terraform is repaired within one pass and expiry needs no scheduled
+job. The reconciler also disables the Keycloak account of a grant that has ended and re-enables it
+on a re-grant, since the realm's first-broker-login gate only runs once per person; an ended row is
+marked `deactivated_at` once that has happened (or at once, when there is no Keycloak target), so
+it is not queried again. The two targets fail independently and are retried next pass.
+
+The endpoints, all under `admin_required` and 404 when the label is unset: `GET /chat/v1/admin/access-grants`
+lists every row with `active`; `POST` with `{email, confirm_unknown_provider?}` normalises the
+address, classifies it (`classify_provider`: `google`/`apple` for the consumer domains, otherwise
+a DNS-over-HTTPS MX lookup — Google-hosted → `google-workspace`, iCloud+ → `apple`, anything else
+or a failed lookup → `unknown`) and, for `unknown` without the confirmation flag, answers
+`granted: false` so the UI can warn that only a Google or Apple identity can sign in; otherwise it
+upserts the row, kicks the reconciler and mails the person, reporting `email_sent`/`email_error`
+without undoing the grant when the mail fails. A re-POST of an active address is idempotent and
+does not mail again. `DELETE /chat/v1/admin/access-grants/{email}` revokes; `POST …/{email}/email`
+resends. `GET /chat/v1/access-grants/check?email=` is internal (the marker, and no identity
+header, as `/tokens/validate`) and is how results-api and mcp-server — which have no copy of the
+table — honour grants after their own static list misses, each caching the answer for 60 s
+(`access_check.py` here, `app/core/auth.py:_has_access_grant` there). Within chat-backend,
+`auth.core._email_allowed` consults the table directly after a static miss, which is also what
+makes `/tokens/validate` refuse a per-user API token whose owner has lost access: **a key is only
+as valid as its owner's allow-list standing**, so a granted user's keys stop the moment the grant
+does and work again on a re-grant, with no revocation step. `/chat/v1/auth` advertises
+`access_grants: {label, expires_at}` to admins when the label is set and `null` to everyone else.
+
 When `ENABLE_ADMIN_PAGE=true`, admin endpoints are available at `/chat/v1/admin/`. Access control depends on `REQUIRE_AUTH`:
 - `REQUIRE_AUTH=false` (dev mode): any user can access admin endpoints
 - `REQUIRE_AUTH=true`: only users listed in `ADMIN_USERS` can access admin endpoints

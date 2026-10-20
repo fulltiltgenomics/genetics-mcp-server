@@ -65,6 +65,7 @@ from genetics_mcp_server.memory_gate import (
 from genetics_mcp_server.rate_limit import check_rate_limit
 from genetics_mcp_server.rate_limit import configure as configure_rate_limit
 from genetics_mcp_server.routers import (
+    access_grants_router,
     admin_router,
     api_tokens_router,
     chat_history_router,
@@ -440,9 +441,18 @@ async def lifespan(app: FastAPI):
                 logger.error(f"Download cleanup error: {e}")
 
     cleanup_task = asyncio.create_task(_download_cleanup_loop())
+    # re-derives the oauth2-proxy file and the Keycloak attribute from the grant table; None
+    # when no ACCESS_GRANT_BUTTON_LABEL is set
+    from genetics_mcp_server.access_grants import get_reconciler
+
+    reconciler = get_reconciler()
+    if reconciler is not None:
+        reconciler.start()
     yield
     # cleanup
     cleanup_task.cancel()
+    if reconciler is not None:
+        reconciler.stop()
     # turns outlive their HTTP responses, so uvicorn's connection drain does not cover them.
     # Waiting here is what turns a deploy landing mid-answer into a persisted answer; the
     # bound keeps the pod inside its termination grace period (see chat-backend.yaml)
@@ -474,6 +484,7 @@ app.include_router(chat_history_router, prefix="/chat/v1", tags=["chat-history"]
 app.include_router(llm_config_router, prefix="/chat/v1", tags=["llm-config"])
 
 app.include_router(admin_router, prefix="/chat/v1", tags=["admin"])
+app.include_router(access_grants_router, prefix="/chat/v1", tags=["access-grants"])
 
 
 class ChatMessage(BaseModel):
@@ -592,10 +603,22 @@ async def auth(request: Request):
             is_admin = True
         elif user and user.lower() in settings.admin_users_list:
             is_admin = True
+    # the access-grant button: admins only, and only where the deployment configured a label.
+    # Everyone else gets null, so a browser without the key behaves exactly as before
+    access_grants = None
+    if is_admin and settings.access_grants_enabled:
+        from genetics_mcp_server.access_grants import parse_expires_at
+
+        expires_at = parse_expires_at(settings.access_grant_expires_at)
+        access_grants = {
+            "label": settings.access_grant_button_label,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+        }
     return JSONResponse({
         "authenticated": user is not None,
         "user": user,
         "is_admin": is_admin,
+        "access_grants": access_grants,
     })
 
 

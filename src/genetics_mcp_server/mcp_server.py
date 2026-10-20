@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import TransportSecuritySettings
 
+from genetics_mcp_server.access_check import has_access_grant
 from genetics_mcp_server.auth.core import _matches_allow_list
 from genetics_mcp_server.config.settings import get_settings, require_internal_api_secret
 from genetics_mcp_server.tools.definitions import register_mcp_tools
@@ -261,7 +262,9 @@ def _validate_keycloak_token(token: str, settings) -> bool:
     # nobody — Keycloak already refuses "*" and creates no account. So honouring it here
     # would contradict that gate and admit exactly the realm accounts it never vetted:
     # pre-existing and admin-created ones.
-    if not _matches_allow_list(email, settings, allow_wildcard=False):
+    # a runtime grant (chat-backend's access_grants table) admits what the static list does
+    # not, so a conference user's MCP client works for exactly as long as their browser does
+    if not _matches_allow_list(email, settings, allow_wildcard=False) and not has_access_grant(email):
         logger.warning("Keycloak email not allowed: %s", email)
         return False
     logger.info("authenticated Keycloak user: %s", email)
@@ -370,7 +373,10 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             # ungated path admit every Google-verified address (genetics-results-suite-g8i).
             # _audience_allowed above is no backstop: inert without GOOGLE_TOKEN_AUDIENCE, and
             # the *public* gcloud client id when set.
-            if not _matches_allow_list(email, settings, allow_wildcard=False):
+            if (
+                not _matches_allow_list(email, settings, allow_wildcard=False)
+                and not has_access_grant(email)
+            ):
                 logger.warning("Email domain not allowed: %s", email)
                 return False
             logger.info("authenticated JWT user: %s", email)

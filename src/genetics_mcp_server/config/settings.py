@@ -434,6 +434,61 @@ class Settings:
         default_factory=lambda: os.environ.get("ADMIN_USERS", "")
     )
 
+    # runtime access grants (access_grants.py). The button label doubles as the feature
+    # switch: unset means no admin sees a button, no reconciler runs and the grant table is
+    # consulted but never written. The deadline is one value for every grant made while it is
+    # set — a conference, not a per-person TTL — as an ISO 8601 stamp with an offset.
+    access_grant_button_label: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_BUTTON_LABEL", "").strip()
+    )
+    access_grant_expires_at: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EXPIRES_AT", "").strip()
+    )
+    # the oauth2-proxy authenticated-emails ConfigMap the reconciler rewrites; empty disables
+    # that target (local dev has no cluster to patch)
+    access_grant_configmap: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_CONFIGMAP", "").strip()
+    )
+    # Keycloak admin REST, reached in-cluster, as a confidential client with service-account
+    # roles on realm-management — not the bootstrap admin. The secret is the switch for that
+    # target: it exists only where scripts/keycloak-register-access-grants-client.sh has run,
+    # so a deployment without a broker never tries
+    keycloak_admin_url: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_ADMIN_URL", "").rstrip("/")
+    )
+    keycloak_realm: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_REALM") or "genetics"
+    )
+    keycloak_access_grants_client_id: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_ACCESS_GRANTS_CLIENT_ID") or "access-grants"
+    )
+    keycloak_access_grants_client_secret: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_ACCESS_GRANTS_CLIENT_SECRET", "")
+    )
+    # notification e-mail over authenticated SMTP (STARTTLS). Unset host = grants are made
+    # but nobody is mailed, and the response says so. `or` rather than a default: deploy.sh
+    # renders an unset .env variable as "", which int() would refuse at startup
+    smtp_host: str = field(default_factory=lambda: os.environ.get("SMTP_HOST", ""))
+    smtp_port: int = field(
+        default_factory=lambda: int(os.environ.get("SMTP_PORT") or 587)
+    )
+    smtp_username: str = field(default_factory=lambda: os.environ.get("SMTP_USERNAME", ""))
+    smtp_password: str = field(default_factory=lambda: os.environ.get("SMTP_PASSWORD", ""))
+    access_grant_email_from: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_FROM", "")
+    )
+    access_grant_email_reply_to: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_REPLY_TO", "")
+    )
+    access_grant_email_subject: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_SUBJECT", "")
+    )
+    # the body lives in a mounted file so a deployment can word it without a rebuild; `{email}`
+    # in it is replaced with the granted address
+    access_grant_email_body_file: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_BODY_FILE", "")
+    )
+
     # bearer token auth: allowed email domains and specific emails
     # mirrors genetics-results-api/app/config/common.py parsing semantics
     allowed_email_domains: set[str] = field(
@@ -518,6 +573,10 @@ class Settings:
         if not self.admin_users:
             return []
         return [u.strip().lower() for u in self.admin_users.split(",") if u.strip()]
+
+    @property
+    def access_grants_enabled(self) -> bool:
+        return bool(self.access_grant_button_label)
 
     # the deployment's data profile (genetics-results-suite configs/datasets.yaml), the same
     # env var schema_docs gates views on. Tools whose data only some profiles serve are
