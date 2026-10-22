@@ -113,7 +113,8 @@ LITERATURE_SKILL = "literature_review"
 PROD_CONTEXT = "gke_daly-finngenie_us-central1-a_finngenie"
 DEFAULT_USERS = ("bneale", "mjdaly", "finucane")
 DEFAULT_MODEL = "claude-opus-5"
-# a turn's findings list runs to a few KB of JSON; the nightly judge's 1000 truncates it
+# a turn's findings list runs to a few KB of JSON, more than the max_tokens the nightly quality
+# judge in analyze_conversations.py allows, so that budget cannot be reused here
 DEFAULT_MAX_TOKENS = 8000
 
 # what the answering model could see of one tool result (settings.mcp_max_result_size), so the
