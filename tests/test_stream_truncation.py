@@ -75,6 +75,14 @@ class _FakeMessages:
         return _FakeStream(events, message)
 
 
+def _without_cache_control(content):
+    """The message as the tests care about it: the history's cache breakpoint moves onto
+    whichever block is last, so a nudge arrives as a text block carrying cache_control."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return [{k: v for k, v in block.items() if k != "cache_control"} for block in content]
+
+
 def _service(turns, executor=None):
     svc = LLMService.__new__(LLMService)
     svc.openai_client = None
@@ -324,7 +332,10 @@ async def test_unfilled_results_turn_is_continued():
     assert len(svc.anthropic_client.messages.calls) == 2
 
     resume_messages = svc.anthropic_client.messages.calls[1]["messages"]
-    assert resume_messages[-1] == {"role": "user", "content": CONTINUE_UNFILLED_PROMPT}
+    assert resume_messages[-1]["role"] == "user"
+    assert _without_cache_control(resume_messages[-1]["content"]) == [
+        {"type": "text", "text": CONTINUE_UNFILLED_PROMPT}
+    ]
     assert resume_messages[-2]["role"] == "assistant"
 
 
@@ -808,7 +819,9 @@ async def test_truncated_tool_call_prompt_names_truncation_not_a_missing_argumen
     svc._execute_tool = lambda *a, **k: None
     await _collect(svc)
 
-    sent = svc.anthropic_client.messages.calls[1]["messages"][-1]["content"]
+    last = svc.anthropic_client.messages.calls[1]["messages"][-1]
+    (block,) = _without_cache_control(last["content"])
+    sent = block["text"]
     assert "output token limit" in sent
     assert "was not run" in sent
     assert "smaller" in sent
@@ -900,7 +913,10 @@ async def test_finish_budget_runs_the_pending_tools_then_asks_for_the_answer(mon
     last_user = calls[1]["messages"][-1]
     assert last_user["role"] == "user"
     assert last_user["content"][0]["type"] == "tool_result"
-    assert last_user["content"][-1] == {"type": "text", "text": FINISH_TURN_PROMPT}
+    assert _without_cache_control(last_user["content"])[-1] == {
+        "type": "text",
+        "text": FINISH_TURN_PROMPT,
+    }
 
     text = "".join(c.content for c in chunks if c.type == "text")
     assert text.startswith("final answer")
