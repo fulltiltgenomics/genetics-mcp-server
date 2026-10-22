@@ -358,6 +358,8 @@ class TestBackendIsCallerControlled:
         service.executor = _executor_with_transport(_handler())
         service.subagent_service = None
         monkeypatch.setenv("PERPLEXITY_API_KEY", "test-key")
+        # the tool is refused when withdrawn, and a checkout's .env may withdraw it
+        monkeypatch.setenv("ENABLE_LITERATURE_SEARCH", "true")
         return service
 
     def test_tool_exposes_no_backend_parameter(self):

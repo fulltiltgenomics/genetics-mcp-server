@@ -57,9 +57,14 @@ def flag_disabled_tools(
     opposite of a bare test environment — because everything below is about what the
     prompt says when a tool IS present; each flag-off direction is asserted explicitly
     instead (genetics-results-suite-4h6.56).
+
+    Literature search is pinned to its shipped default because Settings would otherwise read
+    ENABLE_LITERATURE_SEARCH from the process, and a checkout's .env setting it false (the
+    benchmark configuration) withdrew the tool from every surface these tests describe.
     """
     return Settings(
         enable_subagents=subagents,
+        enable_literature_search=True,
         sandbox_enabled=sandbox,
         alphagenome_enabled=alphagenome,
         alphagenome_api_key="test-key" if alphagenome else None,
