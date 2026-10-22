@@ -108,7 +108,7 @@ _mcp_disabled = _settings.disabled_tools | {
     # MCP (genetics-results-suite-4h6). run_analysis IS code execution; read_artifact
     # returns files a script wrote for the chat session that ran it, and resolving a name
     # to an execution requires the session identity only chat-backend holds. run_analysis
-    # additionally has no handler in register_mcp_tools at all (see definitions.py), so this
+    # additionally has no register_mcp_tools block at all (see definitions.py), so this
     # entry is the second registration-layer control rather than the only one — but it is
     # the one §5 names and the one tests/test_mcp_server.py enumerates the tool list
     # against. This literal is the hardcoded half deliberately —

@@ -265,12 +265,11 @@ _LAZY_MODULES = ("plots", "linemodels", "mr", "enrichment")
 def __getattr__(name: str):
     """`genetics.plots`, `genetics.linemodels`, `genetics.mr` and `genetics.enrichment` resolve on first use, and only then.
 
-    Deliberately lazy rather than an import at the top of this file: they import numpy,
-    scipy or matplotlib.pyplot (mr through plots), and this package is imported by
-    chat-backend and mcp-server, where a figure is never drawn and no model is fitted. In
-    the sandbox the cost is already paid — the supervisor prewarms those libraries before the
-    first fork (the suite's sandbox/prewarm.py) — so the laziness buys the servers an import
-    they do not need and costs a script nothing.
+    Deliberately lazy rather than an import at the top of this file: plots imports
+    matplotlib.pyplot and linemodels and mr numpy, and this package is imported by chat-backend and
+    mcp-server, where a figure is never drawn and no mixture is fitted. In the sandbox the
+    cost is already paid — the supervisor prewarms both before the first fork — so the
+    laziness buys the servers an import they do not need and costs a script nothing.
     """
     if name in _LAZY_MODULES:
         # import_module and NOT `from genetics_mcp_server.sdk import plots`: the `from` form

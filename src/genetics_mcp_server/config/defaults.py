@@ -928,7 +928,7 @@ def default_system_prompt(
         tool_names: the tool names actually in force for this request. Blocks naming a
             tool that is not in the list are dropped, so the prompt describes only what
             the model was given. `None` disables the filtering entirely and emits every
-            block, for callers that have no tool list
+            block — the pre-4h6.69 behaviour, kept for callers that have no tool list
             (and for tests that want the full text).
         variant: which entry of `PROMPT_VARIANTS` to assemble. `None` and any unknown
             name resolve to `DEFAULT_PROMPT_VARIANT`; see `resolve_prompt_variant`.
