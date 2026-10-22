@@ -1708,27 +1708,53 @@ instead of looking broken. The chat path truncates instead of rejecting; see bel
 
 ### Endpoints
 
-All under `/chat/v1`, all `Depends(auth_required)` and scoped to the authenticated caller
-(`routers/llm_config.py`):
+All scoped to the authenticated caller (`routers/llm_config.py`); the list below is generated
+from the route decorators by `scripts/gen-doc-blocks.py`:
 
-- `GET /chat/v1/llm-config/user/instruction-sets` — the caller's non-archived sets, most recently edited first
-- `POST /chat/v1/llm-config/user/instruction-sets` — `{name, body, comment?}`; 400 on an empty name or body, 413 over the char cap, 409 over the count cap
-- `PUT /chat/v1/llm-config/user/instruction-sets/{set_id}` — `{name?, body?, comment?}`, omitted fields keep their value; 400 empty, 413 over cap, **404** for a set that is not the caller's *or* is archived (an archived set is deleted as far as the user is concerned, so editing one must not report success)
-- `DELETE /chat/v1/llm-config/user/instruction-sets/{set_id}` — archives, **204**; 404 as above
-- `GET /chat/v1/llm-config/user/instruction-sets/{set_id}/history?limit=20` — versions newest first. Archived sets stay readable here, so history survives a delete
+<!-- BEGIN GENERATED: instruction-set-endpoints -->
+
+- `GET /chat/v1/llm-config/user/instruction-sets` (`list_instruction_sets`) — List the current user's non-archived instruction sets, most recently edited first. raises 401.
+- `POST /chat/v1/llm-config/user/instruction-sets` (`create_instruction_set`) — Create a new instruction set for the current user. body `{name, body, comment?}`; raises 400, 401, 409, 413.
+- `PUT /chat/v1/llm-config/user/instruction-sets/{set_id}` (`update_instruction_set`) — Update one of the current user's instruction sets. body `{name?, body?, comment?}`; raises 400, 401, 404, 413.
+- `DELETE /chat/v1/llm-config/user/instruction-sets/{set_id}` (`delete_instruction_set`) — Archive one of the current user's instruction sets. answers **204**; raises 401, 404.
+- `GET /chat/v1/llm-config/user/instruction-sets/{set_id}/history` (`get_instruction_set_history`) — Recent versions of one of the current user's instruction sets, newest first. `?limit=20` (1–100); raises 401, 404.
+
+Every route above takes `Depends(auth_required)`. The status codes are the ones the handler raises itself, not those of the helpers it calls.
+
+<!-- END GENERATED: instruction-set-endpoints -->
+
+400 is an empty name or body; 413 and 409 are the two caps above. On the write routes 404 covers
+a set that is not the caller's *or* is archived — an archived set is deleted as far as the user is
+concerned, so editing one must not report success — while the history route still answers for an
+archived set, so history survives a delete.
 
 Cross-session memory is a separate opt-in feature (documented under "Cross-session memory
 premise measurement" below), and its endpoints live in `routers/chat_history.py` rather than
-`llm_config.py`. They are scoped to a **project**: the project CRUD and per-project session list
-(`list_projects`, `create_project`, `update_project`, `delete_project`, `list_project_sessions`),
-filing a conversation into one (`set_session_project`), the project's digest rendered fresh
-(`get_project_memory` — answered regardless of the opt-in, so the memory dialog can preview it
-before the setting is turned on) and the pin toggle (`pin_session`, which keeps a conversation in
-its own project's digest after it falls out of the in-project window). Read the decorators for
-paths and status codes. Like the rest of that router they 404 rather than 403 for something that
-is not the caller's, and they 404 for a caller that is not an identifiable person (a service
-identity, or the shared `anonymous` of an auth-less deployment) — a secret chat's id 404s at the
-pin by construction, having never written a row.
+`llm_config.py`. They are scoped to a **project**: the project CRUD and per-project session list,
+filing a conversation into one, the project's digest rendered fresh, and the pin toggle (generated
+by `scripts/gen-doc-blocks.py`):
+
+<!-- BEGIN GENERATED: project-endpoints -->
+
+- `PUT /chat/v1/chat/sessions/{session_id}/pin` (`pin_session`) — Pin a session so it keeps surfacing in the memory digest. Owner only. body `{pinned}`; raises 401, 404.
+- `PUT /chat/v1/chat/sessions/{session_id}/project` (`set_session_project`) — File the session into request.project_id, or unfile it with project_id=None. body `{project_id?}`; raises 401, 404.
+- `GET /chat/v1/projects` (`list_projects`) — The caller's own projects, most recently active first. raises 401, 404.
+- `POST /chat/v1/projects` (`create_project`) — Create a project for the caller. 400 on a blank name or past the per-user cap. body `{name}`; raises 400, 401, 404.
+- `PUT /chat/v1/projects/{project_id}` (`update_project`) — Rename the caller's own project. 400 on a blank name, 404 if not theirs. body `{name}`; raises 400, 401, 404.
+- `DELETE /chat/v1/projects/{project_id}` (`delete_project`) — Delete the caller's own project. `?with_sessions=false`; raises 401, 404.
+- `GET /chat/v1/projects/{project_id}/sessions` (`list_project_sessions`) — The caller's own sessions filed into this project, most recent first. raises 401, 404.
+- `GET /chat/v1/projects/{project_id}/memory` (`get_project_memory`) — The caller's memory digest for this project, rendered fresh. raises 401, 404.
+
+Every route above takes `Depends(auth_required)`. The status codes are the ones the handler raises itself, not those of the helpers it calls.
+
+<!-- END GENERATED: project-endpoints -->
+
+`get_project_memory` is answered regardless of the opt-in, so the memory dialog can preview the
+digest before the setting is turned on; a pin keeps a conversation in its own project's digest
+after it falls out of the in-project window. Like the rest of that router they 404 rather than 403
+for something that is not the caller's, and they 404 for a caller that is not an identifiable
+person (a service identity, or the shared `anonymous` of an auth-less deployment) — a secret
+chat's id 404s at the pin by construction, having never written a row.
 
 `chat_projects` (id, owner, name, timestamps, capped per user by
 `chat_history_db.PROJECTS_MAX_PER_USER`) and the nullable `chat_sessions.project_id` carry the
@@ -1767,10 +1793,34 @@ generator's `finally` with its failure kind as `outcome`. **The Anthropic path o
 `_stream_openai` records nothing, so any aggregate over this table would under-count a
 deployment that also served OpenAI. Since `genetics-results-suite-c4s` refuses
 `provider="openai"` at the request boundary, no such deployment can exist and the gap is
-latent rather than live. It holds
-`iterations`, `tool_call_count`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
-`cache_create_tokens`, `cost_usd`, `wall_ms`, `tool_profile`, `model`, `source`, `outcome` and
-`created_at`. Before it, these numbers existed only in Cloud Logging and had to be recovered from
+latent rather than live. Its columns, as a fresh database creates them
+(`_TURN_METRICS_COLUMNS` in `db/chat_history_db.py`, generated by `scripts/gen-doc-blocks.py`):
+
+<!-- BEGIN GENERATED: turn-metrics-columns -->
+
+| column | type | constraint |
+|---|---|---|
+| `id` | TEXT | primary key |
+| `session_id` | TEXT | nullable |
+| `message_id` | TEXT | nullable |
+| `user_id` | TEXT | nullable |
+| `iterations` | INTEGER | not null |
+| `tool_call_count` | INTEGER | nullable |
+| `input_tokens` | INTEGER | not null |
+| `output_tokens` | INTEGER | not null |
+| `cache_read_tokens` | INTEGER | nullable |
+| `cache_create_tokens` | INTEGER | nullable |
+| `cost_usd` | REAL | not null |
+| `wall_ms` | INTEGER | nullable |
+| `tool_profile` | TEXT | nullable |
+| `model` | TEXT | nullable |
+| `source` | TEXT | not null, default `'live'` |
+| `outcome` | TEXT | not null, default `'complete'` |
+| `created_at` | TIMESTAMP | nullable, default `CURRENT_TIMESTAMP` |
+
+<!-- END GENERATED: turn-metrics-columns -->
+
+Before it, these numbers existed only in Cloud Logging and had to be recovered from
 the BigQuery log sink; `chat_messages.content_json` is not a substitute, because it flattens a
 whole turn's blocks into one assistant record, leaving parallel and sequential tool calls
 indistinguishable and roundtrips per turn underivable.
@@ -2294,81 +2344,104 @@ raw id rather than failing the run.
 
 ### Module structure
 
+Every tracked file of the package, each module annotated with its docstring's summary, generated
+by `scripts/gen-doc-blocks.py` from `git ls-files`. `schema_docs/` is generated in turn by
+genetics-results-suite's `scripts/gen-sandbox-docs.py`.
+
+<!-- BEGIN GENERATED: module-tree -->
+
 ```
 src/genetics_mcp_server/
-├── __init__.py
-├── mcp_server.py        # standalone MCP server entry point
-├── mcp_client.py        # MCP client for testing
-├── mcp_proxy.py         # proxy for external MCP servers
-├── chat_api.py          # FastAPI chat service
-├── llm_service.py       # LLM provider integration
-├── logging_config.py    # GCP Cloud Logging JSON formatter
-├── rate_limit.py        # per-user sliding window rate limiter
-├── cost.py              # Anthropic API cost estimation
-├── download_store.py    # disk-persisted download storage for TSV files
-├── sandbox_token.py     # mints the per-execution, audience-scoped sandbox credentials
-├── sandbox_client.py    # HTTP transport to the sandbox supervisor (POST /execute, GET /health)
-├── url_fetch_client.py  # HTTP transport to the url-fetcher, plus the per-user in-memory fetch cache; `allowed_hosts()` reads the fetcher's host allow-list off the health route for the system prompt
-├── memory_digest.py     # entity extraction and session clustering, shared by the digest and its premise gate
-├── memory_gate.py       # the one place that decides whether a caller gets cross-session memory
-├── config/
-│   ├── __init__.py
-│   ├── settings.py      # configuration dataclass
-│   └── defaults.py      # default prompts and values
-├── tools/
-│   ├── __init__.py
-│   ├── definitions.py   # tool definitions (shared)
-│   ├── executor.py      # tool execution via HTTP; the half the sandbox image ships
-│   ├── orchestration.py # ServerToolExecutor: run_analysis, read_artifact, web/literature search
-│   ├── sql_safety.py    # allow-list validation of values spliced into server-built SQL
-│   ├── uniprot.py       # UniProtKB / EBI Proteins API client (TTL cache, accession/symbol resolution)
-│   └── chembl.py        # ChEMBL REST client (drug mechanisms, indications, bioactivity)
-├── schema_docs/          # the BigQuery view docs inlined into the `code` system prompt;
-│                         # GENERATED by genetics-results-suite/scripts/gen-sandbox-docs.py
-├── sdk/                    # importable `genetics` data SDK (thin layer over ToolExecutor)
-│   ├── __init__.py      # sync module-level functions, shared client lifecycle
-│   ├── client.py        # GeneticsClient: one async method per data product
-│   ├── _runner.py       # background event loop: the sync facade and the shared client's awaited calls both run on it
-│   ├── errors.py        # GeneticsError / GeneticsUsageError
-│   ├── plots.py         # genetics.plots: the standard figures (locuszoom, phewas, upset, linemodels, forest, volcano, mr)
-│   ├── linemodels.py    # genetics.linemodels: Pirinen's line models, a numpy port validated against R
-│   ├── mr.py            # genetics.mr: Mendelian randomization — instruments, harmonise, run, checks
-│   └── _mr_estimators.py # the MR estimators mr.py re-exports, held to the R packages' outputs
-├── subagent.py             # parallel subagent service
-├── scripts/
-│   ├── analyze_variants.py # standalone variant list analysis CLI
-│   ├── analyze_conversations.py # conversation history analysis and eval extraction
-│   ├── analysis_timeseries.py  # shared rolling-window aggregation used by both renderers
-│   ├── plot_conversation_scores.py # time-series plots of quality over time (from metrics.json)
-│   ├── backfill_metrics_dates.py # one-off: join session created_at into an older metrics.json
-│   ├── backfill_turn_metrics.py # chat_turn_metrics rows from the log sink, for turns before the table existed
-│   ├── replay_benchmark.py  # paired A/B replay of recorded conversations through /chat/v1/chat
-│   ├── benchmark_counters.py # per-arm mechanics of a run, against a recorded baseline
-│   ├── memory_premise_stats.py # read-only premise measurement over chat_history.db
-│   ├── mcp_oauth_login.py   # one-off browser login for an OAuth-protected external MCP server (C3PO)
-│   ├── literature_judge.py  # literature-evidence judge: baseline over prod turns, calibration, replay scoring
-│   └── conversation_prompts.py  # LLM prompt templates: the analyzer's topic, issue and quality prompts, the pairwise and literature-evidence judges
-├── skills/
-│   ├── __init__.py
-│   ├── definitions.py      # skill definitions and registry
-│   ├── sandbox_tools.py    # file read and directory listing tools for subagents
-│   └── instructions/       # markdown instruction files per skill
+├── __init__.py                     # Genetics MCP Server - MCP tools and LLM service for genetics data.
+├── access_check.py                 # Ask chat-backend whether an address holds a runtime access grant.
+├── access_grants.py                # Runtime access grants: admit an address for a bounded time without a deploy.
+├── chat_api.py                     # FastAPI chat router for LLM-powered conversations about genetics data.
+├── cost.py                         # Estimate API call cost from Anthropic token usage.
+├── download_store.py               # Disk-persisted download storage for tool result TSV files.
+├── llm_service.py                  # LLM service for handling chat interactions with multiple providers.
+├── logging_config.py               # Structured JSON logging for GCP Cloud Logging.
+├── mcp_client.py                   # Simple MCP client for calling tools on a running MCP server.
+├── mcp_proxy.py                    # MCP proxy for integrating remote MCP servers.
+├── mcp_server.py                   # Standalone MCP server for genetics data tools.
+├── memory_digest.py                # Entity extraction and cross-session digest rendering for chat memory.
+├── memory_gate.py                  # The single place that decides whether a caller gets cross-session chat memory.
+├── rate_limit.py                   # Per-user rate limiting for chat API requests.
+├── sandbox_client.py               # HTTP transport between chat-backend and the sandbox supervisor.
+├── sandbox_token.py                # Mint the per-execution, audience-scoped tokens the sandbox uses to reach db-api and results-api.
+├── subagent.py                     # Subagent service for running parallel specialized agents.
+├── turns.py                        # Server-owned chat turns.
+├── url_fetch_client.py             # HTTP transport between chat-backend and the url-fetcher, and the per-user fetch cache.
 ├── auth/
-│   ├── __init__.py
-│   ├── core.py          # IAP/oauth2-proxy header extraction
-│   └── dependencies.py  # FastAPI auth dependencies
+│   ├── __init__.py                 # Authentication module for genetics MCP server.
+│   ├── core.py                     # Authentication via X-Goog-Authenticated-User-Email header (set by IAP or oauth2-proxy).
+│   └── dependencies.py             # FastAPI dependencies for authentication.
+├── config/
+│   ├── __init__.py                 # Configuration for genetics MCP server.
+│   ├── defaults.py                 # Default LLM system prompt and configurations.
+│   ├── prompt_blocks.py            # The system-prompt block type, shared by every prompt variant.
+│   ├── prompt_condensed.py         # The condensed system prompt — `PROMPT_VARIANTS["condensed"]`.
+│   └── settings.py                 # Configuration settings for genetics MCP server.
 ├── db/
+│   ├── __init__.py                 # Database utilities for chat history and LLM config.
+│   ├── chat_history_db.py          # SQLite service for chat history persistence.
+│   ├── llm_config_db.py            # SQLite service for LLM configuration with change history.
+│   └── singleton.py                # Singleton metaclass for database connections.
+├── routers/
+│   ├── __init__.py                 # API routers for chat history and LLM configuration.
+│   ├── access_grants.py            # Admin endpoints for runtime access grants, plus the internal check other services call.
+│   ├── admin.py                    # Admin router for viewing all conversations and usage analytics.
+│   ├── api_tokens.py               # API token router for managing per-user MCP server access tokens.
+│   ├── chat_history.py             # Chat history router for managing persistent chat sessions.
+│   └── llm_config.py               # LLM Configuration router for managing editable system prompts and tool descriptions.
+├── schema_docs/
+│   ├── __init__.py                 # The BigQuery view documentation, inlined into the system prompt.
+│   ├── *.md
+│   └── _availability.json
+├── scripts/
 │   ├── __init__.py
-│   ├── singleton.py     # async DB singleton base
-│   ├── llm_config_db.py    # user LLM config storage
-│   └── chat_history_db.py  # conversation persistence
-└── routers/
-    ├── __init__.py
-    ├── admin.py         # admin page: all conversations, analytics
-    ├── api_tokens.py    # per-user API token management
-    ├── llm_config.py    # LLM config API endpoints
-    └── chat_history.py  # chat history API endpoints
+│   ├── analysis_timeseries.py      # Single source of truth for conversation-quality time-series aggregations.
+│   ├── analyze_conversations.py    # Analyze conversation history to gain insights for improving the genetics AI assistant.
+│   ├── analyze_variants.py         # Standalone CLI for variant list analysis.
+│   ├── backfill_metrics_dates.py   # One-off hotfix: backfill the `created_at` field into an existing metrics.json.
+│   ├── backfill_turn_metrics.py    # Backfill chat_turn_metrics from the chat-backend log sink, for turns that ran before the table existed.
+│   ├── benchmark_counters.py       # Per-arm mechanics of a benchmark run: what the model DID, not how good the answer was.
+│   ├── benchmark_scorecard.py      # Per-question scorecard for a saved replay_benchmark report.
+│   ├── conversation_prompts.py     # Prompt templates for LLM-based conversation categorization.
+│   ├── literature_judge.py         # Literature-evidence judge: how critically does a chat turn appraise the papers it cites?
+│   ├── mcp_oauth_login.py          # Log a service identity in to an OAuth-protected MCP server and print its credentials.
+│   ├── memory_premise_stats.py     # Premise measurement for cross-session memory: is there anything to remember?
+│   ├── pairwise_judge.py           # Blind, order-randomised pairwise LLM judging of the replay benchmark's matched pairs.
+│   ├── plot_conversation_scores.py # Plot evaluated conversation quality over time from analyze_conversations output.
+│   └── replay_benchmark.py         # Paired A/B replay benchmark for /chat/v1/chat.
+├── sdk/
+│   ├── __init__.py                 # The `genetics` SDK — importable data access for scripts.
+│   ├── _mr_estimators.py           # Two-sample MR estimators over a harmonised instrument frame.
+│   ├── _runner.py                  # Runs the SDK's async client from synchronous script code.
+│   ├── client.py                   # Async client behind the `genetics` SDK.
+│   ├── enrichment.py               # Gene set enrichment: which gene sets a list of genes, or a gene-level statistic, points at.
+│   ├── errors.py                   # Errors raised by the genetics SDK.
+│   ├── linemodels.py               # Line models: cluster effect estimates by the linear relationship between them.
+│   ├── mr.py                       # Mendelian randomization: instruments, harmonisation, estimates and checks in one call.
+│   └── plots.py                    # Standard plots, drawn the same way every time.
+├── skills/
+│   ├── __init__.py                 # Skill definitions and sandbox tools for subagents.
+│   ├── definitions.py              # Skill definitions for subagents.
+│   ├── sandbox_tools.py            # Sandbox tools for subagent file access.
+│   └── instructions/
+│       └── *.md
+└── tools/
+    ├── __init__.py                 # MCP tools for genetics data access.
+    ├── alphagenome.py              # Client for the AlphaGenome Atlas API (regulatory-track variant effect prediction).
+    ├── alphagenome_comparison.py   # Measured suite data placed beside AlphaGenome's prediction for the same variant.
+    ├── chembl.py                   # Client for the ChEMBL REST API (drug mechanisms, indications, bioactivity).
+    ├── definitions.py              # Tool definitions for genetics data access.
+    ├── executor.py                 # Tool executor - handles HTTP calls to genetics API and external services.
+    ├── orchestration.py            # The half of the tool executor that orchestrates other services.
+    ├── sql_safety.py               # Validation of caller-supplied values that get spliced into server-built BigQuery SQL.
+    └── uniprot.py                  # Client for the UniProt REST API and the EBI Proteins API.
 ```
+
+<!-- END GENERATED: module-tree -->
 
 ### Data flow
 
@@ -2843,13 +2916,18 @@ All configuration is via environment variables (`.env` file supported):
 
 ### Database and storage
 
+Defaults are read from `config/settings.py` by `scripts/gen-doc-blocks.py`; the descriptions
+are kept in that script.
+
+<!-- BEGIN GENERATED: database-env -->
+
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LLM_CONFIG_DB` | Path to LLM config SQLite DB | `/path/to/llm_config.db` |
-| `CHAT_HISTORY_DB` | Path to chat history SQLite DB | `/path/to/chat_history.db` |
+| `LLM_CONFIG_DB` | Path to LLM config SQLite DB | `/mnt/disks/data/llm_config.db` |
+| `CHAT_HISTORY_DB` | Path to chat history SQLite DB | `/mnt/disks/data/chat_history.db` |
 | `TURN_DRAIN_TIMEOUT_S` | How long shutdown waits for chat turns whose clients are gone before cancelling them; keep it inside the pod's termination grace period together with uvicorn's own drain | `270` |
-| `ATTACHMENT_STORAGE_PATH` | Path for file attachment storage | `/path/to/attachments` |
-| `MAX_ATTACHMENT_SIZE` | Max attachment size in bytes; data files are further capped at `sandbox_client.MAX_INPUT_BYTES` (not configurable) | `52428800` (50MB) |
+| `ATTACHMENT_STORAGE_PATH` | Path for file attachment storage | `/mnt/disks/data/attachments` |
+| `MAX_ATTACHMENT_SIZE` | Max attachment size in bytes; data files are further capped at `sandbox_client.MAX_INPUT_BYTES` (not configurable) | `52428800` (50 MiB) |
 | `MAX_MESSAGE_CHARS` | Max typed-text characters in a single user message (excludes attachments) | `50000` |
 | `MAX_REQUEST_CHARS` | Cap on total text across **all** messages in one chat request, images excluded. Deliberately generous — replayed tool results are legitimately far larger than a typed message — so it bounds the payload rather than policing use | `2000000` |
 | `HISTORY_PRUNE_TRIGGER_CHARS` | Serialised size of the replayed history past which the oldest tool results are cleared from the model's view (see "Replayed tool results are cleared past a budget"). About 300K tokens of JSON. `0` disables the pass | `900000` |
@@ -2860,6 +2938,8 @@ All configuration is via environment variables (`.env` file supported):
 | `MAX_FILE_BLOCK_BYTES` | Cap in UTF-8 bytes on one `[File: ...]` reference block, in any turn; mirrored by the browser | `8192` |
 | `DOWNLOAD_STORAGE_PATH` | Path for tool result download files | `/mnt/disks/data/downloads` |
 | `DOWNLOAD_TTL_SECONDS` | TTL for download files in seconds | `2592000` (30 days) |
+
+<!-- END GENERATED: database-env -->
 
 **Both SQLite databases run in WAL mode**, set by `_create_connection` in `chat_history_db.py`
 and `llm_config_db.py`. Under the default rollback journal a reader is refused while a write is
@@ -3255,6 +3335,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_benchmark_scorecard.py` | The scorecard never presents an arm that fell over as cheaper or faster: uncomparable cases are excluded from the totals with a reason, interval-priced cost is marked, an unpriced model is not reported as free, and a rate-limited run is called out before any number is read. For `--markdown`: a script is reproduced whole where the column views elide it, a fence outgrows backticks inside the value it wraps, discarded prose and absent tool results are declared, an uncomparable case still shows why its arm failed, and an unknown `--case` returns the refusal `main()` exits non-zero on. Per-arm output: a one-arm file holds only that arm yet still states the pair's comparability, keeps the question when only the other arm recorded it, refuses an unknown arm, and `main()` writes `FILE.<arm>.md` beside the paired file |
 | `test_benchmark_transcript.py` | The side-by-side transcript carries what distinguishes a *wide* arm from a *slow* one (per-call iteration, retry loops, script shapes) and never invents a measurement it lacks — an unattributed call has no iteration, and the final iteration's absent tool phase is not reported as a gap |
 | `test_pairwise_judge.py` | Blind pairwise judging (every judge call goes through a fake client — the suite never spends money): the arm cannot reach the prompt (no arm name, no tool trace, only the shared *user* turns as context), both presentation orders are actually used and seeded reproducibly across processes, a position-biased judge scores no wins, a failed call leaves the pair `unresolved` and does not pay for a second call, the exact sign test and the `MIN_DECISIVE_PAIRS` power rule (no p-value **and no win rate** below it, in the printed report *and* in every restricted table in the saved JSON), and the harness's own distortions being visible per arm rather than assumed even-handed: characters the answer-slicing rule discarded (and `dropped_prose_blocks` returning that same text with the call it followed, for the transcript and never for the judge), length measured on the text **as shown** to the judge rather than raw, per-arm truncation and provenance-marker counts, and pairs with an unextracted answer getting their own restricted table instead of scoring as losses |
+| `test_doc_blocks.py` | The gate for `scripts/gen-doc-blocks.py`: runs it with `--check`, so a generated block in this document that no longer matches its source fails the suite; a hand edit inside a block is rewritten, and a missing marker is refused (exit 2) rather than skipped |
 
 Run tests:
 ```bash
@@ -4151,6 +4232,10 @@ run covers every worktree too.
 - `README.md`: Installation, quick start, tool reference
 - `.env.example`: All configuration variables
 - This document: Architecture and implementation details
+
+The `<!-- BEGIN GENERATED -->` blocks in this document are written by `scripts/gen-doc-blocks.py`
+from the code they enumerate; edit the source, or the script for the hand-kept descriptions it
+holds, then re-run it. `tests/test_doc_blocks.py` fails while any block is stale.
 
 ## Architecture decisions
 
