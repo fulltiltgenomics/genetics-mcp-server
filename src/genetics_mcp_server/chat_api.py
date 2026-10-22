@@ -948,13 +948,8 @@ async def stream_chat(
     """
     Stream chat responses as Server-Sent Events (SSE).
 
-    The response is a stream of JSON objects:
-    - {"type": "content", "content": "text chunk"}
-    - {"type": "thinking"}  (keepalive while the model reasons; no content)
-    - {"type": "thinking_summary", "iteration": N, "text": "..."}  (only when the request
-      set `capture_thinking`; the model's SUMMARIZED reasoning, never the raw chain)
-    - {"type": "done", "message_content": [...]}
-    - {"type": "error", "error": "message"}
+    Each event is one JSON object keyed by `type`; read the types off what
+    `event_generator` below yields rather than from a list here.
     """
     settings = get_settings()
     service = get_llm_service()

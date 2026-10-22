@@ -546,6 +546,9 @@ def assistant_payload_sizes(con):
 
 
 def collect(db_path):
+    # mode=ro still creates a WAL database's -shm/-wal sidecars when they are absent, so in a
+    # read-only directory without them the first read fails (exit 1, empty stdout); a live
+    # chat-backend's database already has both
     con = sqlite3.connect(f"file:{quote(db_path)}?mode=ro", uri=True)
     try:
         pinned_expr, pinned_visible = sessions_pinned_column(con)

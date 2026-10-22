@@ -1,9 +1,16 @@
 """Entity extraction and cross-session digest rendering for chat memory.
 
-The premise measurement and the session digest must agree on what an entity is, so both
-call `extract_entities` here instead of each keying on its own list of parameter names.
-Kinds are a closed set: gene, phenotype, variant, dataset, view. `render_digest` turns a
-list of prior sessions into the text block a new session's prompt is seeded with.
+The premise measurement and the session digest both call `extract_entities` here rather
+than each keying on its own list of parameter names, so they agree on what a tool call's
+entity is; the premise also unions `extract_user_entities` and `extract_marker_entities`,
+which the digest does not call. Kinds are a closed set: gene, phenotype, variant, dataset,
+view. `render_digest` turns a list of prior sessions into the text block a new session's
+prompt is seeded with.
+
+Entities are not identifiers only: a quoted literal compared against an entity-like column
+name (`_COLUMN_KIND`) in a tool call's SQL or script text is extracted too, so a literal the
+model wrote can reach the digest — whitespace-collapsed, dropped if longer than
+`_MAX_VALUE_CHARS`, and at most `MAX_ENTITIES_PER_LINE` per session line.
 """
 
 import base64

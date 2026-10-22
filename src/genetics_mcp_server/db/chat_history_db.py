@@ -947,9 +947,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         Each dict carries id, title, created_at, updated_at, phenotype_code,
         pinned_at, first_user_message (the opening user turn's content), and
         assistant_content_json (that session's assistant messages' content_json,
-        in conversation order — the renderer extracts entities from tool_use
-        inputs there and never needs tool_results_json, so that column is not
-        fetched at all).
+        in conversation order). tool_results_json is not fetched.
 
         limit bounds the recency window by updated_at. With include_pinned, a
         pinned session (pinned_at NOT NULL) is still returned even when it
@@ -1384,6 +1382,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         )
         total = cursor.fetchone()["cnt"]
 
+        # no context_digest, for the same reason as get_session_any_user
         cursor.execute(
             f"""
             SELECT s.id, s.user_id, s.title, s.created_at, s.updated_at,
@@ -1450,6 +1449,8 @@ class ChatHistoryDB(object, metaclass=Singleton):
         conn = self._conn
         self._discard_stale_transaction(conn)
         cursor = conn.cursor()
+        # context_digest is not selected: it only indexes the owner's other sessions, whose
+        # full transcripts an admin can already open
         cursor.execute(
             """
             SELECT id, user_id, title, created_at, updated_at, rating, comment, phenotype_code, shared
