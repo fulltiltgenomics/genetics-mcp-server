@@ -13,6 +13,17 @@ from genetics_mcp_server import rate_limit
 from genetics_mcp_server.llm_service import StreamChunk
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _chat_api_imported_before_any_test_runs():
+    """Importing chat_api runs setup_logging(), which clears the root logger's handlers.
+
+    Most tests here import chat_api lazily, so the first one to do so inside its call phase
+    removed caplog's handler and captured nothing; a caplog test passed only when an earlier
+    test had already paid for the import.
+    """
+    from genetics_mcp_server import chat_api  # noqa: F401
+
+
 @pytest.fixture(autouse=True)
 def _fresh_rate_limit_window():
     """Every test starts with an empty rate-limit window.
