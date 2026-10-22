@@ -46,9 +46,11 @@ cohort): the FinnGen annotation is its reference or there is none.
 
 The exposure frequency's scale (`af_scale`) comes from what is known about its source, never
 from its values: a `maf` column is a minor-allele frequency, an `af`/`aaf` column the alt
-allele's, except for a dataset in `_MAF_UNDER_ALT_NAME`. On the MAF scale the reference is
+allele's, except for a dataset known to store a MAF under that name, such as UKB_PPP. On
+the MAF scale the reference is
 folded to a MAF too, so the comparison catches a wrong variant but cannot see a swapped
-allele at all, and `checks()` never passes it for orientation.
+allele at all, and `checks()` never passes it for orientation. `af_diff` is the exposure
+frequency minus the reference, both on that scale.
 
 `orientation_unverifiable` marks every instrument whose MAF exceeds (1 - af_tolerance) / 2:
 its two alleles' frequencies differ by less than the tolerance, so a mislabelled allele
@@ -772,9 +774,10 @@ def instruments(
     annotation AF (FinnGen first; gnomAD AF_nfe only for a non-Finnish exposure), with the
     source in `af_source`. A lead must reach `p_threshold` and, with `exclude_mhc`, lie
     outside chr6:25-34 Mb. `mode="cis"` keeps rows within `cis_window` of the gene whose
-    HGNC symbol equals the trait, and REFUSES when no cis set survives (no fallback).
-    `cis_window` is 1 Mb either side of the gene, not the investigation doc's 500 kb: 1 Mb
-    is what Zhang 2025 and the kill measurement used.
+    HGNC symbol equals the trait, and REFUSES when no cis set survives (no fallback). A set
+    straddling the window edge keeps only its members inside, so its lead is the max-pip
+    member inside the window. `cis_window` is 1 Mb either side of the gene, as in Zhang
+    2025.
 
     COST: a cis dict exposure costs two `sql` calls, the gene lookup then the fetch (a
     literal chr and pos range, which prunes the partition). `mode="genome_wide"` on a dict
@@ -1191,7 +1194,8 @@ _INJECTABLES = frozenset({"ld", "annotation", "sql", "ld_panels", "datasets", "s
                           "phenotypes", "exposure_dataset"})
 _COLOC_MAX_ROWS = 10_000
 # `cohorts` tokens of case-control consortia, whose sample prevalence says nothing about the
-# population's; a token not listed here gets the generic Steiger prevalence note
+# population's; a token not listed here gets the generic Steiger prevalence note. Stale when a
+# case-control consortium's token is added to `cohorts` in the suite's configs/datasets.yaml
 _CASE_CONTROL_CONSORTIA = frozenset({"iibdgc", "pgc", "covid_hgi", "gp2"})
 _select_instruments = instruments
 
@@ -1494,9 +1498,10 @@ def run(
     `REQUEST_CAP` (1,000 requests per execution: instrument selection + phenotypes + summary_stats chunks + coloc, the
     annotation lookups for rows without a frequency not included); and `outcomes` longer
     than `OUTCOME_CAP` (250, refused before any fetch: the execution's wall clock, not the
-    request cap, bounds a screen, so split it across executions). instruments() adds the
-    no-cis-set (D6) and pseudo-credible-set refusals. In a batch, an outcome that fails is
-    listed in `.failed` with the reason instead of stopping the others.
+    request cap, bounds a screen, so split it across executions). instruments() adds its
+    refusals: a cis exposure with no cis credible set, and a pseudo-credible-set exposure.
+    In a batch, an outcome that fails is listed in `.failed` with the reason instead of
+    stopping the others.
 
     Injectables (each defaults to the SDK function): ld, annotation, sql, ld_panels,
     datasets, phenotypes, summary_stats (sync or async, called with
