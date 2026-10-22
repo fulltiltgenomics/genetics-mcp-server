@@ -88,7 +88,7 @@ message (Egger and median need 3 variants: RSPO3 and CXCL10's 2-variant correlat
 | `mr_mbe` weighted/unweighted | MendelianRandomization | weighted and simple mode, stderror delta, phi 1, iterations 10000, seed 314159265 |
 | `mr:<method>` | TwoSampleMR | `mr()` with its default method list, `set.seed(20261010)` first, nboot 1000, phi 1 |
 | `mr_heterogeneity:*`, `mr_pleiotropy_test` | TwoSampleMR | Q for IVW and Egger, Egger intercept |
-| `mr_singlesnp`, `mr_leaveoneout` (per variant) | TwoSampleMR | defaults (Wald ratio per SNP; IVW leaving each out, K > 2 only) |
+| `mr_singlesnp`, `mr_leaveoneout` (per variant) | TwoSampleMR | defaults (Wald ratio per SNP; IVW leaving each out, K > 2 only). The `variant` column also holds the packages' pooled rows: `All` (leave-one-out: IVW over every instrument) and `All - Inverse variance weighted` / `All - MR Egger` (single-SNP) |
 | `get_r_from_bsen:*`, `get_r_from_lor:outcome`, `input` (per variant) | TwoSampleMR | the r each convention gives, and the ncase/ncontrol used |
 | `steiger_filtering` (per variant), `directionality_test`, `mr_steiger` | TwoSampleMR | exposure `units = "SD"` (r from beta, se, n); the IBD outcome `units = "log odds"` with the row's ncase/ncontrol and `prevalence` 0.1 (TwoSampleMR's assumed default) and 0.005 (closer to IBD), both written; synthetic outcome in SD units |
 
@@ -98,7 +98,8 @@ p-values handed to TwoSampleMR are 2 * pnorm(-|beta/se|) computed in `reference.
 
 - Deterministic and reproduced byte for byte by a second container run: everything below
   that is not a bootstrap SE. Closed-form estimators (Wald, IVW in every form, Egger, Q,
-  I2, leave-one-out, single-SNP, the r conventions, Steiger) can be matched to ~1e-10.
+  I2, leave-one-out, single-SNP, the r conventions, Steiger) are held to a relative 1e-9 by
+  `tests/test_sdk_mr_estimators.py` (its `REL`).
 - Weighted/simple median and mode **point estimates** are deterministic; their **SEs, CIs and
   p-values** come from seeded bootstraps (R's RNG), so a port matches them only within Monte
   Carlo error (a few percent at 10,000 iterations, more at TwoSampleMR's 1,000).

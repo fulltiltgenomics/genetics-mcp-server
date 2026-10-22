@@ -293,12 +293,12 @@ print(json.dumps({
 
 
 # Shipped by prune_venv.py's SDK_ALLOWLIST but NOT reachable from `import
-# genetics_mcp_server.sdk`, so the closure probe below cannot see them. sdk/plots.py,
-# sdk/linemodels.py and sdk/mr.py (with the _mr_estimators it imports) are resolved through
-# sdk/__init__.py's module __getattr__ precisely so the servers never import matplotlib or
-# numpy, which means the measurement that keeps this
-# file honest stops at their door — and a deferred `import somethingelse` inside either would
-# ship and fail inside the sandbox with nothing here objecting. Listed rather than measured
+# genetics_mcp_server.sdk`, so the closure probe below cannot see them. They are resolved
+# through sdk/__init__.py's module __getattr__ (mr's _mr_estimators by mr's own import)
+# precisely so the servers never import matplotlib, numpy or scipy, which means the
+# measurement that keeps this file honest stops at their door — and a deferred
+# `import somethingelse` inside any of them would ship and fail inside the sandbox with
+# nothing here objecting. Listed rather than measured
 # because there is nothing to measure: if this list and SDK_ALLOWLIST disagree, the symptom
 # is a shipped file nobody scans.
 SHIPPED_OUTSIDE_CLOSURE = (

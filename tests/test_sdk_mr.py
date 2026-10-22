@@ -556,7 +556,7 @@ def test_finnish_exposure_never_consults_gnomad_and_unknown_af_fails_the_floor()
     assert [s for s, _ in ann.calls] == ["finngen"]
 
 
-def test_pseudo_credible_sets_are_refused_by_default_naming_dataset_and_reason():
+def test_pseudo_credible_sets_are_refused_naming_dataset_and_reason():
     frame = cs([("1:1000100:A:G", "chr1_1000200_A_G", 0.9, 20.0, 0.2)])
     with pytest.raises(GeneticsUsageError, match=r"SETS has pseudo credible sets.*tens of kb"):
         run_instruments(frame, dataset=PSEUDO)
@@ -1220,7 +1220,7 @@ def test_coloc_rows_are_attached_for_a_partner_outcome_in_one_query():
     assert res.requests["colocalization.sql"] == 1
 
 
-def test_coloc_is_skipped_quietly_for_an_outcome_that_is_not_a_partner():
+def test_coloc_is_skipped_with_a_note_for_an_outcome_that_is_not_a_partner():
     sql = RunSQL(coloc=pl.DataFrame({"x": [1]}))
     res = mr_run(three_leads(), ("ibd_gwas", "P1"), sql=sql)
     assert res.coloc is None
