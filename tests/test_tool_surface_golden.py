@@ -22,8 +22,10 @@ default in settings.py moves this baseline the same way it would move production
 
 The chat half is resolved through the two functions the collapse edits — `LLMService.
 resolve_local_tools` and `resolve_proxied_tools` — rather than through `get_anthropic_tools`
-underneath them, so a collapse wired correctly in one and wrongly in the other is invisible
-to a baseline taken below them. The profile names in `PROFILES` reach the local half only
+underneath them, so a baseline taken below them could not see either half mis-wired. That
+the proxied half reaches both surfaces per request is pinned separately, by
+tests/test_llm_service.py::TestProxiedToolsReachBothSurfaces. The profile names in `PROFILES`
+reach the local half only
 through `code_execution_requested`, the edge every chat request goes through; the proxied
 half takes no surface argument at all, so it is recorded once for the whole chat backend
 rather than per profile — six copies of one answer would be six things to keep agreeing.

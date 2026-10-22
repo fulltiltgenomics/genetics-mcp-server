@@ -1435,7 +1435,11 @@ _PINNED_SKILL_TOOLS: dict[str, set[str]] = {
 
 
 class TestSkillToolSurface:
-    """Pins the resolved tool set of every skill."""
+    """Pins the local tool set of every skill.
+
+    External tools resolve to nothing in the test environment; their inclusion is
+    covered by TestExternalToolInclusion.
+    """
 
     def _resolve(self, skill):
         service = SubagentService(MagicMock(), MagicMock())

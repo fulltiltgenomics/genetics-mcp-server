@@ -854,8 +854,10 @@ value read back from a `chat_messages` row written by an older client.
 Downstream of that edge nothing reads the name for any surface decision at all:
 `resolve_local_tools`, `resolve_local_tool_names`, `get_anthropic_tools` and `stream_chat`
 all take `code_execution`, `resolve_tools` takes it too, and `resolve_proxied_tools` takes
-no surface argument of any kind. The one thing still handed the string is the turn-metrics
-row, which records what the client actually sent.
+no surface argument of any kind. The string is still recorded verbatim — in the turn-metrics
+row and in `stream_chat`'s tool-count log line — and `describe_available_tools` and
+`/chat/v1/tools/resolved` take it only to coerce it at their own edge and, for the latter, to
+report `known_profile`.
 
 **The stored value is never rewritten.** `chat_messages.tool_profile` and
 `user_settings.chat_tool_profile` keep the string the client wrote, legacy names included,
@@ -871,7 +873,7 @@ by it, via `tool_category()`). **No surface decision reads it.**
 
 | Category | Description |
 |----------|-------------|
-| `general` | Always available: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, compare_alphagenome_with_measured, get_gene_group_members, normalize_gene_symbols |
+| `general` | Labelling only; the code surface drops the ones marked `sdk_replaceable`: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, compare_alphagenome_with_measured, get_gene_group_members, normalize_gene_symbols |
 | `api` | Local genetics API tools: credible sets, gene data, colocalization, variant annotations, etc. |
 | `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
 | `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |

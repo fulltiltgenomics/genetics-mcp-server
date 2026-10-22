@@ -367,7 +367,7 @@ class TestMCPDisabledTools:
     def test_run_analysis_is_named_in_the_hardcoded_exclusion_set(self):
         """Belt and braces on the above: the entry is what §5 names, what an operator
 
-        greps for, and what catches a register_mcp_tools block added later.
+        greps for, and what catches a register_mcp_tools handler added later.
         """
         from genetics_mcp_server import mcp_server
 

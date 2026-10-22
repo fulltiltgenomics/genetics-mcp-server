@@ -1359,7 +1359,7 @@ class TestProxiedToolsReachBothSurfaces:
     Nothing in the sandbox can reach an external MCP server — its egress allow-list admits
     db-api and results-api only — so a code-surface request denied them would have no route
     to them at all. The subtraction that remains is EXTERNAL_MCP_EXCLUDE_TOOLS, which is a
-    deployment's and applies to everybody.
+    deployment's setting and applies to everybody.
     """
 
     def test_the_resolver_takes_no_surface_argument(self):
