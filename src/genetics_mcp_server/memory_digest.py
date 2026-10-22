@@ -287,7 +287,8 @@ def cluster_sessions(
 
     Cluster ids number from zero in order of each cluster's smallest key, so the same
     input gives the same numbering however the mapping happened to be iterated. Keys must
-    be mutually comparable.
+    be mutually comparable. Pass sets: an iterable that repeats an entity counts it once
+    per repeat toward `min_shared`.
     """
     if min_shared < 1:
         raise ValueError("min_shared must be at least 1")

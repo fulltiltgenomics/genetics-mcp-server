@@ -17,9 +17,9 @@ from .singleton import Singleton
 
 logger = logging.getLogger(__name__)
 
-# a project is a manual grouping the user maintains by hand; past twenty the sidebar
-# stops being something anyone files into, and the memory a project carries is only
-# as good as the filing
+# a judgement, not a measurement: a project is a manual grouping the user maintains by
+# hand, the memory a project carries is only as good as the filing, and the cap keeps
+# the sidebar short enough to file into
 PROJECTS_MAX_PER_USER = 20
 
 # shared by the CREATE TABLE and the one-time rebuild in _relax_turn_metrics_columns, so the

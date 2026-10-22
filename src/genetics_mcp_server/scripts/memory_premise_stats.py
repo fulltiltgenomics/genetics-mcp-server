@@ -45,7 +45,8 @@ WINDOW_DAYS = 90
 MIN_REMENTION_CHARS = 3
 # memory_gate.MEMORY_PROJECT_SESSION_CAP, copied rather than imported because the bundle
 # may import nothing of this package; a drift between the two makes M3 measure a window
-# the product does not have
+# the product does not have. The product's window also admits pinned sessions, which
+# analyse_clusters treats as in-window only when chat_sessions has pinned_at to read
 DIGEST_WINDOW_SESSIONS = 20
 # both linkage thresholds are reported: at 1 a single shared gene merges two lines of
 # work, at 2 a project has to be recognisable by more than one identifier

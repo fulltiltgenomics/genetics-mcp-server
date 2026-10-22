@@ -921,8 +921,8 @@ async def _resolve_user_memory(
     The gate is `memory_gate_open` — opt-in, gateway-asserted, non-secret, a named person.
     Every failure past it degrades to 'no memory' the way instruction sets do: memory is a
     convenience, and a convenience must never fail a chat turn. The opt-in read is inside
-    the try for that reason — it is a query against a second database, and it used to be
-    able to fail the turn.
+    the try for that reason: it is a query against a second database, which can fail on
+    its own.
     """
     try:
         return await asyncio.to_thread(

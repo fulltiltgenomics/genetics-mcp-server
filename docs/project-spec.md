@@ -1737,7 +1737,7 @@ project held nothing else to index — a hit, so the session does not re-render 
 the project gains a second conversation. `set_session_project` nulls it whenever the project
 actually changes, which is what makes a move re-render.
 
-`GET /chat/v1/chat/sessions` (`list_sessions`, `routers/chat_history.py`) now returns a
+`GET /chat/v1/chat/sessions` (`list_sessions`, `routers/chat_history.py`) returns a
 `pinned` field per session, sourced from `chat_sessions.pinned_at`.
 
 Status, detail string and response shape are identical for a foreign id and a nonexistent one on

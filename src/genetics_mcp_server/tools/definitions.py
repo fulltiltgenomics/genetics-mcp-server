@@ -2100,8 +2100,8 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
 #
 # subagent.py names all three in its `disabled` set except where a skill is granted
 # run_analysis explicitly; run_analysis and read_artifact are additionally in
-# mcp_server.py's _mcp_disabled, and run_analysis has no register_mcp_tools block at
-# all, so no disabled_tools set can register it (see the comment there).
+# mcp_server.py's _mcp_disabled, and run_analysis has no `@_tool()` handler in
+# register_mcp_tools at all, so no disabled_tools set can register it (see the comment there).
 CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "list_capabilities",
@@ -2139,7 +2139,7 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             # inside one tool's description, where it is invisible to the prompt and
             # contradicted whatever the prompt said about the other path. Nothing is lost
             # for MCP clients, which never see this tool at all — run_analysis has no
-            # register_mcp_tools block.
+            # handler in register_mcp_tools.
             "Run a Python script against the genetics data in a sandbox and get back what it "
             "printed. One script can query, join, filter and summarise in a single call.\n\n"
             "Keep a script to ONE chain of work. A run that overruns `timeout_s` returns "
@@ -2410,9 +2410,10 @@ Available skills:
 
 # the values a client may still put on the wire in `tool_profile`. NOT a set of surfaces:
 # `code_execution_requested` below maps every one of them onto the single boolean the
-# surface is resolved from. It survives because two callers have to tell a value this
+# surface is resolved from. It survives because three readers have to tell a value this
 # server recognises from one it does not — the admin's DEFAULT_TOOL_PROFILE validation
-# (routers/llm_config.py) and `known_profile` on /chat/v1/tools/resolved.
+# (routers/llm_config.py), `known_profile` on /chat/v1/tools/resolved, and
+# `code_execution_requested` itself, which warns on an unrecognised value.
 KNOWN_TOOL_PROFILES: frozenset[str] = frozenset(
     {"api", "bigquery", "rag", "nocode", "code"}
 )
@@ -2681,6 +2682,9 @@ def _gate(
     code_execution: bool | None,
 ) -> Callable[[], Callable[[Callable], Callable]]:
     """The one admission rule every `register_mcp_tools` handler goes through.
+
+    Not every /mcp tool: `mcp_proxy.register_proxy_tools` registers the proxied external
+    tools outside this gate and outside `disabled_tools`.
 
     Handlers used to divide into two classes — a few wrapped in `if "x" not in disabled:`
     and the rest registered whatever the caller asked for — so naming a tool in
@@ -3424,16 +3428,16 @@ def register_mcp_tools(
         """List the `genetics` SDK surface for one module ('genetics', 'client', 'errors', 'plots') as signatures with docstrings. Omit module for the index."""
         return await executor.list_capabilities(module=module)
 
-    # run_analysis has NO block here, deliberately, and the omission is the point.
+    # run_analysis has NO handler here, deliberately, and the omission is the point.
     # docs/code-execution-security.md §5 layer 1 names two registration-layer controls for
     # run_analysis — membership of mcp_server.py's _mcp_disabled, and the absent handler
-    # here — and then says the layer as a whole is assumed defeatable. The missing block is
+    # here — and then says the layer as a whole is assumed defeatable. The missing handler is
     # the half no set passed to this function can undo: `disabled_tools` can only subtract. It also matches what
     # the tool needs — the handler is given the authenticated user and the chat session id
     # by the caller, and an MCP session has neither, so a registered wrapper could only
     # ever pass identity it does not have. Keep _mcp_disabled's entry as well: it is the
     # named control the security doc and the tests reason about, and it is what catches a
-    # future block added here without this comment being read.
+    # future handler added here without this comment being read.
 
     @_tool()
     async def read_artifact(name: str) -> dict:
