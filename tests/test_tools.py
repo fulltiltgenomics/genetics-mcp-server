@@ -787,19 +787,19 @@ _CODE_SURFACE_NAMES = {
 class TestToolDefinitions:
     """Tests for tool definitions and surface resolution."""
 
-    def test_all_tools_have_category(self):
-        """Every tool definition must have a category field."""
+    def test_all_tools_have_group(self):
+        """Every tool definition must have a group field."""
         for tool in TOOL_DEFINITIONS:
-            assert "category" in tool, f"Tool {tool['name']} missing category"
+            assert "group" in tool, f"Tool {tool['name']} missing group"
         for tool in BIGQUERY_TOOL_DEFINITIONS:
-            assert "category" in tool, f"Tool {tool['name']} missing category"
+            assert "group" in tool, f"Tool {tool['name']} missing group"
 
-    def test_valid_categories(self):
-        """Tool categories must be one of the known values."""
-        valid = {"general", "api", "bigquery", "orchestration"}
+    def test_valid_groups(self):
+        """Tool groups are the browser panel's sections; a new value needs a section there."""
+        valid = {"lookup", "results", "sql", "analysis"}
         for tool in all_local_tool_definitions():
-            assert tool["category"] in valid, (
-                f"Tool {tool['name']} has invalid category {tool['category']}"
+            assert tool["group"] in valid, (
+                f"Tool {tool['name']} has invalid group {tool['group']}"
             )
 
     def test_every_definition_declares_sdk_replaceable(self):

@@ -43,7 +43,7 @@ from genetics_mcp_server.tools import (
     ServerToolExecutor,
     get_anthropic_tools,
 )
-from genetics_mcp_server.tools.definitions import code_execution_requested, tool_category
+from genetics_mcp_server.tools.definitions import code_execution_requested, tool_group
 from genetics_mcp_server.tools.orchestration import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
@@ -1062,8 +1062,8 @@ class LLMService:
         Both halves go through the same resolution the request itself uses
         (`resolve_local_tools`, `resolve_proxied_tools`), so the panel cannot list a tool
         the model is not given, or miss one it is. `source` distinguishes them because only
-        the local half has a category to group by — proxied tools carry the remote server's
-        own name and description and have no category at all.
+        the local half has a `group` to file under — proxied tools carry the remote server's
+        own name and description and belong to no panel group.
 
         Takes the wire value rather than the boolean because it is called straight off a
         query parameter; it is coerced here through the same edge function a chat request
@@ -1077,7 +1077,7 @@ class LLMService:
             {
                 "name": t["name"],
                 "description": t["description"],
-                "category": tool_category(t["name"]),
+                "group": tool_group(t["name"]),
                 "source": "local",
             }
             for t in local.definitions
@@ -1093,7 +1093,7 @@ class LLMService:
                 {
                     "name": t["name"],
                     "description": t.get("description", ""),
-                    "category": None,
+                    "group": None,
                     "source": source,
                 }
                 for t in definitions

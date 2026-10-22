@@ -1219,10 +1219,10 @@ class TestSubagentTruncation:
         assert payload["results"][0]["truncated"] is True
 
 
-# The exact tool names each skill resolves to. Pinned rather than derived: a skill's surface
-# used to be a function of tool `category` and the tool_profile table, so retuning either for
-# the main agent silently changed what a subagent could reach. A failure here means a skill
-# gained or lost a tool — decide whether that was intended, then update this map.
+# The exact tool names each skill resolves to. Pinned rather than derived: a surface derived
+# from the definitions' own fields (their `group`, the tool_profile table) lets a retuning
+# meant for the main agent silently change what a subagent can reach. A failure here means a
+# skill gained or lost a tool — decide whether that was intended, then update this map.
 _PINNED_SKILL_TOOLS: dict[str, set[str]] = {
     "genetics_data_extraction": {
         "analyze_variant_list",

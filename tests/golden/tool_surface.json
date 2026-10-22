@@ -433,8 +433,44 @@
     }
   },
   "local_tool_definitions": {
-    "by_category": {
-      "api": {
+    "by_group": {
+      "analysis": {
+        "count": 4,
+        "tools": [
+          "launch_subagents",
+          "list_capabilities",
+          "read_artifact",
+          "run_analysis"
+        ]
+      },
+      "lookup": {
+        "count": 22,
+        "tools": [
+          "compare_alphagenome_with_measured",
+          "get_alphagenome_variant_predictions",
+          "get_dataset_display_names",
+          "get_drug_profile",
+          "get_drug_targets_for_gene",
+          "get_gene_group_members",
+          "get_protein_annotations",
+          "get_resource_metadata",
+          "get_target_bioactivity",
+          "get_variant_protein_effect",
+          "list_datasets",
+          "lookup_phenotype_names",
+          "lookup_variants_by_rsid",
+          "map_protein_variants",
+          "normalize_gene_symbols",
+          "search_cbioportal",
+          "search_genes",
+          "search_mgi",
+          "search_phenotypes",
+          "search_scientific_literature",
+          "search_uniprot",
+          "web_search"
+        ]
+      },
+      "results": {
         "count": 46,
         "tools": [
           "analyze_variant_list",
@@ -485,47 +521,11 @@
           "get_variants_in_ld"
         ]
       },
-      "bigquery": {
+      "sql": {
         "count": 2,
         "tools": [
           "get_database_schema",
           "query_database"
-        ]
-      },
-      "general": {
-        "count": 22,
-        "tools": [
-          "compare_alphagenome_with_measured",
-          "get_alphagenome_variant_predictions",
-          "get_dataset_display_names",
-          "get_drug_profile",
-          "get_drug_targets_for_gene",
-          "get_gene_group_members",
-          "get_protein_annotations",
-          "get_resource_metadata",
-          "get_target_bioactivity",
-          "get_variant_protein_effect",
-          "list_datasets",
-          "lookup_phenotype_names",
-          "lookup_variants_by_rsid",
-          "map_protein_variants",
-          "normalize_gene_symbols",
-          "search_cbioportal",
-          "search_genes",
-          "search_mgi",
-          "search_phenotypes",
-          "search_scientific_literature",
-          "search_uniprot",
-          "web_search"
-        ]
-      },
-      "orchestration": {
-        "count": 4,
-        "tools": [
-          "launch_subagents",
-          "list_capabilities",
-          "read_artifact",
-          "run_analysis"
         ]
       }
     },

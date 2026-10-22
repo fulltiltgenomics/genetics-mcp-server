@@ -676,7 +676,7 @@ async def list_tools(
     `resolved=true` answers the question the browser's tools panel actually asks — what
     *this* conversation's assistant can do — by going through `describe_available_tools`,
     which resolves the local surface and the proxied ones exactly as a chat request does.
-    It carries `category` and `source` per tool instead of `parameters`: the panel groups
+    It carries `group` and `source` per tool instead of `parameters`: the panel groups
     by them, and the schemas are for the model, not the reader.
 
     Both shapes are a list of tool objects, so a caller that ignores the new fields is

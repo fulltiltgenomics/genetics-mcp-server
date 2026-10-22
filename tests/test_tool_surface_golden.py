@@ -214,9 +214,9 @@ def _named(names) -> dict[str, object]:
 
 def build_surface() -> dict:
     """Resolve every surface from the code as it stands right now."""
-    by_category: dict[str, list[str]] = {}
+    by_group: dict[str, list[str]] = {}
     for definition in all_local_tool_definitions():
-        by_category.setdefault(definition["category"], []).append(definition["name"])
+        by_group.setdefault(definition["group"], []).append(definition["name"])
 
     with _deployed_env("chat_backend"):
         service = _ResolverService()
@@ -256,8 +256,8 @@ def build_surface() -> dict:
 
     return {
         "local_tool_definitions": {
-            "count": sum(len(v) for v in by_category.values()),
-            "by_category": {k: _named(v) for k, v in sorted(by_category.items())},
+            "count": sum(len(v) for v in by_group.values()),
+            "by_group": {k: _named(v) for k, v in sorted(by_group.items())},
         },
         "chat_backend": {
             "deployed_flags_set": dict(sorted(DEPLOYED_FLAGS["chat_backend"].items())),

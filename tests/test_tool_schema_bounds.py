@@ -117,7 +117,7 @@ def test_pattern_is_forwarded_when_a_parameter_declares_one(monkeypatch):
     fake = [
         {
             "name": "synthetic_tool",
-            "category": "general",
+            "group": "lookup",
             "description": "synthetic",
             "parameters": {
                 "code": {
@@ -143,7 +143,7 @@ def test_zero_valued_bounds_survive_the_builder(monkeypatch):
     fake = [
         {
             "name": "synthetic_tool",
-            "category": "general",
+            "group": "lookup",
             "description": "synthetic",
             "parameters": {
                 "n": {"type": "integer", "minimum": 0, "maximum": 0},

@@ -826,8 +826,8 @@ script inside the sandbox reaches internal data through the `genetics` SDK, and 
 nothing else, because the sandbox egress allow-list names db-api and results-api only. So a
 tool that fetches internal data is `sdk_replaceable: True` and the code surface drops it; a
 tool that calls an outside host is `sdk_replaceable: False` and both surfaces carry it.
-`get_myvariant_annotations` is the case that shows the field is not the category: it is
-categorised `api` but calls myvariant.info through `external_client`.
+`get_myvariant_annotations` is the case that shows the field is not the panel group: it
+is filed under `results` but calls myvariant.info through `external_client`.
 
 Three tools are exempt from that rule and say so where they are defined:
 `search_genes`, `search_phenotypes` and `lookup_variants_by_rsid` have SDK routes but stay on
@@ -866,17 +866,19 @@ resolution. `KNOWN_TOOL_PROFILES` survives for the two callers that must tell a 
 value from an unrecognised one — the `DEFAULT_TOOL_PROFILE` admin validation and
 `known_profile` on `/chat/v1/tools/resolved` — and for the warning's own message.
 
-### Tool categories
+### Tool groups
 
-Each tool still has a `category` field, used for labelling (the browser's tools panel groups
-by it, via `tool_category()`). **No surface decision reads it.**
+Each tool has a `group` field, which is presentational: its values are the sections of the
+browser's tools panel, which files each local tool under its group via `tool_group()`. **No
+surface decision reads it.** The tools under each group are listed in
+`genetics-results-suite/docs/chat-tool-reference.md`; the per-group totals there are generated.
 
-| Category | Description |
-|----------|-------------|
-| `general` | Labelling only; the code surface drops the ones marked `sdk_replaceable`: search_phenotypes, search_genes, lookup_variants_by_rsid, lookup_phenotype_names, list_datasets, get_resource_metadata, get_dataset_display_names, search_scientific_literature, web_search, search_mgi, search_cbioportal, get_protein_annotations, map_protein_variants, get_variant_protein_effect, search_uniprot, get_drug_targets_for_gene, get_drug_profile, get_target_bioactivity, get_alphagenome_variant_predictions, compare_alphagenome_with_measured, get_gene_group_members, normalize_gene_symbols |
-| `api` | Local genetics API tools: credible sets, gene data, colocalization, variant annotations, etc. |
-| `bigquery` | BigQuery SQL tools: query_database, get_database_schema |
-| `orchestration` | launch_subagents, run_analysis, list_capabilities, read_artifact. No surface decision reads this value — `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents`. |
+| Group | Panel section | Contents |
+|-------|---------------|----------|
+| `lookup` | Lookup and search | Identifier resolution and the searches that are not about the hosted results: genes, phenotypes, variants, proteins, literature, the web. The code surface drops the ones marked `sdk_replaceable` like any other data tool |
+| `results` | Genetics results | The hosted results themselves: credible sets, gene data, colocalization, variant annotations, etc. |
+| `sql` | Database (SQL) | query_database, get_database_schema |
+| `analysis` | Analysis and orchestration | launch_subagents, run_analysis, list_capabilities, read_artifact. `subagent.py` drops three of them **by name**, to prevent recursive launches and to keep a subagent away from another execution's artifacts. `run_analysis` is not dropped: the `data_analysis` skill declares it and runs under the identity the caller threads into `run_subagents` |
 
 ### Profile behavior
 
@@ -901,7 +903,7 @@ That covers one of the two drift directions. The other is a profile added HERE t
 resolves the same way whichever side invented it. Changing the accepted set here still
 requires editing that file: `tests/test_unknown_profile_warning.py::test_the_profile_key_set_is_pinned_against_the_browsers_copy` pins `KNOWN_TOOL_PROFILES` against a literal so the decision is deliberate, mirroring the browser's own pin in `useChatOptions.test.ts`.
 
-`GET /chat/v1/tools?resolved=true[&tool_profile=<value>][&enable_tools=false]` answers this table for a caller: a list of `{name, description, category, source}`, where `source` is `local`, `external` or `rag` and `category` is null for the two proxied sources. Bare (`resolved` omitted) the endpoint keeps its older answer — `TOOL_DEFINITIONS` verbatim, with each tool's full `parameters`, but no profile filter, no `disabled_tools`, and neither the BigQuery nor the subagent list — which is the raw catalogue, not a surface anyone is ever handed. The browser's Tools panel (`genetics-results-browser/src/features/chat/ToolsDialog.tsx`) shows a user what the assistant on screen can do, so it asks with `resolved=true` and the conversation's own profile. Both halves resolve through the same functions a chat request does — `LLMService.resolve_local_tools` and `resolve_proxied_tools`, the latter extracted from `stream_chat` for exactly this reason — so the panel cannot name a tool the model was not given, or miss one it was.
+`GET /chat/v1/tools?resolved=true[&tool_profile=<value>][&enable_tools=false]` answers this table for a caller: a list of `{name, description, group, source}`, where `source` is `local`, `external` or `rag` and `group` is null for the two proxied sources. Bare (`resolved` omitted) the endpoint keeps its older answer — `TOOL_DEFINITIONS` verbatim, with each tool's full `parameters`, but no profile filter, no `disabled_tools`, and neither the BigQuery nor the subagent list — which is the raw catalogue, not a surface anyone is ever handed. The browser's Tools panel (`genetics-results-browser/src/features/chat/ToolsDialog.tsx`) shows a user what the assistant on screen can do, so it asks with `resolved=true` and the conversation's own profile. Both halves resolve through the same functions a chat request does — `LLMService.resolve_local_tools` and `resolve_proxied_tools`, the latter extracted from `stream_chat` for exactly this reason — so the panel cannot name a tool the model was not given, or miss one it was.
 
 The two proxied sources that endpoint reports — the external servers (gnomAD, Open Targets from `EXTERNAL_MCP_SERVERS`) and the RAG server (`RAG_MCP_SERVER`) — are the same for every profile value, so a `source` of `external` or `rag` tells a caller where a tool came from and never which profile earned it.
 
@@ -916,12 +918,12 @@ That default is the *request's*: a null `tool_profile` resolves to the no-code s
 An importable data-access package sitting **over** `ToolExecutor`, for code that consumes
 genetics data programmatically rather than through a tool schema. It is the data half of the
 code-execution agent: a script in the sandbox imports it instead of the agent calling the
-API-category tools one at a time. It wraps all but three of them; the `api`-category tools it
+`results`-group tools one at a time. It wraps all but three of them; the `results` tools it
 does **not** wrap are `get_credible_sets_stats`, `analyze_variant_list` and
 `get_myvariant_annotations`. The "Deliberately **not** in the SDK" section below gives the
-reasoning, but it is written across categories — its list also names `general`-category tools
-such as `search_uniprot`, which was never `api`-category — so it is not a substitute for
-the three named here.
+reasoning, but it is written across groups — its list also names `lookup` tools such as
+`search_uniprot`, which was never in `results` — so it is not a substitute for the three
+named here.
 
 The three are excluded deliberately, but not for one shared reason, and the axis that separates
 them is **not** whether the endpoint computes something server-side. It is whether the rows the
@@ -2772,7 +2774,7 @@ Each skill has:
 - Optional file read, for skills that inspect uploaded files
 - `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
-**Recursive launch prevention**: The `launch_subagents` tool has category `orchestration`, which is included only for the main agent. Subagent tool sets explicitly exclude `launch_subagents` to prevent recursive launches.
+**Recursive launch prevention**: Subagent tool sets explicitly exclude `launch_subagents` by name to prevent recursive launches; its `analysis` group plays no part in that.
 
 **Identity**: `run_subagents(tasks, progress_callback, *, user, session_id, gateway_asserted)` takes the caller's authenticated identity from the request context and carries it to `_execute_subagent_tool`, which injects it into `run_analysis` after stripping any same-named key the model wrote. It is keyword-only so no positional call site can slide a task field into the subject of a per-execution credential. Both `run_subagents` call sites are in `llm_service` (the streaming path and `_execute_tool`) and both pass the same triple the main path's own `run_analysis` injection uses.
 

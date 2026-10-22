@@ -439,13 +439,13 @@ class TestRcnvToolDefinitions:
         by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
 
         dosage = by_name["get_dosage_sensitivity"]
-        assert dosage["category"] == "api"
+        assert dosage["group"] == "results"
         assert dosage["sdk_replaceable"] is True
         assert dosage["parameters"]["genes"]["required"]
         assert dosage["parameters"]["genes"]["type"] == "array"
 
         rcnv = by_name["get_rcnv_associations"]
-        assert rcnv["category"] == "api"
+        assert rcnv["group"] == "results"
         assert rcnv["sdk_replaceable"] is True
         # neither selector is `required`: the tool takes either one, and the pair is
         # enforced in the executor because a schema cannot express "at least one of"

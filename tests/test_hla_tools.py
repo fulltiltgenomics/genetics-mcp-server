@@ -412,6 +412,6 @@ class TestHlaToolDefinitions:
         by_name = {t["name"]: t for t in TOOL_DEFINITIONS}
         assert by_name["get_hla_by_phenotype"]["parameters"]["phenotypes"]["required"]
         assert by_name["get_hla_by_allele"]["parameters"]["allele"]["required"]
-        # both are api-profile tools
-        assert by_name["get_hla_by_phenotype"]["category"] == "api"
-        assert by_name["get_hla_by_allele"]["category"] == "api"
+        # both sit with the hosted results in the tools panel
+        assert by_name["get_hla_by_phenotype"]["group"] == "results"
+        assert by_name["get_hla_by_allele"]["group"] == "results"

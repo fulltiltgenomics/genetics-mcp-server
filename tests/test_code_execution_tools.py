@@ -902,9 +902,9 @@ async def _run(executor, sandbox, **kwargs):
 
 
 class TestRunAnalysisDefinition:
-    def test_defined_as_an_orchestration_tool(self):
+    def test_defined_as_an_analysis_tool(self):
         by_name = {t["name"]: t for t in CODE_EXECUTION_TOOL_DEFINITIONS}
-        assert by_name["run_analysis"]["category"] == "orchestration"
+        assert by_name["run_analysis"]["group"] == "analysis"
 
     def test_takes_code_and_a_timeout_and_no_identity(self):
         """The identity is the caller's, never the model's: it is not an argument."""
