@@ -356,7 +356,8 @@ def test_ld_is_asked_for_over_more_than_the_plotted_span_and_above_a_floor(monke
 
 def test_a_correlated_partner_outside_the_window_is_reported_and_drawn(monkeypatch, tmp_path):
     """The failure this exists for: a ±250 kb plot of 12:49272869:C:T excludes
-    12:49564549:G:A, which is r²=0.78 with the lead and more significant than it."""
+    12:49564549:G:A, which is r²=0.78 with the lead and more significant than it. With
+    `data=` the window cannot be refetched wider, so the partner is reported instead."""
     from genetics_mcp_server import sdk
 
     def fake_ld(variant, *, window, r2_threshold, panel):
@@ -419,6 +420,120 @@ def test_a_weakly_correlated_partner_outside_the_window_is_not_reported():
     just_under = plots._LD_NOTABLE_R2 - 0.01
     ld = pl.DataFrame({"variant": ["12:100:A:G", "12:900:A:G"], "r2": [just_under, just_over]})
     assert [p["r2"] for p in plots._partners_outside(ld, 400, 600)] == [just_over]
+
+
+# ------------------------------------------------- the window widens to take partners in
+
+
+def test_a_widened_region_grows_only_the_sides_that_need_it():
+    right_only = [{"pos": 2_500}]
+    assert plots._widened_region("12:1000-2000", right_only) == "12:1000-2500"
+    both = [{"pos": 500}, {"pos": 2_500}]
+    assert plots._widened_region("12:1000-2000", both) == "12:500-2500"
+
+
+def fetched_regions(monkeypatch, partner_pos=49_700_000, partner_pval=1e-35):
+    """Fake the two fetches a widening makes: summary statistics per region, and LD that
+    names one r²=0.78 partner `partner_pos` past the default frame's right edge — stronger
+    than the first lead, so the widened window should lead with it."""
+    from genetics_mcp_server import sdk
+
+    regions = []
+    partner = f"12:{partner_pos}:G:A"
+
+    def fake_summary_stats(*, phenotypes, region, resource, data_type):
+        regions.append(region)
+        _chrom, lo, hi = plots.parse_region(region)
+        rows = frame_of().to_dicts()
+        if lo <= partner_pos <= hi:
+            rows.append(
+                {
+                    "chr": "12",
+                    "pos": partner_pos,
+                    "ref": "G",
+                    "alt": "A",
+                    "pval": partner_pval,
+                    "mlog10p": -math.log10(partner_pval),
+                }
+            )
+        return sumstats(rows)
+
+    def fake_ld(variant, *, window, r2_threshold, panel):
+        other = partner if variant != partner else "12:49503000:C:T"
+        return ld_answer({"variant": ["12:49505000:A:G", other], "r2": [0.9, 0.78]})
+
+    monkeypatch.setattr(sdk, "summary_stats", fake_summary_stats)
+    monkeypatch.setattr(sdk, "ld", fake_ld)
+    return regions
+
+
+def test_a_partner_outside_the_window_widens_it_in_the_same_call(monkeypatch, tmp_path):
+    """The reader used to get a warning and the model a second tool call; now the window
+    grows to take the partner in, the data is fetched again, and the stronger partner
+    leads the wider window."""
+    regions = fetched_regions(monkeypatch)
+    result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True, data=None)
+    assert regions == ["12:49400000-49600000", "12:49400000-49700000"]
+    assert result["region"] == "12:49400000-49700000"
+    assert result["widened_from"] == "12:49400000-49600000"
+    assert result["region_width_bp"] == 300_000
+    assert result["ld_partners_outside_window"] == []
+    assert result["lead"] == "12:49700000:G:A", "the widened window keeps the old lead"
+    assert result["n_variants"] == 26
+    assert "300 kb, widened from 200 kb" in ax.get_title()
+    assert not any("kb out" in t.get_text() for t in ax.texts), "a warning survived the widening"
+
+
+def test_widen_false_keeps_the_window_and_warns_instead(monkeypatch, tmp_path):
+    regions = fetched_regions(monkeypatch)
+    result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True, data=None, widen=False)
+    assert regions == ["12:49400000-49600000"]
+    assert result["region"] == "12:49400000-49600000"
+    assert result["widened_from"] is None
+    assert result["region_width_bp"] == 200_000
+    assert [p["variant"] for p in result["ld_partners_outside_window"]] == ["12:49700000:G:A"]
+    assert any("kb out" in t.get_text() for t in ax.texts), "the warning was not drawn"
+    assert ax.get_title().endswith("12:49400000-49600000 (200 kb)")
+
+
+def test_widening_stops_after_its_budget_and_says_what_is_still_out(monkeypatch, tmp_path):
+    """Each pass is two fetches, so a locus whose partners keep appearing further out does
+    not chase them forever: the figure then carries the warning, as it did before."""
+    from genetics_mcp_server import sdk
+
+    regions = []
+
+    def fake_summary_stats(*, phenotypes, region, resource, data_type):
+        regions.append(region)
+        _chrom, lo, hi = plots.parse_region(region)
+        rows = [
+            {"chr": "12", "pos": pos, "ref": "C", "alt": "T", "pval": 0.01, "mlog10p": 2.0}
+            for pos in range(lo, hi + 1, 10_000)
+        ]
+        rows[0].update(pval=1e-30, mlog10p=30.0)
+        return sumstats(rows)
+
+    def fake_ld(variant, *, window, r2_threshold, panel):
+        # always 50 kb past the right edge of whatever was last fetched
+        _chrom, _lo, hi = plots.parse_region(regions[-1])
+        return ld_answer({"variant": [f"12:{hi + 50_000}:G:A"], "r2": [0.8]})
+
+    monkeypatch.setattr(sdk, "summary_stats", fake_summary_stats)
+    monkeypatch.setattr(sdk, "ld", fake_ld)
+    result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True, data=None)
+    assert len(regions) == plots._MAX_WIDENINGS + 1
+    assert result["widened_from"] == "12:49400000-49600000"
+    assert len(result["ld_partners_outside_window"]) == 1
+    assert any("kb out" in t.get_text() for t in ax.texts), "the warning was not drawn"
+
+
+def test_the_title_and_the_dict_say_how_wide_the_window_is(monkeypatch, tmp_path):
+    result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path)
+    assert result["region_width_bp"] == 200_000
+    assert result["widened_from"] is None
+    assert ax.get_title().endswith("12:49400000-49600000 (200 kb)")
+    assert plots._span_label(1_200_000) == "1.2 Mb"
+    assert plots._span_label(500_000) == "500 kb"
 
 
 def test_dir_of_the_sdk_package_lists_the_lazily_resolved_plots_module():
@@ -998,6 +1113,24 @@ def test_the_legend_names_the_lead_and_the_panel_the_r2_came_from(monkeypatch, t
     assert result["lead"] in title
     assert "sisu99" in title, "the panel is hard-coded rather than taken from the call"
     assert "r^2" in title
+
+
+def test_the_legend_says_what_grey_means(monkeypatch, tmp_path):
+    """Grey is most of the points on most figures, and nothing on the figure said whether
+    it meant "weakly correlated" or "never measured" — it means either. The lowest coloured
+    bin starts at the floor asked of the server, so the two rows do not overlap."""
+    from genetics_mcp_server import sdk
+
+    monkeypatch.setattr(
+        sdk,
+        "ld",
+        lambda variant, **k: pl.DataFrame({"variant": ["12:49501000:C:T"], "r2": [0.9]}),
+    )
+    _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True)
+    legend = ax.get_legend()
+    labels = [t.get_text() for t in legend.get_texts()]
+    assert labels[-2:] == ["0.05–0.2", "< 0.05 or not in panel"]
+    assert legend.legend_handles[-1].get_color() == plots._LD_UNKNOWN
 
 
 def test_the_type_and_the_rules_are_sized_for_the_figure_these_draw(monkeypatch, tmp_path):

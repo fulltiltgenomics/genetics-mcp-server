@@ -47,22 +47,39 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from genetics_mcp_server.sdk.client import parse_region
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import LD_MAX_WINDOW
 
 __all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest", "volcano", "mr"]
 
+# Asked of the LD server rather than 0.0. At r²≥0 it answers with every variant in the panel,
+# which costs twice: the informative points disappear into a navy cloud of r²≈0, and the answer
+# is truncated positionally. Measured at 12:49272869:C:T — a ±250 kb request came back with
+# 3000 entries spanning 49,023,161–49,503,366 while the panel holds 3097 in that window, so the
+# right-hand edge of the plot went grey with nothing to say why. At this floor the same locus
+# returns 17 entries across ±500 kb: every point that carries colour, and no truncation.
+# A variant below it is grey — not measured-and-low, but "not among the ones worth colouring",
+# which is what grey already means for a variant the panel does not carry at all.
+_LD_MIN_R2 = 0.05
+
 # The LocusZoom convention, and deliberately not the house style's prop_cycle: a reader decodes
 # r² from these, so they are data encoding rather than decoration. Ordered high to low; the
-# first threshold a variant's r² meets or exceeds wins.
+# first threshold a variant's r² meets or exceeds wins. The lowest bin starts at the floor
+# asked of the server rather than at 0, because below the floor a variant is grey, and a
+# legend reading "< 0.2" over a grey row reading "< 0.05" would claim both colours for the
+# same r².
 _LD_BINS: tuple[tuple[float, str, str], ...] = (
     (0.8, "#D43F3A", "0.8–1.0"),
     (0.6, "#EEA236", "0.6–0.8"),
     (0.4, "#5CB85C", "0.4–0.6"),
     (0.2, "#46B8DA", "0.2–0.4"),
-    (0.0, "#357EBD", "< 0.2"),
+    (0.0, "#357EBD", f"{_LD_MIN_R2:g}–0.2"),
 )
 _LD_UNKNOWN = "#BBBBBB"
+# the grey row of the legend: the two reasons a point is grey are told apart by nothing on
+# the figure, so the label names both
+_LD_UNKNOWN_LABEL = f"< {_LD_MIN_R2:g} or not in panel"
 _LEAD_COLOUR = "#7D26CD"
 
 # Shape carries consequence, colour carries LD: two channels, so a coding variant in high LD
@@ -115,20 +132,11 @@ _TICK_SIZE = 6
 _AXIS_LINEWIDTH = 0.5
 _TICK_LENGTH = 2.0
 
-# Asked of the LD server rather than 0.0. At r²≥0 it answers with every variant in the panel,
-# which costs twice: the informative points disappear into a navy cloud of r²≈0, and the answer
-# is truncated positionally. Measured at 12:49272869:C:T — a ±250 kb request came back with
-# 3000 entries spanning 49,023,161–49,503,366 while the panel holds 3097 in that window, so the
-# right-hand edge of the plot went grey with nothing to say why. At this floor the same locus
-# returns 17 entries across ±500 kb: every point that carries colour, and no truncation.
-# A variant below it is grey — not measured-and-low, but "not among the ones worth colouring",
-# which is what grey already means for a variant the panel does not carry at all.
-_LD_MIN_R2 = 0.05
-
 # LD is asked for over this multiple of the plotted span so a correlated partner just outside
-# the window can be named rather than silently omitted. Measured at the same locus: the
-# strongest variant there (r²=0.78, and more significant than the lead) sits 292 kb away, so a
-# ±250 kb plot drops the one point showing the signal is not a singleton.
+# the window is seen, and the window widened to take it in, rather than silently omitted.
+# Measured at the same locus: the strongest variant there (r²=0.78, and more significant than
+# the lead) sits 292 kb away, so a ±250 kb plot drops the one point showing the signal is not
+# a singleton.
 _LD_SEARCH_SPAN_MULTIPLE = 2
 
 _LD_MIN_WINDOW = 200_000
@@ -143,10 +151,18 @@ _LEAD_MIN_MAF = 0.01
 # how many `label_r2` neighbours are named. More than this and the labels are the figure.
 _MAX_R2_LABELS = 8
 
-# r² at which a partner outside the window is worth reporting. The note asks the reader to
-# redraw at a wider window, so it sits where that is worth doing — a partner the ramp would
-# have shown as strongly correlated — rather than at every partner the search span reaches.
+# r² at which a partner outside the window is worth widening the window for. It sits where
+# the redraw is worth its cost — a partner the ramp would have shown as strongly correlated —
+# rather than at every partner the search span reaches, which would pull every window out to
+# the LD search's edge.
 _LD_NOTABLE_R2 = 0.6
+
+# How many times the window is widened to take in partners found past its edge. Each pass
+# costs one summary-statistics fetch and one LD request, and the LD search reaches twice the
+# plotted span, so the second pass already sees past the first pass's new edges. A locus whose
+# correlated partners keep turning up further out than that is one to frame by hand, and the
+# figure says what was still left out.
+_MAX_WIDENINGS = 2
 
 
 def _artifacts_dir() -> str:
@@ -344,13 +360,16 @@ def _phenotype_name(phenotype: str) -> str | None:
     return str(name)
 
 
-def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: str) -> str:
-    """`Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14) — 12:49022869-49522869`.
+def _default_title(
+    phenotype: str, region: str, frame: pl.DataFrame, resource: str, width: str = ""
+) -> str:
+    """`Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14) — 12:49022869-49522869 (500 kb)`.
 
     The code stays in the title even when the name resolves, because it is what a follow-up
     query takes and the name is not. Release and resource are read off the frame rather than
     off the arguments, so a caller who passed `data=` gets the label of the data they actually
-    plotted instead of this function's `resource` default.
+    plotted instead of this function's `resource` default. `width` names how wide the window
+    is, which the coordinates state only to a reader willing to subtract them.
 
     Every part is optional and the title degrades one piece at a time: no name leaves the code
     in front, no release leaves the resource alone, and neither leaves `CODE — region`.
@@ -368,7 +387,8 @@ def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: s
     )
     inside = ", ".join(part for part in (phenotype if name else None, source) if part)
     head = name or phenotype
-    return f"{head} ({inside}) — {region}" if inside else f"{head} — {region}"
+    where = f"{region} ({width})" if width else region
+    return f"{head} ({inside}) — {where}" if inside else f"{head} — {where}"
 
 
 def _consequences(region: str) -> dict[str, tuple[str | None, str | None]] | None:
@@ -424,6 +444,23 @@ def _partners_outside(ld_frame: pl.DataFrame | None, lo: int, hi: int) -> list[d
         found.append({"variant": _norm_variant_id(variant), "pos": pos, "r2": float(r2)})
     found.sort(key=lambda partner: partner["r2"], reverse=True)
     return found
+
+
+def _widened_region(region: str, outside: list[dict[str, Any]]) -> str:
+    """`region` grown, on whichever sides need it, exactly to the partners it excluded.
+
+    No margin past the partner: the axis already pads 2% of the span beyond the outermost
+    point, so an edge partner is drawn clear of the frame, and the next pass's LD search
+    reaches twice the new span, so anything correlated beyond it is still found.
+    """
+    chrom, lo, hi = parse_region(region)
+    positions = [partner["pos"] for partner in outside]
+    return f"{chrom}:{min(lo, *positions)}-{max(hi, *positions)}"
+
+
+def _span_label(width: int) -> str:
+    """`500 kb`, `1.2 Mb`: the width of a window, as a reader would say it."""
+    return f"{width / 1e6:.1f} Mb" if width >= 1_000_000 else f"{width / 1e3:.0f} kb"
 
 
 def _region_from_variant(variant: str, flank: int) -> tuple[str, str]:
@@ -900,6 +937,7 @@ def locuszoom(
     region: str | None = None,
     variant: str | None = None,
     flank: int = 250_000,
+    widen: bool = True,
     resource: str = "finngen",
     data_type: str = "gwas",
     lead: str | None = None,
@@ -940,15 +978,20 @@ def locuszoom(
     THE DEFAULT WINDOW IS THE RIGHT ONE UNLESS THE QUESTION IS ABOUT THE WINDOW. `flank` is
     250 kb either side, i.e. a 500 kb plot; pass `variant=` and leave it alone. Widening it as
     a matter of course spreads the signal over a picture that is mostly empty, and a locus
-    that genuinely needs more says so — `ld_partners_outside_window` names the correlated
-    variants the window excluded, and that is the signal to redraw wider.
+    that genuinely needs more is widened here, in the same call: LD is looked up past both
+    edges, and when a variant at r² ≥ 0.6 with the lead lies outside the window the region is
+    grown to take it in and the summary statistics fetched again, up to twice. There is no
+    need to redraw. `widen=False` keeps the window exactly as given. Whatever was drawn,
+    `region` in the returned dict is the window actually plotted and `region_width_bp` its
+    width; ALWAYS tell the user how wide the plotted region is, and that it was widened
+    (`widened_from` names the window asked for) when it was.
 
     Colour is LD and shape is consequence, so a coding variant in high LD reads as both at
     once: a square sits in a coding sequence or changes the protein, a circle does not, and
     the lead takes whichever shape its own consequence gives it. Grey means "no r² to show" —
     either the LD panel does not carry the variant or its r² is below the floor these plots
-    colour at. Only the correlated variants are coloured, so the ramp reads at a glance
-    instead of painting the whole cloud navy.
+    colour at — and the legend says so. Only the correlated variants are coloured, so the
+    ramp reads at a glance instead of painting the whole cloud navy.
 
     The gene track draws one model per gene: a hairline over the transcript, a bar per exon
     of it, and a thicker bar over the part of each exon that is translated, so an
@@ -959,8 +1002,8 @@ def locuszoom(
     when the API served no exon structure, in which case the track is gene bodies only.
 
     Returns a dict describing what was drawn: `path`, `lead`, `lead_mlog10p`, `region`,
-    `phenotype`, `n_variants`, `n_genes`, `n_exons`, plus the ones below, worth reading every
-    time.
+    `region_width_bp`, `widened_from`, `phenotype`, `n_variants`, `n_genes`, `n_exons`, plus
+    the ones below, worth reading every time.
 
     `ld_joined` is False when there is no r² to colour by — a plot with grey points rather
     than an error, because a locuszoom without LD is still the right picture of the locus.
@@ -975,11 +1018,12 @@ def locuszoom(
     "unavailable" — the LD server failed, the one case worth retrying later;
     "off" — `ld=False`.
 
-    `ld_partners_outside_window` lists the variants correlated with the lead that fall
-    outside the window, strongest first, as {variant, pos, r2}. It is non-empty when the
-    window is too narrow for the locus — the signal has support the plot does not show — and
-    the fix is to redraw with a larger `flank` or an explicit `region`. The figure carries
-    the same warning so a reader who never sees this dict is not misled.
+    `ld_partners_outside_window` lists the variants correlated with the lead that still fall
+    outside the plotted window, strongest first, as {variant, pos, r2}. It is normally empty,
+    because the window is widened to take them in; it is non-empty only when that could not
+    happen — `data=` was given, `widen=False`, or the partners kept appearing further out
+    than two widenings reach — and then the figure carries the same warning so a reader who
+    never sees this dict is not misled. Say so rather than redrawing.
 
     `coding_marked` is False when the consequence lookup did not answer, in which case every
     point is a circle and shape means nothing; set `coding=False` to skip that fetch outright.
@@ -1009,96 +1053,115 @@ def locuszoom(
     chrom = None
     if variant and not region:
         region, chrom = _region_from_variant(variant, flank)
-
-    frame = (
-        data
-        if data is not None
-        else sdk.summary_stats(
-            phenotypes=phenotype, region=region, resource=resource, data_type=data_type
-        )
-    )
-    if frame.is_empty():
-        raise GeneticsUsageError(
-            f"no summary statistics for {phenotype!r} in {region} "
-            f"(resource={resource!r}, data_type={data_type!r}) — nothing to plot"
-        )
-    for needed in ("pos",):
-        if needed not in frame.columns:
-            raise GeneticsUsageError(
-                f"summary statistics have no {needed!r} column; got {frame.columns}"
-            )
-
-    frame = frame.with_columns(_mlog10p(frame).alias("_y"))
-    if {"chr", "ref", "alt"} <= set(frame.columns):
-        frame = frame.with_columns(
-            pl.struct(["chr", "pos", "ref", "alt"])
-            .map_elements(
-                lambda r: _variant_id(r["chr"], r["pos"], r["ref"], r["alt"]),
-                return_dtype=pl.Utf8,
-            )
-            .alias("_variant_id")
-        )
-    else:
-        frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("_variant_id"))
+    requested_region = region
+    if label_r2 is not None and not 0 < label_r2 <= 1:
+        raise GeneticsUsageError(f"label_r2 is an r² threshold in (0, 1], got {label_r2!r}")
+    centre = _norm_variant_id(variant) if variant else None
+    highlights = [highlight] if isinstance(highlight, str) else list(highlight or [])
 
     def row_id(row: dict[str, Any]) -> str:
         return row["_variant_id"] or f"{row.get('chr', chrom)}:{row['pos']}"
 
-    strongest = row_id(frame.sort("_y", descending=True).row(0, named=True))
-    if lead is None:
-        lead_row = _default_lead(frame, significance)
-        lead = row_id(lead_row)
-    else:
-        match = frame.filter(pl.col("_variant_id") == _norm_variant_id(lead))
-        if match.is_empty():
-            raise GeneticsUsageError(f"lead {lead!r} is not among the variants in {region}")
-        lead_row = match.row(0, named=True)
-    lead_pos, lead_y = lead_row["pos"], lead_row["_y"]
-    lead_id = _norm_variant_id(lead)
-
-    if label_r2 is not None and not 0 < label_r2 <= 1:
-        raise GeneticsUsageError(f"label_r2 is an r² threshold in (0, 1], got {label_r2!r}")
-    known_ids = set(frame["_variant_id"].drop_nulls().to_list())
-    marked: list[str] = []
-    centre = _norm_variant_id(variant) if variant else None
-    if centre and centre != lead_id and centre in known_ids:
-        marked.append(centre)
-    for wanted in [highlight] if isinstance(highlight, str) else list(highlight or []):
-        wanted_id = _norm_variant_id(wanted)
-        if wanted_id not in known_ids:
-            raise GeneticsUsageError(f"highlight {wanted!r} is not among the variants in {region}")
-        if wanted_id != lead_id and wanted_id not in marked:
-            marked.append(wanted_id)
-
-    # the window the DATA covers. Computed here rather than at plotting time because the LD
-    # request is sized from it: `flank` is meaningless when the caller gave region=, and the
-    # old `2 * flank` asked for the default width regardless of what was actually drawn.
-    span_lo, span_hi = int(frame["pos"].min()), int(frame["pos"].max())
-
-    ld_frame = None
-    ld_failure = None
-    outside: list[dict[str, Any]] = []
-    # the server's `window` is the TOTAL span it centres on the lead, so this is
-    # _LD_SEARCH_SPAN_MULTIPLE times the plotted width — wide enough to cover the window from
-    # a lead anywhere inside it, and to see just past both edges — up to the server's ceiling
-    ld_window = min(
-        max(_LD_SEARCH_SPAN_MULTIPLE * max(span_hi - span_lo, 1), _LD_MIN_WINDOW),
-        # past the server's ceiling the answer is a 400 and the whole figure goes grey
-        LD_MAX_WINDOW,
-    )
-    if ld:
-        try:
-            ld_frame = sdk.ld(lead_id, window=ld_window, r2_threshold=_LD_MIN_R2, panel=ld_panel)
-        except GeneticsError as exc:
-            # neither loses the figure, but they are different answers: a lead the panel does
-            # not carry stays that way, and only a failed server is worth a retry
-            ld_failure = (
-                "lead_not_in_panel" if exc.code == "ld_variant_not_in_panel" else "unavailable"
+    # Fetch, choose the lead, ask for LD, and go round again on a wider window when the LD
+    # search found a partner the window excludes. The lead is chosen afresh each pass: the
+    # partner that forced the widening is often stronger than the lead that found it, and
+    # a window the reader sees as "this is the locus" should lead with its strongest point.
+    widenings = 0
+    while True:
+        frame = (
+            data
+            if data is not None
+            else sdk.summary_stats(
+                phenotypes=phenotype, region=region, resource=resource, data_type=data_type
             )
-        except Exception:
-            ld_failure = "unavailable"
+        )
+        if frame.is_empty():
+            raise GeneticsUsageError(
+                f"no summary statistics for {phenotype!r} in {region} "
+                f"(resource={resource!r}, data_type={data_type!r}) — nothing to plot"
+            )
+        for needed in ("pos",):
+            if needed not in frame.columns:
+                raise GeneticsUsageError(
+                    f"summary statistics have no {needed!r} column; got {frame.columns}"
+                )
+
+        frame = frame.with_columns(_mlog10p(frame).alias("_y"))
+        if {"chr", "ref", "alt"} <= set(frame.columns):
+            frame = frame.with_columns(
+                pl.struct(["chr", "pos", "ref", "alt"])
+                .map_elements(
+                    lambda r: _variant_id(r["chr"], r["pos"], r["ref"], r["alt"]),
+                    return_dtype=pl.Utf8,
+                )
+                .alias("_variant_id")
+            )
         else:
-            outside = _partners_outside(ld_frame, span_lo, span_hi)
+            frame = frame.with_columns(pl.lit(None, dtype=pl.Utf8).alias("_variant_id"))
+
+        strongest = row_id(frame.sort("_y", descending=True).row(0, named=True))
+        if lead is None:
+            lead_row = _default_lead(frame, significance)
+            lead_id = _norm_variant_id(row_id(lead_row))
+        else:
+            match = frame.filter(pl.col("_variant_id") == _norm_variant_id(lead))
+            if match.is_empty():
+                raise GeneticsUsageError(f"lead {lead!r} is not among the variants in {region}")
+            lead_row = match.row(0, named=True)
+            lead_id = _norm_variant_id(lead)
+        lead_pos, lead_y = lead_row["pos"], lead_row["_y"]
+
+        known_ids = set(frame["_variant_id"].drop_nulls().to_list())
+        marked: list[str] = []
+        if centre and centre != lead_id and centre in known_ids:
+            marked.append(centre)
+        for wanted in highlights:
+            wanted_id = _norm_variant_id(wanted)
+            if wanted_id not in known_ids:
+                raise GeneticsUsageError(
+                    f"highlight {wanted!r} is not among the variants in {region}"
+                )
+            if wanted_id != lead_id and wanted_id not in marked:
+                marked.append(wanted_id)
+
+        # the window the DATA covers. Computed here rather than at plotting time because the
+        # LD request is sized from it: `flank` is meaningless when the caller gave region=,
+        # and the old `2 * flank` asked for the default width regardless of what was drawn.
+        span_lo, span_hi = int(frame["pos"].min()), int(frame["pos"].max())
+
+        ld_frame = None
+        ld_failure = None
+        outside: list[dict[str, Any]] = []
+        # the server's `window` is the TOTAL span it centres on the lead, so this is
+        # _LD_SEARCH_SPAN_MULTIPLE times the plotted width — wide enough to cover the window
+        # from a lead anywhere inside it, and to see just past both edges — up to the
+        # server's ceiling
+        ld_window = min(
+            max(_LD_SEARCH_SPAN_MULTIPLE * max(span_hi - span_lo, 1), _LD_MIN_WINDOW),
+            # past the server's ceiling the answer is a 400 and the whole figure goes grey
+            LD_MAX_WINDOW,
+        )
+        if ld:
+            try:
+                ld_frame = sdk.ld(
+                    lead_id, window=ld_window, r2_threshold=_LD_MIN_R2, panel=ld_panel
+                )
+            except GeneticsError as exc:
+                # neither loses the figure, but they are different answers: a lead the panel
+                # does not carry stays that way, and only a failed server is worth a retry
+                ld_failure = (
+                    "lead_not_in_panel" if exc.code == "ld_variant_not_in_panel" else "unavailable"
+                )
+            except Exception:
+                ld_failure = "unavailable"
+            else:
+                outside = _partners_outside(ld_frame, span_lo, span_hi)
+        # a frame handed in cannot be refetched wider, so with data= the partners stay a
+        # warning on the figure, as they do once the widening budget is spent
+        if not outside or not widen or data is not None or widenings == _MAX_WIDENINGS:
+            break
+        widenings += 1
+        region = _widened_region(region, outside)
     colours, r2_values, ld_joined = _ld_colours(frame, lead_id, ld_frame)
     ld_reach = ld_window // 2
     if not ld:
@@ -1236,12 +1299,23 @@ def locuszoom(
             color=_WARNING_COLOUR,
         )
 
-    _dress(ax, title if title is not None else _default_title(phenotype, region, frame, resource))
+    _chrom, region_lo, region_hi = parse_region(region)
+    region_width = region_hi - region_lo
+    width_label = _span_label(region_width)
+    if widenings:
+        _c, asked_lo, asked_hi = parse_region(requested_region)
+        width_label += f", widened from {_span_label(asked_hi - asked_lo)}"
+    _dress(
+        ax,
+        title
+        if title is not None
+        else _default_title(phenotype, region, frame, resource, width_label),
+    )
     ax.margins(x=0.02)
     if ld_joined:
         handles = [
             plt.Line2D([], [], marker="o", linestyle="", markersize=4, color=colour, label=label)
-            for _threshold, colour, label in _LD_BINS
+            for _threshold, colour, label in (*_LD_BINS, (None, _LD_UNKNOWN, _LD_UNKNOWN_LABEL))
         ]
         # the panel is named, not just the quantity: r² is to the lead and from one LD panel,
         # and a reader comparing two figures cannot tell either from a bare "r²". The panel
@@ -1328,6 +1402,8 @@ def locuszoom(
         "lead": lead_id,
         "lead_mlog10p": float(lead_y),
         "region": region,
+        "region_width_bp": region_width,
+        "widened_from": requested_region if widenings else None,
         "phenotype": phenotype,
         "n_variants": frame.height,
         "n_genes": n_genes,
