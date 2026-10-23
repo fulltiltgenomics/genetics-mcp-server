@@ -4206,9 +4206,12 @@ literature result is shown to the judge up to the answering model's own tool-res
 
 ## Lint gate
 
-`scripts/lint-staged.sh` runs ruff over the **staged** Python files from the `pre-commit`
-hook and **fails the commit** when anything is reported. `git commit --no-verify` is the
-bypass. It is the one pre-commit check that blocks; `scripts/check-doc-drift.sh` only warns.
+`scripts/lint-staged.sh` runs `ruff check` and then `ruff format --check` over the
+**staged** Python files from the `pre-commit` hook and **fails the commit** when either
+reports anything. `git commit --no-verify` is the bypass. It is the one pre-commit check
+that blocks; `scripts/check-doc-drift.sh` only warns. The gate checks formatting rather
+than applying it: a hook that rewrites files behind the commit stages something the author
+never saw, so an unformatted file is fixed with `ruff format <file>` and re-staged.
 
 - **Staged, not repo-wide.** A finding in a file the commit does not touch never blocks it.
   The other side of that coin is that a pre-existing finding is only ever cleared by

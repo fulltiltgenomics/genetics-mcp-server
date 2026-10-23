@@ -72,13 +72,14 @@ uv sync --extra dev
 # tests
 uv run pytest
 
-# lint (the whole repo, as the pre-commit gate's --all mode does)
-uv run ruff check
+# lint and format-check (the whole repo, as the pre-commit gate's --all mode does)
+uv run ruff check && uv run ruff format --check
 ```
 
 `scripts/install-git-hooks.sh`, run once per clone, wires `core.hooksPath` so the
 `pre-commit` hook runs: `scripts/check-doc-drift.sh` warns, and `scripts/lint-staged.sh`
-lints the staged Python files and **blocks the commit** on a finding. The setting is
+lints and format-checks the staged Python files and **blocks the commit** on a finding or an
+unformatted file (`ruff format <file>` fixes the latter; the gate never rewrites files itself). The setting is
 shared across worktrees, so one run covers every worktree too. In a worktree with no
 `.venv`, the gate falls back to the main checkout's ruff, then `PATH`, then `uvx` — and
 fails the commit if it finds none, rather than passing it unchecked.
