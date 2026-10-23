@@ -26,7 +26,15 @@ import sys
 
 from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
 
-REQUIRED = ("log_id", "created_at", "user_id", "iterations", "input_tokens", "output_tokens", "cost_usd")
+REQUIRED = (
+    "log_id",
+    "created_at",
+    "user_id",
+    "iterations",
+    "input_tokens",
+    "output_tokens",
+    "cost_usd",
+)
 
 
 def read_turns(stream) -> list[dict]:
@@ -42,17 +50,19 @@ def read_turns(stream) -> list[dict]:
         missing = [k for k in REQUIRED if row.get(k) in (None, "")]
         if missing:
             raise SystemExit(f"row {row.get('log_id')!r} is missing {missing}")
-        turns.append({
-            "log_id": row["log_id"],
-            "created_at": row["created_at"],
-            "user_id": row["user_id"],
-            "session_id": row.get("session_id") or None,
-            "model": row.get("model") or None,
-            "iterations": int(row["iterations"]),
-            "input_tokens": int(row["input_tokens"]),
-            "output_tokens": int(row["output_tokens"]),
-            "cost_usd": float(row["cost_usd"]),
-        })
+        turns.append(
+            {
+                "log_id": row["log_id"],
+                "created_at": row["created_at"],
+                "user_id": row["user_id"],
+                "session_id": row.get("session_id") or None,
+                "model": row.get("model") or None,
+                "iterations": int(row["iterations"]),
+                "input_tokens": int(row["input_tokens"]),
+                "output_tokens": int(row["output_tokens"]),
+                "cost_usd": float(row["cost_usd"]),
+            }
+        )
     return turns
 
 

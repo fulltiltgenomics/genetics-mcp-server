@@ -146,9 +146,7 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._connections: dict[int, sqlite3.Connection] = dd(
-            lambda: self._create_connection()
-        )
+        self._connections: dict[int, sqlite3.Connection] = dd(lambda: self._create_connection())
         self._init_db()
 
     def _create_connection(self) -> sqlite3.Connection:
@@ -165,9 +163,7 @@ class LLMConfigDB(object, metaclass=Singleton):
         return self._connections[threading.get_ident()]
 
     def _table_exists(self, cursor: sqlite3.Cursor, name: str) -> bool:
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-        )
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
         return cursor.fetchone() is not None
 
     def _migrate_to_history_tables(self, cursor: sqlite3.Cursor) -> None:
@@ -901,9 +897,7 @@ class LLMConfigDB(object, metaclass=Singleton):
             body=body,
             created_at=cls._as_utc_or_epoch(row["created_at"]),
             updated_at=cls._as_utc_or_epoch(row["updated_at"]),
-            archived_at=(
-                cls._as_utc_or_epoch(row["archived_at"]) if row["archived_at"] else None
-            ),
+            archived_at=(cls._as_utc_or_epoch(row["archived_at"]) if row["archived_at"] else None),
             body_over_cap=len(body) > INSTRUCTION_SET_MAX_BODY_CHARS,
         )
 
@@ -1318,13 +1312,9 @@ class LLMConfigDB(object, metaclass=Singleton):
                 token_prefix=row["token_prefix"],
                 name=row["name"],
                 created_at=self._as_utc(row["created_at"]),
-                last_used_at=(
-                    self._as_utc(row["last_used_at"]) if row["last_used_at"] else None
-                ),
+                last_used_at=(self._as_utc(row["last_used_at"]) if row["last_used_at"] else None),
                 is_active=bool(row["is_active"]),
-                expires_at=(
-                    self._as_utc(row["expires_at"]) if row["expires_at"] else None
-                ),
+                expires_at=(self._as_utc(row["expires_at"]) if row["expires_at"] else None),
             )
             for row in cursor.fetchall()
         ]
@@ -1384,9 +1374,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                 logger.info("rejected idle-expired API token id=%s", row["id"])
                 return None
 
-        new_expires_at = (
-            self._utc_stamp(now + timedelta(days=ttl_days)) if ttl_days > 0 else None
-        )
+        new_expires_at = self._utc_stamp(now + timedelta(days=ttl_days)) if ttl_days > 0 else None
         try:
             cursor.execute(
                 "UPDATE user_api_tokens SET last_used_at = ?, expires_at = ? WHERE id = ?",
@@ -1438,9 +1426,7 @@ class LLMConfigDB(object, metaclass=Singleton):
             deactivated_at=opt("deactivated_at"),
         )
 
-    def upsert_access_grant(
-        self, email: str, granted_by: str, expires_at: datetime
-    ) -> AccessGrant:
+    def upsert_access_grant(self, email: str, granted_by: str, expires_at: datetime) -> AccessGrant:
         """Create a grant, or re-arm an ended one for the same address.
 
         One row per address: re-granting resets the deadline and clears the revocation, the

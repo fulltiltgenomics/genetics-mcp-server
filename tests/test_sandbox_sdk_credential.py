@@ -95,9 +95,7 @@ async def test_each_destination_gets_its_own_audience_bound_token(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_the_internal_secret_is_not_attached_when_a_token_file_exists(
-    tmp_path, monkeypatch
-):
+async def test_the_internal_secret_is_not_attached_when_a_token_file_exists(tmp_path, monkeypatch):
     """The regression that matters. A sandbox that held both would keep being served by
     `is_internal_caller` with `sandbox_budget._executions` empty, and every quota control
     above it would stay inert while looking enforced."""

@@ -53,8 +53,12 @@ COVID_MODELS = dict(
 def test_classify_matches_r_on_the_package_example():
     ref = fixture("ex1_line_models.csv")
     res = lm.classify(
-        ref.select("beta1", "beta2"), ref.select("se1", "se2"),
-        slopes=[0, 0.5, 1], scales=0.2, cors=0.995, names=["M0", "M.5", "M1"],
+        ref.select("beta1", "beta2"),
+        ref.select("se1", "se2"),
+        slopes=[0, 0.5, 1],
+        scales=0.2,
+        cors=0.995,
+        names=["M0", "M.5", "M1"],
     )
     got = res["groups"].select("M0", "M.5", "M1").to_numpy()
     assert np.abs(got - ref.select("M0", "M.5", "M1").to_numpy()).max() < 1e-12
@@ -76,8 +80,11 @@ def test_classify_matches_r_on_the_annotation_example():
     data = fixture("linemodels_ex2.csv")
     ref = fixture("ex2_line_models.csv")
     res = lm.classify(
-        data.select("beta1", "beta2"), data.select("se1", "se2"),
-        slopes=[0, 3], scales=0.1, cors=0.999,
+        data.select("beta1", "beta2"),
+        data.select("se1", "se2"),
+        slopes=[0, 3],
+        scales=0.1,
+        cors=0.999,
     )
     got = res["groups"].select("M1", "M2").to_numpy()
     assert np.abs(got - ref.to_numpy()).max() < 1e-12
@@ -163,7 +170,9 @@ def test_bad_data_is_a_usage_error(ex1):
     with pytest.raises(GeneticsUsageError, match="positive"):
         lm.classify(x, ex1.select("se1", "se2").with_columns(pl.lit(0.0).alias("se1")))
     with pytest.raises(GeneticsUsageError, match="null, NaN"):
-        lm.classify(x.with_columns(pl.lit(None, dtype=pl.Float64).alias("beta2")), ex1.select("se1", "se2"))
+        lm.classify(
+            x.with_columns(pl.lit(None, dtype=pl.Float64).alias("beta2")), ex1.select("se1", "se2")
+        )
     with pytest.raises(GeneticsUsageError, match="at least two columns"):
         lm.classify(ex1.select("beta1"), ex1.select("se1"))
     with pytest.raises(GeneticsUsageError, match="slopes is required"):
@@ -180,8 +189,12 @@ def test_proportions_reproduces_the_paper(covid):
     0.95, 12 severity-only, 5 susceptibility-only, 0 both. R's own run of the same
     settings (seed 91, 10,000 sweeps) is in covid_proportions_params.csv."""
     res = lm.proportions(
-        covid.select("B2_beta", "C2_beta"), covid.select("B2_sebeta", "C2_sebeta"),
-        **COVID_MODELS, n_iter=10000, n_burnin=50, seed=91,
+        covid.select("B2_beta", "C2_beta"),
+        covid.select("B2_sebeta", "C2_sebeta"),
+        **COVID_MODELS,
+        n_iter=10000,
+        n_burnin=50,
+        seed=91,
     )
     params = res["params"]
     assert params["model"].to_list() == ["SEVER.", "SUSCEP.", "BOTH"]
@@ -191,7 +204,9 @@ def test_proportions_reproduces_the_paper(covid):
     assert params["up95"].to_list() == pytest.approx(r_params["95%up"].to_list(), abs=0.03)
     probs = res["groups"].select("SEVER.", "SUSCEP.", "BOTH").to_numpy()
     assert (probs > 0.95).sum(axis=0).tolist() == [12, 5, 0]
-    r_groups = fixture("covid_proportions_groups.csv").select("SEVER.", "SUSCEP.", "BOTH").to_numpy()
+    r_groups = (
+        fixture("covid_proportions_groups.csv").select("SEVER.", "SUSCEP.", "BOTH").to_numpy()
+    )
     assert np.abs(probs - r_groups).max() < 0.05
     assert res["n_iter"] == 10000 and res["n_burnin"] == 50
 
@@ -225,9 +240,14 @@ def test_optimize_finds_the_optimum_r_found(ex1):
     """linemodels_examples.R, Example 1: from a perturbed start the middle model reaches
     scale 0.23198, slope 0.50755, cor 0.99775 (R's BFGS)."""
     res = lm.optimize(
-        ex1.select("beta1", "beta2"), ex1.select("se1", "se2"),
-        slopes=[0, 0.2, 1], scales=[0.2, 0.05, 0.2], cors=[0.995, 0.1, 0.995],
-        names=["M0", "M.5", "M1"], fit=[[False] * 3, [True] * 3, [False] * 3], tol_loglik=1e-2,
+        ex1.select("beta1", "beta2"),
+        ex1.select("se1", "se2"),
+        slopes=[0, 0.2, 1],
+        scales=[0.2, 0.05, 0.2],
+        cors=[0.995, 0.1, 0.995],
+        names=["M0", "M.5", "M1"],
+        fit=[[False] * 3, [True] * 3, [False] * 3],
+        tol_loglik=1e-2,
     )
     models = res["models"]
     assert models["scale"].to_list() == pytest.approx([0.2, 0.23198327, 0.2], abs=1e-3)
@@ -242,8 +262,12 @@ def test_optimize_single_parameter_uses_the_bounded_path(ex1):
     """The vignette's one-slope fit: slope 0.5098276, log-likelihood 171.47986, weights
     0.1893305 / 0.3718141 / 0.4388554."""
     res = lm.optimize(
-        ex1.select("beta1", "beta2"), ex1.select("se1", "se2"),
-        slopes=[0, 0.3, 1], scales=0.2, cors=0.995, fit={"slopes": [False, True, False]},
+        ex1.select("beta1", "beta2"),
+        ex1.select("se1", "se2"),
+        slopes=[0, 0.3, 1],
+        scales=0.2,
+        cors=0.995,
+        fit={"slopes": [False, True, False]},
     )
     assert res["models"]["slope"][1] == pytest.approx(0.5098276, abs=1e-3)
     assert res["loglik"] == pytest.approx(171.47986, abs=1e-3)
@@ -256,12 +280,19 @@ def test_optimize_scales_on_the_heritability_scale_with_constant_se(ex1):
     """linemodels_examples.R: after maf scaling the scales come out 0.1515844, 0.1418315,
     0.1350342 with assume.constant.SE = TRUE."""
     res = lm.optimize(
-        ex1.select("beta1", "beta2"), ex1.select("se1", "se2"), maf=ex1["maf"],
-        slopes=[0, 0.2, 1], scales=1.0, cors=[0.995, 0.1, 0.995],
+        ex1.select("beta1", "beta2"),
+        ex1.select("se1", "se2"),
+        maf=ex1["maf"],
+        slopes=[0, 0.2, 1],
+        scales=1.0,
+        cors=[0.995, 0.1, 0.995],
         fit=[[True, False, False], [True, True, True], [True, False, False]],
-        tol_loglik=1e-2, constant_se=True,
+        tol_loglik=1e-2,
+        constant_se=True,
     )
-    assert res["models"]["scale"].to_list() == pytest.approx([0.1515844, 0.1418315, 0.1350342], abs=1e-3)
+    assert res["models"]["scale"].to_list() == pytest.approx(
+        [0.1515844, 0.1418315, 0.1350342], abs=1e-3
+    )
     assert res["models"]["slope"][1] == pytest.approx(0.50838806, abs=2e-3)
     assert res["scaled"] is True
 
@@ -270,10 +301,17 @@ def test_optimize_three_dimensions_with_one_shared_scale(ex1):
     """Example 3: the slopes recover the simulation's (0,0), (1,1), (0.5,0.2); R's shared
     scale is 0.13801688."""
     res = lm.optimize(
-        ex1.select("beta1", "beta2", "beta3"), ex1.select("se1", "se2", "se3"), maf=ex1["maf"],
-        slopes=[[0, 0], [1, 1], [0.5, 0.5]], scales=0.15, cors=0.995, r_lkhood=[0, 0, 0],
-        fit={"scales": True, "slopes": True}, force_same_scales=True,
-        tol_loglik=1e-2, constant_se=True,
+        ex1.select("beta1", "beta2", "beta3"),
+        ex1.select("se1", "se2", "se3"),
+        maf=ex1["maf"],
+        slopes=[[0, 0], [1, 1], [0.5, 0.5]],
+        scales=0.15,
+        cors=0.995,
+        r_lkhood=[0, 0, 0],
+        fit={"scales": True, "slopes": True},
+        force_same_scales=True,
+        tol_loglik=1e-2,
+        constant_se=True,
     )
     models = res["models"]
     assert models.columns == ["model", "scale", "slope_beta2", "slope_beta3", "cor", "weight"]
@@ -318,7 +356,9 @@ def test_estimator_correlation_is_bhattacharjee():
 def test_prior_covariance_matches_r():
     """prior.V values from the R package."""
     v = lm._prior_covariance(0.15, np.array([0.2]), 0.999)
-    assert v == pytest.approx(np.array([[0.0225, 0.0044976589], [0.0044976589, 0.0009112374]]), abs=1e-9)
+    assert v == pytest.approx(
+        np.array([[0.0225, 0.0044976589], [0.0044976589, 0.0009112374]]), abs=1e-9
+    )
     v = lm._prior_covariance(0.2, np.array([0.5, 0.2]), 0.995)
     assert v[0] == pytest.approx([0.04, 0.0199568771, 0.0079827508], abs=1e-9)
     v = lm._prior_covariance(0.1, np.array([math.inf]), 0.99)
@@ -366,7 +406,14 @@ def test_the_figure_draws_and_counts(ex1, tmp_path, monkeypatch):
 
     # models alone, with an infinite slope and a null model, draw without data
     only = plots.linemodels(
-        pl.DataFrame({"model": ["null", "y"], "scale": [0.0, 0.2], "slope": [1.0, math.inf], "cor": [0.995, 0.995]}),
+        pl.DataFrame(
+            {
+                "model": ["null", "y"],
+                "scale": [0.0, 0.2],
+                "slope": [1.0, math.inf],
+                "cor": [0.995, 0.995],
+            }
+        ),
         path="m.png",
     )
     assert only["n_points"] == 0 and os.path.exists(os.path.join(str(tmp_path), "m.png"))

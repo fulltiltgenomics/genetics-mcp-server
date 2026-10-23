@@ -74,11 +74,10 @@ def _conditional_query_kind(tool_name: str, args: dict, value: Any) -> str | Non
     if tool_name == "search_mgi":
         # a symbol, an MP phenotype term or an MGI id, told apart by shape
         return (
-            "gene"
-            if isinstance(value, str) and _SYMBOL_RE.match(value.strip().upper())
-            else None
+            "gene" if isinstance(value, str) and _SYMBOL_RE.match(value.strip().upper()) else None
         )
     return None
+
 
 # parameters holding SQL or Python: mined with regexes rather than taken whole
 _TEXT_PARAMS = frozenset({"sql", "code"})
@@ -448,13 +447,18 @@ def _final_answer_text(assistant_content_json: list) -> str:
     texts = [
         block["text"]
         for block in blocks
-        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
     ]
     return " ".join(t for t in texts if t)
 
 
 def _render_unpinned(session: dict) -> str:
-    fields = [_date_str(session.get("updated_at")), _head(session.get("title"), _TITLE_CHARS) or "(untitled)"]
+    fields = [
+        _date_str(session.get("updated_at")),
+        _head(session.get("title"), _TITLE_CHARS) or "(untitled)",
+    ]
     phenotype_code = _head(session.get("phenotype_code"), _PHENOTYPE_CODE_CHARS, scrub=False)
     if phenotype_code:
         fields.append(phenotype_code)
@@ -484,7 +488,9 @@ def _render_pinned(session: dict) -> str:
     message = _head(session.get("first_user_message"), _PINNED_MESSAGE_CHARS)
     if message:
         lines.append(f"  Q: {message}")
-    answer = _head(_final_answer_text(session.get("assistant_content_json") or []), _PINNED_ANSWER_CHARS)
+    answer = _head(
+        _final_answer_text(session.get("assistant_content_json") or []), _PINNED_ANSWER_CHARS
+    )
     if answer:
         lines.append(f"  A: {answer}")
     return "\n".join(lines)

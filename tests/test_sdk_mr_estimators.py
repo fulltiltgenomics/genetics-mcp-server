@@ -34,6 +34,8 @@ NOT_REPORTED = {("mr_egger", "I.sq"), ("mr_ivw", "I2_from_Q")}
 
 def abs_for(quantity: str) -> float:
     return ABS if quantity in EXACT_ZERO_QUANTITIES else 0.0
+
+
 # two independent 10,000-draw bootstraps of the same SD differ by ~1%; worst observed 1.5%
 MEDIAN_SE_BAND = 0.05
 # the README calls mode SEs version-dependent (mr_mbe keeps the first of tied modes);
@@ -59,9 +61,11 @@ def close(got: float, want: float, rel: float = REL, abs_: float = ABS) -> bool:
 
 
 def groups(frame: pl.DataFrame, package: str, prefix: str = "") -> list[tuple[str, str, str]]:
-    rows = frame.filter(
-        (pl.col("package") == package) & pl.col("method").str.starts_with(prefix)
-    ).select("table", "method", "options").unique(maintain_order=True)
+    rows = (
+        frame.filter((pl.col("package") == package) & pl.col("method").str.starts_with(prefix))
+        .select("table", "method", "options")
+        .unique(maintain_order=True)
+    )
     return [tuple(r) for r in rows.iter_rows()]
 
 
@@ -80,14 +84,35 @@ def gid(case) -> str:
 
 # --------------------------------------------------------------------------- MendelianRandomization
 
-IVW_KEYS = {"Estimate": "estimate", "StdError": "se", "CILower": "ci_low", "CIUpper": "ci_high",
-            "Pvalue": "p", "Q": "Q", "Q_pval": "Q_pval", "RSE": "RSE", "I2_from_Q": "I2",
-            "SNPs": "n_instruments"}
-EGGER_KEYS = {"Estimate": "estimate", "StdError.Est": "se", "CILower.Est": "ci_low",
-              "CIUpper.Est": "ci_high", "Pvalue.Est": "p", "Intercept": "intercept",
-              "StdError.Int": "intercept_se", "CILower.Int": "intercept_ci_low",
-              "CIUpper.Int": "intercept_ci_high", "Pvalue.Int": "intercept_p", "Q": "Q",
-              "Q_pval": "Q_pval", "I.sq": "I2_GX", "RSE": "RSE", "SNPs": "n_instruments"}
+IVW_KEYS = {
+    "Estimate": "estimate",
+    "StdError": "se",
+    "CILower": "ci_low",
+    "CIUpper": "ci_high",
+    "Pvalue": "p",
+    "Q": "Q",
+    "Q_pval": "Q_pval",
+    "RSE": "RSE",
+    "I2_from_Q": "I2",
+    "SNPs": "n_instruments",
+}
+EGGER_KEYS = {
+    "Estimate": "estimate",
+    "StdError.Est": "se",
+    "CILower.Est": "ci_low",
+    "CIUpper.Est": "ci_high",
+    "Pvalue.Est": "p",
+    "Intercept": "intercept",
+    "StdError.Int": "intercept_se",
+    "CILower.Int": "intercept_ci_low",
+    "CIUpper.Int": "intercept_ci_high",
+    "Pvalue.Int": "intercept_p",
+    "Q": "Q",
+    "Q_pval": "Q_pval",
+    "I.sq": "I2_GX",
+    "RSE": "RSE",
+    "SNPs": "n_instruments",
+}
 SE_KEYS = {"Estimate": "estimate", "StdError": "se", "SNPs": "n_instruments"}
 
 
@@ -109,8 +134,9 @@ def run_mr_package(table: str, method: str, options: str):
         return fn(data, seed=int(o["seed"]), iterations=int(o["iterations"])), SE_KEYS
     if method == "mr_mbe":
         fn = mr.weighted_mode if o["weighting"] == "weighted" else mr.simple_mode
-        return fn(data, phi=float(o["phi"]), seed=int(o["seed"]),
-                  iterations=int(o["iterations"])), SE_KEYS
+        return fn(
+            data, phi=float(o["phi"]), seed=int(o["seed"]), iterations=int(o["iterations"])
+        ), SE_KEYS
     raise AssertionError(method)
 
 
@@ -154,7 +180,7 @@ def test_two_point_simple_mode_is_a_grid_tie():
     opt = "weighting=unweighted;stderror=delta;phi=1;iterations=10000;seed=314159265"
     want = float(reference("RSPO3", "mr_mbe", opt)["Estimate"])
     ratio = (TABLES["RSPO3"]["beta_y"] / TABLES["RSPO3"]["beta_x"]).to_numpy()
-    bw = 0.9 * min(np.std(ratio, ddof=1), mr._mad(ratio[None, :])[0]) / 2 ** 0.2
+    bw = 0.9 * min(np.std(ratio, ddof=1), mr._mad(ratio[None, :])[0]) / 2**0.2
     step = (np.ptp(ratio) + 6 * bw) / 511
     got = mr.simple_mode(TABLES["RSPO3"], iterations=200)["estimate"]
     assert abs(got - want) <= step * (1 + 1e-9)
@@ -268,11 +294,15 @@ def per_variant_check(got: pl.DataFrame, ref: dict, keys: dict[str, str]) -> Non
 @pytest.mark.parametrize("table", list(TABLES))
 def test_wald_single_snp_and_leave_one_out(table):
     frame = TABLES[table]
-    per_variant_check(mr.wald(frame), reference(table, "wald", "first_order", PER_VARIANT),
-                      {"estimate": "estimate", "se": "se"})
+    per_variant_check(
+        mr.wald(frame),
+        reference(table, "wald", "first_order", PER_VARIANT),
+        {"estimate": "estimate", "se": "se"},
+    )
     keys = {"b": "estimate", "se": "se", "p": "p"}
-    per_variant_check(mr.single_snp(frame),
-                      reference(table, "mr_singlesnp", "defaults", PER_VARIANT), keys)
+    per_variant_check(
+        mr.single_snp(frame), reference(table, "mr_singlesnp", "defaults", PER_VARIANT), keys
+    )
     loo = reference(table, "mr_leaveoneout", "defaults", PER_VARIANT)
     if frame.height < 3:
         assert {v for v, _ in loo} == {"All"}
@@ -334,20 +364,37 @@ def test_result_keys_checks_reads():
     for res in (mr.ivw(frame), mr.heterogeneity(frame), mr.egger(frame)):
         assert {"Q", "Q_df", "Q_pval"} <= res.keys()
     assert {"correct_causal_direction", "steiger_pval"} <= mr.steiger(frame).keys()
-    for fn in (mr.ivw, mr.egger, mr.weighted_median, mr.simple_median, mr.weighted_mode,
-               mr.simple_mode):
+    for fn in (
+        mr.ivw,
+        mr.egger,
+        mr.weighted_median,
+        mr.simple_median,
+        mr.weighted_mode,
+        mr.simple_mode,
+    ):
         res = fn(frame) if fn in (mr.ivw, mr.egger) else fn(frame, iterations=50)
-        assert {"method", "estimate", "se", "p", "ci_low", "ci_high", "n_instruments",
-                "options"} <= res.keys()
+        assert {
+            "method",
+            "estimate",
+            "se",
+            "p",
+            "ci_low",
+            "ci_high",
+            "n_instruments",
+            "options",
+        } <= res.keys()
 
 
 def test_accepts_harmonised_and_single_instrument():
     frame = TABLES["CD274"]
-    h = SimpleNamespace(frame=frame, units={"exposure": "SD (quantitative)",
-                                            "outcome": "log OR (binary)"})
+    h = SimpleNamespace(
+        frame=frame, units={"exposure": "SD (quantitative)", "outcome": "log OR (binary)"}
+    )
     assert mr.ivw(h)["estimate"] == mr.ivw(frame)["estimate"]
-    assert mr.steiger(h, prevalence=0.1)["steiger_pval"] == mr.steiger(frame, prevalence=0.1)[
-        "steiger_pval"]
+    assert (
+        mr.steiger(h, prevalence=0.1)["steiger_pval"]
+        == mr.steiger(frame, prevalence=0.1)["steiger_pval"]
+    )
     one = mr.ivw(frame.head(1))
     w = mr.wald(frame.head(1)).row(0, named=True)
     assert one["method"] == "wald" and one["estimate"] == w["estimate"] and one["se"] == w["se"]
@@ -372,8 +419,14 @@ def test_bad_inputs_are_usage_errors():
         mr.ivw(frame.with_columns(se_x=pl.lit(0.0)))
     for col in ("beta_y", "se_y"):
         with pytest.raises(GeneticsUsageError, match="missing or infinite"):
-            mr.ivw(frame.with_columns(pl.when(pl.int_range(pl.len()) == 0)
-                                      .then(math.inf).otherwise(pl.col(col)).alias(col)))
+            mr.ivw(
+                frame.with_columns(
+                    pl.when(pl.int_range(pl.len()) == 0)
+                    .then(math.inf)
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
+            )
     with pytest.raises(GeneticsUsageError, match="expected"):
         mr.ivw({"beta_x": [1]})
 

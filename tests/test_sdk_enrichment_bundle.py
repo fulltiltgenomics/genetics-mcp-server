@@ -99,7 +99,8 @@ def test_gene_sets_returns_mapping_metadata_and_attribution():
     assert list(by_symbol["gene_sets"])[:2] == ["B_FIRST", "B_SECOND"]
     assert by_symbol["gene_sets"]["B_FIRST"] == [sym(i) for i in range(1, 7)]
     assert [c["collection"] for c in by_symbol["attribution"]["collections"]] == [
-        "coll.b", "coll.a",
+        "coll.b",
+        "coll.a",
     ]
 
 
@@ -125,8 +126,16 @@ def test_gene_sets_refuses_an_unknown_id_kind():
 
 
 STATS_COLUMNS = {
-    "ora": ["set_id", "size", "overlap", "expected", "fold_enrichment", "pval", "padj",
-            "overlap_genes"],
+    "ora": [
+        "set_id",
+        "size",
+        "overlap",
+        "expected",
+        "fold_enrichment",
+        "pval",
+        "padj",
+        "overlap_genes",
+    ],
     "gsea": ["set_id", "size", "es", "nes", "pval", "padj", "n_more_extreme", "leading_edge"],
     "competitive": ["set_id", "size", "beta", "se", "t", "pval", "padj"],
 }
@@ -140,13 +149,16 @@ def both_ways(kind: str, names):
         uni = [sym(i) for i in range(1, 31)]
         named = enrichment.ora(lst, names, universe=uni, universe_mode="given")
         plain = enrichment.ora(
-            [ens(i) for i in (1, 2, 3, 4, 5, 10, 11)], mapping,
-            universe=[ens(i) for i in range(1, 31)], universe_mode="given",
+            [ens(i) for i in (1, 2, 3, 4, 5, 10, 11)],
+            mapping,
+            universe=[ens(i) for i in range(1, 31)],
+            universe_mode="given",
         )
     else:
         values = np.linspace(3, -2.8, 30)
-        keyed = {sym(i) if i % 3 else str(1000 + i): v
-                 for i, v in zip(range(1, 31), values, strict=True)}
+        keyed = {
+            sym(i) if i % 3 else str(1000 + i): v for i, v in zip(range(1, 31), values, strict=True)
+        }
         plain_keyed = {ens(i): v for i, v in zip(range(1, 31), values, strict=True)}
         if kind == "gsea":
             named = enrichment.gsea_preranked(keyed, names, nperm=200, seed=3)
@@ -193,16 +205,16 @@ def test_mapping_results_keep_their_columns():
 
 def test_identifiers_resolve_and_unresolved_are_reported():
     genes = [
-        ens(1) + ".12",      # versioned Ensembl
-        ens(2),              # plain Ensembl
-        "1003",              # Entrez
-        "GENE4",             # symbol
-        "gene5",             # symbol, wrong case
-        "c1ORF99",           # mixed-case symbol, wrong case
-        "ENSG99999999999",   # Ensembl-shaped, not in the gene table: kept
-        "GENE4",             # a repeat counts once
-        "NOTAGENE",          # unknown symbol
-        "999999",            # unknown Entrez
+        ens(1) + ".12",  # versioned Ensembl
+        ens(2),  # plain Ensembl
+        "1003",  # Entrez
+        "GENE4",  # symbol
+        "gene5",  # symbol, wrong case
+        "c1ORF99",  # mixed-case symbol, wrong case
+        "ENSG99999999999",  # Ensembl-shaped, not in the gene table: kept
+        "GENE4",  # a repeat counts once
+        "NOTAGENE",  # unknown symbol
+        "999999",  # unknown Entrez
     ]
     res = enrichment.ora(genes, "coll.a", universe=[ens(i) for i in range(1, 31)])
     rep = res["parameters"]["id_resolution"]["genes"]
@@ -211,7 +223,10 @@ def test_identifiers_resolve_and_unresolved_are_reported():
     assert rep["unresolved"] == 2
     assert rep["unresolved_sample"] == ["NOTAGENE", "999999"]
     assert rep["resolved_by"] == {
-        "ensembl": 3, "entrez": 1, "symbol": 1, "symbol_ignoring_case": 2,
+        "ensembl": 3,
+        "entrez": 1,
+        "symbol": 1,
+        "symbol_ignoring_case": 2,
     }
     # ENSG99999999999 and C1orf99 are in no coll.a set: the annotated universe drops them
     assert res["parameters"]["list_size"] == 5
@@ -224,8 +239,9 @@ def test_identifiers_resolve_and_unresolved_are_reported():
 def test_the_unresolved_sample_is_capped():
     junk = [f"JUNK{i}" for i in range(25)]
     universe = [sym(i) for i in range(1, 31)] + junk
-    res = enrichment.ora(["GENE1", "GENE2", *junk], "coll.a", universe=universe,
-                         universe_mode="given")
+    res = enrichment.ora(
+        ["GENE1", "GENE2", *junk], "coll.a", universe=universe, universe_mode="given"
+    )
     for what in ("genes", "universe"):
         rep = res["parameters"]["id_resolution"][what]
         assert rep["unresolved"] == 25
@@ -260,10 +276,12 @@ def test_competitive_resolves_covariate_ids_too():
     values = np.linspace(2, -1, 30)
     log_len = np.log(np.arange(1, 31) * 1000.0)
     stats = {sym(i): v for i, v in zip(range(1, 31), values, strict=True)}
-    covariates = pl.DataFrame({
-        "gene": [str(1000 + i) if i != 29 else ens(29) + ".1" for i in range(1, 31)],
-        "log_len": log_len,
-    })
+    covariates = pl.DataFrame(
+        {
+            "gene": [str(1000 + i) if i != 29 else ens(29) + ".1" for i in range(1, 31)],
+            "log_len": log_len,
+        }
+    )
     named = enrichment.competitive(stats, "coll.a", covariates=covariates)
     plain = enrichment.competitive(
         {ens(i): v for i, v in zip(range(1, 31), values, strict=True)},

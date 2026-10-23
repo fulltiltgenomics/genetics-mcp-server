@@ -194,9 +194,7 @@ def input_path(name: str) -> str:
             f"files are attached to the analysis call, not opened from a URL by the script"
         )
     if not isinstance(name, str) or not name or name in (".", ".."):
-        raise GeneticsUsageError(
-            f"input name must be a file name, not {name!r}"
-        )
+        raise GeneticsUsageError(f"input name must be a file name, not {name!r}")
     if any(sep and sep in name for sep in ("/", "\\", os.sep, os.altsep)):
         raise GeneticsUsageError(
             f"input name {name!r} must be a bare file name, not a path: inputs are delivered "
@@ -247,9 +245,7 @@ def _make_sync(name: str):
 
     # drop `self` so help()/inspect show what a script actually passes
     signature = inspect.signature(method)
-    wrapper.__signature__ = signature.replace(
-        parameters=list(signature.parameters.values())[1:]
-    )
+    wrapper.__signature__ = signature.replace(parameters=list(signature.parameters.values())[1:])
     return wrapper
 
 

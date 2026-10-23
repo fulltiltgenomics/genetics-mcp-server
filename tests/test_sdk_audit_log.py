@@ -76,11 +76,13 @@ def _lines(caplog) -> list[str]:
 class TestOneLinePerCall:
     @pytest.mark.asyncio
     async def test_call_emits_exactly_one_line_with_every_field(self, audit_lines):
-        client = _client({
-            "success": True,
-            "results": [["IL7R", 0.9], ["IL7R", 0.5]],
-            "columns": ["gene", "pip"],
-        })
+        client = _client(
+            {
+                "success": True,
+                "results": [["IL7R", 0.9], ["IL7R", 0.5]],
+                "columns": ["gene", "pip"],
+            }
+        )
         await client.credible_sets(gene="IL7R")
 
         lines = _lines(audit_lines)

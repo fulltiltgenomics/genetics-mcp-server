@@ -170,10 +170,12 @@ async def get_defaults(user: str = Depends(auth_required)):
     """
     tool_defs = []
     for tool in TOOL_DEFINITIONS:
-        tool_defs.append(DefaultToolDescription(
-            tool_name=tool["name"],
-            description=tool["description"],
-        ))
+        tool_defs.append(
+            DefaultToolDescription(
+                tool_name=tool["name"],
+                description=tool["description"],
+            )
+        )
 
     return LLMConfigDefaults(
         tool_descriptions=tool_defs,
@@ -181,6 +183,7 @@ async def get_defaults(user: str = Depends(auth_required)):
 
 
 # user comments
+
 
 @router.get(
     "/llm-config/user/comments",
@@ -258,6 +261,7 @@ async def delete_user_comment(
 
 # user settings
 
+
 @router.get(
     "/llm-config/user/settings",
     summary="Get all user settings",
@@ -315,7 +319,8 @@ def _deployment_default_tool_profile() -> str | None:
         _warned_default_profiles.add(value)
         logger.warning(
             "DEFAULT_TOOL_PROFILE=%r names no tool profile (known: %s); serving no default",
-            value, sorted(KNOWN_TOOL_PROFILES),
+            value,
+            sorted(KNOWN_TOOL_PROFILES),
         )
     return None
 
@@ -411,6 +416,7 @@ async def delete_user_setting(
 # read and written through /user/settings/selected_instruction_set. Every endpoint below is
 # scoped to the authenticated user by passing `user` into the accessor, so a set belonging to
 # someone else is indistinguishable from one that does not exist.
+
 
 @router.get(
     "/llm-config/user/instruction-sets",
@@ -553,6 +559,7 @@ async def get_instruction_set_history(
 # the reads move too: they return changed_by, which is an admin's email address, and a resource
 # that is admin-to-write but world-to-read invites the write gate being read as accidental.
 
+
 @router.get(
     "/llm-config/tool-descriptions",
     summary="Get all tool descriptions",
@@ -629,7 +636,9 @@ async def update_tool_description(
         user=user or "anonymous",
         comment=update.comment,
     )
-    logger.info(f"Tool '{tool_name}' description updated by {user or 'anonymous'}: {update.comment or 'no comment'}")
+    logger.info(
+        f"Tool '{tool_name}' description updated by {user or 'anonymous'}: {update.comment or 'no comment'}"
+    )
     return ToolDescriptionResponse(
         id=desc.id,
         tool_name=desc.tool_name,

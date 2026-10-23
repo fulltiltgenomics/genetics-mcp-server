@@ -16,7 +16,11 @@ from genetics_mcp_server.scripts.replay_benchmark import attach_call_metadata, e
 def _call_lines_of(out):
     """The rendered CALL rows only. The footnotes discuss the same markers in prose, and a
     substring search over the whole output therefore matches the explanation of an absence."""
-    return [ln for ln in out.splitlines() if re.match(r"\s*\d+\.\s", ln) or "|" in ln and re.search(r"\|\s*\d+\.\s", ln)]
+    return [
+        ln
+        for ln in out.splitlines()
+        if re.match(r"\s*\d+\.\s", ln) or "|" in ln and re.search(r"\|\s*\d+\.\s", ln)
+    ]
 
 
 def _call(seq, name, inp, id_):
@@ -36,7 +40,9 @@ def _turn(case, arm, i, calls, **kw):
         "cost_usd": 0.5,
         "tool_calls_detail": calls,
         "user_question": "how many caQTLs does FOXP3 have?",
-        "iterations_detail": [{"iteration": n + 1, "tool_phase_ms": 500.0} for n in range(len(calls))]
+        "iterations_detail": [
+            {"iteration": n + 1, "tool_phase_ms": 500.0} for n in range(len(calls))
+        ]
         + [{"iteration": len(calls) + 1, "tool_phase_ms": None}],
     }
     t.update(kw)
@@ -112,7 +118,13 @@ def test_the_final_iterations_absent_tool_phase_is_not_reported_as_a_gap():
 
 def test_an_unmeasured_middle_iteration_is_flagged_so_the_total_is_not_read_as_whole():
     total, gaps = _tool_phase_total(
-        {"iterations_detail": [{"tool_phase_ms": None}, {"tool_phase_ms": 300.0}, {"tool_phase_ms": None}]}
+        {
+            "iterations_detail": [
+                {"tool_phase_ms": None},
+                {"tool_phase_ms": 300.0},
+                {"tool_phase_ms": None},
+            ]
+        }
     )
     assert total == 300.0 and gaps is True
     assert "+" in render_transcript(
@@ -124,7 +136,11 @@ def test_an_unmeasured_middle_iteration_is_flagged_so_the_total_is_not_read_as_w
                     "code",
                     0,
                     [_call(0, "t", {}, "b")],
-                    iterations_detail=[{"tool_phase_ms": None}, {"tool_phase_ms": 300.0}, {"tool_phase_ms": None}],
+                    iterations_detail=[
+                        {"tool_phase_ms": None},
+                        {"tool_phase_ms": 300.0},
+                        {"tool_phase_ms": None},
+                    ],
                 )
             ],
         )
@@ -203,8 +219,10 @@ def test_a_failed_turn_shows_its_status_beside_the_arm_that_finished():
 def test_an_arm_missing_a_turn_entirely_does_not_drop_the_other_arms_turn():
     out = render_transcript(
         _report(
-            [_turn("c", "nocode", 0, [_call(0, "kept", {}, "a")]),
-             _turn("c", "nocode", 1, [_call(0, "also_kept", {}, "b")])],
+            [
+                _turn("c", "nocode", 0, [_call(0, "kept", {}, "a")]),
+                _turn("c", "nocode", 1, [_call(0, "also_kept", {}, "b")]),
+            ],
             [_turn("c", "code", 0, [])],
         ),
         width=160,
@@ -225,7 +243,9 @@ def test_a_script_is_shown_with_its_line_structure_and_elided_visibly():
     )
     assert "row_1 = 1" in out, "a script must keep its lines, not be rewrapped into a paragraph"
     assert "row_49 = 49" not in out
-    assert "…" in out and "tool_calls_detail" in out, "elision must be marked and the whole value located"
+    assert "…" in out and "tool_calls_detail" in out, (
+        "elision must be marked and the whole value located"
+    )
 
 
 def test_asking_for_a_case_that_is_not_in_the_report_lists_what_is():

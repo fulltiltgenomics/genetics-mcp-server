@@ -146,7 +146,9 @@ if external_servers:
         logger.info(f"Connecting to external MCP server: {server_url}")
         try:
             proxy_client, config = build_proxy_client(server_entry, default_timeout=60.0)
-            register_proxy_tools(mcp, proxy_client, exclude_tools=exclude_tools, allow_tools=config.tools)
+            register_proxy_tools(
+                mcp, proxy_client, exclude_tools=exclude_tools, allow_tools=config.tools
+            )
         except Exception as e:
             logger.error(f"Failed to connect to external MCP server {server_url}: {e}")
 
@@ -162,6 +164,7 @@ def _get_google_request():
         with _google_request_lock:
             if _google_request is None:
                 from google.auth.transport import requests as google_requests
+
                 _google_request = google_requests.Request()
     return _google_request
 
@@ -179,6 +182,7 @@ def _get_jwks_client(jwks_uri: str):
             client = _jwks_clients.get(jwks_uri)
             if client is None:
                 import jwt
+
                 client = jwt.PyJWKClient(jwks_uri)
                 _jwks_clients[jwks_uri] = client
     return client
@@ -264,7 +268,9 @@ def _validate_keycloak_token(token: str, settings) -> bool:
     # pre-existing and admin-created ones.
     # a runtime grant (chat-backend's access_grants table) admits what the static list does
     # not, so a conference user's MCP client works for exactly as long as their browser does
-    if not _matches_allow_list(email, settings, allow_wildcard=False) and not has_access_grant(email):
+    if not _matches_allow_list(email, settings, allow_wildcard=False) and not has_access_grant(
+        email
+    ):
         logger.warning("Keycloak email not allowed: %s", email)
         return False
     logger.info("authenticated Keycloak user: %s", email)
@@ -276,6 +282,7 @@ def _validate_user_token(token: str) -> bool:
     # try local DB first (works when both services share the same filesystem)
     try:
         from genetics_mcp_server.db import get_llm_config_db
+
         db = get_llm_config_db()
         if db.validate_api_token(token) is not None:
             return True
@@ -288,6 +295,7 @@ def _validate_user_token(token: str) -> bool:
         return False
     try:
         import httpx
+
         # same silent-fallback shape as tools/executor.py (genetics-results-suite-618): with the
         # secret unset this posts to chat-backend with no Authorization header at all. On the
         # remote transports `main()` calls require_internal_api_secret() before serving, so the
@@ -350,10 +358,13 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             # oauth resource-server path: trust Keycloak-issued access tokens.
             # tried first (when enabled) so a valid Keycloak token short-circuits;
             # otherwise we fall through to the Google id_token check below.
-            if getattr(settings, "oauth_enabled", False) and _validate_keycloak_token(token, settings):
+            if getattr(settings, "oauth_enabled", False) and _validate_keycloak_token(
+                token, settings
+            ):
                 return True
 
             from google.oauth2 import id_token
+
             try:
                 payload = id_token.verify_oauth2_token(token, _get_google_request())
             except ValueError as e:
@@ -373,10 +384,9 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             # ungated path admit every Google-verified address (genetics-results-suite-g8i).
             # _audience_allowed above is no backstop: inert without GOOGLE_TOKEN_AUDIENCE, and
             # the *public* gcloud client id when set.
-            if (
-                not _matches_allow_list(email, settings, allow_wildcard=False)
-                and not has_access_grant(email)
-            ):
+            if not _matches_allow_list(
+                email, settings, allow_wildcard=False
+            ) and not has_access_grant(email):
                 logger.warning("Email domain not allowed: %s", email)
                 return False
             logger.info("authenticated JWT user: %s", email)
@@ -391,9 +401,14 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
 
         # RFC 9728 protected-resource metadata: served without auth so MCP clients
         # can discover the Keycloak authorization server before obtaining a token.
-        if scope["type"] == "http" and scope.get("method") == "GET" and scope.get("path") in (
-            "/.well-known/oauth-protected-resource",
-            "/.well-known/oauth-protected-resource/mcp",
+        if (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path")
+            in (
+                "/.well-known/oauth-protected-resource",
+                "/.well-known/oauth-protected-resource/mcp",
+            )
         ):
             settings = get_settings()
             if getattr(settings, "oauth_enabled", False):
@@ -435,8 +450,10 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
                 token = token_values[0] if token_values else None
 
                 if token and _token_is_valid(token):
-                    logger.warning("Authentication via query parameter token (client: %s)",
-                                   scope.get("client", ("unknown",))[0])
+                    logger.warning(
+                        "Authentication via query parameter token (client: %s)",
+                        scope.get("client", ("unknown",))[0],
+                    )
                 else:
                     if scope["type"] == "http":
                         await _send_401(send)
@@ -449,32 +466,42 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         await app(scope, receive, send)
 
     async def _send_healthz(send):
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(b"content-type", b"application/json")],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"status":"ok"}',
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b'{"status":"ok"}',
+            }
+        )
 
     async def _send_oauth_metadata(send, settings):
-        body = json.dumps({
-            "resource": settings.oauth_resource_url,
-            "authorization_servers": [settings.oauth_issuer],
-            "bearer_methods_supported": ["header"],
-            "scopes_supported": ["openid", "email", "profile"],
-        }).encode()
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [(b"content-type", b"application/json")],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": body,
-        })
+        body = json.dumps(
+            {
+                "resource": settings.oauth_resource_url,
+                "authorization_servers": [settings.oauth_issuer],
+                "bearer_methods_supported": ["header"],
+                "scopes_supported": ["openid", "email", "profile"],
+            }
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body,
+            }
+        )
 
     async def _send_401(send):
         headers = [(b"content-type", b"application/json")]
@@ -485,20 +512,30 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
             # after it — so https://host/mcp maps to https://host/.well-known/oauth-protected-resource/mcp
             _r = urlsplit(settings.oauth_resource_url)
             metadata_url = urlunsplit(
-                (_r.scheme, _r.netloc, f"/.well-known/oauth-protected-resource{_r.path.rstrip('/')}", "", "")
+                (
+                    _r.scheme,
+                    _r.netloc,
+                    f"/.well-known/oauth-protected-resource{_r.path.rstrip('/')}",
+                    "",
+                    "",
+                )
             )
             headers.append(
                 (b"www-authenticate", f'Bearer resource_metadata="{metadata_url}"'.encode())
             )
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": headers,
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"error":"Invalid or missing bearer token"}',
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 401,
+                "headers": headers,
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b'{"error":"Invalid or missing bearer token"}',
+            }
+        )
 
     return auth_middleware
 
@@ -568,7 +605,9 @@ def main():
         # require MCP_API_KEY for remote transports (comma-separated for multiple keys)
         api_key_env = os.environ.get("MCP_API_KEY", "").strip()
         if not api_key_env:
-            logger.error("MCP_API_KEY is required for remote transports — refusing to start without authentication")
+            logger.error(
+                "MCP_API_KEY is required for remote transports — refusing to start without authentication"
+            )
             sys.exit(1)
         # same reasoning one line up, for the credential this server SENDS rather than the one
         # it accepts: a remote-transport server is a deployed service, and its tools are HTTP

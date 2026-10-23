@@ -100,10 +100,22 @@ def test_judge_cell_tallies_per_turn_verdicts_and_flags_broken_blinding():
     judging = {
         "arms": ["nocode", "code"],
         "pairs": [
-            {"case_id": "c", "turn_index": 0, "outcome": "win", "winner": "code",
-             "margin": "clear", "arm_identifiable": False},
-            {"case_id": "c", "turn_index": 1, "outcome": "tie_both_good", "winner": None,
-             "margin": None, "arm_identifiable": True},
+            {
+                "case_id": "c",
+                "turn_index": 0,
+                "outcome": "win",
+                "winner": "code",
+                "margin": "clear",
+                "arm_identifiable": False,
+            },
+            {
+                "case_id": "c",
+                "turn_index": 1,
+                "outcome": "tie_both_good",
+                "winner": None,
+                "margin": None,
+                "arm_identifiable": True,
+            },
         ],
     }
     out = render(_report(turns, judging))
@@ -148,8 +160,14 @@ def test_markdown_reproduces_a_script_whole_where_the_terminal_views_elide_it():
         _turn("c", "code", 0),
     ]
     turns[1]["tool_calls_detail"] = [
-        {"seq": 0, "name": "run_analysis", "iteration": 2, "input": {"code": script},
-         "script_duration_ms": 1200.0, "script_status": "ok"}
+        {
+            "seq": 0,
+            "name": "run_analysis",
+            "iteration": 2,
+            "input": {"code": script},
+            "script_duration_ms": 1200.0,
+            "script_status": "ok",
+        }
     ]
     turns[1]["final_answer"] = "42"
     out = render_markdown(_report(turns))

@@ -122,8 +122,12 @@ def _lit_tool_turn(tool_use_id="lit1", content="paper: GPR17 and demyelination")
     """A done chunk shaped like a turn that called search_scientific_literature."""
     return _done(
         blocks=[
-            {"type": "tool_use", "id": tool_use_id, "name": LITERATURE_TOOL,
-             "input": {"query": "GPR17"}},
+            {
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": LITERATURE_TOOL,
+                "input": {"query": "GPR17"},
+            },
             {"type": "text", "text": "answer"},
         ],
         tool_results=[
@@ -250,7 +254,9 @@ def test_is_case_literature_bearing_prefers_the_explicit_field_over_tools_used()
     # explicit field wins even when it disagrees with tools_used (a dataset exported by
     # export_eval_dataset can see the subagent's skill, tools_used alone cannot)
     assert is_case_literature_bearing({"literature_bearing": True, "tools_used": []})
-    assert not is_case_literature_bearing({"literature_bearing": False, "tools_used": ["search_scientific_literature"]})
+    assert not is_case_literature_bearing(
+        {"literature_bearing": False, "tools_used": ["search_scientific_literature"]}
+    )
     # no explicit field: falls back to tools_used
     assert is_case_literature_bearing({"tools_used": ["search_scientific_literature"]})
     assert not is_case_literature_bearing({"tools_used": ["get_variants"]})
@@ -263,9 +269,13 @@ def test_load_cases_literature_bearing_only_filters_before_the_limit(tmp_path):
     plain = make_case("plain")
     plain["literature_bearing"] = False
     dataset = write_dataset(tmp_path, [lit, plain])
-    assert [c["session_id"] for c in load_cases(dataset, None, literature_bearing_only=True)] == ["lit"]
+    assert [c["session_id"] for c in load_cases(dataset, None, literature_bearing_only=True)] == [
+        "lit"
+    ]
     # a --limit above the filtered population must not resurrect the dropped case
-    assert [c["session_id"] for c in load_cases(dataset, 5, literature_bearing_only=True)] == ["lit"]
+    assert [c["session_id"] for c in load_cases(dataset, 5, literature_bearing_only=True)] == [
+        "lit"
+    ]
 
 
 def test_literature_tool_pinned_against_the_judge():
@@ -313,10 +323,18 @@ def test_extract_literature_results_captures_a_literature_review_subagent_call()
     call, or the judge (which derives literature_bearing from this same capture, mirrored
     from literature_judge.literature_tool_uses) scores it as no search at all."""
     blocks = [
-        {"type": "tool_use", "id": "t1", "name": LITERATURE_SUBAGENT_TOOL,
-         "input": {"tasks": [{"skill": LITERATURE_SUBAGENT_SKILL, "query": "GPR17"}]}},
-        {"type": "tool_use", "id": "t2", "name": LITERATURE_SUBAGENT_TOOL,
-         "input": {"tasks": [{"skill": "data_analysis", "query": "x"}]}},
+        {
+            "type": "tool_use",
+            "id": "t1",
+            "name": LITERATURE_SUBAGENT_TOOL,
+            "input": {"tasks": [{"skill": LITERATURE_SUBAGENT_SKILL, "query": "GPR17"}]},
+        },
+        {
+            "type": "tool_use",
+            "id": "t2",
+            "name": LITERATURE_SUBAGENT_TOOL,
+            "input": {"tasks": [{"skill": "data_analysis", "query": "x"}]},
+        },
     ]
     results = [
         {"type": "tool_result", "tool_use_id": "t1", "content": "subagent digest"},
@@ -332,7 +350,9 @@ def test_extract_literature_results_with_no_matching_result_is_empty_string():
     result, and the two need to agree or the judge's "(no result persisted)" rendering
     would miss a replayed turn's missing result."""
     blocks = [{"type": "tool_use", "id": "t1", "name": LITERATURE_TOOL, "input": {}}]
-    out = extract_literature_results(blocks, [{"type": "tool_result", "tool_use_id": "other", "content": "x"}])
+    out = extract_literature_results(
+        blocks, [{"type": "tool_result", "tool_use_id": "other", "content": "x"}]
+    )
     assert out == [{"name": LITERATURE_TOOL, "input": {}, "content": ""}]
 
 
@@ -458,9 +478,7 @@ async def test_request_shape_overrides_arm_and_always_sends_secret(stub_server, 
     assert {b["tool_profile"] for b in stub_server.requests} == {None, "bigquery"}
 
 
-async def test_paired_execution_keeps_arms_adjacent_and_alternates_order(
-    stub_server, tmp_path
-):
+async def test_paired_execution_keeps_arms_adjacent_and_alternates_order(stub_server, tmp_path):
     ok_turn = [_usage(1, 100, 10, 100, 10), _done()]
     stub_server.plan = {None: list(ok_turn), "bigquery": list(ok_turn)}
     cases = [make_case(sid) for sid in ("aaa", "bbb", "ccc", "ddd")]
@@ -493,9 +511,7 @@ async def test_paired_execution_keeps_arms_adjacent_and_alternates_order(
     assert profiles == [None, "bigquery", "bigquery", None, None, "bigquery", "bigquery", None]
 
 
-async def test_single_arm_runs_one_profile_and_costs_one_turn_per_case(
-    stub_server, tmp_path
-):
+async def test_single_arm_runs_one_profile_and_costs_one_turn_per_case(stub_server, tmp_path):
     """`--arm-b none` measures one profile against a previous run's recorded numbers.
 
     The pairing exists to make a mid-run model swap or slowdown hit both arms equally, so
@@ -536,6 +552,7 @@ def test_single_arm_is_opt_in_and_a_repeated_arm_is_still_refused(tmp_path, caps
     meaningful rather than trading it for an empty-string special case nobody sees."""
     dataset = write_dataset(tmp_path, [make_case("aaa")])
     import genetics_mcp_server.scripts.replay_benchmark as replay_benchmark
+
     rc = replay_benchmark.main(
         ["--dataset", str(dataset), "--arm-a", "code", "--arm-b", "code", "--dry-run"]
     )
@@ -543,9 +560,7 @@ def test_single_arm_is_opt_in_and_a_repeated_arm_is_still_refused(tmp_path, caps
     assert "must differ" in capsys.readouterr().err
 
 
-async def test_concurrency_parallelises_cases_never_the_arms_within_one(
-    stub_server, tmp_path
-):
+async def test_concurrency_parallelises_cases_never_the_arms_within_one(stub_server, tmp_path):
     """Concurrency is over cases only; a case's two arms are always sequential.
 
     Global wire adjacency cannot hold once cases overlap, so the invariant checked here
@@ -576,9 +591,7 @@ async def test_concurrency_parallelises_cases_never_the_arms_within_one(
     by_case: dict[str, list[object]] = {}
     for body in stub_server.requests:
         # session ids are "replay-<run>-<case>-<arm>"; the case segment pairs the two arms
-        by_case.setdefault(body["session_id"].rsplit("-", 1)[0], []).append(
-            body["tool_profile"]
-        )
+        by_case.setdefault(body["session_id"].rsplit("-", 1)[0], []).append(body["tool_profile"])
     assert len(by_case) == 6
     for case_id, order in report["arm_order_per_case"].items():
         wire = next(v for k, v in by_case.items() if k.endswith(case_id[:8]))
@@ -820,8 +833,7 @@ async def test_replayed_history_carries_tool_results_so_tool_use_survives_saniti
     # and the pairing is the one the server accepts: the tool_use block survives
     sanitized = _sanitize_tool_blocks(messages)
     assert any(
-        b.get("type") == "tool_use" and b.get("id") == "tu-42"
-        for b in sanitized[1]["content"]
+        b.get("type") == "tool_use" and b.get("id") == "tu-42" for b in sanitized[1]["content"]
     ), "tool_use was stripped as orphaned; the replayed context is not production-shaped"
     assert sanitized[2]["content"] == messages[2]["content"]
 
@@ -835,8 +847,15 @@ async def test_literature_results_are_captured_on_a_real_stream_and_not_for_othe
     dataset = write_dataset(tmp_path, [make_case("s1")])
 
     report = await run_benchmark(
-        dataset=dataset, base_url=stub_server.base_url, arms=(ALL_TOOLS_ARM,), limit=None,
-        concurrency=1, model=None, timeout=30.0, max_turns=None, auth_token=None,
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM,),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
     )
     turn = report["turns"][0]
     assert turn["literature_results"] == [
@@ -849,15 +868,20 @@ async def test_a_non_literature_tool_result_is_not_captured_as_literature(stub_s
     dataset = write_dataset(tmp_path, [make_case("s1")])
 
     report = await run_benchmark(
-        dataset=dataset, base_url=stub_server.base_url, arms=(ALL_TOOLS_ARM,), limit=None,
-        concurrency=1, model=None, timeout=30.0, max_turns=None, auth_token=None,
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=(ALL_TOOLS_ARM,),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
     )
     assert report["turns"][0]["literature_results"] == []
 
 
-async def test_matched_comparison_does_not_flatter_an_arm_that_fails_late(
-    stub_server, tmp_path
-):
+async def test_matched_comparison_does_not_flatter_an_arm_that_fails_late(stub_server, tmp_path):
     """An arm that dies on the expensive late turns must not win on its cheap survivors."""
 
     def cheap_then_explode(body):
@@ -908,9 +932,7 @@ async def test_matched_comparison_does_not_flatter_an_arm_that_fails_late(
     assert "UNMATCHED MARGINALS" in text
 
 
-async def test_measured_zero_script_runs_is_not_printed_as_not_measured(
-    stub_server, tmp_path
-):
+async def test_measured_zero_script_runs_is_not_printed_as_not_measured(stub_server, tmp_path):
     """script_runs==0 with a script chunk seen is measured; only script_runs is None is not."""
     stub_server.plan = {
         None: [
@@ -949,9 +971,9 @@ async def test_measured_zero_script_runs_is_not_printed_as_not_measured(
     lines = "\n".join(_script_lines(zero_runs))
     assert "NOT MEASURED" not in lines
     assert "script attempts=0 (executed=0)" in lines
-    assert "NOT MEASURED" in "\n".join(
-        _script_lines(report["per_arm"]["bigquery"])
-    ), "an arm with no script chunk at all must still read as unmeasured"
+    assert "NOT MEASURED" in "\n".join(_script_lines(report["per_arm"]["bigquery"])), (
+        "an arm with no script chunk at all must still read as unmeasured"
+    )
 
 
 async def test_turn_without_usage_chunks_is_not_counted_as_a_zero_tool_call_turn(
@@ -1008,9 +1030,7 @@ async def test_whole_case_exception_records_every_turn_of_both_arms(
 
     monkeypatch.setattr(rb, "replay_case", boom)
     # case index 1 gets the reversed arm order; the failure path must record that order
-    dataset = write_dataset(
-        tmp_path, [make_case("aaa", turns=2), make_case("bbb", turns=4)]
-    )
+    dataset = write_dataset(tmp_path, [make_case("aaa", turns=2), make_case("bbb", turns=4)])
 
     report = await run_benchmark(
         dataset=dataset,
@@ -1042,9 +1062,7 @@ def test_min_n_for_p90_is_ten_not_eleven():
     assert distribution(list(range(10)))["unreliable_percentiles"] == ["p95"]
 
 
-async def test_unpriceable_model_reports_no_cost_rather_than_sonnet_prices(
-    stub_server, tmp_path
-):
+async def test_unpriceable_model_reports_no_cost_rather_than_sonnet_prices(stub_server, tmp_path):
     stub_server.plan = {
         None: [_usage(1, 10_000, 500, 10_000, 500), _done()],
         "bigquery": [_usage(1, 10_000, 500, 10_000, 500), _done()],
@@ -1095,12 +1113,26 @@ def _usage_v2(
 # increment of total_input_tokens, which is the invariant llm_service's comment states
 _SPLIT_TURN = [
     _usage_v2(
-        1, 40_000, 500, 10_000, 500,
-        cache_read=25_000, cache_create=5_000, turn_elapsed_ms=1_200, model_ms=1_000,
+        1,
+        40_000,
+        500,
+        10_000,
+        500,
+        cache_read=25_000,
+        cache_create=5_000,
+        turn_elapsed_ms=1_200,
+        model_ms=1_000,
     ),
     _usage_v2(
-        2, 60_000, 300, 22_000, 800,
-        cache_read=45_000, cache_create=3_000, turn_elapsed_ms=9_000, model_ms=2_000,
+        2,
+        60_000,
+        300,
+        22_000,
+        800,
+        cache_read=45_000,
+        cache_create=3_000,
+        turn_elapsed_ms=9_000,
+        model_ms=2_000,
     ),
 ]
 
@@ -1181,9 +1213,7 @@ async def test_a_stream_without_the_cache_split_falls_back_to_the_interval_and_s
     assert "cost_usd is EXACT for 1 turn(s)" in text
 
 
-async def test_one_iteration_carrying_no_split_demotes_the_whole_turn(
-    stub_server, tmp_path
-):
+async def test_one_iteration_carrying_no_split_demotes_the_whole_turn(stub_server, tmp_path):
     """Pricing part of a turn exactly and the rest by assumption is not an exact turn."""
     report = await _one_case(
         stub_server,
@@ -1304,15 +1334,29 @@ async def test_a_single_iteration_turn_still_reports_a_roundtrip(stub_server, tm
         {
             None: [
                 _usage_v2(
-                    1, 40_000, 500, 10_000, 500,
-                    cache_read=0, cache_create=0, turn_elapsed_ms=3_100, model_ms=3_000,
+                    1,
+                    40_000,
+                    500,
+                    10_000,
+                    500,
+                    cache_read=0,
+                    cache_create=0,
+                    turn_elapsed_ms=3_100,
+                    model_ms=3_000,
                 ),
                 _done(),
             ],
             "bigquery": [
                 _usage_v2(
-                    1, 1_000, 10, 1_000, 10,
-                    cache_read=0, cache_create=0, turn_elapsed_ms=900, model_ms=800,
+                    1,
+                    1_000,
+                    10,
+                    1_000,
+                    10,
+                    cache_read=0,
+                    cache_create=0,
+                    turn_elapsed_ms=900,
+                    model_ms=800,
                 ),
                 _done(),
             ],
@@ -1340,8 +1384,15 @@ async def test_the_timeline_prints_each_column_its_own_n_and_flags_thin_percenti
             None: [*_SPLIT_TURN, _done()],
             "bigquery": [
                 _usage_v2(
-                    1, 1_000, 10, 1_000, 10,
-                    cache_read=0, cache_create=0, turn_elapsed_ms=500, model_ms=400,
+                    1,
+                    1_000,
+                    10,
+                    1_000,
+                    10,
+                    cache_read=0,
+                    cache_create=0,
+                    turn_elapsed_ms=500,
+                    model_ms=400,
                 ),
                 _done(),
             ],
@@ -1360,9 +1411,7 @@ async def test_the_timeline_prints_each_column_its_own_n_and_flags_thin_percenti
     assert "model_attempts" in "\n".join(lines)
 
 
-async def test_an_untimed_chunk_in_the_middle_does_not_merge_two_iterations(
-    stub_server, tmp_path
-):
+async def test_an_untimed_chunk_in_the_middle_does_not_merge_two_iterations(stub_server, tmp_path):
     """A gap must break the timeline, not be papered over.
 
     Advancing the baseline only on timed chunks would make iteration 3's segment span
@@ -1372,13 +1421,27 @@ async def test_an_untimed_chunk_in_the_middle_does_not_merge_two_iterations(
     """
     middle_untimed = [
         _usage_v2(
-            1, 10_000, 100, 1_000, 100,
-            cache_read=0, cache_create=0, turn_elapsed_ms=1_000, model_ms=800,
+            1,
+            10_000,
+            100,
+            1_000,
+            100,
+            cache_read=0,
+            cache_create=0,
+            turn_elapsed_ms=1_000,
+            model_ms=800,
         ),
         _usage(2, 20_000, 100, 2_000, 200),  # no turn_elapsed_ms, no model_ms
         _usage_v2(
-            3, 30_000, 100, 3_000, 300,
-            cache_read=0, cache_create=0, turn_elapsed_ms=9_000, model_ms=500,
+            3,
+            30_000,
+            100,
+            3_000,
+            300,
+            cache_read=0,
+            cache_create=0,
+            turn_elapsed_ms=9_000,
+            model_ms=500,
         ),
     ]
     report = await _one_case(
@@ -1406,9 +1469,7 @@ async def test_an_untimed_chunk_in_the_middle_does_not_merge_two_iterations(
     assert turn["slowest_iteration"] == 3 and turn["slowest_iteration_ms"] == 500
 
 
-async def test_an_untimed_usage_chunk_leaves_the_timeline_empty_not_zero(
-    stub_server, tmp_path
-):
+async def test_an_untimed_usage_chunk_leaves_the_timeline_empty_not_zero(stub_server, tmp_path):
     report = await _one_case(
         stub_server,
         tmp_path,
@@ -1420,9 +1481,10 @@ async def test_an_untimed_usage_chunk_leaves_the_timeline_empty_not_zero(
     turn = next(t for t in report["turns"] if t["arm"] == ALL_TOOLS_ARM)
     assert turn["iterations_detail"][0]["iteration_ms"] is None
     assert turn["model_ms_total"] is None
-    assert report["per_arm"][ALL_TOOLS_ARM]["iteration_timing"]["distributions"][
-        "iteration_ms"
-    ]["n"] == 0
+    assert (
+        report["per_arm"][ALL_TOOLS_ARM]["iteration_timing"]["distributions"]["iteration_ms"]["n"]
+        == 0
+    )
 
 
 def _script(iteration, *, ok=True, ran=True, exception=None, status=None, timed_out=False):
@@ -1589,9 +1651,7 @@ async def test_a_failure_on_the_last_iteration_is_not_a_retry_loop(stub_server, 
     assert arm["retry_loops"] == 0
 
 
-async def test_a_sandbox_fault_is_not_charged_to_the_scripts_failure_rate(
-    stub_server, tmp_path
-):
+async def test_a_sandbox_fault_is_not_charged_to_the_scripts_failure_rate(stub_server, tmp_path):
     """A restarting sandbox says nothing about the model's script. Counting it would let a
     deploy landing mid-run decide the rollout.
     """
@@ -1669,9 +1729,7 @@ async def test_a_model_caused_rejection_is_a_script_failure_not_a_sandbox_fault(
     assert "(executed_failed + model_rejected)" in text
 
 
-async def test_the_disputed_deadline_shape_is_bucketed_with_neither_side(
-    stub_server, tmp_path
-):
+async def test_the_disputed_deadline_shape_is_bucketed_with_neither_side(stub_server, tmp_path):
     """TurnBudgetExceeded is classified differently by different readers, so it is reported
     on its own line and left out of both the numerator and the denominator. Whichever way a
     reader classifies it, the arithmetic is available on the page.
@@ -1733,8 +1791,18 @@ async def test_a_call_is_attributed_to_its_iteration_over_the_real_wire(stub_ser
             _usage(3, 300, 10, 300, 30),
             _done(
                 blocks=[
-                    {"type": "tool_use", "id": "a", "name": "search_genes", "input": {"query": "FOXP3"}},
-                    {"type": "tool_use", "id": "b", "name": "get_gene_to_peaks", "input": {"gene": "F"}},
+                    {
+                        "type": "tool_use",
+                        "id": "a",
+                        "name": "search_genes",
+                        "input": {"query": "FOXP3"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "b",
+                        "name": "get_gene_to_peaks",
+                        "input": {"gene": "F"},
+                    },
                     {"type": "tool_use", "id": "c", "name": "run_analysis", "input": {"code": "x"}},
                     {"type": "text", "text": "answer"},
                 ]
@@ -1854,9 +1922,7 @@ async def test_thinking_is_neither_requested_nor_recorded_by_default(stub_server
     assert all(t["thinking_detail"] == [] for t in report["turns"])
 
 
-async def test_capture_thinking_records_the_summary_against_its_iteration(
-    stub_server, tmp_path
-):
+async def test_capture_thinking_records_the_summary_against_its_iteration(stub_server, tmp_path):
     turn = [
         _usage(1, 100, 10, 100, 10),
         {"type": "thinking_summary", "iteration": 1, "text": "check burden first"},
@@ -1888,9 +1954,7 @@ async def test_capture_thinking_records_the_summary_against_its_iteration(
         ]
 
 
-async def test_a_summary_without_an_iteration_falls_back_to_the_usage_count(
-    stub_server, tmp_path
-):
+async def test_a_summary_without_an_iteration_falls_back_to_the_usage_count(stub_server, tmp_path):
     # absent stays usable rather than being dropped: the harness keeps the text and
     # attributes it to the iteration in force, the same rule tool_use attribution uses
     turn = [
@@ -1919,9 +1983,7 @@ async def test_a_summary_without_an_iteration_falls_back_to_the_usage_count(
     ]
 
 
-async def test_prose_discarded_from_the_answer_is_kept_with_its_position(
-    stub_server, tmp_path
-):
+async def test_prose_discarded_from_the_answer_is_kept_with_its_position(stub_server, tmp_path):
     # the harness records the text, not only how much of it there was: the transcript's
     # apology for a missing table is worth less than the table
     turn = [

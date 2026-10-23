@@ -23,8 +23,7 @@ def _turn(case, index, arm, scripts, iterations=1, ms=1000.0):
         "ms_to_done": ms,
         "tool_calls": len(scripts),
         "tool_calls_detail": [
-            {"seq": i, "name": "run_analysis", "input": {"code": s}}
-            for i, s in enumerate(scripts)
+            {"seq": i, "name": "run_analysis", "input": {"code": s}} for i, s in enumerate(scripts)
         ],
     }
 

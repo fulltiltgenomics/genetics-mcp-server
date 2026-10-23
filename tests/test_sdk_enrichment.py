@@ -97,7 +97,9 @@ def test_overlap_genes_and_fold_enrichment_match_fora(inputs):
     assert got["overlap_genes"].to_list() == ref_genes
     assert_rel(got["pval"], fora["pval"], "fora pval")
     nonzero = fora["foldEnrichment"] > 0
-    assert_rel(got["fold_enrichment"].filter(nonzero), fora["foldEnrichment"].filter(nonzero), "fold")
+    assert_rel(
+        got["fold_enrichment"].filter(nonzero), fora["foldEnrichment"].filter(nonzero), "fold"
+    )
 
 
 def test_results_are_ordered_by_p(inputs):
@@ -205,7 +207,10 @@ def test_gsea_es_and_leading_edge_match_fgsea_exactly(gsea):
     assert got["leading_edge"].to_list() == [g.split(",") for g in ref["leadingEdge"]]
     params = res["parameters"]
     assert (params["min_size"], params["max_size"], params["nperm"], params["seed"]) == (
-        5, 300, NPERM, 1,
+        5,
+        300,
+        NPERM,
+        1,
     )
     assert params["n_genes"] == 900 and params["sets_tested"] == 28 == ref.height
 

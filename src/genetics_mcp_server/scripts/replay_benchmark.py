@@ -155,6 +155,7 @@ def parse_arm(spec: str, default_base_url: str) -> Arm:
         label = profile if not sep else f"{profile}@{urllib.parse.urlsplit(base_url).netloc}"
     return Arm(label=label.strip(), profile=profile, base_url=base_url)
 
+
 REPORTED_PERCENTILES = (25, 50, 75, 90, 95)
 
 # a percentile is only distinguishable from the maximum once the sample has at least
@@ -203,7 +204,9 @@ SCRIPT_SHAPES_DISPUTED = frozenset({"TurnBudgetExceeded"})
 # outcome categories, disjoint and exhaustive over script_result chunks
 OUTCOME_EXECUTED_OK = "executed_ok"
 OUTCOME_EXECUTED_FAILED = "executed_failed"
-OUTCOME_MODEL_REJECTED = "model_rejected"  # never reached the sandbox, and that is the model's doing
+OUTCOME_MODEL_REJECTED = (
+    "model_rejected"  # never reached the sandbox, and that is the model's doing
+)
 OUTCOME_DISPUTED = "disputed"
 OUTCOME_INFRA = "infra"
 
@@ -778,13 +781,9 @@ def _derive_iteration_timing(
     for index, row in enumerate(rows):
         is_final = index + 1 == len(rows)
         row["tool_phase_ms"] = None if is_final else rows[index + 1]["pre_model_ms"]
-        tool_phase = (
-            0.0 if is_final and final_iteration_ran_no_tools else row["tool_phase_ms"]
-        )
+        tool_phase = 0.0 if is_final and final_iteration_ran_no_tools else row["tool_phase_ms"]
         row["iteration_ms"] = (
-            None
-            if row["model_ms"] is None or tool_phase is None
-            else row["model_ms"] + tool_phase
+            None if row["model_ms"] is None or tool_phase is None else row["model_ms"] + tool_phase
         )
     return rows
 
@@ -931,7 +930,8 @@ async def replay_turn(
                             # the code arm, so it is left rather than guessed at.
                             cause = (
                                 OUTCOME_EXECUTED_FAILED
-                                if pending_causes & {OUTCOME_EXECUTED_FAILED, OUTCOME_MODEL_REJECTED}
+                                if pending_causes
+                                & {OUTCOME_EXECUTED_FAILED, OUTCOME_MODEL_REJECTED}
                                 else OUTCOME_DISPUTED
                                 if OUTCOME_DISPUTED in pending_causes
                                 else OUTCOME_INFRA
@@ -1061,9 +1061,7 @@ async def replay_turn(
         # tools), which yields None — an honest absence, the safe direction.
         record.iterations_detail = _derive_iteration_timing(
             usages,
-            final_iteration_ran_no_tools=(
-                record.status == "ok" and not record.hit_max_iterations
-            ),
+            final_iteration_ran_no_tools=(record.status == "ok" and not record.hit_max_iterations),
         )
         model_times = [u.model_ms for u in usages if u.model_ms is not None]
         if model_times:
@@ -1097,9 +1095,7 @@ async def replay_turn(
             extract_tool_calls(message_content), call_iteration, script_by_call
         )
         record.tool_calls = len(record.tool_calls_detail)
-        record.final_answer, record.final_answer_dropped_chars = final_answer_split(
-            message_content
-        )
+        record.final_answer, record.final_answer_dropped_chars = final_answer_split(message_content)
         record.final_answer_dropped_prose = dropped_prose_blocks(message_content)
         record.literature_results = extract_literature_results(message_content, tool_results)
     else:
@@ -1333,8 +1329,7 @@ def _iteration_timing(records: list[TurnRecord]) -> dict[str, Any]:
             1 for row in reported_attempts if (row["model_attempts"] or 1) > 1
         ),
         "distributions": {
-            name: distribution([row.get(name) for row in rows])
-            for name in _ITERATION_DISTRIBUTIONS
+            name: distribution([row.get(name) for row in rows]) for name in _ITERATION_DISTRIBUTIONS
         },
         "by_iteration_index": [
             {
@@ -1362,8 +1357,7 @@ def summarize_arm(records: list[TurnRecord]) -> dict[str, Any]:
         "turns_by_status": status_counts,
         "turns_hitting_max_iterations": sum(1 for r in ok if r.hit_max_iterations),
         "distributions": {
-            name: distribution([getattr(r, attr) for r in ok])
-            for name, attr in _TURN_DISTRIBUTIONS
+            name: distribution([getattr(r, attr) for r in ok]) for name, attr in _TURN_DISTRIBUTIONS
         },
         "iteration_timing": _iteration_timing(ok),
         # how many of this arm's ok turns got an exact USD figure and how many only a
@@ -1389,13 +1383,9 @@ def summarize_arm(records: list[TurnRecord]) -> dict[str, Any]:
         summary["script_failure_rate_definition"] = SCRIPT_FAILURE_RATE_DEFINITION
         summary["retry_loops"] = sum(r.retry_loops or 0 for r in measured_scripts)
         summary["retry_loops_script"] = sum(r.retry_loops_script or 0 for r in measured_scripts)
-        summary["retry_loops_disputed"] = sum(
-            r.retry_loops_disputed or 0 for r in measured_scripts
-        )
+        summary["retry_loops_disputed"] = sum(r.retry_loops_disputed or 0 for r in measured_scripts)
         summary["retry_loops_infra"] = sum(r.retry_loops_infra or 0 for r in measured_scripts)
-        summary["script_infra_errors"] = sum(
-            r.script_infra_errors or 0 for r in measured_scripts
-        )
+        summary["script_infra_errors"] = sum(r.script_infra_errors or 0 for r in measured_scripts)
         summary["script_budget_exceeded"] = sum(
             r.script_budget_exceeded or 0 for r in measured_scripts
         )
@@ -1451,9 +1441,7 @@ class RateLimitedError(RuntimeError):
     """The chat service refused a turn with 429. Run-invalidating, not per-turn."""
 
 
-async def resolve_arm_tools(
-    client: httpx.AsyncClient, arms: tuple[Arm, ...]
-) -> dict[str, Any]:
+async def resolve_arm_tools(client: httpx.AsyncClient, arms: tuple[Arm, ...]) -> dict[str, Any]:
     """Ask each arm's OWN SERVER what that arm actually resolves to, before spending.
 
     Four things this prevents, each of which produces a run that looks fine and means
@@ -1502,13 +1490,9 @@ async def resolve_arm_tools(
     for arm in arms:
         params = {} if arm.tool_profile is None else {"tool_profile": arm.tool_profile}
         try:
-            resp = await client.get(
-                f"{arm.base_url}{RESOLVED_TOOLS_PATH}", params=params
-            )
+            resp = await client.get(f"{arm.base_url}{RESOLVED_TOOLS_PATH}", params=params)
         except httpx.HTTPError as exc:
-            logger.warning(
-                "could not resolve arm %r against %s: %s", arm.label, arm.base_url, exc
-            )
+            logger.warning("could not resolve arm %r against %s: %s", arm.label, arm.base_url, exc)
             out[arm.label] = {"base_url": arm.base_url, "error": str(exc)}
             continue
         if resp.status_code == 404:
@@ -1553,8 +1537,7 @@ async def resolve_arm_tools(
             )
     if unknown:
         detail = ", ".join(
-            f"{label} (resolved to {out[label].get('count')} local tools)"
-            for label in unknown
+            f"{label} (resolved to {out[label].get('count')} local tools)" for label in unknown
         )
         raise ArmResolutionError(
             f"these arm profiles are not recognised by the server they were sent to: "
@@ -1608,9 +1591,7 @@ async def resolve_arm_tools(
     names_a = info_a.get("names")
     names_b = info_b.get("names")
     same_tools = (
-        isinstance(names_a, list)
-        and isinstance(names_b, list)
-        and set(names_a) == set(names_b)
+        isinstance(names_a, list) and isinstance(names_b, list) and set(names_a) == set(names_b)
     )
     if arm_a.base_url == arm_b.base_url:
         if same_tools:
@@ -1686,11 +1667,7 @@ def build_report(
             "dropped_ok_turns_per_arm": dropped,
             "per_arm": {
                 arm: summarize_arm(
-                    [
-                        t
-                        for t in all_turns
-                        if t.arm == arm and (t.case_id, t.turn_index) in matched
-                    ]
+                    [t for t in all_turns if t.arm == arm and (t.case_id, t.turn_index) in matched]
                 )
                 for arm in arms
             },
@@ -1806,7 +1783,9 @@ def _script_lines(summary: dict[str, Any]) -> list[str]:
             "  script failure rate           : NOT MEASURED",
             "  retry-loop count              : NOT MEASURED",
         ]
-        lines.extend(f"      {key}: {reason}" for key, reason in summary.get("unmeasured", {}).items())
+        lines.extend(
+            f"      {key}: {reason}" for key, reason in summary.get("unmeasured", {}).items()
+        )
         return lines
     rate = summary["script_failure_rate"]
     rate_text = "n/a (0 script attempts)" if rate is None else f"{rate:.3f}"
@@ -1859,9 +1838,7 @@ def format_summary(report: dict[str, Any]) -> str:
     matched = report["matched"]
     dropped = matched["dropped_ok_turns_per_arm"]
     lines.append("=" * 78)
-    lines.append(
-        f"HEADLINE — MATCHED PAIRS: {matched['pairs']} turns ok on BOTH arms"
-    )
+    lines.append(f"HEADLINE — MATCHED PAIRS: {matched['pairs']} turns ok on BOTH arms")
     lines.append("=" * 78)
     if any(dropped.values()):
         detail = ", ".join(f"{arm}: {n}" for arm, n in dropped.items())
@@ -2134,7 +2111,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit", type=int, default=None, help="max cases to replay")
     parser.add_argument("--max-turns", type=int, default=None, help="max user turns per case")
-    parser.add_argument("--concurrency", type=int, default=1, help="cases in flight (arms within a case are always sequential)")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="cases in flight (arms within a case are always sequential)",
+    )
     parser.add_argument(
         "--model",
         default=None,
@@ -2173,7 +2155,9 @@ def build_parser() -> argparse.ArgumentParser:
         "literature_judge.py --report.",
     )
     parser.add_argument("--output", type=Path, default=None, help="write the JSON report here")
-    parser.add_argument("--dry-run", action="store_true", help="resolve the plan, issue no requests")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="resolve the plan, issue no requests"
+    )
     parser.add_argument(
         "--judge",
         action="store_true",
@@ -2238,10 +2222,10 @@ def main(argv: list[str] | None = None) -> int:
     judge_model = args.judge_model or pairwise_judge.DEFAULT_JUDGE_MODEL
 
     if args.dry_run:
-        cases = load_cases(args.dataset, args.limit, literature_bearing_only=args.literature_bearing)
-        turns = sum(
-            len((c.get("user_turns") or [])[: args.max_turns]) for c in cases
+        cases = load_cases(
+            args.dataset, args.limit, literature_bearing_only=args.literature_bearing
         )
+        turns = sum(len((c.get("user_turns") or [])[: args.max_turns]) for c in cases)
         print(f"{len(cases)} cases, {turns} turns per arm, {turns * len(arms)} model turns total")
         print(f"arms: {' vs '.join(a.label for a in arms)}")
         for a in arms:
@@ -2262,10 +2246,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
         for i, c in enumerate(cases):
             order = arm_order_for_case(arms, i)
-            print(
-                f"  {i:>3} {c.get('session_id')} "
-                f"order={','.join(a.label for a in order)}"
-            )
+            print(f"  {i:>3} {c.get('session_id')} order={','.join(a.label for a in order)}")
         if args.judge:
             # the ceiling: every turn matching on both arms. Turns that fail on one arm are
             # not judged, so the real pair count can only be lower — an over-estimate is the
@@ -2297,10 +2278,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nERROR: {exc}", file=sys.stderr)
         return 2
     except RateLimitedError as exc:
-        turns_needed = sum(
-            len((c.get("user_turns") or [])[: args.max_turns])
-            for c in load_cases(args.dataset, args.limit, literature_bearing_only=args.literature_bearing)
-        ) * 2
+        turns_needed = (
+            sum(
+                len((c.get("user_turns") or [])[: args.max_turns])
+                for c in load_cases(
+                    args.dataset, args.limit, literature_bearing_only=args.literature_bearing
+                )
+            )
+            * 2
+        )
         print(
             f"\nABORTED: the chat service is rate-limiting this run.\n  {exc}\n\n"
             f"This plan needs {turns_needed} requests; the service's default is "
@@ -2328,7 +2314,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except Exception as e:
-            logger.error("judging failed (%s: %s); the benchmark report is unaffected", type(e).__name__, e)
+            logger.error(
+                "judging failed (%s: %s); the benchmark report is unaffected", type(e).__name__, e
+            )
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -115,15 +115,18 @@ class TestAllowListConsultsGrants:
         assert core._email_allowed(GUEST) is True
 
     def test_expired_or_revoked_grant_does_not_admit(self, deployed):
-        deployed.upsert_access_grant(GUEST, ADMIN, datetime.now(timezone.utc) - timedelta(seconds=1))
+        deployed.upsert_access_grant(
+            GUEST, ADMIN, datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
         assert core._email_allowed(GUEST) is False
         deployed.upsert_access_grant(GUEST, ADMIN, datetime.now(timezone.utc) + timedelta(hours=1))
         deployed.revoke_access_grant(GUEST)
         assert core._email_allowed(GUEST) is False
 
     def test_static_users_never_touch_the_table(self, deployed):
-        with patch.object(db_module, "_llm_config_db", None), patch.object(
-            db_module, "LLMConfigDB", side_effect=AssertionError("table consulted")
+        with (
+            patch.object(db_module, "_llm_config_db", None),
+            patch.object(db_module, "LLMConfigDB", side_effect=AssertionError("table consulted")),
         ):
             assert core._email_allowed("anyone@finngen.fi") is True
 
@@ -175,23 +178,36 @@ class TestAdminApi:
 
     def test_button_absent_when_unconfigured(self, grant_db):
         with settings_env(
-            REQUIRE_AUTH="true", INTERNAL_API_SECRET=INTERNAL_SECRET, ENABLE_ADMIN_PAGE="true",
-            ADMIN_USERS=ADMIN, ALLOWED_EMAIL_DOMAINS="finngen.fi", ACCESS_GRANT_BUTTON_LABEL="",
+            REQUIRE_AUTH="true",
+            INTERNAL_API_SECRET=INTERNAL_SECRET,
+            ENABLE_ADMIN_PAGE="true",
+            ADMIN_USERS=ADMIN,
+            ALLOWED_EMAIL_DOMAINS="finngen.fi",
+            ACCESS_GRANT_BUTTON_LABEL="",
         ):
             with TestClient(app) as c:
-                assert c.get("/chat/v1/auth", headers=_admin_headers()).json()["access_grants"] is None
-                assert c.get("/chat/v1/admin/access-grants", headers=_admin_headers()).status_code == 404
+                assert (
+                    c.get("/chat/v1/auth", headers=_admin_headers()).json()["access_grants"] is None
+                )
+                assert (
+                    c.get("/chat/v1/admin/access-grants", headers=_admin_headers()).status_code
+                    == 404
+                )
 
     def test_non_admin_is_refused(self, client):
-        resp = client.get("/chat/v1/admin/access-grants", headers=_admin_headers("someone@finngen.fi"))
+        resp = client.get(
+            "/chat/v1/admin/access-grants", headers=_admin_headers("someone@finngen.fi")
+        )
         assert resp.status_code == 403
 
     def test_grant_known_provider_records_and_mails(self, client, deployed):
-        with patch.object(svc, "classify_provider", return_value="google") as classify, patch.object(
-            svc, "notify", return_value=None
-        ) as notify:
+        with (
+            patch.object(svc, "classify_provider", return_value="google") as classify,
+            patch.object(svc, "notify", return_value=None) as notify,
+        ):
             resp = client.post(
-                "/chat/v1/admin/access-grants", json={"email": " Visitor@Gmail.com "},
+                "/chat/v1/admin/access-grants",
+                json={"email": " Visitor@Gmail.com "},
                 headers=_admin_headers(),
             )
         assert resp.status_code == 200
@@ -205,16 +221,22 @@ class TestAdminApi:
         assert deployed.has_active_access_grant(GUEST)
 
     def test_unknown_provider_needs_confirmation(self, client, deployed):
-        with patch.object(svc, "classify_provider", return_value="unknown"), patch.object(
-            svc, "notify", return_value=None
-        ) as notify:
+        with (
+            patch.object(svc, "classify_provider", return_value="unknown"),
+            patch.object(svc, "notify", return_value=None) as notify,
+        ):
             first = client.post(
-                "/chat/v1/admin/access-grants", json={"email": "x@uni.example"},
+                "/chat/v1/admin/access-grants",
+                json={"email": "x@uni.example"},
                 headers=_admin_headers(),
             ).json()
             assert first == {
-                "granted": False, "already_active": False, "provider": "unknown",
-                "grant": None, "email_sent": None, "email_error": None,
+                "granted": False,
+                "already_active": False,
+                "provider": "unknown",
+                "grant": None,
+                "email_sent": None,
+                "email_error": None,
             }
             assert not deployed.has_active_access_grant("x@uni.example")
             notify.assert_not_awaited()
@@ -227,10 +249,13 @@ class TestAdminApi:
         assert deployed.has_active_access_grant("x@uni.example")
 
     def test_regrant_of_active_address_does_not_mail_again(self, client, deployed):
-        with patch.object(svc, "classify_provider", return_value="google"), patch.object(
-            svc, "notify", return_value=None
-        ) as notify:
-            client.post("/chat/v1/admin/access-grants", json={"email": GUEST}, headers=_admin_headers())
+        with (
+            patch.object(svc, "classify_provider", return_value="google"),
+            patch.object(svc, "notify", return_value=None) as notify,
+        ):
+            client.post(
+                "/chat/v1/admin/access-grants", json={"email": GUEST}, headers=_admin_headers()
+            )
             again = client.post(
                 "/chat/v1/admin/access-grants", json={"email": GUEST}, headers=_admin_headers()
             ).json()
@@ -238,10 +263,14 @@ class TestAdminApi:
         assert notify.await_count == 1
 
     def test_mail_failure_is_reported_but_access_stands(self, client, deployed):
-        with patch.object(svc, "classify_provider", return_value="google"), patch.object(
-            svc, "send_notification", side_effect=OSError("connection refused")
-        ), settings_env(
-            SMTP_HOST="smtp.example", ACCESS_GRANT_EMAIL_FROM="a@b", ACCESS_GRANT_EMAIL_BODY_FILE="/x",
+        with (
+            patch.object(svc, "classify_provider", return_value="google"),
+            patch.object(svc, "send_notification", side_effect=OSError("connection refused")),
+            settings_env(
+                SMTP_HOST="smtp.example",
+                ACCESS_GRANT_EMAIL_FROM="a@b",
+                ACCESS_GRANT_EMAIL_BODY_FILE="/x",
+            ),
         ):
             body = client.post(
                 "/chat/v1/admin/access-grants", json={"email": GUEST}, headers=_admin_headers()
@@ -252,7 +281,9 @@ class TestAdminApi:
         assert deployed.get_access_grant(GUEST).email_error == body["email_error"]
 
     def test_invalid_address_and_passed_deadline(self, client, deployed):
-        resp = client.post("/chat/v1/admin/access-grants", json={"email": "nope"}, headers=_admin_headers())
+        resp = client.post(
+            "/chat/v1/admin/access-grants", json={"email": "nope"}, headers=_admin_headers()
+        )
         assert resp.status_code == 400
         with settings_env(ACCESS_GRANT_EXPIRES_AT="2020-01-01T00:00:00+00:00"):
             resp = client.post(
@@ -261,12 +292,18 @@ class TestAdminApi:
         assert resp.status_code == 400 and "passed" in resp.json()["detail"]
 
     def test_list_revoke_resend(self, client, deployed):
-        with patch.object(svc, "classify_provider", return_value="google"), patch.object(
-            svc, "send_notification", side_effect=RuntimeError("smtp down")
-        ), settings_env(
-            SMTP_HOST="smtp.example", ACCESS_GRANT_EMAIL_FROM="a@b", ACCESS_GRANT_EMAIL_BODY_FILE="/x",
+        with (
+            patch.object(svc, "classify_provider", return_value="google"),
+            patch.object(svc, "send_notification", side_effect=RuntimeError("smtp down")),
+            settings_env(
+                SMTP_HOST="smtp.example",
+                ACCESS_GRANT_EMAIL_FROM="a@b",
+                ACCESS_GRANT_EMAIL_BODY_FILE="/x",
+            ),
         ):
-            client.post("/chat/v1/admin/access-grants", json={"email": GUEST}, headers=_admin_headers())
+            client.post(
+                "/chat/v1/admin/access-grants", json={"email": GUEST}, headers=_admin_headers()
+            )
         listed = client.get("/chat/v1/admin/access-grants", headers=_admin_headers()).json()
         assert [g["email"] for g in listed] == [GUEST]
         assert listed[0]["active"] is True and listed[0]["email_error"] == "RuntimeError: smtp down"
@@ -277,28 +314,48 @@ class TestAdminApi:
             ).json()
         assert resend == {"email_sent": True, "email_error": None}
 
-        assert client.delete(f"/chat/v1/admin/access-grants/{GUEST}", headers=_admin_headers()).json() == {
-            "status": "revoked"
-        }
-        assert client.delete(f"/chat/v1/admin/access-grants/{GUEST}", headers=_admin_headers()).status_code == 404
-        assert client.post(f"/chat/v1/admin/access-grants/{GUEST}/email", headers=_admin_headers()).status_code == 404
-        assert client.get("/chat/v1/admin/access-grants", headers=_admin_headers()).json()[0]["active"] is False
+        assert client.delete(
+            f"/chat/v1/admin/access-grants/{GUEST}", headers=_admin_headers()
+        ).json() == {"status": "revoked"}
+        assert (
+            client.delete(
+                f"/chat/v1/admin/access-grants/{GUEST}", headers=_admin_headers()
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                f"/chat/v1/admin/access-grants/{GUEST}/email", headers=_admin_headers()
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get("/chat/v1/admin/access-grants", headers=_admin_headers()).json()[0]["active"]
+            is False
+        )
 
 
 class TestInternalCheck:
     def test_requires_the_marker_and_no_identity(self, client, deployed):
         deployed.upsert_access_grant(GUEST, ADMIN, datetime.now(timezone.utc) + timedelta(hours=1))
-        assert client.get("/chat/v1/access-grants/check", params={"email": GUEST}).status_code == 403
-        assert client.get(
-            "/chat/v1/access-grants/check", params={"email": GUEST}, headers=_admin_headers()
-        ).status_code == 403
+        assert (
+            client.get("/chat/v1/access-grants/check", params={"email": GUEST}).status_code == 403
+        )
+        assert (
+            client.get(
+                "/chat/v1/access-grants/check", params={"email": GUEST}, headers=_admin_headers()
+            ).status_code
+            == 403
+        )
         ok = client.get(
-            "/chat/v1/access-grants/check", params={"email": GUEST},
+            "/chat/v1/access-grants/check",
+            params={"email": GUEST},
             headers={"Authorization": f"Bearer {INTERNAL_SECRET}"},
         )
         assert ok.json() == {"allowed": True}
         other = client.get(
-            "/chat/v1/access-grants/check", params={"email": "nobody@gmail.com"},
+            "/chat/v1/access-grants/check",
+            params={"email": "nobody@gmail.com"},
             headers={"Authorization": f"Bearer {INTERNAL_SECRET}"},
         )
         assert other.json() == {"allowed": False}
@@ -395,8 +452,12 @@ class TestReconciler:
     async def test_desired_is_static_plus_active(self, reconciler, deployed):
         active_until = datetime.now(timezone.utc) + timedelta(hours=1)
         deployed.upsert_access_grant(GUEST, ADMIN, active_until)
-        deployed.upsert_access_grant("gone@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1))
-        deployed.upsert_access_grant("never@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1))
+        deployed.upsert_access_grant(
+            "gone@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        deployed.upsert_access_grant(
+            "never@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1)
+        )
 
         result = await reconciler.run_once()
 
@@ -415,7 +476,9 @@ class TestReconciler:
         assert reconciler.keycloak.calls[1][1] == []
 
     async def test_keycloak_failure_leaves_ended_rows_for_the_next_pass(self, reconciler, deployed):
-        deployed.upsert_access_grant("gone@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1))
+        deployed.upsert_access_grant(
+            "gone@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1)
+        )
 
         async def boom(*_a, **_k):
             raise httpx.ConnectError("down")
@@ -427,7 +490,9 @@ class TestReconciler:
 
     async def test_without_keycloak_target_ended_rows_are_just_marked(self, reconciler, deployed):
         reconciler.keycloak = None
-        deployed.upsert_access_grant("gone@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1))
+        deployed.upsert_access_grant(
+            "gone@gmail.com", ADMIN, datetime.now(timezone.utc) - timedelta(hours=1)
+        )
         await reconciler.run_once()
         assert deployed.get_access_grant("gone@gmail.com").deactivated_at is not None
 
@@ -447,7 +512,9 @@ class TestTargets:
 
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.headers["Authorization"] == "Bearer tok"
-            assert request.url.path == "/api/v1/namespaces/genetics/configmaps/oauth2-allowed-emails"
+            assert (
+                request.url.path == "/api/v1/namespaces/genetics/configmaps/oauth2-allowed-emails"
+            )
             if request.method == "GET":
                 return httpx.Response(200, json={"data": {"allowed-emails.txt": state["text"]}})
             assert request.headers["Content-Type"] == "application/merge-patch+json"
@@ -456,9 +523,11 @@ class TestTargets:
 
         target = svc.ConfigMapTarget("oauth2-allowed-emails")
         monkeypatch.setattr(
-            target, "_client",
+            target,
+            "_client",
             lambda: httpx.AsyncClient(
-                base_url="https://kube:443", transport=httpx.MockTransport(handler),
+                base_url="https://kube:443",
+                transport=httpx.MockTransport(handler),
                 headers={"Authorization": "Bearer tok"},
             ),
         )
@@ -508,4 +577,8 @@ class TestTargets:
             )
         assert disabled == ["gone@gmail.com"]
         assert realm["attributes"] == {"allowedEmails": f"a@x.y,{GUEST}", "other": "kept"}
-        assert log == ["realm-put", "user-put gone@gmail.com enabled=False", f"user-put {GUEST} enabled=True"]
+        assert log == [
+            "realm-put",
+            "user-put gone@gmail.com enabled=False",
+            f"user-put {GUEST} enabled=True",
+        ]

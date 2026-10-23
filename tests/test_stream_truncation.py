@@ -93,7 +93,10 @@ def _service(turns, executor=None):
 
 
 def _text_turn(text, stop_reason="end_turn"):
-    return ([_delta_event("text_delta", text)], _FakeMessage([_Block("text", text=text)], stop_reason))
+    return (
+        [_delta_event("text_delta", text)],
+        _FakeMessage([_Block("text", text=text)], stop_reason),
+    )
 
 
 async def _collect(svc, **kwargs):
@@ -112,10 +115,12 @@ async def _collect(svc, **kwargs):
 
 @pytest.mark.asyncio
 async def test_text_deltas_stream_through():
-    turns = [(
-        [_delta_event("text_delta", "Hello "), _delta_event("text_delta", "world")],
-        _FakeMessage([_Block("text", text="Hello world")], "end_turn"),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "Hello "), _delta_event("text_delta", "world")],
+            _FakeMessage([_Block("text", text="Hello world")], "end_turn"),
+        )
+    ]
     chunks = await _collect(_service(turns))
     text = "".join(c.content for c in chunks if c.type == "text")
     assert text == "Hello world"
@@ -125,14 +130,16 @@ async def test_text_deltas_stream_through():
 @pytest.mark.asyncio
 async def test_thinking_deltas_emit_throttled_keepalive():
     """Two rapid thinking deltas produce one keepalive, and no reasoning text leaks."""
-    turns = [(
-        [
-            _delta_event("thinking_delta", "step one"),
-            _delta_event("thinking_delta", "step two"),
-            _delta_event("text_delta", "answer"),
-        ],
-        _FakeMessage([_Block("text", text="answer")], "end_turn"),
-    )]
+    turns = [
+        (
+            [
+                _delta_event("thinking_delta", "step one"),
+                _delta_event("thinking_delta", "step two"),
+                _delta_event("text_delta", "answer"),
+            ],
+            _FakeMessage([_Block("text", text="answer")], "end_turn"),
+        )
+    ]
     chunks = await _collect(_service(turns))
     keepalives = [c for c in chunks if c.type == "thinking"]
     assert len(keepalives) == 1
@@ -142,13 +149,18 @@ async def test_thinking_deltas_emit_throttled_keepalive():
 
 @pytest.mark.asyncio
 async def test_thinking_blocks_are_not_persisted():
-    turns = [(
-        [_delta_event("text_delta", "answer")],
-        _FakeMessage(
-            [_Block("thinking", thinking="secret", signature="sig"), _Block("text", text="answer")],
-            "end_turn",
-        ),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "answer")],
+            _FakeMessage(
+                [
+                    _Block("thinking", thinking="secret", signature="sig"),
+                    _Block("text", text="answer"),
+                ],
+                "end_turn",
+            ),
+        )
+    ]
     chunks = await _collect(_service(turns))
     done = next(c for c in chunks if c.type == "done")
     assert [b["type"] for b in done.message_content] == ["text"]
@@ -157,13 +169,18 @@ async def test_thinking_blocks_are_not_persisted():
 @pytest.mark.asyncio
 async def test_reasoning_text_needs_an_explicit_opt_in():
     """The UI path: without capture_thinking the summary leaves the process nowhere."""
-    turns = [(
-        [_delta_event("text_delta", "answer")],
-        _FakeMessage(
-            [_Block("thinking", thinking="secret", signature="sig"), _Block("text", text="answer")],
-            "end_turn",
-        ),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "answer")],
+            _FakeMessage(
+                [
+                    _Block("thinking", thinking="secret", signature="sig"),
+                    _Block("text", text="answer"),
+                ],
+                "end_turn",
+            ),
+        )
+    ]
     chunks = await _collect(_service(turns))
     assert not [c for c in chunks if c.type == "thinking_summary"]
     assert "secret" not in "".join(c.content for c in chunks)
@@ -173,13 +190,18 @@ async def test_reasoning_text_needs_an_explicit_opt_in():
 async def test_capture_thinking_emits_the_summary_and_still_never_persists_it():
     """The benchmark's opt-in changes what is EMITTED, never what is stored: a caller that
     asks for reasoning must not be able to write it into a conversation or replay it."""
-    turns = [(
-        [_delta_event("text_delta", "answer")],
-        _FakeMessage(
-            [_Block("thinking", thinking="secret", signature="sig"), _Block("text", text="answer")],
-            "end_turn",
-        ),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "answer")],
+            _FakeMessage(
+                [
+                    _Block("thinking", thinking="secret", signature="sig"),
+                    _Block("text", text="answer"),
+                ],
+                "end_turn",
+            ),
+        )
+    ]
     chunks = await _collect(_service(turns), capture_thinking=True)
 
     summaries = [c for c in chunks if c.type == "thinking_summary"]
@@ -197,13 +219,15 @@ async def test_capture_thinking_emits_the_summary_and_still_never_persists_it():
 @pytest.mark.asyncio
 async def test_redacted_thinking_is_not_emitted_as_an_empty_summary():
     """Its payload is encrypted, so there is no text to show and no chunk to send."""
-    turns = [(
-        [_delta_event("text_delta", "answer")],
-        _FakeMessage(
-            [_Block("redacted_thinking", data="ENCRYPTED"), _Block("text", text="answer")],
-            "end_turn",
-        ),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "answer")],
+            _FakeMessage(
+                [_Block("redacted_thinking", data="ENCRYPTED"), _Block("text", text="answer")],
+                "end_turn",
+            ),
+        )
+    ]
     chunks = await _collect(_service(turns), capture_thinking=True)
     assert not [c for c in chunks if c.type == "thinking_summary"]
 
@@ -243,9 +267,7 @@ async def test_continuations_are_bounded_and_reported(monkeypatch):
     from genetics_mcp_server.config import get_settings
 
     capped = replace(get_settings(), max_continuations=2)
-    monkeypatch.setattr(
-        "genetics_mcp_server.llm_service.get_settings", lambda: capped
-    )
+    monkeypatch.setattr("genetics_mcp_server.llm_service.get_settings", lambda: capped)
 
     turns = [
         (
@@ -386,10 +408,12 @@ async def test_unfilled_continuations_are_bounded_and_reported(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_adaptive_thinking_requested_for_supporting_model():
-    turns = [(
-        [_delta_event("text_delta", "hi")],
-        _FakeMessage([_Block("text", text="hi")], "end_turn"),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "hi")],
+            _FakeMessage([_Block("text", text="hi")], "end_turn"),
+        )
+    ]
     svc = _service(turns)
     await _collect(svc)
     assert svc.anthropic_client.messages.calls[0]["thinking"] == {
@@ -400,10 +424,12 @@ async def test_adaptive_thinking_requested_for_supporting_model():
 
 @pytest.mark.asyncio
 async def test_adaptive_thinking_omitted_for_older_model():
-    turns = [(
-        [_delta_event("text_delta", "hi")],
-        _FakeMessage([_Block("text", text="hi")], "end_turn"),
-    )]
+    turns = [
+        (
+            [_delta_event("text_delta", "hi")],
+            _FakeMessage([_Block("text", text="hi")], "end_turn"),
+        )
+    ]
     svc = _service(turns)
     async for _ in svc._stream_anthropic(
         messages=[{"role": "user", "content": "hi"}],
@@ -703,7 +729,9 @@ async def test_a_pre_output_fallback_is_announced_before_the_answer_and_priced_a
     chunks = await _collect(svc)
 
     text = "".join(c.content for c in chunks if c.type == "text")
-    assert text.index("Claude Fable 5.1 declined this request; Claude Opus 5 answered instead") < text.index("Answer")
+    assert text.index(
+        "Claude Fable 5.1 declined this request; Claude Opus 5 answered instead"
+    ) < text.index("Answer")
     done = next(c for c in chunks if c.type == "done")
     persisted = [b["text"] for b in done.message_content if b["type"] == "text"]
     assert "declined this request" in persisted[0]
@@ -1076,7 +1104,9 @@ class TestRefusalCreditParams:
             "max_tokens": 10,
             "tools": [{"name": "t"}],
             "extra_body": {"fallbacks": "default"},
-            "extra_headers": {"anthropic-beta": "server-side-fallback-2026-07-01,fallback-credit-2026-07-01"},
+            "extra_headers": {
+                "anthropic-beta": "server-side-fallback-2026-07-01,fallback-credit-2026-07-01"
+            },
         }
         echo = [{"type": "text", "text": "Partial"}]
         cont = _refusal_retry_params(request, "claude-opus-5", "tok", "continue", echo)
@@ -1098,8 +1128,12 @@ class TestRefusalCreditParams:
 @pytest.mark.asyncio
 async def test_the_refusal_category_is_read_off_the_delta_not_the_final_message():
     """The accumulator never carries `stop_details`; the delta does. No token, no retry."""
-    turns = [([_refusal_delta(category="general_harms", explanation="policy", token=None)],
-              _refused_message([]))]
+    turns = [
+        (
+            [_refusal_delta(category="general_harms", explanation="policy", token=None)],
+            _refused_message([]),
+        )
+    ]
     svc = _fable_service(turns)
     chunks = await _collect_fable(svc)
 

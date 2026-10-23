@@ -401,7 +401,9 @@ class TestRefusalVersusTransient:
         with pytest.raises(UrlFetchRefused, match="not on the allow-list"):
             await client.fetch(URL, user=ALICE)
 
-    @pytest.mark.parametrize("status,expected", [(404, UrlFetchRefused), (503, UrlFetchUnavailable)])
+    @pytest.mark.parametrize(
+        "status,expected", [(404, UrlFetchRefused), (503, UrlFetchUnavailable)]
+    )
     async def test_an_envelope_without_the_flag_falls_back_to_the_status(self, status, expected):
         """Something other than the fetcher answered — an ingress, a crash page. 5xx is the
         only shape worth a second attempt."""
@@ -466,9 +468,14 @@ class TestCrossUserIsolation:
         identifier; a tuple has no separator to attack."""
         cache = FetchCache(ttl_s=900, max_bytes=MAX_FETCH_BYTES)
         result = url_fetch_client.FetchedFile(
-            url=URL, name="d", content=b"x", size_bytes=1,
-            sha256=hashlib.sha256(b"x").hexdigest(), content_type=None,
-            content_encoding=None, redirects=0,
+            url=URL,
+            name="d",
+            content=b"x",
+            size_bytes=1,
+            sha256=hashlib.sha256(b"x").hexdigest(),
+            content_type=None,
+            content_encoding=None,
+            redirects=0,
         )
         cache.put("a|b", "c", result)
         assert cache.get("a", "b|c") is None
@@ -614,8 +621,9 @@ class TestWhatIsNeverCached:
         guard has not been asked about."""
         cache = FetchCache(ttl_s=900, max_bytes=MAX_FETCH_BYTES)
         client, recorder = _client(
-            httpx.Response(200, json=_ok_body(url="https://zenodo.org/after-redirect.tsv",
-                                              redirects=1)),
+            httpx.Response(
+                200, json=_ok_body(url="https://zenodo.org/after-redirect.tsv", redirects=1)
+            ),
             cache=cache,
         )
         await client.fetch(URL, user=ALICE)

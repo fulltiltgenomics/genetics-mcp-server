@@ -164,12 +164,8 @@ def _proxied_inclusion() -> dict[str, bool]:
     while leaving the rule under test the production one.
     """
     with (
-        patch.object(
-            llm_service_module, "get_external_anthropic_tools", lambda: _PROXY_SENTINEL
-        ),
-        patch.object(
-            llm_service_module, "get_rag_anthropic_tools", lambda: _PROXY_SENTINEL
-        ),
+        patch.object(llm_service_module, "get_external_anthropic_tools", lambda: _PROXY_SENTINEL),
+        patch.object(llm_service_module, "get_rag_anthropic_tools", lambda: _PROXY_SENTINEL),
     ):
         external, rag = resolve_proxied_tools()
     return {"external_tools": bool(external), "rag_tools": bool(rag)}
@@ -187,9 +183,7 @@ def _mcp_hardcoded_exclusions() -> set[str]:
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Assign):
             continue
-        if not any(
-            isinstance(t, ast.Name) and t.id == "_mcp_disabled" for t in node.targets
-        ):
+        if not any(isinstance(t, ast.Name) and t.id == "_mcp_disabled" for t in node.targets):
             continue
         value = node.value
         if not isinstance(value, ast.BinOp) or not isinstance(value.op, ast.BitOr):
@@ -359,14 +353,12 @@ class TestResolvedProfiles:
         assert "run_analysis" not in nocode["tools"]
 
     def test_the_profile_set_itself_has_not_changed(self, resolved, golden):
-        assert set(resolved["chat_backend"]["profiles"]) == set(
-            golden["chat_backend"]["profiles"]
-        )
+        assert set(resolved["chat_backend"]["profiles"]) == set(golden["chat_backend"]["profiles"])
 
     def test_deployed_disabled_tools_match(self, resolved, golden):
-        assert resolved["chat_backend"]["disabled_tools"] == golden["chat_backend"][
-            "disabled_tools"
-        ]
+        assert (
+            resolved["chat_backend"]["disabled_tools"] == golden["chat_backend"]["disabled_tools"]
+        )
 
 
 class TestMCPToolList:

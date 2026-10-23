@@ -99,7 +99,8 @@ async def grant(body: GrantRequest, user: str = Depends(admin_required)):
     now = datetime.now(timezone.utc)
     if expires_at <= now:
         raise HTTPException(
-            status_code=400, detail=f"The configured access deadline {expires_at.isoformat()} has passed"
+            status_code=400,
+            detail=f"The configured access deadline {expires_at.isoformat()} has passed",
         )
 
     db = get_llm_config_db()

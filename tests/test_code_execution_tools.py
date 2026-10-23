@@ -76,14 +76,30 @@ class TestToolDefinitions:
         assert tools["read_artifact"]["input_schema"]["required"] == ["name"]
         capabilities = tools["list_capabilities"]["input_schema"]
         assert capabilities["required"] == []
-        assert capabilities["properties"]["module"]["enum"] == ["genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"]
+        assert capabilities["properties"]["module"]["enum"] == [
+            "genetics",
+            "client",
+            "errors",
+            "plots",
+            "linemodels",
+            "mr",
+            "enrichment",
+        ]
 
 
 class TestListCapabilities:
     async def test_index_lists_every_module(self, executor):
         result = await executor.list_capabilities()
         assert result["success"] is True
-        assert [m["module"] for m in result["modules"]] == ["genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"]
+        assert [m["module"] for m in result["modules"]] == [
+            "genetics",
+            "client",
+            "errors",
+            "plots",
+            "linemodels",
+            "mr",
+            "enrichment",
+        ]
         assert all(m["summary"] for m in result["modules"])
 
     async def test_index_covers_the_whole_sdk_export_list(self, executor):
@@ -125,7 +141,16 @@ class TestListCapabilities:
 
     async def test_discloses_no_credentials(self, executor, monkeypatch):
         monkeypatch.setenv("INTERNAL_API_SECRET", "super-secret-value")
-        for module in (None, "genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"):
+        for module in (
+            None,
+            "genetics",
+            "client",
+            "errors",
+            "plots",
+            "linemodels",
+            "mr",
+            "enrichment",
+        ):
             result = await executor.list_capabilities(module=module)
             assert "super-secret-value" not in str(result)
 
@@ -155,14 +180,25 @@ class TestListCapabilities:
             "results-api",
             "genetics-results-suite-6uk",
         )
-        for module in (None, "genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"):
+        for module in (
+            None,
+            "genetics",
+            "client",
+            "errors",
+            "plots",
+            "linemodels",
+            "mr",
+            "enrichment",
+        ):
             result = await executor.list_capabilities(module=module)
             assert "doc" not in result
             rendered = str(result)
             for token in forbidden:
                 assert token not in rendered, f"{token!r} leaked for module {module!r}"
 
-    @pytest.mark.parametrize("module", [None, "genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"])
+    @pytest.mark.parametrize(
+        "module", [None, "genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"]
+    )
     async def test_every_response_says_how_to_import_the_sdk(self, executor, module):
         """genetics-results-suite-706: the catalogue is the only reachable place that can.
 
@@ -175,7 +211,9 @@ class TestListCapabilities:
         result = await executor.list_capabilities(module=module)
         assert "import genetics" in result["usage"]
 
-    @pytest.mark.parametrize("module", ["genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"])
+    @pytest.mark.parametrize(
+        "module", ["genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"]
+    )
     async def test_every_module_response_shows_the_call_path_not_only_the_import(
         self, executor, module
     ):
@@ -276,7 +314,9 @@ class TestReadArtifactProxiesOverHTTP:
         executor._sandbox = _ArtifactSandbox(
             {"manhattan.png": _served("manhattan.png", PNG_HEADER, "image/png")}
         )
-        result = await executor.read_artifact(name="manhattan.png", user=USER_A, session_id="conv-9")
+        result = await executor.read_artifact(
+            name="manhattan.png", user=USER_A, session_id="conv-9"
+        )
         assert result["encoding"] == "base64"
         assert base64.b64decode(result["content"]) == PNG_HEADER
         assert result["content_type"] == "image/png"
@@ -343,7 +383,9 @@ class TestReadArtifactSessionScoping:
         executor._sandbox = _ArtifactSandbox({"secrets.tsv": _served("secrets.tsv", b"data")})
 
         theirs = await executor.read_artifact(name="secrets.tsv", user=USER_A, session_id="conv-9")
-        never = await executor.read_artifact(name="no-such-file.tsv", user=USER_A, session_id="conv-9")
+        never = await executor.read_artifact(
+            name="no-such-file.tsv", user=USER_A, session_id="conv-9"
+        )
         assert theirs["success"] is False
         assert theirs["error"].replace("secrets.tsv", "X") == never["error"].replace(
             "no-such-file.tsv", "X"
@@ -360,13 +402,13 @@ class TestReadArtifactSessionScoping:
                 (EXEC_B, "manhattan.png"): _served("manhattan.png", b"new"),
             }
         )
-        result = await executor.read_artifact(name="manhattan.png", user=USER_A, session_id="conv-9")
+        result = await executor.read_artifact(
+            name="manhattan.png", user=USER_A, session_id="conv-9"
+        )
         assert result["content"] == "new"
         assert executor._sandbox.asked == [(EXEC_B, "manhattan.png")]
 
-    async def test_an_older_execution_still_answers_for_a_name_the_newer_one_lacks(
-        self, executor
-    ):
+    async def test_an_older_execution_still_answers_for_a_name_the_newer_one_lacks(self, executor):
         _record("conv-9", EXEC_A, "hits.tsv")
         _record("conv-9", EXEC_B, "manhattan.png")
         executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
@@ -702,7 +744,9 @@ class TestReadArtifactLifetime:
 
         registry.record(USER_A, "conv-9", EXEC_A, ["hits.tsv"])
         executor._sandbox = _ArtifactSandbox({"hits.tsv": _served("hits.tsv", b"rows")})
-        assert (await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9"))["success"]
+        assert (await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9"))[
+            "success"
+        ]
 
         clock["now"] += 61
         expired = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
@@ -796,11 +840,7 @@ class TestReadArtifactErrorMapping:
     async def test_an_unreachable_sandbox_is_retryable_and_not_a_missing_name(self, executor):
         _record("conv-9", EXEC_A, "hits.tsv")
         executor._sandbox = _ArtifactSandbox(
-            {
-                "hits.tsv": ArtifactResult(
-                    ok=False, name="hits.tsv", error_type="SandboxUnreachable"
-                )
-            }
+            {"hits.tsv": ArtifactResult(ok=False, name="hits.tsv", error_type="SandboxUnreachable")}
         )
         result = await executor.read_artifact(name="hits.tsv", user=USER_A, session_id="conv-9")
         assert result["error_type"] == "ArtifactUnavailable"
@@ -817,7 +857,9 @@ class TestReadArtifactErrorMapping:
         result = executor._artifact_error(
             "hits.tsv",
             ArtifactResult(
-                ok=False, name="hits.tsv", status_code=200,
+                ok=False,
+                name="hits.tsv",
+                status_code=200,
                 error_type=ERROR_MALFORMED_RESPONSE,
             ),
         )
@@ -932,13 +974,10 @@ class TestRunAnalysisDefinition:
         """On the code surface, which is the only one it reaches; `disabled_tools` can
         still withhold it there (see TestRunAnalysisSandboxFlag).
         """
-        assert "run_analysis" in {
-            t["name"] for t in get_anthropic_tools(code_execution=True)
-        }
+        assert "run_analysis" in {t["name"] for t in get_anthropic_tools(code_execution=True)}
         enabled = Settings(sandbox_enabled=True).disabled_tools
         names = {
-            t["name"]
-            for t in get_anthropic_tools(code_execution=True, disabled_tools=enabled)
+            t["name"] for t in get_anthropic_tools(code_execution=True, disabled_tools=enabled)
         }
         assert "run_analysis" in names
 
@@ -1357,9 +1396,14 @@ class TestRunAnalysisImages:
         )
         sandbox = _StubSandbox(
             result=body,
-            artifacts={"plot.png": _image(), "table.csv": {"name": "table.csv",
-                                                           "content_type": "text/csv",
-                                                           "content_base64": "YSxiCg=="}},
+            artifacts={
+                "plot.png": _image(),
+                "table.csv": {
+                    "name": "table.csv",
+                    "content_type": "text/csv",
+                    "content_base64": "YSxiCg==",
+                },
+            },
         )
         result = await _run(executor, sandbox)
 
@@ -1433,7 +1477,11 @@ class TestRunAnalysisImages:
 
         body = _result_body(
             artifacts=[
-                {"name": "big.png", "size": ARTIFACT_READ_MAX_BYTES + 1, "content_type": "image/png"},
+                {
+                    "name": "big.png",
+                    "size": ARTIFACT_READ_MAX_BYTES + 1,
+                    "content_type": "image/png",
+                },
                 {"name": "small.png", "size": 11, "content_type": "image/png"},
             ]
         )
@@ -1483,7 +1531,9 @@ class TestRunAnalysisImages:
         assert "artifacts_not_delivered" in result["artifacts_note"]
 
     async def test_a_fully_delivered_run_carries_no_not_delivered_field(self, executor):
-        body = _result_body(artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}])
+        body = _result_body(
+            artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}]
+        )
         sandbox = _StubSandbox(result=body, artifacts={"plot.png": _image()})
         result = await _run(executor, sandbox)
         assert "artifacts_not_delivered" not in result
@@ -1520,9 +1570,7 @@ class TestRunAnalysisImages:
         body = _result_body(
             artifacts=[{"name": "plot.png", "size": 11, "content_type": "image/png"}]
         )
-        result = await _run(
-            executor, _StubSandbox(result=body, artifacts={"plot.png": _image()})
-        )
+        result = await _run(executor, _StubSandbox(result=body, artifacts={"plot.png": _image()}))
         assert "8f14e45f" not in str(result)
 
     async def test_a_malformed_manifest_entry_is_dropped_not_fatal(self, executor):
@@ -1640,9 +1688,7 @@ class TestRunAnalysisRequiresARealUser:
         """
         sandbox = _StubSandbox(result=_result_body())
         with settings_env(REQUIRE_AUTH="true"):
-            result = await _run(
-                executor, sandbox, user="real@finngen.fi", gateway_asserted=True
-            )
+            result = await _run(executor, sandbox, user="real@finngen.fi", gateway_asserted=True)
         assert result["success"] is True
         assert len(sandbox.calls) == 1
 
@@ -2303,7 +2349,9 @@ class TestRunAnalysisInputsResolveBeforeAnythingIsMinted:
 
         _install_fetcher(monkeypatch, _StubFetcher(raises=UrlFetchRefused("blocked")))
         sandbox = _StubSandbox(
-            result=_result_body(artifacts=[{"name": "x.png", "size": 1, "content_type": "image/png"}])
+            result=_result_body(
+                artifacts=[{"name": "x.png", "size": 1, "content_type": "image/png"}]
+            )
         )
         result = await _run_with_inputs(
             executor, sandbox, [{"url": "https://example.org/data.tsv"}]
@@ -2429,9 +2477,7 @@ class TestRunAnalysisInputErrorTaxonomy:
         assert "summary-statistics" in result["error"]
         assert sandbox.calls == []
 
-    async def test_a_retryable_upstream_status_stays_input_unavailable(
-        self, executor, monkeypatch
-    ):
+    async def test_a_retryable_upstream_status_stays_input_unavailable(self, executor, monkeypatch):
         """The flag decides, not the status: a 503 marked retryable by the fetcher is a
         transient failure even though its `error_type` is also `upstream_status`."""
         from genetics_mcp_server.url_fetch_client import UrlFetchUnavailable
@@ -2494,7 +2540,7 @@ class TestRunAnalysisInputErrorTaxonomy:
     async def test_an_unconfigured_fetcher_is_never_answered_with_lower_timeout_s(
         self, executor, monkeypatch
     ):
-        """"Lower timeout_s" is advice this deployment can never act on — no timeout_s makes
+        """ "Lower timeout_s" is advice this deployment can never act on — no timeout_s makes
         an absent fetcher reachable — so this branch answers ahead of every budget wording,
         at the timeout_s that leaves a url the least room."""
         from genetics_mcp_server.sandbox_client import MAX_TIMEOUT_S
@@ -2602,7 +2648,9 @@ class TestRunAnalysisInputNameSeam:
         from genetics_mcp_server.sandbox_client import INPUT_NAME_PATTERN
 
         url = "https://example.org/thing"
-        _install_fetcher(monkeypatch, _StubFetcher(files={url: _fetched(url=url, name=fetched_name)}))
+        _install_fetcher(
+            monkeypatch, _StubFetcher(files={url: _fetched(url=url, name=fetched_name)})
+        )
         sandbox = _StubSandbox(result=_result_body())
         result = await _run_with_inputs(executor, sandbox, [{"url": url}])
 
@@ -2655,7 +2703,9 @@ class TestRunAnalysisInputNameSeam:
         _install_fetcher(monkeypatch, _StubFetcher(files=files))
         sandbox = _StubSandbox(result=_result_body())
         result = await _run_with_inputs(
-            executor, sandbox, [{"url": "https://a.example.org/x"}, {"url": "https://b.example.org/x"}]
+            executor,
+            sandbox,
+            [{"url": "https://a.example.org/x"}, {"url": "https://b.example.org/x"}],
         )
         assert result["error_type"] == "InputRejected"
         assert "hits.tsv" in result["error"]
@@ -2926,9 +2976,7 @@ class TestRunAnalysisAttachmentInputs:
         assert result["retryable"] is False
         assert sandbox.calls == []
 
-    async def test_an_attachment_of_another_session_is_refused(
-        self, executor, monkeypatch, upload
-    ):
+    async def test_an_attachment_of_another_session_is_refused(self, executor, monkeypatch, upload):
         _install_attachments(
             monkeypatch,
             _FakeAttachmentStore(
@@ -2974,9 +3022,7 @@ class TestRunAnalysisAttachmentInputs:
             _FakeAttachmentStore(
                 owner="u@finngen.fi",
                 session_id="conv-9",
-                rows=[
-                    _FakeAttachment("att-1", "conv-9", "gone.tsv", tmp_path / "not-written.tsv")
-                ],
+                rows=[_FakeAttachment("att-1", "conv-9", "gone.tsv", tmp_path / "not-written.tsv")],
             ),
         )
         sandbox = _StubSandbox(result=_result_body())
@@ -3102,9 +3148,7 @@ class TestRunAnalysisInputsDefinition:
             {"name": "x.tsv"},
         ],
     )
-    async def test_an_item_naming_no_single_source_is_refused(
-        self, executor, monkeypatch, entry
-    ):
+    async def test_an_item_naming_no_single_source_is_refused(self, executor, monkeypatch, entry):
         fetcher = _install_fetcher(monkeypatch, _StubFetcher())
         result = await _run_with_inputs(executor, _StubSandbox(result=_result_body()), [entry])
         assert result["error_type"] == "InputRejected"

@@ -26,7 +26,9 @@ class _Server:
 
     def __init__(self, tools=("query_kb", "run_pipeline")):
         self.requests: list[httpx.Request] = []
-        self.tools = [{"name": t, "description": "d", "inputSchema": {"type": "object"}} for t in tools]
+        self.tools = [
+            {"name": t, "description": "d", "inputSchema": {"type": "object"}} for t in tools
+        ]
         self.refresh_count = 0
         self.rotate = True
         self.reject_bearer: str | None = None
@@ -37,12 +39,19 @@ class _Server:
         if str(request.url) == TOKEN_ENDPOINT:
             form = dict(p.split("=", 1) for p in request.content.decode().split("&"))
             self.refresh_count += 1
-            body = {"access_token": f"at{self.refresh_count}", "expires_in": 3600, "token_type": "Bearer"}
+            body = {
+                "access_token": f"at{self.refresh_count}",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            }
             if self.rotate:
                 body["refresh_token"] = f"rt{self.refresh_count}"
             assert form["grant_type"] == "refresh_token"
             return httpx.Response(200, json=body)
-        if self.reject_bearer and request.headers.get("authorization") == f"Bearer {self.reject_bearer}":
+        if (
+            self.reject_bearer
+            and request.headers.get("authorization") == f"Bearer {self.reject_bearer}"
+        ):
             return httpx.Response(401)
         payload = json.loads(request.content)
         if "id" not in payload:
@@ -56,13 +65,21 @@ class _Server:
             result = {"content": [{"type": "text", "text": json.dumps({"ok": method})}]}
         reply = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
         if self.sse_notification_first and method == "tools/call":
-            note = {"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "KB query finished"}}
+            note = {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"level": "info", "data": "KB query finished"},
+            }
             body = f"event: message\ndata: {json.dumps(note)}\n\nevent: message\ndata: {json.dumps(reply)}\n\n"
-            return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+            return httpx.Response(
+                200, content=body.encode(), headers={"content-type": "text/event-stream"}
+            )
         return httpx.Response(200, json=reply)
 
     def mcp_methods(self) -> list[str]:
-        return [json.loads(r.content)["method"] for r in self.requests if str(r.url) != TOKEN_ENDPOINT]
+        return [
+            json.loads(r.content)["method"] for r in self.requests if str(r.url) != TOKEN_ENDPOINT
+        ]
 
 
 @pytest.fixture
@@ -70,7 +87,9 @@ def server(monkeypatch):
     fake = _Server()
     real_client, real_async = httpx.Client, httpx.AsyncClient
     monkeypatch.setattr(
-        mcp_proxy.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(fake), **kw)
+        mcp_proxy.httpx,
+        "Client",
+        lambda **kw: real_client(transport=httpx.MockTransport(fake), **kw),
     )
     monkeypatch.setattr(
         mcp_proxy.httpx,
@@ -110,7 +129,9 @@ class TestServerConfig:
 
 
 class TestSseParsing:
-    async def test_a_notification_ahead_of_the_response_on_the_stream_is_not_mistaken_for_it(self, server):
+    async def test_a_notification_ahead_of_the_response_on_the_stream_is_not_mistaken_for_it(
+        self, server
+    ):
         server.sse_notification_first = True
         client = MCPProxyClient("https://x.invalid")
         assert await client.call_tool("query_kb", {"query": "q"}) == {"ok": "tools/call"}
@@ -122,9 +143,18 @@ class TestSseParsing:
             'data: {"jsonrpc":"2.0","id":7,"result":{"a":1}}\n\n'
             'data: {"jsonrpc":"2.0","id":8,"result":{"a":2}}\n\n'
         )
-        assert client._parse_sse_response(stream, 7) == {"jsonrpc": "2.0", "id": 7, "result": {"a": 1}}
+        assert client._parse_sse_response(stream, 7) == {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {"a": 1},
+        }
         assert client._parse_sse_response(stream, 9)["id"] == 8
-        assert client._parse_sse_response('data: {"jsonrpc":"2.0","method":"notifications/message"}\n', 1) is None
+        assert (
+            client._parse_sse_response(
+                'data: {"jsonrpc":"2.0","method":"notifications/message"}\n', 1
+            )
+            is None
+        )
 
 
 class TestEndpointPath:
@@ -162,7 +192,9 @@ class TestOAuthRefreshTokenSource:
         source._expires_at = time.monotonic() + 30  # inside the refresh margin
         assert source.access_token() == "at2"
 
-    def test_a_rotated_refresh_token_is_persisted_and_read_back_ahead_of_the_seed(self, server, tmp_path):
+    def test_a_rotated_refresh_token_is_persisted_and_read_back_ahead_of_the_seed(
+        self, server, tmp_path
+    ):
         path = tmp_path / "C3PO.json"
         OAuthRefreshTokenSource(_seed(), state_path=path).access_token()
         assert json.loads(path.read_text())["refresh_token"] == "rt1"
@@ -195,7 +227,9 @@ class TestOAuthRefreshTokenSource:
 
         real_client = httpx.Client
         monkeypatch.setattr(
-            mcp_proxy.httpx, "Client", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)
+            mcp_proxy.httpx,
+            "Client",
+            lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
         )
         with pytest.raises(RuntimeError, match="invalid_grant"):
             OAuthRefreshTokenSource(_seed()).access_token()
@@ -217,12 +251,16 @@ class TestBuildProxyClient:
     def test_an_oauth_entry_reads_its_env_var_and_the_state_dir(self, monkeypatch, tmp_path):
         monkeypatch.setenv("C3PO_MCP_OAUTH", json.dumps(_seed()))
         monkeypatch.setenv("EXTERNAL_MCP_STATE_DIR", str(tmp_path))
-        client, config = build_proxy_client("https://mcp.c3po.bio|path=/|oauth=C3PO_MCP_OAUTH", 60.0)
+        client, config = build_proxy_client(
+            "https://mcp.c3po.bio|path=/|oauth=C3PO_MCP_OAUTH", 60.0
+        )
         assert client.url == "https://mcp.c3po.bio"
         assert client.token_source.state_path == tmp_path / "C3PO_MCP_OAUTH.json"
         assert config.oauth_env == "C3PO_MCP_OAUTH"
 
-    def test_an_unset_oauth_env_var_is_an_error_not_a_silent_unauthenticated_client(self, monkeypatch):
+    def test_an_unset_oauth_env_var_is_an_error_not_a_silent_unauthenticated_client(
+        self, monkeypatch
+    ):
         monkeypatch.delenv("NOPE_OAUTH", raising=False)
         with pytest.raises(ValueError, match="NOPE_OAUTH"):
             build_proxy_client("https://x.invalid|oauth=NOPE_OAUTH", 60.0)
@@ -241,7 +279,9 @@ class TestRegistration:
         assert mcp_proxy.initialize_external_servers() == 2
         assert set(mcp_proxy._proxy_clients) == {"query_kb"}
 
-    async def test_a_prefix_namespaces_the_registered_names_and_dispatch_strips_it(self, server, monkeypatch):
+    async def test_a_prefix_namespaces_the_registered_names_and_dispatch_strips_it(
+        self, server, monkeypatch
+    ):
         monkeypatch.setenv("EXTERNAL_MCP_SERVERS", "https://a.invalid|prefix=c3po|tools=query_kb")
         monkeypatch.delenv("EXTERNAL_MCP_EXCLUDE_TOOLS", raising=False)
         monkeypatch.delenv("RAG_MCP_SERVER", raising=False)
@@ -252,8 +292,12 @@ class TestRegistration:
         assert await mcp_proxy.execute_external_tool("c3po_query_kb", {}) == {"ok": "tools/call"}
         assert json.loads(server.requests[-1].content)["params"]["name"] == "query_kb"
 
-    def test_a_server_whose_oauth_env_is_unset_is_skipped_and_the_rest_still_register(self, server, monkeypatch):
-        monkeypatch.setenv("EXTERNAL_MCP_SERVERS", "https://a.invalid|oauth=UNSET_OAUTH,https://b.invalid")
+    def test_a_server_whose_oauth_env_is_unset_is_skipped_and_the_rest_still_register(
+        self, server, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "EXTERNAL_MCP_SERVERS", "https://a.invalid|oauth=UNSET_OAUTH,https://b.invalid"
+        )
         monkeypatch.delenv("UNSET_OAUTH", raising=False)
         monkeypatch.delenv("EXTERNAL_MCP_EXCLUDE_TOOLS", raising=False)
         monkeypatch.delenv("RAG_MCP_SERVER", raising=False)

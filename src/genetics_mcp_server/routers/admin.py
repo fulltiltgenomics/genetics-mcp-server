@@ -214,25 +214,27 @@ async def list_all_sessions(
     for s in sessions:
         preview = db.get_first_user_message(s.id)
         messages = db.get_messages(s.id)
-        items.append(AdminSessionItem(
-            usd=costs.get(s.id),
-            instruction_set_name=resolve_instruction_set_name(s.user_id, messages),
-            id=s.id,
-            user_id=s.user_id,
-            title=s.title,
-            created_at=s.created_at.isoformat(),
-            updated_at=s.updated_at.isoformat(),
-            rating=s.rating,
-            comment=s.comment,
-            phenotype_code=s.phenotype_code,
-            message_count=len(messages),
-            preview=preview[:100] if preview else None,
-            disposition=s.disposition,
-            issue_count=s.issue_count,
-            issue_categories=s.issue_categories or [],
-            llm_rating=s.llm_quality_score,
-            success_label=s.success_label,
-        ))
+        items.append(
+            AdminSessionItem(
+                usd=costs.get(s.id),
+                instruction_set_name=resolve_instruction_set_name(s.user_id, messages),
+                id=s.id,
+                user_id=s.user_id,
+                title=s.title,
+                created_at=s.created_at.isoformat(),
+                updated_at=s.updated_at.isoformat(),
+                rating=s.rating,
+                comment=s.comment,
+                phenotype_code=s.phenotype_code,
+                message_count=len(messages),
+                preview=preview[:100] if preview else None,
+                disposition=s.disposition,
+                issue_count=s.issue_count,
+                issue_categories=s.issue_categories or [],
+                llm_rating=s.llm_quality_score,
+                success_label=s.success_label,
+            )
+        )
 
     return AdminSessionListResponse(
         sessions=items,
@@ -345,25 +347,35 @@ async def list_feedback(
 
     for uc in get_llm_config_db().list_all_user_comments():
         created_at = uc.created_at.isoformat()
-        entries.append(((created_at, "feedback_dialog", uc.id), FeedbackItem(
-            user=uc.user_id,
-            comment=uc.comment,
-            preview=uc.comment[:100],
-            created_at=created_at,
-            source="feedback_dialog",
-        )))
+        entries.append(
+            (
+                (created_at, "feedback_dialog", uc.id),
+                FeedbackItem(
+                    user=uc.user_id,
+                    comment=uc.comment,
+                    preview=uc.comment[:100],
+                    created_at=created_at,
+                    source="feedback_dialog",
+                ),
+            )
+        )
 
     for sc in get_chat_history_db().list_sessions_with_comments():
         comment = sc["comment"]
         created_at = sc["created_at"].isoformat()
-        entries.append(((created_at, "session_comment", sc["session_id"]), FeedbackItem(
-            user=sc["user_id"],
-            comment=comment,
-            preview=comment[:100],
-            created_at=created_at,
-            source="session_comment",
-            session_id=sc["session_id"],
-        )))
+        entries.append(
+            (
+                (created_at, "session_comment", sc["session_id"]),
+                FeedbackItem(
+                    user=sc["user_id"],
+                    comment=comment,
+                    preview=comment[:100],
+                    created_at=created_at,
+                    source="session_comment",
+                    session_id=sc["session_id"],
+                ),
+            )
+        )
 
     # newest first, ties broken by (source, id)
     entries.sort(key=lambda e: e[0], reverse=True)
@@ -371,7 +383,7 @@ async def list_feedback(
 
     total = len(items)
     latest_at = items[0].created_at if items else None
-    page = items[offset:offset + limit]
+    page = items[offset : offset + limit]
 
     return FeedbackListResponse(
         items=page,

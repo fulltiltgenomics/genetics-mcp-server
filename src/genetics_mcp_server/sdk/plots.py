@@ -83,20 +83,22 @@ _MARKER_OTHER = "o"
 # `splice_region_variant` is excluded because VEP assigns it up to 8 bp into an intron, so a
 # square there would claim a coding position the term does not establish — the two splice-site
 # terms that abolish a site ARE here.
-_CODING_CONSEQUENCES = frozenset({
-    "frameshift_variant",
-    "inframe_deletion",
-    "inframe_insertion",
-    "incomplete_terminal_codon_variant",
-    "missense_variant",
-    "protein_altering_variant",
-    "splice_acceptor_variant",
-    "splice_donor_variant",
-    "start_lost",
-    "stop_gained",
-    "stop_lost",
-    "transcript_ablation",
-})
+_CODING_CONSEQUENCES = frozenset(
+    {
+        "frameshift_variant",
+        "inframe_deletion",
+        "inframe_insertion",
+        "incomplete_terminal_codon_variant",
+        "missense_variant",
+        "protein_altering_variant",
+        "splice_acceptor_variant",
+        "splice_donor_variant",
+        "start_lost",
+        "stop_gained",
+        "stop_lost",
+        "transcript_ablation",
+    }
+)
 
 # the significance line and its label are scaffolding, not data: grey keeps them behind the
 # points instead of competing with the LD ramp for the reader's attention
@@ -353,6 +355,7 @@ def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: s
     Every part is optional and the title degrades one piece at a time: no name leaves the code
     in front, no release leaves the resource alone, and neither leaves `CODE — region`.
     """
+
     def first(column: str) -> str | None:
         if column not in frame.columns or frame.height == 0:
             return None
@@ -361,8 +364,7 @@ def _default_title(phenotype: str, region: str, frame: pl.DataFrame, resource: s
 
     name = _phenotype_name(phenotype)
     source = " ".join(
-        part for part in (_resource_label(first("resource") or resource), first("version"))
-        if part
+        part for part in (_resource_label(first("resource") or resource), first("version")) if part
     )
     inside = ", ".join(part for part in (phenotype if name else None, source) if part)
     head = name or phenotype
@@ -387,9 +389,7 @@ def _consequences(region: str) -> dict[str, tuple[str | None, str | None]] | Non
     if annotations.is_empty() or not {"variant", "most_severe"} <= set(annotations.columns):
         return None
     return {
-        _norm_variant_id(row["variant"]): (
-            row.get("most_severe"), row.get("gene_most_severe")
-        )
+        _norm_variant_id(row["variant"]): (row.get("most_severe"), row.get("gene_most_severe"))
         for row in annotations.iter_rows(named=True)
     }
 
@@ -404,9 +404,7 @@ def _variant_pos(value: Any) -> int | None:
         return None
 
 
-def _partners_outside(
-    ld_frame: pl.DataFrame | None, lo: int, hi: int
-) -> list[dict[str, Any]]:
+def _partners_outside(ld_frame: pl.DataFrame | None, lo: int, hi: int) -> list[dict[str, Any]]:
     """LD partners the plotted window excludes, strongest first.
 
     A locuszoom is read as "this is the locus", so a correlated variant just past the edge is
@@ -537,8 +535,9 @@ def _bar(ax, lo, hi, row: int, width: float, start: int, end: int) -> None:
     lo, hi = max(lo, start), min(hi, end)
     if lo > hi:
         return
-    ax.plot([lo, hi], [-row, -row], linewidth=width, solid_capstyle="butt",
-            color=_GENE_COLOUR, zorder=2)
+    ax.plot(
+        [lo, hi], [-row, -row], linewidth=width, solid_capstyle="butt", color=_GENE_COLOUR, zorder=2
+    )
 
 
 def _gene_label(gene: dict[str, Any]) -> str | None:
@@ -606,7 +605,8 @@ def _draw_genes(
     # its label would float past the axes with no model under it.
     drawable = sorted(
         (
-            d for d in (_drawable(g) for g in genes.iter_rows(named=True))
+            d
+            for d in (_drawable(g) for g in genes.iter_rows(named=True))
             if d and d[2] >= start and d[1] <= end
         ),
         key=lambda d: d[1],
@@ -636,11 +636,19 @@ def _draw_genes(
             _bar(ax, cds_start, cds_end, row, _GENE_CDS_WIDTH, start, end)
             exons_drawn += 1
         label = f"{name}{'→' if strand == '+' else '←' if strand == '-' else ''}"
-        ax.text((left + right) / 2, -row + 0.22, label, ha="center", va="bottom",
-                fontsize=5, color="#222222")
+        ax.text(
+            (left + right) / 2,
+            -row + 0.22,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=5,
+            color="#222222",
+        )
         drawn += 1
     ax.set_ylim(-max(len(row_ends), 1) + 0.2, 0.9)
     return drawn, exons_drawn
+
 
 def _significance_line(ax, significance: float, *, label_right: bool = False) -> float:
     """The significance line and its label; returns the line's y.
@@ -659,15 +667,25 @@ def _significance_line(ax, significance: float, *, label_right: bool = False) ->
     line_y = -math.log10(significance)
     ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
     backing = (
-        {"bbox": {"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6},
-         "zorder": 4}
-        if label_right else {}
+        {
+            "bbox": {"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6},
+            "zorder": 4,
+        }
+        if label_right
+        else {}
     )
     # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
-    ax.text(0.994 if label_right else 0.006, line_y,
-            f"p {significance:g}".replace("e-0", "e-"),
-            transform=ax.get_yaxis_transform(), ha="right" if label_right else "left",
-            va="bottom", fontsize=6, color=_SIGNIFICANCE_GREY, **backing)
+    ax.text(
+        0.994 if label_right else 0.006,
+        line_y,
+        f"p {significance:g}".replace("e-0", "e-"),
+        transform=ax.get_yaxis_transform(),
+        ha="right" if label_right else "left",
+        va="bottom",
+        fontsize=6,
+        color=_SIGNIFICANCE_GREY,
+        **backing,
+    )
     return line_y
 
 
@@ -696,9 +714,7 @@ def _mb_axis(ax) -> None:
     def fmt(value: float, _pos: Any) -> str:
         locs = sorted(ax.xaxis.get_majorticklocs())
         step = min((b - a for a, b in zip(locs, locs[1:])), default=1e6) / 1e6
-        decimals = next(
-            (d for d in range(7) if abs(round(step, d) - step) < 1e-9), 6
-        )
+        decimals = next((d for d in range(7) if abs(round(step, d) - step) < 1e-9), 6)
         return f"{value / 1e6:.{decimals}f}"
 
     ax.xaxis.set_major_formatter(FuncFormatter(fmt))
@@ -719,7 +735,8 @@ def _track_symbol(symbol: str | None, genes: pl.DataFrame | None) -> str | None:
     if symbol in names or "hgnc_prev_symbol" not in genes.columns:
         return symbol
     renamed = [
-        gene for gene in genes.iter_rows(named=True)
+        gene
+        for gene in genes.iter_rows(named=True)
         if symbol in str(gene.get("hgnc_prev_symbol") or "").split("|")
     ]
     if len(renamed) != 1:
@@ -772,9 +789,14 @@ def _label_spots() -> list[tuple[float, float, str, str]]:
     line to somewhere clear.
     """
     spots: list[tuple[float, float, str, str]] = [
-        (0, -9, "center", "top"), (9, 0, "left", "center"), (-9, 0, "right", "center"),
-        (9, -9, "left", "top"), (-9, -9, "right", "top"), (0, 9, "center", "bottom"),
-        (9, 9, "left", "bottom"), (-9, 9, "right", "bottom"),
+        (0, -9, "center", "top"),
+        (9, 0, "left", "center"),
+        (-9, 0, "right", "center"),
+        (9, -9, "left", "top"),
+        (-9, -9, "right", "top"),
+        (0, 9, "center", "bottom"),
+        (9, 9, "left", "bottom"),
+        (-9, 9, "right", "bottom"),
     ]
     for radius in (28, 50, 75, 105):
         for degrees in (-30, -150, 0, 180, -60, -120, 30, 150, 60, 120):
@@ -789,8 +811,14 @@ _LABEL_SPOTS = _label_spots()
 _LEADER_FROM = 10  # points of offset beyond which a label gets a line back to its point
 
 
-def _place_labels(ax, renderer, labels: list[tuple[str, float, float, float]],
-                  points: np.ndarray, taken: list, fontstyle: str = "normal") -> None:
+def _place_labels(
+    ax,
+    renderer,
+    labels: list[tuple[str, float, float, float]],
+    points: np.ndarray,
+    taken: list,
+    fontstyle: str = "normal",
+) -> None:
     """Annotate each (text, x, y, fontsize) where it covers the fewest points.
 
     At a fixed offset the lead's caption lands on its own LD partners at a dense locus, and
@@ -804,11 +832,22 @@ def _place_labels(ax, renderer, labels: list[tuple[str, float, float, float]],
     frame = ax.bbox
     for text, x, y, fontsize in labels:
         note = ax.annotate(
-            text, (x, y), textcoords="offset points", xytext=_LABEL_SPOTS[0][:2],
-            ha=_LABEL_SPOTS[0][2], va=_LABEL_SPOTS[0][3], fontsize=fontsize, zorder=5,
+            text,
+            (x, y),
+            textcoords="offset points",
+            xytext=_LABEL_SPOTS[0][:2],
+            ha=_LABEL_SPOTS[0][2],
+            va=_LABEL_SPOTS[0][3],
+            fontsize=fontsize,
+            zorder=5,
             fontstyle=fontstyle,
-            arrowprops={"arrowstyle": "-", "linewidth": 0.4, "color": "#555555",
-                        "shrinkA": 0, "shrinkB": 3},
+            arrowprops={
+                "arrowstyle": "-",
+                "linewidth": 0.4,
+                "color": "#555555",
+                "shrinkA": 0,
+                "shrinkB": 3,
+            },
         )
         note.arrow_patch.set_visible(False)
         if renderer is None:
@@ -822,12 +861,24 @@ def _place_labels(ax, renderer, labels: list[tuple[str, float, float, float]],
             # reaches back to the point and so always "covers" it
             note.update_positions(renderer)
             box = Text.get_window_extent(note, renderer)
-            inside = (box.x0 >= frame.x0 and box.x1 <= frame.x1
-                      and box.y0 >= frame.y0 and box.y1 <= frame.y1)
-            covered = int((
-                (points[:, 0] >= box.x0 - 2) & (points[:, 0] <= box.x1 + 2)
-                & (points[:, 1] >= box.y0 - 2) & (points[:, 1] <= box.y1 + 2)
-            ).sum()) if len(points) else 0
+            inside = (
+                box.x0 >= frame.x0
+                and box.x1 <= frame.x1
+                and box.y0 >= frame.y0
+                and box.y1 <= frame.y1
+            )
+            covered = (
+                int(
+                    (
+                        (points[:, 0] >= box.x0 - 2)
+                        & (points[:, 0] <= box.x1 + 2)
+                        & (points[:, 1] >= box.y0 - 2)
+                        & (points[:, 1] <= box.y1 + 2)
+                    ).sum()
+                )
+                if len(points)
+                else 0
+            )
             clashes = sum(1 for other in taken if box.overlaps(other))
             cost = (0 if inside else 10_000) + 500 * clashes + covered
             if best is None or cost < best[0]:
@@ -959,8 +1010,12 @@ def locuszoom(
     if variant and not region:
         region, chrom = _region_from_variant(variant, flank)
 
-    frame = data if data is not None else sdk.summary_stats(
-        phenotypes=phenotype, region=region, resource=resource, data_type=data_type
+    frame = (
+        data
+        if data is not None
+        else sdk.summary_stats(
+            phenotypes=phenotype, region=region, resource=resource, data_type=data_type
+        )
     )
     if frame.is_empty():
         raise GeneticsUsageError(
@@ -1011,9 +1066,7 @@ def locuszoom(
     for wanted in [highlight] if isinstance(highlight, str) else list(highlight or []):
         wanted_id = _norm_variant_id(wanted)
         if wanted_id not in known_ids:
-            raise GeneticsUsageError(
-                f"highlight {wanted!r} is not among the variants in {region}"
-            )
+            raise GeneticsUsageError(f"highlight {wanted!r} is not among the variants in {region}")
         if wanted_id != lead_id and wanted_id not in marked:
             marked.append(wanted_id)
 
@@ -1035,9 +1088,7 @@ def locuszoom(
     )
     if ld:
         try:
-            ld_frame = sdk.ld(
-                lead_id, window=ld_window, r2_threshold=_LD_MIN_R2, panel=ld_panel
-            )
+            ld_frame = sdk.ld(lead_id, window=ld_window, r2_threshold=_LD_MIN_R2, panel=ld_panel)
         except GeneticsError as exc:
             # neither loses the figure, but they are different answers: a lead the panel does
             # not carry stays that way, and only a failed server is worth a retry
@@ -1075,9 +1126,7 @@ def locuszoom(
         partners = frame.filter(
             (pl.col("_r2") >= label_r2) & (pl.col("_variant_id") != lead_id)
         ).sort("_y", descending=True)
-        named += [
-            vid for vid in partners["_variant_id"].head(_MAX_R2_LABELS) if vid not in named
-        ]
+        named += [vid for vid in partners["_variant_id"].head(_MAX_R2_LABELS) if vid not in named]
 
     own_figure = ax is None
     gene_frame = None
@@ -1091,8 +1140,12 @@ def locuszoom(
             want_genes = gene_frame is not None and not gene_frame.is_empty()
         if want_genes:
             figure, (ax, gene_ax) = plt.subplots(
-                2, 1, sharex=True, height_ratios=[4, 1],
-                figsize=(6.5, 4.2), constrained_layout=True,
+                2,
+                1,
+                sharex=True,
+                height_ratios=[4, 1],
+                figsize=(6.5, 4.2),
+                constrained_layout=True,
             )
         else:
             figure, ax = plt.subplots(figsize=(6.5, 3.4), constrained_layout=True)
@@ -1107,21 +1160,43 @@ def locuszoom(
         rows = [i for i, is_coding in enumerate(coding_flags) if is_coding is wanted]
         if not rows:
             continue
-        ax.scatter([positions[i] for i in rows], [ys[i] for i in rows],
-                   c=[colours[i] for i in rows], marker=marker, s=9, linewidths=0.2,
-                   edgecolors="#33333355", zorder=2)
+        ax.scatter(
+            [positions[i] for i in rows],
+            [ys[i] for i in rows],
+            c=[colours[i] for i in rows],
+            marker=marker,
+            s=9,
+            linewidths=0.2,
+            edgecolors="#33333355",
+            zorder=2,
+        )
 
     index_of = {vid: i for i, vid in enumerate(frame["_variant_id"]) if vid is not None}
     lead_index = index_of.get(lead_id)
     lead_coding = bool(lead_index is not None and coding_flags[lead_index])
-    ax.scatter([lead_pos], [lead_y], marker=_MARKER_CODING if lead_coding else _MARKER_OTHER,
-               s=40, c=_LEAD_COLOUR, edgecolors="black", linewidths=0.4, zorder=3)
+    ax.scatter(
+        [lead_pos],
+        [lead_y],
+        marker=_MARKER_CODING if lead_coding else _MARKER_OTHER,
+        s=40,
+        c=_LEAD_COLOUR,
+        edgecolors="black",
+        linewidths=0.4,
+        zorder=3,
+    )
     for vid in marked:
         # a ring, so the point keeps the colour and shape it already carries
         i = index_of[vid]
-        ax.scatter([positions[i]], [ys[i]], s=42, facecolors="none", edgecolors="black",
-                   linewidths=0.7, zorder=3,
-                   marker=_MARKER_CODING if coding_flags[i] else _MARKER_OTHER)
+        ax.scatter(
+            [positions[i]],
+            [ys[i]],
+            s=42,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=0.7,
+            zorder=3,
+            marker=_MARKER_CODING if coding_flags[i] else _MARKER_OTHER,
+        )
     line_y = _significance_line(ax, significance, label_right=True)
 
     ld_note = {
@@ -1131,23 +1206,33 @@ def locuszoom(
     }.get(ld_status)
     if ld_note:
         # where the legend would have been, so grey points say why they are grey
-        ax.text(0.006, 0.99, ld_note, transform=ax.transAxes, ha="left", va="top",
-                fontsize=5, color=_SIGNIFICANCE_GREY)
+        ax.text(
+            0.006,
+            0.99,
+            ld_note,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=5,
+            color=_SIGNIFICANCE_GREY,
+        )
 
     if outside:
         # on the figure and not only in the returned dict: the figure is what reaches the
         # reader, and a plot that silently omits the locus's best-correlated variant is wrong
         # in the one way a reader cannot detect
-        nearest = min(
-            outside, key=lambda p: min(abs(p["pos"] - span_lo), abs(p["pos"] - span_hi))
-        )
+        nearest = min(outside, key=lambda p: min(abs(p["pos"] - span_lo), abs(p["pos"] - span_hi)))
         gap = min(abs(nearest["pos"] - span_lo), abs(nearest["pos"] - span_hi))
         ax.text(
-            0.995, 0.99,
+            0.995,
+            0.99,
             rf"{len(outside)} r$^2\geq${_LD_NOTABLE_R2:g} partner"
             f"{'' if len(outside) == 1 else 's'} outside window; "
             f"nearest {gap / 1000:.0f} kb out, r$^2$ {nearest['r2']:.2f}",
-            transform=ax.transAxes, ha="right", va="top", fontsize=7,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=7,
             color=_WARNING_COLOUR,
         )
 
@@ -1155,8 +1240,7 @@ def locuszoom(
     ax.margins(x=0.02)
     if ld_joined:
         handles = [
-            plt.Line2D([], [], marker="o", linestyle="", markersize=4, color=colour,
-                       label=label)
+            plt.Line2D([], [], marker="o", linestyle="", markersize=4, color=colour, label=label)
             for _threshold, colour, label in _LD_BINS
         ]
         # the panel is named, not just the quantity: r² is to the lead and from one LD panel,
@@ -1165,8 +1249,14 @@ def locuszoom(
         legend_title = f"LD $r^2$ to {lead_id} ({ld_panel})"
         if ld_status == "partial":
             legend_title += f"\nonly within {ld_reach / 1e6:g} Mb of the lead"
-        ax.legend(handles=handles, title=legend_title,
-                  fontsize=5, title_fontsize=5, loc="upper left", ncol=1)
+        ax.legend(
+            handles=handles,
+            title=legend_title,
+            fontsize=5,
+            title_fontsize=5,
+            loc="upper left",
+            ncol=1,
+        )
 
     # pinned before the gene track can widen it through sharex
     pad = max((span_hi - span_lo) * 0.02, 1)
@@ -1186,19 +1276,21 @@ def locuszoom(
         # models between the points and their own scale
         ax.tick_params(labelbottom=True)
     chrom_label = frame["chr"][0] if "chr" in frame.columns else ""
-    ax.set_xlabel(
-        f"position on chromosome {chrom_label}".rstrip() + " (Mb)", fontsize=_LABEL_SIZE
-    )
+    ax.set_xlabel(f"position on chromosome {chrom_label}".rstrip() + " (Mb)", fontsize=_LABEL_SIZE)
     _mb_axis(ax)
 
     # last, because where a label fits depends on everything else already being in place
     _fit_title(ax, figure, own_figure)
     renderer = _renderer(figure)
     lead_gene_label = _track_symbol(lead_gene, gene_frame)
-    labels = [(
-        _lead_label(lead_id, lead_row, lead_y, lead_consequence, lead_gene_label),
-        lead_pos, lead_y, 6,
-    )]
+    labels = [
+        (
+            _lead_label(lead_id, lead_row, lead_y, lead_consequence, lead_gene_label),
+            lead_pos,
+            lead_y,
+            6,
+        )
+    ]
     highlighted = []
     for vid in named:
         row = frame.row(index_of[vid], named=True)
@@ -1208,13 +1300,21 @@ def locuszoom(
             text += rf"  r$^2$ {row['_r2']:.2f}"
         labels.append((text, row["pos"], row["_y"], 5.5))
         highlighted.append({"variant": vid, "mlog10p": float(row["_y"]), "r2": row["_r2"]})
-    taken = [] if renderer is None else [
-        artist.get_window_extent(renderer)
-        for artist in [*ax.texts, ax.get_legend()] if artist is not None
-    ]
+    taken = (
+        []
+        if renderer is None
+        else [
+            artist.get_window_extent(renderer)
+            for artist in [*ax.texts, ax.get_legend()]
+            if artist is not None
+        ]
+    )
     _place_labels(
-        ax, renderer, labels,
-        ax.transData.transform(np.column_stack([positions, ys])), taken,
+        ax,
+        renderer,
+        labels,
+        ax.transData.transform(np.column_stack([positions, ys])),
+        taken,
     )
 
     written = None
@@ -1308,7 +1408,9 @@ def _tick_label(category: str) -> str:
     return "\n".join(lines)
 
 
-def _phenotype_metadata(frame: pl.DataFrame) -> dict[tuple[str | None, str], tuple[str | None, str | None]]:
+def _phenotype_metadata(
+    frame: pl.DataFrame,
+) -> dict[tuple[str | None, str], tuple[str | None, str | None]]:
     """(dataset, code) -> (name, category) from `phenotypes_v`, for the frame's traits.
 
     The category is the source's own grouping — a FinnGen ICD chapter, an Open Targets
@@ -1413,8 +1515,10 @@ def phewas(
     from genetics_mcp_server import sdk
 
     variant_id = _norm_variant_id(variant)
-    frame = data if data is not None else sdk.credible_sets(
-        variant=variant_id, resource=resource, data_types="GWAS"
+    frame = (
+        data
+        if data is not None
+        else sdk.credible_sets(variant=variant_id, resource=resource, data_types="GWAS")
     )
     if "trait" not in frame.columns:
         raise GeneticsUsageError(
@@ -1425,9 +1529,7 @@ def phewas(
         # a caller's `data=` may carry the QTL rows too; a phewas is the GWAS ones
         frame = frame.filter(pl.col("data_type").cast(pl.Utf8).str.to_uppercase() == "GWAS")
     if not frame.is_empty():
-        frame = frame.with_columns(_mlog10p(frame).alias("_y")).filter(
-            pl.col("_y") >= min_mlog10p
-        )
+        frame = frame.with_columns(_mlog10p(frame).alias("_y")).filter(pl.col("_y") >= min_mlog10p)
     if frame.is_empty():
         raise GeneticsUsageError(
             f"no GWAS associations for {variant_id} at -log10(p) >= {min_mlog10p:g} "
@@ -1446,18 +1548,14 @@ def phewas(
     datasets = frame["dataset"] if "dataset" in frame.columns else [None] * frame.height
     names, categories_of = [], []
     for dataset, code, display in zip(datasets, frame["_code"], frame["_display"]):
-        name, category = metadata.get(
-            (dataset, code), metadata.get((None, code), (None, None))
-        )
+        name, category = metadata.get((dataset, code), metadata.get((None, code), (None, None)))
         names.append(name or display)
         categories_of.append(category or _PHEWAS_UNCATEGORISED)
     grouped_by = "category"
     if len(set(categories_of)) > _PHEWAS_MAX_CATEGORIES:
         grouped_by = "resource"
         resources = frame["resource"] if "resource" in frame.columns else [None] * frame.height
-        categories_of = [
-            _resource_label(str(r)) if r else _PHEWAS_UNCATEGORISED for r in resources
-        ]
+        categories_of = [_resource_label(str(r)) if r else _PHEWAS_UNCATEGORISED for r in resources]
     frame = frame.with_columns(
         pl.Series("_name", names, dtype=pl.Utf8),
         pl.Series("_category", categories_of, dtype=pl.Utf8),
@@ -1493,11 +1591,22 @@ def phewas(
 
     # colour separates neighbouring groups and encodes nothing a reader decodes, so unlike
     # the LD ramp it follows whatever prop_cycle the caller's style set
-    palette = dict(zip(categories, itertools.cycle(
-        plt.rcParams["axes.prop_cycle"].by_key().get("color") or ["#333333"]
-    )))
-    ax.scatter(xs, ys, c=[palette[c] for c in frame["_category"]],
-               marker=_MARKER_OTHER, s=9, linewidths=0.2, edgecolors="#33333355", zorder=2)
+    palette = dict(
+        zip(
+            categories,
+            itertools.cycle(plt.rcParams["axes.prop_cycle"].by_key().get("color") or ["#333333"]),
+        )
+    )
+    ax.scatter(
+        xs,
+        ys,
+        c=[palette[c] for c in frame["_category"]],
+        marker=_MARKER_OTHER,
+        s=9,
+        linewidths=0.2,
+        edgecolors="#33333355",
+        zorder=2,
+    )
     line_y = _significance_line(ax, significance)
 
     # each phenotype is named once, at its strongest point: the same trait from two resources
@@ -1517,15 +1626,23 @@ def phewas(
         text = labels[i]
         if len(text) > _PHEWAS_LABEL_CHARS:
             text = text[:_PHEWAS_LABEL_CHARS] + "…"
-        ax.annotate(text, (xs[i], ys[i]), textcoords="offset points", xytext=(2, 2),
-                    ha="left", va="bottom", fontsize=5)
+        ax.annotate(
+            text,
+            (xs[i], ys[i]),
+            textcoords="offset points",
+            xytext=(2, 2),
+            ha="left",
+            va="bottom",
+            fontsize=5,
+        )
 
     _dress(ax, title if title is not None else _phewas_title(variant_id, frame, resource))
     # the categories ARE the x scale: one label under the middle of each group, and no tick
     # marks, since a mark would point at one association among several
     ax.set_xticks([(lo + hi) / 2 for lo, hi in (spans[c] for c in categories)])
-    ax.set_xticklabels([_tick_label(c) for c in categories], rotation=45, ha="right",
-                       rotation_mode="anchor")
+    ax.set_xticklabels(
+        [_tick_label(c) for c in categories], rotation=45, ha="right", rotation_mode="anchor"
+    )
     ax.tick_params(axis="x", length=0)
     ax.set_xlim(-1, x)
     y_top = max(max(ys), line_y)
@@ -1612,9 +1729,11 @@ def _upset_from_data(
 ) -> tuple[list[str], dict[frozenset[str], int]]:
     """Exclusive intersection sizes from a frame with one membership column per set, one row
     per element — or, with `count=`, one row per combination already tallied."""
-    names = [str(c) for c in columns] if columns else [
-        c for c in data.columns if data.schema[c] == pl.Boolean
-    ]
+    names = (
+        [str(c) for c in columns]
+        if columns
+        else [c for c in data.columns if data.schema[c] == pl.Boolean]
+    )
     if not names:
         raise GeneticsUsageError(
             f"no membership columns: pass columns=[...] naming them, or give the frame "
@@ -1628,7 +1747,11 @@ def _upset_from_data(
         )
     flags = data.select(
         [pl.col(c).cast(pl.Boolean, strict=False).fill_null(False) for c in names]
-        + ([pl.col(count).cast(pl.Int64).fill_null(0).alias("_n")] if count else [pl.lit(1).alias("_n")])
+        + (
+            [pl.col(count).cast(pl.Int64).fill_null(0).alias("_n")]
+            if count
+            else [pl.lit(1).alias("_n")]
+        )
     )
     counts: dict[frozenset[str], int] = {}
     for row in flags.iter_rows():
@@ -1698,8 +1821,11 @@ def upset(
     """
     import matplotlib.pyplot as plt
 
-    given = [name for name, value in (("sets", sets), ("data", data), ("counts", counts))
-             if value is not None]
+    given = [
+        name
+        for name, value in (("sets", sets), ("data", data), ("counts", counts))
+        if value is not None
+    ]
     if len(given) != 1:
         raise GeneticsUsageError(
             f"pass exactly one of sets=, data= or counts=; got {given or 'none'}"
@@ -1737,8 +1863,10 @@ def upset(
     own_figure = ax is None
     if own_figure:
         figure = plt.figure(
-            figsize=(min(_UPSET_MAX_WIDTH_IN, _UPSET_SET_PANEL_IN + matrix_in + 1.9),
-                     _UPSET_BARS_IN + rows_in + 0.8),
+            figsize=(
+                min(_UPSET_MAX_WIDTH_IN, _UPSET_SET_PANEL_IN + matrix_in + 1.9),
+                _UPSET_BARS_IN + rows_in + 0.8,
+            ),
             constrained_layout=True,
         )
         grid = figure.add_gridspec
@@ -1746,8 +1874,14 @@ def upset(
         figure = ax.get_figure()
         grid = ax.get_subplotspec().subgridspec
         ax.remove()
-    spec = grid(2, 2, width_ratios=[_UPSET_SET_PANEL_IN, matrix_in],
-                height_ratios=[_UPSET_BARS_IN, rows_in], wspace=0.04, hspace=0.04)
+    spec = grid(
+        2,
+        2,
+        width_ratios=[_UPSET_SET_PANEL_IN, matrix_in],
+        height_ratios=[_UPSET_BARS_IN, rows_in],
+        wspace=0.04,
+        hspace=0.04,
+    )
     ax_bars = figure.add_subplot(spec[0, 1])
     ax_matrix = figure.add_subplot(spec[1, 1])
     ax_sets = figure.add_subplot(spec[1, 0])
@@ -1757,8 +1891,15 @@ def upset(
     heights = [nonempty[k] for k in shown]
     ax_bars.bar(xs, heights, width=0.6, color=_UPSET_INK)
     for x, h in zip(xs, heights):
-        ax_bars.annotate(f"{h:,}", (x, h), textcoords="offset points", xytext=(0, 1.5),
-                         ha="center", va="bottom", fontsize=5)
+        ax_bars.annotate(
+            f"{h:,}",
+            (x, h),
+            textcoords="offset points",
+            xytext=(0, 1.5),
+            ha="center",
+            va="bottom",
+            fontsize=5,
+        )
     ax_bars.set_ylim(0, max(heights) * (1 + _UPSET_BAR_HEADROOM))
     ax_bars.set_xlim(-0.6, n_columns - 0.4)
     ax_bars.set_xticks([])
@@ -1775,11 +1916,17 @@ def upset(
                 panel.axhspan(y_of[n] - 0.5, y_of[n] + 0.5, color=_UPSET_BAND, zorder=0)
     for x, key in zip(xs, shown):
         ys_on = [y_of[n] for n in rows if n in key]
-        ax_matrix.scatter([x] * len(rows), [y_of[n] for n in rows], s=36,
-                          color=[_UPSET_INK if n in key else _UPSET_OFF for n in rows], zorder=2)
+        ax_matrix.scatter(
+            [x] * len(rows),
+            [y_of[n] for n in rows],
+            s=36,
+            color=[_UPSET_INK if n in key else _UPSET_OFF for n in rows],
+            zorder=2,
+        )
         if len(ys_on) > 1:
-            ax_matrix.plot([x, x], [min(ys_on), max(ys_on)], color=_UPSET_INK,
-                           linewidth=1.2, zorder=1)
+            ax_matrix.plot(
+                [x, x], [min(ys_on), max(ys_on)], color=_UPSET_INK, linewidth=1.2, zorder=1
+            )
     ax_matrix.set_xlim(-0.6, n_columns - 0.4)
     ax_matrix.set_ylim(-0.5, len(rows) - 0.5)
     ax_matrix.set_xticks([])
@@ -1789,8 +1936,15 @@ def upset(
     sizes = [set_sizes[n] for n in rows]
     ax_sets.barh([y_of[n] for n in rows], sizes, height=0.5, color=_UPSET_SET_BAR, zorder=2)
     for n in rows:
-        ax_sets.annotate(f"{set_sizes[n]:,}", (set_sizes[n], y_of[n]), textcoords="offset points",
-                         xytext=(-2, 0), ha="right", va="center", fontsize=5)
+        ax_sets.annotate(
+            f"{set_sizes[n]:,}",
+            (set_sizes[n], y_of[n]),
+            textcoords="offset points",
+            xytext=(-2, 0),
+            ha="right",
+            va="center",
+            fontsize=5,
+        )
     ax_sets.set_xlim(max(sizes) * (1 + _UPSET_SET_HEADROOM), 0)
     ax_sets.set_ylim(-0.5, len(rows) - 0.5)
     ax_sets.set_yticks([y_of[n] for n in rows])
@@ -1812,7 +1966,9 @@ def upset(
         "path": written,
         "sets": rows,
         "set_sizes": set_sizes,
-        "intersections": [{"sets": [n for n in rows if n in k], "count": nonempty[k]} for k in shown],
+        "intersections": [
+            {"sets": [n for n in rows if n in k], "count": nonempty[k]} for k in shown
+        ],
         "n_intersections": len(nonempty),
         "n_elements": sum(nonempty.values()),
     }
@@ -1823,7 +1979,14 @@ def upset(
 # Okabe–Ito, in an order that keeps the first three models far apart; the palette is data
 # encoding (a reader decodes the model from the hue), so it does not follow the prop_cycle
 _LINEMODEL_COLOURS = (
-    "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000",
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#F0E442",
+    "#000000",
 )
 _LINEMODEL_UNDETERMINED = "#9A9A9A"
 _LINEMODEL_ERRORBAR = "#BBBBBB"
@@ -1894,7 +2057,9 @@ def linemodels(
             groups = result.get("groups")
     else:
         models = result
-    if not isinstance(models, pl.DataFrame) or not {"model", "scale", "slope", "cor"} <= set(models.columns):
+    if not isinstance(models, pl.DataFrame) or not {"model", "scale", "slope", "cor"} <= set(
+        models.columns
+    ):
         raise GeneticsUsageError(
             "result must be a genetics.linemodels result or a models frame with model, "
             "scale, slope and cor columns; only two effect variables can be drawn"
@@ -1918,16 +2083,16 @@ def linemodels(
         if SE is not None:
             errors, _ = lm._matrix(SE, "SE")
             if errors.shape != points.shape:
-                raise GeneticsUsageError(f"X has shape {points.shape} but SE has shape {errors.shape}")
+                raise GeneticsUsageError(
+                    f"X has shape {points.shape} but SE has shape {errors.shape}"
+                )
     colour_of = dict(zip(names, _LINEMODEL_COLOURS))
 
     assigned: dict[str, int] = {n: 0 for n in names}
     point_colours: list[str] = []
     if points is not None and groups is not None:
         if groups.height != points.shape[0]:
-            raise GeneticsUsageError(
-                f"groups has {groups.height} rows but X has {points.shape[0]}"
-            )
+            raise GeneticsUsageError(f"groups has {groups.height} rows but X has {points.shape[0]}")
         missing = [n for n in names if n not in groups.columns]
         if missing:
             raise GeneticsUsageError(f"groups lacks a probability column for {missing}")
@@ -1945,8 +2110,9 @@ def linemodels(
 
     own_figure = ax is None
     if own_figure:
-        figure, ax = plt.subplots(figsize=(_LINEMODEL_FIGURE_IN, _LINEMODEL_FIGURE_IN),
-                                  constrained_layout=True)
+        figure, ax = plt.subplots(
+            figsize=(_LINEMODEL_FIGURE_IN, _LINEMODEL_FIGURE_IN), constrained_layout=True
+        )
     else:
         figure = ax.get_figure()
 
@@ -1976,31 +2142,65 @@ def linemodels(
 
     if points is not None:
         if errors is not None:
-            ax.errorbar(points[:, 0], points[:, 1], xerr=1.96 * errors[:, 0],
-                        yerr=1.96 * errors[:, 1], fmt="none", ecolor=_LINEMODEL_ERRORBAR,
-                        elinewidth=0.5, zorder=3)
+            ax.errorbar(
+                points[:, 0],
+                points[:, 1],
+                xerr=1.96 * errors[:, 0],
+                yerr=1.96 * errors[:, 1],
+                fmt="none",
+                ecolor=_LINEMODEL_ERRORBAR,
+                elinewidth=0.5,
+                zorder=3,
+            )
         filled = [c != _LINEMODEL_UNDETERMINED for c in point_colours]
         colours = np.array(point_colours)
         mask = np.array(filled)
         if (~mask).any():
-            ax.scatter(points[~mask, 0], points[~mask, 1], s=14, facecolors="none",
-                       edgecolors=_LINEMODEL_UNDETERMINED, linewidths=0.6, zorder=4)
+            ax.scatter(
+                points[~mask, 0],
+                points[~mask, 1],
+                s=14,
+                facecolors="none",
+                edgecolors=_LINEMODEL_UNDETERMINED,
+                linewidths=0.6,
+                zorder=4,
+            )
         if mask.any():
-            ax.scatter(points[mask, 0], points[mask, 1], s=14, c=colours[mask],
-                       edgecolors="#FFFFFF", linewidths=0.3, zorder=5)
+            ax.scatter(
+                points[mask, 0],
+                points[mask, 1],
+                s=14,
+                c=colours[mask],
+                edgecolors="#FFFFFF",
+                linewidths=0.3,
+                zorder=5,
+            )
 
     from matplotlib.lines import Line2D
 
     handles = [
-        Line2D([0], [0], color=colour_of[n], linewidth=1.5,
-               label=f"{n} ({assigned[n]})" if points is not None and groups is not None else n)
+        Line2D(
+            [0],
+            [0],
+            color=colour_of[n],
+            linewidth=1.5,
+            label=f"{n} ({assigned[n]})" if points is not None and groups is not None else n,
+        )
         for n in names
     ]
     if points is not None and groups is not None:
         undetermined = sum(1 for c in point_colours if c == _LINEMODEL_UNDETERMINED)
-        handles.append(Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="none",
-                              markeredgecolor=_LINEMODEL_UNDETERMINED,
-                              label=f"< {threshold:g} ({undetermined})"))
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="none",
+                markerfacecolor="none",
+                markeredgecolor=_LINEMODEL_UNDETERMINED,
+                label=f"< {threshold:g} ({undetermined})",
+            )
+        )
     else:
         undetermined = 0
     ax.legend(handles=handles, fontsize=5, frameon=False, loc="best")
@@ -2039,8 +2239,13 @@ _FOREST_MUTED = "#8A8A8A"
 # the marker, so neither follows the prop_cycle. No diamond among the markers — that shape
 # is a pooled estimate's.
 _FOREST_SERIES = (
-    ("#0072B2", "o"), ("#D55E00", "s"), ("#009E73", "^"), ("#CC79A7", "v"),
-    ("#E69F00", "P"), ("#56B4E9", "X"), ("#000000", "h"),
+    ("#0072B2", "o"),
+    ("#D55E00", "s"),
+    ("#009E73", "^"),
+    ("#CC79A7", "v"),
+    ("#E69F00", "P"),
+    ("#56B4E9", "X"),
+    ("#000000", "h"),
 )
 
 # inches. A row holds one estimate, or one per series stacked `_FOREST_MARK_IN` apart. The
@@ -2132,7 +2337,7 @@ def _forest_p(mlog10p: float | None) -> str:
     if mlog10p is None or not math.isfinite(mlog10p) or mlog10p < 0:
         return ""
     if mlog10p < 3:
-        return f"{10 ** -mlog10p:.2g}"
+        return f"{10**-mlog10p:.2g}"
     exponent = math.floor(mlog10p)
     mantissa = 10 ** (1 - (mlog10p - exponent))
     exponent += 1
@@ -2163,7 +2368,7 @@ def _forest_number(value: float, decimals: int, ratio: bool = False) -> str:
         return ">1,000"
     if size >= 1e5:
         exponent = math.floor(math.log10(size))
-        return rf"${value / 10 ** exponent:.1f}\times10^{{{exponent}}}$"
+        return rf"${value / 10**exponent:.1f}\times10^{{{exponent}}}$"
     if size >= 100:
         text = f"{value:.0f}"
     elif size >= 10:
@@ -2207,12 +2412,12 @@ def _forest_ratio_ticks(lo: float, hi: float) -> list[float]:
     decades = range(math.floor(math.log10(lo)), math.ceil(math.log10(hi)) + 1)
     ticks: list[float] = []
     for mantissas in ((1, 2, 5), (1,)):
-        ticks = [m * 10.0 ** e for e in decades for m in mantissas if lo <= m * 10.0 ** e <= hi]
+        ticks = [m * 10.0**e for e in decades for m in mantissas if lo <= m * 10.0**e <= hi]
         if len(ticks) <= 7:
             return ticks
     # every nth decade, counted from 1 so that the null keeps its tick
     step = math.ceil(len(ticks) / 7)
-    return [10.0 ** e for e in decades if e % step == 0 and lo <= 10.0 ** e <= hi]
+    return [10.0**e for e in decades if e % step == 0 and lo <= 10.0**e <= hi]
 
 
 def _forest_tick_label(value: float) -> str:
@@ -2261,9 +2466,13 @@ def _forest_limits(marks: list[dict[str, Any]]) -> tuple[float, float]:
     than that is not informative and does not set the axis either.
     """
     halves = [
-        (m["hi"] - m["lo"]) / 2 for m in marks
-        if m["lo"] is not None and m["hi"] is not None
-        and math.isfinite(m["lo"]) and math.isfinite(m["hi"]) and m["hi"] > m["lo"]
+        (m["hi"] - m["lo"]) / 2
+        for m in marks
+        if m["lo"] is not None
+        and m["hi"] is not None
+        and math.isfinite(m["lo"])
+        and math.isfinite(m["hi"])
+        and m["hi"] > m["lo"]
     ]
     reach = _FOREST_CLIP * statistics.median(halves) if halves else 0.0
 
@@ -2435,7 +2644,9 @@ def forest(
     needed = [label, estimate, lower, upper, group, series, summary, weight, pvalue, *extra]
     missing = [c for c in needed if c is not None and c not in data.columns]
     if missing:
-        raise GeneticsUsageError(f"columns {missing} are not in the frame; columns are {data.columns}")
+        raise GeneticsUsageError(
+            f"columns {missing} are not in the frame; columns are {data.columns}"
+        )
     if data.is_empty():
         raise GeneticsUsageError("the frame has no rows — nothing to plot")
     if significance is not None and pvalue is None:
@@ -2468,7 +2679,11 @@ def forest(
     estimates = _floats(data, estimate)
     lows = _floats(data, lower, keep_inf=True) if has_bounds else [None] * n
     highs = _floats(data, upper, keep_inf=True) if has_bounds else [None] * n
-    ses = _floats(data, se) if se is not None and se in data.columns and scale != "ratio" else [None] * n
+    ses = (
+        _floats(data, se)
+        if se is not None and se in data.columns and scale != "ratio"
+        else [None] * n
+    )
     weights = _floats(data, weight) if weight else [None] * n
     if pvalue is None:
         mlog10ps: list[float | None] = [None] * n
@@ -2481,16 +2696,22 @@ def forest(
         ]
     flagged = (
         data[summary].cast(pl.Boolean, strict=False).fill_null(False).to_list()
-        if summary else [False] * n
+        if summary
+        else [False] * n
     )
     labels = [_plain("—" if v is None else v, _FOREST_LABEL_CHARS) for v in data[label].to_list()]
     groups_of = (
-        [_FOREST_UNGROUPED if v is None else _plain(v, _FOREST_LABEL_CHARS) for v in data[group].to_list()]
-        if group else [None] * n
+        [
+            _FOREST_UNGROUPED if v is None else _plain(v, _FOREST_LABEL_CHARS)
+            for v in data[group].to_list()
+        ]
+        if group
+        else [None] * n
     )
     series_of = (
         ["—" if v is None else _plain(v, _FOREST_CELL_CHARS) for v in data[series].to_list()]
-        if series else [None] * n
+        if series
+        else [None] * n
     )
     series_names = list(dict.fromkeys(series_of)) if series else []
     if len(series_names) > len(_FOREST_SERIES):
@@ -2511,7 +2732,13 @@ def forest(
                 lo = hi = None
             elif lo > hi:
                 lo, hi = hi, lo
-            if se_a is None and lo is not None and math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+            if (
+                se_a is None
+                and lo is not None
+                and math.isfinite(lo)
+                and math.isfinite(hi)
+                and hi > lo
+            ):
                 se_a = (hi - lo) / (2 * z)
         elif a is not None and se_a is not None:
             lo, hi = a - z * se_a, a + z * se_a
@@ -2520,13 +2747,20 @@ def forest(
         if a is None:
             lo = hi = se_a = None
         mlog10p = mlog10ps[i]
-        marks.append({
-            "a": a, "lo": lo, "hi": hi, "se": se_a, "mlog10p": mlog10p,
-            "weight": weights[i] if weights[i] is not None and weights[i] > 0 else None,
-            "series": series_of[i], "diamond": bool(flagged[i]),
-            "hollow": threshold is not None and (mlog10p is None or mlog10p < threshold),
-            "extra": [extra_cells[c][i] for c in extra],
-        })
+        marks.append(
+            {
+                "a": a,
+                "lo": lo,
+                "hi": hi,
+                "se": se_a,
+                "mlog10p": mlog10p,
+                "weight": weights[i] if weights[i] is not None and weights[i] > 0 else None,
+                "series": series_of[i],
+                "diamond": bool(flagged[i]),
+                "hollow": threshold is not None and (mlog10p is None or mlog10p < threshold),
+                "extra": [extra_cells[c][i] for c in extra],
+            }
+        )
 
     # rows, per group in order of first appearance. Without series= a row is a frame row;
     # with it a row is a label, holding one mark per series.
@@ -2567,23 +2801,38 @@ def forest(
             pooled_marks = []
             for s in series_names or [None]:
                 usable = [
-                    m for row in rows for m in row["marks"]
+                    m
+                    for row in rows
+                    for m in row["marks"]
                     if m["series"] == s and not m["diamond"] and m["a"] is not None and m["se"]
                 ]
                 if len(usable) < 2:
                     continue
                 fit = _forest_pool([m["a"] for m in usable], [m["se"] for m in usable], pool)
-                pooled_marks.append({
-                    "a": fit["a"], "lo": fit["a"] - z * fit["se"], "hi": fit["a"] + z * fit["se"],
-                    "se": fit["se"], "mlog10p": fit["mlog10p"], "weight": None, "series": s,
-                    "diamond": True, "hollow": False, "extra": [""] * len(extra),
-                })
+                pooled_marks.append(
+                    {
+                        "a": fit["a"],
+                        "lo": fit["a"] - z * fit["se"],
+                        "hi": fit["a"] + z * fit["se"],
+                        "se": fit["se"],
+                        "mlog10p": fit["mlog10p"],
+                        "weight": None,
+                        "series": s,
+                        "diamond": True,
+                        "hollow": False,
+                        "extra": [""] * len(extra),
+                    }
+                )
                 pooled.append({"group": name, "series": s, "method": pool, **fit})
             if pooled_marks:
-                rows.append({
-                    "label": _FOREST_POOLS[pool], "marks": pooled_marks, "summary": True,
-                    "pooled": True,
-                })
+                rows.append(
+                    {
+                        "label": _FOREST_POOLS[pool],
+                        "marks": pooled_marks,
+                        "summary": True,
+                        "pooled": True,
+                    }
+                )
 
     # the cut: the first max_rows rows of the frame's own estimates, a pooled row kept with
     # whatever of its group survives
@@ -2620,7 +2869,9 @@ def forest(
         try:
             x_lo, x_hi = float(xlim[0]), float(xlim[1])
         except (TypeError, ValueError, IndexError):
-            raise GeneticsUsageError(f"xlim is a (low, high) pair in the units of the axis; got {xlim!r}")
+            raise GeneticsUsageError(
+                f"xlim is a (low, high) pair in the units of the axis; got {xlim!r}"
+            )
         if not x_lo < x_hi or (ratio and x_lo <= 0):
             raise GeneticsUsageError(
                 f"xlim must be increasing{' and positive on a ratio axis' if ratio else ''}; got {xlim!r}"
@@ -2664,7 +2915,8 @@ def forest(
         [_text_width_in(name, _LABEL_SIZE, bold=True) for name in by_group if name]
         + [
             indent + _text_width_in(row["label"], _LABEL_SIZE)
-            for rows in by_group.values() for row in rows
+            for rows in by_group.values()
+            for row in rows
         ]
     )
     column_in = [
@@ -2696,20 +2948,38 @@ def forest(
     if series:
         present = {m["series"] for m in drawn}
         handles += [
-            Line2D([0], [0], color=colour, marker=marker, markersize=_FOREST_MARKER_PT,
-                   linewidth=_FOREST_INTERVAL_WIDTH, label=name)
-            for name, (colour, marker) in zip(series_names, _FOREST_SERIES) if name in present
+            Line2D(
+                [0],
+                [0],
+                color=colour,
+                marker=marker,
+                markersize=_FOREST_MARKER_PT,
+                linewidth=_FOREST_INTERVAL_WIDTH,
+                label=name,
+            )
+            for name, (colour, marker) in zip(series_names, _FOREST_SERIES)
+            if name in present
         ]
     if threshold is not None:
         # 5×10⁻⁸ as it is said, not the 5.0×10⁻⁸ a column of p-values aligns on
         p_text = _forest_p(threshold).replace(r".0\times", r"\times")
         handles += [
-            Line2D([0], [0], color=_FOREST_INK, marker="o", markersize=_FOREST_MARKER_PT,
-                   linestyle="none", markerfacecolor=face, markeredgewidth=0.7,
-                   label=rf"$P {sign}$ {p_text}")
+            Line2D(
+                [0],
+                [0],
+                color=_FOREST_INK,
+                marker="o",
+                markersize=_FOREST_MARKER_PT,
+                linestyle="none",
+                markerfacecolor=face,
+                markeredgewidth=0.7,
+                label=rf"$P {sign}$ {p_text}",
+            )
             for face, sign in ((_FOREST_INK, "<"), ("white", r"\geq"))
         ]
-    note = f"{n_omitted:,} further row{'' if n_omitted == 1 else 's'} not drawn" if n_omitted else ""
+    note = (
+        f"{n_omitted:,} further row{'' if n_omitted == 1 else 's'} not drawn" if n_omitted else ""
+    )
 
     # points below the axis: tick labels, then the direction line, then the axis label
     below_pt = 12 + (8 if direction else 0) + 11
@@ -2720,10 +2990,14 @@ def forest(
     own_figure = ax is None
     if own_figure:
         figure = plt.figure(figsize=size_in)
-        canvas = figure.add_axes([
-            _FOREST_SIDE_IN / size_in[0], bottom_in / size_in[1],
-            width_in / size_in[0], height_in / size_in[1],
-        ])
+        canvas = figure.add_axes(
+            [
+                _FOREST_SIDE_IN / size_in[0],
+                bottom_in / size_in[1],
+                width_in / size_in[0],
+                height_in / size_in[1],
+            ]
+        )
     else:
         figure, canvas = ax.get_figure(), ax
     # two axes over one area: the canvas is the table, measured in inches from its top left,
@@ -2741,14 +3015,32 @@ def forest(
     panel.set_xlim(x_lo, x_hi)
     panel.set_ylim(height_in, 0)
 
-    canvas.plot([0, width_in], [_FOREST_HEADER_IN] * 2, color=_FOREST_INK,
-                linewidth=_AXIS_LINEWIDTH, zorder=1)
+    canvas.plot(
+        [0, width_in],
+        [_FOREST_HEADER_IN] * 2,
+        color=_FOREST_INK,
+        linewidth=_AXIS_LINEWIDTH,
+        zorder=1,
+    )
     for heading, x, right in zip(headings, column_x, numeric):
-        canvas.text(x, _FOREST_HEADER_IN / 2, heading, ha="right" if right else "left",
-                    va="center", fontsize=_LABEL_SIZE, color=_FOREST_INK)
+        canvas.text(
+            x,
+            _FOREST_HEADER_IN / 2,
+            heading,
+            ha="right" if right else "left",
+            va="center",
+            fontsize=_LABEL_SIZE,
+            color=_FOREST_INK,
+        )
     if lim_lo < 0 < lim_hi:
-        panel.plot([shown(0.0)] * 2, [_FOREST_HEADER_IN, height_in], color=_FOREST_INK,
-                   linewidth=_AXIS_LINEWIDTH, linestyle=(0, (3, 2)), zorder=1)
+        panel.plot(
+            [shown(0.0)] * 2,
+            [_FOREST_HEADER_IN, height_in],
+            color=_FOREST_INK,
+            linewidth=_AXIS_LINEWIDTH,
+            linestyle=(0, (3, 2)),
+            zorder=1,
+        )
 
     heaviest = max((m["weight"] for m in drawn if m["weight"]), default=None)
     style_of = dict(zip(series_names, _FOREST_SERIES))
@@ -2756,31 +3048,58 @@ def forest(
     for kind, item, y_row in layout:
         if kind == "group":
             banded = ruled = False
-            canvas.text(0, y_row, item, ha="left", va="center", fontsize=_LABEL_SIZE,
-                        fontweight="bold", color=_FOREST_INK)
+            canvas.text(
+                0,
+                y_row,
+                item,
+                ha="left",
+                va="center",
+                fontsize=_LABEL_SIZE,
+                fontweight="bold",
+                color=_FOREST_INK,
+            )
             continue
         row = item
         if banded:
-            canvas.axhspan(y_row - row_in / 2, y_row + row_in / 2, color=_UPSET_BAND,
-                           linewidth=0, zorder=0)
+            canvas.axhspan(
+                y_row - row_in / 2, y_row + row_in / 2, color=_UPSET_BAND, linewidth=0, zorder=0
+            )
         banded = not banded
         if row["summary"] and not ruled:
             # a hairline over the first summary row of a block: the diamond says what the
             # row is, the rule says where the rows it summarises stop
-            canvas.plot([0, width_in], [y_row - row_in / 2] * 2, color=_FOREST_MUTED,
-                        linewidth=0.25, zorder=1)
+            canvas.plot(
+                [0, width_in],
+                [y_row - row_in / 2] * 2,
+                color=_FOREST_MUTED,
+                linewidth=0.25,
+                zorder=1,
+            )
         ruled = row["summary"]
-        canvas.text(indent, y_row, row["label"], ha="left", va="center", fontsize=_LABEL_SIZE,
-                    fontstyle="italic" if italic and not row.get("pooled") else "normal",
-                    color=_FOREST_INK)
+        canvas.text(
+            indent,
+            y_row,
+            row["label"],
+            ha="left",
+            va="center",
+            fontsize=_LABEL_SIZE,
+            fontstyle="italic" if italic and not row.get("pooled") else "normal",
+            color=_FOREST_INK,
+        )
         for m in row["marks"]:
             slot = series_names.index(m["series"]) if dodged else 0
             y_mark = y_row + (slot - (slots - 1) / 2) * _FOREST_MARK_IN
             colour, marker = style_of.get(m["series"], (_FOREST_INK, "o"))
             for cell, x, right in zip(m["cells"], column_x, numeric):
-                canvas.text(x, y_mark, cell, ha="right" if right else "left", va="center",
-                            fontsize=text_size,
-                            color=_FOREST_MUTED if cell == "NA" else _FOREST_INK)
+                canvas.text(
+                    x,
+                    y_mark,
+                    cell,
+                    ha="right" if right else "left",
+                    va="center",
+                    fontsize=text_size,
+                    color=_FOREST_MUTED if cell == "NA" else _FOREST_INK,
+                )
             if m["a"] is None:
                 continue
             inside = lim_lo <= m["a"] <= lim_hi
@@ -2789,32 +3108,64 @@ def forest(
             n_clipped += cut_lo or cut_hi
             seg_lo, seg_hi = max(lo, lim_lo), min(hi, lim_hi)
             if m["diamond"] and m["lo"] is not None and inside and not (cut_lo or cut_hi):
-                panel.add_patch(Polygon(
-                    [(shown(lo), y_mark), (shown(m["a"]), y_mark - _FOREST_DIAMOND_IN),
-                     (shown(hi), y_mark), (shown(m["a"]), y_mark + _FOREST_DIAMOND_IN)],
-                    closed=True, facecolor=colour, edgecolor=colour, linewidth=0.5, zorder=3,
-                ))
+                panel.add_patch(
+                    Polygon(
+                        [
+                            (shown(lo), y_mark),
+                            (shown(m["a"]), y_mark - _FOREST_DIAMOND_IN),
+                            (shown(hi), y_mark),
+                            (shown(m["a"]), y_mark + _FOREST_DIAMOND_IN),
+                        ],
+                        closed=True,
+                        facecolor=colour,
+                        edgecolor=colour,
+                        linewidth=0.5,
+                        zorder=3,
+                    )
+                )
                 continue
             if seg_lo < seg_hi:
-                panel.plot([shown(seg_lo), shown(seg_hi)], [y_mark] * 2, color=colour,
-                           linewidth=_FOREST_INTERVAL_WIDTH, solid_capstyle="butt", zorder=2)
+                panel.plot(
+                    [shown(seg_lo), shown(seg_hi)],
+                    [y_mark] * 2,
+                    color=colour,
+                    linewidth=_FOREST_INTERVAL_WIDTH,
+                    solid_capstyle="butt",
+                    zorder=2,
+                )
             # an arrowhead where the interval leaves the axis; an estimate wholly outside
             # it is an arrowhead alone, on the side it lies
             for cut, edge, head in ((cut_lo, lim_lo, CARETLEFT), (cut_hi, lim_hi, CARETRIGHT)):
                 if cut:
-                    panel.plot([shown(edge)], [y_mark], marker=head, markersize=3,
-                               color=colour, linestyle="none", clip_on=False, zorder=4)
+                    panel.plot(
+                        [shown(edge)],
+                        [y_mark],
+                        marker=head,
+                        markersize=3,
+                        color=colour,
+                        linestyle="none",
+                        clip_on=False,
+                        zorder=4,
+                    )
             if not inside:
                 continue
             side_pt = _FOREST_MARKER_PT
             if heaviest and m["weight"]:
                 small, large = _FOREST_WEIGHT_PT
-                side_pt = math.sqrt(small ** 2 + (large ** 2 - small ** 2) * m["weight"] / heaviest)
+                side_pt = math.sqrt(small**2 + (large**2 - small**2) * m["weight"] / heaviest)
                 marker = "s"
-            panel.plot([shown(m["a"])], [y_mark], marker="D" if m["diamond"] else marker,
-                       markersize=side_pt, color=colour, linestyle="none",
-                       markerfacecolor="white" if m["hollow"] else colour,
-                       markeredgecolor=colour, markeredgewidth=0.7, zorder=3)
+            panel.plot(
+                [shown(m["a"])],
+                [y_mark],
+                marker="D" if m["diamond"] else marker,
+                markersize=side_pt,
+                color=colour,
+                linestyle="none",
+                markerfacecolor="white" if m["hollow"] else colour,
+                markeredgecolor=colour,
+                markeredgewidth=0.7,
+                zorder=3,
+            )
 
     if ratio:
         ticks = _forest_ratio_ticks(x_lo, x_hi)
@@ -2829,19 +3180,43 @@ def forest(
     panel.set_xlabel(xlabel, fontsize=_LABEL_SIZE, labelpad=2 + (8 if direction else 0))
     if direction is not None:
         for text, x, ha in ((f"← {direction[0]}", 0, "left"), (f"{direction[1]} →", 1, "right")):
-            panel.annotate(_plain(text, _FOREST_LABEL_CHARS), (x, 0), xycoords="axes fraction",
-                           xytext=(0, -12), textcoords="offset points", ha=ha, va="top",
-                           fontsize=5, color=_FOREST_MUTED)
+            panel.annotate(
+                _plain(text, _FOREST_LABEL_CHARS),
+                (x, 0),
+                xycoords="axes fraction",
+                xytext=(0, -12),
+                textcoords="offset points",
+                ha=ha,
+                va="top",
+                fontsize=5,
+                color=_FOREST_MUTED,
+            )
     under = ScaledTranslation(0, -below_pt / 72, figure.dpi_scale_trans)
     if handles:
-        panel.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0),
-                     bbox_transform=panel.transAxes + under, ncol=min(len(handles), 4),
-                     frameon=False, fontsize=5, handlelength=1.8, columnspacing=1.2,
-                     borderaxespad=0.2)
+        panel.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0),
+            bbox_transform=panel.transAxes + under,
+            ncol=min(len(handles), 4),
+            frameon=False,
+            fontsize=5,
+            handlelength=1.8,
+            columnspacing=1.2,
+            borderaxespad=0.2,
+        )
     if note:
-        canvas.annotate(note, (0, 0), xycoords="axes fraction", xytext=(0, -below_pt),
-                        textcoords="offset points", ha="left", va="top", fontsize=5,
-                        color=_FOREST_MUTED)
+        canvas.annotate(
+            note,
+            (0, 0),
+            xycoords="axes fraction",
+            xytext=(0, -below_pt),
+            textcoords="offset points",
+            ha="left",
+            va="top",
+            fontsize=5,
+            color=_FOREST_MUTED,
+        )
     if title:
         canvas.set_title(title, fontsize=_TITLE_SIZE, loc="left", pad=3)
 
@@ -2979,7 +3354,8 @@ def _volcano_y_ticks(linthresh: float, top: float) -> list[float]:
     from matplotlib.ticker import MaxNLocator
 
     ticks = [
-        float(t) for t in MaxNLocator(nbins=4, steps=[1, 2, 5, 10]).tick_values(0, linthresh)
+        float(t)
+        for t in MaxNLocator(nbins=4, steps=[1, 2, 5, 10]).tick_values(0, linthresh)
         if 0 <= t <= linthresh
     ]
     decades = range(math.floor(math.log10(linthresh)), math.ceil(math.log10(top)) + 1)
@@ -2987,8 +3363,7 @@ def _volcano_y_ticks(linthresh: float, top: float) -> list[float]:
     for mantissas in ((1, 2, 5), (1,)):
         # not within 40% of the break, where a label would sit on the break's own
         upper = [
-            m * 10.0 ** e for e in decades for m in mantissas
-            if linthresh * 1.4 <= m * 10.0 ** e <= top
+            m * 10.0**e for e in decades for m in mantissas if linthresh * 1.4 <= m * 10.0**e <= top
         ]
         if len(upper) <= 5:
             break
@@ -3003,7 +3378,7 @@ def _volcano_threshold_text(
         # `:g` renders 5e-8 as "5e-08"; the padded exponent is not how anyone writes it
         return f"p {significance:g}".replace("e-0", "e-")
     level = f"{alpha * 100:g}%"
-    p = f"{10 ** -line_y:.2g}" if line_y < 3 else _format_p(line_y)
+    p = f"{10**-line_y:.2g}" if line_y < 3 else _format_p(line_y)
     if correction == "bonferroni":
         return f"Bonferroni {alpha:g}/{n_tests:,}: p {p}"
     if not n_pass:
@@ -3160,7 +3535,8 @@ def volcano(
             )
         correction = significance
     elif (
-        isinstance(significance, bool) or not isinstance(significance, (int, float))
+        isinstance(significance, bool)
+        or not isinstance(significance, (int, float))
         or not 0 < significance < 1
     ):
         raise GeneticsUsageError(
@@ -3179,8 +3555,11 @@ def volcano(
     if min_effect is not None and not (min_effect > 1 if ratio else min_effect > 0):
         raise GeneticsUsageError(
             "min_effect is in the units of the axis: "
-            + ("a ratio above 1 on a ratio axis, e.g. 1.5 for 1.5 and 1/1.5"
-               if ratio else "a positive effect size")
+            + (
+                "a ratio above 1 on a ratio axis, e.g. 1.5 for 1.5 and 1/1.5"
+                if ratio
+                else "a positive effect size"
+            )
             + f"; got {min_effect!r}"
         )
     if pvalue == "auto":
@@ -3189,8 +3568,11 @@ def volcano(
         ]
         if len(found) != 1:
             raise GeneticsUsageError(
-                ("the frame has neither `mlog10p` nor `pval`" if not found
-                 else f"the frame has several -log10 p columns {found}")
+                (
+                    "the frame has neither `mlog10p` nor `pval`"
+                    if not found
+                    else f"the frame has several -log10 p columns {found}"
+                )
                 + f"; name the one to plot with pvalue=. Columns are {data.columns}"
             )
         pvalue = found[0]
@@ -3209,11 +3591,14 @@ def volcano(
     elif isinstance(labels, str):
         raise GeneticsUsageError("labels is a count or a list of names; wrap one name in a list")
     missing = [
-        c for c in (estimate, pvalue, label, se, colour, size, ring)
+        c
+        for c in (estimate, pvalue, label, se, colour, size, ring)
         if c is not None and c not in data.columns
     ]
     if missing:
-        raise GeneticsUsageError(f"columns {missing} are not in the frame; columns are {data.columns}")
+        raise GeneticsUsageError(
+            f"columns {missing} are not in the frame; columns are {data.columns}"
+        )
     if data.is_empty():
         raise GeneticsUsageError("the frame has no rows — nothing to plot")
     ring_flags, ring_text = None, None
@@ -3252,8 +3637,11 @@ def volcano(
     else:
         y_all = np.array(
             [
-                np.nan if p is None or not 0 <= p <= 1
-                else math.inf if p == 0 else abs(-math.log10(p))
+                np.nan
+                if p is None or not 0 <= p <= 1
+                else math.inf
+                if p == 0
+                else abs(-math.log10(p))
                 for p in _floats(data, pvalue)
             ],
             dtype=float,
@@ -3343,7 +3731,7 @@ def volcano(
         # only once every name has been given
         high, low = per_side
         named = high[: budget // 2] + low[: budget // 2]
-        spare = sorted(high[budget // 2:] + low[budget // 2:], key=rank.__getitem__)
+        spare = sorted(high[budget // 2 :] + low[budget // 2 :], key=rank.__getitem__)
         named += spare[: budget - len(named)]
         named += sorted(repeats, key=rank.__getitem__)[: budget - len(named)]
         named.sort(key=lambda i: (x[i] < 0, rank[i]))
@@ -3366,7 +3754,9 @@ def volcano(
         try:
             x_lo, x_hi = float(xlim[0]), float(xlim[1])
         except (TypeError, ValueError, IndexError):
-            raise GeneticsUsageError(f"xlim is a (low, high) pair in the units of the axis; got {xlim!r}")
+            raise GeneticsUsageError(
+                f"xlim is a (low, high) pair in the units of the axis; got {xlim!r}"
+            )
         if not x_lo < x_hi or (ratio and x_lo <= 0):
             raise GeneticsUsageError(
                 f"xlim must be increasing{' and positive on a ratio axis' if ratio else ''}; got {xlim!r}"
@@ -3402,9 +3792,7 @@ def volcano(
     off_top = ~finite
     plot_y = np.where(finite, y, y_top)
 
-    areas = np.where(
-        called | small, _VOLCANO_AREA, _VOLCANO_AREA_BELOW[count > _VOLCANO_CLOUD]
-    )
+    areas = np.where(called | small, _VOLCANO_AREA, _VOLCANO_AREA_BELOW[count > _VOLCANO_CLOUD])
     size_range = None
     if size:
         # the hits only: a size on every point of the cloud is a slab nobody can read
@@ -3426,16 +3814,15 @@ def volcano(
     if colour:
         values = data[colour].to_list()
         category_of = [
-            _FOREST_UNGROUPED if values[i] is None
-            else _plain(values[i], _VOLCANO_CATEGORY_CHARS)
+            _FOREST_UNGROUPED if values[i] is None else _plain(values[i], _VOLCANO_CATEGORY_CHARS)
             for i in kept
         ]
         tally = collections.Counter(category_of[i] for i in np.nonzero(called)[0])
         categories = [name for name, _count in tally.most_common()]
         if len(categories) > len(_FOREST_SERIES):
-            categories = [
-                c for c in categories if c != _FOREST_UNGROUPED
-            ][: len(_FOREST_SERIES) - 1] + [_FOREST_UNGROUPED]
+            categories = [c for c in categories if c != _FOREST_UNGROUPED][
+                : len(_FOREST_SERIES) - 1
+            ] + [_FOREST_UNGROUPED]
         category_of = [c if c in categories else _FOREST_UNGROUPED for c in category_of]
         styles = dict(zip(categories, _FOREST_SERIES))
 
@@ -3450,7 +3837,8 @@ def volcano(
     if log_y:
         share = _VOLCANO_LINEAR_SHARE
         ax.set_yscale(
-            "symlog", linthresh=linthresh,
+            "symlog",
+            linthresh=linthresh,
             linscale=math.log10(y_top / linthresh) * share / (1 - share),
         )
     ax.set_ylim(0, y_top)
@@ -3465,8 +3853,15 @@ def volcano(
             (mask & ~off_top & off_right, ">", False),
         ):
             if chosen.any():
-                ax.scatter(plot_x[chosen], plot_y[chosen], s=areas[chosen], color=colour_,
-                           marker=shape, clip_on=clip, **style)
+                ax.scatter(
+                    plot_x[chosen],
+                    plot_y[chosen],
+                    s=areas[chosen],
+                    color=colour_,
+                    marker=shape,
+                    clip_on=clip,
+                    **style,
+                )
 
     if lim_lo < 0 < lim_hi:
         ax.axvline(shown(0.0), color=_VOLCANO_NULL_RULE, linewidth=_AXIS_LINEWIDTH, zorder=1)
@@ -3501,19 +3896,24 @@ def volcano(
             if not corners:
                 continue
             ink = styles[name][0]
-            ax.add_patch(Polygon(
-                np.column_stack([plot_x[corners], plot_y[corners]]), closed=True,
-                facecolor=to_rgba(ink, _VOLCANO_HULL_FILL),
-                edgecolor=to_rgba(ink, _VOLCANO_HULL_EDGE), linewidth=0.6,
-                joinstyle="round", zorder=1.5,
-            ))
-            drawn_hulls.append({
-                "category": name,
-                "n_points": int(len(members)),
-                "crosses_null": bool(
-                    plot_x[members].min() < null_x < plot_x[members].max()
-                ),
-            })
+            ax.add_patch(
+                Polygon(
+                    np.column_stack([plot_x[corners], plot_y[corners]]),
+                    closed=True,
+                    facecolor=to_rgba(ink, _VOLCANO_HULL_FILL),
+                    edgecolor=to_rgba(ink, _VOLCANO_HULL_EDGE),
+                    linewidth=0.6,
+                    joinstyle="round",
+                    zorder=1.5,
+                )
+            )
+            drawn_hulls.append(
+                {
+                    "category": name,
+                    "n_points": int(len(members)),
+                    "crosses_null": bool(plot_x[members].min() < null_x < plot_x[members].max()),
+                }
+            )
     ringed = np.zeros(count, dtype=bool)
     if ring_flags is not None:
         ringed = np.array(ring_flags, dtype=bool)[kept]
@@ -3521,27 +3921,58 @@ def volcano(
         # so a named point that is not a hit can be found in the cloud
         ringed[named] = True
     if ringed.any():
-        ax.scatter(plot_x[ringed], plot_y[ringed], s=areas[ringed] + 14, facecolors="none",
-                   edgecolors="black", linewidths=0.6, clip_on=False, zorder=3.2)
+        ax.scatter(
+            plot_x[ringed],
+            plot_y[ringed],
+            s=areas[ringed] + 14,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=0.6,
+            clip_on=False,
+            zorder=3.2,
+        )
 
     backing = {"facecolor": "white", "edgecolor": "none", "alpha": 0.75, "pad": 0.6}
     if line_y is not None:
         ax.axhline(line_y, color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle="--", zorder=1)
-        ax.text(0.006, line_y,
-                _volcano_threshold_text(correction, significance, alpha, n_tests, n_pass, line_y),
-                transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=5,
-                color=_SIGNIFICANCE_GREY, bbox=backing, zorder=4)
+        ax.text(
+            0.006,
+            line_y,
+            _volcano_threshold_text(correction, significance, alpha, n_tests, n_pass, line_y),
+            transform=ax.get_yaxis_transform(),
+            ha="left",
+            va="bottom",
+            fontsize=5,
+            color=_SIGNIFICANCE_GREY,
+            bbox=backing,
+            zorder=4,
+        )
     if band:
         for edge in (-band, band):
             if lim_lo < edge < lim_hi:
-                ax.axvline(shown(edge), color=_SIGNIFICANCE_GREY, linewidth=0.6,
-                           linestyle=":", zorder=1)
+                ax.axvline(
+                    shown(edge), color=_SIGNIFICANCE_GREY, linewidth=0.6, linestyle=":", zorder=1
+                )
     if log_y:
-        ax.axhline(linthresh, color=_VOLCANO_NULL_RULE, linewidth=_AXIS_LINEWIDTH,
-                   linestyle=(0, (1, 2)), zorder=1)
-        ax.text(0.994, linthresh, f"log scale above {linthresh:g}",
-                transform=ax.get_yaxis_transform(), ha="right", va="bottom", fontsize=5,
-                color=_SIGNIFICANCE_GREY, bbox=backing, zorder=4)
+        ax.axhline(
+            linthresh,
+            color=_VOLCANO_NULL_RULE,
+            linewidth=_AXIS_LINEWIDTH,
+            linestyle=(0, (1, 2)),
+            zorder=1,
+        )
+        ax.text(
+            0.994,
+            linthresh,
+            f"log scale above {linthresh:g}",
+            transform=ax.get_yaxis_transform(),
+            ha="right",
+            va="bottom",
+            fontsize=5,
+            color=_SIGNIFICANCE_GREY,
+            bbox=backing,
+            zorder=4,
+        )
     n_up, n_down = int(up.sum()), int(down.sum())
     if correction:
         # over the frame, not in its corners: the top corners of a volcano are where the
@@ -3551,10 +3982,17 @@ def volcano(
             (n_down, sides[0], 0, "left", _VOLCANO_DOWN),
             (n_up, sides[1], 1, "right", _VOLCANO_UP),
         ):
-            ax.annotate(f"{number:,} {_plain(side, _VOLCANO_LABEL_CHARS)}", (at, 1),
-                        xycoords="axes fraction", xytext=(0, 3), textcoords="offset points",
-                        ha=ha, va="bottom", fontsize=_LABEL_SIZE,
-                        color=_FOREST_INK if colour else ink)
+            ax.annotate(
+                f"{number:,} {_plain(side, _VOLCANO_LABEL_CHARS)}",
+                (at, 1),
+                xycoords="axes fraction",
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha=ha,
+                va="bottom",
+                fontsize=_LABEL_SIZE,
+                color=_FOREST_INK if colour else ink,
+            )
 
     _dress(ax, title or "")
     if ratio:
@@ -3576,46 +4014,81 @@ def volcano(
     ax.set_xlabel(xlabel, fontsize=_LABEL_SIZE)
 
     handles = [
-        Line2D([0], [0], color=styles[name][0], marker=styles[name][1], linestyle="none",
-               markersize=_FOREST_MARKER_PT, label=name)
+        Line2D(
+            [0],
+            [0],
+            color=styles[name][0],
+            marker=styles[name][1],
+            linestyle="none",
+            markersize=_FOREST_MARKER_PT,
+            label=name,
+        )
         for name in categories
     ]
     if size_range is not None:
         lo_area, hi_area = _VOLCANO_AREA_RANGE
         handles += [
-            Line2D([0], [0], color=_VOLCANO_SMALL, marker="o", linestyle="none",
-                   markersize=math.sqrt(lo_area + (hi_area - lo_area) * value / size_range[1]),
-                   label=f"{_plain(size, _FOREST_CELL_CHARS)} {_forest_cell(value)}")
+            Line2D(
+                [0],
+                [0],
+                color=_VOLCANO_SMALL,
+                marker="o",
+                linestyle="none",
+                markersize=math.sqrt(lo_area + (hi_area - lo_area) * value / size_range[1]),
+                label=f"{_plain(size, _FOREST_CELL_CHARS)} {_forest_cell(value)}",
+            )
             for value in size_range
         ]
     if ring_text is not None:
-        handles.append(Line2D(
-            [0], [0], marker="o", linestyle="none", markersize=_FOREST_MARKER_PT + 1.5,
-            markerfacecolor="none", markeredgecolor="black", markeredgewidth=0.6,
-            label=ring_text,
-        ))
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="none",
+                markersize=_FOREST_MARKER_PT + 1.5,
+                markerfacecolor="none",
+                markeredgecolor="black",
+                markeredgewidth=0.6,
+                label=ring_text,
+            )
+        )
     if handles:
         # under the axis label, where no point can be: every corner of a volcano may hold some
         under = ScaledTranslation(0, -26 / 72, figure.dpi_scale_trans)
         # four columns of short names fit under the axes; three of chapter-length ones
         wide = max(len(handle.get_label()) for handle in handles) > _FOREST_CELL_CHARS
-        ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0),
-                  bbox_transform=ax.transAxes + under, ncol=min(len(handles), 3 if wide else 4),
-                  frameon=False, fontsize=5, handlelength=1.2, columnspacing=1.2,
-                  borderaxespad=0.2)
+        ax.legend(
+            handles=handles,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0),
+            bbox_transform=ax.transAxes + under,
+            ncol=min(len(handles), 3 if wide else 4),
+            frameon=False,
+            fontsize=5,
+            handlelength=1.2,
+            columnspacing=1.2,
+            borderaxespad=0.2,
+        )
 
     whiskers: list[np.ndarray] = []
     for i, half in half_widths.items():
         lo, hi = max(x[i] - half, lim_lo), min(x[i] + half, lim_hi)
         if lo < hi:
-            ax.plot([shown(lo), shown(hi)], [plot_y[i]] * 2, color=colour_of[i],
-                    linewidth=0.6, solid_capstyle="butt", zorder=2.8)
+            ax.plot(
+                [shown(lo), shown(hi)],
+                [plot_y[i]] * 2,
+                color=colour_of[i],
+                linewidth=0.6,
+                solid_capstyle="butt",
+                zorder=2.8,
+            )
             # sampled along its length, so a name is kept off it the way it is kept off
             # the points
             along = np.linspace(lo, hi, 12)
-            whiskers.append(np.column_stack(
-                [np.exp(along) if ratio else along, np.full(12, plot_y[i])]
-            ))
+            whiskers.append(
+                np.column_stack([np.exp(along) if ratio else along, np.full(12, plot_y[i])])
+            )
 
     # last, because where a name fits depends on everything else already being in place
     if title:
@@ -3624,14 +4097,22 @@ def volcano(
             # a line above the counts, which the title would otherwise run into
             ax.set_title(ax.get_title(), fontsize=_TITLE_SIZE, pad=13)
     renderer = _renderer(figure)
-    taken = [] if renderer is None else [
-        artist.get_window_extent(renderer)
-        for artist in [*ax.texts, ax.get_legend()] if artist is not None
-    ]
+    taken = (
+        []
+        if renderer is None
+        else [
+            artist.get_window_extent(renderer)
+            for artist in [*ax.texts, ax.get_legend()]
+            if artist is not None
+        ]
+    )
     _place_labels(
-        ax, renderer, [(texts[i], plot_x[i], plot_y[i], 5) for i in named],
+        ax,
+        renderer,
+        [(texts[i], plot_x[i], plot_y[i], 5) for i in named],
         ax.transData.transform(np.vstack([np.column_stack([plot_x, plot_y]), *whiskers])),
-        taken, fontstyle="italic" if italic else "normal",
+        taken,
+        fontstyle="italic" if italic else "normal",
     )
 
     written = None
@@ -3646,7 +4127,7 @@ def volcano(
         "n_missing": n - count,
         "n_tests": n_tests,
         "correction": correction,
-        "threshold_p": None if line_y is None else 10 ** -line_y,
+        "threshold_p": None if line_y is None else 10**-line_y,
         "threshold_mlog10p": line_y,
         "n_significant": int(significant.sum()),
         "n_up": n_up,
@@ -3736,16 +4217,26 @@ def _mr_fits(estimates: dict[str, Any]) -> list[dict[str, Any]]:
         if (lo is None or hi is None) and se is not None:
             lo, hi = b - _MR_Z * se, b + _MR_Z * se
         name, colour, dash = _MR_METHODS.get(method, (str(method), *_MR_OTHER))
-        fits.append({
-            "method": method, "name": name, "colour": colour, "dash": dash, "estimate": b,
-            "se": se, "lower": lo, "upper": hi,
-            "intercept": _mr_float(est.get("intercept")),
-            "intercept_se": _mr_float(est.get("intercept_se")),
-        })
+        fits.append(
+            {
+                "method": method,
+                "name": name,
+                "colour": colour,
+                "dash": dash,
+                "estimate": b,
+                "se": se,
+                "lower": lo,
+                "upper": hi,
+                "intercept": _mr_float(est.get("intercept")),
+                "intercept_se": _mr_float(est.get("intercept_se")),
+            }
+        )
     return fits
 
 
-def _mr_interval_rows(frame: pl.DataFrame, keep: set[str]) -> list[tuple[str, float | None, float | None, float | None]]:
+def _mr_interval_rows(
+    frame: pl.DataFrame, keep: set[str]
+) -> list[tuple[str, float | None, float | None, float | None]]:
     """(variant, estimate, lower, upper) per row of a single-SNP or leave-one-out frame.
 
     Those frames carry `se` and not the bounds (TwoSampleMR's shape), so the 95% interval is
@@ -3765,10 +4256,17 @@ def _mr_interval_rows(frame: pl.DataFrame, keep: set[str]) -> list[tuple[str, fl
 
 
 def _mr_forest_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
-    return pl.DataFrame(rows, schema={
-        "label": pl.Utf8, "group": pl.Utf8, "estimate": pl.Float64, "lower": pl.Float64,
-        "upper": pl.Float64, "summary": pl.Boolean,
-    })
+    return pl.DataFrame(
+        rows,
+        schema={
+            "label": pl.Utf8,
+            "group": pl.Utf8,
+            "estimate": pl.Float64,
+            "lower": pl.Float64,
+            "upper": pl.Float64,
+            "summary": pl.Boolean,
+        },
+    )
 
 
 def _mr_draw_scatter(ax, bx, sx, by, sy, proxy, fits) -> list[str]:
@@ -3784,13 +4282,37 @@ def _mr_draw_scatter(ax, bx, sx, by, sy, proxy, fits) -> list[str]:
     x, y = np.abs(bx), by * sign
     ax.axhline(0, color="#000000", linewidth=_AXIS_LINEWIDTH, zorder=1)
     ax.axvline(0, color="#000000", linewidth=_AXIS_LINEWIDTH, zorder=1)
-    ax.errorbar(x, y, xerr=_MR_Z * sx, yerr=_MR_Z * sy, fmt="none", ecolor=_LINEMODEL_ERRORBAR,
-                elinewidth=0.5, zorder=2)
-    ax.scatter(x[~proxy], y[~proxy], s=12, color=_FOREST_INK, edgecolors="#FFFFFF",
-               linewidths=0.3, zorder=4, gid="mr-instruments")
+    ax.errorbar(
+        x,
+        y,
+        xerr=_MR_Z * sx,
+        yerr=_MR_Z * sy,
+        fmt="none",
+        ecolor=_LINEMODEL_ERRORBAR,
+        elinewidth=0.5,
+        zorder=2,
+    )
+    ax.scatter(
+        x[~proxy],
+        y[~proxy],
+        s=12,
+        color=_FOREST_INK,
+        edgecolors="#FFFFFF",
+        linewidths=0.3,
+        zorder=4,
+        gid="mr-instruments",
+    )
     if proxy.any():
-        ax.scatter(x[proxy], y[proxy], s=14, facecolors="#FFFFFF", edgecolors=_FOREST_INK,
-                   linewidths=0.7, zorder=4, gid="mr-proxies")
+        ax.scatter(
+            x[proxy],
+            y[proxy],
+            s=14,
+            facecolors="#FFFFFF",
+            edgecolors=_FOREST_INK,
+            linewidths=0.7,
+            zorder=4,
+            gid="mr-proxies",
+        )
     x_hi = float((x + _MR_Z * sx).max()) * 1.05 or 1.0
     x_lo = min(0.0, float((x - _MR_Z * sx).min()))
     xs = np.array([0.0, x_hi])
@@ -3805,19 +4327,45 @@ def _mr_draw_scatter(ax, bx, sx, by, sy, proxy, fits) -> list[str]:
             label += f"\n  intercept {fit['intercept']:.3g}"
             if fit["intercept_se"] is not None:
                 label += f" ({fit['intercept_se']:.3g})"
-        ax.plot(xs, intercept + fit["estimate"] * xs, color=fit["colour"], linestyle=fit["dash"],
-                linewidth=1.0, zorder=3, gid=f"mr-fit:{fit['method']}")
-        handles.append(Line2D([0], [0], color=fit["colour"], linestyle=fit["dash"],
-                              linewidth=1.0, label=label))
+        ax.plot(
+            xs,
+            intercept + fit["estimate"] * xs,
+            color=fit["colour"],
+            linestyle=fit["dash"],
+            linewidth=1.0,
+            zorder=3,
+            gid=f"mr-fit:{fit['method']}",
+        )
+        handles.append(
+            Line2D([0], [0], color=fit["colour"], linestyle=fit["dash"], linewidth=1.0, label=label)
+        )
         drawn.append(fit["method"])
     if proxy.any():
-        handles.append(Line2D([0], [0], marker="o", linestyle="none", markersize=3.5,
-                              markerfacecolor="#FFFFFF", markeredgecolor=_FOREST_INK,
-                              markeredgewidth=0.7, label="proxy (LD partner)"))
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="none",
+                markersize=3.5,
+                markerfacecolor="#FFFFFF",
+                markeredgecolor=_FOREST_INK,
+                markeredgewidth=0.7,
+                label="proxy (LD partner)",
+            )
+        )
     if handles:
-        ax.legend(handles=handles, fontsize=5, frameon=False, loc="upper left",
-                  bbox_to_anchor=(1.03, 1.0), borderaxespad=0, title="estimate (SE)",
-                  title_fontsize=5, alignment="left")
+        ax.legend(
+            handles=handles,
+            fontsize=5,
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.03, 1.0),
+            borderaxespad=0,
+            title="estimate (SE)",
+            title_fontsize=5,
+            alignment="left",
+        )
     ax.set_xlim(x_lo - 0.02 * (x_hi - x_lo), x_hi)
     ax.set_xlabel(r"effect on exposure $\beta_x$ (oriented positive)", fontsize=_LABEL_SIZE)
     ax.set_ylabel(r"effect on outcome $\beta_y$", fontsize=_LABEL_SIZE)
@@ -3871,7 +4419,9 @@ def mr(
     panels = tuple(panels)
     unknown = [p for p in panels if p not in _MR_PANELS]
     if not panels or unknown or len(set(panels)) != len(panels):
-        raise GeneticsUsageError(f"panels is a non-empty selection from {_MR_PANELS}; got {panels!r}")
+        raise GeneticsUsageError(
+            f"panels is a non-empty selection from {_MR_PANELS}; got {panels!r}"
+        )
 
     harmonised = frame if frame is not None else _mr_part(result, "harmonised")
     if harmonised is not None and not isinstance(harmonised, pl.DataFrame):
@@ -3883,11 +4433,17 @@ def mr(
         )
     missing = [c for c in _MR_REQUIRED if c not in harmonised.columns]
     if missing:
-        raise GeneticsUsageError(f"the instrument frame lacks {missing}; columns are {harmonised.columns}")
+        raise GeneticsUsageError(
+            f"the instrument frame lacks {missing}; columns are {harmonised.columns}"
+        )
     estimates = estimates if estimates is not None else (_mr_part(result, "estimates") or {})
-    sensitivity = sensitivity if sensitivity is not None else (_mr_part(result, "sensitivity") or {})
+    sensitivity = (
+        sensitivity if sensitivity is not None else (_mr_part(result, "sensitivity") or {})
+    )
     if not isinstance(estimates, dict) or not isinstance(sensitivity, dict):
-        raise GeneticsUsageError("estimates and sensitivity are dicts, as genetics.mr.run returns them")
+        raise GeneticsUsageError(
+            "estimates and sensitivity are dicts, as genetics.mr.run returns them"
+        )
 
     data = harmonised
     n_excluded = 0
@@ -3896,14 +4452,21 @@ def mr(
         n_excluded = int((~keep).sum())
         data = data.filter(keep)
     numbers = {c: data[c].cast(pl.Float64, strict=False).to_numpy() for c in _MR_REQUIRED[1:]}
-    usable = np.all([np.isfinite(v) for v in numbers.values()], axis=0) if data.height else np.array([], bool)
+    usable = (
+        np.all([np.isfinite(v) for v in numbers.values()], axis=0)
+        if data.height
+        else np.array([], bool)
+    )
     data = data.filter(pl.Series(usable))
     bx, sx, by, sy = (numbers[c][usable] for c in _MR_REQUIRED[1:])
     if data.is_empty():
-        raise GeneticsUsageError("no instrument with finite effects is in the outcome — nothing to plot")
+        raise GeneticsUsageError(
+            "no instrument with finite effects is in the outcome — nothing to plot"
+        )
     proxy = (
         data["is_proxy"].cast(pl.Boolean, strict=False).fill_null(False).to_numpy()
-        if "is_proxy" in data.columns else np.zeros(data.height, bool)
+        if "is_proxy" in data.columns
+        else np.zeros(data.height, bool)
     )
     variants = [str(v) for v in data["variant"].to_list()]
     rsids = data["rsid"].to_list() if "rsid" in data.columns else [None] * data.height
@@ -3929,31 +4492,74 @@ def mr(
                     se = sy / np.abs(bx)
                 ok = np.isfinite(ratio) & np.isfinite(se)
                 if not ok.all():
-                    notes.append(f"Wald ratio not drawn for {int((~ok).sum())} instrument(s) with beta_x = 0")
-                per = [(v, float(b), float(b - _MR_Z * s), float(b + _MR_Z * s))
-                       for v, b, s, good in zip(variants, ratio, se, ok) if good]
-            rows = [{"label": label_of[v], "group": "Wald ratio per instrument", "estimate": b,
-                     "lower": lo, "upper": hi, "summary": False} for v, b, lo, hi in per]
-            rows += [{"label": f["name"], "group": "Pooled estimates", "estimate": f["estimate"],
-                      "lower": f["lower"], "upper": f["upper"], "summary": True} for f in fits]
+                    notes.append(
+                        f"Wald ratio not drawn for {int((~ok).sum())} instrument(s) with beta_x = 0"
+                    )
+                per = [
+                    (v, float(b), float(b - _MR_Z * s), float(b + _MR_Z * s))
+                    for v, b, s, good in zip(variants, ratio, se, ok)
+                    if good
+                ]
+            rows = [
+                {
+                    "label": label_of[v],
+                    "group": "Wald ratio per instrument",
+                    "estimate": b,
+                    "lower": lo,
+                    "upper": hi,
+                    "summary": False,
+                }
+                for v, b, lo, hi in per
+            ]
+            rows += [
+                {
+                    "label": f["name"],
+                    "group": "Pooled estimates",
+                    "estimate": f["estimate"],
+                    "lower": f["lower"],
+                    "upper": f["upper"],
+                    "summary": True,
+                }
+                for f in fits
+            ]
             blocks.append(("forest", _mr_forest_frame(rows)))
         else:
             loo = sensitivity.get("leave_one_out")
             if not isinstance(loo, pl.DataFrame) or loo.is_empty():
-                why = (f"it needs at least 3 instruments and there {'is' if k == 1 else 'are'} {k}"
-                       if k < 3 else "no leave_one_out frame was given")
+                why = (
+                    f"it needs at least 3 instruments and there {'is' if k == 1 else 'are'} {k}"
+                    if k < 3
+                    else "no leave_one_out frame was given"
+                )
                 notes.append(f"Leave-one-out not drawn: {why}")
                 blocks.append(("note", notes[-1]))
                 continue
             per = _mr_interval_rows(loo, set(variants) | {"All"})
-            rows = [{"label": "All instruments" if v == "All" else label_of[v],
-                     "group": "IVW leaving out each instrument", "estimate": b, "lower": lo,
-                     "upper": hi, "summary": v == "All"} for v, b, lo, hi in per]
+            rows = [
+                {
+                    "label": "All instruments" if v == "All" else label_of[v],
+                    "group": "IVW leaving out each instrument",
+                    "estimate": b,
+                    "lower": lo,
+                    "upper": hi,
+                    "summary": v == "All",
+                }
+                for v, b, lo, hi in per
+            ]
             blocks.append(("leave_one_out", _mr_forest_frame(rows)))
 
-    forest_args = {"label": "label", "estimate": "estimate", "se": None, "lower": "lower",
-                   "upper": "upper", "group": "group", "summary": "summary", "pvalue": None,
-                   "sort_by": "estimate", "xlabel": "causal estimate (95% CI)"}
+    forest_args = {
+        "label": "label",
+        "estimate": "estimate",
+        "se": None,
+        "lower": "lower",
+        "upper": "upper",
+        "group": "group",
+        "summary": "summary",
+        "pvalue": None,
+        "sort_by": "estimate",
+        "xlabel": "causal estimate (95% CI)",
+    }
 
     # forest() sizes itself from its text and expects an axis of that size, so each is
     # measured on a scratch figure first; its canvas limits are the axis size in inches
@@ -3987,8 +4593,14 @@ def mr(
 
     figure = plt.figure(figsize=(width, height))
     if title:
-        figure.text(_MR_SCATTER_MARGIN_IN[0] / width, 1 - 0.04 / height, _plain(title, 120),
-                    ha="left", va="top", fontsize=_TITLE_SIZE)
+        figure.text(
+            _MR_SCATTER_MARGIN_IN[0] / width,
+            1 - 0.04 / height,
+            _plain(title, 120),
+            ha="left",
+            va="top",
+            fontsize=_TITLE_SIZE,
+        )
     top = height - head
     lines: list[str] = []
     drawn: list[str] = []
@@ -3997,18 +4609,37 @@ def mr(
         bottom = top - box_h
         if kind == "scatter":
             left, margin_b, _ = _MR_SCATTER_MARGIN_IN
-            ax = figure.add_axes((left / width, (bottom + margin_b) / height,
-                                  _MR_SCATTER_IN[0] / width, _MR_SCATTER_IN[1] / height))
+            ax = figure.add_axes(
+                (
+                    left / width,
+                    (bottom + margin_b) / height,
+                    _MR_SCATTER_IN[0] / width,
+                    _MR_SCATTER_IN[1] / height,
+                )
+            )
             lines = _mr_draw_scatter(ax, bx, sx, by, sy, proxy, fits)
             drawn.append(kind)
         elif kind == "note":
-            figure.text(_MR_SCATTER_MARGIN_IN[0] / width, (bottom + box_h / 2) / height, payload,
-                        ha="left", va="center", fontsize=_LABEL_SIZE, color=_FOREST_MUTED)
+            figure.text(
+                _MR_SCATTER_MARGIN_IN[0] / width,
+                (bottom + box_h / 2) / height,
+                payload,
+                ha="left",
+                va="center",
+                fontsize=_LABEL_SIZE,
+                color=_FOREST_MUTED,
+            )
         else:
             # the axis sits at the top of its box; everything forest() reserves for its tick
             # labels and axis label hangs below it
-            ax = figure.add_axes((_FOREST_SIDE_IN / width, (top - canvas_h) / height,
-                                  canvas_w / width, canvas_h / height))
+            ax = figure.add_axes(
+                (
+                    _FOREST_SIDE_IN / width,
+                    (top - canvas_h) / height,
+                    canvas_w / width,
+                    canvas_h / height,
+                )
+            )
             returned[kind] = forest(payload, ax=ax, **forest_args)
             drawn.append(kind)
         top = bottom - _MR_GAP_IN

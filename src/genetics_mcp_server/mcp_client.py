@@ -130,9 +130,7 @@ class SSEClient:
         self.url = url
         self.timeout = timeout
 
-    async def run(
-        self, command: str, tool_name: str | None = None, tool_args: dict | None = None
-    ):
+    async def run(self, command: str, tool_name: str | None = None, tool_args: dict | None = None):
         """Run a command against the SSE server."""
         from mcp import ClientSession
         from mcp.client.sse import sse_client
@@ -283,9 +281,7 @@ def main():
                     print(json.dumps(result, indent=2))
 
     except httpx.HTTPStatusError as e:
-        print(
-            f"HTTP error: {e.response.status_code} - {e.response.text}", file=sys.stderr
-        )
+        print(f"HTTP error: {e.response.status_code} - {e.response.text}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

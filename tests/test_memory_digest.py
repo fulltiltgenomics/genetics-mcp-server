@@ -118,9 +118,7 @@ def test_conditional_query_parameters():
 
 
 def test_tool_results_are_never_read():
-    results = json.dumps(
-        {"toolu_01": {"results": [{"gene": "BRCA1", "phenocode": "C3_BREAST"}]}}
-    )
+    results = json.dumps({"toolu_01": {"results": [{"gene": "BRCA1", "phenocode": "C3_BREAST"}]}})
     content = blocks(
         tool_use("search_genes", query="APOE"),
         {"type": "tool_result", "tool_use_id": "toolu_01", "content": "BRCA1 C3_BREAST"},
@@ -141,12 +139,8 @@ def test_malformed_and_empty_inputs():
 
 
 def test_user_text_yields_identifiers_only():
-    assert extract_user_entities("does rs429358 matter for APOE?") == {
-        ("variant", "rs429358")
-    }
-    assert extract_user_entities("look at chr19:44908684:T:C") == {
-        ("variant", "19-44908684-t-c")
-    }
+    assert extract_user_entities("does rs429358 matter for APOE?") == {("variant", "rs429358")}
+    assert extract_user_entities("look at chr19:44908684:T:C") == {("variant", "19-44908684-t-c")}
     assert extract_user_entities(None) == set()
 
 
@@ -154,9 +148,7 @@ def test_legacy_tooluse_marker():
     payload = base64.b64encode(
         json.dumps({"name": "search_genes", "input": {"query": "APOE"}}).encode()
     ).decode()
-    assert extract_marker_entities(f"Working on it [TOOLUSE:{payload}] done") == {
-        ("gene", "APOE")
-    }
+    assert extract_marker_entities(f"Working on it [TOOLUSE:{payload}] done") == {("gene", "APOE")}
     assert extract_marker_entities("[TOOLUSE:notbase64!!]") == set()
     assert extract_marker_entities(None) == set()
 
@@ -398,8 +390,7 @@ def build_cluster_db(path):
         session_id = f"c{index + 1}"
         stamp = (now - timedelta(days=20 - index)).strftime("%Y-%m-%d %H:%M:%S")
         con.execute(
-            "INSERT INTO chat_sessions (id, user_id, created_at, updated_at)"
-            " VALUES (?,?,?,?)",
+            "INSERT INTO chat_sessions (id, user_id, created_at, updated_at) VALUES (?,?,?,?)",
             (session_id, "carol", stamp, stamp),
         )
         con.execute(
@@ -826,14 +817,24 @@ def test_render_digest_is_deterministic_regardless_of_entity_insertion_order():
         "t",
         "2026-09-01 09:00:00",
         "hello",
-        [blocks(tool_use("search_genes", query="APOE"), tool_use("lookup_variants_by_rsid", rsids=["rs429358"]))],
+        [
+            blocks(
+                tool_use("search_genes", query="APOE"),
+                tool_use("lookup_variants_by_rsid", rsids=["rs429358"]),
+            )
+        ],
     )
     s_b = session(
         "s1",
         "t",
         "2026-09-01 09:00:00",
         "hello",
-        [blocks(tool_use("lookup_variants_by_rsid", rsids=["rs429358"]), tool_use("search_genes", query="APOE"))],
+        [
+            blocks(
+                tool_use("lookup_variants_by_rsid", rsids=["rs429358"]),
+                tool_use("search_genes", query="APOE"),
+            )
+        ],
     )
     out_a = render_digest([s_a], datetime(2026, 9, 9))
     out_b = render_digest([s_b], datetime(2026, 9, 9))
@@ -915,7 +916,11 @@ def test_render_digest_never_surfaces_tool_result_text():
         "t",
         "2026-01-01 09:00:00",
         "hi",
-        [blocks(tool_use("search_genes", query="APOE"), tool_result("toolu_01", "SECRET_ROW_DATA"))],
+        [
+            blocks(
+                tool_use("search_genes", query="APOE"), tool_result("toolu_01", "SECRET_ROW_DATA")
+            )
+        ],
         pinned_at="2026-01-01 09:05:00",
     )
     out = render_digest([s], datetime(2026, 9, 9))
@@ -930,7 +935,9 @@ def test_render_digest_collapses_newlines_in_first_message_head():
 
 
 def test_render_digest_marks_artifact_looking_values_as_expires():
-    s = session("s1", "t", "2026-01-01 09:00:00", "see report_final.csv or https://x.example/a.pdf?x=1")
+    s = session(
+        "s1", "t", "2026-01-01 09:00:00", "see report_final.csv or https://x.example/a.pdf?x=1"
+    )
     out = render_digest([s], datetime(2026, 9, 9))
     assert "report_final.csv" not in out
     assert "https://x.example" not in out

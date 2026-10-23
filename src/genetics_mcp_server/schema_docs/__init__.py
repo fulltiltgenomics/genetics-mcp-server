@@ -67,14 +67,18 @@ def _hidden_views(profile: str | None) -> frozenset[str]:
     if not known and gated:
         logger.error(
             "%s=%r is not one of %s; hiding gated schema views %s",
-            _PROFILE_ENV, profile, availability["profiles"], sorted(gated),
+            _PROFILE_ENV,
+            profile,
+            availability["profiles"],
+            sorted(gated),
         )
     return frozenset(v for v, allowed in gated.items() if not known or profile not in allowed)
 
 
 def _visible(hidden: frozenset[str]) -> list[str]:
     return sorted(
-        f[:-3] for f in os.listdir(_DIR)
+        f[:-3]
+        for f in os.listdir(_DIR)
         if f.endswith(".md") and f != _INDEX and f[:-3] not in hidden
     )
 
@@ -122,8 +126,7 @@ def _drop_rows(text: str, hidden: frozenset[str]) -> str:
     """
     rows = [re.compile(rf"^\| `{re.escape(v)}` \|") for v in hidden]
     return "".join(
-        line for line in text.splitlines(keepends=True)
-        if not any(row.match(line) for row in rows)
+        line for line in text.splitlines(keepends=True) if not any(row.match(line) for row in rows)
     )
 
 

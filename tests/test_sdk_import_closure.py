@@ -46,10 +46,14 @@ assert _src in _origin.parents, f"imported {{_origin}}, not the checkout under t
 
 
 def _run_probe(body: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(_SRC), os.environ.get("PYTHONPATH", "")])}
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(_SRC), os.environ.get("PYTHONPATH", "")]),
+    }
     return subprocess.run(
         [sys.executable, "-c", body], capture_output=True, text=True, check=False, env=env
     )
+
 
 # Widening this set means the sandbox image ships another genetics_mcp_server source file.
 # Do that deliberately — and update SDK_ALLOWLIST in genetics-results-suite
@@ -391,8 +395,7 @@ def test_no_shipped_source_names_a_module_the_image_lacks():
         "call inside the sandbox — and neither does a `TYPE_CHECKING` or `try/except "
         "ImportError` guard: the name is in the shipped source whether or not that line "
         "runs. Move the code out of the SDK's import closure, or widen "
-        "genetics-results-suite/sandbox/requirements.txt deliberately:\n  "
-        + "\n  ".join(offenders)
+        "genetics-results-suite/sandbox/requirements.txt deliberately:\n  " + "\n  ".join(offenders)
     )
 
 

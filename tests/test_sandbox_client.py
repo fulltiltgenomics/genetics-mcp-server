@@ -297,7 +297,9 @@ class TestTheResult:
 
     async def test_a_mismatched_execution_id_is_a_protocol_error(self):
         """The id is the join key; a result carrying another one cannot be recorded."""
-        handler = _Recorder(httpx.Response(200, json=_ok_body("00000000-0000-4000-8000-000000000000")))
+        handler = _Recorder(
+            httpx.Response(200, json=_ok_body("00000000-0000-4000-8000-000000000000"))
+        )
         with pytest.raises(SandboxProtocolError):
             await _client(handler).execute(code=CODE, user=USER, session_id=SESSION)
 
@@ -725,9 +727,7 @@ class TestInputs:
         """Unknown top-level fields are a 400, so a sandbox predating this field must still
         serve every execution that does not use it."""
         recorder = _Recorder(_echoing_ok)
-        await _client(recorder).execute(
-            code=CODE, user=USER, session_id=SESSION, inputs=inputs
-        )
+        await _client(recorder).execute(code=CODE, user=USER, session_id=SESSION, inputs=inputs)
         assert "inputs" not in recorder.bodies[0]
 
     async def test_an_input_at_the_per_input_cap_is_accepted(self):
@@ -748,7 +748,9 @@ class TestInputs:
                 user=USER,
                 session_id=SESSION,
                 inputs=[
-                    SandboxInput(name="big.bin", content=b"x" * (sandbox_client.MAX_INPUT_BYTES + 1))
+                    SandboxInput(
+                        name="big.bin", content=b"x" * (sandbox_client.MAX_INPUT_BYTES + 1)
+                    )
                 ],
             )
         assert recorder.requests == []
@@ -762,7 +764,9 @@ class TestInputs:
             session_id=SESSION,
             inputs=[
                 SandboxInput(name="a.bin", content=b"a" * half),
-                SandboxInput(name="b.bin", content=b"b" * (sandbox_client.MAX_INPUTS_TOTAL_BYTES - half)),
+                SandboxInput(
+                    name="b.bin", content=b"b" * (sandbox_client.MAX_INPUTS_TOTAL_BYTES - half)
+                ),
             ],
         )
         assert len(recorder.requests) == 1
@@ -946,17 +950,13 @@ class TestInputs:
                 user=USER,
                 session_id=SESSION,
                 inputs=[
-                    SandboxInput(
-                        name="a.txt", content=b"these bytes", expected_sha256="0" * 64
-                    )
+                    SandboxInput(name="a.txt", content=b"these bytes", expected_sha256="0" * 64)
                 ],
             )
         assert "expected sha256" in str(excinfo.value)
         assert recorder.requests == []
 
-    @pytest.mark.parametrize(
-        "expected", ["", "deadbeef", "0" * 63, "A" * 64, 42]
-    )
+    @pytest.mark.parametrize("expected", ["", "deadbeef", "0" * 63, "A" * 64, 42])
     async def test_a_malformed_expected_digest_is_refused(self, expected):
         recorder = _Recorder(_echoing_ok)
         with pytest.raises(SandboxRejected):

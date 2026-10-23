@@ -51,6 +51,7 @@ _ANALYTICS_PERIOD_DAYS = {"week": 7, "month": 30, "year": 365}
 @dataclass
 class ChatProject:
     """A user's project: a named container for chat sessions."""
+
     id: str
     user_id: str
     name: str
@@ -70,6 +71,7 @@ class ChatProject:
 @dataclass
 class ChatSession:
     """A chat session with metadata."""
+
     id: str
     user_id: str
     title: str | None
@@ -102,6 +104,7 @@ class ChatSession:
 @dataclass
 class ChatMessageRecord:
     """A chat message stored in the database."""
+
     id: str
     session_id: str
     role: str
@@ -111,14 +114,19 @@ class ChatMessageRecord:
     content_json: str | None = None  # JSON string of full message content blocks
     literature_backend: str | None = None  # literature search backend: europepmc or perplexity
     tool_profile: str | None = None  # tool profile: api, bigquery, rag, or None (all)
-    tool_results_json: str | None = None  # JSON string of tool_result blocks for this assistant turn
-    instruction_set_id: str | None = None  # user instruction set in force for this turn, NULL if none
+    tool_results_json: str | None = (
+        None  # JSON string of tool_result blocks for this assistant turn
+    )
+    instruction_set_id: str | None = (
+        None  # user instruction set in force for this turn, NULL if none
+    )
     verbosity: str | None = None  # answer detail in force for this turn: brief or detailed
 
 
 @dataclass
 class ChatAttachment:
     """A file attachment for a chat message."""
+
     id: str
     session_id: str
     file_name: str
@@ -139,9 +147,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._connections: dict[int, sqlite3.Connection] = dd(
-            lambda: self._create_connection()
-        )
+        self._connections: dict[int, sqlite3.Connection] = dd(lambda: self._create_connection())
         self._init_db()
 
     def _create_connection(self) -> sqlite3.Connection:
@@ -366,9 +372,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         # before the turn died, a floor on what the turn cost. Spend is spend, so cost
         # aggregates take every outcome; a per-turn distribution filters on 'complete',
         # or a cut-off turn reads as a cheap one.
-        cursor.execute(
-            f"CREATE TABLE IF NOT EXISTS chat_turn_metrics ({_TURN_METRICS_COLUMNS})"
-        )
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS chat_turn_metrics ({_TURN_METRICS_COLUMNS})")
         self._relax_turn_metrics_columns(cursor)
 
         cursor.execute("""
@@ -424,17 +428,27 @@ class ChatHistoryDB(object, metaclass=Singleton):
             return
         present = {row[1] for row in info}
         wanted = [
-            "id", "session_id", "message_id", "user_id", "iterations", "tool_call_count",
-            "input_tokens", "output_tokens", "cache_read_tokens", "cache_create_tokens",
-            "cost_usd", "wall_ms", "tool_profile", "model", "created_at",
+            "id",
+            "session_id",
+            "message_id",
+            "user_id",
+            "iterations",
+            "tool_call_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_create_tokens",
+            "cost_usd",
+            "wall_ms",
+            "tool_profile",
+            "model",
+            "created_at",
         ]
         columns = ", ".join(c for c in wanted if c in present)
         cursor.execute("BEGIN")
         try:
             cursor.execute("DROP TABLE IF EXISTS chat_turn_metrics_relaxed")
-            cursor.execute(
-                f"CREATE TABLE chat_turn_metrics_relaxed ({_TURN_METRICS_COLUMNS})"
-            )
+            cursor.execute(f"CREATE TABLE chat_turn_metrics_relaxed ({_TURN_METRICS_COLUMNS})")
             cursor.execute(
                 f"INSERT INTO chat_turn_metrics_relaxed ({columns}) "
                 f"SELECT {columns} FROM chat_turn_metrics"
@@ -865,9 +879,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
 
         return self.delete_project(user_id, project_id)
 
-    def set_session_project(
-        self, user_id: str, session_id: str, project_id: str | None
-    ) -> bool:
+    def set_session_project(self, user_id: str, session_id: str, project_id: str | None) -> bool:
         """File a session into a project, or unfile it with project_id=None.
 
         Both ends are owner-checked: returns False when the session is not this
@@ -1104,7 +1116,18 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     instruction_set_id = excluded.instruction_set_id,
                     verbosity = excluded.verbosity
                 """,
-                (message_id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id, verbosity),
+                (
+                    message_id,
+                    session_id,
+                    role,
+                    content,
+                    content_json,
+                    literature_backend,
+                    tool_profile,
+                    tool_results_json,
+                    instruction_set_id,
+                    verbosity,
+                ),
             )
             # also touch the session
             cursor.execute(
@@ -1229,7 +1252,16 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 INSERT INTO chat_attachments (id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (attachment_id, session_id, file_name, file_type, mime_type, file_size, storage_path, text_path),
+                (
+                    attachment_id,
+                    session_id,
+                    file_name,
+                    file_type,
+                    mime_type,
+                    file_size,
+                    storage_path,
+                    text_path,
+                ),
             )
             conn.commit()
         except BaseException:
@@ -1332,9 +1364,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         """
         # issue_count is a scalar so it filters in WHERE without a GROUP BY;
         # keeping it a correlated subquery preserves the simple count/paginate shape
-        issue_count_expr = (
-            "(SELECT COUNT(*) FROM conversation_issue ci WHERE ci.session_id = s.id)"
-        )
+        issue_count_expr = "(SELECT COUNT(*) FROM conversation_issue ci WHERE ci.session_id = s.id)"
 
         conditions = []
         params: list = []
@@ -1512,9 +1542,18 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     INSERT INTO chat_messages (id, session_id, role, content, content_json, literature_backend, tool_profile, tool_results_json, instruction_set_id, verbosity)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (new_msg_id, new_session_id, row["role"], row["content"],
-                     row["content_json"], row["literature_backend"], row["tool_profile"], row["tool_results_json"],
-                     row["instruction_set_id"], row["verbosity"]),
+                    (
+                        new_msg_id,
+                        new_session_id,
+                        row["role"],
+                        row["content"],
+                        row["content_json"],
+                        row["literature_backend"],
+                        row["tool_profile"],
+                        row["tool_results_json"],
+                        row["instruction_set_id"],
+                        row["verbosity"],
+                    ),
                 )
 
             conn.commit()
@@ -1556,7 +1595,11 @@ class ChatHistoryDB(object, metaclass=Singleton):
             (f"-{days} days",),
         )
         return [
-            {"date": row["day"], "unique_users": row["unique_users"], "conversations": row["conversations"]}
+            {
+                "date": row["day"],
+                "unique_users": row["unique_users"],
+                "conversations": row["conversations"],
+            }
             for row in cursor.fetchall()
         ]
 
@@ -1600,8 +1643,13 @@ class ChatHistoryDB(object, metaclass=Singleton):
             return users.setdefault(
                 key,
                 {
-                    "user": key, "conversations": 0, "avg_messages": 0.0, "max_messages": 0,
-                    "usd": 0.0, "avg_usd": None, "max_usd": None,
+                    "user": key,
+                    "conversations": 0,
+                    "avg_messages": 0.0,
+                    "max_messages": 0,
+                    "usd": 0.0,
+                    "avg_usd": None,
+                    "max_usd": None,
                 },
             )
 
@@ -1786,10 +1834,24 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 WHERE chat_turn_metrics.user_id IS excluded.user_id
                 """,
                 (
-                    row_id, session_id, message_id, user_id, iterations, tool_call_count,
-                    input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                    cost_usd, wall_ms, tool_profile, model, outcome,
-                    session_id, user_id, user_id,
+                    row_id,
+                    session_id,
+                    message_id,
+                    user_id,
+                    iterations,
+                    tool_call_count,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_create_tokens,
+                    cost_usd,
+                    wall_ms,
+                    tool_profile,
+                    model,
+                    outcome,
+                    session_id,
+                    user_id,
+                    user_id,
                 ),
             )
             written = cursor.rowcount > 0
@@ -1872,9 +1934,15 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'log', ?)
                     """,
                     (
-                        f"log:{t['log_id']}", t.get("session_id"), t["user_id"],
-                        t["iterations"], t["input_tokens"], t["output_tokens"],
-                        t["cost_usd"], t.get("model"), t["created_at"],
+                        f"log:{t['log_id']}",
+                        t.get("session_id"),
+                        t["user_id"],
+                        t["iterations"],
+                        t["input_tokens"],
+                        t["output_tokens"],
+                        t["cost_usd"],
+                        t.get("model"),
+                        t["created_at"],
                     ),
                 )
                 if cursor.rowcount > 0:
@@ -1977,9 +2045,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
             )
 
             # replace the session's issue rows wholesale to keep them in sync
-            cursor.execute(
-                "DELETE FROM conversation_issue WHERE session_id = ?", (session_id,)
-            )
+            cursor.execute("DELETE FROM conversation_issue WHERE session_id = ?", (session_id,))
             if issue_categories:
                 cursor.executemany(
                     "INSERT INTO conversation_issue (session_id, category) VALUES (?, ?)",
@@ -1999,9 +2065,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         cursor.execute("SELECT * FROM conversation_analysis")
         return {row["session_id"]: dict(row) for row in cursor.fetchall()}
 
-    def get_stale_or_missing_session_ids(
-        self, force: bool, analyzer_version: int
-    ) -> list[str]:
+    def get_stale_or_missing_session_ids(self, force: bool, analyzer_version: int) -> list[str]:
         """Return session ids needing (re)analysis.
 
         A session is stale when it has no analysis row, its chat_sessions

@@ -15,17 +15,40 @@ from genetics_mcp_server.tools.definitions import TOOL_DEFINITIONS, get_anthropi
 
 # db-api serializes rows POSITIONALLY with the names in a separate `columns` key.
 DOSAGE_COLUMNS = [
-    "symbol", "symbol_gencode_v19", "ensembl_gene_id",
-    "phaplo", "ptriplo", "haploinsufficient", "triplosensitive",
+    "symbol",
+    "symbol_gencode_v19",
+    "ensembl_gene_id",
+    "phaplo",
+    "ptriplo",
+    "haploinsufficient",
+    "triplosensitive",
 ]
 DOSAGE_ROWS = [["SHANK3", "SHANK3", "ENSG00000251322", 0.9917, 0.6021, True, False]]
 
 RCNV_COLUMNS = [
-    "phenotype", "trait_name", "cnv_type", "symbol", "ensembl_gene_id",
-    "n_nominal_cohorts", "beta", "mlog10p", "mlog10_fdr_q",
+    "phenotype",
+    "trait_name",
+    "cnv_type",
+    "symbol",
+    "ensembl_gene_id",
+    "n_nominal_cohorts",
+    "beta",
+    "mlog10p",
+    "mlog10_fdr_q",
 ]
-RCNV_ROWS = [["HP0012759", "Neurodevelopmental abnormality", "DEL", "SHANK3",
-              "ENSG00000251322", 4, 3.699, 12.4, 9.1]]
+RCNV_ROWS = [
+    [
+        "HP0012759",
+        "Neurodevelopmental abnormality",
+        "DEL",
+        "SHANK3",
+        "ENSG00000251322",
+        4,
+        3.699,
+        12.4,
+        9.1,
+    ]
+]
 
 
 def _executor(result=None):
@@ -451,8 +474,14 @@ class TestRcnvToolDefinitions:
         # enforced in the executor because a schema cannot express "at least one of"
         assert not any(p.get("required") for p in rcnv["parameters"].values())
         assert set(rcnv["parameters"]) == {
-            "gene", "phenotype", "cnv_type", "min_mlog10p", "max_fdr_q",
-            "significant_only", "include_no_estimate", "limit",
+            "gene",
+            "phenotype",
+            "cnv_type",
+            "min_mlog10p",
+            "max_fdr_q",
+            "significant_only",
+            "include_no_estimate",
+            "limit",
         }
 
     def test_the_no_estimate_rows_are_described_where_the_model_reads(self):

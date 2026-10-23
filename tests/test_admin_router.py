@@ -180,7 +180,6 @@ class TestAdminSessionsAnalysisFields:
 
 
 class TestAdminQualityAnalytics:
-
     def test_quality_rows(self, analyzed_admin_client):
         client, s1, s2, s3 = analyzed_admin_client
         resp = client.get("/chat/v1/admin/analytics/quality")
@@ -198,7 +197,6 @@ class TestAdminQualityAnalytics:
 
 
 class TestAdminSessions:
-
     def test_list_all_sessions(self, admin_client):
         response = admin_client.get("/chat/v1/admin/sessions")
         assert response.status_code == 200
@@ -234,7 +232,6 @@ class TestAdminSessions:
 
 
 class TestAdminSessionDetail:
-
     def test_get_session_detail(self, admin_client, seeded_db):
         sessions, _ = seeded_db.list_all_sessions()
         session_id = sessions[0].id
@@ -253,7 +250,6 @@ class TestAdminSessionDetail:
 
 
 class TestAdminAnalytics:
-
     def test_analytics_week(self, admin_client):
         response = admin_client.get("/chat/v1/admin/analytics/usage?period=week")
         assert response.status_code == 200
@@ -279,22 +275,37 @@ class TestAdminAnalytics:
 
 
 class TestAdminCostAnalytics:
-
     @pytest.fixture
     def costed_client(self, admin_client, seeded_db):
         sessions, _ = seeded_db.list_all_sessions()
         alice = next(s for s in sessions if s.user_id == "alice@example.com")
         for cost in (1.25, 0.5):
             seeded_db.record_turn_metrics(
-                session_id=alice.id, message_id=None, user_id="alice@example.com",
-                iterations=2, tool_call_count=1, input_tokens=100, output_tokens=10,
-                cache_read_tokens=0, cache_create_tokens=0, cost_usd=cost, wall_ms=100,
+                session_id=alice.id,
+                message_id=None,
+                user_id="alice@example.com",
+                iterations=2,
+                tool_call_count=1,
+                input_tokens=100,
+                output_tokens=10,
+                cache_read_tokens=0,
+                cache_create_tokens=0,
+                cost_usd=cost,
+                wall_ms=100,
             )
         # spend by someone who opened no conversation in the window is still a row
         seeded_db.record_turn_metrics(
-            session_id=None, message_id=None, user_id="carol@example.com",
-            iterations=1, tool_call_count=0, input_tokens=10, output_tokens=1,
-            cache_read_tokens=0, cache_create_tokens=0, cost_usd=0.05, wall_ms=10,
+            session_id=None,
+            message_id=None,
+            user_id="carol@example.com",
+            iterations=1,
+            tool_call_count=0,
+            input_tokens=10,
+            output_tokens=1,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cost_usd=0.05,
+            wall_ms=10,
         )
         return admin_client
 
@@ -308,13 +319,19 @@ class TestAdminCostAnalytics:
 
         by_user = {u["user"]: u for u in data["users"]}
         assert [u["user"] for u in data["users"]] == [
-            "alice@example.com", "carol@example.com", "bob@example.com",
+            "alice@example.com",
+            "carol@example.com",
+            "bob@example.com",
         ], "sorted by spend, then name"
         # both turns sit on one of alice's two sessions: the other has no attributed turn and
         # does not enter the per-conversation USD figures
         assert by_user["alice@example.com"] == {
-            "user": "alice@example.com", "conversations": 2, "avg_messages": 2.0,
-            "max_messages": 2, "usd": pytest.approx(1.75), "avg_usd": pytest.approx(1.75),
+            "user": "alice@example.com",
+            "conversations": 2,
+            "avg_messages": 2.0,
+            "max_messages": 2,
+            "usd": pytest.approx(1.75),
+            "avg_usd": pytest.approx(1.75),
             "max_usd": pytest.approx(1.75),
         }
         assert by_user["bob@example.com"]["usd"] == 0.0
@@ -327,7 +344,10 @@ class TestAdminCostAnalytics:
 
     def test_cost_periods(self, costed_client):
         for period in ("month", "year"):
-            assert costed_client.get(f"/chat/v1/admin/analytics/cost?period={period}").status_code == 200
+            assert (
+                costed_client.get(f"/chat/v1/admin/analytics/cost?period={period}").status_code
+                == 200
+            )
         assert costed_client.get("/chat/v1/admin/analytics/cost?period=day").status_code == 400
 
     def test_session_list_carries_each_conversations_cost(self, costed_client):
@@ -336,7 +356,10 @@ class TestAdminCostAnalytics:
         for s in sessions:
             by_user.setdefault(s["user_id"], []).append(s["usd"])
         # alice's two turns sit on one of her sessions; the other, and bob's, have no turn
-        assert sorted(by_user["alice@example.com"], key=lambda v: v or 0) == [None, pytest.approx(1.75)]
+        assert sorted(by_user["alice@example.com"], key=lambda v: v or 0) == [
+            None,
+            pytest.approx(1.75),
+        ]
         assert by_user["bob@example.com"] == [None]
 
     def test_cost_empty_db_is_not_an_error(self, admin_client):
@@ -347,9 +370,9 @@ class TestAdminCostAnalytics:
 
 
 class TestAdminAuthGuards:
-
     def test_non_admin_denied_when_auth_required(self, seeded_db):
         """Non-admin user gets 403 when REQUIRE_AUTH is true."""
+
         async def mock_auth():
             return "regular@example.com"
 
@@ -445,7 +468,6 @@ class TestAdminAuthGuards:
 
 
 class TestAdminDBMethods:
-
     def test_list_all_sessions_no_filter(self, seeded_db):
         sessions, total = seeded_db.list_all_sessions()
         assert total == 3
@@ -589,7 +611,6 @@ def feedback_client(test_db):
 
 
 class TestAdminFeedbackEndpoint:
-
     def test_list_feedback_empty(self, feedback_client):
         client, _, _ = feedback_client
         response = client.get("/chat/v1/admin/feedback")
@@ -651,7 +672,9 @@ class TestAdminFeedbackEndpoint:
 
         for i in range(2):
             s = chat_db.create_session(f"sess_user{i}@example.com")
-            chat_db.update_session(s.id, f"sess_user{i}@example.com", comment=f"session comment {i}")
+            chat_db.update_session(
+                s.id, f"sess_user{i}@example.com", comment=f"session comment {i}"
+            )
             time.sleep(0.02)
 
         # full list
@@ -675,7 +698,9 @@ class TestAdminFeedbackEndpoint:
         assert len(data_p3["items"]) == 1
 
         # no overlap between pages
-        all_comments = [i["comment"] for i in data_p1["items"] + data_p2["items"] + data_p3["items"]]
+        all_comments = [
+            i["comment"] for i in data_p1["items"] + data_p2["items"] + data_p3["items"]
+        ]
         assert len(all_comments) == len(set(all_comments))
 
 
@@ -720,7 +745,9 @@ class TestAdminFeedbackPaginationStability:
             config_db.add_user_comment(f"user{i}@example.com", f"dialog comment {i}")
         for i in range(3):
             s = chat_db.create_session(f"sess_user{i}@example.com")
-            chat_db.update_session(s.id, f"sess_user{i}@example.com", comment=f"session comment {i}")
+            chat_db.update_session(
+                s.id, f"sess_user{i}@example.com", comment=f"session comment {i}"
+            )
         # by SQL rather than by racing the clock: landing six writes in one second is the one
         # thing a timing test cannot arrange
         config_db._conn.execute("UPDATE user_comments SET created_at = ?", (self.STAMP,))
@@ -952,15 +979,11 @@ class TestAdminSessionsAnalysisJoin:
 
     def test_filters_compose_with_user_filter(self, analyzed_db):
         db, s1, s2, s3 = analyzed_db
-        sessions, total = db.list_all_sessions(
-            user_filter="alice", success_label="successful"
-        )
+        sessions, total = db.list_all_sessions(user_filter="alice", success_label="successful")
         assert total == 1
         assert sessions[0].id == s1
         # composing with a non-matching user yields nothing
-        _, total = db.list_all_sessions(
-            user_filter="bob", success_label="successful"
-        )
+        _, total = db.list_all_sessions(user_filter="bob", success_label="successful")
         assert total == 0
 
     def test_list_all_analysis_rows(self, analyzed_db):
@@ -1004,8 +1027,12 @@ def instruction_set_admin_client(test_db):
     # (user_id, set_id), not set_id alone
     s4 = test_db.create_session("bob@example.com")
     test_db.add_message(s4.id, "s4-m1", "user", "hi", instruction_set_id=named.id)
-    sessions = {"alice_switch": s1.id, "alice_none": s2.id, "bob_ghost": s3.id,
-                "bob_borrowed": s4.id}
+    sessions = {
+        "alice_switch": s1.id,
+        "alice_none": s2.id,
+        "bob_ghost": s3.id,
+        "bob_borrowed": s4.id,
+    }
 
     async def mock_admin():
         return "admin@example.com"
@@ -1014,9 +1041,10 @@ def instruction_set_admin_client(test_db):
 
     with patch.dict(os.environ, {"ENABLE_ADMIN_PAGE": "true"}):
         get_settings.cache_clear()
-        with patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db), \
-                patch("genetics_mcp_server.routers.admin.get_llm_config_db",
-                      return_value=config_db):
+        with (
+            patch("genetics_mcp_server.routers.admin.get_chat_history_db", return_value=test_db),
+            patch("genetics_mcp_server.routers.admin.get_llm_config_db", return_value=config_db),
+        ):
             with TestClient(app) as client:
                 yield client, config_db, sessions
         get_settings.cache_clear()
@@ -1044,8 +1072,7 @@ class TestAdminSessionsInstructionSet:
     def test_session_without_a_set_reports_none(self, instruction_set_admin_client):
         sessions = self._by_session(instruction_set_admin_client)
         assert any(
-            s["instruction_set_name"] is None and s["message_count"] == 1
-            for s in sessions.values()
+            s["instruction_set_name"] is None and s["message_count"] == 1 for s in sessions.values()
         )
 
     def test_unresolvable_set_reports_none(self, instruction_set_admin_client):
@@ -1065,12 +1092,11 @@ class TestAdminSessionsInstructionSet:
         """Archiving is a soft delete precisely so history stays resolvable."""
         config_db = instruction_set_admin_client[1]
         sessions_before = self._by_session(instruction_set_admin_client)
-        target = next(
-            s for s in sessions_before.values() if s["instruction_set_name"] == "Terse"
-        )
+        target = next(s for s in sessions_before.values() if s["instruction_set_name"] == "Terse")
 
-        terse = next(s for s in config_db.list_instruction_sets("alice@example.com")
-                     if s.name == "Terse")
+        terse = next(
+            s for s in config_db.list_instruction_sets("alice@example.com") if s.name == "Terse"
+        )
         assert config_db.archive_instruction_set("alice@example.com", terse.id)
 
         after = self._by_session(instruction_set_admin_client)

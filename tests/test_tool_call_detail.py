@@ -53,19 +53,36 @@ def _report(detail, status="ok"):
     return {
         "arms": ["nocode", "code"],
         "turns": [
-            {"case_id": "c", "arm": "nocode", "turn_index": 0, "status": status,
-             "ms_to_done": 1.0, "tool_calls": len(detail), "cost_usd": 0.1,
-             "tool_calls_detail": detail},
-            {"case_id": "c", "arm": "code", "turn_index": 0, "status": "ok",
-             "ms_to_done": 1.0, "tool_calls": 0, "cost_usd": 0.1, "tool_calls_detail": []},
+            {
+                "case_id": "c",
+                "arm": "nocode",
+                "turn_index": 0,
+                "status": status,
+                "ms_to_done": 1.0,
+                "tool_calls": len(detail),
+                "cost_usd": 0.1,
+                "tool_calls_detail": detail,
+            },
+            {
+                "case_id": "c",
+                "arm": "code",
+                "turn_index": 0,
+                "status": "ok",
+                "ms_to_done": 1.0,
+                "tool_calls": 0,
+                "cost_usd": 0.1,
+                "tool_calls_detail": [],
+            },
         ],
     }
 
 
 def test_the_tools_view_elides_visibly_and_says_where_the_whole_value_is():
     long_script = "x" * 5000
-    out = render_tool_calls(_report([{"seq": 0, "name": "run_analysis", "id": "t",
-                                      "input": {"script": long_script}}]), width=60)
+    out = render_tool_calls(
+        _report([{"seq": 0, "name": "run_analysis", "id": "t", "input": {"script": long_script}}]),
+        width=60,
+    )
     assert "…" in out, "a shortened argument must be marked"
     assert "x" * 5000 not in out
     assert "tool_calls_detail" in out, "and the report path for the full value must be given"

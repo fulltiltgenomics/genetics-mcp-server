@@ -31,12 +31,18 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-ZHANG = ("zhang2025_natcommun/41467_2025_57879_MOESM3_ESM.xlsx",
-         "78f66fa2c9e01cffaf2f0dad5a47fe27418397a915d125e6e5708debc7c60449")
-ZHOU = ("zhou2021_natmed/41591_2021_1281_MOESM2_ESM.xlsx",
-        "dff7cbfbf5f01988032c87a2698498bcef35d92294280542ffd806a7ee030e6c")
-ZHENG = ("zheng2020_natgenet/41588_2020_682_MOESM3_ESM.xlsx",
-         "0812c04ca38150e67d6eae1bde3863331ffd61fc0f7634e1120780edd8328a14")
+ZHANG = (
+    "zhang2025_natcommun/41467_2025_57879_MOESM3_ESM.xlsx",
+    "78f66fa2c9e01cffaf2f0dad5a47fe27418397a915d125e6e5708debc7c60449",
+)
+ZHOU = (
+    "zhou2021_natmed/41591_2021_1281_MOESM2_ESM.xlsx",
+    "dff7cbfbf5f01988032c87a2698498bcef35d92294280542ffd806a7ee030e6c",
+)
+ZHENG = (
+    "zheng2020_natgenet/41588_2020_682_MOESM3_ESM.xlsx",
+    "0812c04ca38150e67d6eae1bde3863331ffd61fc0f7634e1120780edd8328a14",
+)
 
 # "1.97(1.52,2.55)"; the workbook writes no spaces, but tolerating them costs nothing
 OR_CI = re.compile(r"^\s*([0-9.eE+-]+)\s*\(\s*([0-9.eE+-]+)\s*,\s*([0-9.eE+-]+)\s*\)\s*$")
@@ -70,16 +76,17 @@ def shared_strings(book):
     if "xl/sharedStrings.xml" not in book.namelist():
         return []
     # a rich-text string is its runs' text concatenated; phonetic guides (rPh) are not text
-    return ["".join(t.text or "" for t in [*si.findall(f"{MAIN}t"),
-                                            *si.findall(f"{MAIN}r/{MAIN}t")])
-            for si in xml_of(book, "xl/sharedStrings.xml").findall(f"{MAIN}si")]
+    return [
+        "".join(t.text or "" for t in [*si.findall(f"{MAIN}t"), *si.findall(f"{MAIN}r/{MAIN}t")])
+        for si in xml_of(book, "xl/sharedStrings.xml").findall(f"{MAIN}si")
+    ]
 
 
 def number_text(raw):
     """A numeric cell as written here: an integral value as an integer, anything else as the
     shortest text that round-trips to the stored double."""
     value = float(raw)
-    if value.is_integer() and abs(value) < 2 ** 53:
+    if value.is_integer() and abs(value) < 2**53:
         return str(int(value))
     return repr(value)
 
@@ -112,11 +119,18 @@ def column_index(letters):
 
 def rows_of(book, sheet):
     """Every row of `sheet` from row 1, as equal-width tuples of strings; "" is a blank cell."""
-    rels = {r.get("Id"): r.get("Target")
-            for r in xml_of(book, "xl/_rels/workbook.xml.rels").findall(f"{PKG_REL}Relationship")}
-    target = next((rels[s.get(f"{REL}id")]
-                   for s in xml_of(book, "xl/workbook.xml").iter(f"{MAIN}sheet")
-                   if s.get("name") == sheet), None)
+    rels = {
+        r.get("Id"): r.get("Target")
+        for r in xml_of(book, "xl/_rels/workbook.xml.rels").findall(f"{PKG_REL}Relationship")
+    }
+    target = next(
+        (
+            rels[s.get(f"{REL}id")]
+            for s in xml_of(book, "xl/workbook.xml").iter(f"{MAIN}sheet")
+            if s.get("name") == sheet
+        ),
+        None,
+    )
     if target is None:
         raise FixtureError(f"no sheet named {sheet!r}")
     member = target.lstrip("/") if target.startswith("/") else posixpath.join("xl", target)
@@ -142,7 +156,7 @@ def is_empty(row):
 
 def find_row(rows, prefix, start=0, sheet=""):
     for i in range(start, len(rows)):
-        if rows[i][:len(prefix)] == tuple(prefix):
+        if rows[i][: len(prefix)] == tuple(prefix):
             return i
     raise FixtureError(f"{sheet}: no row starting {prefix!r}")
 
@@ -191,12 +205,22 @@ def write_tsv(name, header, rows):
 def zhang_data8(book):
     sheet = "Supplementary Data 8"
     rows = rows_of(book, sheet)
-    source = ("Protein", "SNP", "chr.exposure", "pos.exposure", "effect_allele.exposure",
-              "other_allele.exposure", "eaf.exposure", "beta.exposure", "se.exposure",
-              "pval.exposure", "samplesize.exposure")
+    source = (
+        "Protein",
+        "SNP",
+        "chr.exposure",
+        "pos.exposure",
+        "effect_allele.exposure",
+        "other_allele.exposure",
+        "eaf.exposure",
+        "beta.exposure",
+        "se.exposure",
+        "pval.exposure",
+        "samplesize.exposure",
+    )
     h = find_row(rows, source, sheet=sheet)
     header = ("protein", "rsid", "chr", "pos_grch38", "ea", "oa", "eaf", "beta", "se", "p", "n")
-    body = [row[:len(source)] for row in data_until_break(rows, h + 1)]
+    body = [row[: len(source)] for row in data_until_break(rows, h + 1)]
     return write_tsv("zhang2025_data8_instruments.tsv", header, body)
 
 
@@ -209,17 +233,26 @@ def zhang_data9(book):
         outcome = rows[h][offset + 2]
         expect_top = (outcome, "", "IIBDGC", "", "FinnGen", "", "Combined", "", "")
         expect_sub = ("OR(95%CI)", "P-value") * 3 + ("FDR",)
-        if (rows[h][offset:offset + 2] != ("Proteins", "Significance in the observational study")
-                or rows[h + 1][offset + 2:offset + 7:2] != expect_top[2:7:2]
-                or rows[h + 2][offset + 2:offset + 9] != expect_sub):
-            raise FixtureError(f"{sheet}: column block at offset {offset} is not laid out as inspected")
+        if (
+            rows[h][offset : offset + 2] != ("Proteins", "Significance in the observational study")
+            or rows[h + 1][offset + 2 : offset + 7 : 2] != expect_top[2:7:2]
+            or rows[h + 2][offset + 2 : offset + 9] != expect_sub
+        ):
+            raise FixtureError(
+                f"{sheet}: column block at offset {offset} is not laid out as inspected"
+            )
         outcomes.append((outcome.lower(), offset))
     header = ["protein"]
     for o, _ in outcomes:
         header.append(f"{o}_observational")
         for study in ("iibdgc", "finngen", "combined"):
-            header += [f"{o}_{study}_or_ci", f"{o}_{study}_or", f"{o}_{study}_ci_low",
-                       f"{o}_{study}_ci_high", f"{o}_{study}_p"]
+            header += [
+                f"{o}_{study}_or_ci",
+                f"{o}_{study}_or",
+                f"{o}_{study}_ci_low",
+                f"{o}_{study}_ci_high",
+                f"{o}_{study}_p",
+            ]
         header.append(f"{o}_fdr")
     body = []
     for n, row in enumerate(data_until_break(rows, h + 3)):
@@ -227,8 +260,9 @@ def zhang_data9(book):
         out = [protein]
         for o, offset in outcomes:
             if row[offset] != protein:
-                raise FixtureError(f"{sheet}: row {n}: the {o} block names {row[offset]!r}, "
-                                   f"not {protein!r}")
+                raise FixtureError(
+                    f"{sheet}: row {n}: the {o} block names {row[offset]!r}, not {protein!r}"
+                )
             out.append(row[offset + 1])
             for k in range(3):
                 text, p = row[offset + 2 + 2 * k], row[offset + 3 + 2 * k]
@@ -248,19 +282,29 @@ def zhang_data13(book):
     studies = ("iibdgc", "finngen", "combined")
     header = ["outcome", "protein"]
     for study in studies:
-        header += [f"{study}_or_ci", f"{study}_or", f"{study}_ci_low", f"{study}_ci_high",
-                   f"{study}_p"]
+        header += [
+            f"{study}_or_ci",
+            f"{study}_or",
+            f"{study}_ci_low",
+            f"{study}_ci_high",
+            f"{study}_p",
+        ]
     body = []
     for offset in (0, 8, 16):
         outcome = rows[h][offset + 1]
-        if (rows[h][offset] != "Proteins" or outcome not in ("IBD", "CD", "UC")
-                or rows[h + 1][offset + 1:offset + 6:2] != ("IIBDGC", "FinnGen", "Combined")
-                or rows[h + 2][offset + 1:offset + 7] != ("OR(95%CI)", "P-value") * 3):
-            raise FixtureError(f"{sheet}: column block at offset {offset} is not laid out as inspected")
-        block = [row[offset:offset + 7] for row in rows[h + 3:]]
+        if (
+            rows[h][offset] != "Proteins"
+            or outcome not in ("IBD", "CD", "UC")
+            or rows[h + 1][offset + 1 : offset + 6 : 2] != ("IIBDGC", "FinnGen", "Combined")
+            or rows[h + 2][offset + 1 : offset + 7] != ("OR(95%CI)", "P-value") * 3
+        ):
+            raise FixtureError(
+                f"{sheet}: column block at offset {offset} is not laid out as inspected"
+            )
+        block = [row[offset : offset + 7] for row in rows[h + 3 :]]
         data = data_until_break(block, 0)
         # past the break a block may hold its footnote and nothing else
-        if any(not is_empty(row) and any(row[1:]) for row in block[len(data):]):
+        if any(not is_empty(row) and any(row[1:]) for row in block[len(data) :]):
             raise FixtureError(f"{sheet}: the {outcome} block has data after its first break")
         if len({row[0] for row in data}) != len(data):
             raise FixtureError(f"{sheet}: the {outcome} block names a protein twice")
@@ -276,11 +320,21 @@ def zhang_data13(book):
 def zhou_st2(book):
     sheet = "Supplementary Table 2"
     rows = rows_of(book, sheet)
-    source = ("SOMAmers", "Method", "#SNP", "Beta", "Se", "P value", "P FDR", "OR",
-              "95% CI lower bound", "95% CI upper bound")
+    source = (
+        "SOMAmers",
+        "Method",
+        "#SNP",
+        "Beta",
+        "Se",
+        "P value",
+        "P FDR",
+        "OR",
+        "95% CI lower bound",
+        "95% CI upper bound",
+    )
     h = find_row(rows, source, sheet=sheet)
     header = ("somamer", "method", "n_snp", "beta", "se", "p", "p_fdr", "or", "ci_low", "ci_high")
-    body = [row[:len(source)] for row in data_until_break(rows, h + 1)]
+    body = [row[: len(source)] for row in data_until_break(rows, h + 1)]
     oas1 = [r for r in body if r[0] == "OAS1.10361.25.3"]
     # the anchor the investigation quotes; a different number means a different sheet
     if len(oas1) != 1 or not oas1[0][7].startswith("0.544"):
@@ -309,19 +363,37 @@ def zheng_s1(book):
 def zheng_s9(book):
     sheet = "TableS9.multi-cis-top"
     rows = rows_of(book, sheet)
-    source = ("Exposure", "N_instrument", "Outcome_id", "beta_trans", "Outcome", "Method",
-              "Multi_cis_beta", "Multi_cis_se", "Multi_cis_P", "Single_cis_beta",
-              "Single_cis_P", "Q", "Q_pval")
+    source = (
+        "Exposure",
+        "N_instrument",
+        "Outcome_id",
+        "beta_trans",
+        "Outcome",
+        "Method",
+        "Multi_cis_beta",
+        "Multi_cis_se",
+        "Multi_cis_P",
+        "Single_cis_beta",
+        "Single_cis_P",
+        "Q",
+        "Q_pval",
+    )
     body, start = [], 0
     for table in ("9A", "9B"):
         # the caption cell carries the whole caption, so it is matched on its prefix
-        title = next((i for i in range(start, len(rows))
-                      if rows[i][0].startswith(f"Supplementary Table {table}.")), None)
+        title = next(
+            (
+                i
+                for i in range(start, len(rows))
+                if rows[i][0].startswith(f"Supplementary Table {table}.")
+            ),
+            None,
+        )
         if title is None:
             raise FixtureError(f"{sheet}: no caption for table {table}")
         h = find_row(rows, source, title, sheet)
         block = data_until_break(rows, h + 1)
-        body += [(table, *row[:len(source)]) for row in block]
+        body += [(table, *row[: len(source)]) for row in block]
         start = h + 1 + len(block)
     return write_tsv("zheng2020_s9_multicis.tsv", ("table", *source), body)
 
@@ -341,8 +413,12 @@ def main():
     try:
         check_expat()
         zhang = open_workbook(root, ZHANG)
-        outputs = [zhang_data8(zhang), zhang_data9(zhang), zhang_data13(zhang),
-                   zhou_st2(open_workbook(root, ZHOU))]
+        outputs = [
+            zhang_data8(zhang),
+            zhang_data9(zhang),
+            zhang_data13(zhang),
+            zhou_st2(open_workbook(root, ZHOU)),
+        ]
         zheng = open_workbook(root, ZHENG)
         outputs += [zheng_s1(zheng), zheng_s9(zheng)]
     except (FixtureError, OSError, zipfile.BadZipFile, ET.ParseError) as exc:

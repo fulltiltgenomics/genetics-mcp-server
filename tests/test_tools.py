@@ -119,25 +119,19 @@ class TestCredibleSetTools:
 
     async def test_get_credible_sets_by_gene_with_window(self):
         """Test getting credible sets with custom window size."""
-        result = await self.executor.get_credible_sets_by_gene(
-            "APOE", window=50000
-        )
+        result = await self.executor.get_credible_sets_by_gene("APOE", window=50000)
 
         assert result["success"] is True
 
     async def test_get_credible_sets_by_gene_with_data_types(self):
         """Test filtering credible sets by data type."""
-        result = await self.executor.get_credible_sets_by_gene(
-            "APOE", data_types="GWAS"
-        )
+        result = await self.executor.get_credible_sets_by_gene("APOE", data_types="GWAS")
 
         assert result["success"] is True
 
     async def test_get_credible_sets_by_gene_no_summarize(self):
         """Test getting raw credible sets without summarization."""
-        result = await self.executor.get_credible_sets_by_gene(
-            "APOE", summarize=False
-        )
+        result = await self.executor.get_credible_sets_by_gene("APOE", summarize=False)
 
         assert result["success"] is True
         assert "results" in result
@@ -145,18 +139,14 @@ class TestCredibleSetTools:
 
     async def test_get_credible_sets_by_variant(self):
         """Test getting credible sets containing a variant."""
-        result = await self.executor.get_credible_sets_by_variant(
-            "19:44908684:T:C"
-        )
+        result = await self.executor.get_credible_sets_by_variant("19:44908684:T:C")
 
         assert result["success"] is True
         assert result["variant"] == "19:44908684:T:C"
 
     async def test_get_credible_sets_by_phenotype(self):
         """Test getting credible sets for a phenotype."""
-        result = await self.executor.get_credible_sets_by_phenotype(
-            "T2D", resource="finngen"
-        )
+        result = await self.executor.get_credible_sets_by_phenotype("T2D", resource="finngen")
 
         assert result["success"] is True
         assert result["phenotype"] == "T2D"
@@ -247,9 +237,7 @@ class TestLDTools:
 
     async def test_get_ld_between_variants_found(self):
         """Test getting LD between two variants that are in LD."""
-        result = await self.executor.get_ld_between_variants(
-            "6:44693011:A:G", "6:44682355:C:G"
-        )
+        result = await self.executor.get_ld_between_variants("6:44693011:A:G", "6:44682355:C:G")
         assert result["success"] is True
         assert result["variant1"] == "6:44693011:A:G"
         assert result["variant2"] == "6:44682355:C:G"
@@ -258,25 +246,19 @@ class TestLDTools:
 
     async def test_get_ld_between_variants_different_chromosomes(self):
         """Test error when variants are on different chromosomes."""
-        result = await self.executor.get_ld_between_variants(
-            "6:44693011:A:G", "7:12345678:C:T"
-        )
+        result = await self.executor.get_ld_between_variants("6:44693011:A:G", "7:12345678:C:T")
         assert result["success"] is False
         assert "same chromosome" in result["error"].lower()
 
     async def test_get_ld_between_variants_too_far_apart(self):
         """Test error when variants are further apart than the panel's window reaches."""
-        result = await self.executor.get_ld_between_variants(
-            "6:10000000:A:G", "6:20000000:C:T"
-        )
+        result = await self.executor.get_ld_between_variants("6:10000000:A:G", "6:20000000:C:T")
         assert result["success"] is False
         assert "bp apart" in result["error"].lower()
 
     async def test_get_ld_between_variants_invalid_format(self):
         """Test error with invalid variant format."""
-        result = await self.executor.get_ld_between_variants(
-            "invalid", "6:44682355:C:G"
-        )
+        result = await self.executor.get_ld_between_variants("invalid", "6:44682355:C:G")
         assert result["success"] is False
         assert "invalid" in result["error"].lower()
 
@@ -304,16 +286,12 @@ class TestLDTools:
 
     async def test_get_variants_in_ld_with_window(self):
         """Test LD query with custom window size."""
-        result = await self.executor.get_variants_in_ld(
-            "6:44693011:A:G", window=100000
-        )
+        result = await self.executor.get_variants_in_ld("6:44693011:A:G", window=100000)
         assert result["success"] is True
 
     async def test_get_variants_in_ld_high_threshold(self):
         """Test LD query with high r2 threshold."""
-        result = await self.executor.get_variants_in_ld(
-            "6:44693011:A:G", r2_threshold=0.9
-        )
+        result = await self.executor.get_variants_in_ld("6:44693011:A:G", r2_threshold=0.9)
         assert result["success"] is True
         # with high threshold, all returned variants should meet threshold
         for v in result.get("variants", []):
@@ -326,9 +304,7 @@ class TestLDTools:
 
     async def test_get_variants_in_ld_sorted_by_r2(self):
         """Test that results are sorted by r2 descending."""
-        result = await self.executor.get_variants_in_ld(
-            "6:44693011:A:G", r2_threshold=0.5
-        )
+        result = await self.executor.get_variants_in_ld("6:44693011:A:G", r2_threshold=0.5)
         if result["success"] and len(result["variants"]) > 1:
             r2_values = [v["r2"] for v in result["variants"]]
             assert r2_values == sorted(r2_values, reverse=True)
@@ -392,9 +368,7 @@ class TestRegionTools:
 
     async def test_get_genes_in_region(self):
         """Test getting genes in a genomic region."""
-        result = await self.executor.get_genes_in_region(
-            chr="19", start=44905000, end=44910000
-        )
+        result = await self.executor.get_genes_in_region(chr="19", start=44905000, end=44910000)
 
         assert result["success"] is True
         assert "19:44905000-44910000" in result["region"]
@@ -549,9 +523,7 @@ class TestCredibleSetStatsTools:
 
     async def test_get_credible_sets_stats_with_trait(self):
         """Test getting stats filtered by trait."""
-        result = await self.executor.get_credible_sets_stats(
-            "finngen", trait="T2D"
-        )
+        result = await self.executor.get_credible_sets_stats("finngen", trait="T2D")
 
         assert result["success"] is True
         if result["n_traits"] > 0:
@@ -714,9 +686,7 @@ class TestVariantAnnotationTools:
 
     async def test_get_variant_annotations_multiple_query_params(self):
         """Test that providing multiple query params returns error."""
-        result = await self.executor.get_variant_annotations(
-            variant="1:13668:G:A", gene="PCSK9"
-        )
+        result = await self.executor.get_variant_annotations(variant="1:13668:G:A", gene="PCSK9")
 
         assert result["success"] is False
         assert "error" in result
@@ -737,9 +707,7 @@ class TestVariantAnnotationTools:
 
     async def test_get_variant_annotations_batch_download_data(self):
         """Test that POST queries include download data."""
-        result = await self.executor.get_variant_annotations(
-            variants=["1:13668:G:A"]
-        )
+        result = await self.executor.get_variant_annotations(variants=["1:13668:G:A"])
 
         assert result["success"] is True
         if result["count"] > 0:
@@ -798,9 +766,7 @@ class TestToolDefinitions:
         """Tool groups are the browser panel's sections; a new value needs a section there."""
         valid = {"lookup", "results", "sql", "analysis"}
         for tool in all_local_tool_definitions():
-            assert tool["group"] in valid, (
-                f"Tool {tool['name']} has invalid group {tool['group']}"
-            )
+            assert tool["group"] in valid, f"Tool {tool['name']} has invalid group {tool['group']}"
 
     def test_every_definition_declares_sdk_replaceable(self):
         """The field is the whole of surface membership, so a missing one is not a default.
@@ -817,9 +783,7 @@ class TestToolDefinitions:
         """No-code carries the data tools and neither the sandbox's nor launch_subagents."""
         names = {t["name"] for t in resolve_tools(code_execution=False)}
 
-        assert names == {
-            t["name"] for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS
-        }
+        assert names == {t["name"] for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS}
         assert "run_analysis" not in names
         assert "launch_subagents" not in names
 
@@ -838,9 +802,7 @@ class TestToolDefinitions:
         code = {t["name"] for t in resolve_tools(code_execution=True)}
         nocode = {t["name"] for t in resolve_tools(code_execution=False)}
         replaceable = {
-            t["name"]
-            for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS
-            if t["sdk_replaceable"]
+            t["name"] for t in TOOL_DEFINITIONS + BIGQUERY_TOOL_DEFINITIONS if t["sdk_replaceable"]
         }
 
         assert code & nocode == code - {"run_analysis", "list_capabilities", "read_artifact"}
@@ -855,10 +817,7 @@ class TestToolDefinitions:
 
     def test_disabled_applies_to_both_surfaces(self):
         """A deployment flag still removes a tool the surface would otherwise carry."""
-        names = {
-            t["name"]
-            for t in resolve_tools(code_execution=True, disabled={"read_artifact"})
-        }
+        names = {t["name"] for t in resolve_tools(code_execution=True, disabled={"read_artifact"})}
 
         assert "read_artifact" not in names
         assert "run_analysis" in names
@@ -885,10 +844,7 @@ class TestProfileCoercionAtTheEdge:
 
     def test_code_resolves_to_the_code_surface(self):
         assert {
-            t["name"]
-            for t in get_anthropic_tools(
-                code_execution=code_execution_requested("code")
-            )
+            t["name"] for t in get_anthropic_tools(code_execution=code_execution_requested("code"))
         } == _CODE_SURFACE_NAMES
 
     @pytest.mark.parametrize(
@@ -898,9 +854,7 @@ class TestProfileCoercionAtTheEdge:
         assert code_execution_requested(tool_profile) is False
         assert {
             t["name"]
-            for t in get_anthropic_tools(
-                code_execution=code_execution_requested(tool_profile)
-            )
+            for t in get_anthropic_tools(code_execution=code_execution_requested(tool_profile))
         } == {t["name"] for t in resolve_tools(code_execution=False)}
 
     def test_unknown_profile_does_not_raise(self):
@@ -935,9 +889,7 @@ class TestProfileCoercionAtTheEdge:
     def test_disabled_tools_still_applies_after_the_coercion(self):
         names = {
             t["name"]
-            for t in get_anthropic_tools(
-                code_execution=True, disabled_tools={"read_artifact"}
-            )
+            for t in get_anthropic_tools(code_execution=True, disabled_tools={"read_artifact"})
         }
 
         assert "read_artifact" not in names
@@ -1009,7 +961,9 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock
+        ):
             result = await self.executor.search_mgi(query="Trp53", query_type="gene_phenotypes")
 
         assert result["success"] is True
@@ -1034,14 +988,28 @@ class TestSearchMGI:
         # [mp_id, mp_term, gene_mgi_id, gene_symbol, gene_name]
         json_data = {
             "results": [
-                ["MP:0001262", "decreased body weight", "MGI:97874", "Trp53", "transformation related protein 53"],
-                ["MP:0001262", "decreased body weight", "MGI:88336", "Brca1", "breast cancer 1, early onset"],
+                [
+                    "MP:0001262",
+                    "decreased body weight",
+                    "MGI:97874",
+                    "Trp53",
+                    "transformation related protein 53",
+                ],
+                [
+                    "MP:0001262",
+                    "decreased body weight",
+                    "MGI:88336",
+                    "Brca1",
+                    "breast cancer 1, early onset",
+                ],
                 # row with missing gene id is dropped
                 ["MP:0001262", "decreased body weight", None, None, None],
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock
+        ):
             result = await self.executor.search_mgi(
                 query="MP:0001262", query_type="phenotype_genes"
             )
@@ -1076,10 +1044,10 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
-            result = await self.executor.search_mgi(
-                query="MGI:1857436", query_type="allele"
-            )
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock
+        ):
+            result = await self.executor.search_mgi(query="MGI:1857436", query_type="allele")
 
         assert result["success"] is True
         assert result["source"] == "mgi"
@@ -1111,7 +1079,9 @@ class TestSearchMGI:
             ]
         }
         mock = self._mock_response(json_data=json_data)
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock
+        ):
             result = await self.executor.search_mgi(
                 query="Trp53", query_type="ortholog", species="mouse"
             )
@@ -1129,7 +1099,9 @@ class TestSearchMGI:
         from unittest.mock import AsyncMock, patch
 
         mock = self._mock_response(json_data={"results": []})
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock
+        ):
             result = await self.executor.search_mgi(query="Xyz123", query_type="gene_phenotypes")
 
         assert result["success"] is True
@@ -1141,7 +1113,9 @@ class TestSearchMGI:
         from unittest.mock import AsyncMock, patch
 
         mock = self._mock_response(status_code=500, text="MouseMine is down")
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock
+        ):
             result = await self.executor.search_mgi(query="Trp53")
 
         assert result["success"] is False
@@ -1188,21 +1162,44 @@ class TestSearchCBioPortal:
         await self.executor.close()
 
     STUDIES = [
-        {"studyId": "luad_tcga_pan_can_atlas_2018", "name": "Lung Adenocarcinoma (TCGA)",
-         "cancerTypeId": "luad", "allSampleCount": 566, "referenceGenome": "hg19",
-         "citation": "TCGA, Cell 2018", "pmid": "29625048", "description": "lung"},
-        {"studyId": "msk_impact_2017", "name": "MSK-IMPACT Clinical Sequencing Cohort",
-         "cancerTypeId": "mixed", "allSampleCount": 10945, "referenceGenome": "hg38",
-         "citation": "Zehir et al. Nat Med 2017", "pmid": "28481359", "description": "pan-cancer"},
+        {
+            "studyId": "luad_tcga_pan_can_atlas_2018",
+            "name": "Lung Adenocarcinoma (TCGA)",
+            "cancerTypeId": "luad",
+            "allSampleCount": 566,
+            "referenceGenome": "hg19",
+            "citation": "TCGA, Cell 2018",
+            "pmid": "29625048",
+            "description": "lung",
+        },
+        {
+            "studyId": "msk_impact_2017",
+            "name": "MSK-IMPACT Clinical Sequencing Cohort",
+            "cancerTypeId": "mixed",
+            "allSampleCount": 10945,
+            "referenceGenome": "hg38",
+            "citation": "Zehir et al. Nat Med 2017",
+            "pmid": "28481359",
+            "description": "pan-cancer",
+        },
     ]
 
     PROFILES = [
-        {"molecularProfileId": "luad_tcga_pan_can_atlas_2018_mutations",
-         "studyId": "luad_tcga_pan_can_atlas_2018", "molecularAlterationType": "MUTATION_EXTENDED"},
-        {"molecularProfileId": "msk_impact_2017_mutations",
-         "studyId": "msk_impact_2017", "molecularAlterationType": "MUTATION_EXTENDED"},
-        {"molecularProfileId": "msk_impact_2017_structural_variants",
-         "studyId": "msk_impact_2017", "molecularAlterationType": "STRUCTURAL_VARIANT"},
+        {
+            "molecularProfileId": "luad_tcga_pan_can_atlas_2018_mutations",
+            "studyId": "luad_tcga_pan_can_atlas_2018",
+            "molecularAlterationType": "MUTATION_EXTENDED",
+        },
+        {
+            "molecularProfileId": "msk_impact_2017_mutations",
+            "studyId": "msk_impact_2017",
+            "molecularAlterationType": "MUTATION_EXTENDED",
+        },
+        {
+            "molecularProfileId": "msk_impact_2017_structural_variants",
+            "studyId": "msk_impact_2017",
+            "molecularAlterationType": "STRUCTURAL_VARIANT",
+        },
     ]
 
     @staticmethod
@@ -1233,27 +1230,47 @@ class TestSearchCBioPortal:
             return pick(posts, url)
 
         return (
-            patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get),
-            patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post),
+            patch.object(
+                self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get
+            ),
+            patch.object(
+                self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post
+            ),
         )
 
     async def test_gene_summary(self):
         gets = {
-            "/genes/EGFR": self._resp({"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}),
+            "/genes/EGFR": self._resp(
+                {"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}
+            ),
             "/studies": self._resp(self.STUDIES),
         }
         posts = {
-            "/mutation-data-counts/fetch": self._resp([{"hugoGeneSymbol": "EGFR", "counts": [
-                {"value": "MUTATED", "count": 100},
-                {"value": "NOT_MUTATED", "count": 900},
-                {"value": "NOT_PROFILED", "count": 50},
-            ]}]),
-            "/genomic-data-counts/fetch": self._resp([{"hugoGeneSymbol": "EGFR", "counts": [
-                {"value": "NA", "count": 400},
-                {"value": "2", "count": 30},
-                {"value": "0", "count": 560},
-                {"value": "-2", "count": 10},
-            ]}]),
+            "/mutation-data-counts/fetch": self._resp(
+                [
+                    {
+                        "hugoGeneSymbol": "EGFR",
+                        "counts": [
+                            {"value": "MUTATED", "count": 100},
+                            {"value": "NOT_MUTATED", "count": 900},
+                            {"value": "NOT_PROFILED", "count": 50},
+                        ],
+                    }
+                ]
+            ),
+            "/genomic-data-counts/fetch": self._resp(
+                [
+                    {
+                        "hugoGeneSymbol": "EGFR",
+                        "counts": [
+                            {"value": "NA", "count": 400},
+                            {"value": "2", "count": 30},
+                            {"value": "0", "count": 560},
+                            {"value": "-2", "count": 10},
+                        ],
+                    }
+                ]
+            ),
         }
         g, p = self._patch(gets, posts)
         with g, p:
@@ -1277,7 +1294,9 @@ class TestSearchCBioPortal:
 
     async def test_gene_by_cancer_type_merges_spellings_and_uses_profiled_denominator(self):
         gets = {
-            "/genes/EGFR": self._resp({"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}),
+            "/genes/EGFR": self._resp(
+                {"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}
+            ),
             "/studies": self._resp(self.STUDIES),
             "/molecular-profiles": self._resp(self.PROFILES),
         }
@@ -1290,16 +1309,30 @@ class TestSearchCBioPortal:
             calls.append(body)
             # the denominator call carries genomicProfiles, the numerator geneFilters
             if "genomicProfiles" in body.get("studyViewFilter", {}):
-                return self._resp([{"attributeId": "CANCER_TYPE", "counts": [
-                    {"value": "Non-Small Cell Lung Cancer", "count": 600},
-                    {"value": "Non Small Cell Lung Cancer", "count": 400},
-                    {"value": "Tiny Cohort", "count": 10},
-                ]}])
-            return self._resp([{"attributeId": "CANCER_TYPE", "counts": [
-                {"value": "Non-Small Cell Lung Cancer", "count": 150},
-                {"value": "Non Small Cell Lung Cancer", "count": 50},
-                {"value": "Tiny Cohort", "count": 9},
-            ]}])
+                return self._resp(
+                    [
+                        {
+                            "attributeId": "CANCER_TYPE",
+                            "counts": [
+                                {"value": "Non-Small Cell Lung Cancer", "count": 600},
+                                {"value": "Non Small Cell Lung Cancer", "count": 400},
+                                {"value": "Tiny Cohort", "count": 10},
+                            ],
+                        }
+                    ]
+                )
+            return self._resp(
+                [
+                    {
+                        "attributeId": "CANCER_TYPE",
+                        "counts": [
+                            {"value": "Non-Small Cell Lung Cancer", "count": 150},
+                            {"value": "Non Small Cell Lung Cancer", "count": 50},
+                            {"value": "Tiny Cohort", "count": 9},
+                        ],
+                    }
+                ]
+            )
 
         async def do_get(url, **kwargs):
             for suffix, payload in gets.items():
@@ -1307,8 +1340,14 @@ class TestSearchCBioPortal:
                     return payload
             raise AssertionError(f"unmocked path: {url}")
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
-             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
+        with (
+            patch.object(
+                self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get
+            ),
+            patch.object(
+                self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post
+            ),
+        ):
             result = await self.executor.search_cbioportal(
                 query="EGFR", query_type="gene_by_cancer_type"
             )
@@ -1328,16 +1367,20 @@ class TestSearchCBioPortal:
 
     async def test_gene_by_cancer_type_filters_to_requested_types(self):
         gets = {
-            "/genes/EGFR": self._resp({"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}),
+            "/genes/EGFR": self._resp(
+                {"entrezGeneId": 1956, "hugoGeneSymbol": "EGFR", "type": "protein-coding"}
+            ),
             "/studies": self._resp(self.STUDIES),
             "/molecular-profiles": self._resp(self.PROFILES),
         }
         from unittest.mock import AsyncMock, patch
 
         async def do_post(url, **kwargs):
-            counts = ([{"value": "Glioma", "count": 500}, {"value": "Melanoma", "count": 500}]
-                      if "genomicProfiles" in kwargs["json"].get("studyViewFilter", {})
-                      else [{"value": "Glioma", "count": 50}, {"value": "Melanoma", "count": 100}])
+            counts = (
+                [{"value": "Glioma", "count": 500}, {"value": "Melanoma", "count": 500}]
+                if "genomicProfiles" in kwargs["json"].get("studyViewFilter", {})
+                else [{"value": "Glioma", "count": 50}, {"value": "Melanoma", "count": 100}]
+            )
             return self._resp([{"attributeId": "CANCER_TYPE", "counts": counts}])
 
         async def do_get(url, **kwargs):
@@ -1346,8 +1389,14 @@ class TestSearchCBioPortal:
                     return payload
             raise AssertionError(f"unmocked path: {url}")
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
-             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
+        with (
+            patch.object(
+                self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get
+            ),
+            patch.object(
+                self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post
+            ),
+        ):
             result = await self.executor.search_cbioportal(
                 query="EGFR", query_type="gene_by_cancer_type", cancer_types=["glioma"]
             )
@@ -1356,23 +1405,61 @@ class TestSearchCBioPortal:
 
     async def test_gene_mutations_keeps_builds_separate(self):
         gets = {
-            "/genes/TP53": self._resp({"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}),
+            "/genes/TP53": self._resp(
+                {"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}
+            ),
             "/molecular-profiles": self._resp(self.PROFILES),
         }
         records = [
-            {"uniqueSampleKey": "s1", "proteinChange": "R175H", "proteinPosStart": 175,
-             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh37", "chr": "17",
-             "startPosition": 7578406, "referenceAllele": "C", "variantAllele": "T", "studyId": "a"},
-            {"uniqueSampleKey": "s2", "proteinChange": "R175H", "proteinPosStart": 175,
-             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh38", "chr": "17",
-             "startPosition": 7675088, "referenceAllele": "C", "variantAllele": "T", "studyId": "b"},
+            {
+                "uniqueSampleKey": "s1",
+                "proteinChange": "R175H",
+                "proteinPosStart": 175,
+                "mutationType": "Missense_Mutation",
+                "ncbiBuild": "GRCh37",
+                "chr": "17",
+                "startPosition": 7578406,
+                "referenceAllele": "C",
+                "variantAllele": "T",
+                "studyId": "a",
+            },
+            {
+                "uniqueSampleKey": "s2",
+                "proteinChange": "R175H",
+                "proteinPosStart": 175,
+                "mutationType": "Missense_Mutation",
+                "ncbiBuild": "GRCh38",
+                "chr": "17",
+                "startPosition": 7675088,
+                "referenceAllele": "C",
+                "variantAllele": "T",
+                "studyId": "b",
+            },
             # same sample seen twice must not double-count
-            {"uniqueSampleKey": "s1", "proteinChange": "R175H", "proteinPosStart": 175,
-             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh37", "chr": "17",
-             "startPosition": 7578406, "referenceAllele": "C", "variantAllele": "T", "studyId": "a"},
-            {"uniqueSampleKey": "s3", "proteinChange": "R248Q", "proteinPosStart": 248,
-             "mutationType": "Missense_Mutation", "ncbiBuild": "GRCh37", "chr": "17",
-             "startPosition": 7577538, "referenceAllele": "C", "variantAllele": "T", "studyId": "a"},
+            {
+                "uniqueSampleKey": "s1",
+                "proteinChange": "R175H",
+                "proteinPosStart": 175,
+                "mutationType": "Missense_Mutation",
+                "ncbiBuild": "GRCh37",
+                "chr": "17",
+                "startPosition": 7578406,
+                "referenceAllele": "C",
+                "variantAllele": "T",
+                "studyId": "a",
+            },
+            {
+                "uniqueSampleKey": "s3",
+                "proteinChange": "R248Q",
+                "proteinPosStart": 248,
+                "mutationType": "Missense_Mutation",
+                "ncbiBuild": "GRCh37",
+                "chr": "17",
+                "startPosition": 7577538,
+                "referenceAllele": "C",
+                "variantAllele": "T",
+                "studyId": "a",
+            },
         ]
         from unittest.mock import AsyncMock, patch
 
@@ -1387,9 +1474,17 @@ class TestSearchCBioPortal:
                     return payload
             raise AssertionError(f"unmocked path: {url}")
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
-             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
-            result = await self.executor.search_cbioportal(query="TP53", query_type="gene_mutations")
+        with (
+            patch.object(
+                self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get
+            ),
+            patch.object(
+                self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post
+            ),
+        ):
+            result = await self.executor.search_cbioportal(
+                query="TP53", query_type="gene_mutations"
+            )
 
         assert result["success"] is True
         assert result["scope"] == "all_studies"
@@ -1404,7 +1499,9 @@ class TestSearchCBioPortal:
 
     async def test_gene_mutations_falls_back_to_curated_cohort_when_too_large(self):
         gets = {
-            "/genes/TP53": self._resp({"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}),
+            "/genes/TP53": self._resp(
+                {"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}
+            ),
             "/molecular-profiles": self._resp(self.PROFILES),
             "/studies": self._resp(self.STUDIES),
         }
@@ -1423,28 +1520,56 @@ class TestSearchCBioPortal:
                     return payload
             raise AssertionError(f"unmocked path: {url}")
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get), \
-             patch.object(self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post):
-            result = await self.executor.search_cbioportal(query="TP53", query_type="gene_mutations")
+        with (
+            patch.object(
+                self.executor.external_client, "get", new_callable=AsyncMock, side_effect=do_get
+            ),
+            patch.object(
+                self.executor.external_client, "post", new_callable=AsyncMock, side_effect=do_post
+            ),
+        ):
+            result = await self.executor.search_cbioportal(
+                query="TP53", query_type="gene_mutations"
+            )
 
         assert result["scope"] == "curated_cohort"
         assert result["total_mutation_records"] == 141838
         # the narrowed fetch must actually use the curated profiles, not the full set
         assert set(seen_bodies[-1]["molecularProfileIds"]) == {
-            "luad_tcga_pan_can_atlas_2018_mutations", "msk_impact_2017_mutations"
+            "luad_tcga_pan_can_atlas_2018_mutations",
+            "msk_impact_2017_mutations",
         }
 
     async def test_gene_fusions_reports_partner_gene(self):
         gets = {
-            "/genes/ALK": self._resp({"entrezGeneId": 238, "hugoGeneSymbol": "ALK", "type": "protein-coding"}),
+            "/genes/ALK": self._resp(
+                {"entrezGeneId": 238, "hugoGeneSymbol": "ALK", "type": "protein-coding"}
+            ),
             "/molecular-profiles": self._resp(self.PROFILES),
         }
         posts = {
-            "/structural-variant/fetch": self._resp([
-                {"site1HugoSymbol": "EML4", "site2HugoSymbol": "ALK", "studyId": "a", "variantClass": "DELETION"},
-                {"site1HugoSymbol": "ALK", "site2HugoSymbol": "EML4", "studyId": "b", "variantClass": "DELETION"},
-                {"site1HugoSymbol": "", "site2HugoSymbol": "ALK", "studyId": "b", "variantClass": "NA"},
-            ]),
+            "/structural-variant/fetch": self._resp(
+                [
+                    {
+                        "site1HugoSymbol": "EML4",
+                        "site2HugoSymbol": "ALK",
+                        "studyId": "a",
+                        "variantClass": "DELETION",
+                    },
+                    {
+                        "site1HugoSymbol": "ALK",
+                        "site2HugoSymbol": "EML4",
+                        "studyId": "b",
+                        "variantClass": "DELETION",
+                    },
+                    {
+                        "site1HugoSymbol": "",
+                        "site2HugoSymbol": "ALK",
+                        "studyId": "b",
+                        "variantClass": "NA",
+                    },
+                ]
+            ),
         }
         g, p = self._patch(gets, posts)
         with g, p:
@@ -1459,14 +1584,29 @@ class TestSearchCBioPortal:
         assert result["results"][1]["partner_gene"] == "(intergenic)"
 
     async def test_variant_hotspot_accepts_change_or_bare_position(self):
-        gets = {"/genes/TP53": self._resp({"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"})}
-        posts = {"/mutation-counts-by-position/fetch": self._resp(
-            [{"entrezGeneId": 7157, "proteinPosStart": 175, "proteinPosEnd": 175, "count": 6757}]
-        )}
+        gets = {
+            "/genes/TP53": self._resp(
+                {"entrezGeneId": 7157, "hugoGeneSymbol": "TP53", "type": "protein-coding"}
+            )
+        }
+        posts = {
+            "/mutation-counts-by-position/fetch": self._resp(
+                [
+                    {
+                        "entrezGeneId": 7157,
+                        "proteinPosStart": 175,
+                        "proteinPosEnd": 175,
+                        "count": 6757,
+                    }
+                ]
+            )
+        }
         for query in ("TP53 R175H", "TP53 175", "TP53:R175"):
             g, p = self._patch(gets, posts)
             with g, p:
-                result = await self.executor.search_cbioportal(query=query, query_type="variant_hotspot")
+                result = await self.executor.search_cbioportal(
+                    query=query, query_type="variant_hotspot"
+                )
             assert result["success"] is True, query
             assert result["protein_position"] == 175, query
             assert result["sample_count"] == 6757, query

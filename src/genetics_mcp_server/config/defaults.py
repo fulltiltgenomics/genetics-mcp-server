@@ -128,7 +128,9 @@ Now, looking only at the extracted data and literature above, provide your analy
     _Block(
         "- **get_gene_based_results returns only genebass and BRaVa p < 1e-4 rows, so a gene missing from it is not a gene without a burden result.** To say a gene was tested and came out null in a given trait, use get_gene_based_results_by_phenotype (unfiltered, one trait) or query gene_burden_results_v in the database (unfiltered, every gene x annotation x trait)\n"
     ),
-    _Block("""- **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types or resources — is what got cut, and you cannot see what is missing. Never answer a counting question ("how many X"), an inventory question ("which cell types / datasets / traits"), or an absence question ("is there any caQTL data for this gene") from a truncated result, and never state that something is not in the data because it was not in the visible part."""),
+    _Block(
+        """- **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types or resources — is what got cut, and you cannot see what is missing. Never answer a counting question ("how many X"), an inventory question ("which cell types / datasets / traits"), or an absence question ("is there any caQTL data for this gene") from a truncated result, and never state that something is not in the data because it was not in the visible part."""
+    ),
     # the remedy is keyed on a PARAMETER and on a database, neither of which the name gate
     # can see, so as one sentence it was emitted on surfaces with no `summarize` and no
     # database at all (genetics-results-suite-4h6.75). Each clause now carries the gate for
@@ -244,10 +246,13 @@ A magnitude-only modality's comparison carries no direction at all — that abse
     # `text` still carries the template so the tool-name gate reads the same names.
     _Block(
         _CUSTOM_GWAS_SECTION,
-        requires_any=_fs("get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"),
+        requires_any=_fs(
+            "get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"
+        ),
         render=lambda: _custom_gwas_section(_CUSTOM_GWAS_SECTION),
     ),
-    _Block("""
+    _Block(
+        """
 ### HLA / the MHC region
 
 Do NOT answer a question about chr6:29-33Mb, HLA typing, or a named HLA allele from SNP summary statistics or credible sets: LD across the MHC is so extensive that variant-level results there are not interpretable, and the classical allele is what the literature and the clinic actually use.
@@ -264,12 +269,14 @@ The unit is an **allele** (`B*27:05`), not a variant — it has no chr:pos:ref:a
         excludes=_fs("get_hla_by_phenotype"),
         requires_any=_fs("query_database", "run_analysis"),
     ),
-    _Block("""
+    _Block(
+        """
 Two traps when reading HLA results: `pval` underflows to 0 at these effect sizes so rank on **`mlog10p`** (that is the house spelling everywhere), and a rare allele with low **`info`** (imputation quality) produces a huge unstable beta that is an imputation artifact rather than a finding — say so rather than reporting it as a hit.
 """,
         requires_any=_fs("get_hla_by_phenotype", "query_database", "run_analysis"),
     ),
-    _Block("""
+    _Block(
+        """
 ### Dosage sensitivity / rare CNVs
 
 pHaplo and pTriplo (Collins et al. 2022) are per-gene probabilities that a gene is haploinsufficient or triplosensitive, learned from rare CNVs; the paper's own cutoffs are already materialized as the `haploinsufficient` (pHaplo >= 0.86) and `triplosensitive` (pTriplo >= 0.94) columns, so cite those rather than re-deriving the threshold.
@@ -316,14 +323,13 @@ Always check which target or molecule actually answered before quoting a result.
     # any of them rather than on naming them: named inline they inherited the implicit
     # requires_all of the routing block above, and disabling a single ChEMBL tool deleted
     # the max_phase semantics and the never-from-memory rule along with it.
-    _Block("""
+    _Block(
+        """
 **`max_phase` 4 means approved somewhere in the world, by some regulator, for some indication — it does NOT mean "FDA-approved", and you must not write that.** Values 0 to 3 are preclinical and clinical stages — 0 is a phase ChEMBL records, not a missing one — and `max_phase` None means ChEMBL records no phase: unknown, not zero.
 
 **NEVER cite ChEMBL content from memory.** ChEMBL ids, phases, mechanisms and indications must come from a tool result in this conversation. Every successful result carries an `attribution` line; include it whenever you cite ChEMBL content. A failed call carries none — there is then nothing to cite.
 """,
-        requires_any=_fs(
-            "get_drug_targets_for_gene", "get_drug_profile", "get_target_bioactivity"
-        ),
+        requires_any=_fs("get_drug_targets_for_gene", "get_drug_profile", "get_target_bioactivity"),
     ),
     # the heading is its own block and names no tool. Its body below — the products /
     # data_type paragraph, the aggregate-counts and sample-size-provenance paragraphs, and
@@ -341,7 +347,8 @@ Always check which target or molecule actually answered before quoting a result.
 """),
     # the products-vs-data_type distinction is a property of the data, not of any tool, so
     # it is stated without naming one; only the "go and call it" sentence is gated
-    _Block("""
+    _Block(
+        """
 When presenting data availability, always check each dataset's `products` field — it shows which data products (credible_sets, summary_stats, colocalization) are actually available. When listing datasets, always mention which products each dataset supports.
 """,
         # the imperative presupposes a route to the field. Ungated it instructed surfaces
@@ -384,7 +391,9 @@ Data types are case-sensitive. Use the exact values: `GWAS`, `eQTL`, `pQTL`, `sQ
 
 Results from datasets whose registry `pseudo_credible_sets` flag is true (`datasets_v.pseudo_credible_sets` in SQL) are **pseudo credible sets**, not statistically fine-mapped credible sets. Always tell the user explicitly when presenting pseudo credible set data."""),
     # continues the sentence above
-    _Block(" (`list_datasets` shows the flag as `pseudo_credible_sets` and in the description field.)"),
+    _Block(
+        " (`list_datasets` shows the flag as `pseudo_credible_sets` and in the description field.)"
+    ),
     _Block("""
 
 Pseudo credible sets are approximate credible sets constructed from GWAS summary statistics and LD information, without formal statistical fine-mapping (like SuSiE or FINEMAP). Each set is built around a lead variant from a GWAS locus. **All pseudo credible sets are computed using the FinnGen LD reference panel**, regardless of the meta-analysis dataset they come from.
@@ -434,7 +443,9 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
         ' The r² thresholds above are how membership is *computed* — use them as a sanity check, never as a substitute. In particular, a variant in *partial* LD with the lead (e.g. r² ≈ 0.4–0.6) is NOT a member; describe it as "in partial LD with the lead", never as "a member of the credible set".',
         requires_any=_fs("get_credible_set_by_id", "query_database", "run_analysis"),
     ),
-    _Block(" When in doubt, verify with `get_credible_set_by_id` before calling anything a member."),
+    _Block(
+        " When in doubt, verify with `get_credible_set_by_id` before calling anything a member."
+    ),
     _Block(
         "\n\n**Re-query; do not answer from memory.** For questions about how many credible sets are in a region, which variants are members, or whether a variant is a lead, derive the answer from a fresh authoritative call",
         requires_any=_fs("get_credible_set_by_id", "query_database", "run_analysis"),
@@ -447,7 +458,8 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
         excludes=_fs("get_credible_set_by_id"),
         requires_any=_fs("query_database", "run_analysis"),
     ),
-    _Block(""" — not from an earlier summary or a list you curated earlier in the conversation. This is especially important when resuming an earlier conversation: do not treat a previously hand-selected subset (e.g. "the top N leads") as complete. If the user cites an external source (e.g. a paper) that conflicts with what you said earlier, re-query the data before conceding or correcting.
+    _Block(
+        """ — not from an earlier summary or a list you curated earlier in the conversation. This is especially important when resuming an earlier conversation: do not treat a previously hand-selected subset (e.g. "the top N leads") as complete. If the user cites an external source (e.g. a paper) that conflicts with what you said earlier, re-query the data before conceding or correcting.
 """,
         requires_any=_fs("get_credible_set_by_id", "query_database", "run_analysis"),
     ),
@@ -459,7 +471,8 @@ Pseudo credible sets are approximate credible sets constructed from GWAS summary
     # neither that tool nor get_database_schema, so it gets the SDK's route instead —
     # without it those surfaces read all the SQL guidance below with no way to discover a
     # column name.
-    _Block("""
+    _Block(
+        """
 The database contains tables for credible sets, colocalization, exome/burden test results, and more.
 Refer to views by their bare name (e.g., `credible_sets_v`) — do NOT prefix them with a project or dataset. The database resolves the dataset itself. Views include a `resource` column for filtering by data source.
 Filter by data source using `WHERE resource = '<resource>'` rather than matching dataset names directly; when one dataset is meant, filter on the `dataset` value `list_datasets` returns, which is the views' column value and not the `dataset_id`.
@@ -473,11 +486,12 @@ Selecting rows is not the same as pruning the scan: each view's "Scan pruning" s
         requires_any=_fs("query_database", "run_analysis"),
     ),
     _Block(
-        "`genetics.sql(...)` inside a script is the only route to the database on this surface. The complete schema is in this prompt, under \"BigQuery view reference\" below: every view, its columns and BigQuery types, the allowed values of its categorical columns, and worked example SQL. **You already have it — do not spend a script discovering it.** Write the query directly. The same text is also on disk in the sandbox at `$GENETICS_SCHEMA_DIR`, and `genetics.schema()` returns the column-level schema as a live call, but reading either costs a round trip and tells you what is written below.\n",
+        '`genetics.sql(...)` inside a script is the only route to the database on this surface. The complete schema is in this prompt, under "BigQuery view reference" below: every view, its columns and BigQuery types, the allowed values of its categorical columns, and worked example SQL. **You already have it — do not spend a script discovering it.** Write the query directly. The same text is also on disk in the sandbox at `$GENETICS_SCHEMA_DIR`, and `genetics.schema()` returns the column-level schema as a live call, but reading either costs a round trip and tells you what is written below.\n',
         excludes=_fs("query_database"),
         requires_any=_fs("run_analysis"),
     ),
-    _Block("""
+    _Block(
+        """
 **What is and is NOT in the database.** The database holds credible sets (`credible_sets_v`), colocalization (`colocalization_v`, `coloc_credsets_v`), exome/burden results (`exome_variant_results_v`, `gene_burden_results_v`), the count-based exome views (`exome_gene_counts_v`, `exome_gene_bayes_results_v`, `exome_variant_counts_v` — ASC 2026 autism counts, Bayes factor and FDR; no p-values exist there, rank on `fdr`), gene annotations (`gene_annotations_v`), and the functional-assay/prediction views (`mpra_v` measured MPRA reporter activity, `variant_effect_v` in-silico chromatin-effect predictions, `open_chromatin_v` accessible-region atlas, `asm_qtl_v` allele-specific methylation QTL), and gnomAD 4.1.1 per-variant annotation (`gnomad_variant_annotation_v`: allele frequency overall and per genetic ancestry group, rsIDs, site filters, VEP consequence and gene). For joins and bulk questions over fine-mapped variants — frequencies by ancestry, consequence, gene — JOIN `gnomad_variant_annotation_v` on `chr`, `pos` and `variant` with a literal `chr` filter on both sides; a handful of variants is a per-variant annotation lookup, and the gnomAD MCP tools remain for live browser-level detail the view does not hold (gene constraint, coverage, structural variants). It does NOT contain **pathogenicity / clinical-significance** annotations, nor FinnGen's own per-variant allele frequency and enrichment — a credible-set row carries its result's `aaf` and consequence, not an annotation table — and you must NEVER query the database for them. To restrict variants to coding ones, filter by the consequence categories listed under "Coding Variant" in Terminology below — there is no prebuilt coding-only table.
 """,
         requires_any=_fs("query_database", "run_analysis"),
@@ -552,7 +566,8 @@ Selecting rows is not the same as pruning the scan: each view's "Scan pruning" s
             "get_variant_protein_effect",
         ),
     ),
-    _Block("""
+    _Block(
+        """
 When querying data with few datasets per resource, include a per-dataset breakdown in the results (e.g., `GROUP BY dataset`).
 Do NOT break down by dataset for datasets flagged `collection: true` (e.g. eQTL Catalogue) — show only resource-level totals for those.
 
@@ -667,7 +682,8 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
     # into a schema — but the rule this exists for (untrusted content, retrying a refusal)
     # only ever bites AFTER a fetch the model chose to make, so nothing here is emitted on
     # a surface where no fetch was ever possible.
-    _Block("""
+    _Block(
+        """
 - **When a script needs an outside file, pass it through `inputs` rather than pasting its contents into `code`.** Never transcribe a fetched file into the script by hand — ask for it as an input (`{"url": ...}` or `{"attachment_id": ...}`) and read it with `genetics.open_input(name)`, using the name `inputs_delivered` reports, which may differ from the file's own name.
 - **An uploaded file appears in the conversation as a `[File: <name>] attachment_id=<id> size=<bytes> type=<mime>` line followed by a preview of its first lines — the preview is not the file.** To read the file, pass `{"attachment_id": "<id>"}` in `inputs`, with the id from that line, not the file name, and open it with `genetics.open_input(name)`. An Excel upload is delivered as `<name>.tsv`. Column names may be read from the preview's header line; row counts, values and anything past the first lines come from a script over the delivered file, never from the preview.
 - **Name what was fetched and where it came from in your answer.** The URL or the attachment, stated in words, is what keeps provenance in the transcript — the tool call itself is not something the user reads.
@@ -691,7 +707,8 @@ You have access to `launch_subagents`, which runs specialized agents in parallel
     # get_credible_sets_by_gene. the citation holds only because no shipped profile carries
     # get_credible_sets_by_gene without one of get_credible_set_by_id / query_database /
     # run_analysis — such a profile would emit this bullet with no rule above it.
-    _Block("""- **A follow-up that narrows an earlier result re-runs that retrieval with the filter added.** When the ask is the same table minus a locus, a gene family or a category, add the predicate to the query or script that produced it and run that again, rather than rebuilding the analysis from scratch. Re-running a retrieval you already wrote, with a predicate added, IS the fresh authoritative call the rule above asks for — what that rule forbids is answering from an earlier summary or from a subset you curated, not re-issuing a retrieval. Do not re-issue a schema discovery call for a schema this conversation has already used; that applies to discovery calls only — where the schema ships as files alongside your tools, reading the file for a view still comes before writing SQL.
+    _Block(
+        """- **A follow-up that narrows an earlier result re-runs that retrieval with the filter added.** When the ask is the same table minus a locus, a gene family or a category, add the predicate to the query or script that produced it and run that again, rather than rebuilding the analysis from scratch. Re-running a retrieval you already wrote, with a predicate added, IS the fresh authoritative call the rule above asks for — what that rule forbids is answering from an earlier summary or from a subset you curated, not re-issuing a retrieval. Do not re-issue a schema discovery call for a schema this conversation has already used; that applies to discovery calls only — where the schema ships as files alongside your tools, reading the file for a view still comes before writing SQL.
 - When a follow-up question refers to results from a previous step, think about which of the paths above can answer it.
 - Always review your full set of available tools before concluding that data is unavailable.
 """,
@@ -811,9 +828,7 @@ def known_tool_names() -> frozenset[str]:
     if _known_tool_names_cache is None:
         from genetics_mcp_server.tools.definitions import all_local_tool_definitions
 
-        _known_tool_names_cache = frozenset(
-            t["name"] for t in all_local_tool_definitions()
-        )
+        _known_tool_names_cache = frozenset(t["name"] for t in all_local_tool_definitions())
     return _known_tool_names_cache
 
 
@@ -830,7 +845,9 @@ def tools_named_in(text: str) -> frozenset[str]:
     block; it goes wrong only if the tool set can change within a process, which is the
     same assumption `known_tool_names` already makes by caching in a module global.
     """
-    return frozenset(n for n in known_tool_names() if re.search(rf"(?<![\w]){re.escape(n)}\b", text))
+    return frozenset(
+        n for n in known_tool_names() if re.search(rf"(?<![\w]){re.escape(n)}\b", text)
+    )
 
 
 def _assemble(
@@ -1045,10 +1062,7 @@ def memory_envelope(digest: str) -> str:
     if not digest:
         return ""
     fence = _fence_for(digest)
-    return (
-        f"{_MEMORY_ENVELOPE_PREAMBLE}{fence}text\n{digest}\n{fence}"
-        f"{_MEMORY_ENVELOPE_POSTAMBLE}"
-    )
+    return f"{_MEMORY_ENVELOPE_PREAMBLE}{fence}text\n{digest}\n{fence}{_MEMORY_ENVELOPE_POSTAMBLE}"
 
 
 def verbosity_prompt(verbosity: str | None) -> str:
@@ -1057,7 +1071,9 @@ def verbosity_prompt(verbosity: str | None) -> str:
     Unknown or missing values fall back to the default rather than raising: the
     setting is a presentation preference, never a reason to fail a chat turn.
     """
-    return _VERBOSITY_PROMPTS.get(verbosity or DEFAULT_VERBOSITY, _VERBOSITY_PROMPTS[DEFAULT_VERBOSITY])
+    return _VERBOSITY_PROMPTS.get(
+        verbosity or DEFAULT_VERBOSITY, _VERBOSITY_PROMPTS[DEFAULT_VERBOSITY]
+    )
 
 
 # Sent as a user turn after a turn stopped on `stop_reason: max_tokens`. It has to be

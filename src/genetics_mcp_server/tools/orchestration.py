@@ -593,11 +593,23 @@ def _one_work(candidates: list[dict], record: dict) -> dict | None:
 
 
 # hosts whose every page is a curated database entry rather than a paper
-_DATABASE_HOSTS = frozenset({
-    "genecards.org", "malacards.org", "omim.org", "uniprot.org", "rest.uniprot.org",
-    "ensembl.org", "gnomad.broadinstitute.org", "gtexportal.org", "proteinatlas.org",
-    "orpha.net", "medlineplus.gov", "clinicaltrials.gov", "informatics.jax.org",
-})
+_DATABASE_HOSTS = frozenset(
+    {
+        "genecards.org",
+        "malacards.org",
+        "omim.org",
+        "uniprot.org",
+        "rest.uniprot.org",
+        "ensembl.org",
+        "gnomad.broadinstitute.org",
+        "gtexportal.org",
+        "proteinatlas.org",
+        "orpha.net",
+        "medlineplus.gov",
+        "clinicaltrials.gov",
+        "informatics.jax.org",
+    }
+)
 
 
 def _is_database_page(url: str) -> bool:
@@ -715,9 +727,7 @@ class ServerToolExecutor(ToolExecutor):
 
         requested = _requested_variants(variants)
         try:
-            prediction = await self.alphagenome.score_variants(
-                requested, cell_type, modalities
-            )
+            prediction = await self.alphagenome.score_variants(requested, cell_type, modalities)
         except Exception:
             logger.exception("Error in compare_alphagenome_with_measured(%r)", requested)
             return {
@@ -743,7 +753,7 @@ class ServerToolExecutor(ToolExecutor):
             {name for entry in entries for name in (entry.get("modalities") or {})}
         )
         rows_by_view, lookups, unavailable = {}, {}, set()
-        for view, data_types in (needed.items() if suite_ids else ()):
+        for view, data_types in needed.items() if suite_ids else ():
             sql = (
                 comparison.credible_sets_sql(suite_ids, data_types, cell_type)
                 if view == comparison.CREDIBLE_SETS_VIEW
@@ -763,9 +773,7 @@ class ServerToolExecutor(ToolExecutor):
         results = [
             comparison.compare_variant(
                 entry,
-                by_variant.get(
-                    comparison.suite_variant_id(entry.get("variant") or {}) or "", {}
-                ),
+                by_variant.get(comparison.suite_variant_id(entry.get("variant") or {}) or "", {}),
                 cell_type,
                 frozenset(unavailable),
             )
@@ -795,8 +803,7 @@ class ServerToolExecutor(ToolExecutor):
     ) -> dict[str, Any]:
         """Search scientific literature via Europe PMC or Perplexity."""
         selected_backend = (
-            backend
-            or os.environ.get("LITERATURE_SEARCH_BACKEND", "perplexity")
+            backend or os.environ.get("LITERATURE_SEARCH_BACKEND", "perplexity")
         ).lower()
 
         if selected_backend == "perplexity":
@@ -984,21 +991,25 @@ class ServerToolExecutor(ToolExecutor):
             is_preprint = "biorxiv.org" in url or "medrxiv.org" in url
             date = entry.get("date") or ""
 
-            results.append({
-                "title": entry.get("title") or "",
-                "authors": "",
-                "journal": "",
-                "year": date[:4],
-                "abstract": entry.get("snippet") or "",
-                "doi": doi,
-                "pmid": pmid,
-                "pmcid": pmcid,
-                "source": "perplexity",
-                "metadata_source": "perplexity",
-                "is_preprint": is_preprint,
-                "url": url,
-                "record_kind": "database_page" if _is_database_page(url) else "perplexity_snippet",
-            })
+            results.append(
+                {
+                    "title": entry.get("title") or "",
+                    "authors": "",
+                    "journal": "",
+                    "year": date[:4],
+                    "abstract": entry.get("snippet") or "",
+                    "doi": doi,
+                    "pmid": pmid,
+                    "pmcid": pmcid,
+                    "source": "perplexity",
+                    "metadata_source": "perplexity",
+                    "is_preprint": is_preprint,
+                    "url": url,
+                    "record_kind": "database_page"
+                    if _is_database_page(url)
+                    else "perplexity_snippet",
+                }
+            )
         returned = len(results)
 
         # the summary numbers its markers over every hit, not the max_results kept, so a
@@ -1007,11 +1018,13 @@ class ServerToolExecutor(ToolExecutor):
         for n in _summary_markers(content):
             if returned < n <= len(entries):
                 entry = entries[n - 1]
-                results.append({
-                    "title": entry.get("title") or "",
-                    "url": entry.get("url") or "",
-                    "record_kind": "cited_only",
-                })
+                results.append(
+                    {
+                        "title": entry.get("title") or "",
+                        "url": entry.get("url") or "",
+                        "record_kind": "cited_only",
+                    }
+                )
 
         return {
             "success": True,
@@ -1261,8 +1274,7 @@ class ServerToolExecutor(ToolExecutor):
                     "pub_types": list((paper.get("pubTypeList") or {}).get("pubType") or []),
                     "subjects": [
                         heading["descriptorName"]
-                        for heading in (paper.get("meshHeadingList") or {}).get("meshHeading")
-                        or []
+                        for heading in (paper.get("meshHeadingList") or {}).get("meshHeading") or []
                         if heading.get("descriptorName")
                     ][:_EPMC_SUBJECTS_CAP],
                     "cited_by": _int_or_none(paper.get("citedByCount")),
@@ -1631,9 +1643,7 @@ class ServerToolExecutor(ToolExecutor):
                 "error_type": "ArtifactUnavailable",
                 "retryable": False,
             }
-        logger.warning(
-            "artifact %r could not be read: status=%s type=%s", name, status, error_type
-        )
+        logger.warning("artifact %r could not be read: status=%s type=%s", name, status, error_type)
         return {
             "success": False,
             "error": (
@@ -1690,9 +1700,7 @@ class ServerToolExecutor(ToolExecutor):
 
         return SandboxClient()
 
-    def _sandbox_or_operator_error(
-        self, consequence: str
-    ) -> tuple[Any, dict[str, Any] | None]:
+    def _sandbox_or_operator_error(self, consequence: str) -> tuple[Any, dict[str, Any] | None]:
         """The transport, or — with nothing configured — the shaped error to return in its place.
 
         THE ONE PLACE `SandboxNotConfigured` STOPS BEING AN EXCEPTION. `_sandbox` is a
@@ -1793,8 +1801,7 @@ class ServerToolExecutor(ToolExecutor):
         for position, entry in enumerate(inputs, start=1):
             if not isinstance(entry, dict):
                 return [], self._input_error(
-                    f"inputs[{position}] must be an object carrying a 'url' or an "
-                    "'attachment_id'.",
+                    f"inputs[{position}] must be an object carrying a 'url' or an 'attachment_id'.",
                     "InputRejected",
                 )
             named = [
@@ -1956,12 +1963,8 @@ class ServerToolExecutor(ToolExecutor):
                 and 1 <= timeout_s <= MAX_TIMEOUT_S
                 else DEFAULT_TIMEOUT_S
             )
-            worst_attempt = (
-                CONNECT_TIMEOUT_S + BODY_WRITE_DEADLINE_S + client_deadline_s(effective)
-            )
-            resolve_budget_s = min(
-                worst_fetch, self._RUN_ANALYSIS_DEADLINE_S - worst_attempt
-            )
+            worst_attempt = CONNECT_TIMEOUT_S + BODY_WRITE_DEADLINE_S + client_deadline_s(effective)
+            resolve_budget_s = min(worst_fetch, self._RUN_ANALYSIS_DEADLINE_S - worst_attempt)
 
         async def resolve_all() -> tuple[list[Any], list[dict[str, Any]], dict[str, Any] | None]:
             resolved: list[Any] = []
@@ -1998,7 +2001,9 @@ class ServerToolExecutor(ToolExecutor):
                                     "InputUpstreamError",
                                 ),
                             )
-                        logger.warning("run_analysis input %d was refused by the fetcher: %s", index, e)
+                        logger.warning(
+                            "run_analysis input %d was refused by the fetcher: %s", index, e
+                        )
                         if e.error_type == fetcher.ERROR_TOO_LARGE:
                             return (
                                 [],
@@ -2672,7 +2677,11 @@ class ServerToolExecutor(ToolExecutor):
                 continue
             # skipped locally rather than fetched and refused: the supervisor would answer
             # 413 and the round trip buys nothing
-            if isinstance(size, int) and not isinstance(size, bool) and size > ARTIFACT_READ_MAX_BYTES:
+            if (
+                isinstance(size, int)
+                and not isinstance(size, bool)
+                and size > ARTIFACT_READ_MAX_BYTES
+            ):
                 logger.info("skipping oversize image artifact %s (%d bytes)", name, size)
                 not_delivered.append(
                     self._not_delivered(name, self._oversize_reason(size, "shown nor readable"))
@@ -2735,7 +2744,11 @@ class ServerToolExecutor(ToolExecutor):
             # images already have a route; everything else is what this is for
             if isinstance(content_type, str) and content_type.startswith("image/"):
                 continue
-            if isinstance(size, int) and not isinstance(size, bool) and size > ARTIFACT_READ_MAX_BYTES:
+            if (
+                isinstance(size, int)
+                and not isinstance(size, bool)
+                and size > ARTIFACT_READ_MAX_BYTES
+            ):
                 logger.info("skipping oversize file artifact %s (%d bytes)", name, size)
                 not_delivered.append(
                     self._not_delivered(
@@ -2831,7 +2844,9 @@ class ServerToolExecutor(ToolExecutor):
                 artifacts.append(
                     {
                         "name": name,
-                        "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                        "size": size
+                        if isinstance(size, int) and not isinstance(size, bool)
+                        else None,
                         "content_type": content_type if isinstance(content_type, str) else None,
                     }
                 )

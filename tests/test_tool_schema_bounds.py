@@ -73,12 +73,9 @@ def test_bounds_track_the_constants_that_enforce_them():
         == ToolExecutor._MAX_SQL_LIMIT
     )
     assert (
-        props["run_analysis"]["properties"]["timeout_s"]["maximum"]
-        == sandbox_client.MAX_TIMEOUT_S
+        props["run_analysis"]["properties"]["timeout_s"]["maximum"] == sandbox_client.MAX_TIMEOUT_S
     )
-    assert (
-        props["run_analysis"]["properties"]["inputs"]["maxItems"] == sandbox_client.MAX_INPUTS
-    )
+    assert props["run_analysis"]["properties"]["inputs"]["maxItems"] == sandbox_client.MAX_INPUTS
 
 
 def test_no_declared_bound_contradicts_its_own_default():

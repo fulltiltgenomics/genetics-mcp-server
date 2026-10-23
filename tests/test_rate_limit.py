@@ -64,4 +64,8 @@ def test_users_do_not_share_a_window(clock, limits):
 
 def test_configure_sets_all_three_limits():
     rate_limit.configure(max_per_hour=1, max_per_day=2, max_per_week=3)
-    assert (rate_limit._max_per_hour, rate_limit._max_per_day, rate_limit._max_per_week) == (1, 2, 3)
+    assert (rate_limit._max_per_hour, rate_limit._max_per_day, rate_limit._max_per_week) == (
+        1,
+        2,
+        3,
+    )

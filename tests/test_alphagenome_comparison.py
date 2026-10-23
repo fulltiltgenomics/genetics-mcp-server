@@ -58,7 +58,19 @@ _MPRA_COLUMNS = [
 
 
 def _cs_row(beta, data_type="caQTL", trait="chr1-100-200", cell_type="CD4_T", variant="1:100:A:G"):
-    return [variant, data_type, trait, cell_type, beta, 0.1, 0.9, "cs1", 8.0, "finngen_caqtl", "finngen"]
+    return [
+        variant,
+        data_type,
+        trait,
+        cell_type,
+        beta,
+        0.1,
+        0.9,
+        "cs1",
+        8.0,
+        "finngen_caqtl",
+        "finngen",
+    ]
 
 
 def _mpra_row(skew, cell_line="K562", variant="1:100:A:G"):
@@ -116,8 +128,14 @@ def test_no_pairing_points_at_a_predictions_view():
 @pytest.mark.parametrize(
     "variant,expected",
     [
-        ({"chromosome": "chr1", "position": 100, "reference_bases": "A", "alternate_bases": "G"}, "1:100:A:G"),
-        ({"chromosome": "chrX", "position": 5, "reference_bases": "T", "alternate_bases": "C"}, "23:5:T:C"),
+        (
+            {"chromosome": "chr1", "position": 100, "reference_bases": "A", "alternate_bases": "G"},
+            "1:100:A:G",
+        ),
+        (
+            {"chromosome": "chrX", "position": 5, "reference_bases": "T", "alternate_bases": "C"},
+            "23:5:T:C",
+        ),
     ],
 )
 def test_the_suite_spelling_of_a_variant_is_what_the_views_use(variant, expected):
@@ -138,16 +156,19 @@ def test_the_sql_names_the_variant_the_chromosome_and_the_requested_context():
 
 @pytest.mark.parametrize(
     "predicted,measured,direction",
-    [(0.5, 0.42, "agrees"), (-0.5, -0.42, "agrees"), (0.5, -0.42, "disagrees"), (-0.5, 0.42, "disagrees")],
+    [
+        (0.5, 0.42, "agrees"),
+        (-0.5, -0.42, "agrees"),
+        (0.5, -0.42, "disagrees"),
+        (-0.5, 0.42, "disagrees"),
+    ],
 )
 async def test_a_signed_modality_reports_direction_agreement_both_ways(
     predicted, measured, direction
 ):
     fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([predicted])]}})
     executor = _executor(fake, {"credible_sets_v": (_CS_COLUMNS, [_cs_row(measured)])})
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["DNASE"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["DNASE"])
     block = result["results"][0]["modalities"]["DNASE"]
     assert block["concordance"]["direction"] == direction
     assert block["concordance"]["predicted_value"] == predicted
@@ -158,7 +179,9 @@ async def test_a_splice_modality_never_reports_a_direction_even_with_two_signs()
     """sQTL beta orients to a leafcutter intron cluster and the splice delta has no
     corresponding orientation. Both signs are present in the inputs here and NEITHER
     reaches the output: no `direction` key anywhere, and no word that reads as one."""
-    fake = FakeAtlas(responses={"chr1:100": {"SPLICE_SITES": [entry([-0.4], gene=("ENSG1", "GENEA"))]}})
+    fake = FakeAtlas(
+        responses={"chr1:100": {"SPLICE_SITES": [entry([-0.4], gene=("ENSG1", "GENEA"))]}}
+    )
     executor = _executor(
         fake,
         {"credible_sets_v": (_CS_COLUMNS, [_cs_row(-0.33, data_type="sQTL", trait="GENEA")])},
@@ -181,9 +204,7 @@ async def test_a_splice_modality_never_reports_a_direction_even_with_two_signs()
 async def test_a_tier_4_modality_says_nothing_was_measured_rather_than_pairing_something():
     fake = FakeAtlas(responses={"chr1:100": {"CHIP_TF": [entry([0.5])]}})
     executor = _executor(fake, {"credible_sets_v": (_CS_COLUMNS, [_cs_row(0.42)])})
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["CHIP_TF"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["CHIP_TF"])
     block = result["results"][0]["modalities"]["CHIP_TF"]
     assert block["measured_substrates"] == []
     assert block["measurements"] == []
@@ -233,9 +254,7 @@ async def test_every_measured_value_carries_the_flag_and_its_source():
             "mpra_v": (_MPRA_COLUMNS, [_mpra_row(0.7)]),
         },
     )
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["DNASE"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["DNASE"])
     block = result["results"][0]["modalities"]["DNASE"]
 
     assert len(block["measurements"]) == 2
@@ -257,9 +276,7 @@ async def test_the_population_rho_belongs_to_the_pairing_and_says_so():
     the number shown is the pair's own — and `rho_scope` names what it ranges over."""
     fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
     executor = _executor(fake, {"credible_sets_v": (_CS_COLUMNS, [_cs_row(0.42)])})
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["DNASE"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["DNASE"])
     substrates = result["results"][0]["modalities"]["DNASE"]["measured_substrates"]
     assert {s["substrate"]: s["population_rho"] for s in substrates} == {
         "caQTL": 0.478,
@@ -296,9 +313,7 @@ async def test_a_gene_resolved_modality_compares_the_gene_that_was_measured():
         fake,
         {"credible_sets_v": (_CS_COLUMNS, [_cs_row(-0.5, data_type="eQTL", trait="QUIET")])},
     )
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["RNA_SEQ"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["RNA_SEQ"])
     block = result["results"][0]["modalities"]["RNA_SEQ"]
     assert block["prediction"]["gene"] == "QUIET"
     assert block["concordance"]["predicted_value"] == pytest.approx(-0.2)
@@ -328,9 +343,7 @@ async def test_a_gene_resolved_modality_reports_no_direction_when_the_measured_g
             )
         },
     )
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["RNA_SEQ"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["RNA_SEQ"])
     concordance = result["results"][0]["modalities"]["RNA_SEQ"]["concordance"]
 
     assert "direction" not in concordance
@@ -353,9 +366,7 @@ async def test_a_substrate_whose_lookup_failed_is_marked_even_when_another_answe
             "mpra_v": {"success": False, "error": "HTTP 503: upstream"},
         },
     )
-    result = await executor.compare_alphagenome_with_measured(
-        ["1:100:A:G"], modalities=["DNASE"]
-    )
+    result = await executor.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["DNASE"])
     block = result["results"][0]["modalities"]["DNASE"]
     by_view = {s["view"]: s for s in block["measured_substrates"]}
 
@@ -388,9 +399,7 @@ async def test_no_measured_rows_is_distinguished_from_a_failed_lookup():
     assert "for this variant in this suite" in result["results"][0]["modalities"]["ATAC"]["note"]
 
     alphagenome._CACHE.clear()
-    broken = _executor(
-        fake, {"credible_sets_v": {"success": False, "error": "HTTP 503: upstream"}}
-    )
+    broken = _executor(fake, {"credible_sets_v": {"success": False, "error": "HTTP 503: upstream"}})
     result = await broken.compare_alphagenome_with_measured(["1:100:A:G"], modalities=["ATAC"])
     block = result["results"][0]["modalities"]["ATAC"]
     assert "the measured lookup in credible_sets_v failed" in block["note"]

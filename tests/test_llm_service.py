@@ -83,7 +83,9 @@ class TestSanitizeToolBlocks:
         ]
         out = _sanitize_tool_blocks(messages)
         kept_uses = {b["id"] for b in out[0]["content"] if b.get("type") == "tool_use"}
-        kept_results = {b["tool_use_id"] for b in out[1]["content"] if b.get("type") == "tool_result"}
+        kept_results = {
+            b["tool_use_id"] for b in out[1]["content"] if b.get("type") == "tool_result"
+        }
         assert kept_uses == {"a", "b"}
         assert kept_results == {"a", "b"}
 
@@ -124,7 +126,10 @@ class TestStripToolUseMarkers:
 
     def test_strips_marker_from_string_content(self):
         messages = [
-            {"role": "assistant", "content": "*[Using tool: get_variant_annotations; variant: 8:1:C:T]*\n\nThe answer is 42."},
+            {
+                "role": "assistant",
+                "content": "*[Using tool: get_variant_annotations; variant: 8:1:C:T]*\n\nThe answer is 42.",
+            },
         ]
         out = _strip_tool_use_markers(messages)
         assert "Using tool" not in out[0]["content"]
@@ -141,13 +146,15 @@ class TestStripToolUseMarkers:
         assert "## Result" in out[0]["content"]
 
     def test_strips_marker_from_text_block(self):
-        messages = [{
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "*[Using tool: x; a: b]*\n\nreal prose"},
-                {"type": "tool_use", "id": "a", "name": "x", "input": {}},
-            ],
-        }]
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "*[Using tool: x; a: b]*\n\nreal prose"},
+                    {"type": "tool_use", "id": "a", "name": "x", "input": {}},
+                ],
+            }
+        ]
         out = _strip_tool_use_markers(messages)
         text_blocks = [b for b in out[0]["content"] if b.get("type") == "text"]
         assert text_blocks[0]["text"] == "real prose"
@@ -155,13 +162,15 @@ class TestStripToolUseMarkers:
         assert any(b.get("type") == "tool_use" for b in out[0]["content"])
 
     def test_marker_only_text_block_dropped(self):
-        messages = [{
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "*[Using tool: x; a: b]*"},
-                {"type": "tool_use", "id": "a", "name": "x", "input": {}},
-            ],
-        }]
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "*[Using tool: x; a: b]*"},
+                    {"type": "tool_use", "id": "a", "name": "x", "input": {}},
+                ],
+            }
+        ]
         out = _strip_tool_use_markers(messages)
         assert all(b.get("type") != "text" for b in out[0]["content"])
         assert any(b.get("type") == "tool_use" for b in out[0]["content"])
@@ -215,7 +224,10 @@ def _turn(i: int, result: str, tool: str = "search_phenotypes") -> list[dict]:
                 {"type": "text", "text": f"answer {i}"},
             ],
         },
-        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": result}]},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": result}],
+        },
     ]
 
 
@@ -275,7 +287,9 @@ class TestPruneReplayedToolResults:
         """Between crossings the history is byte-identical to the last request's, so the
         prompt cache serves it; a pass that re-pruned to the trigger each turn would not."""
         messages = _history(6, 10_000)
-        _prune_replayed_tool_results(messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2)
+        _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
+        )
         after_first = [dict(m) for m in messages]
         messages.append({"role": "assistant", "content": [{"type": "text", "text": "short"}]})
         messages.append({"role": "user", "content": "and another"})
@@ -287,11 +301,16 @@ class TestPruneReplayedToolResults:
 
     def test_a_cleared_note_is_not_cleared_again(self):
         messages = _history(6, 10_000)
-        _prune_replayed_tool_results(messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2)
+        _prune_replayed_tool_results(
+            messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
+        )
         notes = _results(messages)[:4]
         # grow past the trigger again: the old notes survive untouched, the next-oldest goes
         for i in range(6, 9):
-            messages[-1:] = [*_turn(i, "y" * 10_000, tool="query_database"), {"role": "user", "content": "next"}]
+            messages[-1:] = [
+                *_turn(i, "y" * 10_000, tool="query_database"),
+                {"role": "user", "content": "next"},
+            ]
         cleared, _ = _prune_replayed_tool_results(
             messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
         )
@@ -444,7 +463,9 @@ class TestTurnMetrics:
         assert row["tool_profile"] == "bigquery"
         assert row["model"] == MODEL
         assert row["wall_ms"] >= 0
-        expected_cost = estimate_cost(MODEL, 100, 50, 900, 40) + estimate_cost(MODEL, 200, 80, 1100, 0)
+        expected_cost = estimate_cost(MODEL, 100, 50, 900, 40) + estimate_cost(
+            MODEL, 200, 80, 1100, 0
+        )
         assert row["cost_usd"] == pytest.approx(expected_cost)
 
     @pytest.mark.asyncio
@@ -487,9 +508,9 @@ class TestTurnMetrics:
             chunks = await _run(svc, secret=True)
 
         assert get_db.call_count == 0
-        count = chat_history_db._conn.execute(
-            "SELECT COUNT(*) FROM chat_turn_metrics"
-        ).fetchone()[0]
+        count = chat_history_db._conn.execute("SELECT COUNT(*) FROM chat_turn_metrics").fetchone()[
+            0
+        ]
         assert count == 0
         # the answer itself is unaffected
         assert [c.type for c in chunks].count("done") == 1
@@ -517,9 +538,10 @@ class TestTurnMetrics:
         turns = [_tool_turn(f"t{i}", input_tokens=1, output_tokens=1) for i in range(3)]
         svc = _with_tools(_service(turns))
 
-        with self._patch_db(chat_history_db), patch(
-            "genetics_mcp_server.llm_service.get_settings"
-        ) as get_settings:
+        with (
+            self._patch_db(chat_history_db),
+            patch("genetics_mcp_server.llm_service.get_settings") as get_settings,
+        ):
             get_settings.return_value = SimpleNamespace(
                 default_provider="anthropic",
                 default_model=MODEL,
@@ -567,8 +589,9 @@ class TestTurnMetrics:
             events.append("write")
             return real(db_self, **kwargs)
 
-        with self._patch_db(chat_history_db), patch.object(
-            type(chat_history_db), "record_turn_metrics", _spy
+        with (
+            self._patch_db(chat_history_db),
+            patch.object(type(chat_history_db), "record_turn_metrics", _spy),
         ):
             async for chunk in svc._stream_anthropic(
                 messages=[{"role": "user", "content": "hi"}],
@@ -720,10 +743,14 @@ class TestAbandonedTurnMetrics:
     async def test_a_generator_closed_by_its_consumer_is_recorded_too(self, chat_history_db):
         """The other shape a disconnect takes: the consumer stops iterating and closes the
         generator, which raises GeneratorExit at the yield — where awaiting is an error."""
-        svc = _with_tools(_service([
-            _tool_turn("t1", **self.FIRST),
-            _answer_turn(input_tokens=200, output_tokens=80),
-        ]))
+        svc = _with_tools(
+            _service(
+                [
+                    _tool_turn("t1", **self.FIRST),
+                    _answer_turn(input_tokens=200, output_tokens=80),
+                ]
+            )
+        )
         agen = svc._stream_anthropic(
             messages=[{"role": "user", "content": "hi"}],
             model=MODEL,
@@ -787,9 +814,9 @@ class TestAbandonedTurnMetrics:
             await _run(svc, user="user@example.com")
             await _settle_detached_writes()
 
-        count = chat_history_db._conn.execute(
-            "SELECT COUNT(*) FROM chat_turn_metrics"
-        ).fetchone()[0]
+        count = chat_history_db._conn.execute("SELECT COUNT(*) FROM chat_turn_metrics").fetchone()[
+            0
+        ]
         assert count == 1
         assert chat_history_db.get_turn_metrics("sess1")[0]["outcome"] == "complete"
 
@@ -802,9 +829,9 @@ class TestAbandonedTurnMetrics:
                 await _run(svc, user="user@example.com", secret=True)
             await _settle_detached_writes()
 
-        count = chat_history_db._conn.execute(
-            "SELECT COUNT(*) FROM chat_turn_metrics"
-        ).fetchone()[0]
+        count = chat_history_db._conn.execute("SELECT COUNT(*) FROM chat_turn_metrics").fetchone()[
+            0
+        ]
         assert count == 0
 
 
@@ -925,15 +952,18 @@ class TestRunAnalysisDisplayInput:
 
     @pytest.mark.asyncio
     async def test_forged_identity_is_neither_streamed_nor_logged(self, chat_history_db, caplog):
-        turns = self._turns({
-            "code": "print(1)",
-            "user": "attacker@evil.example",
-            "session_id": "other-sid",
-        })
+        turns = self._turns(
+            {
+                "code": "print(1)",
+                "user": "attacker@evil.example",
+                "session_id": "other-sid",
+            }
+        )
         svc = _with_tools(_service(turns))
 
-        with self._patch_db(chat_history_db), caplog.at_level(
-            logging.INFO, logger="genetics_mcp_server.llm_service"
+        with (
+            self._patch_db(chat_history_db),
+            caplog.at_level(logging.INFO, logger="genetics_mcp_server.llm_service"),
         ):
             chunks = await _run(svc, enable_tools=True)
 
@@ -961,8 +991,9 @@ class TestRunAnalysisDisplayInput:
         code = "x = 1  # padding\n" * 4000
         svc = _with_tools(_service(self._turns({"code": code})))
 
-        with self._patch_db(chat_history_db), caplog.at_level(
-            logging.INFO, logger="genetics_mcp_server.llm_service"
+        with (
+            self._patch_db(chat_history_db),
+            caplog.at_level(logging.INFO, logger="genetics_mcp_server.llm_service"),
         ):
             chunks = await _run(svc, enable_tools=True)
 
@@ -1024,9 +1055,7 @@ class TestResolveLocalToolNames:
         # asserted on the disabled set rather than on the resolved names because neither
         # surface carries launch_subagents at all now, so the resolved list cannot tell the
         # two apart — the liveness check is still the only thing that removes it here
-        assert "launch_subagents" not in self._svc(
-            subagent_service=None
-        ).resolve_local_tool_names()
+        assert "launch_subagents" not in self._svc(subagent_service=None).resolve_local_tool_names()
 
     def test_prompt_matches_the_resolution_when_the_service_is_dead(self, monkeypatch):
         from genetics_mcp_server.config.defaults import default_system_prompt
@@ -1094,7 +1123,7 @@ class TestRateLimitRetryPolicy:
             monkeypatch.delenv(var, raising=False)
         default = Settings()
         assert default.anthropic_retry_rate_limit is False
-        assert default.anthropic_max_retries == 3       # unchanged from the literal it replaced
+        assert default.anthropic_max_retries == 3  # unchanged from the literal it replaced
         assert default.anthropic_retry_after_max_s == 60
 
         monkeypatch.setenv("ANTHROPIC_RETRY_RATE_LIMIT", "true")
@@ -1141,9 +1170,7 @@ class TestResolvedSurfaceEnforcement:
 
     @staticmethod
     def _surface(code_execution):
-        return {
-            t["name"] for t in get_anthropic_tools(code_execution=code_execution)
-        }
+        return {t["name"] for t in get_anthropic_tools(code_execution=code_execution)}
 
     @pytest.mark.asyncio
     async def test_a_no_code_tool_named_on_the_code_surface_is_refused(self):
@@ -1225,9 +1252,7 @@ class TestResolvedSurfaceEnforcement:
         svc = self._svc()
         on_both_surfaces = sorted(self._surface(True) & self._surface(False))[0]
 
-        refused = await svc._execute_tool(
-            on_both_surfaces, {}, advertised_tools={"only_this_one"}
-        )
+        refused = await svc._execute_tool(on_both_surfaces, {}, advertised_tools={"only_this_one"})
         assert refused["success"] is False
         assert svc.executor.calls == []
 
@@ -1252,8 +1277,9 @@ class TestResolvedSurfaceEnforcement:
         chunks = await _run(
             svc,
             enable_tools=True,
-            local_tools=ResolvedLocalTools([{"name": "search_genes", "description": "d",
-                                             "input_schema": {"type": "object"}}]),
+            local_tools=ResolvedLocalTools(
+                [{"name": "search_genes", "description": "d", "input_schema": {"type": "object"}}]
+            ),
         )
 
         assert svc.executor.calls == []
@@ -1459,8 +1485,7 @@ class TestUserMemoryBlock:
             content = message.get("content")
             if isinstance(content, list):
                 count += sum(
-                    1 for block in content
-                    if isinstance(block, dict) and "cache_control" in block
+                    1 for block in content if isinstance(block, dict) and "cache_control" in block
                 )
         return count
 
@@ -1503,9 +1528,7 @@ class TestUserMemoryBlock:
     async def test_memory_follows_the_instructions_in_one_block(self):
         from genetics_mcp_server.config.defaults import memory_envelope
 
-        params = await self._params(
-            user_instructions=self.INSTRUCTIONS, user_memory=self.DIGEST
-        )
+        params = await self._params(user_instructions=self.INSTRUCTIONS, user_memory=self.DIGEST)
 
         assert len(params["system"]) == 2
         assert params["system"][1]["text"] == (
@@ -1547,14 +1570,23 @@ class TestHistoryBreakpointFollowsTheTurn:
         assert "cache_control" not in messages[1]["content"][-1]
         assert messages[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
         # the request already sent keeps its own record of where the mark was
-        assert first_request[1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        assert first_request[1]["content"][-1]["cache_control"] == {
+            "type": "ephemeral",
+            "ttl": "1h",
+        }
 
     @pytest.mark.asyncio
     async def test_every_request_of_a_tool_turn_marks_only_its_newest_message(self):
         usage = dict(input_tokens=1, output_tokens=1)
-        svc = _with_tools(_service([
-            _tool_turn("t1", **usage), _tool_turn("t2", **usage), _answer_turn(**usage),
-        ]))
+        svc = _with_tools(
+            _service(
+                [
+                    _tool_turn("t1", **usage),
+                    _tool_turn("t2", **usage),
+                    _answer_turn(**usage),
+                ]
+            )
+        )
         await _run(svc, enable_tools=True, system_prompt="SHARED")
 
         calls = svc.anthropic_client.messages.calls

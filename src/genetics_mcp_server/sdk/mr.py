@@ -126,8 +126,18 @@ from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.sdk.plots import _CODING_CONSEQUENCES
 
 # run first: the catalogue's call-path example and the stub both follow this order
-__all__ = ["run", "instruments", "harmonise", "checks", "sample_overlap_statement",
-           "MRResult", "MRBatch", "Harmonised", "Instruments", *_ESTIMATORS]
+__all__ = [
+    "run",
+    "instruments",
+    "harmonise",
+    "checks",
+    "sample_overlap_statement",
+    "MRResult",
+    "MRBatch",
+    "Harmonised",
+    "Instruments",
+    *_ESTIMATORS,
+]
 
 AF_TOLERANCE = 0.2
 F_WEAK = 10.0
@@ -179,8 +189,11 @@ def _first(frame: pl.DataFrame, *names: str) -> str | None:
 def _first_populated(frame: pl.DataFrame, *names: str) -> str | None:
     """The first of `names` holding at least one value: an all-NA `aaf` must not hide `maf`."""
     return next(
-        (n for n in names
-         if n in frame.columns and frame.select(_num(frame, n)).to_series().drop_nulls().len()),
+        (
+            n
+            for n in names
+            if n in frame.columns and frame.select(_num(frame, n)).to_series().drop_nulls().len()
+        ),
         None,
     )
 
@@ -188,8 +201,12 @@ def _first_populated(frame: pl.DataFrame, *names: str) -> str | None:
 def _variant_key(frame: pl.DataFrame) -> pl.Expr:
     """`chr:pos:ref:alt` with the chromosome bare and X as 23, as the results views hold it."""
     if all(c in frame.columns for c in ("chr", "pos", "ref", "alt")):
-        parts = [pl.col("chr").cast(pl.String), pl.col("pos").cast(pl.String),
-                 pl.col("ref").cast(pl.String), pl.col("alt").cast(pl.String)]
+        parts = [
+            pl.col("chr").cast(pl.String),
+            pl.col("pos").cast(pl.String),
+            pl.col("ref").cast(pl.String),
+            pl.col("alt").cast(pl.String),
+        ]
         raw = pl.concat_str(parts, separator=":")
     elif "variant" in frame.columns:
         raw = pl.col("variant").cast(pl.String).str.replace_all("_", ":")
@@ -197,11 +214,7 @@ def _variant_key(frame: pl.DataFrame) -> pl.Expr:
         raise GeneticsUsageError(
             "a frame needs a `variant` column or `chr`, `pos`, `ref` and `alt` columns"
         )
-    return (
-        raw.str.replace(r"^(?i:chr)", "")
-        .str.replace(r"^X:", "23:")
-        .str.replace(r"^Y:", "24:")
-    )
+    return raw.str.replace(r"^(?i:chr)", "").str.replace(r"^X:", "23:").str.replace(r"^Y:", "24:")
 
 
 def _n_expr(frame: pl.DataFrame) -> pl.Expr:
@@ -216,11 +229,14 @@ def _is_finnish(dataset: dict[str, Any] | None) -> bool:
 
 
 def _has_cases(frame: pl.DataFrame) -> bool:
-    return "n_cases" in frame.columns and frame.select(_num(frame, "n_cases")).drop_nulls().height > 0
+    return (
+        "n_cases" in frame.columns and frame.select(_num(frame, "n_cases")).drop_nulls().height > 0
+    )
 
 
-def _unit(dataset: dict[str, Any] | None, binary_rows: bool,
-          meta: dict[str, Any] | None = None) -> str:
+def _unit(
+    dataset: dict[str, Any] | None, binary_rows: bool, meta: dict[str, Any] | None = None
+) -> str:
     """Per side: the rows' case counts first, then the phenotypes() row, then the dataset's
     trait_type. A dataset's trait_type describes the release, not the phenotype: FinnGen's
     is binary although it serves quantitative endpoints such as inverse-rank BMI, whose
@@ -323,10 +339,16 @@ def harmonise(
         (_num(exposure, af_col) if af_col else pl.lit(None, dtype=pl.Float64)).alias("af_x"),
         _n_expr(exposure).alias("n_x"),
         _num(exposure, "pip").alias("pip"),
-        (pl.col("cs_id").cast(pl.String) if "cs_id" in exposure.columns
-         else pl.lit(None, dtype=pl.String)).alias("cs_id"),
-        (pl.col("most_severe").cast(pl.String) if "most_severe" in exposure.columns
-         else pl.lit(None, dtype=pl.String)).alias("most_severe"),
+        (
+            pl.col("cs_id").cast(pl.String)
+            if "cs_id" in exposure.columns
+            else pl.lit(None, dtype=pl.String)
+        ).alias("cs_id"),
+        (
+            pl.col("most_severe").cast(pl.String)
+            if "most_severe" in exposure.columns
+            else pl.lit(None, dtype=pl.String)
+        ).alias("most_severe"),
     )
     if exposure_dataset and exposure_dataset.get("n_samples") is not None:
         x = x.with_columns(pl.col("n_x").fill_null(float(exposure_dataset["n_samples"])))
@@ -355,14 +377,23 @@ def harmonise(
 
     parts = x.select(
         "variant",
-        *(pl.col("variant").str.split(":").list.get(i).alias(n)
-          for i, n in enumerate(("chr", "pos", "ref", "alt"))),
+        *(
+            pl.col("variant").str.split(":").list.get(i).alias(n)
+            for i, n in enumerate(("chr", "pos", "ref", "alt"))
+        ),
     ).with_columns(pl.col("chr").cast(pl.Int64, strict=False), pl.col("pos").cast(pl.Int64))
     x = x.join(parts, on="variant", how="left")
     x = x.with_columns(
         pl.concat_str("ref", "alt").is_in(["AT", "TA", "CG", "GC"]).alias("palindromic"),
-        (pl.col("chr").cast(pl.String) + ":" + pl.col("pos").cast(pl.String) + ":"
-         + pl.col("alt") + ":" + pl.col("ref")).alias("_swapped"),
+        (
+            pl.col("chr").cast(pl.String)
+            + ":"
+            + pl.col("pos").cast(pl.String)
+            + ":"
+            + pl.col("alt")
+            + ":"
+            + pl.col("ref")
+        ).alias("_swapped"),
     )
 
     y = outcome.select(
@@ -382,9 +413,12 @@ def harmonise(
 
     merged = x.join(y, left_on="variant", right_on="_key", how="left")
     merged = merged.with_columns(
-        pl.when(pl.col("beta_y").is_not_null()).then(pl.lit("exact"))
-        .when(pl.col("_swapped").is_in(y["_key"].implode())).then(pl.lit("swapped_not_used"))
-        .otherwise(pl.lit("absent")).alias("outcome_match"),
+        pl.when(pl.col("beta_y").is_not_null())
+        .then(pl.lit("exact"))
+        .when(pl.col("_swapped").is_in(y["_key"].implode()))
+        .then(pl.lit("swapped_not_used"))
+        .otherwise(pl.lit("absent"))
+        .alias("outcome_match"),
     ).drop("_swapped")
     merged = merged.with_columns((pl.col("outcome_match") == "exact").alias("in_outcome"))
 
@@ -393,20 +427,44 @@ def harmonise(
     merged = merged.with_columns(
         pl.lit(af_scale).alias("af_scale"),
         (pl.min_horizontal(maf_ref, 1 - maf_ref) > (1 - af_tolerance) / 2)
-        .fill_null(pl.col("palindromic")).alias("orientation_unverifiable"),
-        pl.when(pl.col("most_severe").is_null()).then(None)
-        .otherwise(pl.col("most_severe").is_in(list(_CODING_CONSEQUENCES))).alias("coding"),
+        .fill_null(pl.col("palindromic"))
+        .alias("orientation_unverifiable"),
+        pl.when(pl.col("most_severe").is_null())
+        .then(None)
+        .otherwise(pl.col("most_severe").is_in(list(_CODING_CONSEQUENCES)))
+        .alias("coding"),
     )
     columns = [
-        "variant", "chr", "pos", "beta_x", "se_x", "af_x", "n_x", "pip", "cs_id",
-        "beta_y", "se_y", "af_y", "n_y", "n_cases", "n_controls", "most_severe",
-        "in_outcome", "outcome_match", "af_checked_against", "af_reference", "af_scale",
-        "af_diff", "af_flag", "palindromic", "orientation_unverifiable", "coding",
+        "variant",
+        "chr",
+        "pos",
+        "beta_x",
+        "se_x",
+        "af_x",
+        "n_x",
+        "pip",
+        "cs_id",
+        "beta_y",
+        "se_y",
+        "af_y",
+        "n_y",
+        "n_cases",
+        "n_controls",
+        "most_severe",
+        "in_outcome",
+        "outcome_match",
+        "af_checked_against",
+        "af_reference",
+        "af_scale",
+        "af_diff",
+        "af_flag",
+        "palindromic",
+        "orientation_unverifiable",
+        "coding",
     ]
     units = {
         "exposure": _unit(exposure_dataset, _has_cases(exposure), exposure_meta),
-        "outcome": _unit(outcome_dataset, merged["n_cases"].drop_nulls().len() > 0,
-                         outcome_meta),
+        "outcome": _unit(outcome_dataset, merged["n_cases"].drop_nulls().len() > 0, outcome_meta),
     }
     return Harmonised(
         frame=merged.select(columns),
@@ -468,8 +526,7 @@ def _af_check(
     return frame.with_columns(
         pl.when(checked).then(diff).otherwise(None).alias("af_diff")
     ).with_columns(
-        pl.when(checked).then(pl.col("af_diff").abs() > tolerance).otherwise(None)
-        .alias("af_flag")
+        pl.when(checked).then(pl.col("af_diff").abs() > tolerance).otherwise(None).alias("af_flag")
     )
 
 
@@ -487,8 +544,11 @@ def _strength(frame: pl.DataFrame) -> dict[str, str]:
     weak = int((f < F_WEAK).sum())
     mean = float(f.mean())
     status = "fail" if mean < F_WEAK else "warn" if weak else "pass"
-    return _row("instrument_strength", status,
-                f"mean F {mean:.1f} over {f.len()} instruments; {weak} below {F_WEAK:g}")
+    return _row(
+        "instrument_strength",
+        status,
+        f"mean F {mean:.1f} over {f.len()} instruments; {weak} below {F_WEAK:g}",
+    )
 
 
 def _af_concordance(frame: pl.DataFrame) -> dict[str, str]:
@@ -499,11 +559,15 @@ def _af_concordance(frame: pl.DataFrame) -> dict[str, str]:
     unchecked = int((frame["af_checked_against"] == "none").sum())
     maf_scale = bool((frame["af_scale"] == "maf").any())
     status = "fail" if flagged else "warn" if unverifiable or unchecked or maf_scale else "pass"
-    detail = (f"{flagged} flagged, {unverifiable} orientation unverifiable, "
-              f"{unchecked} unchecked of {frame.height}")
+    detail = (
+        f"{flagged} flagged, {unverifiable} orientation unverifiable, "
+        f"{unchecked} unchecked of {frame.height}"
+    )
     if maf_scale:
-        detail += ("; the exposure frequency is a MAF, so it can only catch a wrong variant, "
-                   "not a swapped allele")
+        detail += (
+            "; the exposure frequency is a MAF, so it can only catch a wrong variant, "
+            "not a swapped allele"
+        )
     return _row("af_concordance", status, detail)
 
 
@@ -513,9 +577,12 @@ def _pleiotropy(frame: pl.DataFrame) -> dict[str, str]:
         return _row("pleiotropy_proxy", "not_computable", "no most_severe annotation")
     coding = int(known.sum())
     status = "warn" if coding else "pass"
-    return _row("pleiotropy_proxy", status,
-                f"{coding} of {known.len()} annotated instruments are coding "
-                f"({coding / known.len():.0%}); a non-coding-only run is the sensitivity check")
+    return _row(
+        "pleiotropy_proxy",
+        status,
+        f"{coding} of {known.len()} annotated instruments are coding "
+        f"({coding / known.len():.0%}); a non-coding-only run is the sensitivity check",
+    )
 
 
 def _steiger(result: dict[str, Any] | None) -> dict[str, str]:
@@ -527,7 +594,9 @@ def _steiger(result: dict[str, Any] | None) -> dict[str, str]:
         return _row("steiger", "not_computable", "estimator result has no direction")
     p_text = f", p {p:.2g}" if p is not None else ""
     if not direction:
-        return _row("steiger", "fail", f"variance explained in the outcome exceeds the exposure{p_text}")
+        return _row(
+            "steiger", "fail", f"variance explained in the outcome exceeds the exposure{p_text}"
+        )
     status = "pass" if p is not None and p < 0.05 else "warn"
     return _row("steiger", status, f"exposure-to-outcome direction{p_text}")
 
@@ -539,8 +608,9 @@ def _heterogeneity(result: dict[str, Any] | None) -> dict[str, str]:
     if q is None or p is None:
         return _row("heterogeneity", "not_computable", "estimator result has no Q or Q_pval")
     df_text = f" on {df} df" if df is not None else ""
-    return _row("heterogeneity", "warn" if p < 0.05 else "pass",
-                f"Cochran's Q {q:.2f}{df_text}, p {p:.2g}")
+    return _row(
+        "heterogeneity", "warn" if p < 0.05 else "pass", f"Cochran's Q {q:.2f}{df_text}, p {p:.2g}"
+    )
 
 
 def sample_overlap_statement(
@@ -605,8 +675,22 @@ PROXY_R2 = 0.8
 _ANNOTATION_BATCH = 2000
 _SET_KEY = ("dataset", "trait", "trait_original", "cell_type", "cs_id")
 _LEAD_COLUMNS = [
-    "variant", "chr", "pos", "ref", "alt", "beta", "se", "pip", "cs_id", "mlog10p", "maf",
-    "af_source", "trait", "trait_original", "cell_type", "dataset",
+    "variant",
+    "chr",
+    "pos",
+    "ref",
+    "alt",
+    "beta",
+    "se",
+    "pip",
+    "cs_id",
+    "mlog10p",
+    "maf",
+    "af_source",
+    "trait",
+    "trait_original",
+    "cell_type",
+    "dataset",
 ]
 _CS_SQL_COLUMNS = (
     "dataset, resource, trait, trait_original, cell_type, cs_id, variant, chr, pos, ref, alt, "
@@ -653,10 +737,12 @@ class _Counted:
 
 def _sdk(name: str) -> Callable[..., Any]:
     """The SDK function `name`, looked up at call time so a monkeypatch reaches it."""
+
     def call(*args: Any, **kwargs: Any) -> Any:
         import genetics_mcp_server.sdk as sdk
 
         return getattr(sdk, name)(*args, **kwargs)
+
     return call
 
 
@@ -664,11 +750,13 @@ def _quote(value: str) -> str:
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def _dataset_row(rows: list[dict[str, Any]], dataset: str | None,
-                 resource: str | None) -> dict[str, Any] | None:
+def _dataset_row(
+    rows: list[dict[str, Any]], dataset: str | None, resource: str | None
+) -> dict[str, Any] | None:
     def names(row: dict[str, Any]) -> list[str]:
         value = row.get("dataset")
         return value if isinstance(value, list) else [value]
+
     if dataset is None:
         matches = [r for r in rows if resource and r.get("resource") == resource]
     else:
@@ -687,8 +775,10 @@ def _dataset_row(rows: list[dict[str, Any]], dataset: str | None,
 def _normalise_sets(frame: pl.DataFrame) -> pl.DataFrame:
     key = _variant_key(frame)
     parts = key.str.split(":")
-    text = {c: (pl.col(c).cast(pl.String) if c in frame.columns else pl.lit(None, pl.String))
-            for c in ("dataset", "resource", "trait", "trait_original", "cell_type", "cs_id")}
+    text = {
+        c: (pl.col(c).cast(pl.String) if c in frame.columns else pl.lit(None, pl.String))
+        for c in ("dataset", "resource", "trait", "trait_original", "cell_type", "cs_id")
+    }
     return frame.select(
         key.alias("variant"),
         parts.list.get(0).cast(pl.Int64, strict=False).alias("chr"),
@@ -703,9 +793,12 @@ def _normalise_sets(frame: pl.DataFrame) -> pl.DataFrame:
 def _with_maf(rows: pl.DataFrame, annotation: AnnotationFn, finnish: bool) -> pl.DataFrame:
     """`maf` and `af_source`: the set's maf, else its aaf folded, else the annotation AF."""
     rows = rows.with_columns(
-        pl.when(pl.col("maf").is_not_null()).then(pl.lit("credible_set maf"))
-        .when(pl.col("aaf").is_not_null()).then(pl.lit("credible_set aaf"))
-        .otherwise(None).alias("af_source"),
+        pl.when(pl.col("maf").is_not_null())
+        .then(pl.lit("credible_set maf"))
+        .when(pl.col("aaf").is_not_null())
+        .then(pl.lit("credible_set aaf"))
+        .otherwise(None)
+        .alias("af_source"),
         pl.coalesce("maf", pl.min_horizontal("aaf", 1 - pl.col("aaf"))).alias("maf"),
     )
     need = rows.filter(pl.col("maf").is_null())["variant"].unique().sort().to_list()
@@ -715,25 +808,38 @@ def _with_maf(rows: pl.DataFrame, annotation: AnnotationFn, finnish: bool) -> pl
     def lookup(variants: list[str], source: str, columns: tuple[str, ...]) -> dict:
         out: dict[str, tuple[float, str]] = {}
         for i in range(0, len(variants), _ANNOTATION_BATCH):
-            out.update(_annotation_af(annotation, variants[i:i + _ANNOTATION_BATCH], source,
-                                      columns))
+            out.update(
+                _annotation_af(annotation, variants[i : i + _ANNOTATION_BATCH], source, columns)
+            )
         return out
 
-    found = {v: (af, "finngen_annotation")
-             for v, (af, _) in lookup(need, "finngen", ("AF",)).items()}
+    found = {
+        v: (af, "finngen_annotation") for v, (af, _) in lookup(need, "finngen", ("AF",)).items()
+    }
     if not finnish:
         rest = [v for v in need if v not in found]
-        found.update({v: (af, "gnomad_nfe" if col == "AF_nfe" else "gnomad_fin")
-                      for v, (af, col) in lookup(rest, "gnomad", ("AF_nfe", "AF_fin")).items()})
+        found.update(
+            {
+                v: (af, "gnomad_nfe" if col == "AF_nfe" else "gnomad_fin")
+                for v, (af, col) in lookup(rest, "gnomad", ("AF_nfe", "AF_fin")).items()
+            }
+        )
     ann = pl.DataFrame(
-        {"variant": list(found), "_af": [a for a, _ in found.values()],
-         "_src": [s for _, s in found.values()]},
+        {
+            "variant": list(found),
+            "_af": [a for a, _ in found.values()],
+            "_src": [s for _, s in found.values()],
+        },
         schema={"variant": pl.String, "_af": pl.Float64, "_src": pl.String},
     )
-    return rows.join(ann, on="variant", how="left").with_columns(
-        pl.coalesce("maf", pl.min_horizontal("_af", 1 - pl.col("_af"))).alias("maf"),
-        pl.coalesce("af_source", "_src").alias("af_source"),
-    ).drop("_af", "_src")
+    return (
+        rows.join(ann, on="variant", how="left")
+        .with_columns(
+            pl.coalesce("maf", pl.min_horizontal("_af", 1 - pl.col("_af"))).alias("maf"),
+            pl.coalesce("af_source", "_src").alias("af_source"),
+        )
+        .drop("_af", "_src")
+    )
 
 
 def _pick_lead(members: list[dict[str, Any]], floor: float) -> dict | None:
@@ -827,7 +933,8 @@ def instruments(
         dataset, resource = spec.get("dataset"), spec.get("resource")
         if not trait or not (dataset or resource):
             raise GeneticsUsageError(
-                "an exposure dict needs 'trait' and 'dataset' and/or 'resource'")
+                "an exposure dict needs 'trait' and 'dataset' and/or 'resource'"
+            )
         frame = None
     else:
         frame = exposure
@@ -835,7 +942,8 @@ def instruments(
             if column in frame.columns and frame[column].n_unique() > 1:
                 raise GeneticsUsageError(
                     f"instruments() takes one exposure: the frame has {frame[column].n_unique()} "
-                    f"values of `{column}`; filter it to one first")
+                    f"values of `{column}`; filter it to one first"
+                )
         trait = frame["trait"][0] if "trait" in frame.columns and frame.height else None
         dataset = frame["dataset"][0] if "dataset" in frame.columns and frame.height else None
         resource = frame["resource"][0] if "resource" in frame.columns and frame.height else None
@@ -850,7 +958,8 @@ def instruments(
                 "and is refused as an MR exposure: they emit satellite and singleton sets whose "
                 "leads sit tens of kb from the real signal (measured on deCODE against "
                 "UKB_PPP), and an MR on them did not reproduce the published estimates. Use a "
-                "fine-mapped dataset as the exposure")
+                "fine-mapped dataset as the exposure"
+            )
 
     def registry_row(name: str | None) -> dict[str, Any] | None:
         datasets = _Counted(_sdk("datasets"), counts, "datasets")
@@ -863,7 +972,8 @@ def instruments(
         if exposure_dataset is None:
             raise GeneticsUsageError(
                 f"dataset {dataset!r} is not in genetics.datasets(); a dict exposure names "
-                "the `dataset` value the results views hold (e.g. 'UKB_PPP')")
+                "the `dataset` value the results views hold (e.g. 'UKB_PPP')"
+            )
         resolved = True
     if resolved:
         settle()
@@ -872,70 +982,99 @@ def instruments(
     if mode == "cis":
         genes = sql(
             "SELECT symbol, chr, gene_start, gene_end FROM gene_annotations_v "
-            f"WHERE symbol = {_quote(trait)}", max_rows=100)
+            f"WHERE symbol = {_quote(trait)}",
+            max_rows=100,
+        )
         if genes.height != 1:
             raise GeneticsUsageError(
                 f"cis mode reads the trait {trait!r} as an HGNC symbol and gene_annotations_v "
-                f"has {genes.height} rows for it; use mode='genome_wide' or a symbol trait")
+                f"has {genes.height} rows for it; use mode='genome_wide' or a symbol trait"
+            )
         g = genes.to_dicts()[0]
         missing = [c for c in ("chr", "gene_start", "gene_end") if g[c] is None]
         if missing:
             raise GeneticsUsageError(
                 f"cis mode needs {trait}'s position, and its gene_annotations_v row carries no "
-                f"{' / '.join(missing)}; use mode='genome_wide'")
-        region = {"gene": trait, "chr": int(g["chr"]),
-                  "start": max(0, int(g["gene_start"]) - cis_window),
-                  "end": int(g["gene_end"]) + cis_window, "cis_window": cis_window}
-        notes.append(f"cis gene: the trait {trait} is read as its HGNC symbol (no "
-                     "trait_original or aptamer mapping)")
+                f"{' / '.join(missing)}; use mode='genome_wide'"
+            )
+        region = {
+            "gene": trait,
+            "chr": int(g["chr"]),
+            "start": max(0, int(g["gene_start"]) - cis_window),
+            "end": int(g["gene_end"]) + cis_window,
+            "cis_window": cis_window,
+        }
+        notes.append(
+            f"cis gene: the trait {trait} is read as its HGNC symbol (no "
+            "trait_original or aptamer mapping)"
+        )
 
     if frame is None:
         where = [f"trait = {_quote(trait)}"]
-        where += [f"{c} = {_quote(spec[c])}" for c in ("dataset", "resource", "trait_original")
-                  if spec.get(c)]
+        where += [
+            f"{c} = {_quote(spec[c])}"
+            for c in ("dataset", "resource", "trait_original")
+            if spec.get(c)
+        ]
         if region:
             # a literal chr prunes the partition, and joining gene_annotations_v in SQL
             # instead would cost a scan of both
-            where += [f"chr = {region['chr']}",
-                      f"pos BETWEEN {region['start']} AND {region['end']}"]
+            where += [
+                f"chr = {region['chr']}",
+                f"pos BETWEEN {region['start']} AND {region['end']}",
+            ]
         # sql() raises rather than truncate at max_rows
-        frame = sql(f"SELECT {_CS_SQL_COLUMNS} FROM credible_sets_v WHERE "
-                    + " AND ".join(where), max_rows=_CS_MAX_ROWS)
+        frame = sql(
+            f"SELECT {_CS_SQL_COLUMNS} FROM credible_sets_v WHERE " + " AND ".join(where),
+            max_rows=_CS_MAX_ROWS,
+        )
         fetched_only_window = region is not None
     else:
         fetched_only_window = False
 
-    labels = (sorted(frame["dataset"].drop_nulls().cast(pl.String).unique().to_list())
-              if "dataset" in frame.columns else [])
+    labels = (
+        sorted(frame["dataset"].drop_nulls().cast(pl.String).unique().to_list())
+        if "dataset" in frame.columns
+        else []
+    )
     if len(labels) > 1:
         raise GeneticsUsageError(
             f"the credible-set rows of {trait} hold {len(labels)} datasets {labels}; "
-            "instruments() takes one exposure: name its `dataset`")
+            "instruments() takes one exposure: name its `dataset`"
+        )
     if labels:
         dataset = labels[0]
     if not resolved:
         if dataset or resource:
             exposure_dataset = registry_row(dataset)
         if exposure_dataset is None:
-            notes.append(f"exposure {dataset or resource or '(unnamed)'} has no "
-                         "genetics.datasets() row: treated as non-Finnish and not pseudo for "
-                         "want of one")
+            notes.append(
+                f"exposure {dataset or resource or '(unnamed)'} has no "
+                "genetics.datasets() row: treated as non-Finnish and not pseudo for "
+                "want of one"
+            )
         settle()
     if exposure_dataset is not None and not exposure_dataset.get("cohorts"):
         notes.append(f"{dataset} records no cohorts: treated as non-Finnish for the AF fallback")
     finnish = _is_finnish(exposure_dataset)
 
-    rows = _normalise_sets(frame) if frame.height else _normalise_sets(
-        pl.DataFrame(schema={"variant": pl.String}))
+    rows = (
+        _normalise_sets(frame)
+        if frame.height
+        else _normalise_sets(pl.DataFrame(schema={"variant": pl.String}))
+    )
     n_outside = 0
     if region:
         inside = (pl.col("chr") == region["chr"]) & pl.col("pos").is_between(
-            region["start"], region["end"])
+            region["start"], region["end"]
+        )
         n_outside = rows.filter(~inside).height
         rows = rows.filter(inside)
         if n_outside:
-            notes.append(f"{n_outside} credible-set row(s) outside the cis window "
-                         f"chr{region['chr']}:{region['start']}-{region['end']} were left out")
+            notes.append(
+                f"{n_outside} credible-set row(s) outside the cis window "
+                f"chr{region['chr']}:{region['start']}-{region['end']} were left out"
+            )
     rows = _with_maf(rows, annotation, finnish)
 
     sets: dict[tuple, list[dict[str, Any]]] = {}
@@ -947,20 +1086,30 @@ def instruments(
         cs_id = members[0]["cs_id"]
         if lead is None:
             n_floor += 1
-            dropped.append({"variant": None, "cs_id": cs_id,
-                            "reason": f"no variant with MAF >= {maf_floor:g}"})
+            dropped.append(
+                {"variant": None, "cs_id": cs_id, "reason": f"no variant with MAF >= {maf_floor:g}"}
+            )
         elif (lead["mlog10p"] or 0) < threshold:
             n_p += 1
-            dropped.append({"variant": lead["variant"], "cs_id": cs_id,
-                            "reason": f"lead p above {p_threshold:g}"})
+            dropped.append(
+                {
+                    "variant": lead["variant"],
+                    "cs_id": cs_id,
+                    "reason": f"lead p above {p_threshold:g}",
+                }
+            )
         elif exclude_mhc and _in_mhc(lead):
             n_mhc += 1
             dropped.append({"variant": lead["variant"], "cs_id": cs_id, "reason": "lead in MHC"})
         else:
             candidates.append(lead)
 
-    where = (f"cis window chr{region['chr']}:{region['start']}-{region['end']} "
-             f"({trait} ± {cis_window:,})" if region else "genome-wide")
+    where = (
+        f"cis window chr{region['chr']}:{region['start']}-{region['end']} "
+        f"({trait} ± {cis_window:,})"
+        if region
+        else "genome-wide"
+    )
     if not candidates:
         if not sets:
             if fetched_only_window:
@@ -970,10 +1119,12 @@ def instruments(
             else:
                 reason = "no credible-set rows"
         else:
-            reason = (f"no credible set with a lead at MAF >= {maf_floor:g} and p <= "
-                      f"{p_threshold:g}{' outside the MHC' if exclude_mhc else ''} "
-                      f"({len(sets)} sets: {n_floor} below the MAF floor, {n_p} above the p "
-                      f"threshold, {n_mhc} in the MHC)")
+            reason = (
+                f"no credible set with a lead at MAF >= {maf_floor:g} and p <= "
+                f"{p_threshold:g}{' outside the MHC' if exclude_mhc else ''} "
+                f"({len(sets)} sets: {n_floor} below the MAF floor, {n_p} above the p "
+                f"threshold, {n_mhc} in the MHC)"
+            )
         raise GeneticsUsageError(f"no instrument for {trait} in {dataset}, {where}: {reason}")
 
     candidates.sort(key=lambda m: (-(m["mlog10p"] or 0), -(m["pip"] or 0), m["variant"]))
@@ -981,8 +1132,13 @@ def instruments(
     unique = []
     for lead in candidates:
         if lead["variant"] in seen:
-            dropped.append({"variant": lead["variant"], "cs_id": lead["cs_id"],
-                            "reason": f"same lead as set {seen[lead['variant']]['cs_id']}"})
+            dropped.append(
+                {
+                    "variant": lead["variant"],
+                    "cs_id": lead["cs_id"],
+                    "reason": f"same lead as set {seen[lead['variant']]['cs_id']}",
+                }
+            )
         else:
             seen[lead["variant"]] = lead
             unique.append(lead)
@@ -992,8 +1148,10 @@ def instruments(
     scan_r2 = panel_info["r2_floor"]
     panel_info.update(window=window, scan_r2_threshold=scan_r2)
     if r2_prune < scan_r2:
-        notes.append(f"r2_prune {r2_prune:g} is below the panel floor {scan_r2:g}: pairs "
-                     "between the two are not served and count as independent")
+        notes.append(
+            f"r2_prune {r2_prune:g} is below the panel floor {scan_r2:g}: pairs "
+            "between the two are not served and count as independent"
+        )
 
     kept: list[dict] = []
     scans: dict[str, dict[str, tuple[float, float]]] = {}
@@ -1002,47 +1160,75 @@ def instruments(
         hit = _ld_hit(v, kept, scans, r2_prune)
         if hit is None:
             try:
-                scan = ld(v, window=window, r2_threshold=scan_r2, panel=panel,
-                          fields=["r", "r2"])
+                scan = ld(v, window=window, r2_threshold=scan_r2, panel=panel, fields=["r", "r2"])
             except GeneticsError as exc:
                 if exc.code != "ld_variant_not_in_panel":
                     raise
                 # results-api's 404 also covers a swapped spelling and a variant with no
                 # partner above the floor; its text says which
-                dropped.append({"variant": v, "cs_id": lead["cs_id"],
-                                "reason": f"LD unknown: not in panel {panel}: {exc}"})
+                dropped.append(
+                    {
+                        "variant": v,
+                        "cs_id": lead["cs_id"],
+                        "reason": f"LD unknown: not in panel {panel}: {exc}",
+                    }
+                )
                 continue
-            scans[v] = {} if scan.is_empty() else {
-                k: (r, r2) for k, r, r2 in scan.select(
-                    _variant_key(scan), _num(scan, "r"), _num(scan, "r2")).iter_rows()
-                if k != v}
+            scans[v] = (
+                {}
+                if scan.is_empty()
+                else {
+                    k: (r, r2)
+                    for k, r, r2 in scan.select(
+                        _variant_key(scan), _num(scan, "r"), _num(scan, "r2")
+                    ).iter_rows()
+                    if k != v
+                }
+            )
             hit = _ld_reverse_hit(v, kept, scans, r2_prune)
         if hit is not None:
-            dropped.append({"variant": v, "cs_id": lead["cs_id"],
-                            "reason": f"r2 {hit[1]:.3f} with stronger lead {hit[0]}"})
+            dropped.append(
+                {
+                    "variant": v,
+                    "cs_id": lead["cs_id"],
+                    "reason": f"r2 {hit[1]:.3f} with stronger lead {hit[0]}",
+                }
+            )
             continue
         kept.append(lead)
 
     if not kept:
-        first = next((d["reason"] for d in dropped
-                      if d["reason"].startswith("LD unknown:")), "no reason recorded")
+        first = next(
+            (d["reason"] for d in dropped if d["reason"].startswith("LD unknown:")),
+            "no reason recorded",
+        )
         raise GeneticsUsageError(
             f"no instrument for {trait} in {dataset}, {where}: of its {len(unique)} lead(s) "
             f"passing the MAF floor and p threshold ({len(sets)} sets), results-api has no LD "
             f"scan in panel {panel} for any of them (absent, spelled differently, or no "
-            f"partner above the r2 floor), so none can be pruned or used; first: {first}")
+            f"partner above the r2 floor), so none can be pruned or used; first: {first}"
+        )
 
     order = [k["variant"] for k in kept]
     r_matrix, asym = _r_matrix(order, scans)
     if asym:
-        notes.append(f"{asym} lead pair(s) differed between the two scan orderings by at most "
-                     "1e-6 or appeared in one only; the matrix uses their mean")
+        notes.append(
+            f"{asym} lead pair(s) differed between the two scan orderings by at most "
+            "1e-6 or appeared in one only; the matrix uses their mean"
+        )
 
-    out = pl.DataFrame(kept, infer_schema_length=None).select(_LEAD_COLUMNS).with_columns(
-        pl.lit(False).alias("is_proxy"), pl.lit(None, pl.String).alias("proxy_for"),
-        pl.lit(None, pl.Float64).alias("proxy_r"), pl.lit(None, pl.Float64).alias("proxy_r2"),
-        pl.lit(None, pl.Boolean).alias("in_outcome"),
-        pl.lit(None, pl.Float64).alias("lead_beta"), pl.lit(None, pl.Float64).alias("lead_maf"),
+    out = (
+        pl.DataFrame(kept, infer_schema_length=None)
+        .select(_LEAD_COLUMNS)
+        .with_columns(
+            pl.lit(False).alias("is_proxy"),
+            pl.lit(None, pl.String).alias("proxy_for"),
+            pl.lit(None, pl.Float64).alias("proxy_r"),
+            pl.lit(None, pl.Float64).alias("proxy_r2"),
+            pl.lit(None, pl.Boolean).alias("in_outcome"),
+            pl.lit(None, pl.Float64).alias("lead_beta"),
+            pl.lit(None, pl.Float64).alias("lead_maf"),
+        )
     )
     if outcome_lookup is None and outcome is not None:
         outcome_lookup = _default_outcome_lookup(outcome)
@@ -1052,8 +1238,9 @@ def instruments(
     counts["total"] = sum(counts.values())
     return Instruments(
         frame=out,
-        dropped=pl.DataFrame(dropped, schema={"variant": pl.String, "cs_id": pl.String,
-                                              "reason": pl.String}),
+        dropped=pl.DataFrame(
+            dropped, schema={"variant": pl.String, "cs_id": pl.String, "reason": pl.String}
+        ),
         r=r_matrix,
         panel=panel_info,
         requests=counts,
@@ -1069,10 +1256,14 @@ def _panel_info(panels: pl.DataFrame, panel: str) -> dict[str, Any]:
         served = [] if panels.is_empty() else panels["panel"].to_list()
         raise GeneticsUsageError(
             f"instruments() needs signed r, which only an own panel serves; {panel!r} is not "
-            f"one of ld_panels() {served}")
+            f"one of ld_panels() {served}"
+        )
     row = rows[0]
-    return {"name": panel, "r2_floor": float(row["r2_floor"]),
-            "max_distance": int(row["max_distance"])}
+    return {
+        "name": panel,
+        "r2_floor": float(row["r2_floor"]),
+        "max_distance": int(row["max_distance"]),
+    }
 
 
 def _ld_hit(v: str, kept: list[dict], scans: dict, r2_prune: float) -> tuple | None:
@@ -1106,14 +1297,16 @@ def _r_matrix(order: list[str], scans: dict) -> tuple[pl.DataFrame, int]:
             if ab is not None and ba is not None and (ab * ba < 0 or abs(ab - ba) > 1e-6):
                 raise GeneticsError(
                     f"the two LD scans disagree on r({a}, {b}): {ab} from {a}'s scan, {ba} "
-                    f"from {b}'s; the panel's r is not usable for this pair")
+                    f"from {b}'s; the panel's r is not usable for this pair"
+                )
             if ab is None or ba is None or ab != ba:
                 asym += 1
-            r = (ab if ba is None else ba if ab is None else (ab + ba) / 2)
+            r = ab if ba is None else ba if ab is None else (ab + ba) / 2
             values[i][j] = values[j][i] = r
-    frame = pl.DataFrame({"variant": order, **{v: [row[i] for row in values]
-                                               for i, v in enumerate(order)}},
-                         schema={"variant": pl.String, **{v: pl.Float64 for v in order}})
+    frame = pl.DataFrame(
+        {"variant": order, **{v: [row[i] for row in values] for i, v in enumerate(order)}},
+        schema={"variant": pl.String, **{v: pl.Float64 for v in order}},
+    )
     return frame, asym
 
 
@@ -1124,20 +1317,28 @@ def _default_outcome_lookup(outcome: dict[str, Any]) -> Callable[[list[str]], pl
     def lookup(variants: list[str]) -> pl.DataFrame:
         import genetics_mcp_server.sdk as sdk
 
-        return sdk.summary_stats(phenotypes=[outcome["phenotype"]], variants=variants,
-                                 resource=outcome["resource"],
-                                 data_type=outcome.get("data_type", "gwas"))
+        return sdk.summary_stats(
+            phenotypes=[outcome["phenotype"]],
+            variants=variants,
+            resource=outcome["resource"],
+            data_type=outcome.get("data_type", "gwas"),
+        )
+
     return lookup
 
 
-def _proxies(out: pl.DataFrame, scans: dict, lookup: Callable[..., pl.DataFrame],
-             notes: list[str]) -> pl.DataFrame:
+def _proxies(
+    out: pl.DataFrame, scans: dict, lookup: Callable[..., pl.DataFrame], notes: list[str]
+) -> pl.DataFrame:
     """Replace each lead the outcome lacks by its best r2 >= PROXY_R2 neighbour it has."""
     leads = out["variant"].to_list()
-    options = {v: sorted(((k, r, r2) for k, (r, r2) in scans[v].items()
-                          if r2 is not None and r2 >= PROXY_R2),
-                         key=lambda o: (-o[2], o[0]))
-               for v in leads}
+    options = {
+        v: sorted(
+            ((k, r, r2) for k, (r, r2) in scans[v].items() if r2 is not None and r2 >= PROXY_R2),
+            key=lambda o: (-o[2], o[0]),
+        )
+        for v in leads
+    }
     wanted = sorted(set(leads) | {k for opts in options.values() for k, _, _ in opts})
     rows = lookup(wanted)
     present: set[str] = set()
@@ -1160,18 +1361,33 @@ def _proxies(out: pl.DataFrame, scans: dict, lookup: Callable[..., pl.DataFrame]
         n_proxied += 1
         c, p, ref, alt = best[0].split(":")
         sign = 1.0 if best[1] > 0 else -1.0
-        records.append({**rec, "variant": best[0], "chr": int(c), "pos": int(p), "ref": ref,
-                        "alt": alt, "beta": None if rec["beta"] is None else sign * rec["beta"],
-                        "maf": None, "af_source": "proxy: no frequency",
-                        "lead_beta": rec["beta"], "lead_maf": rec["maf"], "is_proxy": True,
-                        "proxy_for": lead, "proxy_r": best[1], "proxy_r2": best[2],
-                        "in_outcome": True})
+        records.append(
+            {
+                **rec,
+                "variant": best[0],
+                "chr": int(c),
+                "pos": int(p),
+                "ref": ref,
+                "alt": alt,
+                "beta": None if rec["beta"] is None else sign * rec["beta"],
+                "maf": None,
+                "af_source": "proxy: no frequency",
+                "lead_beta": rec["beta"],
+                "lead_maf": rec["maf"],
+                "is_proxy": True,
+                "proxy_for": lead,
+                "proxy_r": best[1],
+                "proxy_r2": best[2],
+                "in_outcome": True,
+            }
+        )
     if n_proxied:
         notes.append(
             f"{n_proxied} lead(s) replaced by an outcome-present proxy at r2 >= {PROXY_R2:g}: "
             "the row carries the proxy's own alleles and beta = sign(proxy_r) * the lead's "
             "beta (applied here; the lead's is in lead_beta), so the outcome beta read at the "
-            "proxy aligns as is; maf is null, the scan carries no frequency")
+            "proxy aligns as is; maf is null, the scan carries no frequency"
+        )
     return pl.DataFrame(records, schema=out.schema)
 
 
@@ -1190,8 +1406,18 @@ OUTCOME_CHUNK = 10
 # grow, results-api slows, or the execution wall clock changes
 OUTCOME_CAP = 250
 _R2_PRUNE = {"cis": 0.1, "genome_wide": 0.01}
-_INJECTABLES = frozenset({"ld", "annotation", "sql", "ld_panels", "datasets", "summary_stats",
-                          "phenotypes", "exposure_dataset"})
+_INJECTABLES = frozenset(
+    {
+        "ld",
+        "annotation",
+        "sql",
+        "ld_panels",
+        "datasets",
+        "summary_stats",
+        "phenotypes",
+        "exposure_dataset",
+    }
+)
 _COLOC_MAX_ROWS = 10_000
 # `cohorts` tokens of case-control consortia, whose sample prevalence says nothing about the
 # population's; a token not listed here gets the generic Steiger prevalence note. Stale when a
@@ -1234,18 +1460,31 @@ class MRResult:
     def summary(self) -> pl.DataFrame:
         e = self.estimates[self.headline]
         failing = 0 if self.checks.is_empty() else int((self.checks["status"] == "fail").sum())
-        return pl.DataFrame([{
-            "exposure": self.exposure, "outcome": self.outcome, "method": self.headline,
-            "estimate": e["estimate"], "se": e["se"], "p": e["p"], "ci_low": e["ci_low"],
-            "ci_high": e["ci_high"], "n_instruments": e["n_instruments"],
-            "overlap": self.overlap[0], "checks_failing": failing,
-        }])
+        return pl.DataFrame(
+            [
+                {
+                    "exposure": self.exposure,
+                    "outcome": self.outcome,
+                    "method": self.headline,
+                    "estimate": e["estimate"],
+                    "se": e["se"],
+                    "p": e["p"],
+                    "ci_low": e["ci_low"],
+                    "ci_high": e["ci_high"],
+                    "n_instruments": e["n_instruments"],
+                    "overlap": self.overlap[0],
+                    "checks_failing": failing,
+                }
+            ]
+        )
 
     def __repr__(self) -> str:
         e = self.estimates[self.headline]
-        return (f"MRResult({self.exposure} -> {self.outcome}: {self.headline} "
-                f"{e['estimate']:.4g} (se {e['se']:.3g}, p {e['p']:.3g}), "
-                f"K={e['n_instruments']}, overlap {self.overlap[0]})")
+        return (
+            f"MRResult({self.exposure} -> {self.outcome}: {self.headline} "
+            f"{e['estimate']:.4g} (se {e['se']:.3g}, p {e['p']:.3g}), "
+            f"K={e['n_instruments']}, overlap {self.overlap[0]})"
+        )
 
 
 @dataclass
@@ -1272,8 +1511,10 @@ class MRBatch:
         return self.results[i]
 
     def __repr__(self) -> str:
-        return (f"MRBatch({len(self.results)} ran, {self.failed.height} failed, "
-                f"{self.requests.get('total', 0)} requests)")
+        return (
+            f"MRBatch({len(self.results)} ran, {self.failed.height} failed, "
+            f"{self.requests.get('total', 0)} requests)"
+        )
 
 
 def _outcome_spec(spec: Any) -> dict[str, Any]:
@@ -1282,7 +1523,8 @@ def _outcome_spec(spec: Any) -> dict[str, Any]:
     if isinstance(spec, dict) and spec.get("phenotype") and spec.get("resource"):
         return {"data_type": "gwas", **spec}
     raise GeneticsUsageError(
-        f"an outcome is {{'phenotype', 'resource'}} or a (resource, phenotype) tuple, got {spec!r}")
+        f"an outcome is {{'phenotype', 'resource'}} or a (resource, phenotype) tuple, got {spec!r}"
+    )
 
 
 def _exposure_names(exposure: Any) -> tuple[str | None, str | None, str | None]:
@@ -1290,29 +1532,43 @@ def _exposure_names(exposure: Any) -> tuple[str | None, str | None, str | None]:
     if isinstance(exposure, dict):
         return exposure.get("dataset"), exposure.get("resource"), exposure.get("trait")
     if isinstance(exposure, pl.DataFrame):
+
         def first(c: str) -> str | None:
             return str(exposure[c][0]) if c in exposure.columns and exposure.height else None
+
         return first("dataset"), first("resource"), first("trait")
     raise GeneticsUsageError(
-        "exposure is a dict {dataset or resource, trait} or one trait's credible-set frame")
+        "exposure is a dict {dataset or resource, trait} or one trait's credible-set frame"
+    )
 
 
 def _scan_recorder(ld: Callable[..., pl.DataFrame], scans: dict) -> Callable[..., pl.DataFrame]:
     """Keeps each neighbourhood scan as instruments() reads it, so proxies can be chosen per
     outcome after one instrument selection."""
+
     def call(variant: str, **kwargs: Any) -> pl.DataFrame:
         scan = ld(variant, **kwargs)
-        scans[variant] = {} if scan.is_empty() else {
-            k: (r, r2) for k, r, r2 in scan.select(
-                _variant_key(scan), _num(scan, "r"), _num(scan, "r2")).iter_rows()
-            if k != variant}
+        scans[variant] = (
+            {}
+            if scan.is_empty()
+            else {
+                k: (r, r2)
+                for k, r, r2 in scan.select(
+                    _variant_key(scan), _num(scan, "r"), _num(scan, "r2")
+                ).iter_rows()
+                if k != variant
+            }
+        )
         return scan
+
     return call
 
 
-def _fan_out(fetch: Callable[..., Any], jobs: list[dict[str, Any]],
-             max_in_flight: int) -> list[Any]:
+def _fan_out(
+    fetch: Callable[..., Any], jobs: list[dict[str, Any]], max_in_flight: int
+) -> list[Any]:
     """The SDK's documented fan-out: batches of `max_in_flight`, return_exceptions=True."""
+
     async def one(kwargs: dict[str, Any]) -> Any:
         out = fetch(**kwargs)
         return await out if inspect.isawaitable(out) else out
@@ -1320,9 +1576,11 @@ def _fan_out(fetch: Callable[..., Any], jobs: list[dict[str, Any]],
     async def main() -> list[Any]:
         out: list[Any] = []
         for i in range(0, len(jobs), max_in_flight):
-            out += await asyncio.gather(*(one(j) for j in jobs[i:i + max_in_flight]),
-                                        return_exceptions=True)
+            out += await asyncio.gather(
+                *(one(j) for j in jobs[i : i + max_in_flight]), return_exceptions=True
+            )
         return out
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -1339,24 +1597,35 @@ def _default_summary_stats(**kwargs: Any) -> Any:
     return sdk.get_client().summary_stats(**kwargs)
 
 
-def _resolve_outcome(datasets: list[dict], spec: dict, meta: pl.DataFrame | None,
-                     notes: list[str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _resolve_outcome(
+    datasets: list[dict], spec: dict, meta: pl.DataFrame | None, notes: list[str]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """(registry row, phenotypes() row) of one outcome. A code is often listed under several
     datasets of one resource (FinnGen R12, R14 and HLA); the one serving summary statistics
     of the outcome's data_type is the one summary_stats() reads."""
+
     def serves(row: dict | None) -> bool:
-        return bool(row) and row.get("data_type") == spec["data_type"] and bool(
-            (row.get("products") or {}).get("summary_stats"))
+        return (
+            bool(row)
+            and row.get("data_type") == spec["data_type"]
+            and bool((row.get("products") or {}).get("summary_stats"))
+        )
 
     if spec.get("dataset"):
         row = _dataset_row(datasets, spec["dataset"], spec["resource"])
-        metas = [] if meta is None or meta.is_empty() or "trait_original" not in meta.columns \
+        metas = (
+            []
+            if meta is None or meta.is_empty() or "trait_original" not in meta.columns
             else meta.filter(pl.col("trait_original") == spec["phenotype"]).to_dicts()
+        )
         names = row.get("dataset") if row else None
         names = names if isinstance(names, list) else [names]
         return row, next((m for m in metas if m.get("dataset") in names), None)
-    metas = [] if meta is None or meta.is_empty() or "trait_original" not in meta.columns \
+    metas = (
+        []
+        if meta is None or meta.is_empty() or "trait_original" not in meta.columns
         else meta.filter(pl.col("trait_original") == spec["phenotype"]).to_dicts()
+    )
     listed = [(_dataset_row(datasets, m.get("dataset"), spec["resource"]), m) for m in metas]
     for row, m in listed:
         if serves(row):
@@ -1366,9 +1635,11 @@ def _resolve_outcome(datasets: list[dict], spec: dict, meta: pl.DataFrame | None
         return listed[0]
     candidates = [d for d in datasets if d.get("resource") == spec["resource"] and serves(d)]
     if len(candidates) > 1:
-        notes.append(f"outcome dataset of {spec['resource']} {spec['phenotype']} is ambiguous "
-                     f"({[c['dataset_id'] for c in candidates]}); using "
-                     f"{candidates[0]['dataset_id']}; name it with outcome['dataset']")
+        notes.append(
+            f"outcome dataset of {spec['resource']} {spec['phenotype']} is ambiguous "
+            f"({[c['dataset_id'] for c in candidates]}); using "
+            f"{candidates[0]['dataset_id']}; name it with outcome['dataset']"
+        )
     return (candidates[0] if candidates else None), None
 
 
@@ -1389,9 +1660,11 @@ def _r_for(frame: pl.DataFrame, r: pl.DataFrame | None, scans: dict) -> pl.DataF
     rows = frame.select(
         "variant",
         (pl.col("proxy_for") if "proxy_for" in frame.columns else pl.lit(None, pl.String))
-        .fill_null(pl.col("variant")).alias("_lead"),
-        (pl.col("proxy_r") if "proxy_r" in frame.columns else pl.lit(None, pl.Float64))
-        .alias("_proxy_r"),
+        .fill_null(pl.col("variant"))
+        .alias("_lead"),
+        (pl.col("proxy_r") if "proxy_r" in frame.columns else pl.lit(None, pl.Float64)).alias(
+            "_proxy_r"
+        ),
     ).to_dicts()
     if any(x["_lead"] not in leads for x in rows):
         return None
@@ -1409,9 +1682,11 @@ def _r_for(frame: pl.DataFrame, r: pl.DataFrame | None, scans: dict) -> pl.DataF
             exact = (scans.get(a["variant"], {}).get(b["variant"]) or (None,))[0]
             if exact is not None:
                 return float(exact)
-        return (float(m[idx[a["_lead"]], idx[b["_lead"]]])
-                * (1.0 if a["_proxy_r"] is None else a["_proxy_r"])
-                * (1.0 if b["_proxy_r"] is None else b["_proxy_r"]))
+        return (
+            float(m[idx[a["_lead"]], idx[b["_lead"]]])
+            * (1.0 if a["_proxy_r"] is None else a["_proxy_r"])
+            * (1.0 if b["_proxy_r"] is None else b["_proxy_r"])
+        )
 
     out = {"variant": [x["variant"] for x in rows]}
     for b in rows:
@@ -1419,8 +1694,12 @@ def _r_for(frame: pl.DataFrame, r: pl.DataFrame | None, scans: dict) -> pl.DataF
     return pl.DataFrame(out)
 
 
-def _try(notes: list[str], label: str, fn: Callable[[], Any],
-         errors: type[Exception] = GeneticsUsageError) -> Any:
+def _try(
+    notes: list[str],
+    label: str,
+    fn: Callable[[], Any],
+    errors: type[Exception] = GeneticsUsageError,
+) -> Any:
     """fn(), or None with a note: an estimator's refusal (too few instruments, no sample size)
     or, with errors=GeneticsError, a lookup whose failure only loses decoration."""
     try:
@@ -1430,8 +1709,9 @@ def _try(notes: list[str], label: str, fn: Callable[[], Any],
         return None
 
 
-def _estimate(used: pl.DataFrame, mode: str, r: pl.DataFrame | None,
-              notes: list[str]) -> tuple[dict[str, dict], str]:
+def _estimate(
+    used: pl.DataFrame, mode: str, r: pl.DataFrame | None, notes: list[str]
+) -> tuple[dict[str, dict], str]:
     k = used.height
     if k == 1:
         return {"wald": ivw(used)}, "wald"
@@ -1449,10 +1729,12 @@ def _estimate(used: pl.DataFrame, mode: str, r: pl.DataFrame | None,
     est["ivw"] = ivw(used)
     methods: dict[str, Callable[[], dict]] = {"egger": lambda: egger(used)}
     if mode != "cis":
-        methods.update(weighted_median=lambda: weighted_median(used),
-                       simple_median=lambda: simple_median(used),
-                       weighted_mode=lambda: weighted_mode(used),
-                       simple_mode=lambda: simple_mode(used))
+        methods.update(
+            weighted_median=lambda: weighted_median(used),
+            simple_median=lambda: simple_median(used),
+            weighted_mode=lambda: weighted_mode(used),
+            simple_mode=lambda: simple_mode(used),
+        )
     for name, fn in methods.items():
         value = _try(notes, name, fn)
         if value is not None:
@@ -1514,13 +1796,15 @@ def run(
         raise GeneticsUsageError(
             "run() takes one exposure. Many-exposure (proteome-wide) screens are out of scope "
             "for v1: the lead-only Wald form of a screen (one sql of the lead rows and a few "
-            "summary_stats calls) fits one execution, but this module does not provide it")
+            "summary_stats calls) fits one execution, but this module does not provide it"
+        )
     if (outcome is None) == (outcomes is None):
         raise GeneticsUsageError("give exactly one of `outcome` or `outcomes`")
     if not 1 <= max_in_flight <= MAX_IN_FLIGHT:
         raise GeneticsUsageError(
             f"max_in_flight must be 1-{MAX_IN_FLIGHT}: the server refuses a 5th concurrent "
-            "request rather than queueing it")
+            "request rather than queueing it"
+        )
     batch = outcomes is not None
     if batch:
         # a generator has no len(); list() iterates exactly as the spec comprehension did
@@ -1529,25 +1813,29 @@ def run(
         raise GeneticsUsageError(
             f"{len(outcomes):,} outcomes exceed the {OUTCOME_CAP}-outcome cap of one execution "
             "(400 outcomes measured at 94 s of the 120 s wall clock, the full FinnGen screen "
-            "timed out); split the outcomes across executions")
+            "timed out); split the outcomes across executions"
+        )
     specs = [_outcome_spec(o) for o in (outcomes if batch else [outcome])]
     if not specs:
         raise GeneticsUsageError("`outcomes` is empty")
 
     counts: dict[str, int] = {}
     datasets_fn = _Counted(injectables.get("datasets") or _sdk("datasets"), counts, "datasets")
-    phenotypes_fn = _Counted(injectables.get("phenotypes") or _sdk("phenotypes"), counts,
-                             "phenotypes")
+    phenotypes_fn = _Counted(
+        injectables.get("phenotypes") or _sdk("phenotypes"), counts, "phenotypes"
+    )
     coloc_sql = _Counted(injectables.get("sql") or _sdk("sql"), counts, "colocalization.sql")
-    fetch = _Counted(injectables.get("summary_stats") or _default_summary_stats, counts,
-                     "summary_stats")
+    fetch = _Counted(
+        injectables.get("summary_stats") or _default_summary_stats, counts, "summary_stats"
+    )
     annotation = injectables.get("annotation")
     notes: list[str] = []
 
     if isinstance(instruments, str):
         if instruments not in _R2_PRUNE:
             raise GeneticsUsageError(
-                f"instruments is 'cis', 'genome_wide' or an Instruments/frame, got {instruments!r}")
+                f"instruments is 'cis', 'genome_wide' or an Instruments/frame, got {instruments!r}"
+            )
         mode = instruments
         given = None
     else:
@@ -1565,7 +1853,8 @@ def run(
         raise GeneticsUsageError(
             f"{len(specs)} outcomes need at least {floor} requests before counting LD scans "
             f"and colocalization, over the {REQUEST_CAP:,}-request cap of one execution; "
-            "split the outcomes across executions")
+            "split the outcomes across executions"
+        )
 
     datasets = datasets_fn(include_stats=False)
     x_dataset_name, x_resource, trait = _exposure_names(exposure)
@@ -1576,29 +1865,37 @@ def run(
     # the exposure's phenotypes() row decides its unit where the dataset's trait_type cannot;
     # it rides on an outcome's call when the resources match
     x_meta_resource = None
-    if trait and exposure_dataset and (exposure_dataset.get("data_type") or "").lower() \
-            not in _MOLECULAR_QTL:
+    if (
+        trait
+        and exposure_dataset
+        and (exposure_dataset.get("data_type") or "").lower() not in _MOLECULAR_QTL
+    ):
         x_meta_resource = exposure_dataset.get("resource")
     meta_by_resource: dict[str, pl.DataFrame | None] = {}
     for resource in sorted({s["resource"] for s in specs} | ({x_meta_resource} - {None})):
-        codes = sorted({s["phenotype"] for s in specs if s["resource"] == resource}
-                       | ({trait} if resource == x_meta_resource else set()))
+        codes = sorted(
+            {s["phenotype"] for s in specs if s["resource"] == resource}
+            | ({trait} if resource == x_meta_resource else set())
+        )
         meta_by_resource[resource] = _try(
-            notes, f"phenotypes() metadata for {resource}",
-            lambda r=resource, c=codes: phenotypes_fn(codes=c, resource=r), GeneticsError)
+            notes,
+            f"phenotypes() metadata for {resource}",
+            lambda r=resource, c=codes: phenotypes_fn(codes=c, resource=r),
+            GeneticsError,
+        )
 
     failed: list[dict[str, str]] = []
     resolved: list[tuple[dict, dict | None, dict | None]] = []
     for s in specs:
-        y_dataset, meta = _resolve_outcome(datasets, s, meta_by_resource.get(s["resource"]),
-                                           notes)
+        y_dataset, meta = _resolve_outcome(datasets, s, meta_by_resource.get(s["resource"]), notes)
         try:
             _refuse_pair(exposure_dataset, trait, exposure, s, y_dataset)
         except GeneticsUsageError as exc:
             if not batch:
                 raise
-            failed.append({"resource": s["resource"], "phenotype": s["phenotype"],
-                           "reason": str(exc)})
+            failed.append(
+                {"resource": s["resource"], "phenotype": s["phenotype"], "reason": str(exc)}
+            )
             continue
         resolved.append((s, y_dataset, meta))
 
@@ -1606,16 +1903,35 @@ def run(
     if given is None:
         ld = _scan_recorder(injectables.get("ld") or _sdk("ld"), scans)
         inst = _select_instruments(
-            exposure, mode=mode, cis_window=cis_window, p_threshold=p_threshold,
-            maf_floor=maf_floor, r2_prune=r2_prune, panel=panel,
-            exposure_dataset=exposure_dataset, ld=ld, annotation=annotation,
-            sql=injectables.get("sql"), ld_panels=injectables.get("ld_panels"))
+            exposure,
+            mode=mode,
+            cis_window=cis_window,
+            p_threshold=p_threshold,
+            maf_floor=maf_floor,
+            r2_prune=r2_prune,
+            panel=panel,
+            exposure_dataset=exposure_dataset,
+            ld=ld,
+            annotation=annotation,
+            sql=injectables.get("sql"),
+            ld_panels=injectables.get("ld_panels"),
+        )
         exposure_dataset = inst.exposure_dataset or exposure_dataset
     else:
-        inst = given if isinstance(given, Instruments) else Instruments(
-            frame=given, dropped=pl.DataFrame(schema={"variant": pl.String, "cs_id": pl.String,
-                                                      "reason": pl.String}),
-            r=None, panel={}, requests={"total": 0}, cis_region=None)
+        inst = (
+            given
+            if isinstance(given, Instruments)
+            else Instruments(
+                frame=given,
+                dropped=pl.DataFrame(
+                    schema={"variant": pl.String, "cs_id": pl.String, "reason": pl.String}
+                ),
+                r=None,
+                panel={},
+                requests={"total": 0},
+                cis_region=None,
+            )
+        )
         mode = "cis" if inst.cis_region and inst.r is not None else "genome_wide"
         exposure_dataset = exposure_dataset or inst.exposure_dataset
         notes.append("instruments given by the caller: used as given, no proxy lookup")
@@ -1628,17 +1944,33 @@ def run(
     if x_metas is not None and not x_metas.is_empty() and "trait_original" in x_metas.columns:
         names = (exposure_dataset or {}).get("dataset")
         names = names if isinstance(names, list) else [names]
-        x_meta = next((m for m in x_metas.filter(pl.col("trait_original") == trait).to_dicts()
-                       if m.get("dataset") in names), None)
+        x_meta = next(
+            (
+                m
+                for m in x_metas.filter(pl.col("trait_original") == trait).to_dicts()
+                if m.get("dataset") in names
+            ),
+            None,
+        )
 
     base = inst.frame
     leads = base["variant"].to_list()
-    wanted = sorted(set(leads) | {k for v in leads for k, (_, r2) in scans.get(v, {}).items()
-                                  if r2 is not None and r2 >= PROXY_R2})
+    wanted = sorted(
+        set(leads)
+        | {
+            k
+            for v in leads
+            for k, (_, r2) in scans.get(v, {}).items()
+            if r2 is not None and r2 >= PROXY_R2
+        }
+    )
     x_resource = x_resource or (exposure_dataset or {}).get("resource")
     partnered = [(s, y, m) for s, y, m in resolved if _coloc_partnered(exposure_dataset, y)]
-    cs_ids = (sorted(base["cs_id"].drop_nulls().cast(pl.String).unique().to_list())
-              if "cs_id" in base.columns else [])
+    cs_ids = (
+        sorted(base["cs_id"].drop_nulls().cast(pl.String).unique().to_list())
+        if "cs_id" in base.columns
+        else []
+    )
     coloc_wanted = attach_coloc and bool(partnered) and bool(cs_ids) and bool(trait)
     spent = sum(counts.values())
     estimate = spent + n_fetch + int(coloc_wanted)
@@ -1647,15 +1979,22 @@ def run(
             f"this run needs about {estimate} requests ({spent} spent on instruments and "
             f"metadata, {n_fetch} summary_stats chunk(s) of up to {OUTCOME_CHUNK} outcomes, "
             f"{int(coloc_wanted)} colocalization), over the {REQUEST_CAP:,}-request cap of one "
-            "execution; split the outcomes across executions")
+            "execution; split the outcomes across executions"
+        )
 
     jobs, job_specs = [], []
     for (resource, data_type), members in groups.items():
         live = [s for s, _, _ in resolved if s in members]
         for i in range(0, len(live), OUTCOME_CHUNK):
-            chunk = live[i:i + OUTCOME_CHUNK]
-            jobs.append({"phenotypes": [s["phenotype"] for s in chunk], "variants": wanted,
-                         "resource": resource, "data_type": data_type})
+            chunk = live[i : i + OUTCOME_CHUNK]
+            jobs.append(
+                {
+                    "phenotypes": [s["phenotype"] for s in chunk],
+                    "variants": wanted,
+                    "resource": resource,
+                    "data_type": data_type,
+                }
+            )
             job_specs.append(chunk)
     rows_by: dict[tuple[str, str, str], pl.DataFrame | BaseException] = {}
     for chunk, result in zip(job_specs, _fan_out(fetch, jobs, max_in_flight)):
@@ -1670,17 +2009,32 @@ def run(
 
     coloc_all = None
     if coloc_wanted:
-        coloc_all = _try(notes, "colocalization lookup", lambda: _coloc_query(
-            coloc_sql, exposure_dataset, trait, cs_ids, partnered, _chromosomes(base)),
-            GeneticsError)
-    selection = {"cis_window": cis_window, "p_threshold": p_threshold, "maf_floor": maf_floor,
-                 "panel": panel, "r2_prune": r2_prune}
+        coloc_all = _try(
+            notes,
+            "colocalization lookup",
+            lambda: _coloc_query(
+                coloc_sql, exposure_dataset, trait, cs_ids, partnered, _chromosomes(base)
+            ),
+            GeneticsError,
+        )
+    selection = {
+        "cis_window": cis_window,
+        "p_threshold": p_threshold,
+        "maf_floor": maf_floor,
+        "panel": panel,
+        "r2_prune": r2_prune,
+    }
     if given is not None:
         selection = dict.fromkeys(selection, "not used (instruments given)")
-    parameters = {"mode": mode, **selection,
-                  "af_tolerance": AF_TOLERANCE, "proxy_r2": PROXY_R2,
-                  "attach_coloc": attach_coloc, "max_in_flight": max_in_flight,
-                  "outcome_chunk": OUTCOME_CHUNK}
+    parameters = {
+        "mode": mode,
+        **selection,
+        "af_tolerance": AF_TOLERANCE,
+        "proxy_r2": PROXY_R2,
+        "attach_coloc": attach_coloc,
+        "max_in_flight": max_in_flight,
+        "outcome_chunk": OUTCOME_CHUNK,
+    }
     results: list[MRResult] = []
     for s, y_dataset, meta in resolved:
         rows = rows_by[(s["resource"], s["data_type"], s["phenotype"])]
@@ -1688,58 +2042,95 @@ def run(
             if not batch:
                 raise rows
             # any exception of one chunk, not only a GeneticsError, fails its outcomes only
-            failed.append({"resource": s["resource"], "phenotype": s["phenotype"],
-                           "reason": str(rows) or type(rows).__name__})
+            failed.append(
+                {
+                    "resource": s["resource"],
+                    "phenotype": s["phenotype"],
+                    "reason": str(rows) or type(rows).__name__,
+                }
+            )
             continue
         try:
-            results.append(_one_outcome(
-                exposure_label=f"{x_dataset_name or x_resource} {trait}", spec=s,
-                inst=inst, scans=scans, rows=rows, meta=meta, exposure_dataset=exposure_dataset,
-                x_meta=x_meta,
-                y_dataset=y_dataset, mode=mode, prevalence=prevalence, annotation=annotation,
-                coloc=coloc_all, x_trait=trait, partnered=_coloc_partnered(exposure_dataset, y_dataset),
-                attach_coloc=attach_coloc,
-                parameters=parameters,
-                base_notes=notes, counts=counts))
+            results.append(
+                _one_outcome(
+                    exposure_label=f"{x_dataset_name or x_resource} {trait}",
+                    spec=s,
+                    inst=inst,
+                    scans=scans,
+                    rows=rows,
+                    meta=meta,
+                    exposure_dataset=exposure_dataset,
+                    x_meta=x_meta,
+                    y_dataset=y_dataset,
+                    mode=mode,
+                    prevalence=prevalence,
+                    annotation=annotation,
+                    coloc=coloc_all,
+                    x_trait=trait,
+                    partnered=_coloc_partnered(exposure_dataset, y_dataset),
+                    attach_coloc=attach_coloc,
+                    parameters=parameters,
+                    base_notes=notes,
+                    counts=counts,
+                )
+            )
         except GeneticsError as exc:
             if not batch:
                 raise
-            failed.append({"resource": s["resource"], "phenotype": s["phenotype"],
-                           "reason": str(exc)})
+            failed.append(
+                {"resource": s["resource"], "phenotype": s["phenotype"], "reason": str(exc)}
+            )
     counts["total"] = sum(v for k, v in counts.items() if k != "total")
     if not batch:
         return results[0]
-    return MRBatch(results=results,
-                   failed=pl.DataFrame(failed, schema={"resource": pl.String,
-                                                       "phenotype": pl.String,
-                                                       "reason": pl.String}),
-                   instruments=inst, requests=counts, notes=notes)
+    return MRBatch(
+        results=results,
+        failed=pl.DataFrame(
+            failed, schema={"resource": pl.String, "phenotype": pl.String, "reason": pl.String}
+        ),
+        instruments=inst,
+        requests=counts,
+        notes=notes,
+    )
 
 
-def _refuse_pair(exposure_dataset: dict | None, trait: str | None, exposure: Any, spec: dict,
-                 y_dataset: dict | None) -> None:
+def _refuse_pair(
+    exposure_dataset: dict | None,
+    trait: str | None,
+    exposure: Any,
+    spec: dict,
+    y_dataset: dict | None,
+) -> None:
     if y_dataset is not None and not (y_dataset.get("products") or {}).get("summary_stats"):
         has = sorted(k for k, v in (y_dataset.get("products") or {}).items() if v)
         raise GeneticsUsageError(
             f"outcome {spec['resource']} {spec['phenotype']}: dataset {y_dataset['dataset_id']} "
             f"serves no summary statistics (it has {', '.join(has) or 'nothing'}), and an MR "
-            "outcome needs each instrument's effect, not only fine-mapped sets")
+            "outcome needs each instrument's effect, not only fine-mapped sets"
+        )
     x_names = {trait} | ({exposure.get("trait_original")} if isinstance(exposure, dict) else set())
-    if (exposure_dataset and y_dataset
-            and exposure_dataset.get("dataset_id") == y_dataset.get("dataset_id")
-            and spec["phenotype"] in x_names):
+    if (
+        exposure_dataset
+        and y_dataset
+        and exposure_dataset.get("dataset_id") == y_dataset.get("dataset_id")
+        and spec["phenotype"] in x_names
+    ):
         raise GeneticsUsageError(
             f"exposure and outcome are the same trait {spec['phenotype']} in the same dataset "
-            f"{y_dataset['dataset_id']}: that regresses a trait on itself")
+            f"{y_dataset['dataset_id']}: that regresses a trait on itself"
+        )
 
 
 def _coloc_partnered(x: dict | None, y: dict | None) -> bool:
     """Whether colocalization_v pairs the two datasets, by the registry's partner lists."""
+
     def partners(d: dict | None) -> set[str]:
         coloc = ((d or {}).get("products") or {}).get("colocalization")
         return set(coloc.get("partners") or []) if isinstance(coloc, dict) else set()
-    return bool(x and y) and (y.get("dataset_id") in partners(x)
-                              or x.get("dataset_id") in partners(y))
+
+    return bool(x and y) and (
+        y.get("dataset_id") in partners(x) or x.get("dataset_id") in partners(y)
+    )
 
 
 def _labels(d: dict | None) -> list[str]:
@@ -1759,67 +2150,114 @@ def _chromosomes(frame: pl.DataFrame) -> list[int]:
     return sorted(out)
 
 
-def _coloc_query(sql: Callable[..., pl.DataFrame], x: dict | None, trait: str,
-                 cs_ids: list[str], partnered: list[tuple],
-                 chromosomes: list[int] | None = None) -> pl.DataFrame:
+def _coloc_query(
+    sql: Callable[..., pl.DataFrame],
+    x: dict | None,
+    trait: str,
+    cs_ids: list[str],
+    partnered: list[tuple],
+    chromosomes: list[int] | None = None,
+) -> pl.DataFrame:
     """One query for every instrument's set against every partnered outcome, either side.
 
     `genetics.colocalization(credible_set_id=)` answers from one side of the pair only, and
     UKB_PPP sets sit on side 2 of colocalization_v, so it returns nothing for them. The view
     is partitioned by chr and prunes only on a literal chr predicate."""
+
     def in_list(values: list[str]) -> str:
         return "(" + ", ".join(_quote(v) for v in values) + ")"
+
     xl = in_list(_labels(x))
-    yl = in_list(sorted({v for _, y, m in partnered
-                         for v in ([m["dataset"]] if m and m.get("dataset") else _labels(y))}))
+    yl = in_list(
+        sorted(
+            {
+                v
+                for _, y, m in partnered
+                for v in ([m["dataset"]] if m and m.get("dataset") else _labels(y))
+            }
+        )
+    )
     ph = in_list(sorted({s["phenotype"] for s, _, _ in partnered}))
     cs = in_list(cs_ids)
     sides = []
     for a, b in (("1", "2"), ("2", "1")):
-        sides.append(f"(dataset{a} IN {xl} AND trait{a} = {_quote(trait)} AND cs{a}_id IN {cs} "
-                     f"AND dataset{b} IN {yl} AND trait{b} IN {ph})")
-    chr_filter = (f"chr IN ({', '.join(str(c) for c in chromosomes)}) AND "
-                  if chromosomes else "")
-    return sql("SELECT * FROM colocalization_v WHERE " + chr_filter
-               + "(" + " OR ".join(sides) + ")", max_rows=_COLOC_MAX_ROWS)
+        sides.append(
+            f"(dataset{a} IN {xl} AND trait{a} = {_quote(trait)} AND cs{a}_id IN {cs} "
+            f"AND dataset{b} IN {yl} AND trait{b} IN {ph})"
+        )
+    chr_filter = f"chr IN ({', '.join(str(c) for c in chromosomes)}) AND " if chromosomes else ""
+    return sql(
+        "SELECT * FROM colocalization_v WHERE " + chr_filter + "(" + " OR ".join(sides) + ")",
+        max_rows=_COLOC_MAX_ROWS,
+    )
 
 
-def _one_outcome(*, exposure_label: str, spec: dict, inst: Instruments, scans: dict,
-                 rows: pl.DataFrame, meta: dict | None, exposure_dataset: dict | None,
-                 x_meta: dict | None,
-                 y_dataset: dict | None, mode: str, prevalence: float | None,
-                 annotation: AnnotationFn | None, coloc: pl.DataFrame | None, partnered: bool,
-                 x_trait: str | None,
-                 attach_coloc: bool,
-                 parameters: dict, base_notes: list[str], counts: dict) -> MRResult:
+def _one_outcome(
+    *,
+    exposure_label: str,
+    spec: dict,
+    inst: Instruments,
+    scans: dict,
+    rows: pl.DataFrame,
+    meta: dict | None,
+    exposure_dataset: dict | None,
+    x_meta: dict | None,
+    y_dataset: dict | None,
+    mode: str,
+    prevalence: float | None,
+    annotation: AnnotationFn | None,
+    coloc: pl.DataFrame | None,
+    partnered: bool,
+    x_trait: str | None,
+    attach_coloc: bool,
+    parameters: dict,
+    base_notes: list[str],
+    counts: dict,
+) -> MRResult:
     label = f"{spec['resource']} {spec['phenotype']}"
     notes = list(base_notes) + list(inst.notes)
     if meta:
-        missing = [c for c in ("n_cases", "n_controls")
-                   if (c not in rows.columns or rows.is_empty()
-                       or rows[c].cast(pl.String).is_in(["NA", ""]).fill_null(True).all())
-                   and meta.get(c) is not None]
+        missing = [
+            c
+            for c in ("n_cases", "n_controls")
+            if (
+                c not in rows.columns
+                or rows.is_empty()
+                or rows[c].cast(pl.String).is_in(["NA", ""]).fill_null(True).all()
+            )
+            and meta.get(c) is not None
+        ]
         if missing and not rows.is_empty():
             rows = rows.with_columns(*(pl.lit(float(meta[c])).alias(c) for c in missing))
-            notes.append(f"{label}: {', '.join(missing)} taken from phenotypes() (the rows carry "
-                         "none)")
+            notes.append(
+                f"{label}: {', '.join(missing)} taken from phenotypes() (the rows carry none)"
+            )
 
     frame = inst.frame
     if scans:
         frame = _proxies(frame, scans, lambda _variants: rows, notes)
         dup = frame["variant"].is_duplicated()
         if dup.any():
-            notes.append(f"{label}: {int(dup.sum())} rows proxied to an already used variant; "
-                         "the stronger lead's row is kept")
+            notes.append(
+                f"{label}: {int(dup.sum())} rows proxied to an already used variant; "
+                "the stronger lead's row is kept"
+            )
             frame = frame.unique(subset="variant", keep="first", maintain_order=True)
     if rows.is_empty():
         raise GeneticsUsageError(
             f"summary_stats returned no rows of {label} for the {frame.height} instrument(s) "
             "and their proxies; check the phenotype code (phenotypes(codes=[...], resource=...) "
-            "lists the codes a resource serves)")
-    h = harmonise(frame, rows, exposure_dataset=exposure_dataset, outcome_dataset=y_dataset,
-                  exposure_meta=x_meta, outcome_meta=meta,
-                  **({"annotation": annotation} if annotation else {}))
+            "lists the codes a resource serves)"
+        )
+    h = harmonise(
+        frame,
+        rows,
+        exposure_dataset=exposure_dataset,
+        outcome_dataset=y_dataset,
+        exposure_meta=x_meta,
+        outcome_meta=meta,
+        **({"annotation": annotation} if annotation else {}),
+    )
     used = h.frame.filter(pl.col("in_outcome"))
     if used.is_empty():
         match = h.frame["outcome_match"].value_counts().sort("outcome_match").to_dicts()
@@ -1827,28 +2265,38 @@ def _one_outcome(*, exposure_label: str, spec: dict, inst: Instruments, scans: d
         raise GeneticsUsageError(
             f"no instrument of {exposure_label} is in {label} after the r2 >= {PROXY_R2:g} proxy "
             f"lookup: {h.frame.height} instrument(s), {detail}; {h.dropped.height} exposure "
-            "row(s) unusable")
+            "row(s) unusable"
+        )
     notes += h.notes
     r = None
     if mode == "cis":
         proxy_cols = [c for c in ("proxy_for", "proxy_r", "is_proxy") if c in frame.columns]
-        tagged = used.join(frame.select("variant", *proxy_cols), on="variant", how="left") \
-            if proxy_cols else used
+        tagged = (
+            used.join(frame.select("variant", *proxy_cols), on="variant", how="left")
+            if proxy_cols
+            else used
+        )
         r = _r_for(tagged, inst.r, scans)
-        proxied = (tagged.filter(pl.col("proxy_for").is_not_null())["variant"].to_list()
-                   if "proxy_for" in tagged.columns else [])
+        proxied = (
+            tagged.filter(pl.col("proxy_for").is_not_null())["variant"].to_list()
+            if "proxy_for" in tagged.columns
+            else []
+        )
         if r is not None and proxied and used.height > 1:
             notes.append(
                 f"LD r of the proxied instrument(s) {', '.join(proxied)} is approximated by the "
                 "chain r(lead_a, lead_b) * r(proxy, its lead) (exact only as the proxy r2 "
-                "approaches 1); a lead's own scan value is used where it holds the proxy")
+                "approaches 1); a lead's own scan value is used where it holds the proxy"
+            )
     if mode == "cis" and r is None and used.height > 1:
         notes.append("no LD r for these instruments: the IVW is independent")
     estimates, headline = _estimate(used, mode, r, notes)
     if r is not None and used.height > 1:
-        notes.append("leave-one-out, single-SNP, heterogeneity and Steiger treat the "
-                     "instruments as independent (the LD r enters only the headline IVW and "
-                     "Egger)")
+        notes.append(
+            "leave-one-out, single-SNP, heterogeneity and Steiger treat the "
+            "instruments as independent (the LD r enters only the headline IVW and "
+            "Egger)"
+        )
 
     binary = "binary" in h.units.get("outcome", "")
     prevalence_source = "given" if prevalence is not None else None
@@ -1858,69 +2306,104 @@ def _one_outcome(*, exposure_label: str, spec: dict, inst: Instruments, scans: d
         if share is not None and math.isfinite(share):
             prevalence = float(share)
             prevalence_source = "sample"
-            consortia = sorted(set((y_dataset or {}).get("cohorts") or [])
-                               & _CASE_CONTROL_CONSORTIA)
+            consortia = sorted(
+                set((y_dataset or {}).get("cohorts") or []) & _CASE_CONTROL_CONSORTIA
+            )
             notes.append(
                 f"Steiger prevalence {prevalence:.4g} is the sample's n_cases/(n_cases"
                 "+n_controls), not the population prevalence: "
-                + (f"{label} comes from a case-control consortium collection "
-                   f"({', '.join(consortia)}) whose sample prevalence is far from the "
-                   "population's; pass prevalence= for a meaningful Steiger" if consortia else
-                   "close for a population cohort such as FinnGen, not for a case-control "
-                   "consortium"))
+                + (
+                    f"{label} comes from a case-control consortium collection "
+                    f"({', '.join(consortia)}) whose sample prevalence is far from the "
+                    "population's; pass prevalence= for a meaningful Steiger"
+                    if consortia
+                    else "close for a population cohort such as FinnGen, not for a case-control "
+                    "consortium"
+                )
+            )
     sensitivity = {
         "heterogeneity": _try(notes, "heterogeneity", lambda: heterogeneity(used))
-        if used.height >= 2 else None,
+        if used.height >= 2
+        else None,
         "leave_one_out": _try(notes, "leave-one-out", lambda: leave_one_out(used))
-        if used.height >= 3 else None,
+        if used.height >= 3
+        else None,
         "single_snp": _try(notes, "single-SNP", lambda: single_snp(used)),
-        "steiger": _try(notes, "Steiger", lambda: steiger(
-            replace(h, frame=used) if binary else used, prevalence=prevalence)),
+        "steiger": _try(
+            notes,
+            "Steiger",
+            lambda: steiger(replace(h, frame=used) if binary else used, prevalence=prevalence),
+        ),
     }
     if used.height < 3:
-        notes.append(f"{used.height} instrument(s): leave-one-out needs 3"
-                     + ("" if used.height >= 2 else ", heterogeneity 2"))
-    checks_frame = checks(h, steiger=sensitivity["steiger"],
-                          heterogeneity=sensitivity["heterogeneity"])
+        notes.append(
+            f"{used.height} instrument(s): leave-one-out needs 3"
+            + ("" if used.height >= 2 else ", heterogeneity 2")
+        )
+    checks_frame = checks(
+        h, steiger=sensitivity["steiger"], heterogeneity=sensitivity["heterogeneity"]
+    )
     overlap = sample_overlap_statement(exposure_dataset, y_dataset)
 
     coloc_frame = None
     if attach_coloc and not partnered:
-        notes.append(f"colocalization: {label} is not a colocalization partner of the exposure "
-                     "dataset in the registry; none attached")
+        notes.append(
+            f"colocalization: {label} is not a colocalization partner of the exposure "
+            "dataset in the registry; none attached"
+        )
     elif attach_coloc and coloc is not None and not coloc.is_empty():
         lead_of = dict(used.select("cs_id", "variant").drop_nulls("cs_id").iter_rows())
         x_first = pl.col("dataset1").is_in(_labels(exposure_dataset)) & (
-            pl.col("trait1") == x_trait)
+            pl.col("trait1") == x_trait
+        )
         y_side = pl.when(x_first).then(pl.col("trait2")).otherwise(pl.col("trait1"))
         y_set = pl.when(x_first).then(pl.col("dataset2")).otherwise(pl.col("dataset1"))
         y_labels = [meta["dataset"]] if meta and meta.get("dataset") else _labels(y_dataset)
         x_cs = pl.when(x_first).then(pl.col("cs1_id")).otherwise(pl.col("cs2_id"))
         got = coloc.filter((y_side == spec["phenotype"]) & y_set.is_in(y_labels)).with_columns(
-            x_cs.replace_strict(lead_of, default=None).alias("instrument"))
+            x_cs.replace_strict(lead_of, default=None).alias("instrument")
+        )
         coloc_frame = got.filter(pl.col("instrument").is_not_null()) if got.height else None
         if coloc_frame is not None and coloc_frame.is_empty():
             coloc_frame = None
     if attach_coloc and partnered and coloc_frame is None:
-        notes.append(f"colocalization: no precomputed row pairs an instrument's credible set "
-                     f"with {label}")
+        notes.append(
+            f"colocalization: no precomputed row pairs an instrument's credible set with {label}"
+        )
     versions = {
         "exposure": {k: (exposure_dataset or {}).get(k) for k in ("dataset_id", "version")},
         "outcome": {k: (y_dataset or {}).get(k) for k in ("dataset_id", "version")},
-        "outcome_rows": (sorted(rows["version"].drop_nulls().cast(pl.String).unique().to_list())
-                         if "version" in rows.columns else None),
+        "outcome_rows": (
+            sorted(rows["version"].drop_nulls().cast(pl.String).unique().to_list())
+            if "version" in rows.columns
+            else None
+        ),
         "source": "genetics.datasets() version fields and the summary_stats rows' version "
-                  "column; summary_stats does not surface results-api's X-Dataset-Version",
+        "column; summary_stats does not surface results-api's X-Dataset-Version",
     }
     head = estimates[headline]
-    params = {**parameters, "mode": mode, "prevalence": prevalence,
-              "prevalence_source": prevalence_source,
-              "model": head.get("model"), "headline": headline,
-              "n_instruments": used.height}
+    params = {
+        **parameters,
+        "mode": mode,
+        "prevalence": prevalence,
+        "prevalence_source": prevalence_source,
+        "model": head.get("model"),
+        "headline": headline,
+        "n_instruments": used.height,
+    }
     return MRResult(
-        exposure=exposure_label, outcome=label, headline=headline, harmonised=h,
-        instruments=replace(inst, frame=frame, notes=list(inst.notes)), estimates=estimates,
-        sensitivity=sensitivity, checks=checks_frame, parameters=params, overlap=overlap,
-        versions=versions, coloc=coloc_frame, notes=list(dict.fromkeys(notes)),
+        exposure=exposure_label,
+        outcome=label,
+        headline=headline,
+        harmonised=h,
+        instruments=replace(inst, frame=frame, notes=list(inst.notes)),
+        estimates=estimates,
+        sensitivity=sensitivity,
+        checks=checks_frame,
+        parameters=params,
+        overlap=overlap,
+        versions=versions,
+        coloc=coloc_frame,
+        notes=list(dict.fromkeys(notes)),
         requests=counts,
     )

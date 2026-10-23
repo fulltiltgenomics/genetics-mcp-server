@@ -38,13 +38,20 @@ def main():
         alleles = {inst["ea"], inst["oa"]}
         hits = [v for v in by_rsid.get(inst["rsid"], []) if set(v.split(":")[2:]) == alleles]
         base = f"{inst['chr']}:{inst['pos_grch38']}"
-        inst["candidates"] = hits or [f"{base}:{inst['oa']}:{inst['ea']}", f"{base}:{inst['ea']}:{inst['oa']}"]
+        inst["candidates"] = hits or [
+            f"{base}:{inst['oa']}:{inst['ea']}",
+            f"{base}:{inst['ea']}:{inst['oa']}",
+        ]
 
     pheno = {r["trait_name"]: r for r in genetics.phenotypes(resource=OUTCOME_RESOURCE).to_dicts()}
     code = pheno[OUTCOME_TRAIT]["trait_original"]
     variants = sorted({v for i in instruments for v in i["candidates"]})
-    rows = genetics.summary_stats(phenotypes=[code], variants=variants, resource=OUTCOME_RESOURCE).to_dicts()
-    index = {f"{r['chr']}:{r['pos']}:{r['ref']}:{r['alt']}": r for r in rows if r["phenotype"] == code}
+    rows = genetics.summary_stats(
+        phenotypes=[code], variants=variants, resource=OUTCOME_RESOURCE
+    ).to_dicts()
+    index = {
+        f"{r['chr']}:{r['pos']}:{r['ref']}:{r['alt']}": r for r in rows if r["phenotype"] == code
+    }
     print(f"outcome {OUTCOME_RESOURCE}/{code}: {len(index)} rows for {len(variants)} candidate ids")
 
     table, kept = [], {p: [] for p in PROTEINS}
@@ -59,19 +66,31 @@ def main():
         elif (inst["ea"], inst["oa"]) == (row["ref"], row["alt"]):
             beta, eaf = -beta, 1 - eaf
         else:
-            print(f"DROP {inst['protein']} {inst['rsid']}: alleles {inst['ea']}/{inst['oa']} vs row {row['ref']}/{row['alt']}")
+            print(
+                f"DROP {inst['protein']} {inst['rsid']}: alleles {inst['ea']}/{inst['oa']} vs row {row['ref']}/{row['alt']}"
+            )
             continue
         variant = f"{row['chr']}:{row['pos']}:{row['ref']}:{row['alt']}"
         if row.get("af") is not None and abs(eaf - row["af"]) > 0.2:
             print(f"NOTE {inst['protein']} {variant}: af_x {eaf:.3f} vs af_y {row['af']:.3f}")
         kept[inst["protein"]].append(variant)
-        table.append({
-            "protein": inst["protein"], "variant": variant, "rsid": inst["rsid"],
-            "beta_x": fmt(beta), "se_x": fmt(inst["se"]), "beta_y": fmt(row["beta"]), "se_y": fmt(row["se"]),
-            "af_x": fmt(eaf), "af_y": fmt(row.get("af")), "n_x": inst["n"],
-            "n_y": int(row["n_cases"]) + int(row["n_controls"]),
-            "ncase_y": int(row["n_cases"]), "ncontrol_y": int(row["n_controls"]),
-        })
+        table.append(
+            {
+                "protein": inst["protein"],
+                "variant": variant,
+                "rsid": inst["rsid"],
+                "beta_x": fmt(beta),
+                "se_x": fmt(inst["se"]),
+                "beta_y": fmt(row["beta"]),
+                "se_y": fmt(row["se"]),
+                "af_x": fmt(eaf),
+                "af_y": fmt(row.get("af")),
+                "n_x": inst["n"],
+                "n_y": int(row["n_cases"]) + int(row["n_controls"]),
+                "ncase_y": int(row["n_cases"]),
+                "ncontrol_y": int(row["n_controls"]),
+            }
+        )
     with open(os.path.join(HERE, "input_cis_ibd.csv"), "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(table[0]), lineterminator="\n")
         w.writeheader()
@@ -86,7 +105,7 @@ def main():
             except Exception as exc:
                 print(f"LD DROP {protein} {v}: {type(exc).__name__}: {str(exc)[:200]}")
         for i, a in enumerate(in_panel):
-            for b in in_panel[i + 1:]:
+            for b in in_panel[i + 1 :]:
                 res = genetics.ld(a, b, panel=PANEL, fields="r", r2_threshold=0).to_dicts()
                 val = res[0].get("r") if res and res[0].get("in_ld") else None
                 r[(a, b)] = r[(b, a)] = 0.0 if val is None else float(val)

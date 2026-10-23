@@ -73,7 +73,12 @@ async def test_the_pair_lookup_uses_results_apis_pair_route():
     whether an empty answer means below the floor or possibly absent, and how far a pair
     may be apart."""
     capture = {}
-    pair = {"variation1": "6:44693011:A:G", "variation2": "6:44682355:C:G", "r2": 0.81, "d_prime": 0.94}
+    pair = {
+        "variation1": "6:44693011:A:G",
+        "variation2": "6:44682355:C:G",
+        "r2": 0.81,
+        "d_prime": 0.94,
+    }
     async with executor_with(FakeResponse(payload={"ld": [pair]}), capture=capture) as executor:
         result = await executor.get_ld_between_variants("6:44693011:A:G", "6:44682355:C:G")
 
@@ -92,7 +97,9 @@ async def test_a_pair_too_far_apart_is_results_apis_refusal_relayed():
     async with executor_with(
         FakeResponse(
             status_code=422,
-            payload={"detail": "6:10000000:A:G and 6:13000001:C:G are 3,000,001 bp apart; LD panel finngen_r12 holds pairs up to 3,000,000 bp apart"},
+            payload={
+                "detail": "6:10000000:A:G and 6:13000001:C:G are 3,000,001 bp apart; LD panel finngen_r12 holds pairs up to 3,000,000 bp apart"
+            },
         )
     ) as executor:
         refused = await executor.get_ld_between_variants("6:10000000:A:G", "6:13000001:C:G")
@@ -127,7 +134,11 @@ async def test_signed_r_comes_back_when_the_panel_carries_it():
         {"variant": "6:44682355:C:G", "r": -0.9, "r2": 0.81},
         {"variant": "6:44690000:T:C", "r": 0.6481, "r2": 0.42},
     ]
-    assert (result["fields"], result["r2_floor"], result["max_distance"]) == (["r", "r2"], 0.01, 3_000_000)
+    assert (result["fields"], result["r2_floor"], result["max_distance"]) == (
+        ["r", "r2"],
+        0.01,
+        3_000_000,
+    )
 
 
 async def test_fields_are_passed_through_and_only_those_come_back():
@@ -189,7 +200,16 @@ async def test_a_statistic_the_panel_lacks_is_refused_by_name():
 async def test_the_panel_listing_is_relayed():
     capture = {}
     payload = {
-        "panels": [{"panel": "finngen_r12", "fields": ["r", "r2"], "r2_floor": 0.01, "max_distance": 3_000_000, "n_samples": 520_210, "description": "..."}],
+        "panels": [
+            {
+                "panel": "finngen_r12",
+                "fields": ["r", "r2"],
+                "r2_floor": 0.01,
+                "max_distance": 3_000_000,
+                "n_samples": 520_210,
+                "description": "...",
+            }
+        ],
         "default_panel": "sisu42",
         "upstream_fields": ["r2", "d_prime"],
     }
@@ -234,7 +254,9 @@ async def test_an_unreachable_ld_server_reads_as_unavailable_rather_than_as_a_ba
 
 async def test_a_variant_the_panel_does_not_carry_is_not_reported_as_an_outage():
     async with executor_with(
-        FakeResponse(status_code=404, payload={"detail": "6:44693011:A:G is not in LD panel sisu42"})
+        FakeResponse(
+            status_code=404, payload={"detail": "6:44693011:A:G is not in LD panel sisu42"}
+        )
     ) as executor:
         result = await executor.get_variants_in_ld("6:44693011:A:G")
 

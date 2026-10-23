@@ -65,10 +65,7 @@ def scores(values, quantiles=None, biosamples=None, genes=None):
         matrix = matrix.reshape(1, -1)
     quantile_rows = quantiles if quantiles is not None else [None] * matrix.shape[0]
     genes = genes or [None] * matrix.shape[0]
-    pairs = [
-        (None, entry(row, q, g))
-        for row, q, g in zip(matrix.tolist(), quantile_rows, genes)
-    ]
+    pairs = [(None, entry(row, q, g)) for row, q, g in zip(matrix.tolist(), quantile_rows, genes)]
     ann = _ann(pairs, biosamples=biosamples)
     if genes == [None] * matrix.shape[0]:
         ann.obs = ann.obs.drop(columns=["variant"])
@@ -300,9 +297,7 @@ def test_flattened_response_carries_the_validation_block():
 
 
 def test_flattening_returns_plain_json_able_python():
-    flat = alphagenome.flatten_scores(
-        scores([[0.4999, -0.1]], quantiles=[[0.987, 0.4]]), "DNASE"
-    )
+    flat = alphagenome.flatten_scores(scores([[0.4999, -0.1]], quantiles=[[0.987, 0.4]]), "DNASE")
     assert isinstance(flat["value"], float)
     for track in flat["top_tracks"]:
         assert set(track) == {"track", "biosample", "value", "quantile"}
@@ -311,9 +306,7 @@ def test_flattening_returns_plain_json_able_python():
 
 
 def test_the_quantile_is_returned_alongside_the_raw_score():
-    flat = alphagenome.flatten_scores(
-        scores([[0.4999, -0.1]], quantiles=[[0.987, 0.4]]), "DNASE"
-    )
+    flat = alphagenome.flatten_scores(scores([[0.4999, -0.1]], quantiles=[[0.987, 0.4]]), "DNASE")
     assert flat["value"] == pytest.approx(0.4999)
     assert flat["quantile"] == pytest.approx(0.987)
 
@@ -384,9 +377,7 @@ def test_a_magnitude_modality_hides_the_direction_in_the_quantile_too():
 
 
 def test_a_signed_modality_keeps_a_negative_quantile():
-    flat = alphagenome.flatten_scores(
-        scores([[-0.42, 0.10]], quantiles=[[-0.83, 0.20]]), "DNASE"
-    )
+    flat = alphagenome.flatten_scores(scores([[-0.42, 0.10]], quantiles=[[-0.83, 0.20]]), "DNASE")
     assert flat["quantile"] == pytest.approx(-0.83)
 
 
@@ -474,9 +465,7 @@ async def test_a_healthy_batch_is_one_call_split_back_apart_by_variant():
 async def test_two_ids_for_one_locus_are_both_scored():
     """Keyed by locus, the split would keep one id and report the other as all-null."""
     fake = FakeAtlas(responses={"chr1:100": {"DNASE": [entry([0.5])]}})
-    result = await _client(fake).score_variants(
-        ["1:100:A:G", "chr1:100:A:G"], modalities=["DNASE"]
-    )
+    result = await _client(fake).score_variants(["1:100:A:G", "chr1:100:A:G"], modalities=["DNASE"])
     assert len(fake.single_calls) == 2
     values = {r["variant"]["id"]: r["modalities"]["DNASE"]["value"] for r in result["results"]}
     assert values == {
@@ -799,7 +788,9 @@ async def test_the_delegate_passes_the_validation_block_through_structurally():
     validation = result["results"][0]["modalities"]["DNASE"]["validation"]
     assert validation == alphagenome.validation_metadata("DNASE")
     assert validation["rho_scope"] == "population"
-    assert validation["population_rho"] == pytest.approx(alphagenome.MODALITIES["DNASE"].population_rho)
+    assert validation["population_rho"] == pytest.approx(
+        alphagenome.MODALITIES["DNASE"].population_rho
+    )
 
 
 async def test_the_delegate_takes_a_comma_separated_string_too():

@@ -39,11 +39,32 @@ HLA_ROWS = [
 # (`[_serialize_value(v) for v in row.values()]`) with the names in a separate key —
 # unlike the results-api rows above, which arrive as dicts.
 ALLELE_COLUMNS = [
-    "phenotype", "gene", "allele", "mlog10p", "pval", "beta", "se",
-    "af", "af_cases", "af_controls", "info",
+    "phenotype",
+    "gene",
+    "allele",
+    "mlog10p",
+    "pval",
+    "beta",
+    "se",
+    "af",
+    "af_cases",
+    "af_controls",
+    "info",
 ]
 ALLELE_ROWS = [
-    ["K11_COELIAC", "HLA-DQB1", "DQB1*02:01", 1596.65, 0.0, 1.6397, 0.0421, 0.30, 0.51, 0.28, 0.96906]
+    [
+        "K11_COELIAC",
+        "HLA-DQB1",
+        "DQB1*02:01",
+        1596.65,
+        0.0,
+        1.6397,
+        0.0421,
+        0.30,
+        0.51,
+        0.28,
+        0.96906,
+    ]
 ]
 
 
@@ -168,7 +189,10 @@ class TestGetHlaByAllele:
                 return_value={
                     "success": True,
                     "columns": ["phenotype", "allele", "mlog10p"],
-                    "rows": [["K11_COELIAC", "DQB1*02:01", 1596.65], ["M13_ANKYLOSPON", "B*27:05", 88.2]],
+                    "rows": [
+                        ["K11_COELIAC", "DQB1*02:01", 1596.65],
+                        ["M13_ANKYLOSPON", "B*27:05", 88.2],
+                    ],
                 }
             )
 
@@ -186,10 +210,22 @@ class TestGetHlaByAllele:
     @pytest.mark.parametrize(
         "bad_result",
         [
-            {"success": True, "columns": ["phenotype", "allele"], "rows": [["K11", "B*27:05", 1.0]]},
-            {"success": True, "columns": ["phenotype", "allele", "mlog10p"], "rows": [["K11", "B*27:05"]]},
+            {
+                "success": True,
+                "columns": ["phenotype", "allele"],
+                "rows": [["K11", "B*27:05", 1.0]],
+            },
+            {
+                "success": True,
+                "columns": ["phenotype", "allele", "mlog10p"],
+                "rows": [["K11", "B*27:05"]],
+            },
             {"success": True, "columns": [], "rows": [["K11", "B*27:05"]]},
-            {"success": True, "columns": ["phenotype", "allele"], "rows": [{"phenotype": "K11", "allele": "B*27:05"}]},
+            {
+                "success": True,
+                "columns": ["phenotype", "allele"],
+                "rows": [{"phenotype": "K11", "allele": "B*27:05"}],
+            },
         ],
         ids=["row-too-long", "row-too-short", "no-column-names", "row-is-a-dict"],
     )

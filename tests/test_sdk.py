@@ -156,23 +156,42 @@ async def test_ld_dispatches_pair_vs_neighbourhood_with_shape_specific_defaults(
 
 
 async def test_ld_passes_fields_and_panel_through_and_frames_what_came_back():
-    client, executor = make_client({
-        "success": True, "variant1": "1:1:A:G", "variant2": "1:2:C:T", "in_ld": True,
-        "r": -0.95, "r2": 0.9025, "panel": "finngen_r12", "fields": ["r", "r2"],
-        "r2_floor": 0.01, "max_distance": 3_000_000,
-    })
-    frame = await client.ld("1:1:A:G", "1:2:C:T", r2_threshold=0, panel="finngen_r12", fields=["r", "r2"])
+    client, executor = make_client(
+        {
+            "success": True,
+            "variant1": "1:1:A:G",
+            "variant2": "1:2:C:T",
+            "in_ld": True,
+            "r": -0.95,
+            "r2": 0.9025,
+            "panel": "finngen_r12",
+            "fields": ["r", "r2"],
+            "r2_floor": 0.01,
+            "max_distance": 3_000_000,
+        }
+    )
+    frame = await client.ld(
+        "1:1:A:G", "1:2:C:T", r2_threshold=0, panel="finngen_r12", fields=["r", "r2"]
+    )
     assert executor.last[2] == {"r2_threshold": 0, "panel": "finngen_r12", "fields": ["r", "r2"]}
     assert frame.columns == ["variant1", "variant2", "in_ld", "r", "r2", "panel"]
     assert frame["r"][0] == -0.95
 
     # a pair below the floor keeps the statistic columns, as nulls, so a script can
     # read `r` off every answer in a loop without checking the shape first
-    client, executor = make_client({
-        "success": True, "variant1": "1:1:A:G", "variant2": "1:2:C:T", "in_ld": False,
-        "panel": "finngen_r12", "fields": ["r"], "r2_floor": 0.01, "max_distance": 3_000_000,
-        "message": "...",
-    })
+    client, executor = make_client(
+        {
+            "success": True,
+            "variant1": "1:1:A:G",
+            "variant2": "1:2:C:T",
+            "in_ld": False,
+            "panel": "finngen_r12",
+            "fields": ["r"],
+            "r2_floor": 0.01,
+            "max_distance": 3_000_000,
+            "message": "...",
+        }
+    )
     frame = await client.ld("1:1:A:G", "1:2:C:T", panel="finngen_r12", fields="r")
     assert frame.columns == ["variant1", "variant2", "in_ld", "r", "panel"]
     assert frame["r"][0] is None
@@ -184,12 +203,23 @@ async def test_ld_passes_fields_and_panel_through_and_frames_what_came_back():
 
 
 async def test_ld_panels_is_one_row_per_own_panel():
-    client, executor = make_client({
-        "success": True,
-        "panels": [{"panel": "finngen_r12", "fields": ["r", "r2"], "r2_floor": 0.01,
-                    "max_distance": 3_000_000, "n_samples": 520_210, "description": "d"}],
-        "default_panel": "sisu42", "upstream_fields": ["r2", "d_prime"],
-    })
+    client, executor = make_client(
+        {
+            "success": True,
+            "panels": [
+                {
+                    "panel": "finngen_r12",
+                    "fields": ["r", "r2"],
+                    "r2_floor": 0.01,
+                    "max_distance": 3_000_000,
+                    "n_samples": 520_210,
+                    "description": "d",
+                }
+            ],
+            "default_panel": "sisu42",
+            "upstream_fields": ["r2", "d_prime"],
+        }
+    )
     frame = await client.ld_panels()
     assert executor.last[0] == "get_ld_panels"
     assert frame["panel"].to_list() == ["finngen_r12"]
@@ -282,8 +312,13 @@ async def test_sql_with_no_rows_keeps_the_column_names():
 
 async def test_phenotypes_builds_one_query_over_phenotypes_v_keyed_on_the_code():
     client, executor = make_client(
-        {"success": True, "columns": ["dataset", "trait_original", "category"],
-         "rows": [["FinnGen_R14", "H8_HL_IDIOP", "VIII Diseases of the ear and mastoid process (H8_)"]]}
+        {
+            "success": True,
+            "columns": ["dataset", "trait_original", "category"],
+            "rows": [
+                ["FinnGen_R14", "H8_HL_IDIOP", "VIII Diseases of the ear and mastoid process (H8_)"]
+            ],
+        }
     )
     frame = await client.phenotypes(codes=["H8_HL_IDIOP", "T2D"], resource="finngen")
     name, args, _kwargs = executor.last
@@ -343,9 +378,7 @@ async def test_bigquery_rows_are_named_by_the_query_columns():
 
 
 async def test_bigquery_empty_result_keeps_its_schema():
-    client, _ = make_client(
-        {"success": True, "results": [], "columns": ["variant", "pip"]}
-    )
+    client, _ = make_client({"success": True, "results": [], "columns": ["variant", "pip"]})
     frame = await client.credible_sets(gene="IL7R")
     assert frame.columns == ["variant", "pip"]
     assert frame.height == 0
@@ -354,7 +387,9 @@ async def test_bigquery_empty_result_keeps_its_schema():
 async def test_truncated_result_raises_instead_of_returning_a_prefix():
     """Silent truncation is the one failure a script cannot detect: the frame is
     well-formed and merely missing rows."""
-    client, _ = make_client({"success": True, "results": [[1]], "columns": ["x"], "truncated": True})
+    client, _ = make_client(
+        {"success": True, "results": [[1]], "columns": ["x"], "truncated": True}
+    )
     with pytest.raises(GeneticsError, match="truncated"):
         await client.mpra(gene="APOE")
 
@@ -363,14 +398,16 @@ async def test_sql_truncation_names_the_cap_db_api_actually_applied():
     """The old message named no number at all, and the only string that did named 100,000 —
     db-api's relaxed transfer cap, four times what a sandbox execution runs under. The number
     is db-api's constant, so it is quoted from the response, never hardcoded here."""
-    client, _ = make_client({
-        "success": True,
-        "rows": [[1]],
-        "columns": ["x"],
-        "truncated": True,
-        "capped_by_server": True,
-        "server_row_cap": 25_000,
-    })
+    client, _ = make_client(
+        {
+            "success": True,
+            "rows": [[1]],
+            "columns": ["x"],
+            "truncated": True,
+            "capped_by_server": True,
+            "server_row_cap": 25_000,
+        }
+    )
     with pytest.raises(GeneticsError, match=r"row cap of 25,000 rows"):
         await client.sql("SELECT 1")
 
@@ -378,13 +415,15 @@ async def test_sql_truncation_names_the_cap_db_api_actually_applied():
 async def test_sql_truncation_degrades_when_the_cap_is_not_reported():
     """An older db-api sends no `max_rows_applied`; the error must still fire and still say
     which ceiling was hit, just without a number."""
-    client, _ = make_client({
-        "success": True,
-        "rows": [[1]],
-        "columns": ["x"],
-        "truncated": True,
-        "capped_by_server": True,
-    })
+    client, _ = make_client(
+        {
+            "success": True,
+            "rows": [[1]],
+            "columns": ["x"],
+            "truncated": True,
+            "capped_by_server": True,
+        }
+    )
     with pytest.raises(GeneticsError, match=r"db-api's row cap, so rows are missing"):
         await client.sql("SELECT 1")
 
@@ -392,13 +431,15 @@ async def test_sql_truncation_degrades_when_the_cap_is_not_reported():
 async def test_a_truncation_the_server_did_not_cause_keeps_the_generic_advice():
     """`truncated` also covers the executor's own LLM-facing slice and the typed endpoints,
     where raising `limit` IS the remedy. Only the server-capped case says otherwise."""
-    client, _ = make_client({
-        "success": True,
-        "rows": [[1]],
-        "columns": ["x"],
-        "truncated": True,
-        "capped_by_server": False,
-    })
+    client, _ = make_client(
+        {
+            "success": True,
+            "rows": [[1]],
+            "columns": ["x"],
+            "truncated": True,
+            "capped_by_server": False,
+        }
+    )
     with pytest.raises(GeneticsError, match=r"raise `limit`"):
         await client.sql("SELECT 1")
 
@@ -442,14 +483,16 @@ async def test_typed_methods_name_the_cap_end_to_end(method, kwargs):
     `truncated`, so the cap keys never reached the SDK and the caller was told to "raise
     `limit`" for a ceiling `limit` cannot move.
     """
-    client, executor = _client_over_real_executor({
-        "columns": ["x"],
-        "rows": [[1]],
-        "total_rows": 90_000,
-        "bytes_processed": 10,
-        "truncated": True,
-        "max_rows_applied": 25_000,
-    })
+    client, executor = _client_over_real_executor(
+        {
+            "columns": ["x"],
+            "rows": [[1]],
+            "total_rows": 90_000,
+            "bytes_processed": 10,
+            "truncated": True,
+            "max_rows_applied": 25_000,
+        }
+    )
     try:
         with pytest.raises(GeneticsError, match=r"row cap of 25,000 rows"):
             await getattr(client, method)(**kwargs)
@@ -460,12 +503,14 @@ async def test_typed_methods_name_the_cap_end_to_end(method, kwargs):
 async def test_typed_methods_drop_the_number_when_db_api_does_not_report_a_cap():
     """A db-api predating `max_rows_applied` reports the cut and no cap. The typed path must
     still raise and still say which ceiling was hit — just without inventing a number."""
-    client, executor = _client_over_real_executor({
-        "columns": ["x"],
-        "rows": [[1]],
-        "total_rows": 90_000,
-        "truncated": True,
-    })
+    client, executor = _client_over_real_executor(
+        {
+            "columns": ["x"],
+            "rows": [[1]],
+            "total_rows": 90_000,
+            "truncated": True,
+        }
+    )
     try:
         with pytest.raises(GeneticsError, match=r"db-api's row cap, so rows are missing"):
             await client.mpra(gene="APOE")
@@ -478,13 +523,15 @@ async def test_sql_sends_the_scripts_limit_to_db_api_unstripped():
     has no download, and under the 25 000-row sandbox cap that stripping turned
     `ORDER BY mlog10p DESC LIMIT 10` over a 108 490-row view into a truncated result and a
     GeneticsError telling the model to bound a query it had already bounded."""
-    client, executor = _client_over_real_executor({
-        "columns": ["x"],
-        "rows": [[1]],
-        "total_rows": 1,
-        "truncated": False,
-        "max_rows_applied": 25_000,
-    })
+    client, executor = _client_over_real_executor(
+        {
+            "columns": ["x"],
+            "rows": [[1]],
+            "total_rows": 1,
+            "truncated": False,
+            "max_rows_applied": 25_000,
+        }
+    )
     try:
         await client.sql("SELECT x FROM credible_sets_v ORDER BY x DESC LIMIT 10")
         sent = executor.client.post.await_args.kwargs["json"]["sql"]
@@ -575,9 +622,7 @@ async def test_hla_by_allele_rows_are_named_by_the_query_columns():
 
 async def test_hla_by_allele_empty_result_keeps_its_schema():
     """A script filtering a no-hit allele must get an empty frame, not ColumnNotFound."""
-    client, _ = make_client(
-        {"success": True, "results": [], "columns": ["phenotype", "mlog10p"]}
-    )
+    client, _ = make_client({"success": True, "results": [], "columns": ["phenotype", "mlog10p"]})
     frame = await client.hla(allele="B*27:05")
     assert frame.columns == ["phenotype", "mlog10p"]
     assert frame.height == 0
@@ -659,7 +704,9 @@ async def test_rcnv_defaults_keep_the_no_estimate_rows_out():
 async def test_rcnv_leaves_the_at_least_one_selector_rule_to_the_executor():
     """Unlike the `_one_of` products, BOTH selectors may be given here, so the SDK cannot
     use that helper and the refusal comes back as a raised GeneticsError instead."""
-    client, _ = make_client({"success": False, "error": "Provide at least one of gene= or phenotype="})
+    client, _ = make_client(
+        {"success": False, "error": "Provide at least one of gene= or phenotype="}
+    )
     with pytest.raises(GeneticsError, match="at least one of"):
         await client.rcnv()
 
@@ -814,8 +861,10 @@ async def test_show_says_so_rather_than_printing_nothing_for_an_empty_frame(caps
     ("data", "expected"),
     [
         ([{"a": 1, "b": 2}, {"a": 3, "b": 4}], ["a=1 | b=2", "a=3 | b=4"]),
-        ({"credible_sets_v": "one", "colocalization_v": "two"},
-         ["credible_sets_v=one", "colocalization_v=two"]),
+        (
+            {"credible_sets_v": "one", "colocalization_v": "two"},
+            ["credible_sets_v=one", "colocalization_v=two"],
+        ),
         ([], ["(empty)"]),
         (["IL7R", "TP53"], ["IL7R", "TP53"]),
         ("plain", ["plain"]),
@@ -903,7 +952,8 @@ class TestInputFiles:
             genetics.open_input("data.tsv", "rb", encoding="utf-8")
 
     @pytest.mark.parametrize(
-        "name", ["", ".", "..", "../data.tsv", "sub/data.tsv", "sub\\data.tsv", "/etc/passwd", 42, None]
+        "name",
+        ["", ".", "..", "../data.tsv", "sub/data.tsv", "sub\\data.tsv", "/etc/passwd", 42, None],
     )
     def test_a_name_that_is_not_a_bare_file_name_is_refused(self, inputs_dir, name):
         """No name can reach outside the directory: one with a separator is refused outright,

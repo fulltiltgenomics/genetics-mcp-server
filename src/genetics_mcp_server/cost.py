@@ -12,24 +12,24 @@ import re
 # would be 1.25x. Cache reads are 0.1x input everywhere except Fable 5.1, where Anthropic
 # cut them to 0.025x.
 _PRICING: list[tuple[str, tuple[int, int], tuple[float, float, float, float]]] = [
-    ("fable",  (5, 1), (10.0, 50.0, 0.25, 20.0)),
-    ("fable",  (5, 0), (10.0, 50.0, 1.0,  20.0)),
-    ("opus",   (4, 5), (5.0,  25.0, 0.50, 10.0)),
-    ("opus",   (0, 0), (15.0, 75.0, 1.50, 30.0)),
-    ("sonnet", (5, 0), (2.0,  10.0, 0.20, 4.0)),
-    ("sonnet", (0, 0), (3.0,  15.0, 0.30, 6.0)),
-    ("haiku",  (4, 5), (1.0,  5.0,  0.10, 2.0)),
-    ("haiku",  (0, 0), (0.80, 4.0,  0.08, 1.6)),
+    ("fable", (5, 1), (10.0, 50.0, 0.25, 20.0)),
+    ("fable", (5, 0), (10.0, 50.0, 1.0, 20.0)),
+    ("opus", (4, 5), (5.0, 25.0, 0.50, 10.0)),
+    ("opus", (0, 0), (15.0, 75.0, 1.50, 30.0)),
+    ("sonnet", (5, 0), (2.0, 10.0, 0.20, 4.0)),
+    ("sonnet", (0, 0), (3.0, 15.0, 0.30, 6.0)),
+    ("haiku", (4, 5), (1.0, 5.0, 0.10, 2.0)),
+    ("haiku", (0, 0), (0.80, 4.0, 0.08, 1.6)),
 ]
 
 # what an unrecognised model is priced at; `has_pricing` lets callers refuse instead
 _FALLBACK_PRICING = (3.0, 15.0, 0.30, 6.0)
 
 _CONTEXT_WINDOWS: dict[str, int] = {
-    "fable":  1_000_000,
-    "opus":   1_000_000,
+    "fable": 1_000_000,
+    "opus": 1_000_000,
     "sonnet": 200_000,
-    "haiku":  200_000,
+    "haiku": 200_000,
 }
 
 # `claude-<family>-<major>[-<minor>][-<yyyymmdd>]`. The minor group also swallows a date

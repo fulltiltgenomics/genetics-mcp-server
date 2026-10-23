@@ -246,9 +246,7 @@ class KeycloakTarget:
         resp.raise_for_status()
         return resp.json()["access_token"]
 
-    async def sync(
-        self, desired: set[str], ended: list[str], reactivated: list[str]
-    ) -> list[str]:
+    async def sync(self, desired: set[str], ended: list[str], reactivated: list[str]) -> list[str]:
         """Apply the attribute and account states. Returns the ended addresses actually disabled."""
         admin = f"/admin/realms/{self.realm}"
         async with httpx.AsyncClient(base_url=self.base_url, timeout=15.0) as client:
@@ -268,8 +266,12 @@ class KeycloakTarget:
                 realm["attributes"] = attributes
                 resp = await client.put(admin, json=realm)
                 resp.raise_for_status()
-                logger.info("keycloak realm %s: %s now holds %d addresses",
-                            self.realm, REALM_ATTRIBUTE, len(desired))
+                logger.info(
+                    "keycloak realm %s: %s now holds %d addresses",
+                    self.realm,
+                    REALM_ATTRIBUTE,
+                    len(desired),
+                )
 
             disabled: list[str] = []
             for email in ended:

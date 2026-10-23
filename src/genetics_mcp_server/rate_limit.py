@@ -32,7 +32,9 @@ def configure(max_per_hour: int, max_per_day: int, max_per_week: int) -> None:
     _max_per_hour = max_per_hour
     _max_per_day = max_per_day
     _max_per_week = max_per_week
-    logger.info(f"Rate limit configured: {max_per_hour}/hour, {max_per_day}/day, {max_per_week}/week")
+    logger.info(
+        f"Rate limit configured: {max_per_hour}/hour, {max_per_day}/day, {max_per_week}/week"
+    )
 
 
 def check_rate_limit(user: str) -> tuple[bool, str | None]:

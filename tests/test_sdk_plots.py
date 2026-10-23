@@ -134,8 +134,12 @@ def test_variant_centres_a_region_and_region_and_variant_are_exclusive(tmp_path)
 
     with pytest.raises(GeneticsUsageError, match="not both"):
         plots.locuszoom(
-            phenotype="X", region="12:1-2", variant="12:3:A:G", data=frame_of(),
-            ld=False, genes=False,
+            phenotype="X",
+            region="12:1-2",
+            variant="12:3:A:G",
+            data=frame_of(),
+            ld=False,
+            genes=False,
         )
     with pytest.raises(GeneticsUsageError, match="region= or variant="):
         plots.locuszoom(phenotype="X", data=frame_of(), ld=False, genes=False)
@@ -261,9 +265,7 @@ def test_a_gene_overlapping_the_boundary_does_not_widen_the_association_panel(
     )
     assert result["n_genes"] == 1
     _lo, hi = drawn["figure"].axes[0].get_xlim()
-    assert hi < frame["pos"].max() + 10_000, (
-        f"the gene track widened the shared axis to {hi}"
-    )
+    assert hi < frame["pos"].max() + 10_000, f"the gene track widened the shared axis to {hi}"
     plt.close("all")
 
 
@@ -293,8 +295,12 @@ def test_a_relative_path_lands_in_the_artifacts_directory(tmp_path, monkeypatch)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(artifacts))
     monkeypatch.chdir(cwd)
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=False, path="hearing_loss.png",
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=False,
+        path="hearing_loss.png",
     )
     assert result["path"] == str(artifacts / "hearing_loss.png")
     assert (artifacts / "hearing_loss.png").exists()
@@ -306,17 +312,19 @@ def test_an_absolute_path_is_honoured_as_given(tmp_path, monkeypatch):
     (tmp_path / "artifacts").mkdir()
     target = tmp_path / "somewhere_else.png"
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=False, path=str(target),
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=False,
+        path=str(target),
     )
     assert result["path"] == str(target)
     assert target.exists()
     assert not list((tmp_path / "artifacts").iterdir())
 
 
-def test_ld_is_asked_for_over_more_than_the_plotted_span_and_above_a_floor(
-    monkeypatch, tmp_path
-):
+def test_ld_is_asked_for_over_more_than_the_plotted_span_and_above_a_floor(monkeypatch, tmp_path):
     """Both halves matter. r2>=0 makes the server answer with the whole panel, which buries
     the colour and truncates positionally; a window equal to the plot cannot see a partner
     just outside it."""
@@ -326,13 +334,19 @@ def test_ld_is_asked_for_over_more_than_the_plotted_span_and_above_a_floor(
 
     def fake_ld(variant, *, window, r2_threshold, panel):
         seen.update(variant=variant, window=window, r2_threshold=r2_threshold, panel=panel)
-        return pl.DataFrame({"variant": [], "r2": []}, schema={"variant": pl.Utf8, "r2": pl.Float64})
+        return pl.DataFrame(
+            {"variant": [], "r2": []}, schema={"variant": pl.Utf8, "r2": pl.Float64}
+        )
 
     monkeypatch.setattr(sdk, "ld", fake_ld)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     frame = frame_of(n=25)  # 24 kb of positions
     plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame, genes=False, ld=True,
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame,
+        genes=False,
+        ld=True,
     )
     span = int(frame["pos"].max()) - int(frame["pos"].min())
     assert seen["r2_threshold"] == plots._LD_MIN_R2 > 0
@@ -357,7 +371,11 @@ def test_a_correlated_partner_outside_the_window_is_reported_and_drawn(monkeypat
     monkeypatch.setattr(sdk, "ld", fake_ld)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), genes=False, ld=True,
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        genes=False,
+        ld=True,
     )
     outside = result["ld_partners_outside_window"]
     # 0.05 is below the reporting floor, 0.9 is inside the plotted span
@@ -377,8 +395,14 @@ def test_nothing_outside_the_window_reports_an_empty_list_not_a_missing_key(tmp_
 def test_partners_outside_ranks_by_r2_and_ignores_what_it_cannot_place():
     ld = pl.DataFrame(
         {
-            "variant": ["12:100:A:G", "12:900:A:G", "12:950:A:G", "not-a-variant",
-                        "12:500:A:G", "12:80:A:G"],
+            "variant": [
+                "12:100:A:G",
+                "12:900:A:G",
+                "12:950:A:G",
+                "not-a-variant",
+                "12:500:A:G",
+                "12:80:A:G",
+            ],
             "r2": [0.7, 0.9, None, 0.99, 0.95, 0.3],
         }
     )
@@ -393,9 +417,7 @@ def test_a_weakly_correlated_partner_outside_the_window_is_not_reported():
     makes this a threshold rather than a preference."""
     just_over = plots._LD_NOTABLE_R2
     just_under = plots._LD_NOTABLE_R2 - 0.01
-    ld = pl.DataFrame(
-        {"variant": ["12:100:A:G", "12:900:A:G"], "r2": [just_under, just_over]}
-    )
+    ld = pl.DataFrame({"variant": ["12:100:A:G", "12:900:A:G"], "r2": [just_under, just_over]})
     assert [p["r2"] for p in plots._partners_outside(ld, 400, 600)] == [just_over]
 
 
@@ -414,11 +436,11 @@ def test_dir_of_the_sdk_package_lists_the_lazily_resolved_plots_module():
 @pytest.mark.parametrize(
     "mlog10p,expected",
     [
-        (12.6814, "2.08e-13"),   # 12:49272869:C:T for hearing loss, p=2.08257e-13
-        (17.1694, "6.77e-18"),   # the same variant for potassium, p=6.77018e-18
-        (0.282271, "5.22e-1"),   # p=0.52207
-        (13.0, "1.00e-13"),      # integral: 10.0e-14 must normalise
-        (400.5, "3.16e-401"),    # 10 ** -400.5 is 0.0 in a float; this is the whole point
+        (12.6814, "2.08e-13"),  # 12:49272869:C:T for hearing loss, p=2.08257e-13
+        (17.1694, "6.77e-18"),  # the same variant for potassium, p=6.77018e-18
+        (0.282271, "5.22e-1"),  # p=0.52207
+        (13.0, "1.00e-13"),  # integral: 10.0e-14 must normalise
+        (400.5, "3.16e-401"),  # 10 ** -400.5 is 0.0 in a float; this is the whole point
         (0.0, "1"),
         (None, "1"),
     ],
@@ -437,14 +459,19 @@ def test_the_lead_label_carries_p_beta_and_af_and_skips_what_is_absent():
 
 def test_the_lead_label_names_the_gene_and_the_consequence_when_annotated():
     labelled = plots._lead_label(
-        "12:49272869:C:T", {"beta": 1.17569, "af": 0.00234211}, 12.6814,
-        "missense_variant", "TUBA1C",
+        "12:49272869:C:T",
+        {"beta": 1.17569, "af": 0.00234211},
+        12.6814,
+        "missense_variant",
+        "TUBA1C",
     )
     assert labelled.splitlines()[0] == "12:49272869:C:T  TUBA1C missense"
     # an intergenic lead has a consequence and no gene; losing the consequence too would be
     # dropping the more informative half
-    assert plots._lead_label("12:1:A:G", {}, 3.0, "intergenic_variant", None).splitlines()[0] \
+    assert (
+        plots._lead_label("12:1:A:G", {}, 3.0, "intergenic_variant", None).splitlines()[0]
         == "12:1:A:G  intergenic"
+    )
     assert plots._lead_label("12:1:A:G", {}, 3.0, None, None).splitlines()[0] == "12:1:A:G"
 
 
@@ -461,8 +488,12 @@ def test_coding_consequences_square_and_everything_else_circles(monkeypatch, tmp
                 # sequence and leaves the protein identical; splice_region is up to 8bp into
                 # an intron; UTR/intron/intergenic are not coding at all
                 "most_severe": [
-                    "missense_variant", "synonymous_variant", "splice_region_variant",
-                    "3_prime_UTR_variant", "intron_variant", "intergenic_variant",
+                    "missense_variant",
+                    "synonymous_variant",
+                    "splice_region_variant",
+                    "3_prime_UTR_variant",
+                    "intron_variant",
+                    "intergenic_variant",
                 ],
             }
         )
@@ -483,20 +514,22 @@ def test_the_coding_set_is_the_one_the_rest_of_the_suite_uses():
     name the annotation actually holds: `transcript_ablation` occurs in the data and
     `transcript_ablation_variant` does not, so the suffixed spelling matched nothing.
     """
-    assert plots._CODING_CONSEQUENCES == frozenset({
-        "frameshift_variant",
-        "inframe_deletion",
-        "inframe_insertion",
-        "incomplete_terminal_codon_variant",
-        "missense_variant",
-        "protein_altering_variant",
-        "splice_acceptor_variant",
-        "splice_donor_variant",
-        "start_lost",
-        "stop_gained",
-        "stop_lost",
-        "transcript_ablation",
-    })
+    assert plots._CODING_CONSEQUENCES == frozenset(
+        {
+            "frameshift_variant",
+            "inframe_deletion",
+            "inframe_insertion",
+            "incomplete_terminal_codon_variant",
+            "missense_variant",
+            "protein_altering_variant",
+            "splice_acceptor_variant",
+            "splice_donor_variant",
+            "start_lost",
+            "stop_gained",
+            "stop_lost",
+            "transcript_ablation",
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -541,8 +574,12 @@ def test_coding_false_skips_the_fetch_entirely(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk, "variant_annotation", refuse)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=False, coding=False,
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=False,
+        coding=False,
     )
     assert result["coding_marked"] is False
     assert result["lead_consequence"] is None and result["lead_gene"] is None
@@ -558,8 +595,12 @@ def test_the_lead_is_not_a_diamond_and_the_significance_line_is_grey(monkeypatch
     monkeypatch.setattr(sdk, "variant_annotation", lambda **k: pl.DataFrame())
     _figure, ax = plt.subplots()
     plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=False, ax=ax,
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=False,
+        ax=ax,
     )
     # reference paths built by scatter itself: a MarkerStyle path is transformed on the way
     # into a collection, so comparing against MarkerStyle("D").get_path() never matches and
@@ -599,8 +640,12 @@ def test_the_lead_annotation_sits_below_the_point(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk, "variant_annotation", lambda **k: pl.DataFrame())
     _figure, ax = plt.subplots()
     plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=False, ax=ax,
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=False,
+        ax=ax,
     )
     note = next(t for t in ax.texts if "\np " in t.get_text())
     assert note.get_verticalalignment() == "top"
@@ -613,19 +658,31 @@ def test_the_leads_gene_and_consequence_are_drawn_and_returned(monkeypatch, tmp_
 
     lead = "12:49503000:C:T"
     monkeypatch.setattr(
-        sdk, "variant_annotation",
+        sdk,
+        "variant_annotation",
         lambda **k: pl.DataFrame(
-            {"variant": [lead], "most_severe": ["missense_variant"],
-             "gene_most_severe": ["TUBA1C"]}
+            {"variant": [lead], "most_severe": ["missense_variant"], "gene_most_severe": ["TUBA1C"]}
         ),
     )
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
-    frame = sumstats([{
-        "chr": "12", "pos": 49_503_000, "ref": "C", "alt": "T",
-        "pval": 2.08257e-13, "mlog10p": 12.6814,
-    }])
+    frame = sumstats(
+        [
+            {
+                "chr": "12",
+                "pos": 49_503_000,
+                "ref": "C",
+                "alt": "T",
+                "pval": 2.08257e-13,
+                "mlog10p": 12.6814,
+            }
+        ]
+    )
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame, ld=False, genes=False,
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame,
+        ld=False,
+        genes=False,
     )
     assert result["lead_consequence"] == "missense_variant"
     assert result["lead_gene"] == "TUBA1C"
@@ -667,9 +724,9 @@ def test_exon_spans_pairs_each_exon_with_its_own_coding_bounds():
 @pytest.mark.parametrize(
     "gene",
     [
-        {},                                                    # a results-api with no exons
-        {"exon_starts": [], "exon_ends": []},                  # a release with no exon file
-        {"exon_starts": [1, 2], "exon_ends": [3]},             # lists that cannot be paired
+        {},  # a results-api with no exons
+        {"exon_starts": [], "exon_ends": []},  # a release with no exon file
+        {"exon_starts": [1, 2], "exon_ends": [3]},  # lists that cannot be paired
     ],
 )
 def test_a_gene_without_usable_exon_structure_draws_its_body_alone(gene):
@@ -692,9 +749,9 @@ def test_a_coding_exon_is_drawn_thicker_than_its_utr_and_the_body_thinnest():
     ], "the three tiers of a gene model are not all present and distinct"
 
     utr_only = [
-        line for line in ax.lines
-        if line.get_linewidth() == plots._GENE_CDS_WIDTH
-        and list(line.get_xdata())[0] == 55_039_445
+        line
+        for line in ax.lines
+        if line.get_linewidth() == plots._GENE_CDS_WIDTH and list(line.get_xdata())[0] == 55_039_445
     ]
     assert not utr_only, "an untranslated exon was given a coding bar"
 
@@ -720,24 +777,36 @@ def test_locuszoom_reports_how_many_exons_it_drew(tmp_path, monkeypatch):
     from genetics_mcp_server import sdk
 
     with_exons = pl.DataFrame(
-        {**PCSK9, "gene_start": [49_490_000], "gene_end": [49_530_000],
-         "exon_starts": [[49_500_000, 49_510_000]],
-         "exon_ends": [[49_500_400, 49_510_600]],
-         "cds_starts": [[None, 49_510_000]],
-         "cds_ends": [[None, 49_510_600]]}
+        {
+            **PCSK9,
+            "gene_start": [49_490_000],
+            "gene_end": [49_530_000],
+            "exon_starts": [[49_500_000, 49_510_000]],
+            "exon_ends": [[49_500_400, 49_510_600]],
+            "cds_starts": [[None, 49_510_000]],
+            "cds_ends": [[None, 49_510_600]],
+        }
     )
     monkeypatch.setattr(sdk, "gene_annotations", lambda **_kw: with_exons, raising=False)
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=True, path=str(tmp_path / "with.png"),
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=True,
+        path=str(tmp_path / "with.png"),
     )
     assert (result["n_genes"], result["n_exons"]) == (1, 2)
 
     bodies_only = with_exons.drop(["exon_starts", "exon_ends", "cds_starts", "cds_ends"])
     monkeypatch.setattr(sdk, "gene_annotations", lambda **_kw: bodies_only, raising=False)
     result = plots.locuszoom(
-        phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-        genes=True, path=str(tmp_path / "without.png"),
+        phenotype="X",
+        region="12:49400000-49600000",
+        data=frame_of(),
+        ld=False,
+        genes=True,
+        path=str(tmp_path / "without.png"),
     )
     assert (result["n_genes"], result["n_exons"]) == (1, 0)
     plt.close("all")
@@ -780,9 +849,7 @@ def test_the_body_spans_the_transcript_and_not_the_gene_record():
 def test_a_gene_with_no_exons_still_spans_its_record():
     """There is nothing else to draw it from, and it is what the track did before exons."""
     figure, ax = gene_axis()
-    bodies_only = pl.DataFrame(TUBA1C).drop(
-        ["exon_starts", "exon_ends", "cds_starts", "cds_ends"]
-    )
+    bodies_only = pl.DataFrame(TUBA1C).drop(["exon_starts", "exon_ends", "cds_starts", "cds_ends"])
     drawn, exons = plots._draw_genes(ax, bodies_only, 49_150_000, 49_300_000)
 
     assert (drawn, exons) == (1, 0)
@@ -872,8 +939,11 @@ def drawn_figure(monkeypatch, tmp_path, annotations=None, **over):
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
 
     kwargs = {
-        "phenotype": "X", "region": "12:49400000-49600000", "data": frame_of(),
-        "ld": False, "genes": True,
+        "phenotype": "X",
+        "region": "12:49400000-49600000",
+        "data": frame_of(),
+        "ld": False,
+        "genes": True,
     }
     kwargs.update(over)
     result = plots.locuszoom(**kwargs)
@@ -919,7 +989,8 @@ def test_the_legend_names_the_lead_and_the_panel_the_r2_came_from(monkeypatch, t
     from genetics_mcp_server import sdk
 
     monkeypatch.setattr(
-        sdk, "ld",
+        sdk,
+        "ld",
         lambda variant, **k: pl.DataFrame({"variant": ["12:49501000:C:T"], "r2": [0.9]}),
     )
     result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path, ld=True, ld_panel="sisu99")
@@ -966,14 +1037,27 @@ def test_the_caption_shortens_the_term_and_the_returned_dict_keeps_it(monkeypatc
     """Two audiences: a reader wants `missense`, and a follow-up query filters on the VEP
     term, which `missense` would not match."""
     lead = "12:49503000:C:T"
-    frame = sumstats([{
-        "chr": "12", "pos": 49_503_000, "ref": "C", "alt": "T",
-        "pval": 2.08257e-13, "mlog10p": 12.6814,
-    }])
+    frame = sumstats(
+        [
+            {
+                "chr": "12",
+                "pos": 49_503_000,
+                "ref": "C",
+                "alt": "T",
+                "pval": 2.08257e-13,
+                "mlog10p": 12.6814,
+            }
+        ]
+    )
     result, ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, data=frame,
-        annotations={"variant": [lead], "most_severe": ["missense_variant"],
-                     "gene_most_severe": ["TUBA1C"]},
+        monkeypatch,
+        tmp_path,
+        data=frame,
+        annotations={
+            "variant": [lead],
+            "most_severe": ["missense_variant"],
+            "gene_most_severe": ["TUBA1C"],
+        },
     )
     assert result["lead_consequence"] == "missense_variant"
     caption = next(t.get_text() for t in ax.texts if lead in t.get_text())
@@ -987,16 +1071,22 @@ def test_no_caption_on_the_figure_reads_as_an_assignment(monkeypatch, tmp_path):
     from genetics_mcp_server import sdk
 
     monkeypatch.setattr(
-        sdk, "ld",
+        sdk,
+        "ld",
         # one partner past the right edge, so the outside-window note is drawn too
         lambda variant, **k: pl.DataFrame(
             {"variant": ["12:49501000:C:T", "12:49900000:G:A"], "r2": [0.9, 0.78]}
         ),
     )
     _result, ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, ld=True,
-        annotations={"variant": ["12:49503000:C:T"], "most_severe": ["missense_variant"],
-                     "gene_most_severe": ["TUBA1C"]},
+        monkeypatch,
+        tmp_path,
+        ld=True,
+        annotations={
+            "variant": ["12:49503000:C:T"],
+            "most_severe": ["missense_variant"],
+            "gene_most_severe": ["TUBA1C"],
+        },
     )
     drawn = [t.get_text() for t in ax.texts]
     assert any("kb out" in t for t in drawn), "the outside-window note was not drawn"
@@ -1008,8 +1098,7 @@ def test_no_caption_on_the_figure_reads_as_an_assignment(monkeypatch, tmp_path):
 # ------------------------------------------------------------------------- the title
 
 
-def title_env(monkeypatch, *, name="Sudden idiopathic hearing loss",
-              label="FinnGen", raises=None):
+def title_env(monkeypatch, *, name="Sudden idiopathic hearing loss", label="FinnGen", raises=None):
     from genetics_mcp_server import sdk
 
     plots._RESOURCE_LABELS = None  # the cache is process-wide; each case starts cold
@@ -1040,9 +1129,12 @@ def sumstats_with_version(version="R14", resource="finngen"):
 
 def test_the_title_names_the_trait_the_code_and_the_release(monkeypatch):
     title_env(monkeypatch)
-    assert plots._default_title(
-        "H8_HL_IDIOP", "12:49022869-49522869", sumstats_with_version(), "finngen"
-    ) == "Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14) — 12:49022869-49522869"
+    assert (
+        plots._default_title(
+            "H8_HL_IDIOP", "12:49022869-49522869", sumstats_with_version(), "finngen"
+        )
+        == "Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen R14) — 12:49022869-49522869"
+    )
 
 
 def test_the_release_and_resource_come_off_the_frame_not_the_argument(monkeypatch):
@@ -1062,11 +1154,13 @@ def test_the_release_and_resource_come_off_the_frame_not_the_argument(monkeypatc
         ({"name": None}, {}, "H8_HL_IDIOP (FinnGen R14) — 12:1-2"),
         ({"name": "Unknown: H8_HL_IDIOP"}, {}, "H8_HL_IDIOP (FinnGen R14) — 12:1-2"),
         # a frame with no release still names the resource
-        ({}, {"version": None},
-         "Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen) — 12:1-2"),
+        ({}, {"version": None}, "Sudden idiopathic hearing loss (H8_HL_IDIOP, FinnGen) — 12:1-2"),
         # both lookups down: the resource argument is all that is left, unlabelled
-        ({"raises": "name", "label": None}, {"version": None, "resource": None},
-         "H8_HL_IDIOP (finngen) — 12:1-2"),
+        (
+            {"raises": "name", "label": None},
+            {"version": None, "resource": None},
+            "H8_HL_IDIOP (finngen) — 12:1-2",
+        ),
     ],
 )
 def test_the_title_degrades_one_piece_at_a_time(monkeypatch, kwargs, frame_kwargs, expected):
@@ -1123,18 +1217,29 @@ def test_the_default_window_is_250kb_either_side():
 def flat_frame(top_af, *, top_mlog10p=4.2, af_column="af"):
     """A window with nothing significant, whose strongest variant has the given frequency."""
     rows = [
-        {"chr": "16", "pos": 6_000_000 + i * 1_000, "ref": "A", "alt": "G",
-         "mlog10p": 1.0 + (i % 5) * 0.5, af_column: 0.2}
+        {
+            "chr": "16",
+            "pos": 6_000_000 + i * 1_000,
+            "ref": "A",
+            "alt": "G",
+            "mlog10p": 1.0 + (i % 5) * 0.5,
+            af_column: 0.2,
+        }
         for i in range(20)
     ]
-    rows[4].update(mlog10p=3.8, **{af_column: 0.046})   # the best common variant
+    rows[4].update(mlog10p=3.8, **{af_column: 0.046})  # the best common variant
     rows[9].update(mlog10p=top_mlog10p, **{af_column: top_af})
     return pl.DataFrame(rows)
 
 
 def lead_of(frame, **over):
-    kwargs = {"phenotype": "X", "region": "16:6000000-6020000", "data": frame,
-              "ld": False, "genes": False}
+    kwargs = {
+        "phenotype": "X",
+        "region": "16:6000000-6020000",
+        "data": frame,
+        "ld": False,
+        "genes": False,
+    }
     kwargs.update(over)
     return plots.locuszoom(**kwargs)
 
@@ -1193,8 +1298,14 @@ def ld_answer(rows):
 def wide_frame():
     """3 Mb of positions with the lead at the left edge."""
     rows = [
-        {"chr": "16", "pos": 5_000_000 + i * 100_000, "ref": "A", "alt": "G",
-         "pval": 0.01, "mlog10p": 2.0}
+        {
+            "chr": "16",
+            "pos": 5_000_000 + i * 100_000,
+            "ref": "A",
+            "alt": "G",
+            "pval": 0.01,
+            "mlog10p": 2.0,
+        }
         for i in range(31)
     ]
     rows[0]["mlog10p"] = 30.0
@@ -1214,7 +1325,10 @@ def test_ld_is_never_asked_for_over_more_than_the_server_accepts(monkeypatch, tm
     monkeypatch.setattr(sdk, "ld", fake_ld)
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     result = plots.locuszoom(
-        phenotype="X", region="16:5000000-8000000", data=wide_frame(), genes=False,
+        phenotype="X",
+        region="16:5000000-8000000",
+        data=wide_frame(),
+        genes=False,
     )
     assert seen["window"] == plots.LD_MAX_WINDOW
     # the lead is at the left edge, so 2.5 Mb either side of it stops short of the right one
@@ -1299,16 +1413,18 @@ def test_a_gene_whose_transcript_misses_the_window_is_not_drawn():
     transcript ends 75 kb before the FCER1A window starts, and its label floated outside the
     axes with nothing under it."""
     _figure, ax = gene_axis()
-    genes = pl.DataFrame({
-        "gene_name": ["AIM2", "FCER1A"],
-        "gene_start": [159_056_129, 159_289_714],
-        "gene_end": [159_188_222, 159_308_224],
-        "gene_strand": ["-", "+"],
-        "exon_starts": [[159_062_484], [159_302_336]],
-        "exon_ends": [[159_076_766], [159_308_202]],
-        "cds_starts": [[None], [None]],
-        "cds_ends": [[None], [None]],
-    })
+    genes = pl.DataFrame(
+        {
+            "gene_name": ["AIM2", "FCER1A"],
+            "gene_start": [159_056_129, 159_289_714],
+            "gene_end": [159_188_222, 159_308_224],
+            "gene_strand": ["-", "+"],
+            "exon_starts": [[159_062_484], [159_302_336]],
+            "exon_ends": [[159_076_766], [159_308_202]],
+            "cds_starts": [[None], [None]],
+            "cds_ends": [[None], [None]],
+        }
+    )
     drawn, _exons = plots._draw_genes(ax, genes, 159_152_270, 159_452_270)
     assert drawn == 1
     assert [t.get_text() for t in ax.texts] == ["FCER1A→"]
@@ -1317,19 +1433,21 @@ def test_a_gene_whose_transcript_misses_the_window_is_not_drawn():
 @pytest.mark.parametrize(
     "symbol,expected",
     [
-        ("MINOS1", "MICOS10"),      # renamed since the annotation was built
+        ("MINOS1", "MICOS10"),  # renamed since the annotation was built
         ("MICOS10", "MICOS10"),
         ("NBL1", "NBL1"),
-        ("C1orf151", "C1orf151"),   # a previous symbol of two genes here: left alone
+        ("C1orf151", "C1orf151"),  # a previous symbol of two genes here: left alone
         ("NOT_HERE", "NOT_HERE"),
         (None, None),
     ],
 )
 def test_the_leads_gene_is_named_the_way_the_track_names_it(symbol, expected):
-    genes = pl.DataFrame({
-        "gene_name": ["MICOS10", "NBL1", "OTHER"],
-        "hgnc_prev_symbol": ["C1orf151|MINOS1", None, "C1orf151"],
-    })
+    genes = pl.DataFrame(
+        {
+            "gene_name": ["MICOS10", "NBL1", "OTHER"],
+            "hgnc_prev_symbol": ["C1orf151|MINOS1", None, "C1orf151"],
+        }
+    )
     assert plots._track_symbol(symbol, genes) == expected
     assert plots._track_symbol(symbol, None) == symbol
 
@@ -1373,15 +1491,11 @@ def test_the_lead_label_stays_inside_the_axes_and_off_the_points(monkeypatch, tm
     frame = ax.bbox
     assert box.x0 >= frame.x0 and box.x1 <= frame.x1, "the label leaves the axes"
     points = ax.transData.transform([(r["pos"], r["mlog10p"]) for r in rows])
-    covered = [
-        (x, y) for x, y in points if box.x0 <= x <= box.x1 and box.y0 <= y <= box.y1
-    ]
+    covered = [(x, y) for x, y in points if box.x0 <= x <= box.x1 and box.y0 <= y <= box.y1]
     assert not covered, "the label is drawn over data"
 
 
-def test_the_significance_label_is_on_the_right_where_the_legend_is_not(
-    monkeypatch, tmp_path
-):
+def test_the_significance_label_is_on_the_right_where_the_legend_is_not(monkeypatch, tmp_path):
     _result, ax, _gene_ax = drawn_figure(monkeypatch, tmp_path)
     label = next(t for t in ax.texts if t.get_text() == "p 5e-8")
     assert label.get_horizontalalignment() == "right"
@@ -1399,7 +1513,11 @@ def ld_frame_for(frame, r2s):
 def test_the_centred_variant_is_marked_when_it_is_not_the_lead(monkeypatch, tmp_path):
     """Asked for a plot of rs2251746, the figure named only the lead 20 kb away."""
     result, ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, region=None, variant="12:49510000:C:T", flank=100_000,
+        monkeypatch,
+        tmp_path,
+        region=None,
+        variant="12:49510000:C:T",
+        flank=100_000,
     )
     assert result["lead"] == "12:49503000:C:T"
     assert [h["variant"] for h in result["highlighted"]] == ["12:49510000:C:T"]
@@ -1408,14 +1526,20 @@ def test_the_centred_variant_is_marked_when_it_is_not_the_lead(monkeypatch, tmp_
 
 def test_the_centred_variant_that_is_the_lead_is_not_named_twice(monkeypatch, tmp_path):
     result, _ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, region=None, variant="12:49503000:C:T", flank=100_000,
+        monkeypatch,
+        tmp_path,
+        region=None,
+        variant="12:49503000:C:T",
+        flank=100_000,
     )
     assert result["highlighted"] == []
 
 
 def test_highlight_names_what_it_is_given_and_refuses_what_is_not_there(monkeypatch, tmp_path):
     result, ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, highlight=["chr12:49520000:c:t", "12:49503000:C:T"],
+        monkeypatch,
+        tmp_path,
+        highlight=["chr12:49520000:c:t", "12:49503000:C:T"],
     )
     # the lead is already named; asking for it again does not label it twice
     assert [h["variant"] for h in result["highlighted"]] == ["12:49520000:C:T"]
@@ -1423,9 +1547,7 @@ def test_highlight_names_what_it_is_given_and_refuses_what_is_not_there(monkeypa
         drawn_figure(monkeypatch, tmp_path, highlight="12:1:A:C")
 
 
-def test_label_r2_names_the_leads_neighbours_strongest_first_up_to_the_cap(
-    monkeypatch, tmp_path
-):
+def test_label_r2_names_the_leads_neighbours_strongest_first_up_to_the_cap(monkeypatch, tmp_path):
     from genetics_mcp_server import sdk
 
     frame = frame_of(n=25)
@@ -1433,7 +1555,11 @@ def test_label_r2_names_the_leads_neighbours_strongest_first_up_to_the_cap(
     r2s = {i: 0.9 for i in range(5, 17)} | {20: 0.5}
     monkeypatch.setattr(sdk, "ld", lambda variant, **k: ld_frame_for(frame, r2s))
     result, ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, data=frame, ld=True, label_r2=0.8,
+        monkeypatch,
+        tmp_path,
+        data=frame,
+        ld=True,
+        label_r2=0.8,
     )
     named = result["highlighted"]
     assert len(named) == plots._MAX_R2_LABELS
@@ -1444,11 +1570,13 @@ def test_label_r2_names_the_leads_neighbours_strongest_first_up_to_the_cap(
 
 def test_labels_use_the_rsid_where_the_frame_has_one(monkeypatch, tmp_path):
     frame = frame_of().with_columns(
-        pl.when(pl.col("pos") == 49_520_000).then(pl.lit("rs356219")).otherwise(None)
-        .alias("rsid")
+        pl.when(pl.col("pos") == 49_520_000).then(pl.lit("rs356219")).otherwise(None).alias("rsid")
     )
     _result, ax, _gene_ax = drawn_figure(
-        monkeypatch, tmp_path, data=frame, highlight="12:49520000:C:T",
+        monkeypatch,
+        tmp_path,
+        data=frame,
+        highlight="12:49520000:C:T",
     )
     assert any(t.get_text() == "rs356219" for t in ax.texts)
 
@@ -1457,8 +1585,12 @@ def test_labels_use_the_rsid_where_the_frame_has_one(monkeypatch, tmp_path):
 def test_label_r2_outside_zero_to_one_is_refused(threshold):
     with pytest.raises(GeneticsUsageError, match="label_r2"):
         plots.locuszoom(
-            phenotype="X", region="12:49400000-49600000", data=frame_of(), ld=False,
-            genes=False, label_r2=threshold,
+            phenotype="X",
+            region="12:49400000-49600000",
+            data=frame_of(),
+            ld=False,
+            genes=False,
+            label_r2=threshold,
         )
 
 
@@ -1468,9 +1600,14 @@ def test_label_r2_outside_zero_to_one_is_refused(threshold):
 def associations(rows):
     """Credible-set rows as `credible_sets(variant=...)` returns them, GWAS and QTL alike."""
     base = {
-        "resource": "finngen", "dataset": "FinnGen_R14", "data_type": "GWAS", "trait": None,
-        "trait_original": None, "mlog10p": None,
-        "most_severe": "missense_variant", "gene_most_severe": "APOE",
+        "resource": "finngen",
+        "dataset": "FinnGen_R14",
+        "data_type": "GWAS",
+        "trait": None,
+        "trait_original": None,
+        "mlog10p": None,
+        "most_severe": "missense_variant",
+        "gene_most_severe": "APOE",
     }
     out = []
     for row in rows:
@@ -1487,31 +1624,45 @@ def associations(rows):
 PHENOTYPES_V = {
     "I9_CHD": ("Coronary heart disease", "IX Diseases of the circulatory system (I9_)"),
     "T2D": ("Type 2 diabetes", "IV Endocrine, nutritional and metabolic diseases (E4_)"),
-    "H8_HL_IDIOP": ("Sudden idiopathic hearing loss",
-                    "VIII Diseases of the ear and mastoid process (H8_)"),
+    "H8_HL_IDIOP": (
+        "Sudden idiopathic hearing loss",
+        "VIII Diseases of the ear and mastoid process (H8_)",
+    ),
     "AD": ("Alzheimer's disease", "VI Diseases of the nervous system (G6_)"),
 }
 
 
 def phewas_frame():
-    return associations([
-        {"trait_original": "I9_CHD", "mlog10p": 12.0},
-        {"trait_original": "T2D", "mlog10p": 9.5},
-        {"trait_original": "AD", "mlog10p": 300.0},
-        {"trait_original": "H8_HL_IDIOP", "mlog10p": 8.0},
-        {"trait_original": "XYZ", "trait": "Some_odd_thing", "mlog10p": 3.0},
-        {"trait_original": "WEAK", "mlog10p": 1.0},
-        {"trait_original": "ENSG00000130203|ge", "trait": "APOE", "mlog10p": 40.0,
-         "data_type": "eQTL"},
-    ])
+    return associations(
+        [
+            {"trait_original": "I9_CHD", "mlog10p": 12.0},
+            {"trait_original": "T2D", "mlog10p": 9.5},
+            {"trait_original": "AD", "mlog10p": 300.0},
+            {"trait_original": "H8_HL_IDIOP", "mlog10p": 8.0},
+            {"trait_original": "XYZ", "trait": "Some_odd_thing", "mlog10p": 3.0},
+            {"trait_original": "WEAK", "mlog10p": 1.0},
+            {
+                "trait_original": "ENSG00000130203|ge",
+                "trait": "APOE",
+                "mlog10p": 40.0,
+                "data_type": "eQTL",
+            },
+        ]
+    )
 
 
 def fake_phenotypes(**kwargs):
     codes = kwargs.get("codes") or []
     rows = [
-        {"dataset": "FinnGen_R14", "resource": "finngen", "trait_original": code,
-         "trait_name": PHENOTYPES_V[code][0], "category": PHENOTYPES_V[code][1]}
-        for code in codes if code in PHENOTYPES_V
+        {
+            "dataset": "FinnGen_R14",
+            "resource": "finngen",
+            "trait_original": code,
+            "trait_name": PHENOTYPES_V[code][0],
+            "category": PHENOTYPES_V[code][1],
+        }
+        for code in codes
+        if code in PHENOTYPES_V
     ]
     return pl.DataFrame(rows) if rows else pl.DataFrame()
 
@@ -1582,10 +1733,14 @@ def test_a_long_chapter_name_is_wrapped_on_the_axis_not_truncated_to_nothing():
 @pytest.mark.parametrize(
     "categories,expected",
     [
-        (["V Mental", "IX Circ", "II Neoplasms", "I Infectious"],
-         ["I Infectious", "II Neoplasms", "V Mental", "IX Circ"]),
-        (["Other", "Quantitative", "Binary", "XI Digestive"],
-         ["XI Digestive", "Binary", "Quantitative", "Other"]),
+        (
+            ["V Mental", "IX Circ", "II Neoplasms", "I Infectious"],
+            ["I Infectious", "II Neoplasms", "V Mental", "IX Circ"],
+        ),
+        (
+            ["Other", "Quantitative", "Binary", "XI Digestive"],
+            ["XI Digestive", "Binary", "Quantitative", "Other"],
+        ),
     ],
 )
 def test_category_order_is_chapter_order_then_alphabetical_then_other(categories, expected):
@@ -1616,8 +1771,12 @@ def test_phewas_leaves_at_least_two_units_above_the_strongest_association(monkey
 def test_phewas_names_the_significant_associations_and_the_variant(monkeypatch, tmp_path):
     _result, ax = named_phewas(monkeypatch, tmp_path)
     drawn = {t.get_text() for t in ax.texts}
-    assert {"Alzheimer's disease", "Coronary heart disease", "Type 2 diabetes",
-            "Sudden idiopathic hearing loss"} <= drawn
+    assert {
+        "Alzheimer's disease",
+        "Coronary heart disease",
+        "Type 2 diabetes",
+        "Sudden idiopathic hearing loss",
+    } <= drawn
     assert not any("odd" in t for t in drawn), "an association below the line is not named"
     assert ax.get_title() == "19:44908684:T:C  APOE missense — finngen"
 
@@ -1629,10 +1788,15 @@ def test_phewas_looks_names_up_by_the_code_and_not_the_display_form(monkeypatch,
         seen.update(kwargs)
         return fake_phenotypes(**kwargs)
 
-    display_form = associations([
-        {"trait_original": "HEIGHT_IRN", "trait": "Height,_inverse-rank_normalized",
-         "mlog10p": 30.0},
-    ])
+    display_form = associations(
+        [
+            {
+                "trait_original": "HEIGHT_IRN",
+                "trait": "Height,_inverse-rank_normalized",
+                "mlog10p": 30.0,
+            },
+        ]
+    )
     monkeypatch.setattr(plots, "_resource_label", lambda resource: resource)
     result, ax = named_phewas(monkeypatch, tmp_path, data=display_form)
     monkeypatch.setattr("genetics_mcp_server.sdk.phenotypes", spy, raising=False)
@@ -1683,11 +1847,13 @@ def test_phewas_into_a_caller_supplied_axis_saves_nothing(monkeypatch, tmp_path)
 
 
 def test_phewas_names_a_phenotype_once_however_many_resources_carry_it(monkeypatch, tmp_path):
-    twice = associations([
-        {"trait_original": "AD", "mlog10p": 300.0, "resource": "finngen"},
-        {"trait_original": "AD", "mlog10p": 120.0, "resource": "ukbb", "dataset": "UKBB"},
-        {"trait_original": "T2D", "mlog10p": 9.5},
-    ])
+    twice = associations(
+        [
+            {"trait_original": "AD", "mlog10p": 300.0, "resource": "finngen"},
+            {"trait_original": "AD", "mlog10p": 120.0, "resource": "ukbb", "dataset": "UKBB"},
+            {"trait_original": "T2D", "mlog10p": 9.5},
+        ]
+    )
     _result, ax = named_phewas(monkeypatch, tmp_path, data=twice)
     names = [t.get_text() for t in ax.texts if not t.get_text().startswith("p ")]
     assert names.count("Alzheimer's disease") == 1
@@ -1697,23 +1863,38 @@ def test_phewas_names_a_phenotype_once_however_many_resources_carry_it(monkeypat
 def test_a_pleiotropic_variant_is_grouped_by_resource_rather_than_by_a_wall_of_chapters(
     monkeypatch, tmp_path
 ):
-    chapters = [f"{numeral} Chapter {i}" for i, numeral in enumerate(
-        ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"], 1
-    )]
+    chapters = [
+        f"{numeral} Chapter {i}"
+        for i, numeral in enumerate(
+            ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"], 1
+        )
+    ]
     rows, meta = [], {}
     for i, chapter in enumerate(chapters):
         code = f"CODE{i}"
         resource = "finngen" if i % 2 else "open_targets"
-        rows.append({"trait_original": code, "mlog10p": 10.0 + i, "resource": resource,
-                     "dataset": "FinnGen_R14" if i % 2 else "Open_Targets_26.06"})
+        rows.append(
+            {
+                "trait_original": code,
+                "mlog10p": 10.0 + i,
+                "resource": resource,
+                "dataset": "FinnGen_R14" if i % 2 else "Open_Targets_26.06",
+            }
+        )
         meta[code] = (f"Trait {i}", chapter)
 
     def phenotypes(**kwargs):
-        return pl.DataFrame([
-            {"dataset": "FinnGen_R14" if int(c[4:]) % 2 else "Open_Targets_26.06",
-             "trait_original": c, "trait_name": meta[c][0], "category": meta[c][1]}
-            for c in kwargs["codes"]
-        ])
+        return pl.DataFrame(
+            [
+                {
+                    "dataset": "FinnGen_R14" if int(c[4:]) % 2 else "Open_Targets_26.06",
+                    "trait_original": c,
+                    "trait_name": meta[c][0],
+                    "category": meta[c][1],
+                }
+                for c in kwargs["codes"]
+            ]
+        )
 
     result, ax = named_phewas(monkeypatch, tmp_path, phenotypes, data=associations(rows))
     assert result["grouped_by"] == "resource"
@@ -1771,8 +1952,7 @@ def test_the_three_input_shapes_agree():
     members = {"A": range(10), "B": range(5, 20), "C": range(18, 30)}
     from_sets = plots._upset_from_sets(members)
     rows = [
-        {"A": i in members["A"], "B": i in members["B"], "C": i in members["C"]}
-        for i in range(30)
+        {"A": i in members["A"], "B": i in members["B"], "C": i in members["C"]} for i in range(30)
     ]
     from_data = plots._upset_from_data(pl.DataFrame(rows), None, None)
     tallied = (
@@ -1835,9 +2015,7 @@ def test_nothing_on_an_upset_is_coloured(monkeypatch, tmp_path):
     assert all(abs(r - g) < 1e-9 and abs(g - b) < 1e-9 for r, g, b in greys), greys
 
 
-def test_the_counts_sit_outside_the_bars_and_the_scales_leave_room_for_them(
-    monkeypatch, tmp_path
-):
+def test_the_counts_sit_outside_the_bars_and_the_scales_leave_room_for_them(monkeypatch, tmp_path):
     _result, bars, matrix, sets = drawn_upset(monkeypatch, tmp_path, counts=CD_UC)
     # above each intersection bar, and the scale runs past the tallest
     labels = {t.get_text(): t.xy for t in bars.texts}
@@ -1863,10 +2041,9 @@ def test_the_matrix_marks_exactly_the_sets_each_column_spans(monkeypatch, tmp_pa
     for collection in matrix.collections:
         offsets = collection.get_offsets()
         colours = collection.get_facecolors()
-        marked.append({
-            int(y) for (_x, y), colour in zip(offsets, colours)
-            if tuple(colour[:3]) == ink
-        })
+        marked.append(
+            {int(y) for (_x, y), colour in zip(offsets, colours) if tuple(colour[:3]) == ink}
+        )
     # rows: UC is the top row (y=1), Crohn below it (y=0)
     assert marked == [{1}, {0}, {0, 1}]
     # one connector, on the one column spanning two sets
@@ -1981,9 +2158,7 @@ def test_forest_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path):
 
 
 def test_log_ratios_are_drawn_as_ratios_on_a_log_axis_around_one(monkeypatch, tmp_path):
-    result, canvas, panel = drawn_forest(
-        monkeypatch, tmp_path, cohort_frame(), scale="log_ratio"
-    )
+    result, canvas, panel = drawn_forest(monkeypatch, tmp_path, cohort_frame(), scale="log_ratio")
     assert panel.get_xscale() == "log"
     assert "1.30 (1.25–1.35)" in canvas_texts(canvas)
     assert "OR (95% CI)" in canvas_texts(canvas)
@@ -1997,12 +2172,22 @@ def test_log_ratios_are_drawn_as_ratios_on_a_log_axis_around_one(monkeypatch, tm
 
 
 def test_ratios_given_as_ratios_need_bounds_and_must_be_positive(monkeypatch, tmp_path):
-    frame = pl.DataFrame({
-        "gene": ["PCSK9", "APOC3", "LPA"],
-        "or": [0.53, 0.60, 1.9], "lo": [0.41, 0.0, 1.5], "hi": [0.69, 0.85, math.inf],
-    })
+    frame = pl.DataFrame(
+        {
+            "gene": ["PCSK9", "APOC3", "LPA"],
+            "or": [0.53, 0.60, 1.9],
+            "lo": [0.41, 0.0, 1.5],
+            "hi": [0.69, 0.85, math.inf],
+        }
+    )
     result, canvas, _panel = drawn_forest(
-        monkeypatch, tmp_path, frame, label="gene", estimate="or", lower="lo", upper="hi",
+        monkeypatch,
+        tmp_path,
+        frame,
+        label="gene",
+        estimate="or",
+        lower="lo",
+        upper="hi",
         scale="ratio",
     )
     texts = canvas_texts(canvas)
@@ -2057,7 +2242,7 @@ def test_pooling_is_inverse_variance_and_reports_heterogeneity(monkeypatch, tmp_
     result, canvas, panel = drawn_forest(
         monkeypatch, tmp_path, frame, scale="log_ratio", pool="fixed"
     )
-    weights = [1 / s ** 2 for s in frame["se"]]
+    weights = [1 / s**2 for s in frame["se"]]
     expected = sum(w * b for w, b in zip(weights, frame["beta"])) / sum(weights)
     (fit,) = result["pooled"]
     assert fit["method"] == "fixed" and fit["k"] == 6 and fit["group"] is None
@@ -2075,22 +2260,33 @@ def test_pooling_is_inverse_variance_and_reports_heterogeneity(monkeypatch, tmp_
 def test_random_effects_widen_the_interval_only_when_the_rows_disagree():
     agree = plots._forest_pool([0.2, 0.2, 0.2], [0.05, 0.04, 0.06], "random")
     assert agree["tau2"] == 0 and agree["i2"] == 0
-    assert agree["se"] == pytest.approx(plots._forest_pool([0.2] * 3, [0.05, 0.04, 0.06], "fixed")["se"])
+    assert agree["se"] == pytest.approx(
+        plots._forest_pool([0.2] * 3, [0.05, 0.04, 0.06], "fixed")["se"]
+    )
     disagree_fixed = plots._forest_pool([0.0, 0.5, 1.0], [0.05, 0.05, 0.05], "fixed")
     disagree_random = plots._forest_pool([0.0, 0.5, 1.0], [0.05, 0.05, 0.05], "random")
     assert disagree_random["tau2"] > 0 and disagree_random["i2"] > 0.9
     assert disagree_random["se"] > disagree_fixed["se"]
 
 
-def test_a_row_flagged_as_a_summary_is_a_diamond_and_stays_out_of_the_pool(
-    monkeypatch, tmp_path
-):
-    frame = cohort_frame().with_columns(pl.lit(False).alias("is_meta")).vstack(
-        pl.DataFrame({
-            "cohort": ["Published meta-analysis"], "beta": [0.25], "se": [0.012],
-            "mlog10p": [92.0], "n_cases": [170_000], "is_meta": [True],
-        })
-    ).sample(fraction=1.0, shuffle=True, seed=1)
+def test_a_row_flagged_as_a_summary_is_a_diamond_and_stays_out_of_the_pool(monkeypatch, tmp_path):
+    frame = (
+        cohort_frame()
+        .with_columns(pl.lit(False).alias("is_meta"))
+        .vstack(
+            pl.DataFrame(
+                {
+                    "cohort": ["Published meta-analysis"],
+                    "beta": [0.25],
+                    "se": [0.012],
+                    "mlog10p": [92.0],
+                    "n_cases": [170_000],
+                    "is_meta": [True],
+                }
+            )
+        )
+        .sample(fraction=1.0, shuffle=True, seed=1)
+    )
     result, _canvas, panel = drawn_forest(
         monkeypatch, tmp_path, frame, summary="is_meta", pool="fixed"
     )
@@ -2144,8 +2340,13 @@ def test_groups_are_headed_in_order_of_first_appearance_and_pooled_separately(
     # largest first within a group, the pooled row after its own group's rows, and no
     # pooled row for a group of one
     assert result["rows"] == [
-        "Estonia", "UK Biobank", "FinnGen", "Random effects meta-analysis",
-        "All of Us", "MVP", "Random effects meta-analysis",
+        "Estonia",
+        "UK Biobank",
+        "FinnGen",
+        "Random effects meta-analysis",
+        "All of Us",
+        "MVP",
+        "Random effects meta-analysis",
         "BBJ",
     ]
     assert [fit["group"] for fit in result["pooled"]] == ["European", "Mixed"]
@@ -2154,11 +2355,13 @@ def test_groups_are_headed_in_order_of_first_appearance_and_pooled_separately(
 
 
 def test_the_cut_keeps_the_first_rows_and_says_how_many_it_left_out(monkeypatch, tmp_path):
-    frame = pl.DataFrame({
-        "cohort": [f"locus {i}" for i in range(40)],
-        "beta": [0.01 * i for i in range(40)],
-        "se": [0.02] * 40,
-    })
+    frame = pl.DataFrame(
+        {
+            "cohort": [f"locus {i}" for i in range(40)],
+            "beta": [0.01 * i for i in range(40)],
+            "se": [0.02] * 40,
+        }
+    )
     result, canvas, _panel = drawn_forest(monkeypatch, tmp_path, frame, max_rows=15)
     assert result["n_rows"] == 15 and result["n_omitted"] == 25
     assert result["rows"][0] == "locus 0" and result["rows"][-1] == "locus 14"
@@ -2166,11 +2369,10 @@ def test_the_cut_keeps_the_first_rows_and_says_how_many_it_left_out(monkeypatch,
 
 
 def test_significance_hollows_the_markers_that_miss_it(monkeypatch, tmp_path):
-    result, _canvas, panel = drawn_forest(
-        monkeypatch, tmp_path, cohort_frame(), significance=5e-8
-    )
+    result, _canvas, panel = drawn_forest(monkeypatch, tmp_path, cohort_frame(), significance=5e-8)
     faces = [
-        line.get_markerfacecolor() for line in panel.lines
+        line.get_markerfacecolor()
+        for line in panel.lines
         if line.get_marker() == "o" and line.get_clip_on()
     ]
     # FinnGen, UK Biobank and MVP pass 5e-8; the other three do not
@@ -2183,7 +2385,11 @@ def test_significance_hollows_the_markers_that_miss_it(monkeypatch, tmp_path):
 
 def test_a_weight_draws_squares_scaled_by_area_and_nothing_else_does(monkeypatch, tmp_path):
     _result, _canvas, panel = drawn_forest(monkeypatch, tmp_path, cohort_frame())
-    plain = {(line.get_marker(), line.get_markersize()) for line in panel.lines if line.get_marker() == "o"}
+    plain = {
+        (line.get_marker(), line.get_markersize())
+        for line in panel.lines
+        if line.get_marker() == "o"
+    }
     assert plain == {("o", plots._FOREST_MARKER_PT)}
 
     _result, _canvas, panel = drawn_forest(monkeypatch, tmp_path, cohort_frame(), weight="n_cases")
@@ -2211,9 +2417,16 @@ def test_extra_columns_and_the_table_switch(monkeypatch, tmp_path):
 
 
 def test_a_label_is_cut_to_length_and_a_dollar_sign_is_not_mathtext(monkeypatch, tmp_path):
-    frame = cohort_frame(cohort=[
-        "Costs between $5 and $10 per sample", "x" * 80, "MVP", "Estonia", "BBJ", "All of Us",
-    ])
+    frame = cohort_frame(
+        cohort=[
+            "Costs between $5 and $10 per sample",
+            "x" * 80,
+            "MVP",
+            "Estonia",
+            "BBJ",
+            "All of Us",
+        ]
+    )
     result, _canvas, _panel = drawn_forest(monkeypatch, tmp_path, frame)
     assert result["rows"][0] == r"Costs between \$5 and \$10 per sample"
     assert len(result["rows"][1]) == 48 and result["rows"][1].endswith("…")
@@ -2306,8 +2519,20 @@ def test_an_empty_frame_is_refused_rather_than_drawn_as_an_empty_table():
 def burden_frame(**over):
     """Twelve genes' burden results for one trait: hits both ways and a body of nulls."""
     columns = {
-        "gene": ["PCSK9", "APOB", "LDLR", "ABCG5", "ANGPTL3", "LPL",
-                 "G7", "G8", "G9", "G10", "G11", "G12"],
+        "gene": [
+            "PCSK9",
+            "APOB",
+            "LDLR",
+            "ABCG5",
+            "ANGPTL3",
+            "LPL",
+            "G7",
+            "G8",
+            "G9",
+            "G10",
+            "G11",
+            "G12",
+        ],
         "beta": [-0.9, -1.1, 1.4, 0.5, -0.6, 0.42, 0.1, -0.2, 0.05, 0.3, -0.15, 0.0],
         "se": [0.05, 0.06, 0.09, 0.06, 0.07, 0.05, 0.2, 0.3, 0.1, 0.4, 0.2, 0.1],
         "mlog10p": [71.7, 74.3, 53.8, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0],
@@ -2365,7 +2590,10 @@ def test_volcano_writes_a_figure_and_reports_what_it_drew(monkeypatch, tmp_path)
     assert result["correction"] == "fixed" and result["threshold_p"] == pytest.approx(1e-6)
     assert (result["n_significant"], result["n_up"], result["n_down"]) == (6, 3, 3)
     assert result["top"][0] == {
-        "label": "APOB", "estimate": -1.1, "mlog10p": 74.3, "direction": "down"
+        "label": "APOB",
+        "estimate": -1.1,
+        "mlog10p": 74.3,
+        "direction": "down",
     }
     # direction is the hue, and what did not pass is pale
     colours = face_colours(ax)
@@ -2390,9 +2618,7 @@ def test_there_is_no_default_threshold():
         plots.volcano(burden_frame())
 
 
-def test_bonferroni_divides_by_the_tests_in_the_frame_or_by_the_number_given(
-    monkeypatch, tmp_path
-):
+def test_bonferroni_divides_by_the_tests_in_the_frame_or_by_the_number_given(monkeypatch, tmp_path):
     result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), significance="bonferroni")
     assert result["correction"] == "bonferroni" and result["n_tests"] == 12
     assert result["threshold_p"] == pytest.approx(0.05 / 12)
@@ -2455,47 +2681,60 @@ def test_log_odds_ratios_are_drawn_as_ratios_on_a_log_axis_around_one(monkeypatc
 
 
 def test_ratios_given_as_ratios_are_logged_and_a_zero_sits_at_the_edge(monkeypatch, tmp_path):
-    frame = pl.DataFrame({
-        "gene": ["A", "B", "C", "D"],
-        "or": [2.0, 0.5, 0.0, 1.1],
-        "pval": [1e-9, 1e-8, 0.4, 0.5],
-    })
+    frame = pl.DataFrame(
+        {
+            "gene": ["A", "B", "C", "D"],
+            "or": [2.0, 0.5, 0.0, 1.1],
+            "pval": [1e-9, 1e-8, 0.4, 0.5],
+        }
+    )
     result, ax = drawn_volcano(monkeypatch, tmp_path, frame, estimate="or", scale="ratio")
     assert (result["n_up"], result["n_down"], result["n_clipped"]) == (1, 1, 1)
     assert result["xlim"][0] * result["xlim"][1] == pytest.approx(1.0)
     with pytest.raises(GeneticsUsageError, match="scale='log_ratio'"):
-        plots.volcano(frame.with_columns(pl.lit(-0.3).alias("or")), estimate="or",
-                      scale="ratio", significance=1e-6)
+        plots.volcano(
+            frame.with_columns(pl.lit(-0.3).alias("or")),
+            estimate="or",
+            scale="ratio",
+            significance=1e-6,
+        )
     with pytest.raises(GeneticsUsageError, match="standard error is on the log scale"):
-        plots.volcano(frame.with_columns(pl.lit(0.1).alias("se")), estimate="or",
-                      scale="ratio", se="se", significance=1e-6)
+        plots.volcano(
+            frame.with_columns(pl.lit(0.1).alias("se")),
+            estimate="or",
+            scale="ratio",
+            se="se",
+            significance=1e-6,
+        )
 
 
 def test_a_p_value_of_zero_is_drawn_at_the_top_edge_and_not_given_a_value(monkeypatch, tmp_path):
-    frame = pl.DataFrame({"gene": ["A", "B", "C"], "beta": [1.0, -0.5, 0.1],
-                          "pval": [0.0, 1e-12, 0.3]})
+    frame = pl.DataFrame(
+        {"gene": ["A", "B", "C"], "beta": [1.0, -0.5, 0.1], "pval": [0.0, 1e-12, 0.3]}
+    )
     result, ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene")
     assert result["n_offscale"] == 1 and result["n_significant"] == 2
     assert result["top"][0]["label"] == "A" and math.isinf(result["top"][0]["mlog10p"])
     # the axis is set by the finite values, and the point sits on its top edge
     top = ax.get_ylim()[1]
     assert 12 < top < 14
-    assert any(
-        (collection.get_offsets()[:, 1] == top).any() for collection in ax.collections
-    )
+    assert any((collection.get_offsets()[:, 1] == top).any() for collection in ax.collections)
     # an infinite -log10 p is the same thing said the other way
     result, _ax = drawn_volcano(
-        monkeypatch, tmp_path,
+        monkeypatch,
+        tmp_path,
         pl.DataFrame({"beta": [1.0, -0.5], "mlog10p": [math.inf, 12.0]}),
     )
     assert result["n_offscale"] == 1
 
 
 def test_rows_without_an_estimate_or_a_p_value_are_counted_and_not_drawn(monkeypatch, tmp_path):
-    frame = pl.DataFrame({
-        "beta": [0.5, None, float("nan"), -0.4, 0.2, 0.3],
-        "pval": [1e-9, 1e-9, 1e-9, None, 1.5, 1e-7],
-    })
+    frame = pl.DataFrame(
+        {
+            "beta": [0.5, None, float("nan"), -0.4, 0.2, 0.3],
+            "pval": [1e-9, 1e-9, 1e-9, None, 1.5, 1e-7],
+        }
+    )
     result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="bonferroni")
     assert result["n_points"] == 2 and result["n_missing"] == 4
     # a test with no effect size was still a test; a p-value outside [0, 1] is not one
@@ -2513,8 +2752,10 @@ def test_a_runaway_estimate_does_not_take_the_volcano_axis(monkeypatch, tmp_path
     assert result["xlim"][1] < 5
     # both are still on the figure, as arrowheads on the edge they lie beyond
     edges = [
-        float(x) for collection in ax.collections
-        for x in collection.get_offsets()[:, 0] if abs(x) == pytest.approx(result["xlim"][1])
+        float(x)
+        for collection in ax.collections
+        for x in collection.get_offsets()[:, 0]
+        if abs(x) == pytest.approx(result["xlim"][1])
     ]
     assert sorted(edges) == pytest.approx(list(result["xlim"]))
 
@@ -2530,12 +2771,14 @@ def test_a_ratio_past_a_thousandfold_never_sets_the_axis_even_when_significant(
 ):
     # what the IIBDGC lead variants hold: real log odds ratios beside rare-variant rows
     # whose estimates are in the hundreds and whose p-values are as small as any
-    frame = pl.DataFrame({
-        "gene": ["NOD2", "IL23R", "ATG16L1", "ZNF586", "PCDH9", "X1"],
-        "beta": [1.108, -0.7647, 0.2, -461.8, 341.2, 11.6],
-        "se": [0.02, 0.02, 0.01, 20.29, 27.99, 1.5],
-        "mlog10p": [418.0, 265.8, 60.0, 113.9, 33.4, 14.0],
-    })
+    frame = pl.DataFrame(
+        {
+            "gene": ["NOD2", "IL23R", "ATG16L1", "ZNF586", "PCDH9", "X1"],
+            "beta": [1.108, -0.7647, 0.2, -461.8, 341.2, 11.6],
+            "se": [0.02, 0.02, 0.01, 20.29, 27.99, 1.5],
+            "mlog10p": [418.0, 265.8, 60.0, 113.9, 33.4, 14.0],
+        }
+    )
     result, ax = drawn_volcano(
         monkeypatch, tmp_path, frame, label="gene", scale="log_ratio", significance=5e-8
     )
@@ -2546,9 +2789,7 @@ def test_a_ratio_past_a_thousandfold_never_sets_the_axis_even_when_significant(
     assert (result["n_up"], result["n_down"]) == (4, 2)
     assert ax.get_xlim() == pytest.approx((lo, hi))
     # at the bound itself an estimate is still one
-    edge = frame.with_columns(
-        pl.Series("beta", [1.108, -0.7647, 0.2, math.log(900), 0.3, 0.1])
-    )
+    edge = frame.with_columns(pl.Series("beta", [1.108, -0.7647, 0.2, math.log(900), 0.3, 0.1]))
     result, _ax = drawn_volcano(monkeypatch, tmp_path, edge, scale="log_ratio", significance=5e-8)
     assert result["n_clipped"] == 0 and result["xlim"][1] > 900
     # a linear axis has no unit to judge by, so there significance still sets it
@@ -2567,11 +2808,18 @@ def test_effects_that_are_all_zero_still_get_an_axis(monkeypatch, tmp_path):
     result, _ax = drawn_volcano(monkeypatch, tmp_path, frame)
     assert result["xlim"] == pytest.approx((-1.08, 1.08))
     # significant, and in neither direction
-    assert (result["n_significant"], result["n_up"], result["n_down"], result["n_small"]) == (1, 0, 0, 1)
+    assert (result["n_significant"], result["n_up"], result["n_down"], result["n_small"]) == (
+        1,
+        0,
+        0,
+        1,
+    )
 
 
 def test_one_association_that_dwarfs_the_rest_breaks_the_p_axis(monkeypatch, tmp_path):
-    frame = burden_frame(mlog10p=[349.0, 61.6, 24.3, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0])
+    frame = burden_frame(
+        mlog10p=[349.0, 61.6, 24.3, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0]
+    )
     result, ax = drawn_volcano(monkeypatch, tmp_path, frame)
     assert result["y_log_above"] == 20.0 and ax.get_yscale() == "symlog"
     assert "log scale above 20" in annotations(ax)
@@ -2582,18 +2830,22 @@ def test_one_association_that_dwarfs_the_rest_breaks_the_p_axis(monkeypatch, tmp
     ticks = list(ax.get_yticks())
     assert 20.0 in ticks and max(ticks) >= 200
     # a spread that fits a linear axis is left on one
-    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(
-        mlog10p=[40.0, 30.0, 24.3, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0]
-    ))
+    result, ax = drawn_volcano(
+        monkeypatch,
+        tmp_path,
+        burden_frame(mlog10p=[40.0, 30.0, 24.3, 16.1, 17.0, 16.4, 0.2, 0.3, 0.2, 0.3, 0.3, 0.0]),
+    )
     assert result["y_log_above"] is None and ax.get_yscale() == "linear"
 
 
 def test_names_are_shared_between_the_two_sides_and_given_once_each(monkeypatch, tmp_path):
-    frame = pl.DataFrame({
-        "gene": ["U1", "U2", "U3", "U4", "U5", "U6", "D1", "D1", "D2"],
-        "beta": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, -1.0, -1.2, -0.8],
-        "mlog10p": [30.0, 29.0, 28.0, 27.0, 26.0, 25.0, 9.0, 8.5, 8.0],
-    })
+    frame = pl.DataFrame(
+        {
+            "gene": ["U1", "U2", "U3", "U4", "U5", "U6", "D1", "D1", "D2"],
+            "beta": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, -1.0, -1.2, -0.8],
+            "mlog10p": [30.0, 29.0, 28.0, 27.0, 26.0, 25.0, 9.0, 8.5, 8.0],
+        }
+    )
     result, _ax = drawn_volcano(monkeypatch, tmp_path, frame, label="gene", labels=4)
     # the weaker side keeps its half although the stronger side could fill every slot
     assert result["labelled"] == ["U1", "U2", "D1", "D2"]
@@ -2625,13 +2877,18 @@ def test_named_labels_are_drawn_whether_or_not_they_passed(monkeypatch, tmp_path
 def test_a_named_point_carries_its_interval_when_the_frame_has_a_standard_error(
     monkeypatch, tmp_path
 ):
-    _result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(), label="gene", labels=["LDLR"])
+    _result, ax = drawn_volcano(
+        monkeypatch, tmp_path, burden_frame(), label="gene", labels=["LDLR"]
+    )
     whiskers = [
-        line for line in ax.lines
+        line
+        for line in ax.lines
         if len(line.get_xdata()) == 2 and line.get_ydata()[0] == line.get_ydata()[1] == 53.8
     ]
     assert len(whiskers) == 1
-    assert tuple(whiskers[0].get_xdata()) == pytest.approx((1.4 - 1.96 * 0.09, 1.4 + 1.96 * 0.09), abs=1e-3)
+    assert tuple(whiskers[0].get_xdata()) == pytest.approx(
+        (1.4 - 1.96 * 0.09, 1.4 + 1.96 * 0.09), abs=1e-3
+    )
     # the outermost point's interval is inside the axis rather than cut by its edge
     assert ax.get_xlim()[1] > 1.4 + 1.96 * 0.09
     _result, ax = drawn_volcano(
@@ -2646,7 +2903,8 @@ def test_min_effect_marks_small_effects_without_calling_them_hits(monkeypatch, t
     assert (result["n_up"], result["n_down"], result["n_small"]) == (1, 3, 2)
     assert face_colours(ax)[plots._VOLCANO_SMALL] == 2
     verticals = sorted(
-        line.get_xdata()[0] for line in ax.lines
+        line.get_xdata()[0]
+        for line in ax.lines
         if len(line.get_xdata()) == 2 and line.get_xdata()[0] == line.get_xdata()[1]
     )
     assert verticals == pytest.approx([-0.55, 0.0, 0.55])
@@ -2659,9 +2917,7 @@ def test_min_effect_marks_small_effects_without_calling_them_hits(monkeypatch, t
 
 def test_colour_names_a_category_and_groups_the_rarest_past_seven(monkeypatch, tmp_path):
     masks = ["pLoF", "missense", "pLoF", "synonymous", "missense", "pLoF"] + ["pLoF"] * 6
-    result, ax = drawn_volcano(
-        monkeypatch, tmp_path, burden_frame(mask=masks), colour="mask"
-    )
+    result, ax = drawn_volcano(monkeypatch, tmp_path, burden_frame(mask=masks), colour="mask")
     assert result["colours"] == ["pLoF", "missense", "synonymous"]
     legend = [t.get_text() for t in ax.get_legend().get_texts()]
     assert legend == ["pLoF", "missense", "synonymous"]
@@ -2669,11 +2925,13 @@ def test_colour_names_a_category_and_groups_the_rarest_past_seven(monkeypatch, t
     assert colours[plots._FOREST_SERIES[0][0]] == 3 and colours[plots._FOREST_SERIES[1][0]] == 2
     assert plots._VOLCANO_UP not in colours or plots._FOREST_SERIES[1][0] == plots._VOLCANO_UP
 
-    many = pl.DataFrame({
-        "beta": [0.1 * (i + 1) for i in range(10)],
-        "mlog10p": [20.0] * 10,
-        "tissue": ["liver", "liver", "liver", "t4", "t5", "t6", "t7", "t8", "t9", "t10"],
-    })
+    many = pl.DataFrame(
+        {
+            "beta": [0.1 * (i + 1) for i in range(10)],
+            "mlog10p": [20.0] * 10,
+            "tissue": ["liver", "liver", "liver", "t4", "t5", "t6", "t7", "t8", "t9", "t10"],
+        }
+    )
     result, _ax = drawn_volcano(monkeypatch, tmp_path, many, colour="tissue")
     assert len(result["colours"]) == len(plots._FOREST_SERIES)
     assert result["colours"][0] == "liver" and result["colours"][-1] == "Other"
@@ -2697,21 +2955,53 @@ def test_a_size_column_holding_one_value_encodes_nothing_and_is_not_drawn(monkey
     )
     assert ax.get_legend() is None
     assert {float(s) for c in ax.collections for s in c.get_sizes()} == {
-        plots._VOLCANO_AREA, plots._VOLCANO_AREA_BELOW[0]
+        plots._VOLCANO_AREA,
+        plots._VOLCANO_AREA_BELOW[0],
     }
 
 
 def endpoint_frame(**over):
     """One variant across ten endpoints in three categories, one of them on both sides."""
     columns = {
-        "endpoint": ["Statins", "Lipid disorder", "Hypercholesterolaemia", "T2D", "Insulin",
-                     "Gestational diabetes", "Gallstones", "Cholecystectomy", "Gout", "Asthma"],
-        "category": ["Endocrine", "Endocrine", "Endocrine", "Diabetes", "Diabetes",
-                     "Diabetes", "Digestive", "Digestive", "Rheuma", "Respiratory"],
+        "endpoint": [
+            "Statins",
+            "Lipid disorder",
+            "Hypercholesterolaemia",
+            "T2D",
+            "Insulin",
+            "Gestational diabetes",
+            "Gallstones",
+            "Cholecystectomy",
+            "Gout",
+            "Asthma",
+        ],
+        "category": [
+            "Endocrine",
+            "Endocrine",
+            "Endocrine",
+            "Diabetes",
+            "Diabetes",
+            "Diabetes",
+            "Digestive",
+            "Digestive",
+            "Rheuma",
+            "Respiratory",
+        ],
         "beta": [-0.07, -0.06, 0.05, 0.05, 0.06, 0.10, 0.08, 0.07, -0.12, 0.01],
         "mlog10p": [39.8, 20.0, 16.0, 12.0, 15.0, 19.0, 21.0, 20.0, 20.6, 0.4],
         "pip": [0.99, 0.6, 0.05, None, 0.3, 0.02, 0.9, 0.11, 0.1, None],
-        "n_cases": [294_760, 60_000, 40_000, 70_000, 30_000, 15_000, 45_000, 38_000, 12_000, 50_000],
+        "n_cases": [
+            294_760,
+            60_000,
+            40_000,
+            70_000,
+            30_000,
+            15_000,
+            45_000,
+            38_000,
+            12_000,
+            50_000,
+        ],
     }
     columns.update(over)
     return pl.DataFrame(columns)
@@ -2751,11 +3041,13 @@ def test_hulls_outline_each_categorys_hits_and_say_which_cross_the_null(monkeypa
 def test_a_hull_is_found_on_the_axes_as_drawn_and_not_on_the_raw_numbers(monkeypatch, tmp_path):
     # on the broken -log10 p axis the middle point lies outside the straight line between
     # the other two, though by the raw numbers it lies inside it
-    frame = pl.DataFrame({
-        "category": ["A"] * 4,
-        "beta": [0.0001, 0.5, 1.0, 1.0],
-        "mlog10p": [10.0, 150.0, 300.0, 10.0],
-    })
+    frame = pl.DataFrame(
+        {
+            "category": ["A"] * 4,
+            "beta": [0.0001, 0.5, 1.0, 1.0],
+            "mlog10p": [10.0, 150.0, 300.0, 10.0],
+        }
+    )
     result, ax = drawn_volcano(
         monkeypatch, tmp_path, frame, significance=5e-8, colour="category", hulls=True
     )
@@ -2795,7 +3087,9 @@ def test_ring_marks_the_fine_mapped_associations(monkeypatch, tmp_path):
     assert result["n_ringed"] == 3
     # a flag column is taken as it stands and named in the legend by its own name
     flagged = endpoint_frame().with_columns((pl.col("pip") > 0.95).alias("fine_mapped"))
-    result, ax = drawn_volcano(monkeypatch, tmp_path, flagged, significance=5e-8, ring="fine_mapped")
+    result, ax = drawn_volcano(
+        monkeypatch, tmp_path, flagged, significance=5e-8, ring="fine_mapped"
+    )
     assert result["n_ringed"] == 1
     assert [t.get_text() for t in ax.get_legend().get_texts()] == ["fine_mapped"]
     with pytest.raises(GeneticsUsageError, match="ring= names a boolean column"):
@@ -2804,15 +3098,24 @@ def test_ring_marks_the_fine_mapped_associations(monkeypatch, tmp_path):
 
 def test_with_ring_the_named_points_are_not_ringed_as_well(monkeypatch, tmp_path):
     result, ax = drawn_volcano(
-        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, label="endpoint",
-        labels=["Asthma"], ring="pip",
+        monkeypatch,
+        tmp_path,
+        endpoint_frame(),
+        significance=5e-8,
+        label="endpoint",
+        labels=["Asthma"],
+        ring="pip",
     )
     rings = [c for c in ax.collections if not len(c.get_facecolors())]
     assert result["n_ringed"] == 5 and len(rings[0].get_offsets()) == 5
     assert (0.01, 0.4) not in {tuple(float(v) for v in xy) for xy in rings[0].get_offsets()}
     # and without it they still are, and that ring is not counted as fine-mapping
     result, ax = drawn_volcano(
-        monkeypatch, tmp_path, endpoint_frame(), significance=5e-8, label="endpoint",
+        monkeypatch,
+        tmp_path,
+        endpoint_frame(),
+        significance=5e-8,
+        label="endpoint",
         labels=["Asthma"],
     )
     rings = [c for c in ax.collections if not len(c.get_facecolors())]
@@ -2832,8 +3135,9 @@ def test_the_p_column_is_found_or_asked_for(monkeypatch, tmp_path):
     result, _ax = drawn_volcano(monkeypatch, tmp_path, burden)
     assert result["n_significant"] == 6
     with pytest.raises(GeneticsUsageError, match="several -log10 p columns"):
-        plots.volcano(burden.with_columns(pl.col("mlog10p_burden").alias("mlog10p_skat")),
-                      significance=1e-6)
+        plots.volcano(
+            burden.with_columns(pl.col("mlog10p_burden").alias("mlog10p_skat")), significance=1e-6
+        )
     with pytest.raises(GeneticsUsageError, match="neither `mlog10p` nor `pval`"):
         plots.volcano(burden.drop("mlog10p_burden"), significance=1e-6)
     # a p-value column gives the picture its -log10 gives
@@ -2845,10 +3149,12 @@ def test_the_p_column_is_found_or_asked_for(monkeypatch, tmp_path):
 
 def test_a_cloud_is_drawn_smaller_and_rasterised(monkeypatch, tmp_path):
     n = 3000
-    frame = pl.DataFrame({
-        "beta": [((i % 41) - 20) / 20 for i in range(n)],
-        "mlog10p": [(i % 17) / 10 for i in range(n)],
-    })
+    frame = pl.DataFrame(
+        {
+            "beta": [((i % 41) - 20) / 20 for i in range(n)],
+            "mlog10p": [(i % 17) / 10 for i in range(n)],
+        }
+    )
     result, ax = drawn_volcano(monkeypatch, tmp_path, frame, significance="bonferroni")
     assert result["n_points"] == n and result["n_significant"] == 0
     cloud = [c for c in ax.collections if len(c.get_offsets()) == n]
@@ -2864,8 +3170,9 @@ def test_volcano_into_a_caller_supplied_axis_saves_nothing(tmp_path, monkeypatch
     monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
     figure, ax = plt.subplots()
     try:
-        result = plots.volcano(burden_frame(), significance=1e-6, label="gene", ax=ax,
-                               title="LDL cholesterol")
+        result = plots.volcano(
+            burden_frame(), significance=1e-6, label="gene", ax=ax, title="LDL cholesterol"
+        )
         assert result["path"] is None and not list(tmp_path.iterdir())
         assert ax.get_title() == "LDL cholesterol" and len(ax.collections) >= 3
     finally:
@@ -2945,8 +3252,10 @@ def mr_result(frame):
     return SimpleNamespace(
         harmonised=SimpleNamespace(frame=frame),
         estimates=mr_estimates(frame),
-        sensitivity={"leave_one_out": mr_est.leave_one_out(frame),
-                     "single_snp": mr_est.single_snp(frame)},
+        sensitivity={
+            "leave_one_out": mr_est.leave_one_out(frame),
+            "single_snp": mr_est.single_snp(frame),
+        },
     )
 
 
@@ -2966,7 +3275,8 @@ def kept_figures(monkeypatch):
 def fit_lines(figure):
     return [
         line.get_gid().split(":", 1)[1]
-        for ax in figure.axes for line in ax.get_lines()
+        for ax in figure.axes
+        for line in ax.get_lines()
         if (line.get_gid() or "").startswith("mr-fit:")
     ]
 
@@ -2999,7 +3309,9 @@ def test_mr_scatter_orients_every_instrument_positive_beta_x(kept_figures, tmp_p
     assert (frame["beta_x"] < 0).sum() == 20
     plots.mr(mr_result(frame), panels=["scatter"], path=str(tmp_path / "o.png"))
     (offsets,) = [
-        c.get_offsets() for ax in kept_figures[-1].axes for c in ax.collections
+        c.get_offsets()
+        for ax in kept_figures[-1].axes
+        for c in ax.collections
         if c.get_gid() == "mr-instruments"
     ]
     bx, by = frame["beta_x"].to_numpy(), frame["beta_y"].to_numpy()
@@ -3009,7 +3321,8 @@ def test_mr_scatter_orients_every_instrument_positive_beta_x(kept_figures, tmp_p
 def test_mr_scatter_legend_stays_inside_a_narrow_figure(kept_figures, tmp_path):
     frame = mr_synthetic().head(4)
     result = plots.mr(
-        frame=frame, estimates={"a_very_long_method_label_that_overruns_the_default_width": mr_est.ivw(frame)},
+        frame=frame,
+        estimates={"a_very_long_method_label_that_overruns_the_default_width": mr_est.ivw(frame)},
         path=str(tmp_path / "narrow.png"),
     )
     figure = kept_figures[-1]
@@ -3019,13 +3332,16 @@ def test_mr_scatter_legend_stays_inside_a_narrow_figure(kept_figures, tmp_path):
     assert right <= result["size_in"][0] == figure.get_figwidth()
 
 
-def test_mr_egger_line_carries_its_intercept_and_the_others_pass_through_the_origin(kept_figures, tmp_path):
+def test_mr_egger_line_carries_its_intercept_and_the_others_pass_through_the_origin(
+    kept_figures, tmp_path
+):
     frame = mr_synthetic()
     res = mr_result(frame)
     plots.mr(res, path=str(tmp_path / "syn.png"))
     lines = {
         line.get_gid().split(":", 1)[1]: line
-        for ax in kept_figures[-1].axes for line in ax.get_lines()
+        for ax in kept_figures[-1].axes
+        for line in ax.get_lines()
         if (line.get_gid() or "").startswith("mr-fit:")
     }
     assert lines["egger"].get_ydata()[0] == pytest.approx(res.estimates["egger"]["intercept"])
@@ -3045,19 +3361,32 @@ def test_each_fitted_estimate_is_drawn_exactly_once(kept_figures, tmp_path):
     }
     result = plots.mr(frame=frame, estimates=estimates, path=str(tmp_path / "all.png"))
     drawn = fit_lines(kept_figures[-1])
-    expected = ["ivw", "egger", "weighted_median", "weighted_mode", "simple_median",
-                "simple_mode", "ivw_correlated"]
+    expected = [
+        "ivw",
+        "egger",
+        "weighted_median",
+        "weighted_mode",
+        "simple_median",
+        "simple_mode",
+        "ivw_correlated",
+    ]
     assert sorted(drawn) == sorted(expected)
     assert result["lines"] == expected
 
 
-def test_two_instruments_draw_the_forest_from_wald_ratios_and_say_why_loo_is_absent(tmp_path, kept_figures):
+def test_two_instruments_draw_the_forest_from_wald_ratios_and_say_why_loo_is_absent(
+    tmp_path, kept_figures
+):
     frame = mr_protein("RSPO3")
     assert frame.height == 2
-    result = plots.mr(frame=frame, estimates={"ivw": mr_est.ivw(frame)}, path=str(tmp_path / "k2.png"))
+    result = plots.mr(
+        frame=frame, estimates={"ivw": mr_est.ivw(frame)}, path=str(tmp_path / "k2.png")
+    )
     assert result["panels"] == ["scatter", "forest"]
     assert result["leave_one_out"] is None
-    assert result["notes"] == ["Leave-one-out not drawn: it needs at least 3 instruments and there are 2"]
+    assert result["notes"] == [
+        "Leave-one-out not drawn: it needs at least 3 instruments and there are 2"
+    ]
     assert result["forest"]["rows"][-1] == "IVW"
     assert result["forest"]["n_estimates"] == 3
     assert fit_lines(kept_figures[-1]) == ["ivw"]
@@ -3065,7 +3394,9 @@ def test_two_instruments_draw_the_forest_from_wald_ratios_and_say_why_loo_is_abs
 
 def test_one_instrument_still_draws_and_says_there_is_one(tmp_path):
     frame = mr_protein("IL12B").head(1)
-    result = plots.mr(frame=frame, estimates={"ivw": mr_est.ivw(frame)}, path=str(tmp_path / "k1.png"))
+    result = plots.mr(
+        frame=frame, estimates={"ivw": mr_est.ivw(frame)}, path=str(tmp_path / "k1.png")
+    )
     assert result["n_instruments"] == 1
     assert result["notes"][0].endswith("there is 1")
     assert result["panels"] == ["scatter", "forest"]
@@ -3075,7 +3406,9 @@ def test_without_a_single_snp_frame_the_wald_ratios_are_computed_first_order(tmp
     frame = mr_protein("CD6")
     seen = []
     real_forest = plots.forest
-    monkeypatch.setattr(plots, "forest", lambda data, **kw: seen.append(data) or real_forest(data, **kw))
+    monkeypatch.setattr(
+        plots, "forest", lambda data, **kw: seen.append(data) or real_forest(data, **kw)
+    )
     result = plots.mr(frame=frame, panels=("forest",), path=str(tmp_path / "w.png"))
     assert result["panels"] == ["forest"] and result["lines"] == []
     wald = mr_est.wald(frame)
@@ -3092,8 +3425,12 @@ def test_rows_not_in_the_outcome_are_left_out_of_every_panel(tmp_path, kept_figu
     flagged = frame.with_columns(in_outcome=pl.col("variant") != dropped)
     kept = frame.filter(pl.col("variant") != dropped)
     result = plots.mr(
-        frame=flagged, estimates=mr_estimates(kept),
-        sensitivity={"leave_one_out": mr_est.leave_one_out(frame), "single_snp": mr_est.single_snp(frame)},
+        frame=flagged,
+        estimates=mr_estimates(kept),
+        sensitivity={
+            "leave_one_out": mr_est.leave_one_out(frame),
+            "single_snp": mr_est.single_snp(frame),
+        },
         path=str(tmp_path / "in.png"),
     )
     name = frame["rsid"][2]
@@ -3104,13 +3441,17 @@ def test_rows_not_in_the_outcome_are_left_out_of_every_panel(tmp_path, kept_figu
 
 
 def test_proxies_are_hollow_on_the_scatter_and_named_in_the_forest(tmp_path, kept_figures):
-    frame = mr_protein("IL12B").with_columns(is_proxy=pl.Series([True, False, True, False, False, False, False]))
+    frame = mr_protein("IL12B").with_columns(
+        is_proxy=pl.Series([True, False, True, False, False, False, False])
+    )
     result = plots.mr(mr_result(frame), path=str(tmp_path / "proxy.png"))
     figure = kept_figures[-1]
     assert result["n_proxies"] == 2
     assert scatter_offsets(figure, "mr-proxies") == 2
     assert scatter_offsets(figure, "mr-instruments") == 5
-    legend_texts = [t.get_text() for ax in figure.axes if ax.get_legend() for t in ax.get_legend().get_texts()]
+    legend_texts = [
+        t.get_text() for ax in figure.axes if ax.get_legend() for t in ax.get_legend().get_texts()
+    ]
     assert "proxy (LD partner)" in legend_texts
     assert sum(r.endswith("(proxy)") for r in result["forest"]["rows"]) == 2
 
@@ -3118,7 +3459,9 @@ def test_proxies_are_hollow_on_the_scatter_and_named_in_the_forest(tmp_path, kep
 def test_keyword_inputs_override_the_result(tmp_path):
     frame = mr_protein("IL12B")
     result = plots.mr(
-        mr_result(frame), estimates={"ivw": mr_est.ivw(frame)}, sensitivity={},
+        mr_result(frame),
+        estimates={"ivw": mr_est.ivw(frame)},
+        sensitivity={},
         path=str(tmp_path / "kw.png"),
     )
     assert result["lines"] == ["ivw"]

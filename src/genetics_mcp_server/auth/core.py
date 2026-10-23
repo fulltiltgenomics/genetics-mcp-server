@@ -330,9 +330,7 @@ def get_authenticated_user(request: Request) -> str | None:
         return email.strip().lower()
 
     if not is_internal_caller(request):
-        logger.warning(
-            "ignoring %s: caller did not present the internal secret", IDENTITY_HEADER
-        )
+        logger.warning("ignoring %s: caller did not present the internal secret", IDENTITY_HEADER)
         return None
     if not _email_allowed(email):
         logger.warning("proxied identity rejected: email not in the allow-list")

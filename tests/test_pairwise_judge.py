@@ -173,8 +173,12 @@ def test_the_slicing_rule_reports_how_much_it_threw_away():
     assert final_answer_split(early_call) == ("the answer", 10)
     assert final_answer_split(late_call) == ("In summary, yes.", 1000)
     # the two cases where the rule keeps NOTHING, and says how much that was
-    assert final_answer_split([{"type": "text", "text": "answered before the call"},
-                               {"type": "tool_use", "id": "t", "name": "g", "input": {}}]) == (
+    assert final_answer_split(
+        [
+            {"type": "text", "text": "answered before the call"},
+            {"type": "tool_use", "id": "t", "name": "g", "input": {}},
+        ]
+    ) == (
         "",
         len("answered before the call"),
     )
@@ -225,21 +229,38 @@ async def test_the_benchmark_records_what_the_slicing_rule_discarded(stub_server
     """
     stub_server.plan = {
         None: [
-            {"type": "usage", "iteration": 1, "input_tokens": 10, "output_tokens": 5,
-             "total_input_tokens": 10, "total_output_tokens": 5, "context_window": 1000,
-             "context_percent": 1.0},
-            {"type": "done", "message_content": [
-                {"type": "text", "text": "a table the judge will never see"},
-                {"type": "tool_use", "id": "t1", "name": "get_x", "input": {}},
-                {"type": "text", "text": "the answer"},
-            ]},
+            {
+                "type": "usage",
+                "iteration": 1,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_input_tokens": 10,
+                "total_output_tokens": 5,
+                "context_window": 1000,
+                "context_percent": 1.0,
+            },
+            {
+                "type": "done",
+                "message_content": [
+                    {"type": "text", "text": "a table the judge will never see"},
+                    {"type": "tool_use", "id": "t1", "name": "get_x", "input": {}},
+                    {"type": "text", "text": "the answer"},
+                ],
+            },
         ],
     }
     stub_server.plan["bigquery"] = stub_server.plan[None]
     dataset = write_dataset(tmp_path, [make_case("s1")])
     report = await run_benchmark(
-        dataset=dataset, base_url=stub_server.base_url, arms=("all", "bigquery"), limit=None,
-        concurrency=1, model=None, timeout=30.0, max_turns=None, auth_token=None,
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=("all", "bigquery"),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
     )
     for turn in report["turns"]:
         assert turn["final_answer"] == "the answer"
@@ -313,7 +334,10 @@ def test_a_long_answer_is_elided_in_the_middle_so_the_conclusion_survives():
     elided = elide_middle(text)
     assert elided.startswith("HEAD")
     assert elided.endswith("TAIL")
-    assert len(elided) <= JUDGE_MAX_ANSWER_CHARS + len("[... middle of this answer elided for length ...]") + 8
+    assert (
+        len(elided)
+        <= JUDGE_MAX_ANSWER_CHARS + len("[... middle of this answer elided for length ...]") + 8
+    )
 
 
 def test_user_question_text_handles_both_recorded_shapes():
@@ -405,8 +429,13 @@ async def test_agreement_across_both_orders_is_a_win_for_that_arm():
 
 
 async def test_a_winner_in_one_order_and_a_tie_in_the_other_is_a_tie():
-    judge = FakeJudge(lambda prompt, index: {"verdict": "1" if index % 2 == 0 else "tie",
-                                             "margin": "clear", "reason": "r"})
+    judge = FakeJudge(
+        lambda prompt, index: {
+            "verdict": "1" if index % 2 == 0 else "tie",
+            "margin": "clear",
+            "reason": "r",
+        }
+    )
     verdicts = await judge_pairs(make_pairs(3), ARMS, client=judge)
     assert {v.outcome for v in verdicts} == {OUTCOME_TIE_UNSTABLE}
     assert all(v.winner is None for v in verdicts)
@@ -464,8 +493,11 @@ async def test_a_win_is_quoted_at_the_weaker_of_the_two_margins():
     margins = iter(["clear", "none"])
 
     def decide(prompt, index):
-        return {"verdict": "1" if "ALPHA" in prompt.split("--- ANSWER 2 ---")[0] else "2",
-                "margin": next(margins), "reason": "r"}
+        return {
+            "verdict": "1" if "ALPHA" in prompt.split("--- ANSWER 2 ---")[0] else "2",
+            "margin": next(margins),
+            "reason": "r",
+        }
 
     verdicts = await judge_pairs(make_pairs(1), ARMS, client=FakeJudge(decide))
     assert verdicts[0].outcome == OUTCOME_WIN and verdicts[0].winner == "all"
@@ -530,16 +562,28 @@ def test_an_empty_answer_the_slicing_rule_caused_is_distinguishable_from_a_silen
     from genetics_mcp_server.scripts.pairwise_judge import PairVerdict
 
     ate_it = PairVerdict(
-        case_id="sliced", turn_index=0, outcome=OUTCOME_WIN, winner="all", loser="code",
-        margin="clear", answer_chars={"all": 10, "code": 0},
+        case_id="sliced",
+        turn_index=0,
+        outcome=OUTCOME_WIN,
+        winner="all",
+        loser="code",
+        margin="clear",
+        answer_chars={"all": 10, "code": 0},
         shown_answer_chars={"all": 10, "code": 0},
-        dropped_chars={"all": 0, "code": 4_000}, empty_answer_arms=["code"],
+        dropped_chars={"all": 0, "code": 4_000},
+        empty_answer_arms=["code"],
     )
     really_silent = PairVerdict(
-        case_id="silent", turn_index=0, outcome=OUTCOME_WIN, winner="all", loser="code",
-        margin="clear", answer_chars={"all": 10, "code": 0},
+        case_id="silent",
+        turn_index=0,
+        outcome=OUTCOME_WIN,
+        winner="all",
+        loser="code",
+        margin="clear",
+        answer_chars={"all": 10, "code": 0},
         shown_answer_chars={"all": 10, "code": 0},
-        dropped_chars={"all": 0, "code": 0}, empty_answer_arms=["code"],
+        dropped_chars={"all": 0, "code": 0},
+        empty_answer_arms=["code"],
     )
     summary = summarize_verdicts([ate_it, really_silent], ARMS, "fake")
     assert summary["empty_answers_per_arm"] == {"all": 0, "code": 2}
@@ -955,21 +999,38 @@ async def test_a_report_without_answer_text_is_refused_rather_than_judged_on_not
 async def test_the_benchmark_records_the_question_and_the_final_answer(stub_server, tmp_path):  # noqa: F811  (the imported fixture)
     stub_server.plan = {
         None: [
-            {"type": "usage", "iteration": 1, "input_tokens": 10, "output_tokens": 5,
-             "total_input_tokens": 10, "total_output_tokens": 5, "context_window": 1000,
-             "context_percent": 1.0},
-            {"type": "done", "message_content": [
-                {"type": "text", "text": "checking"},
-                {"type": "tool_use", "id": "t1", "name": "get_x", "input": {}},
-                {"type": "text", "text": "the answer"},
-            ]},
+            {
+                "type": "usage",
+                "iteration": 1,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_input_tokens": 10,
+                "total_output_tokens": 5,
+                "context_window": 1000,
+                "context_percent": 1.0,
+            },
+            {
+                "type": "done",
+                "message_content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "t1", "name": "get_x", "input": {}},
+                    {"type": "text", "text": "the answer"},
+                ],
+            },
         ],
     }
     stub_server.plan["bigquery"] = stub_server.plan[None]
     dataset = write_dataset(tmp_path, [make_case("s1")])
     report = await run_benchmark(
-        dataset=dataset, base_url=stub_server.base_url, arms=("all", "bigquery"), limit=None,
-        concurrency=1, model=None, timeout=30.0, max_turns=None, auth_token=None,
+        dataset=dataset,
+        base_url=stub_server.base_url,
+        arms=("all", "bigquery"),
+        limit=None,
+        concurrency=1,
+        model=None,
+        timeout=30.0,
+        max_turns=None,
+        auth_token=None,
     )
     for turn in report["turns"]:
         assert turn["user_question"] == "question 0"
@@ -991,7 +1052,9 @@ def test_judging_is_off_unless_asked_for(tmp_path):
 def _full_report_shell():
     from genetics_mcp_server.scripts.replay_benchmark import build_report
 
-    return build_report([], ARMS, {"base_url": "u", "dataset": "d", "model": None, "provider": None})
+    return build_report(
+        [], ARMS, {"base_url": "u", "dataset": "d", "model": None, "provider": None}
+    )
 
 
 def test_a_saved_report_can_be_priced_without_re_running_the_benchmark(tmp_path, capsys):
@@ -1033,7 +1096,5 @@ def test_dropped_prose_keeps_everything_when_the_last_block_is_the_call():
         {"type": "text", "text": "here is the table"},
         {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
     ]
-    assert dropped_prose_blocks(blocks) == [
-        {"after_call": None, "text": "here is the table"}
-    ]
+    assert dropped_prose_blocks(blocks) == [{"after_call": None, "text": "here is the table"}]
     assert final_answer_split(blocks)[0] == ""

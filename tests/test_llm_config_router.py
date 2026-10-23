@@ -34,6 +34,7 @@ def test_db():
 @pytest.fixture
 def client_with_auth(test_db):
     """Create a test client with mocked authentication and database."""
+
     async def mock_auth():
         return "test@example.com"
 
@@ -138,9 +139,7 @@ class TestUserCommentEndpoints:
         )
         comment_id = add_resp.json()["id"]
 
-        response = client_with_auth.delete(
-            f"/chat/v1/llm-config/user/comments/{comment_id}"
-        )
+        response = client_with_auth.delete(f"/chat/v1/llm-config/user/comments/{comment_id}")
 
         assert response.status_code == 200
         assert response.json()["deleted"] is True
@@ -165,6 +164,7 @@ def admin_client(test_db):
     stays false, so the mocked user is treated as an admin — the deny cases live in
     TestToolDescriptionAuthGuards, which moves both settings.
     """
+
     async def mock_auth():
         return "test@example.com"
 
@@ -213,9 +213,7 @@ class TestGlobalToolDescriptionEndpoints:
             json={"description": "Custom description"},
         )
 
-        response = admin_client.get(
-            "/chat/v1/llm-config/tool-descriptions/search_genes"
-        )
+        response = admin_client.get("/chat/v1/llm-config/tool-descriptions/search_genes")
 
         assert response.status_code == 200
         data = response.json()
@@ -223,9 +221,7 @@ class TestGlobalToolDescriptionEndpoints:
 
     def test_get_tool_description_not_found(self, admin_client):
         """Test getting a tool description that hasn't been customized."""
-        response = admin_client.get(
-            "/chat/v1/llm-config/tool-descriptions/nonexistent_tool"
-        )
+        response = admin_client.get("/chat/v1/llm-config/tool-descriptions/nonexistent_tool")
 
         assert response.status_code == 200
         assert response.json() is None
@@ -246,9 +242,7 @@ class TestGlobalToolDescriptionEndpoints:
             json={"description": "Version 2"},
         )
 
-        response = admin_client.get(
-            "/chat/v1/llm-config/tool-descriptions/search_genes/history"
-        )
+        response = admin_client.get("/chat/v1/llm-config/tool-descriptions/search_genes/history")
 
         assert response.status_code == 200
         data = response.json()
@@ -370,9 +364,7 @@ class TestInstructionSetCrud:
     def test_update_name_and_body(self, client_with_auth):
         set_id = _create(client_with_auth).json()["id"]
 
-        resp = client_with_auth.put(
-            f"{BASE}/{set_id}", json={"name": "Terse", "body": "Be terse."}
-        )
+        resp = client_with_auth.put(f"{BASE}/{set_id}", json={"name": "Terse", "body": "Be terse."})
         assert resp.status_code == 200
         assert resp.json()["name"] == "Terse"
         assert resp.json()["body"] == "Be terse."
@@ -424,9 +416,9 @@ class TestInstructionSetCrud:
         set_id = _create(client_with_auth).json()["id"]
         client_with_auth.delete(f"{BASE}/{set_id}")
 
-        assert client_with_auth.put(
-            f"{BASE}/{set_id}", json={"body": "Be terse."}
-        ).status_code == 404
+        assert (
+            client_with_auth.put(f"{BASE}/{set_id}", json={"body": "Be terse."}).status_code == 404
+        )
 
 
 class TestInstructionSetHistory:
@@ -474,9 +466,10 @@ class TestInstructionSetHistory:
         """An int wider than SQLite's INTEGER used to escape as an uncaught 500."""
         set_id = _create(client_with_auth).json()["id"]
 
-        assert client_with_auth.get(
-            f"{BASE}/{set_id}/history?limit=999999999999999999999"
-        ).status_code == 422
+        assert (
+            client_with_auth.get(f"{BASE}/{set_id}/history?limit=999999999999999999999").status_code
+            == 422
+        )
         assert client_with_auth.get(f"{BASE}/{set_id}/history?limit=101").status_code == 422
 
     def test_limit_boundaries_are_accepted(self, client_with_auth):

@@ -58,13 +58,21 @@ EPMC_RESPONSE = {
                 "abstractText": "Full abstract text.",
                 "source": "MED",
                 # core fields as Europe PMC returned them for this PMID on 2026-09-27
-                "pubTypeList": {"pubType": ["Meta-Analysis", "research-article", "Journal Article"]},
+                "pubTypeList": {
+                    "pubType": ["Meta-Analysis", "research-article", "Journal Article"]
+                },
                 "meshHeadingList": {
                     "meshHeading": [
                         {"majorTopic_YN": "N", "descriptorName": name}
                         for name in (
-                            "Humans", "Platelet Count", "Phenotype", "Quantitative Trait Loci",
-                            "Female", "Male", "Genetic Variation", "Biomarkers",
+                            "Humans",
+                            "Platelet Count",
+                            "Phenotype",
+                            "Quantitative Trait Loci",
+                            "Female",
+                            "Male",
+                            "Genetic Variation",
+                            "Biomarkers",
                         )
                     ]
                 },
@@ -83,19 +91,31 @@ EPMC_RESPONSE = {
                 # descriptors, so the subjects cap applies
                 "pubTypeList": {
                     "pubType": [
-                        "Research Support, Non-U.S. Gov't", "review-article", "Review",
-                        "Journal Article", "Research Support, N.I.H., Extramural",
+                        "Research Support, Non-U.S. Gov't",
+                        "review-article",
+                        "Review",
+                        "Journal Article",
+                        "Research Support, N.I.H., Extramural",
                     ]
                 },
                 "meshHeadingList": {
                     "meshHeading": [
                         {"majorTopic_YN": "N", "descriptorName": name}
                         for name in (
-                            "Blood Platelets", "Chromosomes, Human, Pair 12", "Humans",
-                            "Platelet Count", "Platelet Function Tests", "Risk Factors",
-                            "Genomics", "Thrombopoiesis", "Cell Size", "Platelet Aggregation",
-                            "Polymorphism, Single Nucleotide", "Quantitative Trait Loci",
-                            "Coronary Artery Disease", "Genome-Wide Association Study",
+                            "Blood Platelets",
+                            "Chromosomes, Human, Pair 12",
+                            "Humans",
+                            "Platelet Count",
+                            "Platelet Function Tests",
+                            "Risk Factors",
+                            "Genomics",
+                            "Thrombopoiesis",
+                            "Cell Size",
+                            "Platelet Aggregation",
+                            "Polymorphism, Single Nucleotide",
+                            "Quantitative Trait Loci",
+                            "Coronary Artery Disease",
+                            "Genome-Wide Association Study",
                         )
                     ]
                 },
@@ -120,7 +140,8 @@ def _handler(epmc_status: int = 200, perplexity_payload: dict | None = None):
     def handle(request: httpx.Request) -> httpx.Response:
         if request.url.host == "api.perplexity.ai":
             return httpx.Response(
-                200, json=perplexity_payload if perplexity_payload is not None else PERPLEXITY_RESPONSE
+                200,
+                json=perplexity_payload if perplexity_payload is not None else PERPLEXITY_RESPONSE,
             )
         if request.url.host == "www.ebi.ac.uk":
             if epmc_status != 200:
@@ -286,7 +307,11 @@ class TestCoreFields:
             [EPMC_RESPONSE["resultList"]["result"][1]]
         )[0]
         assert len(record["subjects"]) == _EPMC_SUBJECTS_CAP < 14
-        assert record["subjects"][:3] == ["Blood Platelets", "Chromosomes, Human, Pair 12", "Humans"]
+        assert record["subjects"][:3] == [
+            "Blood Platelets",
+            "Chromosomes, Human, Pair 12",
+            "Humans",
+        ]
 
     def test_missing_fields_are_empty_not_errors(self):
         preprint, bare = ServerToolExecutor()._format_literature_results(
@@ -364,9 +389,7 @@ class TestBackendIsCallerControlled:
 
     def test_tool_exposes_no_backend_parameter(self):
         """A backend argument in the schema is what let the model ask for europepmc."""
-        tool = next(
-            t for t in TOOL_DEFINITIONS if t["name"] == "search_scientific_literature"
-        )
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "search_scientific_literature")
         assert "backend" not in tool["parameters"]
 
     async def test_model_supplied_backend_is_discarded(self, service):
@@ -604,19 +627,23 @@ class TestTitleMatchIsOneWork:
 
     async def test_two_different_same_title_records_are_refused(self):
         record = await self._resolve(
-            _title_page([
-                _epmc_record("MED", self.TITLE, "2010", "10.1/a", "Smith A, Jones B."),
-                _epmc_record("MED", self.TITLE, "2019", "10.1/b", "Brown C."),
-            ])
+            _title_page(
+                [
+                    _epmc_record("MED", self.TITLE, "2010", "10.1/a", "Smith A, Jones B."),
+                    _epmc_record("MED", self.TITLE, "2019", "10.1/b", "Brown C."),
+                ]
+            )
         )
         assert record["metadata_source"] == "perplexity"
         assert record["doi"] is None
 
     async def test_preprint_and_journal_version_follow_the_hit_url(self):
-        page = _title_page([
-            _epmc_record("MED", self.TITLE, "2023", "10.1/journal", "McAfee JC, Lee S."),
-            _epmc_record("PPR", self.TITLE, "2022", "10.1101/preprint", "McAfee JC, Lee S."),
-        ])
+        page = _title_page(
+            [
+                _epmc_record("MED", self.TITLE, "2023", "10.1/journal", "McAfee JC, Lee S."),
+                _epmc_record("PPR", self.TITLE, "2022", "10.1101/preprint", "McAfee JC, Lee S."),
+            ]
+        )
         journal = await self._resolve(page)
         preprint = await self._resolve(page, url="https://www.biorxiv.org/search/diabetes")
         assert journal["doi"] == "10.1/journal"
@@ -717,7 +744,10 @@ class TestHydrationDegrades:
             await executor.close()
 
         assert result["success"] is True
-        assert result["results"][0]["title"] == "Genetic variants associated with platelet count are ..."
+        assert (
+            result["results"][0]["title"]
+            == "Genetic variants associated with platelet count are ..."
+        )
         assert {r["metadata_source"] for r in result["results"]} == {"perplexity"}
 
 
@@ -782,7 +812,9 @@ class TestRecordKind:
             await executor.close()
 
         assert [r["record_kind"] for r in result["results"]] == [
-            "europepmc", "europepmc", "database_page",
+            "europepmc",
+            "europepmc",
+            "database_page",
         ]
         assert all(r["metadata_source"] == "europepmc" for r in result["results"][:2])
 
@@ -820,7 +852,11 @@ class TestSummaryCitations:
                 "url": "https://example.org/paper-2",
                 "record_kind": "perplexity_snippet",
             },
-            4: {"title": "Paper 4", "url": "https://example.org/paper-4", "record_kind": "cited_only"},
+            4: {
+                "title": "Paper 4",
+                "url": "https://example.org/paper-4",
+                "record_kind": "cited_only",
+            },
             9: None,
         }
 

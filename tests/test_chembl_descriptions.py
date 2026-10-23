@@ -105,9 +105,7 @@ def _chembl_blocks() -> list:
         block
         for block in _PROMPT_BLOCKS
         if any(
-            name in block.text
-            or name in block.requires_any
-            or name in block.requires_all
+            name in block.text or name in block.requires_any or name in block.requires_all
             for name in _CHEMBL_TOOLS
         )
     ]
@@ -317,6 +315,6 @@ class TestChEMBLDescriptionsNameOnlyRealKeys(_ChEMBLToolCase):
         tool = _tool("get_target_bioactivity")
         doctored = tool["description"] + "\n`other_targets` and `resolution.ambiguous`.\n"
         # other_targets IS on this result; only the invented one is reported
-        assert _unresolved(doctored, {"x": results["get_target_bioactivity"]}, _parameters(tool)) == [
-            "resolution.ambiguous"
-        ]
+        assert _unresolved(
+            doctored, {"x": results["get_target_bioactivity"]}, _parameters(tool)
+        ) == ["resolution.ambiguous"]

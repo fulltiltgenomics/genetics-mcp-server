@@ -77,13 +77,19 @@ class TestFlattenMyvariantResult:
             "clinvar": {
                 "rcv": [
                     {"clinical_significance": "Pathogenic", "preferred_name": "Breast cancer"},
-                    {"clinical_significance": "Likely pathogenic", "preferred_name": "Ovarian cancer"},
+                    {
+                        "clinical_significance": "Likely pathogenic",
+                        "preferred_name": "Ovarian cancer",
+                    },
                 ],
                 "review": {"review_status": "reviewed by expert panel"},
             }
         }
         result = ToolExecutor._flatten_myvariant_result(data)
-        assert set(result["clinvar"]["clinical_significance"]) == {"Pathogenic", "Likely pathogenic"}
+        assert set(result["clinvar"]["clinical_significance"]) == {
+            "Pathogenic",
+            "Likely pathogenic",
+        }
         assert set(result["clinvar"]["conditions"]) == {"Breast cancer", "Ovarian cancer"}
 
     def test_cadd(self):
@@ -159,7 +165,9 @@ class TestGetMyvariantAnnotations:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock_response):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock_response
+        ):
             result = await self.executor.get_myvariant_annotations(variant="1:55051215:G:A")
 
         assert result["success"] is True
@@ -172,7 +180,9 @@ class TestGetMyvariantAnnotations:
         mock_response = MagicMock()
         mock_response.status_code = 404
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock_response):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock_response
+        ):
             result = await self.executor.get_myvariant_annotations(variant="1:99999999:A:G")
 
         assert result["success"] is True
@@ -183,7 +193,9 @@ class TestGetMyvariantAnnotations:
         mock_response = MagicMock()
         mock_response.status_code = 429
 
-        with patch.object(self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock_response):
+        with patch.object(
+            self.executor.external_client, "get", new_callable=AsyncMock, return_value=mock_response
+        ):
             result = await self.executor.get_myvariant_annotations(variant="1:55051215:G:A")
 
         assert result["success"] is False
@@ -193,7 +205,10 @@ class TestGetMyvariantAnnotations:
         import httpx
 
         with patch.object(
-            self.executor.external_client, "get", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timed out")
+            self.executor.external_client,
+            "get",
+            new_callable=AsyncMock,
+            side_effect=httpx.TimeoutException("timed out"),
         ):
             result = await self.executor.get_myvariant_annotations(variant="1:55051215:G:A")
 
@@ -206,13 +221,20 @@ class TestGetMyvariantAnnotations:
         mock_response.json.return_value = [
             {
                 "_id": "chr1:g.55051215G>A",
-                "clinvar": {"rcv": {"clinical_significance": "Pathogenic", "preferred_name": "test"}},
+                "clinvar": {
+                    "rcv": {"clinical_significance": "Pathogenic", "preferred_name": "test"}
+                },
             },
             {"_id": "chr7:g.117559590A>G", "notfound": True},
         ]
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(self.executor.external_client, "post", new_callable=AsyncMock, return_value=mock_response):
+        with patch.object(
+            self.executor.external_client,
+            "post",
+            new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
             result = await self.executor.get_myvariant_annotations(
                 variants=["1:55051215:G:A", "7:117559590:A:G"]
             )

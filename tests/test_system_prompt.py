@@ -134,7 +134,9 @@ class TestPromptNamesOnlyAvailableTools:
         tool list and the prompt. A prompt that kept steering toward run_analysis while the
         tool was gone would be the worst of the three states.
         """
-        off = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False, sandbox=False))
+        off = default_system_prompt(
+            "FinnGenie", tool_names=resolve(None, subagents=False, sandbox=False)
+        )
         assert "run_analysis" not in off
         assert "Choosing How to Get Data" in off, "the other paths still need routing"
         # the default profile is not the only surface: the code arm resolves to nothing it
@@ -427,7 +429,13 @@ class TestSectionStructureSurvivesFiltering:
             if not line.startswith("#"):
                 continue
             rest = lines[i + 1 :]
-            body = [x for x in rest[: next((j for j, y in enumerate(rest) if y.startswith("#")), len(rest))] if x.strip()]
+            body = [
+                x
+                for x in rest[
+                    : next((j for j, y in enumerate(rest) if y.startswith("#")), len(rest))
+                ]
+                if x.strip()
+            ]
             assert body, f"{profile}: heading {line!r} has no body"
 
 
@@ -514,7 +522,7 @@ _LITERATURE_RUBRIC = [
     "Converging evidence is weighed, not counted",
     "not three confirmations",
     "Agreement with the loaded data is reconciled as carefully as disagreement",
-    "\"consistent with\" needs the paper's number beside yours",
+    '"consistent with" needs the paper\'s number beside yours',
     "A caveat stated in Pass 2 survives into Pass 3 and the bottom line",
     "beside the claim it qualifies",
 ]
@@ -664,9 +672,7 @@ class TestRunAnalysisWordingIsArmNeutral:
             | {"run_analysis", "list_capabilities", "read_artifact"},
         }
         bullets = {
-            label: _run_analysis_bullet(
-                default_system_prompt("FinnGenie", tool_names=tools)
-            )
+            label: _run_analysis_bullet(default_system_prompt("FinnGenie", tool_names=tools))
             for label, tools in arms.items()
         }
         assert len(set(bullets.values())) == 1, "run_analysis wording differs between arms"
@@ -779,7 +785,9 @@ _ANNOTATION_NO_ROUTE = "there is no variant-annotation tool on this surface"
 # myvariant is the last resort, never the source for consequence or frequency
 _ANNOTATION_MYVARIANT_ROUTE = "Use `get_myvariant_annotations` only for what those two do not cover"
 # the same shape without a script; no shipped profile, so only the assembly reaches it
-_ANNOTATION_DB_MYVARIANT_ROUTE = "Consequence and allele frequency come from `gnomad_variant_annotation_v` above"
+_ANNOTATION_DB_MYVARIANT_ROUTE = (
+    "Consequence and allele frequency come from `gnomad_variant_annotation_v` above"
+)
 _ANNOTATION_ROUTES = (
     _ANNOTATION_TOOL_ROUTE,
     _ANNOTATION_MYVARIANT_ROUTE,
@@ -875,15 +883,15 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert "get_variant_annotations" not in available
         prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
         assert _ANNOTATION_MYVARIANT_ROUTE in prompt
-        route = prompt[prompt.index("Those per-variant annotations are not in the database"):]
-        assert route.index("genetics.variant_annotation(") < route.index("get_myvariant_annotations")
+        route = prompt[prompt.index("Those per-variant annotations are not in the database") :]
+        assert route.index("genetics.variant_annotation(") < route.index(
+            "get_myvariant_annotations"
+        )
         assert "`get_myvariant_annotations` returns a variant's consequence" not in prompt
 
     @pytest.mark.parametrize("variant", ["condensed", "legacy"])
     def test_a_database_surface_with_myvariant_gets_the_gnomad_view_route(self, variant):
-        available = resolve("nocode", subagents=False, sandbox=False) - {
-            "get_variant_annotations"
-        }
+        available = resolve("nocode", subagents=False, sandbox=False) - {"get_variant_annotations"}
         assert "get_myvariant_annotations" in available
         assert "run_analysis" not in available
         prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
@@ -913,11 +921,14 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
             "get_myvariant_annotations",
             "get_variant_protein_effect",
         }
-        assert not {
-            "get_variant_annotations",
-            "get_myvariant_annotations",
-            "get_variant_protein_effect",
-        } & available
+        assert (
+            not {
+                "get_variant_annotations",
+                "get_myvariant_annotations",
+                "get_variant_protein_effect",
+            }
+            & available
+        )
         assert "run_analysis" in available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
         assert _ANNOTATION_PROHIBITION in prompt
@@ -1011,9 +1022,7 @@ class TestPromptVariants:
         from genetics_mcp_server.config import defaults
 
         marker = "SENTINEL-BLOCK-TEXT"
-        monkeypatch.setitem(
-            defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block(marker),)
-        )
+        monkeypatch.setitem(defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block(marker),))
 
         assert marker in defaults.default_system_prompt(variant="sentinel")
         assert marker not in defaults.default_system_prompt()
@@ -1033,9 +1042,7 @@ class TestPromptVariants:
             ),
         )
 
-        with_tool = defaults.default_system_prompt(
-            tool_names={"run_analysis"}, variant="sentinel"
-        )
+        with_tool = defaults.default_system_prompt(tool_names={"run_analysis"}, variant="sentinel")
         without = defaults.default_system_prompt(tool_names=set(), variant="sentinel")
 
         assert "run_analysis" in with_tool
@@ -1191,8 +1198,12 @@ class TestAlphaGenomeOptIn:
         """The flag is the deployment's intent and gates independently of the key: a
         deployment that leaves ALPHAGENOME_ENABLED off must not advertise the tool or its
         prompt block even if a key was ever seeded there."""
-        disabled = Settings(alphagenome_enabled=False, alphagenome_api_key="test-key").disabled_tools
-        available = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
+        disabled = Settings(
+            alphagenome_enabled=False, alphagenome_api_key="test-key"
+        ).disabled_tools
+        available = {
+            t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)
+        }
         assert self.TOOL not in available
         assert "AlphaGenome" not in default_system_prompt(
             "FinnGenie", tool_names=available, variant=variant
@@ -1204,10 +1215,19 @@ class TestAlphaGenomeOptIn:
         variable — os.environ.get returns "" for `ALPHAGENOME_API_KEY=` in a manifest,
         which is exactly what an optional secret key renders to when the deployment has
         no key."""
-        assert self.TOOL not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
-        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
-        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
-        assert self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
+        assert (
+            self.TOOL
+            not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
+        )
+        assert (
+            self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
+        )
+        assert (
+            self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
+        )
+        assert (
+            self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
+        )
 
     def test_the_tool_description_carries_the_same_rules(self):
         """The strongest wording lives in the description, which the model follows more
@@ -1272,7 +1292,9 @@ class TestRunAnalysisInputsRules:
         assert "run_analysis" not in without
         prompt = default_system_prompt("FinnGenie", tool_names=without, variant=variant)
         for rule in self.RULES:
-            assert rule not in prompt, f"{variant}: lost the gate: {rule!r} survived without run_analysis"
+            assert rule not in prompt, (
+                f"{variant}: lost the gate: {rule!r} survived without run_analysis"
+            )
 
     @pytest.fixture
     def fetcher_allow_list(self, monkeypatch):
@@ -1366,9 +1388,7 @@ class TestRunAnalysisInputsRules:
         """What production does: assembly is called from an async request handler, so the
         probe cannot use the loop it is already on."""
         fetcher_allow_list(self.HOSTS)
-        prompt = default_system_prompt(
-            "FinnGenie", tool_names=resolve("code", subagents=False)
-        )
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("code", subagents=False))
         assert (
             "URL inputs are fetched only from these hosts: "
             "raw.githubusercontent.com, eutils.ncbi.nlm.nih.gov." in prompt
@@ -1435,9 +1455,13 @@ class TestPseudoCredibleSetCaveatIsKeyedOnTheRegistryFlag:
     def test_the_caveat_names_the_flag_and_no_resource_id(self, variant):
         """A resource id in the caveat is a list a new resource silently misses; the
         registry's `pseudo_credible_sets` flag reaches the model through list_datasets."""
-        prompt = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False), variant=variant)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve(None, subagents=False), variant=variant
+        )
         assert "`pseudo_credible_sets` flag is true" in prompt
-        assert not re.search(r"finngen_(mvp_)?ukbb", prompt.split("### Pseudo Credible Sets")[1].split("###")[0])
+        assert not re.search(
+            r"finngen_(mvp_)?ukbb", prompt.split("### Pseudo Credible Sets")[1].split("###")[0]
+        )
 
     @pytest.mark.parametrize("variant", _ALL_VARIANTS)
     def test_the_duty_survives_a_surface_without_list_datasets(self, variant):
@@ -1445,7 +1469,10 @@ class TestPseudoCredibleSetCaveatIsKeyedOnTheRegistryFlag:
         and can surface pseudo sets with no list_datasets tool."""
         tools = resolve(None, subagents=False) - {"list_datasets"}
         prompt = default_system_prompt("FinnGenie", tool_names=tools, variant=variant)
-        assert "list_datasets" not in prompt.split("### Pseudo Credible Sets")[1].split("###")[0].split("(`")[0]
+        assert (
+            "list_datasets"
+            not in prompt.split("### Pseudo Credible Sets")[1].split("###")[0].split("(`")[0]
+        )
         assert "### Pseudo Credible Sets" in prompt
         assert "tell the user explicitly" in prompt
         assert "`pseudo_credible_sets` flag is true" in prompt

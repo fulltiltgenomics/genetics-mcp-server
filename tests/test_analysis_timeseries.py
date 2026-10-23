@@ -145,8 +145,11 @@ def test_build_all_series_shape_and_meta():
     records = [rec(10, score=5, issues=[CAT_A]), rec(11, score=3)]
     out = ats.build_all_series(records, window=7, min_n=1)
     assert set(out) == {
-        "score_share", "mean_and_volume", "disposition_mix",
-        "issue_category_mix", "meta",
+        "score_share",
+        "mean_and_volume",
+        "disposition_mix",
+        "issue_category_mix",
+        "meta",
     }
     assert out["meta"]["empty"] is False
     assert out["meta"]["total"] == 2

@@ -161,9 +161,7 @@ class ChEMBLClient:
         # next URL is server-supplied.
         self._allowed_origins = frozenset({self._origin(httpx.URL(self._base_url))})
 
-    async def _get(
-        self, resource: str, params: dict[str, Any], only: list[str]
-    ) -> dict[str, Any]:
+    async def _get(self, resource: str, params: dict[str, Any], only: list[str]) -> dict[str, Any]:
         """GET one page of `<base>/<resource>.json`, projected to `only`.
 
         Returns the parsed body or an error sentinel; use `_is_error` to tell them
@@ -787,9 +785,7 @@ class ChEMBLClient:
         """
         molecule_id = str(record.get("molecule_chembl_id") or "")
         hierarchy = record.get("molecule_hierarchy")
-        is_parent = (
-            isinstance(hierarchy, dict) and hierarchy.get("parent_chembl_id") == molecule_id
-        )
+        is_parent = isinstance(hierarchy, dict) and hierarchy.get("parent_chembl_id") == molecule_id
         return (-_sort_phase(record.get("max_phase")), 0 if is_parent else 1, molecule_id)
 
     async def _by_ids(
@@ -870,15 +866,11 @@ class ChEMBLClient:
                 and synonym.get("syn_type") == "GENE_SYMBOL"
                 and synonym.get("component_synonym")
             ]
-            components.append(
-                {"accession": component.get("accession"), "gene_symbols": symbols}
-            )
+            components.append({"accession": component.get("accession"), "gene_symbols": symbols})
         return components
 
     @staticmethod
-    def _failed(
-        sentinel: dict[str, Any], stage: str, resolution: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _failed(sentinel: dict[str, Any], stage: str, resolution: dict[str, Any]) -> dict[str, Any]:
         """Turn a stage's sentinel into a tool result; never raises past a tool method."""
         return {
             "success": False,
@@ -959,9 +951,7 @@ class ChEMBLClient:
         than by a table of plurals so a resource nobody anticipated still reads.
         """
         lists = [
-            value
-            for key, value in body.items()
-            if key != "page_meta" and isinstance(value, list)
+            value for key, value in body.items() if key != "page_meta" and isinstance(value, list)
         ]
         return lists[0] if len(lists) == 1 else None
 

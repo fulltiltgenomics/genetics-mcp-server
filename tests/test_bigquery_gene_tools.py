@@ -155,7 +155,11 @@ _INJECTION_PAYLOADS = [
     ("method", "args", "prefix"),
     [
         ("get_mpra_by_variant", ("../../admin/users",), "/api/v1/mpra/variant/"),
-        ("get_open_chromatin_by_variant", ("x?token=leak#frag",), "/api/v1/open_chromatin/variant/"),
+        (
+            "get_open_chromatin_by_variant",
+            ("x?token=leak#frag",),
+            "/api/v1/open_chromatin/variant/",
+        ),
         ("get_variant_effect_by_variant", ("../..",), "/api/v1/variant_effect/variant/"),
         ("get_exome_results_by_gene", ("../v1/resources",), "/api/v1/exome_results_by_gene/"),
         ("get_gene_expression", ("a/b",), "/api/v1/expression_by_gene/"),
@@ -200,9 +204,7 @@ async def test_url_path_segments_cannot_escape_their_endpoint(method, args, pref
 @contextlib.asynccontextmanager
 async def _stubbed_executor():
     executor = ToolExecutor(bigquery_api_url="http://unused.test")
-    executor.query_database = AsyncMock(
-        return_value={"success": True, "rows": [], "columns": []}
-    )
+    executor.query_database = AsyncMock(return_value={"success": True, "rows": [], "columns": []})
     try:
         yield executor
     finally:
@@ -354,7 +356,7 @@ def test_by_gene_tools_take_limit_on_both_surfaces(method):
     assert schema["properties"]["limit"]["default"] == 500
 
     asyncio.run(mcp.call_tool(method, {"gene": "APOE", "limit": 1234}))
-    (name, args, kwargs), = recorder.calls
+    ((name, args, kwargs),) = recorder.calls
     assert name == method
     # the executor's `limit` is positional on every one of these, in a different slot each
     import inspect
@@ -442,9 +444,7 @@ _SQL_EMITTERS = [
 ]
 
 
-@pytest.mark.parametrize(
-    "method,emit", _SQL_EMITTERS, ids=[name for name, _ in _SQL_EMITTERS]
-)
+@pytest.mark.parametrize("method,emit", _SQL_EMITTERS, ids=[name for name, _ in _SQL_EMITTERS])
 async def test_generated_sql_names_views_bare_and_unbackticked(method, emit):
     async with _stubbed_executor() as executor:
         sql = await emit(executor)
@@ -479,14 +479,18 @@ async def test_query_database_passes_db_apis_applied_row_cap_through():
     """
     executor = ToolExecutor(bigquery_api_url="http://unused.test")
     try:
-        executor.client.post = AsyncMock(return_value=_FakeResponse({
-            "columns": ["x"],
-            "rows": [[1]],
-            "total_rows": 90_000,
-            "bytes_processed": 10,
-            "truncated": True,
-            "max_rows_applied": 25_000,
-        }))
+        executor.client.post = AsyncMock(
+            return_value=_FakeResponse(
+                {
+                    "columns": ["x"],
+                    "rows": [[1]],
+                    "total_rows": 90_000,
+                    "bytes_processed": 10,
+                    "truncated": True,
+                    "max_rows_applied": 25_000,
+                }
+            )
+        )
 
         result = await executor.query_database("SELECT 1", max_rows=10)
 
@@ -502,9 +506,16 @@ async def test_query_database_reports_no_cap_when_db_api_does_not_send_one():
     """An older db-api sends no `max_rows_applied`; nothing may invent a number for it."""
     executor = ToolExecutor(bigquery_api_url="http://unused.test")
     try:
-        executor.client.post = AsyncMock(return_value=_FakeResponse({
-            "columns": ["x"], "rows": [[1]], "total_rows": 1, "truncated": False,
-        }))
+        executor.client.post = AsyncMock(
+            return_value=_FakeResponse(
+                {
+                    "columns": ["x"],
+                    "rows": [[1]],
+                    "total_rows": 1,
+                    "truncated": False,
+                }
+            )
+        )
 
         result = await executor.query_database("SELECT 1", max_rows=10)
 

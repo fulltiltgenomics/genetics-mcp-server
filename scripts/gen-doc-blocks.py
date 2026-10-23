@@ -76,9 +76,13 @@ def _router_prefixes():
                     alias_to_module[a.asname] = node.module
     prefixes = {}
     for node in ast.walk(parse(f"{PKG}/chat_api.py")):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                and node.func.attr == "include_router" and node.args \
-                and isinstance(node.args[0], ast.Name):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "include_router"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+        ):
             module = alias_to_module.get(node.args[0].id)
             prefix = next((const(k.value) for k in node.keywords if k.arg == "prefix"), "")
             if module:
@@ -100,8 +104,11 @@ def _models(tree):
             if v is None:
                 required = True
             elif isinstance(v, ast.Call) and getattr(v.func, "id", None) == "Field":
-                default = v.args[0] if v.args else next(
-                    (k.value for k in v.keywords if k.arg == "default"), None)
+                default = (
+                    v.args[0]
+                    if v.args
+                    else next((k.value for k in v.keywords if k.arg == "default"), None)
+                )
                 required = default is None or const(default) is Ellipsis
             else:
                 required = False
@@ -122,9 +129,13 @@ def _routes(module):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for dec in fn.decorator_list:
-            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
-                    and isinstance(dec.func.value, ast.Name) and dec.func.value.id == "router"
-                    and dec.func.attr in _METHODS):
+            if not (
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Attribute)
+                and isinstance(dec.func.value, ast.Name)
+                and dec.func.value.id == "router"
+                and dec.func.attr in _METHODS
+            ):
                 continue
             kw = {k.arg: const(k.value) for k in dec.keywords}
             route = {
@@ -147,14 +158,22 @@ def _routes(module):
                     route["deps"].add(ast.unparse(call.args[0]))
                 elif callee == "Query":
                     bounds = {k.arg: const(k.value) for k in call.keywords}
-                    route["query"].append((arg.arg, const(call.args[0]) if call.args else None,
-                                           bounds.get("ge"), bounds.get("le")))
+                    route["query"].append(
+                        (
+                            arg.arg,
+                            const(call.args[0]) if call.args else None,
+                            bounds.get("ge"),
+                            bounds.get("le"),
+                        )
+                    )
                 elif isinstance(arg.annotation, ast.Name) and arg.annotation.id in models:
                     route["body"] = models[arg.annotation.id]
             for node in ast.walk(fn):
                 if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "HTTPException":
-                    code = next((const(k.value) for k in node.keywords if k.arg == "status_code"),
-                                const(node.args[0]) if node.args else None)
+                    code = next(
+                        (const(k.value) for k in node.keywords if k.arg == "status_code"),
+                        const(node.args[0]) if node.args else None,
+                    )
                     if isinstance(code, int):
                         route["raises"].add(code)
             routes.append(route)
@@ -189,19 +208,30 @@ def _render_routes(routes, what):
         lines.append("".join(parts))
     deps = {d for r in routes for d in r["deps"]}
     if len(deps) == 1 and all(r["deps"] for r in routes):
-        lines += ["", f"Every route above takes `Depends({deps.pop()})`. The status codes are "
-                      "the ones the handler raises itself, not those of the helpers it calls."]
+        lines += [
+            "",
+            f"Every route above takes `Depends({deps.pop()})`. The status codes are "
+            "the ones the handler raises itself, not those of the helpers it calls.",
+        ]
     else:
-        lines += ["", "Dependencies differ between these routes: "
-                  + "; ".join(f"`{r['name']}` " + (", ".join(f"`{d}`" for d in sorted(r["deps"]))
-                                                  or "none") for r in routes) + "."]
+        lines += [
+            "",
+            "Dependencies differ between these routes: "
+            + "; ".join(
+                f"`{r['name']}` " + (", ".join(f"`{d}`" for d in sorted(r["deps"])) or "none")
+                for r in routes
+            )
+            + ".",
+        ]
     return "\n".join(lines)
 
 
 def block_instruction_set_endpoints():
     prefix = "/llm-config/user/instruction-sets"
-    return _render_routes([r for r in _routes("llm_config") if prefix in r["path"]],
-                          f"{prefix} in routers/llm_config.py")
+    return _render_routes(
+        [r for r in _routes("llm_config") if prefix in r["path"]],
+        f"{prefix} in routers/llm_config.py",
+    )
 
 
 # the memory feature's routes: anything addressing a project, plus the per-session filing and
@@ -210,8 +240,10 @@ _MEMORY_ROUTE = re.compile(r"/projects\b|/sessions/\{session_id\}/(project|pin)$
 
 
 def block_project_endpoints():
-    return _render_routes([r for r in _routes("chat_history") if _MEMORY_ROUTE.search(r["path"])],
-                          "the project and pin routes in routers/chat_history.py")
+    return _render_routes(
+        [r for r in _routes("chat_history") if _MEMORY_ROUTE.search(r["path"])],
+        "the project and pin routes in routers/chat_history.py",
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -225,7 +257,8 @@ def block_turn_metrics_columns():
     ddl = None
     for node in parse(rel).body:
         if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == "_TURN_METRICS_COLUMNS" for t in node.targets):
+            isinstance(t, ast.Name) and t.id == "_TURN_METRICS_COLUMNS" for t in node.targets
+        ):
             ddl = const(node.value)
     if not isinstance(ddl, str):
         harness(f"{rel} has no literal _TURN_METRICS_COLUMNS")
@@ -251,9 +284,14 @@ def _env_defaults():
     rel = f"{PKG}/config/settings.py"
     found = {}
     for node in ast.walk(parse(rel)):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "get" and ast.unparse(node.func.value) == "os.environ"
-                and node.args and isinstance(const(node.args[0]), str)):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and ast.unparse(node.func.value) == "os.environ"
+            and node.args
+            and isinstance(const(node.args[0]), str)
+        ):
             continue
         name = node.args[0].value
         found.setdefault(name, set()).add(const(node.args[1]) if len(node.args) > 1 else None)
@@ -274,29 +312,63 @@ def _human(value, unit):
 DATABASE_ENV = [
     ("LLM_CONFIG_DB", "Path to LLM config SQLite DB", None),
     ("CHAT_HISTORY_DB", "Path to chat history SQLite DB", None),
-    ("TURN_DRAIN_TIMEOUT_S", "How long shutdown waits for chat turns whose clients are gone "
-     "before cancelling them; keep it inside the pod's termination grace period together with "
-     "uvicorn's own drain", None),
+    (
+        "TURN_DRAIN_TIMEOUT_S",
+        "How long shutdown waits for chat turns whose clients are gone "
+        "before cancelling them; keep it inside the pod's termination grace period together with "
+        "uvicorn's own drain",
+        None,
+    ),
     ("ATTACHMENT_STORAGE_PATH", "Path for file attachment storage", None),
-    ("MAX_ATTACHMENT_SIZE", "Max attachment size in bytes; data files are further capped at "
-     "`sandbox_client.MAX_INPUT_BYTES` (not configurable)", "bytes"),
-    ("MAX_MESSAGE_CHARS", "Max typed-text characters in a single user message (excludes "
-     "attachments)", None),
-    ("MAX_REQUEST_CHARS", "Cap on total text across **all** messages in one chat request, "
-     "images excluded. Deliberately generous — replayed tool results are legitimately far "
-     "larger than a typed message — so it bounds the payload rather than policing use", None),
-    ("HISTORY_PRUNE_TRIGGER_CHARS", "Serialised size of the replayed history past which the "
-     "oldest tool results are cleared from the model's view (see \"Replayed tool results are "
-     "cleared past a budget\"). About 300K tokens of JSON. `0` disables the pass", None),
-    ("HISTORY_PRUNE_TARGET_CHARS", "What a clearing pass brings the history under. The gap "
-     "below the trigger is how much growth each prompt-cache rewrite buys", None),
-    ("HISTORY_PRUNE_KEEP_TURNS", "The newest assistant turns whose tool results are never "
-     "cleared, since the model is answering a follow-up to them", None),
+    (
+        "MAX_ATTACHMENT_SIZE",
+        "Max attachment size in bytes; data files are further capped at "
+        "`sandbox_client.MAX_INPUT_BYTES` (not configurable)",
+        "bytes",
+    ),
+    (
+        "MAX_MESSAGE_CHARS",
+        "Max typed-text characters in a single user message (excludes attachments)",
+        None,
+    ),
+    (
+        "MAX_REQUEST_CHARS",
+        "Cap on total text across **all** messages in one chat request, "
+        "images excluded. Deliberately generous — replayed tool results are legitimately far "
+        "larger than a typed message — so it bounds the payload rather than policing use",
+        None,
+    ),
+    (
+        "HISTORY_PRUNE_TRIGGER_CHARS",
+        "Serialised size of the replayed history past which the "
+        "oldest tool results are cleared from the model's view (see \"Replayed tool results are "
+        'cleared past a budget"). About 300K tokens of JSON. `0` disables the pass',
+        None,
+    ),
+    (
+        "HISTORY_PRUNE_TARGET_CHARS",
+        "What a clearing pass brings the history under. The gap "
+        "below the trigger is how much growth each prompt-cache rewrite buys",
+        None,
+    ),
+    (
+        "HISTORY_PRUNE_KEEP_TURNS",
+        "The newest assistant turns whose tool results are never "
+        "cleared, since the model is answering a follow-up to them",
+        None,
+    ),
     ("MAX_MESSAGES_PER_REQUEST", "Cap on the number of messages in one chat request", None),
-    ("MAX_ATTACHMENTS_PER_MESSAGE", "Max attachment blocks (image/document/data-file "
-     "reference) per message", None),
-    ("MAX_FILE_BLOCK_BYTES", "Cap in UTF-8 bytes on one `[File: ...]` reference block, in "
-     "any turn; mirrored by the browser", None),
+    (
+        "MAX_ATTACHMENTS_PER_MESSAGE",
+        "Max attachment blocks (image/document/data-file reference) per message",
+        None,
+    ),
+    (
+        "MAX_FILE_BLOCK_BYTES",
+        "Cap in UTF-8 bytes on one `[File: ...]` reference block, in "
+        "any turn; mirrored by the browser",
+        None,
+    ),
     ("DOWNLOAD_STORAGE_PATH", "Path for tool result download files", None),
     ("DOWNLOAD_TTL_SECONDS", "TTL for download files in seconds", "seconds"),
 ]
@@ -306,13 +378,17 @@ def block_database_env():
     defaults = _env_defaults()
     missing = [name for name, _, _ in DATABASE_ENV if name not in defaults]
     if missing:
-        harness(f"config/settings.py no longer reads {missing}; drop or rename the rows in "
-                f"gen-doc-blocks.py's DATABASE_ENV")
+        harness(
+            f"config/settings.py no longer reads {missing}; drop or rename the rows in "
+            f"gen-doc-blocks.py's DATABASE_ENV"
+        )
     rows = ["| Variable | Description | Default |", "|----------|-------------|---------|"]
     for name, desc, unit in DATABASE_ENV:
         if len(defaults[name]) > 1:
-            harness(f"config/settings.py reads {name} with several defaults: "
-                    f"{sorted(map(repr, defaults[name]))}")
+            harness(
+                f"config/settings.py reads {name} with several defaults: "
+                f"{sorted(map(repr, defaults[name]))}"
+            )
         (d,) = defaults[name]
         shown = "-" if d in (None, "") else f"`{d}`{_human(d, unit) if unit else ''}"
         rows.append(f"| `{name}` | {desc} | {shown} |")
@@ -326,11 +402,15 @@ def block_database_env():
 
 def _tracked(prefix):
     try:
-        out = subprocess.run(["git", "-C", ROOT, "ls-files", "--", prefix],
-                             capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(
+            ["git", "-C", ROOT, "ls-files", "--", prefix],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
         harness(f"git ls-files failed: {exc}")
-    files = [f[len(prefix) + 1:] for f in out.splitlines()]
+    files = [f[len(prefix) + 1 :] for f in out.splitlines()]
     if not files:
         harness(f"git ls-files lists nothing under {prefix}")
     return files
@@ -361,16 +441,21 @@ def block_module_tree():
     lines = []
 
     def walk(node, indent):
-        py = sorted((k for k, v in node.items() if isinstance(v, str) and k.endswith(".py")),
-                    key=lambda k: (k != "__init__.py", k))
+        py = sorted(
+            (k for k, v in node.items() if isinstance(v, str) and k.endswith(".py")),
+            key=lambda k: (k != "__init__.py", k),
+        )
         other = {}
         for k, v in node.items():
             if isinstance(v, str) and not k.endswith(".py"):
                 other.setdefault(os.path.splitext(k)[1] or k, []).append(k)
         others = sorted(v[0] if len(v) == 1 else f"*{ext}" for ext, v in other.items())
         dirs = sorted(k for k, v in node.items() if isinstance(v, dict))
-        entries = [(k, _describe(node[k])) for k in py] + [(k, "") for k in others] \
+        entries = (
+            [(k, _describe(node[k])) for k in py]
+            + [(k, "") for k in others]
             + [(k, None) for k in dirs]
+        )
         for i, (name, desc) in enumerate(entries):
             last = i == len(entries) - 1
             lines.append((indent + ("└── " if last else "├── ") + name, desc or ""))
@@ -418,8 +503,9 @@ def render(doc, text):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true",
-                    help="exit 1 if any generated block is stale; write nothing")
+    ap.add_argument(
+        "--check", action="store_true", help="exit 1 if any generated block is stale; write nothing"
+    )
     args = ap.parse_args()
 
     stale = []

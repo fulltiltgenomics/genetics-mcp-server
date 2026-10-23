@@ -37,7 +37,9 @@ def test_generated_blocks_are_current():
 def test_a_tampered_block_is_rewritten():
     gen = _generator()
     current = (ROOT / SPEC).read_text()
-    tampered = current.replace("| `cost_usd` | REAL | not null |", "| `cost_usd` | TEXT | nullable |")
+    tampered = current.replace(
+        "| `cost_usd` | REAL | not null |", "| `cost_usd` | TEXT | nullable |"
+    )
     assert tampered != current
     assert gen.render(SPEC, tampered) == current
 
