@@ -264,9 +264,24 @@ EXTENSION_TO_TYPE = {
     ".webp": "image",
     ".tsv": "tsv",
     ".csv": "tsv",
+    ".txt": "tsv",
     ".xlsx": "excel",
     ".xls": "excel",
 }
+
+
+# TextEdit saves rich text unless told otherwise, so a table pasted into it and saved as
+# .tsv arrives as "{\rtf1..." with every cell wrapped in formatting codes; parsed as a table
+# that is garbage columns, so it is refused with the fix spelled out instead
+_RTF_SIGNATURE = b"{\\rtf"
+RTF_REFUSAL = (
+    "This file is a rich-text (RTF) document, not a plain-text table. In TextEdit choose "
+    "Format > Make Plain Text and save it again, or export the table as TSV or CSV."
+)
+
+
+def is_rtf(content: bytes) -> bool:
+    return content.lstrip()[: len(_RTF_SIGNATURE)] == _RTF_SIGNATURE
 
 
 def get_attachment_type(mime_type: str, filename: str) -> str | None:
@@ -1055,6 +1070,9 @@ async def upload_attachment(
             status_code=400,
             detail=f"File too large. Maximum size: {settings.max_attachment_size // (1024 * 1024)}MB",
         )
+
+    if file_type == "tsv" and is_rtf(content):
+        raise HTTPException(status_code=400, detail=RTF_REFUSAL)
 
     # parse Excel to TSV up front so a bad file fails before anything is written
     parsed_tsv: str | None = None

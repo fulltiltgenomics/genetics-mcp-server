@@ -730,6 +730,30 @@ class TestAttachmentEndpoints:
             else True
         )
 
+    def test_txt_upload_is_a_data_file(self, client_with_auth, tmp_storage):
+        # a plain-text table from a cluster or a text editor is a .txt as often as a .tsv, and
+        # browsers send it with an empty or octet-stream MIME type, so the extension has to carry it
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("table.txt", b"a\tb\n1\t2\n", "application/octet-stream")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "tsv"
+
+    def test_rtf_rejected_with_the_fix_and_nothing_stored(self, client_with_auth, tmp_storage):
+        session_id = self._create_session(client_with_auth)
+        rtf = b"{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n{\\fonttbl\\f0\\fnil Menlo;}\nRSID\\tab CHR\\\n}"
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("cloz2_triage.tsv", rtf, "text/tab-separated-values")},
+        )
+        assert resp.status_code == 400
+        assert "Make Plain Text" in resp.json()["detail"]
+        assert not (tmp_storage / session_id).exists() or not any(
+            (tmp_storage / session_id).glob("*")
+        )
+
     def test_tsv_as_text_returns_original(self, client_with_auth, tmp_storage):
         session_id = self._create_session(client_with_auth)
         resp = client_with_auth.post(
