@@ -46,6 +46,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _Block,
     _fs,
     custom_gwas_resources,
+    r12_model_datasets,
     url_input_hosts_rule,
 )
 
@@ -61,6 +62,29 @@ def _custom_gwas_section(template: str) -> str | None:
     if not resources:
         return None
     return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
+
+
+_R12_MODEL_SECTION = """
+### FinnGen R12 sex-specific and recessive GWAS
+
+R12 only (no R13/R14 run; codes are R12's):
+{models}
+
+**Only on request**: hidden from `search_phenotypes` and `list_datasets` unless called with one of these resources, and reached by a summary-statistics query only with that resource and its data type named (no tool names them here: on the code surface the SDK stands in for them). Use them only when the user explicitly asks about a sex-specific, sex-stratified, female-vs-male or sex-differential effect, or a recessive (non-additive) model; never for a general question about a disease, variant or locus, never beside release results as the same analysis, and always named as the FinnGen R12 sex-specific or recessive run. No fine-mapping, so no credible-set, coloc or PheWAS tool covers them; `get_resource_metadata` on the resource gives counts.
+"""
+
+_R12_MODEL_LINES = {
+    "gwas_sex_specific": "- `{resource}` (data_type `gwas_sex_specific`): females and males separately, meta-analysed; `female_*`, `male_*`, combined `beta`/`pval`, `het_p`. The sex difference is `het_p`, not significance in one sex only (the male analysis is usually smaller): show both betas with sample sizes. Nothing of it is in BigQuery.",
+    "gwas_recessive": "- `{resource}` (data_type `gwas_recessive`): recessive model beside the additive test; unsuffixed statistics recessive, `additive_*` additive, `effect_allele`/`flipped` say which allele was tested (minor; flipped rows are on the opposite allele from the additive beta), `mlog10p_diff` the recessive-minus-additive evidence. X in females only. Nothing in BigQuery.",
+}
+
+
+def _r12_model_section(template: str, lines: dict[str, str]) -> str | None:
+    models = r12_model_datasets()
+    if not models:
+        return None
+    described = [lines[t].replace("{resource}", r) for r, t in models if t in lines]
+    return template.replace("{models}", "\n".join(described))
 
 
 CONDENSED_PROMPT_BLOCKS: tuple[_Block, ...] = (
@@ -453,6 +477,11 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
             "get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"
         ),
         render=lambda: _custom_gwas_section(_CUSTOM_GWAS_SECTION),
+    ),
+    _Block(
+        _R12_MODEL_SECTION,
+        requires_any=_fs("get_summary_stats", "search_phenotypes"),
+        render=lambda: _r12_model_section(_R12_MODEL_SECTION, _R12_MODEL_LINES),
     ),
     _Block(
         """

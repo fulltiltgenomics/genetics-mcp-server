@@ -34,6 +34,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _fs,
     block_text,
     custom_gwas_resources,
+    r12_model_datasets,
     url_input_hosts_rule,
 )
 from genetics_mcp_server.config.prompt_condensed import (
@@ -75,6 +76,32 @@ def _custom_gwas_section(template: str) -> str | None:
     if not resources:
         return None
     return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
+
+
+_R12_MODEL_SECTION = """
+### FinnGen R12 sex-specific and recessive GWAS
+
+FinnGen ran every R12 endpoint under two further models once, in release 12 — R13 and R14 have no such run, so the endpoint codes are R12's, and a code that changed since (check `search_phenotypes` with the resource) is not the R14 one:
+{models}
+
+**Only on request.** Kept out of every default surface the way the custom GWAS are: `search_phenotypes` and `list_datasets` show them only when called with one of these resources, and `get_summary_stats` / `get_summary_stats_by_region` reach them only with that resource and its data type. Use them ONLY when the user explicitly asks about a sex-specific, sex-stratified, female-versus-male or sex-differential effect, or about a recessive (non-additive) model. Never use them to answer a general question about a disease, a variant or a locus — the core release answers that — and never present their numbers beside release results as if they were the same analysis; say in the answer that the result is the FinnGen R12 sex-specific or recessive run. Neither release has fine-mapping, so no credible-set, colocalization or PheWAS tool covers them; `get_resource_metadata` on the resource gives the endpoint's counts.
+"""
+
+# one line per served (resource, data_type), so the section describes exactly what the
+# deployment has and names no resource of its own
+_R12_MODEL_LINES = {
+    "gwas_sex_specific": '- `{resource}` (data_type `gwas_sex_specific`): each endpoint in females and males separately, combined by inverse-variance meta-analysis. A row carries `female_beta`/`female_pval`, `male_beta`/`male_pval`, the combined `beta`/`pval` (the core R12 result) and `het_p`. THE SEX DIFFERENCE IS `het_p`, not "significant in one sex and not the other": the male analysis is usually the smaller, so always show both sexes\' betas with their sample sizes. Nothing of it is in BigQuery.',
+    "gwas_recessive": "- `{resource}` (data_type `gwas_recessive`): each endpoint under a recessive genotype model beside the additive test of the same variant. The unsuffixed `beta`/`pval`/`mlog10p` are the recessive test and `additive_*` the additive one; `effect_allele` and `flipped` say which allele was tested (the minor allele, so on flipped rows the recessive beta is on the opposite allele from the additive beta); `mlog10p_diff` is the recessive-minus-additive evidence. Chromosome X was run in females only. No aggregate exists, so nothing of it is in BigQuery.",
+}
+
+
+def _r12_model_section(template: str, lines: dict[str, str]) -> str | None:
+    """The section listing this deployment's R12 model-specific releases, or nothing."""
+    models = r12_model_datasets()
+    if not models:
+        return None
+    described = [lines[t].replace("{resource}", r) for r, t in models if t in lines]
+    return template.replace("{models}", "\n".join(described))
 
 
 _PROMPT_BLOCKS: tuple[_Block, ...] = (
@@ -250,6 +277,12 @@ A magnitude-only modality's comparison carries no direction at all — that abse
             "get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"
         ),
         render=lambda: _custom_gwas_section(_CUSTOM_GWAS_SECTION),
+    ),
+    # the same shape: rendered from the probe, the template left in `text` for the gate
+    _Block(
+        _R12_MODEL_SECTION,
+        requires_any=_fs("get_summary_stats", "search_phenotypes"),
+        render=lambda: _r12_model_section(_R12_MODEL_SECTION, _R12_MODEL_LINES),
     ),
     _Block(
         """

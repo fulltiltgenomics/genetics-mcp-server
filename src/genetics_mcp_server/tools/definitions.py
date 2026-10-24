@@ -2556,7 +2556,7 @@ def get_anthropic_tools(
         disabled_tools: Optional set of tool names to exclude, applied after the surface.
     """
     return _to_anthropic_format(
-        _with_custom_gwas_hints(resolve_tools(code_execution, disabled_tools)),
+        _with_on_request_hints(resolve_tools(code_execution, disabled_tools)),
         custom_descriptions,
     )
 
@@ -2574,15 +2574,16 @@ def all_anthropic_tools(
     definitions = all_local_tool_definitions()
     if disabled_tools:
         definitions = [t for t in definitions if t["name"] not in disabled_tools]
-    return _to_anthropic_format(_with_custom_gwas_hints(definitions), custom_descriptions)
+    return _to_anthropic_format(_with_on_request_hints(definitions), custom_descriptions)
 
 
-# Appended to the descriptions above when the deployment serves sandbox custom GWAS
-# releases (config.prompt_blocks.on_request_datasets, results-api's answer): the resource
-# names are the deployment's, so no static text here names one, and a deployment with no
-# such data hands the model descriptions that never mention it. (tool, parameter, text);
-# "" is the tool's own description. `{resources}` = the releases, `{hla_resources}` = those
-# with HLA results — a hint using it is dropped when there are none.
+# Appended to the descriptions above when the deployment serves on-request datasets
+# (config.prompt_blocks.on_request_datasets, results-api's answer): the resource names are
+# the deployment's, so no static text here names one, and a deployment with no such data
+# hands the model descriptions that never mention it. (tool, parameter, text); "" is the
+# tool's own description. A hint whose placeholder fills to nothing is dropped.
+# The sandbox custom GWAS releases: `{resources}` = the releases, `{hla_resources}` = those
+# with HLA results.
 _CUSTOM_GWAS_HINTS: list[tuple[str, str, str]] = [
     (
         "search_phenotypes",
@@ -2628,24 +2629,64 @@ _CUSTOM_GWAS_HINTS: list[tuple[str, str, str]] = [
 ]
 
 
-def _with_custom_gwas_hints(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The definitions with this deployment's custom GWAS hints appended, copies where
-    a text changes so the module-level definitions stay as written."""
-    from genetics_mcp_server.config.prompt_blocks import (
-        custom_gwas_hla_resources,
-        custom_gwas_resources,
-    )
+# The FinnGen R12 sex-specific and recessive GWAS, on request like the custom runs but for
+# a different reason: a question about a disease or a variant is answered from the core
+# release unless the user asks for the model. `{model_resources}` = the resources,
+# `{model_pairs}` = each with its data type and what a row carries, `{model_types}` = the
+# data types alone.
+_R12_MODEL_HINTS: list[tuple[str, str, str]] = [
+    (
+        "search_phenotypes",
+        "",
+        " The FinnGen R12 sex-specific and recessive GWAS (resources {model_resources}) are NOT in the default index either: only when the user asks about a sex-specific, sex-differential or recessive effect, pass that resource in `resource`.",
+    ),
+    (
+        "search_phenotypes",
+        "resource",
+        "; one of {model_resources} for the FinnGen R12 sex-specific or recessive GWAS",
+    ),
+    (
+        "list_datasets",
+        "resource",
+        " The FinnGen R12 sex-specific and recessive GWAS ({model_resources}) are on-request datasets too: listed only when named here.",
+    ),
+    (
+        "get_summary_stats",
+        "resource",
+        "; ON REQUEST ONLY, when the user asks for that model: {model_pairs}",
+    ),
+    (
+        "get_summary_stats",
+        "data_type",
+        "; {model_types} only with the matching on-request resource",
+    ),
+    (
+        "get_summary_stats_by_region",
+        "resource",
+        "; ON REQUEST ONLY, when the user asks for that model: {model_pairs}",
+    ),
+    (
+        "get_summary_stats_by_region",
+        "data_type",
+        "; {model_types} only with the matching on-request resource",
+    ),
+]
 
-    resources = custom_gwas_resources()
-    if not resources:
-        return tools
-    fill = {
-        "{resources}": ", ".join(f"'{r}'" for r in resources),
-        "{hla_resources}": ", ".join(f"'{r}'" for r in custom_gwas_hla_resources()),
-    }
-    hinted = {}
-    for name, param, text in _CUSTOM_GWAS_HINTS:
-        if "{hla_resources}" in text and not fill["{hla_resources}"]:
+# what a row of each R12 model-specific data type carries, for `{model_pairs}`
+_R12_MODEL_ROWS = {
+    "gwas_sex_specific": "female, male and combined effects per variant, het_p for the sex difference",
+    "gwas_recessive": "the recessive test beside additive_*; effect_allele/flipped say which allele was tested",
+}
+
+
+def _apply_hints(
+    tools: list[dict[str, Any]], hints: list[tuple[str, str, str]], fill: dict[str, str]
+) -> list[dict[str, Any]]:
+    """`tools` with `hints` appended, copies where a text changes so the module-level
+    definitions stay as written. A hint naming a placeholder that fills to "" is dropped."""
+    hinted: dict[str, list[tuple[str, str]]] = {}
+    for name, param, text in hints:
+        if any(k in text and not v for k, v in fill.items()):
             continue
         for k, v in fill.items():
             text = text.replace(k, v)
@@ -2661,6 +2702,41 @@ def _with_custom_gwas_hints(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
             target["description"] = target["description"] + text
         out.append(tool)
     return out
+
+
+def _with_on_request_hints(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The definitions with this deployment's on-request hints appended: the sandbox
+    custom GWAS releases and the R12 model-specific releases, each only where served."""
+    from genetics_mcp_server.config.prompt_blocks import (
+        custom_gwas_hla_resources,
+        custom_gwas_resources,
+        r12_model_datasets,
+    )
+
+    resources = custom_gwas_resources()
+    if resources:
+        tools = _apply_hints(
+            tools,
+            _CUSTOM_GWAS_HINTS,
+            {
+                "{resources}": ", ".join(f"'{r}'" for r in resources),
+                "{hla_resources}": ", ".join(f"'{r}'" for r in custom_gwas_hla_resources()),
+            },
+        )
+    models = r12_model_datasets()
+    if models:
+        tools = _apply_hints(
+            tools,
+            _R12_MODEL_HINTS,
+            {
+                "{model_resources}": ", ".join(f"'{r}'" for r, _ in models),
+                "{model_pairs}": "; ".join(
+                    f"'{r}' with data_type '{t}' ({_R12_MODEL_ROWS.get(t, t)})" for r, t in models
+                ),
+                "{model_types}": " or ".join(f"'{t}'" for _, t in models),
+            },
+        )
+    return tools
 
 
 def _to_anthropic_format(
