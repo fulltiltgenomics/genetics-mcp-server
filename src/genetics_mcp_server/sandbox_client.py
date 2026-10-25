@@ -410,9 +410,7 @@ class SandboxClient:
         self._sleep = sleep or asyncio.sleep
 
     def _client(self, timeout: httpx.Timeout) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            base_url=self.base_url, timeout=timeout, transport=self._transport
-        )
+        return httpx.AsyncClient(base_url=self.base_url, timeout=timeout, transport=self._transport)
 
     async def health(self) -> SandboxHealth:
         timeout = httpx.Timeout(
@@ -600,9 +598,7 @@ class SandboxClient:
             execution_id = None
 
             try:
-                return await self._submit(
-                    tokens, code=code, timeout_s=timeout_s, inputs=inputs
-                )
+                return await self._submit(tokens, code=code, timeout_s=timeout_s, inputs=inputs)
             except SandboxBusy as exc:
                 if attempt >= MAX_SUBMIT_ATTEMPTS:
                     raise
@@ -766,9 +762,7 @@ class SandboxClient:
                     # ends, so it must not be carried in from further upstream
                     "sha256": hashlib.sha256(item.content).hexdigest(),
                     **(
-                        {"content_type": item.content_type}
-                        if item.content_type is not None
-                        else {}
+                        {"content_type": item.content_type} if item.content_type is not None else {}
                     ),
                 }
                 for item in inputs
@@ -780,8 +774,7 @@ class SandboxClient:
             # the input caps are sized to fit under this one, so with inputs present the
             # actionable half is which of the two to shrink
             carried = (
-                f" carrying {len(inputs)} input(s) of "
-                f"{sum(len(i.content) for i in inputs)} bytes"
+                f" carrying {len(inputs)} input(s) of {sum(len(i.content) for i in inputs)} bytes"
                 if inputs
                 else ""
             )

@@ -224,10 +224,11 @@ def on_request_datasets() -> tuple[tuple[str, str], ...] | None:
     """(resource, data_type) of the datasets this deployment serves only on request, or
     None while results-api has not said.
 
-    A daly results-api answers (), a finngen one names its sandbox custom GWAS releases.
-    The prompt section and the tool-description hints that name those resources are
-    rendered from this and from nothing static, so a deployment without such data never
-    hears of it; None and () both render nothing.
+    A daly results-api answers (), a finngen one names its sandbox custom GWAS releases
+    and the R12 sex-specific and recessive GWAS. The prompt sections and the
+    tool-description hints that name those resources are rendered from this and from
+    nothing static, so a deployment without such data never hears of it; None and ()
+    both render nothing.
     """
     global _on_request_datasets
     now = time.monotonic()
@@ -244,9 +245,36 @@ def on_request_datasets() -> tuple[tuple[str, str], ...] | None:
     return pairs
 
 
+# results-api's answer carries nothing but (resource, data_type), so the data type is what
+# tells the on-request kinds apart: the R12 model-specific releases serve these types and
+# nothing else does; whatever remains is a sandbox custom GWAS release. A third on-request
+# kind needs its own types here, or it is described as a custom GWAS.
+_R12_MODEL_DATA_TYPES = frozenset({"gwas_sex_specific", "gwas_recessive"})
+
+
 def custom_gwas_resources() -> tuple[str, ...]:
-    """The on-request resources, i.e. the sandbox custom GWAS releases; () when unknown."""
-    return tuple(sorted({resource for resource, _ in (on_request_datasets() or ())}))
+    """The on-request sandbox custom GWAS releases; () when unknown."""
+    return tuple(
+        sorted(
+            {
+                resource
+                for resource, data_type in (on_request_datasets() or ())
+                if data_type not in _R12_MODEL_DATA_TYPES
+            }
+        )
+    )
+
+
+def r12_model_datasets() -> tuple[tuple[str, str], ...]:
+    """(resource, data_type) of the on-request FinnGen R12 sex-specific and recessive
+    releases this deployment serves; () when none or unknown."""
+    return tuple(
+        sorted(
+            (resource, data_type)
+            for resource, data_type in (on_request_datasets() or ())
+            if data_type in _R12_MODEL_DATA_TYPES
+        )
+    )
 
 
 def custom_gwas_hla_resources() -> tuple[str, ...]:

@@ -104,9 +104,7 @@ class _Inst:
         self.sy = _col(self.frame, "se_y")
         self.k = self.bx.size
         if self.k < min_k:
-            raise GeneticsUsageError(
-                f"{method} needs at least {min_k} instruments, got {self.k}"
-            )
+            raise GeneticsUsageError(f"{method} needs at least {min_k} instruments, got {self.k}")
         if (self.bx == 0).any():
             raise GeneticsUsageError("an instrument has beta_x = 0; its ratio is undefined")
         if (self.sy <= 0).any() or (self.sx <= 0).any():
@@ -157,14 +155,16 @@ def wald(data: Any) -> pl.DataFrame:
     d = _Inst(data)
     est = d.by / d.bx
     se = d.sy / np.abs(d.bx)
-    return pl.DataFrame({
-        "variant": d.variant,
-        "estimate": est,
-        "se": se,
-        "p": _p_norm(est / se),
-        "ci_low": est - _Z975 * se,
-        "ci_high": est + _Z975 * se,
-    })
+    return pl.DataFrame(
+        {
+            "variant": d.variant,
+            "estimate": est,
+            "se": se,
+            "p": _p_norm(est / se),
+            "ci_low": est - _Z975 * se,
+            "ci_high": est + _Z975 * se,
+        }
+    )
 
 
 # --------------------------------------------------------------------------- IVW
@@ -241,7 +241,11 @@ def ivw(data: Any, *, model: str = "default", correl: Any = None) -> dict:
     if model not in ("default", "fixed", "random"):
         raise GeneticsUsageError("model must be 'default', 'fixed' or 'random'")
     frame = _frame_of(data)
-    options: dict[str, Any] = {"model": model, "weights": "first_order", "correl": correl is not None}
+    options: dict[str, Any] = {
+        "model": model,
+        "weights": "first_order",
+        "correl": correl is not None,
+    }
     r = None
     if correl is not None:
         r, dropped = _correlation(correl, frame["variant"].cast(pl.String).to_list())
@@ -252,12 +256,22 @@ def ivw(data: Any, *, model: str = "default", correl: Any = None) -> dict:
     if d.k == 1:
         row = wald(frame).row(0, named=True)
         options["single_instrument"] = "the IVW estimate of one instrument is its Wald ratio"
-        return _result("wald", row["estimate"], row["se"], 1, options,
-                       Q=math.nan, Q_df=0, Q_pval=math.nan, I2=math.nan, RSE=math.nan,
-                       model="fixed")
+        return _result(
+            "wald",
+            row["estimate"],
+            row["se"],
+            1,
+            options,
+            Q=math.nan,
+            Q_df=0,
+            Q_pval=math.nan,
+            I2=math.nan,
+            RSE=math.nan,
+            model="fixed",
+        )
     used = model if model != "default" else ("fixed" if d.k <= 3 else "random")
     if r is None:
-        omega_inv = np.diag(d.sy ** -2)
+        omega_inv = np.diag(d.sy**-2)
     else:
         r, info = _repair(r)
         options.update(info)
@@ -267,8 +281,16 @@ def ivw(data: Any, *, model: str = "default", correl: Any = None) -> dict:
     rse = math.sqrt(q / df)
     se = math.sqrt(cov[0, 0]) * (max(1.0, rse) if used == "random" else 1.0)
     return _result(
-        "ivw", beta[0], se, d.k, options, model=used,
-        Q=q, Q_df=df, Q_pval=_p_chi2(q, df), I2=max(0.0, (q - df) / q) if q > 0 else 0.0,
+        "ivw",
+        beta[0],
+        se,
+        d.k,
+        options,
+        model=used,
+        Q=q,
+        Q_df=df,
+        Q_pval=_p_chi2(q, df),
+        I2=max(0.0, (q - df) / q) if q > 0 else 0.0,
         RSE=rse,
     )
 
@@ -280,7 +302,10 @@ def heterogeneity(data: Any) -> dict:
     res = ivw(d.frame, model="fixed")
     return {
         "method": "heterogeneity",
-        "Q": res["Q"], "Q_df": res["Q_df"], "Q_pval": res["Q_pval"], "I2": res["I2"],
+        "Q": res["Q"],
+        "Q_df": res["Q_df"],
+        "Q_pval": res["Q_pval"],
+        "I2": res["I2"],
         "n_instruments": d.k,
         "options": {"weights": "first_order", "fit": "ivw fixed"},
     }
@@ -293,7 +318,7 @@ def _i2_gx(bx: np.ndarray, sx: np.ndarray, sy: np.ndarray) -> float:
     """MendelianRandomization's I^2_GX: I2 of |beta_x| / se_y around their weighted mean,
     weights (se_x / se_y)^-2 — the exposure effects on the scale the Egger fit weights them."""
     bx, sx = np.abs(bx) / sy, sx / sy
-    w = sx ** -2.0
+    w = sx**-2.0
     mu = np.sum(w * bx) / np.sum(w)
     q = float(np.sum(w * (bx - mu) ** 2))
     return max(0.0, (q - (bx.size - 1)) / q) if math.isfinite(q) else math.nan
@@ -310,8 +335,12 @@ def egger(data: Any, *, correl: Any = None) -> dict:
     values (< 0.9) bias the slope towards zero. Needs 3 instruments.
     """
     frame = _frame_of(data)
-    options: dict[str, Any] = {"orientation": "beta_x > 0", "weights": "first_order",
-                               "model": "random", "correl": correl is not None}
+    options: dict[str, Any] = {
+        "orientation": "beta_x > 0",
+        "weights": "first_order",
+        "model": "random",
+        "correl": correl is not None,
+    }
     r = None
     if correl is not None:
         r, dropped = _correlation(correl, frame["variant"].cast(pl.String).to_list())
@@ -322,7 +351,7 @@ def egger(data: Any, *, correl: Any = None) -> dict:
     sign = np.where(d.bx < 0, -1.0, 1.0)
     bx, by = np.abs(d.bx), d.by * sign
     if r is None:
-        omega_inv = np.diag(d.sy ** -2)
+        omega_inv = np.diag(d.sy**-2)
     else:
         r, info = _repair(r)
         options.update(info)
@@ -333,12 +362,20 @@ def egger(data: Any, *, correl: Any = None) -> dict:
     rse = math.sqrt(q / df)
     ses = np.sqrt(np.diag(cov)) * max(1.0, rse)
     out = _result(
-        "egger", beta[1], ses[1], d.k, options,
-        intercept=float(beta[0]), intercept_se=float(ses[0]),
+        "egger",
+        beta[1],
+        ses[1],
+        d.k,
+        options,
+        intercept=float(beta[0]),
+        intercept_se=float(ses[0]),
         intercept_p=float(_p_norm(beta[0] / ses[0])),
         intercept_ci_low=float(beta[0] - _Z975 * ses[0]),
         intercept_ci_high=float(beta[0] + _Z975 * ses[0]),
-        Q=q, Q_df=df, Q_pval=_p_chi2(q, df), RSE=rse,
+        Q=q,
+        Q_df=df,
+        Q_pval=_p_chi2(q, df),
+        RSE=rse,
         I2_GX=_i2_gx(bx, d.sx, d.sy),
     )
     return out
@@ -371,22 +408,29 @@ def _median(data: Any, weighting: str, weights: str, seed: int | None, iteration
     elif weights == "first_order":
         w = (d.sy / d.bx) ** -2
     elif weights == "second_order":
-        w = 1 / (d.sy ** 2 / d.bx ** 2 + d.by ** 2 * d.sx ** 2 / d.bx ** 4)
+        w = 1 / (d.sy**2 / d.bx**2 + d.by**2 * d.sx**2 / d.bx**4)
     else:
         raise GeneticsUsageError("weights must be 'first_order' or 'second_order'")
     est = float(_weighted_median(ratio, w))
     rng = np.random.default_rng(seed)
     boot = rng.normal(d.by, d.sy, (iterations, d.k)) / rng.normal(d.bx, d.sx, (iterations, d.k))
     se = float(np.std(_weighted_median(boot, w), ddof=1))
-    options = {"weighting": weighting, "iterations": iterations, "seed": seed,
-               "bootstrap": "parametric, weights held at their observed values"}
+    options = {
+        "weighting": weighting,
+        "iterations": iterations,
+        "seed": seed,
+        "bootstrap": "parametric, weights held at their observed values",
+    }
     if weighting == "weighted":
         options["weights"] = weights
     return _result(f"{weighting}_median", est, se, d.k, options)
 
 
 def weighted_median(
-    data: Any, *, seed: int | None = _MR_SEED, iterations: int = _ITERATIONS,
+    data: Any,
+    *,
+    seed: int | None = _MR_SEED,
+    iterations: int = _ITERATIONS,
     weights: str = "first_order",
 ) -> dict:
     """Weighted median of the Wald ratios; MendelianRandomization::mr_median.
@@ -446,7 +490,7 @@ def _density_mode(x: np.ndarray, w: np.ndarray, bw: np.ndarray) -> np.ndarray:
     np.add.at(y.reshape(-1), (base + ix).ravel(), (w * (1 - fx)).ravel())
     np.add.at(y.reshape(-1), (base + ix + 1).ravel(), (w * fx).ravel())
     kords = np.arange(2 * n)[None, :] * delta[:, None]
-    kords[:, n + 1:] = -kords[:, n - 1:0:-1]
+    kords[:, n + 1 :] = -kords[:, n - 1 : 0 : -1]
     kern = np.exp(-0.5 * (kords / bw[:, None]) ** 2) / (bw[:, None] * math.sqrt(2 * math.pi))
     dens = np.fft.ifft(np.fft.fft(y) * np.conj(np.fft.fft(kern))).real[:, :n]
     dens = np.maximum(dens, 0)
@@ -461,9 +505,9 @@ def _density_mode(x: np.ndarray, w: np.ndarray, bw: np.ndarray) -> np.ndarray:
 def _mbe(ratio: np.ndarray, se_ratio: np.ndarray, phi: float) -> np.ndarray:
     """mr_mbe's estimator, row-wise: bandwidth 0.9 min(sd, mad) / K^(1/5) times phi."""
     k = ratio.shape[-1]
-    s = 0.9 * np.minimum(np.std(ratio, -1, ddof=1), _mad(ratio)) / k ** 0.2
+    s = 0.9 * np.minimum(np.std(ratio, -1, ddof=1), _mad(ratio)) / k**0.2
     h = np.maximum(1e-8, s * phi)
-    w = se_ratio ** -2.0
+    w = se_ratio**-2.0
     return _density_mode(ratio, w / w.sum(), h)
 
 
@@ -471,7 +515,7 @@ def _mode(data: Any, weighting: str, phi: float, seed: int | None, iterations: i
     d = _Inst(data, 2, f"the {weighting} mode")
     ratio = d.by / d.bx
     # delta-method (second-order) SE of each ratio, mr_mbe's stderror = "delta"
-    se_ratio = np.sqrt(d.sy ** 2 / d.bx ** 2 + d.by ** 2 * d.sx ** 2 / d.bx ** 4)
+    se_ratio = np.sqrt(d.sy**2 / d.bx**2 + d.by**2 * d.sx**2 / d.bx**4)
     wse = se_ratio if weighting == "weighted" else np.ones(d.k)
     est = float(_mbe(ratio[None, :], wse, phi)[0])
     rng = np.random.default_rng(seed)
@@ -480,14 +524,23 @@ def _mode(data: Any, weighting: str, phi: float, seed: int | None, iterations: i
         m = min(1000, iterations - start)
         boots.append(_mbe(rng.normal(ratio, se_ratio, (m, d.k)), wse, phi))
     se = float(_mad(np.concatenate(boots)))
-    options = {"weighting": weighting, "stderror": "delta", "phi": phi,
-               "iterations": iterations, "seed": seed,
-               "bootstrap": "parametric on the ratios; SE is the MAD of the bootstrap modes"}
+    options = {
+        "weighting": weighting,
+        "stderror": "delta",
+        "phi": phi,
+        "iterations": iterations,
+        "seed": seed,
+        "bootstrap": "parametric on the ratios; SE is the MAD of the bootstrap modes",
+    }
     return _result(f"{weighting}_mode", est, se, d.k, options)
 
 
 def weighted_mode(
-    data: Any, *, phi: float = 1, seed: int | None = _MR_SEED, iterations: int = _ITERATIONS,
+    data: Any,
+    *,
+    phi: float = 1,
+    seed: int | None = _MR_SEED,
+    iterations: int = _ITERATIONS,
 ) -> dict:
     """Weighted mode-based estimate; MendelianRandomization::mr_mbe(weighting="weighted",
     stderror="delta").
@@ -502,7 +555,11 @@ def weighted_mode(
 
 
 def simple_mode(
-    data: Any, *, phi: float = 1, seed: int | None = _MR_SEED, iterations: int = _ITERATIONS,
+    data: Any,
+    *,
+    phi: float = 1,
+    seed: int | None = _MR_SEED,
+    iterations: int = _ITERATIONS,
 ) -> dict:
     """Unweighted mode-based estimate; mr_mbe(weighting="unweighted")."""
     return _mode(data, "simple", phi, seed, iterations)
@@ -515,7 +572,7 @@ def _tsmr_ivw(bx: np.ndarray, by: np.ndarray, sy: np.ndarray) -> tuple[float, fl
     """TwoSampleMR::mr_ivw: always multiplicative random effects."""
     if bx.size < 2:
         return math.nan, math.nan, math.nan
-    w = sy ** -2
+    w = sy**-2
     sxx = np.sum(w * bx * bx)
     b = float(np.sum(w * bx * by) / sxx)
     sigma = math.sqrt(float(np.sum(w * (by - b * bx) ** 2)) / (bx.size - 1))
@@ -536,8 +593,9 @@ def leave_one_out(data: Any) -> pl.DataFrame:
         keep = np.arange(d.k) != i
         rows.append((v, *_tsmr_ivw(d.bx[keep], d.by[keep], d.sy[keep]), d.k - 1))
     rows.append(("All", *_tsmr_ivw(d.bx, d.by, d.sy), d.k))
-    return pl.DataFrame(rows, schema=["variant", "estimate", "se", "p", "n_instruments"],
-                        orient="row")
+    return pl.DataFrame(
+        rows, schema=["variant", "estimate", "se", "p", "n_instruments"], orient="row"
+    )
 
 
 def single_snp(data: Any) -> pl.DataFrame:
@@ -556,10 +614,14 @@ def single_snp(data: Any) -> pl.DataFrame:
         e = egger(d.frame)
         eb, ese = e["estimate"], e["se"]
         ep = float(_p_t(eb / ese, d.k - 2))
-    tail = pl.DataFrame({
-        "variant": ["All - Inverse variance weighted", "All - MR Egger"],
-        "estimate": [b, eb], "se": [se, ese], "p": [p, ep],
-    })
+    tail = pl.DataFrame(
+        {
+            "variant": ["All - Inverse variance weighted", "All - MR Egger"],
+            "estimate": [b, eb],
+            "se": [se, ese],
+            "p": [p, ep],
+        }
+    )
     return pl.concat([w, tail])
 
 
@@ -603,7 +665,7 @@ def _r_from_lor(lor, af, ncase, ncontrol, prevalence) -> np.ndarray:
     """TwoSampleMR::get_r_from_lor (logit model, no correction): liability-scale r from the
     log-OR, the population allele frequency implied by the case fraction and prevalence,
     and residual variance pi^2/3."""
-    ve = math.pi ** 2 / 3
+    ve = math.pi**2 / 3
     out = np.empty(len(lor))
     for i, (b, f, nca, nco) in enumerate(zip(lor, af, ncase, ncontrol)):
         popaf = _population_af(f, nca / (nca + nco), math.exp(b), prevalence)
@@ -669,24 +731,30 @@ def steiger(data: Any, *, prevalence: float | None = None, exposure_r2: Any = No
         else:
             raise GeneticsUsageError("Steiger on a binary outcome needs `af_y` or `af_x`")
         r_y = np.abs(_r_from_lor(d.by, _col(frame, af_name), ncase, nctrl, prevalence))
-        n_y = (_col(frame, "n_y") if "n_y" in frame.columns and frame["n_y"].null_count() == 0
-               else ncase + nctrl)
-        options.update(outcome_r="get_r_from_lor (logit)", prevalence=prevalence,
-                       outcome_af=af_name)
+        n_y = (
+            _col(frame, "n_y")
+            if "n_y" in frame.columns and frame["n_y"].null_count() == 0
+            else ncase + nctrl
+        )
+        options.update(
+            outcome_r="get_r_from_lor (logit)", prevalence=prevalence, outcome_af=af_name
+        )
         options["prevalence_source"] = "given"
     else:
         n_y = _col(frame, "n_y")
         r_y = np.abs(_r_from_bsen(d.by, d.sy, n_y))
         options["outcome_r"] = "get_r_from_bsen"
-    r2x, r2y = float(np.sum(r_x ** 2)), float(np.sum(r_y ** 2))
+    r2x, r2y = float(np.sum(r_x**2)), float(np.sum(r_y**2))
     p = float(_r_test(math.sqrt(r2x), math.sqrt(r2y), np.mean(n_x), np.mean(n_y)))
-    per_variant = pl.DataFrame({
-        "variant": d.variant,
-        "r2_exposure": r_x ** 2,
-        "r2_outcome": r_y ** 2,
-        "correct_causal_direction": r_x ** 2 > r_y ** 2,
-        "steiger_pval": _r_test(r_x, r_y, n_x, n_y),
-    })
+    per_variant = pl.DataFrame(
+        {
+            "variant": d.variant,
+            "r2_exposure": r_x**2,
+            "r2_outcome": r_y**2,
+            "correct_causal_direction": r_x**2 > r_y**2,
+            "steiger_pval": _r_test(r_x, r_y, n_x, n_y),
+        }
+    )
     return {
         "method": "steiger",
         "correct_causal_direction": r2x > r2y,

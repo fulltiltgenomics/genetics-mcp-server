@@ -34,6 +34,7 @@ def test_db():
 @pytest.fixture
 def client_with_auth(test_db):
     """Create a test client with mocked authentication and database."""
+
     # override auth dependency to return a test user
     async def mock_auth():
         return "test@example.com"
@@ -41,7 +42,9 @@ def client_with_auth(test_db):
     app.dependency_overrides[auth_required] = mock_auth
 
     # patch get_chat_history_db to return our test database
-    with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+    with patch(
+        "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db
+    ):
         with TestClient(app) as client:
             yield client
 
@@ -421,13 +424,16 @@ class TestShareAndForkEndpoints:
     @pytest.fixture
     def two_user_clients(self, test_db):
         """Create two test clients with different authenticated users."""
+
         # owner client
         async def mock_auth_owner():
             return "owner@example.com"
 
         app.dependency_overrides[auth_required] = mock_auth_owner
 
-        with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+        with patch(
+            "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db
+        ):
             with TestClient(app) as owner_client:
                 # create a session with a message as owner
                 create_resp = owner_client.post("/chat/v1/chat/sessions", json={})
@@ -443,12 +449,15 @@ class TestShareAndForkEndpoints:
 
     def _make_client(self, test_db, user_email):
         """Helper to create a test client for a specific user."""
+
         async def mock_auth():
             return user_email
 
         app.dependency_overrides[auth_required] = mock_auth
 
-        return patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db)
+        return patch(
+            "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db
+        )
 
     def test_owner_can_share_session(self, two_user_clients):
         """Test that the session owner can share a session."""
@@ -560,9 +569,7 @@ class TestShareAndForkEndpoints:
 
         with self._make_client(test_db, "owner@example.com"):
             with TestClient(app) as client:
-                project_id = client.post(
-                    "/chat/v1/projects", json={"name": "IBD"}
-                ).json()["id"]
+                project_id = client.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
                 client.put(
                     f"/chat/v1/chat/sessions/{session_id}/project",
                     json={"project_id": project_id},
@@ -678,9 +685,7 @@ class TestAttachmentEndpoints:
         assert att["type"] == "excel"
 
         # raw download still returns the original spreadsheet bytes
-        raw = client_with_auth.get(
-            f"/chat/v1/chat/sessions/{session_id}/attachments/{att['id']}"
-        )
+        raw = client_with_auth.get(f"/chat/v1/chat/sessions/{session_id}/attachments/{att['id']}")
         assert raw.status_code == 200
         assert raw.content == xlsx
 
@@ -719,7 +724,35 @@ class TestAttachmentEndpoints:
         )
         assert resp.status_code == 400
         # the bad upload left no files behind
-        assert not any((tmp_storage / session_id).glob("*")) if (tmp_storage / session_id).exists() else True
+        assert (
+            not any((tmp_storage / session_id).glob("*"))
+            if (tmp_storage / session_id).exists()
+            else True
+        )
+
+    def test_txt_upload_is_a_data_file(self, client_with_auth, tmp_storage):
+        # a plain-text table from a cluster or a text editor is a .txt as often as a .tsv, and
+        # browsers send it with an empty or octet-stream MIME type, so the extension has to carry it
+        session_id = self._create_session(client_with_auth)
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("table.txt", b"a\tb\n1\t2\n", "application/octet-stream")},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "tsv"
+
+    def test_rtf_rejected_with_the_fix_and_nothing_stored(self, client_with_auth, tmp_storage):
+        session_id = self._create_session(client_with_auth)
+        rtf = b"{\\rtf1\\ansi\\ansicpg1252\\cocoartf2822\n{\\fonttbl\\f0\\fnil Menlo;}\nRSID\\tab CHR\\\n}"
+        resp = client_with_auth.post(
+            f"/chat/v1/chat/sessions/{session_id}/attachments",
+            files={"file": ("cloz2_triage.tsv", rtf, "text/tab-separated-values")},
+        )
+        assert resp.status_code == 400
+        assert "Make Plain Text" in resp.json()["detail"]
+        assert not (tmp_storage / session_id).exists() or not any(
+            (tmp_storage / session_id).glob("*")
+        )
 
     def test_tsv_as_text_returns_original(self, client_with_auth, tmp_storage):
         session_id = self._create_session(client_with_auth)
@@ -735,10 +768,7 @@ class TestAttachmentEndpoints:
         assert text.status_code == 200
         assert text.text == "a\tb\n1\t2\n"
 
-
-    def test_data_file_over_the_sandbox_input_cap_is_refused(
-        self, client_with_auth, tmp_storage
-    ):
+    def test_data_file_over_the_sandbox_input_cap_is_refused(self, client_with_auth, tmp_storage):
         from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
 
         session_id = self._create_session(client_with_auth)
@@ -764,9 +794,7 @@ class TestAttachmentEndpoints:
         )
         assert resp.status_code == 200
 
-    def test_excel_is_measured_on_its_tsv_sidecar(
-        self, client_with_auth, tmp_storage, monkeypatch
-    ):
+    def test_excel_is_measured_on_its_tsv_sidecar(self, client_with_auth, tmp_storage, monkeypatch):
         from genetics_mcp_server.routers import chat_history as chat_history_router
         from genetics_mcp_server.sandbox_client import MAX_INPUT_BYTES
 
@@ -816,15 +844,15 @@ class TestGenerateTitle:
 
     def test_leading_thinking_block_is_skipped(self, client_with_auth):
         session_id = self._session_with_message(client_with_auth)
-        anthropic_client = self._mock_anthropic([
-            MagicMock(type="thinking", thinking="pondering..."),
-            MagicMock(type="text", text='"APOE Gene Function"'),
-        ])
+        anthropic_client = self._mock_anthropic(
+            [
+                MagicMock(type="thinking", thinking="pondering..."),
+                MagicMock(type="text", text='"APOE Gene Function"'),
+            ]
+        )
 
         with patch("anthropic.Anthropic", return_value=anthropic_client):
-            resp = client_with_auth.post(
-                f"/chat/v1/chat/sessions/{session_id}/generate-title"
-            )
+            resp = client_with_auth.post(f"/chat/v1/chat/sessions/{session_id}/generate-title")
 
         assert resp.status_code == 200
         assert resp.json()["title"] == "APOE Gene Function"
@@ -835,14 +863,14 @@ class TestGenerateTitle:
     def test_text_free_response_falls_back_to_first_message(self, client_with_auth):
         """All budget spent on thinking must not store an empty title."""
         session_id = self._session_with_message(client_with_auth)
-        anthropic_client = self._mock_anthropic([
-            MagicMock(type="thinking", thinking="pondering..."),
-        ])
+        anthropic_client = self._mock_anthropic(
+            [
+                MagicMock(type="thinking", thinking="pondering..."),
+            ]
+        )
 
         with patch("anthropic.Anthropic", return_value=anthropic_client):
-            resp = client_with_auth.post(
-                f"/chat/v1/chat/sessions/{session_id}/generate-title"
-            )
+            resp = client_with_auth.post(f"/chat/v1/chat/sessions/{session_id}/generate-title")
 
         assert resp.status_code == 200
         assert resp.json()["title"] == "What does APOE do?"
@@ -962,9 +990,7 @@ class TestVerbosityOnMessages:
                 "literature_backend": "europepmc",
             },
         )
-        client_with_auth.put(
-            f"/chat/v1/chat/sessions/{session_id}/share", json={"shared": True}
-        )
+        client_with_auth.put(f"/chat/v1/chat/sessions/{session_id}/share", json={"shared": True})
 
         forked = client_with_auth.post(f"/chat/v1/chat/sessions/{session_id}/fork")
         assert forked.status_code == 200
@@ -978,11 +1004,14 @@ class TestVerbosityOnMessages:
 @pytest.fixture
 def client_as_service(test_db):
     """A client whose caller is the service identity rather than a person."""
+
     async def mock_auth():
         return "mcp-tool"
 
     app.dependency_overrides[auth_required] = mock_auth
-    with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+    with patch(
+        "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db
+    ):
         with TestClient(app) as client:
             yield client
     app.dependency_overrides.clear()
@@ -991,11 +1020,14 @@ def client_as_service(test_db):
 @pytest.fixture
 def client_as_anonymous(test_db):
     """A client of a deployment with REQUIRE_AUTH off, where every caller is the same."""
+
     async def mock_auth():
         return "anonymous"
 
     app.dependency_overrides[auth_required] = mock_auth
-    with patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db):
+    with patch(
+        "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db
+    ):
         with TestClient(app) as client:
             yield client
     app.dependency_overrides.clear()
@@ -1057,9 +1089,7 @@ class TestMemoryEndpoints:
 
         assert response.status_code == 404
 
-    def test_an_anonymous_caller_may_not_pin_its_own_session(
-        self, client_as_anonymous, test_db
-    ):
+    def test_an_anonymous_caller_may_not_pin_its_own_session(self, client_as_anonymous, test_db):
         """`anonymous` owns rows with REQUIRE_AUTH off, so ownership is not the refusal —
         naming no person is: it has no memory for a pin to steer."""
         session = self._seed(test_db, "Ours, collectively", user="anonymous")
@@ -1115,9 +1145,7 @@ class TestProjectMemoryEndpoint:
         # the preview is served anyway, so the dialog can show what would be remembered
         assert "APOE and LDL" in data["digest"]
 
-    def test_enabled_reflects_the_setting(
-        self, client_with_auth, test_db, llm_config_db
-    ):
+    def test_enabled_reflects_the_setting(self, client_with_auth, test_db, llm_config_db):
         project = self._project(test_db)
         llm_config_db.save_user_setting(
             user_id=self.USER, setting_key="chat_memory", setting_value="on"
@@ -1134,9 +1162,7 @@ class TestProjectMemoryEndpoint:
             data = client_with_auth.get(f"/chat/v1/projects/{project.id}/memory").json()
         assert data["enabled"] is False
 
-    def test_sessions_agree_with_the_digest(
-        self, client_with_auth, test_db, llm_config_db
-    ):
+    def test_sessions_agree_with_the_digest(self, client_with_auth, test_db, llm_config_db):
         project = self._project(test_db)
         first = self._seed(test_db, project.id, "APOE and LDL")
         second = self._seed(test_db, project.id, "T2D endpoints")
@@ -1147,21 +1173,18 @@ class TestProjectMemoryEndpoint:
 
         assert [s["id"] for s in data["sessions"]] == [
             row["id"]
-            for row in test_db.get_recent_sessions_for_digest(
-                self.USER, 20, project_id=project.id
-            )
+            for row in test_db.get_recent_sessions_for_digest(self.USER, 20, project_id=project.id)
         ]
         assert {s["id"] for s in data["sessions"]} == {first.id, second.id}
         for session in data["sessions"]:
             assert session["title"] in data["digest"]
             assert session["created_at"]
         assert {s["id"]: s["pinned"] for s in data["sessions"]} == {
-            first.id: True, second.id: False
+            first.id: True,
+            second.id: False,
         }
 
-    def test_char_cap_is_the_renderer_s_own_limit(
-        self, client_with_auth, test_db, llm_config_db
-    ):
+    def test_char_cap_is_the_renderer_s_own_limit(self, client_with_auth, test_db, llm_config_db):
         from genetics_mcp_server.memory_digest import MAX_DIGEST_CHARS
 
         project = self._project(test_db)
@@ -1170,9 +1193,7 @@ class TestProjectMemoryEndpoint:
 
         assert data["char_cap"] == MAX_DIGEST_CHARS
 
-    def test_session_cap_is_the_gate_s_own_window(
-        self, client_with_auth, test_db, llm_config_db
-    ):
+    def test_session_cap_is_the_gate_s_own_window(self, client_with_auth, test_db, llm_config_db):
         from genetics_mcp_server.memory_gate import MEMORY_PROJECT_SESSION_CAP
 
         project = self._project(test_db)
@@ -1197,9 +1218,7 @@ class TestProjectMemoryEndpoint:
 
         assert {s["id"] for s in data["sessions"]} == {in_project.id}
 
-    def test_another_users_project_is_not_found(
-        self, client_with_auth, test_db, llm_config_db
-    ):
+    def test_another_users_project_is_not_found(self, client_with_auth, test_db, llm_config_db):
         project = test_db.create_project("other@example.com", "Theirs")
 
         with self._settings(llm_config_db):
@@ -1213,9 +1232,7 @@ class TestProjectMemoryEndpoint:
 
         assert response.status_code == 404
 
-    def test_a_service_identity_has_no_memory(
-        self, client_as_service, test_db, llm_config_db
-    ):
+    def test_a_service_identity_has_no_memory(self, client_as_service, test_db, llm_config_db):
         project = test_db.create_project(self.USER, "IBD")
 
         with self._settings(llm_config_db):
@@ -1223,9 +1240,7 @@ class TestProjectMemoryEndpoint:
 
         assert response.status_code == 404
 
-    def test_an_anonymous_caller_has_no_memory(
-        self, client_as_anonymous, test_db, llm_config_db
-    ):
+    def test_an_anonymous_caller_has_no_memory(self, client_as_anonymous, test_db, llm_config_db):
         project = test_db.create_project("anonymous", "Shared")
 
         with self._settings(llm_config_db):
@@ -1270,9 +1285,7 @@ class TestProjectEndpoints:
         assert response.status_code == 400
 
     def test_rename_project(self, client_with_auth):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
 
         response = client_with_auth.put(
             f"/chat/v1/projects/{project_id}", json={"name": "IBD renamed"}
@@ -1281,13 +1294,9 @@ class TestProjectEndpoints:
         assert response.json()["name"] == "IBD renamed"
 
     def test_rename_to_a_blank_name_is_rejected(self, client_with_auth):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
 
-        response = client_with_auth.put(
-            f"/chat/v1/projects/{project_id}", json={"name": ""}
-        )
+        response = client_with_auth.put(f"/chat/v1/projects/{project_id}", json={"name": ""})
         assert response.status_code == 400
 
     def test_renaming_someone_elses_project_is_not_found(self, client_with_auth, test_db):
@@ -1300,9 +1309,7 @@ class TestProjectEndpoints:
         assert response.status_code == 404
 
     def test_delete_project_unfiles_its_sessions(self, client_with_auth, test_db):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
         session_id = client_with_auth.post(
             "/chat/v1/chat/sessions", json={"project_id": project_id}
         ).json()["id"]
@@ -1315,9 +1322,7 @@ class TestProjectEndpoints:
         assert client_with_auth.get("/chat/v1/projects").json() == []
 
     def test_delete_with_sessions_removes_them_too(self, client_with_auth, test_db):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
         session_id = client_with_auth.post(
             "/chat/v1/chat/sessions", json={"project_id": project_id}
         ).json()["id"]
@@ -1337,9 +1342,7 @@ class TestProjectEndpoints:
         assert response.status_code == 404
 
     def test_project_sessions_listing(self, client_with_auth):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
         in_project = client_with_auth.post(
             "/chat/v1/chat/sessions", json={"project_id": project_id}
         ).json()["id"]
@@ -1360,13 +1363,9 @@ class TestProjectEndpoints:
         assert response.status_code == 404
 
     def test_create_session_in_a_project(self, client_with_auth):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
 
-        response = client_with_auth.post(
-            "/chat/v1/chat/sessions", json={"project_id": project_id}
-        )
+        response = client_with_auth.post("/chat/v1/chat/sessions", json={"project_id": project_id})
 
         assert response.status_code == 200
         assert response.json()["project_id"] == project_id
@@ -1374,16 +1373,12 @@ class TestProjectEndpoints:
     def test_create_session_in_someone_elses_project_is_not_found(self, client_with_auth, test_db):
         project = test_db.create_project("other@example.com", "Theirs")
 
-        response = client_with_auth.post(
-            "/chat/v1/chat/sessions", json={"project_id": project.id}
-        )
+        response = client_with_auth.post("/chat/v1/chat/sessions", json={"project_id": project.id})
 
         assert response.status_code == 404
 
     def test_move_session_into_a_project_and_unfile_it(self, client_with_auth, test_db):
-        project_id = client_with_auth.post(
-            "/chat/v1/projects", json={"name": "IBD"}
-        ).json()["id"]
+        project_id = client_with_auth.post("/chat/v1/projects", json={"name": "IBD"}).json()["id"]
         session_id = client_with_auth.post("/chat/v1/chat/sessions", json={}).json()["id"]
 
         response = client_with_auth.put(

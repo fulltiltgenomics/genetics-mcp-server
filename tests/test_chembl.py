@@ -95,7 +95,9 @@ class TestOriginPin:
     @pytest.mark.asyncio
     async def test_a_next_pointing_off_host_is_refused_mid_walk(self):
         client = _client()
-        first = _page("targets", [{"target_chembl_id": "CHEMBL235"}], next_path="https://evil.example/x.json")
+        first = _page(
+            "targets", [{"target_chembl_id": "CHEMBL235"}], next_path="https://evil.example/x.json"
+        )
         with patch.object(client, "_get", new=AsyncMock(return_value=first)):
             result = await client._get_all("target", {}, ["target_chembl_id"])
         assert result["_origin_refused"] is True
@@ -119,12 +121,23 @@ class TestPageWalking:
     async def test_pages_are_concatenated_and_total_count_kept(self):
         client = _client()
         pages = [
-            _page("mechanisms", [{"i": 0}], next_path="/chembl/api/data/mechanism.json?offset=1", total=3),
-            _page("mechanisms", [{"i": 1}], next_path="/chembl/api/data/mechanism.json?offset=2", total=3),
+            _page(
+                "mechanisms",
+                [{"i": 0}],
+                next_path="/chembl/api/data/mechanism.json?offset=1",
+                total=3,
+            ),
+            _page(
+                "mechanisms",
+                [{"i": 1}],
+                next_path="/chembl/api/data/mechanism.json?offset=2",
+                total=3,
+            ),
             _page("mechanisms", [{"i": 2}], total=3),
         ]
-        with patch.object(client, "_get", new=AsyncMock(return_value=pages[0])), patch.object(
-            client, "_get_url", new=AsyncMock(side_effect=pages[1:])
+        with (
+            patch.object(client, "_get", new=AsyncMock(return_value=pages[0])),
+            patch.object(client, "_get_url", new=AsyncMock(side_effect=pages[1:])),
         ):
             result = await client._get_all("mechanism", {}, ["molecule_chembl_id"])
         assert result["records"] == [{"i": 0}, {"i": 1}, {"i": 2}]
@@ -133,10 +146,16 @@ class TestPageWalking:
 
     async def test_the_page_cap_truncates_rather_than_walking_on(self):
         client = _client()
-        page = _page("activities", [{"i": 0}], next_path="/chembl/api/data/activity.json?offset=1", total=2267)
+        page = _page(
+            "activities",
+            [{"i": 0}],
+            next_path="/chembl/api/data/activity.json?offset=1",
+            total=2267,
+        )
         get_url = AsyncMock(return_value=page)
-        with patch.object(client, "_get", new=AsyncMock(return_value=page)), patch.object(
-            client, "_get_url", new=get_url
+        with (
+            patch.object(client, "_get", new=AsyncMock(return_value=page)),
+            patch.object(client, "_get_url", new=get_url),
         ):
             result = await client._get_all("activity", {}, ["pchembl_value"], max_pages=3)
         assert result["truncated"] is True
@@ -148,8 +167,9 @@ class TestPageWalking:
         client = _client()
         first = _page("targets", [{"i": 0}], next_path="/chembl/api/data/target.json?offset=1")
         sentinel = {"_error": "ChEMBL HTTP 500: ", "_status": 500}
-        with patch.object(client, "_get", new=AsyncMock(return_value=first)), patch.object(
-            client, "_get_url", new=AsyncMock(return_value=sentinel)
+        with (
+            patch.object(client, "_get", new=AsyncMock(return_value=first)),
+            patch.object(client, "_get_url", new=AsyncMock(return_value=sentinel)),
         ):
             result = await client._get_all("target", {}, ["target_chembl_id"])
         assert result is sentinel
@@ -164,8 +184,9 @@ class TestPageWalking:
         client = _client()
         first = _page("targets", [{"i": 0}], next_path="http://a:notaport/x.json")
         get_url = AsyncMock()
-        with patch.object(client, "_get", new=AsyncMock(return_value=first)), patch.object(
-            client, "_get_url", new=get_url
+        with (
+            patch.object(client, "_get", new=AsyncMock(return_value=first)),
+            patch.object(client, "_get_url", new=get_url),
         ):
             result = await client._get_all("target", {}, ["target_chembl_id"])
         assert result["_unusable_next"] is True
@@ -175,8 +196,9 @@ class TestPageWalking:
         client = _client()
         first = _page("targets", [{"i": 0}], next_path={"href": "/chembl/api/data/target.json"})
         get_url = AsyncMock()
-        with patch.object(client, "_get", new=AsyncMock(return_value=first)), patch.object(
-            client, "_get_url", new=get_url
+        with (
+            patch.object(client, "_get", new=AsyncMock(return_value=first)),
+            patch.object(client, "_get_url", new=get_url),
         ):
             result = await client._get_all("target", {}, ["target_chembl_id"])
         assert result["_unusable_next"] is True
@@ -284,9 +306,11 @@ class TestHttpBehaviour:
 
     async def test_release_reads_chembl_db_version_without_a_projection(self):
         patcher, calls = self._patch_get(
-            lambda url: _resp(body={"chembl_db_version": "ChEMBL_37"})
-            if url.endswith("/status.json")
-            else None
+            lambda url: (
+                _resp(body={"chembl_db_version": "ChEMBL_37"})
+                if url.endswith("/status.json")
+                else None
+            )
         )
         with patcher:
             assert await self.client.release() == "ChEMBL_37"
@@ -363,9 +387,7 @@ class TestTargetResolution:
         return patcher, calls
 
     def _stub_resolver(self, result):
-        return patch.object(
-            self.executor.uniprot, "resolve", new=AsyncMock(return_value=result)
-        )
+        return patch.object(self.executor.uniprot, "resolve", new=AsyncMock(return_value=result))
 
     async def test_a_symbol_resolves_through_uniprot_and_prefers_the_single_protein(self):
         patcher, calls = self._patch_get(lambda url: _resp(body=_page("targets", _PPARG_TARGETS)))
@@ -789,9 +811,7 @@ class TestDrugTargetsForGene(_ChEMBLToolCase):
     async def test_a_non_numeric_min_phase_fails_before_any_request(self):
         patcher, calls = self._patch_get(lambda url: None)
         with self._stub_resolver(), patcher:
-            result = await self.executor.chembl.get_drug_targets_for_gene(
-                "PPARG", min_phase="abc"
-            )
+            result = await self.executor.chembl.get_drug_targets_for_gene("PPARG", min_phase="abc")
 
         assert result["success"] is False
         assert result["stage"] == "input"
@@ -1385,7 +1405,7 @@ class TestAListQueryIsOneRoundTrip:
         assert "upstream exploded" not in str(result)
 
     async def test_no_drugs_is_reported_apart_from_a_failure(self):
-        """"ChEMBL knows this gene and records no drug" and "the lookup broke" are
+        """ "ChEMBL knows this gene and records no drug" and "the lookup broke" are
         different answers; a batch that merges them lets the model report one as the
         other, which a per-gene call could never do."""
 

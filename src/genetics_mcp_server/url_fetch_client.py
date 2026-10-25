@@ -70,6 +70,7 @@ legitimately exceed it."""
 NAME_MAX = 128
 """``fetch.NAME_MAX``. The cap ``fetch.filename_for`` truncates its output to."""
 
+
 def _is_fetcher_name_char(ch: str) -> bool:
     """``fetch.filename_for`` keeps a character when ``ch.isalnum() or ch in "._-"`` —
     ``str.isalnum`` is Unicode-aware, so the rule mirrored here is the same one, not its ASCII
@@ -435,19 +436,17 @@ class UrlFetchClient:
         # test's MockTransport, whose close is a no-op, and real the moment something passes a
         # transport that holds a pool or a socket. Giving this client a long-lived transport
         # means giving it ownership of that transport's lifetime, not just calling it twice.
-        return httpx.AsyncClient(
-            base_url=self.base_url, timeout=timeout, transport=self._transport
-        )
+        return httpx.AsyncClient(base_url=self.base_url, timeout=timeout, transport=self._transport)
 
-    async def _health(self, phase_timeout_s: float = FETCHER_CONNECT_TIMEOUT_S) -> httpx.Response | None:
+    async def _health(
+        self, phase_timeout_s: float = FETCHER_CONNECT_TIMEOUT_S
+    ) -> httpx.Response | None:
         """``GET /healthz``, or None if the fetcher could not be reached at all.
 
         ``phase_timeout_s`` bounds connect and read separately, so the worst case a caller can
         wait is twice it: a connect that stalls to its limit, then a response that never
         arrives."""
-        timeout = httpx.Timeout(
-            phase_timeout_s, connect=phase_timeout_s, read=phase_timeout_s
-        )
+        timeout = httpx.Timeout(phase_timeout_s, connect=phase_timeout_s, read=phase_timeout_s)
         try:
             async with self._client(timeout) as client:
                 return await client.get(HEALTH_PATH)
@@ -715,9 +714,7 @@ class UrlFetchClient:
                 "aborts at"
             )
         if len(content) != size_bytes:
-            raise malformed(
-                f"declares {size_bytes} bytes and carries {len(content)}"
-            )
+            raise malformed(f"declares {size_bytes} bytes and carries {len(content)}")
         if hashlib.sha256(content).hexdigest() != body["sha256"]:
             raise malformed("carries a sha256 that does not describe its content")
 

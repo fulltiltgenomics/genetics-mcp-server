@@ -116,7 +116,9 @@ def _read_code(expected_state: str) -> str:
     return query["code"][0]
 
 
-def code_login(client: httpx.Client, metadata: dict, client_id: str, scope: str, resource: str) -> dict:
+def code_login(
+    client: httpx.Client, metadata: dict, client_id: str, scope: str, resource: str
+) -> dict:
     verifier, challenge = _pkce()
     state = secrets.token_urlsafe(16)
     params = {
@@ -153,21 +155,36 @@ def code_login(client: httpx.Client, metadata: dict, client_id: str, scope: str,
 
 
 def list_tools(server_url: str, path: str, access_token: str) -> list[dict]:
-    proxy = MCPProxyClient(base_url=server_url, timeout=60.0, auth_token=access_token, endpoint_path=path)
+    proxy = MCPProxyClient(
+        base_url=server_url, timeout=60.0, auth_token=access_token, endpoint_path=path
+    )
     return proxy.list_tools_sync()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("server_url", help="the MCP server, e.g. https://mcp.c3po.bio")
-    parser.add_argument("--path", default="/mcp", help="the JSON-RPC endpoint under the URL (default /mcp; C3PO answers at /)")
+    parser.add_argument(
+        "--path",
+        default="/mcp",
+        help="the JSON-RPC endpoint under the URL (default /mcp; C3PO answers at /)",
+    )
     parser.add_argument("--client-name", default="genetics-chat-backend")
     parser.add_argument(
-        "--client-id", help=f"skip registration and use this public client id (it must have {REDIRECT_URI} registered)"
+        "--client-id",
+        help=f"skip registration and use this public client id (it must have {REDIRECT_URI} registered)",
     )
-    parser.add_argument("--scope", default="openid offline_access", help="offline_access is what yields a refresh token")
+    parser.add_argument(
+        "--scope",
+        default="openid offline_access",
+        help="offline_access is what yields a refresh token",
+    )
     parser.add_argument("--out", help="write the credential JSON here instead of stdout")
-    parser.add_argument("--no-list-tools", action="store_true", help="skip the tools/list after login")
+    parser.add_argument(
+        "--no-list-tools", action="store_true", help="skip the tools/list after login"
+    )
     args = parser.parse_args()
 
     with httpx.Client(timeout=30.0) as client:

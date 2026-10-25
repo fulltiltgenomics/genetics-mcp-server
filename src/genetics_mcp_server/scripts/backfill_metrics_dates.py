@@ -46,8 +46,11 @@ def main():
     )
     parser.add_argument("--metrics", required=True, help="Path to metrics.json to patch")
     parser.add_argument("--db", required=True, help="Path to chat_history SQLite DB")
-    parser.add_argument("--overwrite-existing", action="store_true",
-                        help="Also overwrite created_at on records that already have it")
+    parser.add_argument(
+        "--overwrite-existing",
+        action="store_true",
+        help="Also overwrite created_at on records that already have it",
+    )
     args = parser.parse_args()
 
     metrics_path = Path(args.metrics)
@@ -91,12 +94,18 @@ def main():
         print(f"  Backup {backup} already exists, not overwriting it", file=sys.stderr)
 
     metrics_path.write_text(json.dumps(records, indent=2, default=str))
-    print(f"  {len(records)} records: {filled} dated, {already} already had a date, "
-          f"{unmatched} unmatched (session not in DB)", file=sys.stderr)
+    print(
+        f"  {len(records)} records: {filled} dated, {already} already had a date, "
+        f"{unmatched} unmatched (session not in DB)",
+        file=sys.stderr,
+    )
     if unmatched:
-        print("  Note: unmatched records have an empty created_at and will be "
-              "skipped by the plotting script. Point --db at the DB that holds "
-              "those sessions, or pass multiple DBs by re-running.", file=sys.stderr)
+        print(
+            "  Note: unmatched records have an empty created_at and will be "
+            "skipped by the plotting script. Point --db at the DB that holds "
+            "those sessions, or pass multiple DBs by re-running.",
+            file=sys.stderr,
+        )
     print(f"  Wrote {metrics_path}", file=sys.stderr)
 
 

@@ -24,23 +24,17 @@ class Settings:
 
     # genetics API
     genetics_api_url: str = field(
-        default_factory=lambda: os.environ.get(
-            "GENETICS_API_URL", "http://localhost:2000/api"
-        )
+        default_factory=lambda: os.environ.get("GENETICS_API_URL", "http://localhost:2000/api")
     )
 
     # BigQuery API (for direct SQL queries)
-    bigquery_api_url: str | None = field(
-        default_factory=lambda: os.environ.get("BIGQUERY_API_URL")
-    )
+    bigquery_api_url: str | None = field(default_factory=lambda: os.environ.get("BIGQUERY_API_URL"))
 
     # LLM providers
     anthropic_api_key: str | None = field(
         default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY")
     )
-    openai_api_key: str | None = field(
-        default_factory=lambda: os.environ.get("OPENAI_API_KEY")
-    )
+    openai_api_key: str | None = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY"))
 
     # shared secret for service-to-service calls (bearer form of auth_required, and the
     # /tokens/validate caller). read here rather than at each use site so the four consumers
@@ -92,9 +86,9 @@ class Settings:
     # prompt's guidance for it, because the prompt is assembled from the tool list in force
     # (genetics-results-suite-4h6.69) — there is deliberately no prompt edit to remember.
     sandbox_enabled: bool = field(
-        default_factory=lambda: os.environ.get(
-            "SANDBOX_ENABLED", "false"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("SANDBOX_ENABLED", "false").lower() in ("1", "true", "yes")
+        )
     )
 
     # base URL of the url-fetcher (url-fetcher/server.py, the two-route contract). NO DEFAULT,
@@ -102,9 +96,7 @@ class Settings:
     # occupies a common port on a dev machine, and that service's answers classify as fetcher
     # failures instead of "nothing is configured". Empty here and refused loudly at
     # UrlFetchClient construction.
-    url_fetcher_url: str = field(
-        default_factory=lambda: os.environ.get("URL_FETCHER_URL", "")
-    )
+    url_fetcher_url: str = field(default_factory=lambda: os.environ.get("URL_FETCHER_URL", ""))
 
     # bounds of the in-memory per-user fetch cache (url_fetch_client.FetchCache). Either at or
     # below zero disables caching, which must change nothing but latency. The TTL is minutes
@@ -130,9 +122,7 @@ class Settings:
     )
 
     # web search
-    tavily_api_key: str | None = field(
-        default_factory=lambda: os.environ.get("TAVILY_API_KEY")
-    )
+    tavily_api_key: str | None = field(default_factory=lambda: os.environ.get("TAVILY_API_KEY"))
 
     # literature search
     perplexity_api_key: str | None = field(
@@ -140,9 +130,7 @@ class Settings:
     )
 
     # branding
-    app_name: str = field(
-        default_factory=lambda: os.environ.get("APP_NAME", "FinnGenie")
-    )
+    app_name: str = field(default_factory=lambda: os.environ.get("APP_NAME", "FinnGenie"))
 
     # which named system-prompt variant this deployment serves (config.defaults
     # PROMPT_VARIANTS). Deployment-side and never per-request, so a prompt A/B runs as two
@@ -163,9 +151,7 @@ class Settings:
     # reservation (only generated tokens are billed). Kept well inside the
     # 5-minute per-iteration timeout in llm_service; turns that need more room
     # are continued across iterations instead of being given a larger single cap.
-    max_tokens: int = field(
-        default_factory=lambda: int(os.environ.get("MAX_TOKENS", "16384"))
-    )
+    max_tokens: int = field(default_factory=lambda: int(os.environ.get("MAX_TOKENS", "16384")))
     # how many times a turn cut short by max_tokens may be resumed before the
     # truncation is reported to the user. Bounds a model that always runs long.
     max_continuations: int = field(
@@ -219,8 +205,9 @@ class Settings:
         default_factory=lambda: int(os.environ.get("ANTHROPIC_MAX_RETRIES", "3"))
     )
     anthropic_retry_rate_limit: bool = field(
-        default_factory=lambda: os.environ.get("ANTHROPIC_RETRY_RATE_LIMIT", "").lower()
-        in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("ANTHROPIC_RETRY_RATE_LIMIT", "").lower() in ("1", "true", "yes")
+        )
     )
     # cap on a single honoured `retry-after`, so a header naming an hour cannot park a worker
     # for one. Past this the wait is refused and the error propagates as it does today.
@@ -232,9 +219,7 @@ class Settings:
     # reject it. set TEMPERATURE to opt in for models that still support it.
     temperature: float | None = field(
         default_factory=lambda: (
-            float(os.environ["TEMPERATURE"])
-            if os.environ.get("TEMPERATURE", "").strip()
-            else None
+            float(os.environ["TEMPERATURE"]) if os.environ.get("TEMPERATURE", "").strip() else None
         )
     )
 
@@ -268,9 +253,9 @@ class Settings:
 
     # optional tools (disabled by default)
     enable_credible_sets_stats: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_CREDIBLE_SETS_STATS", "false"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("ENABLE_CREDIBLE_SETS_STATS", "false").lower() in ("1", "true", "yes")
+        )
     )
 
     # NOT one of the "optional tools" above: literature search is part of the shipped
@@ -284,23 +269,19 @@ class Settings:
     # drop out with it. That is what stops this repeating the run_analysis failure, where
     # the tool went away and the prompt kept telling the model to use it.
     enable_literature_search: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_LITERATURE_SEARCH", "true"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("ENABLE_LITERATURE_SEARCH", "true").lower() in ("1", "true", "yes")
+        )
     )
 
     # myvariant.info API
     myvariant_api_url: str = field(
-        default_factory=lambda: os.environ.get(
-            "MYVARIANT_API_URL", "https://myvariant.info/v1"
-        )
+        default_factory=lambda: os.environ.get("MYVARIANT_API_URL", "https://myvariant.info/v1")
     )
 
     # UniProt REST API (protein entries, search, sequences)
     uniprot_api_url: str = field(
-        default_factory=lambda: os.environ.get(
-            "UNIPROT_API_URL", "https://rest.uniprot.org"
-        )
+        default_factory=lambda: os.environ.get("UNIPROT_API_URL", "https://rest.uniprot.org")
     )
     # EBI Proteins API, used for protein-position-to-genome coordinate mapping
     ebi_proteins_api_url: str = field(
@@ -325,18 +306,18 @@ class Settings:
     # tools when this is false OR the key is absent, so a key reaching the wrong deployment
     # does not turn the feature on.
     alphagenome_enabled: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ALPHAGENOME_ENABLED", "false"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("ALPHAGENOME_ENABLED", "false").lower() in ("1", "true", "yes")
+        )
     )
     # whether this deployment's results-api has a cell-type expression release pointer. The
     # deploy derives it from the same tfvar that sets the pointer, so the tool is offered exactly
     # where the endpoint can answer; a profile outside CELL_TYPE_EXPRESSION_PROFILES never gets
     # the tool even with this set.
     cell_type_expression_enabled: bool = field(
-        default_factory=lambda: os.environ.get(
-            "CELL_TYPE_EXPRESSION_ENABLED", "false"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("CELL_TYPE_EXPRESSION_ENABLED", "false").lower() in ("1", "true", "yes")
+        )
     )
     # predictions are a deterministic function of the variant and the model, and the Atlas
     # response carries no version identifier, so nothing can detect a model update. A bounded
@@ -359,21 +340,15 @@ class Settings:
 
     # database paths
     llm_config_db: str = field(
-        default_factory=lambda: os.environ.get(
-            "LLM_CONFIG_DB", "/mnt/disks/data/llm_config.db"
-        )
+        default_factory=lambda: os.environ.get("LLM_CONFIG_DB", "/mnt/disks/data/llm_config.db")
     )
     chat_history_db: str = field(
-        default_factory=lambda: os.environ.get(
-            "CHAT_HISTORY_DB", "/mnt/disks/data/chat_history.db"
-        )
+        default_factory=lambda: os.environ.get("CHAT_HISTORY_DB", "/mnt/disks/data/chat_history.db")
     )
 
     # download storage (for tool result TSV files)
     download_storage_path: str = field(
-        default_factory=lambda: os.environ.get(
-            "DOWNLOAD_STORAGE_PATH", "/mnt/disks/data/downloads"
-        )
+        default_factory=lambda: os.environ.get("DOWNLOAD_STORAGE_PATH", "/mnt/disks/data/downloads")
     )
     download_ttl_seconds: int = field(
         default_factory=lambda: int(os.environ.get("DOWNLOAD_TTL_SECONDS", "2592000"))
@@ -419,26 +394,79 @@ class Settings:
     # test moving one left the other behind and /chat/v1/auth could report an admin that
     # admin_required then refused (genetics-results-suite-pol).
     require_auth: bool = field(
-        default_factory=lambda: os.environ.get(
-            "REQUIRE_AUTH", ""
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: os.environ.get("REQUIRE_AUTH", "").lower() in ("1", "true", "yes")
     )
 
     # admin page
     enable_admin_page: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_ADMIN_PAGE", "false"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("ENABLE_ADMIN_PAGE", "false").lower() in ("1", "true", "yes")
+        )
     )
-    admin_users: str = field(
-        default_factory=lambda: os.environ.get("ADMIN_USERS", "")
+    admin_users: str = field(default_factory=lambda: os.environ.get("ADMIN_USERS", ""))
+
+    # runtime access grants (access_grants.py). The button label doubles as the feature
+    # switch: unset means no admin sees a button, no reconciler runs and the grant table is
+    # consulted but never written. The deadline is one value for every grant made while it is
+    # set — a conference, not a per-person TTL — as an ISO 8601 stamp with an offset.
+    access_grant_button_label: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_BUTTON_LABEL", "").strip()
+    )
+    access_grant_expires_at: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EXPIRES_AT", "").strip()
+    )
+    # the oauth2-proxy authenticated-emails ConfigMap the reconciler rewrites; empty disables
+    # that target (local dev has no cluster to patch)
+    access_grant_configmap: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_CONFIGMAP", "").strip()
+    )
+    # Keycloak admin REST, reached in-cluster, as a confidential client with service-account
+    # roles on realm-management — not the bootstrap admin. The secret is the switch for that
+    # target: it exists only where scripts/keycloak-register-access-grants-client.sh has run,
+    # so a deployment without a broker never tries
+    keycloak_admin_url: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_ADMIN_URL", "").rstrip("/")
+    )
+    keycloak_realm: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_REALM") or "genetics"
+    )
+    keycloak_access_grants_client_id: str = field(
+        default_factory=lambda: (
+            os.environ.get("KEYCLOAK_ACCESS_GRANTS_CLIENT_ID") or "access-grants"
+        )
+    )
+    keycloak_access_grants_client_secret: str = field(
+        default_factory=lambda: os.environ.get("KEYCLOAK_ACCESS_GRANTS_CLIENT_SECRET", "")
+    )
+    # notification e-mail over authenticated SMTP (STARTTLS). Unset host = grants are made
+    # but nobody is mailed, and the response says so. `or` rather than a default: deploy.sh
+    # renders an unset .env variable as "", which int() would refuse at startup
+    smtp_host: str = field(default_factory=lambda: os.environ.get("SMTP_HOST", ""))
+    smtp_port: int = field(default_factory=lambda: int(os.environ.get("SMTP_PORT") or 587))
+    smtp_username: str = field(default_factory=lambda: os.environ.get("SMTP_USERNAME", ""))
+    smtp_password: str = field(default_factory=lambda: os.environ.get("SMTP_PASSWORD", ""))
+    access_grant_email_from: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_FROM", "")
+    )
+    access_grant_email_reply_to: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_REPLY_TO", "")
+    )
+    access_grant_email_subject: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_SUBJECT", "")
+    )
+    # the body lives in a mounted file so a deployment can word it without a rebuild; `{email}`
+    # in it is replaced with the granted address
+    access_grant_email_body_file: str = field(
+        default_factory=lambda: os.environ.get("ACCESS_GRANT_EMAIL_BODY_FILE", "")
     )
 
     # bearer token auth: allowed email domains and specific emails
     # mirrors genetics-results-api/app/config/common.py parsing semantics
     allowed_email_domains: set[str] = field(
         default_factory=lambda: {
-            d.strip() for d in os.environ.get("ALLOWED_EMAIL_DOMAINS", "finngen.fi").split(",") if d.strip()
+            d.strip()
+            for d in os.environ.get("ALLOWED_EMAIL_DOMAINS", "finngen.fi").split(",")
+            if d.strip()
         }
     )
     allowed_emails: set[str] = field(
@@ -466,9 +494,7 @@ class Settings:
     # into. Set GOOGLE_TOKEN_AUDIENCE to the client id issued for programmatic access here.
     google_token_audience: list[str] = field(
         default_factory=lambda: [
-            a.strip()
-            for a in os.environ.get("GOOGLE_TOKEN_AUDIENCE", "").split(",")
-            if a.strip()
+            a.strip() for a in os.environ.get("GOOGLE_TOKEN_AUDIENCE", "").split(",") if a.strip()
         ]
     )
 
@@ -490,9 +516,7 @@ class Settings:
     # OAuth 2.1 resource server (optional): trust Keycloak-issued access tokens
     # as a fourth bearer-validation path. inert unless both issuer and resource
     # url are set. token validation reuses allowed_emails / allowed_email_domains.
-    oauth_issuer: str | None = field(
-        default_factory=lambda: os.environ.get("OAUTH_ISSUER") or None
-    )
+    oauth_issuer: str | None = field(default_factory=lambda: os.environ.get("OAUTH_ISSUER") or None)
     oauth_resource_url: str | None = field(
         default_factory=lambda: os.environ.get("OAUTH_RESOURCE_URL") or None
     )
@@ -519,6 +543,10 @@ class Settings:
             return []
         return [u.strip().lower() for u in self.admin_users.split(",") if u.strip()]
 
+    @property
+    def access_grants_enabled(self) -> bool:
+        return bool(self.access_grant_button_label)
+
     # the deployment's data profile (genetics-results-suite configs/datasets.yaml), the same
     # env var schema_docs gates views on. Tools whose data only some profiles serve are
     # withdrawn by `disabled_tools` everywhere else, failing closed when it is unset.
@@ -528,13 +556,11 @@ class Settings:
 
     # subagent settings
     enable_subagents: bool = field(
-        default_factory=lambda: os.environ.get(
-            "ENABLE_SUBAGENTS", "false"
-        ).lower() in ("1", "true", "yes")
+        default_factory=lambda: (
+            os.environ.get("ENABLE_SUBAGENTS", "false").lower() in ("1", "true", "yes")
+        )
     )
-    subagent_model: str = field(
-        default_factory=lambda: os.environ.get("SUBAGENT_MODEL", "")
-    )
+    subagent_model: str = field(default_factory=lambda: os.environ.get("SUBAGENT_MODEL", ""))
     subagent_timeout: int = field(
         default_factory=lambda: int(os.environ.get("SUBAGENT_TIMEOUT", "120"))
     )

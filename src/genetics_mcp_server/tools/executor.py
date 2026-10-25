@@ -439,7 +439,6 @@ def _ld_failure(resp: Any) -> dict[str, Any]:
     return failure
 
 
-
 # the index's ranking diagnostics on every hit: the strings it matched on and three
 # scores the model never acts on. A hit is 470 characters with them and about half that
 # without, and search_phenotypes was the largest replayed tool output in production
@@ -455,6 +454,7 @@ def _without_ranking_fields(hits: Any) -> Any:
         for hit in hits
     ]
 
+
 def _seg(value: Any) -> str:
     """Percent-encode a caller-supplied value for use as a URL *path segment*.
 
@@ -469,6 +469,7 @@ def _seg(value: Any) -> str:
     if encoded in (".", ".."):
         return encoded.replace(".", "%2E")
     return encoded
+
 
 CELL_TYPE_EXPRESSION_LEVELS = ("summary", "dataset")
 
@@ -635,9 +636,7 @@ class ToolExecutor:
         does (pointing an executor at a stub server, say) must assign base_url first, or
         assign public_url explicitly as well.
         """
-        return self._public_api_url_arg or _endpoint_env(
-            "GENETICS_PUBLIC_API_URL", self.base_url
-        )
+        return self._public_api_url_arg or _endpoint_env("GENETICS_PUBLIC_API_URL", self.base_url)
 
     @cached_property
     def bigquery_url(self) -> str | None:
@@ -794,7 +793,7 @@ class ToolExecutor:
         elif len(ref) == 0 or ref == "-":
             # pure insertion (no ref allele)
             return f"{chrom_str}:g.{pos}_{pos + 1}ins{alt}"
-        elif len(ref) > len(alt) and alt == ref[:len(alt)]:
+        elif len(ref) > len(alt) and alt == ref[: len(alt)]:
             # deletion (ref starts with alt, remaining bases are deleted)
             del_start = pos + len(alt)
             del_end = pos + len(ref) - 1
@@ -802,10 +801,10 @@ class ToolExecutor:
                 return f"{chrom_str}:g.{del_start}del"
             else:
                 return f"{chrom_str}:g.{del_start}_{del_end}del"
-        elif len(alt) > len(ref) and alt[:len(ref)] == ref:
+        elif len(alt) > len(ref) and alt[: len(ref)] == ref:
             # insertion (alt starts with ref, remaining bases are inserted)
             ins_after = pos + len(ref) - 1
-            return f"{chrom_str}:g.{ins_after}_{ins_after + 1}ins{alt[len(ref):]}"
+            return f"{chrom_str}:g.{ins_after}_{ins_after + 1}ins{alt[len(ref) :]}"
         else:
             # MNV or complex substitution → delins
             if len(ref) == 1:
@@ -823,11 +822,25 @@ class ToolExecutor:
         if clinvar:
             rcv = clinvar.get("rcv")
             if isinstance(rcv, list):
-                significances = list({r.get("clinical_significance") for r in rcv if r.get("clinical_significance")})
-                conditions = list({r.get("preferred_name") or r.get("conditions", {}).get("name", "") for r in rcv if r.get("preferred_name") or r.get("conditions")})
+                significances = list(
+                    {r.get("clinical_significance") for r in rcv if r.get("clinical_significance")}
+                )
+                conditions = list(
+                    {
+                        r.get("preferred_name") or r.get("conditions", {}).get("name", "")
+                        for r in rcv
+                        if r.get("preferred_name") or r.get("conditions")
+                    }
+                )
             elif isinstance(rcv, dict):
-                significances = [rcv.get("clinical_significance")] if rcv.get("clinical_significance") else []
-                cond = rcv.get("preferred_name") or (rcv.get("conditions", {}).get("name", "") if isinstance(rcv.get("conditions"), dict) else "")
+                significances = (
+                    [rcv.get("clinical_significance")] if rcv.get("clinical_significance") else []
+                )
+                cond = rcv.get("preferred_name") or (
+                    rcv.get("conditions", {}).get("name", "")
+                    if isinstance(rcv.get("conditions"), dict)
+                    else ""
+                )
                 conditions = [cond] if cond else []
             else:
                 significances = []
@@ -836,7 +849,9 @@ class ToolExecutor:
             result["clinvar"] = {
                 "clinical_significance": significances,
                 "conditions": conditions,
-                "review_status": clinvar.get("review", {}).get("review_status") if isinstance(clinvar.get("review"), dict) else None,
+                "review_status": clinvar.get("review", {}).get("review_status")
+                if isinstance(clinvar.get("review"), dict)
+                else None,
                 "variant_id": clinvar.get("variant_id"),
             }
 
@@ -972,9 +987,7 @@ class ToolExecutor:
         keys degrade to the generic message, which is what a pre-`max_rows_applied` db-api
         or a non-BigQuery payload produces.
         """
-        payload["total_count"] = query_result.get(
-            "total_rows", len(query_result.get("rows") or [])
-        )
+        payload["total_count"] = query_result.get("total_rows", len(query_result.get("rows") or []))
         payload["truncated"] = query_result.get("truncated", False)
         if include:
             payload["columns"] = query_result.get("columns", [])
@@ -998,24 +1011,36 @@ class ToolExecutor:
         columns = query_result.get("columns") or []
         rows = query_result.get("rows") or []
         if rows and not columns:
-            return columns, rows, {
-                "success": False,
-                "error": "query result has rows but no column names",
-            }
+            return (
+                columns,
+                rows,
+                {
+                    "success": False,
+                    "error": "query result has rows but no column names",
+                },
+            )
         for row in rows:
             if not isinstance(row, (list, tuple)):
-                return columns, rows, {
-                    "success": False,
-                    "error": f"query result row is {type(row).__name__}, expected a positional list",
-                }
+                return (
+                    columns,
+                    rows,
+                    {
+                        "success": False,
+                        "error": f"query result row is {type(row).__name__}, expected a positional list",
+                    },
+                )
             if len(row) != len(columns):
-                return columns, rows, {
-                    "success": False,
-                    "error": (
-                        f"query result row has {len(row)} values but "
-                        f"{len(columns)} column names"
-                    ),
-                }
+                return (
+                    columns,
+                    rows,
+                    {
+                        "success": False,
+                        "error": (
+                            f"query result row has {len(row)} values but "
+                            f"{len(columns)} column names"
+                        ),
+                    },
+                )
         return columns, rows, None
 
     def _bq_gene_payload(
@@ -1063,10 +1088,10 @@ class ToolExecutor:
     @staticmethod
     def _strip_trailing_limit(sql: str) -> tuple[str, bool]:
         """Strip a trailing LIMIT clause (and optional semicolon) from SQL. Returns (sql, was_stripped)."""
-        stripped = re.sub(r'\bLIMIT\s+\d+\s*;?\s*$', '', sql, flags=re.IGNORECASE).strip()
+        stripped = re.sub(r"\bLIMIT\s+\d+\s*;?\s*$", "", sql, flags=re.IGNORECASE).strip()
         # also strip a bare trailing semicolon
-        stripped = stripped.rstrip(';').rstrip()
-        return stripped, stripped != sql.strip().rstrip(';').rstrip()
+        stripped = stripped.rstrip(";").rstrip()
+        return stripped, stripped != sql.strip().rstrip(";").rstrip()
 
     async def query_database(
         self,
@@ -1121,7 +1146,8 @@ class ToolExecutor:
             # download gets all fetched rows
             download_data = (
                 {"columns": columns, "rows": all_rows, "filename": "finngenie_results.tsv"}
-                if all_rows else None
+                if all_rows
+                else None
             )
 
             # LLM gets at most max_rows
@@ -1245,9 +1271,7 @@ class ToolExecutor:
         resp = await self.client.get(f"{self.base_url}/v1/trait_name_mapping")
         if resp.status_code == 200:
             full_mapping = resp.json()
-            result = {
-                code: full_mapping.get(code, f"Unknown: {code}") for code in codes
-            }
+            result = {code: full_mapping.get(code, f"Unknown: {code}") for code in codes}
             return {"success": True, "names": result}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
@@ -1276,7 +1300,9 @@ class ToolExecutor:
                 dl_params["resources"] = resource
             if data_types:
                 dl_params["data_types"] = data_types
-            download_url = self._build_download_url(f"/v1/credible_sets_by_gene/{_seg(gene)}", dl_params)
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_gene/{_seg(gene)}", dl_params
+            )
 
             if summarize:
                 params["format"] = "tsv"
@@ -1285,7 +1311,13 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, **self._columns_meta(resp), "gene": gene, "_download_url": download_url, **summary}
+                    return {
+                        "success": True,
+                        **self._columns_meta(resp),
+                        "gene": gene,
+                        "_download_url": download_url,
+                        **summary,
+                    }
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1332,7 +1364,9 @@ class ToolExecutor:
                 params["data_types"] = data_types
 
             dl_params = {k: v for k, v in params.items()}
-            download_url = self._build_download_url(f"/v1/credible_sets_by_variant/{_seg(variant)}", dl_params)
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_variant/{_seg(variant)}", dl_params
+            )
 
             if summarize:
                 params["format"] = "tsv"
@@ -1342,7 +1376,13 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, **self._columns_meta(resp), "variant": variant, "_download_url": download_url, **summary}
+                    return {
+                        "success": True,
+                        **self._columns_meta(resp),
+                        "variant": variant,
+                        "_download_url": download_url,
+                        **summary,
+                    }
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1449,7 +1489,13 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_trait(resp.text)
-                    return {"success": True, **self._columns_meta(resp), "phenotype": phenotype, "_download_url": download_url, **summary}
+                    return {
+                        "success": True,
+                        **self._columns_meta(resp),
+                        "phenotype": phenotype,
+                        "_download_url": download_url,
+                        **summary,
+                    }
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1573,7 +1619,9 @@ class ToolExecutor:
                 params["resources"] = resource
 
             dl_params = {k: v for k, v in params.items()}
-            download_url = self._build_download_url(f"/v1/credible_sets_by_qtl_gene/{_seg(gene)}", dl_params)
+            download_url = self._build_download_url(
+                f"/v1/credible_sets_by_qtl_gene/{_seg(gene)}", dl_params
+            )
 
             if summarize:
                 params["format"] = "tsv"
@@ -1583,7 +1631,13 @@ class ToolExecutor:
                 )
                 if resp.status_code == 200:
                     summary = self._summarize_credible_sets_simple(resp.text)
-                    return {"success": True, **self._columns_meta(resp), "gene": gene, "_download_url": download_url, **summary}
+                    return {
+                        "success": True,
+                        **self._columns_meta(resp),
+                        "gene": gene,
+                        "_download_url": download_url,
+                        **summary,
+                    }
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1595,7 +1649,13 @@ class ToolExecutor:
                     params=params,
                 )
                 if resp.status_code == 200:
-                    return {"success": True, **self._columns_meta(resp), "gene": gene, "results": resp.json(), "_download_url": download_url}
+                    return {
+                        "success": True,
+                        **self._columns_meta(resp),
+                        "gene": gene,
+                        "results": resp.json(),
+                        "_download_url": download_url,
+                    }
                 return {
                     "success": False,
                     "error": f"HTTP {resp.status_code}: {resp.text}",
@@ -1635,7 +1695,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             out: dict[str, Any] = {
-                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "gene": gene,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_expression.tsv"},
             }
             # Annotate which expression resources returned no rows for this gene, so a
@@ -1651,9 +1714,7 @@ class ToolExecutor:
             return out
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
-    async def get_cell_type_expression(
-        self, gene: str, level: str = "summary"
-    ) -> dict[str, Any]:
+    async def get_cell_type_expression(self, gene: str, level: str = "summary") -> dict[str, Any]:
         """Single-cell expression by cell type for one or more genes."""
         if level not in CELL_TYPE_EXPRESSION_LEVELS:
             return {
@@ -1668,11 +1729,15 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "gene": genes, "level": level,
+                "success": True,
+                **self._columns_meta(resp),
+                "gene": genes,
+                "level": level,
                 "release": resp.headers.get("X-Dataset-Version"),
                 "results": results,
                 "_download_data": {
-                    "results": results, "filename": f"{genes}_cell_type_expression_{level}.tsv",
+                    "results": results,
+                    "filename": f"{genes}_cell_type_expression_{level}.tsv",
                 },
             }
         # results-api answers 404 both for an unknown gene and for a deployment with no
@@ -1702,10 +1767,7 @@ class ToolExecutor:
         if resources:
             # map resource names to phenotype codes
             pheno_map = {"decode_cpg": "CpG", "decode_mds": "MDS"}
-            phenotypes = ",".join(
-                pheno_map.get(r.strip(), r.strip())
-                for r in resources.split(",")
-            )
+            phenotypes = ",".join(pheno_map.get(r.strip(), r.strip()) for r in resources.split(","))
         params: dict[str, Any] = {
             "variants": variant,
             "phenotypes": phenotypes,
@@ -1717,7 +1779,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "variant": variant,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_asm_qtl.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1784,7 +1849,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "variant": variant,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1797,13 +1865,20 @@ class ToolExecutor:
         if resources:
             params["resources"] = [r.strip() for r in resources.split(",")]
         resp = await self.client.get(
-            f"{self.base_url}/v1/open_chromatin/region/{_seg(chrom)}/{_seg(start)}/{_seg(end)}", params=params
+            f"{self.base_url}/v1/open_chromatin/region/{_seg(chrom)}/{_seg(start)}/{_seg(end)}",
+            params=params,
         )
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "region": f"{chrom}:{start}-{end}", "results": results,
-                "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_open_chromatin.tsv"},
+                "success": True,
+                **self._columns_meta(resp),
+                "region": f"{chrom}:{start}-{end}",
+                "results": results,
+                "_download_data": {
+                    "results": results,
+                    "filename": f"{chrom}_{start}_{end}_open_chromatin.tsv",
+                },
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
@@ -1821,7 +1896,11 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "peak_id": peak_id, "count": len(results), "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "peak_id": peak_id,
+                "count": len(results),
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{peak_id}_open_chromatin.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -1842,7 +1921,11 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "peak_id": peak_id, "count": len(results), "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "peak_id": peak_id,
+                "count": len(results),
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{peak_id}_peak_to_genes.tsv"},
             }
         if resp.status_code == 404:
@@ -1939,7 +2022,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "variant": variant,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_variant_effect.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -2007,7 +2093,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "variant": variant,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_mpra.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -2025,8 +2114,14 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "region": f"{chrom}:{start}-{end}", "results": results,
-                "_download_data": {"results": results, "filename": f"{chrom}_{start}_{end}_mpra.tsv"},
+                "success": True,
+                **self._columns_meta(resp),
+                "region": f"{chrom}:{start}-{end}",
+                "results": results,
+                "_download_data": {
+                    "results": results,
+                    "filename": f"{chrom}_{start}_{end}_mpra.tsv",
+                },
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
@@ -2109,9 +2204,7 @@ class ToolExecutor:
 
         try:
             path = f"/v1/hla/{_seg(resource)}"
-            resp = await self.client.get(
-                f"{self.base_url}{path}", params=params, timeout=300.0
-            )
+            resp = await self.client.get(f"{self.base_url}{path}", params=params, timeout=300.0)
             if resp.status_code == 200:
                 results = resp.json()
                 rows, truncated = self._cap_rows(results)
@@ -2257,7 +2350,10 @@ class ToolExecutor:
         list it passes, and the view holds one row per gene.
         """
         if not isinstance(genes, (list, tuple)):
-            return {"success": False, "error": "genes must be a list of gene symbols or Ensembl IDs"}
+            return {
+                "success": False,
+                "error": "genes must be a list of gene symbols or Ensembl IDs",
+            }
         bad = next((g for g in genes if not isinstance(g, str)), None)
         if bad is not None:
             return {"success": False, "error": f"genes must be strings, got {bad!r}"}
@@ -2497,10 +2593,16 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             result: dict[str, Any] = {
-                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "gene": gene,
+                "results": results,
             }
             if results:
-                result["_download_data"] = {"results": results, "filename": f"{gene}_disease_associations.tsv"}
+                result["_download_data"] = {
+                    "results": results,
+                    "filename": f"{gene}_disease_associations.tsv",
+                }
             return result
         elif resp.status_code == 404:
             # this endpoint expresses "no associations" as a 404, so the schema it
@@ -2523,7 +2625,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "gene": gene, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "gene": gene,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{gene}_exome_results.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -2542,7 +2647,11 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "variant": variant, "count": len(results), "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "variant": variant,
+                "count": len(results),
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_exome_results.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -2560,7 +2669,9 @@ class ToolExecutor:
             {"resources": rlist} if rlist else None,
         )
         resp = await self.client.get(
-            f"{self.base_url}/v1/exome_results_by_region/{_seg(region)}", params=params, timeout=300.0
+            f"{self.base_url}/v1/exome_results_by_region/{_seg(region)}",
+            params=params,
+            timeout=300.0,
         )
         if resp.status_code == 200:
             results = resp.json()
@@ -2576,9 +2687,7 @@ class ToolExecutor:
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
-    async def get_exome_results_by_phenotype(
-        self, resource: str, phenotype: str
-    ) -> dict[str, Any]:
+    async def get_exome_results_by_phenotype(self, resource: str, phenotype: str) -> dict[str, Any]:
         """Get individual variant exome results for a specific phenotype."""
         try:
             resp = await self.client.get(
@@ -2659,9 +2768,7 @@ class ToolExecutor:
         import io
 
         params = {"traits": ",".join(traits)} if traits else None
-        resp = await self.client.get(
-            f"{self.base_url}/v1/gene_based/{_seg(gene)}", params=params
-        )
+        resp = await self.client.get(f"{self.base_url}/v1/gene_based/{_seg(gene)}", params=params)
         if resp.status_code == 200:
             reader = csv.DictReader(io.StringIO(resp.text), delimiter="\t")
             results = list(reader)
@@ -2701,9 +2808,7 @@ class ToolExecutor:
         """
         parts = variant.split(":")
         if len(parts) != 4:
-            raise ValueError(
-                f"Invalid variant format: {variant}. Expected chr:pos:ref:alt"
-            )
+            raise ValueError(f"Invalid variant format: {variant}. Expected chr:pos:ref:alt")
         chr_str, pos_str, ref, alt = parts
         try:
             pos = int(pos_str)
@@ -2790,7 +2895,10 @@ class ToolExecutor:
         try:
             resp = await self.client.get(f"{self.base_url}/v1/ld/panels", timeout=30.0)
             if resp.status_code != 200:
-                return {"success": False, "error": f"LD panel listing failed: HTTP {resp.status_code}"}
+                return {
+                    "success": False,
+                    "error": f"LD panel listing failed: HTTP {resp.status_code}",
+                }
             data = resp.json()
             return {
                 "success": True,
@@ -2935,9 +3043,7 @@ class ToolExecutor:
             return result
 
         except Exception as e:
-            logger.error(
-                f"Error in get_variants_in_ld({variant}): {e}\n{traceback.format_exc()}"
-            )
+            logger.error(f"Error in get_variants_in_ld({variant}): {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
     # -------------------------------------------------------------------------
@@ -2953,7 +3059,10 @@ class ToolExecutor:
         if resp.status_code == 200:
             results = resp.json()
             return {
-                "success": True, **self._columns_meta(resp), "variant": variant, "results": results,
+                "success": True,
+                **self._columns_meta(resp),
+                "variant": variant,
+                "results": results,
                 "_download_data": {"results": results, "filename": f"{variant}_colocalization.tsv"},
             }
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
@@ -3027,9 +3136,7 @@ class ToolExecutor:
         )
         if resp.status_code != 200:
             return None
-        return tuple(
-            sorted({(d["resource"], d.get("data_type") or "") for d in resp.json()})
-        )
+        return tuple(sorted({(d["resource"], d.get("data_type") or "") for d in resp.json()}))
 
     async def get_dataset_display_names(self) -> dict[str, Any]:
         """Get the display-name overrides keyed by the raw `dataset` column value."""
@@ -3054,17 +3161,25 @@ class ToolExecutor:
         )
         if resp.status_code == 200:
             results = resp.json()
-            rows, truncated = self._cap_rows(results) if isinstance(results, list) else (results, False)
+            rows, truncated = (
+                self._cap_rows(results) if isinstance(results, list) else (results, False)
+            )
             return {
                 "success": True,
                 "resource": resource,
                 "count": len(results) if isinstance(results, list) else None,
                 "truncated": truncated,
                 "metadata": rows,
-                "_download_url": self._build_download_url(f"/v1/resource_metadata/{_seg(resource)}"),
+                "_download_url": self._build_download_url(
+                    f"/v1/resource_metadata/{_seg(resource)}"
+                ),
             }
         if resp.status_code == 404:
-            what = f"phenotypes {phenotypes!r} in resource '{resource}'" if phenotypes else f"resource '{resource}'"
+            what = (
+                f"phenotypes {phenotypes!r} in resource '{resource}'"
+                if phenotypes
+                else f"resource '{resource}'"
+            )
             return {"success": False, "error": f"Not found: {what}"}
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
@@ -3095,7 +3210,9 @@ class ToolExecutor:
         query_key: str | None = None
         query_value: str | None = None
         if variants is None:
-            query_key = "variant" if variant is not None else "region" if region is not None else "gene"
+            query_key = (
+                "variant" if variant is not None else "region" if region is not None else "gene"
+            )
             query_value = variant or region or gene
 
         try:
@@ -3235,9 +3352,7 @@ class ToolExecutor:
                     "total_count": len(results),
                     "truncated": truncated,
                     "results": rows,
-                    "_download_url": self._build_download_url(
-                        path, {"phenotypes": pheno_param}
-                    ),
+                    "_download_url": self._build_download_url(path, {"phenotypes": pheno_param}),
                 }
             if resp.status_code in (404, 422):
                 return {"success": False, "error": f"{resp.status_code}: {resp.text}"}
@@ -3279,16 +3394,21 @@ class ToolExecutor:
             # hold whichever one a previous result showed them
             if trait:
                 data = [
-                    row for row in data
-                    if trait in (row.get("trait"), row.get("trait_original"))
+                    row for row in data if trait in (row.get("trait"), row.get("trait_original"))
                 ]
 
             # compute aggregate totals
             stat_cols = [
-                "n_risk_cs", "n_risk_cs_with_coding", "n_risk_cs_with_coding_pip_gt_0_05",
-                "n_risk_cs_with_lof", "n_risk_cs_with_lof_pip_gt_0_05",
-                "n_protective_cs", "n_protective_cs_with_coding", "n_protective_cs_with_coding_pip_gt_0_05",
-                "n_protective_cs_with_lof", "n_protective_cs_with_lof_pip_gt_0_05",
+                "n_risk_cs",
+                "n_risk_cs_with_coding",
+                "n_risk_cs_with_coding_pip_gt_0_05",
+                "n_risk_cs_with_lof",
+                "n_risk_cs_with_lof_pip_gt_0_05",
+                "n_protective_cs",
+                "n_protective_cs_with_coding",
+                "n_protective_cs_with_coding_pip_gt_0_05",
+                "n_protective_cs_with_lof",
+                "n_protective_cs_with_lof_pip_gt_0_05",
             ]
 
             totals = {}
@@ -3331,9 +3451,7 @@ class ToolExecutor:
             has_betas = any(v.get("beta") is not None for v in parsed)
             variant_ids = [v["variant"] for v in parsed]
             # build lookup for input betas
-            input_betas: dict[str, float | None] = {
-                v["variant"]: v.get("beta") for v in parsed
-            }
+            input_betas: dict[str, float | None] = {v["variant"]: v.get("beta") for v in parsed}
 
             variants_payload = {"variants": "\n".join(variant_ids)}
 
@@ -3384,7 +3502,9 @@ class ToolExecutor:
                 else:
                     continue
                 cs_by_variant[vid].append(r)
-            cs_results = [{"variant": vid, "results": cs_by_variant.get(vid, [])} for vid in variant_ids]
+            cs_results = [
+                {"variant": vid, "results": cs_by_variant.get(vid, [])} for vid in variant_ids
+            ]
 
             # build per-variant nearest gene results
             nearest_by_variant: dict[str, dict] = {}
@@ -3404,12 +3524,20 @@ class ToolExecutor:
 
             # aggregate credible set data
             def _new_counts() -> dict:
-                return {"variants": set(), "consistent": set(), "inconsistent": set(), "resources": set(), "datasets": set()}
+                return {
+                    "variants": set(),
+                    "consistent": set(),
+                    "inconsistent": set(),
+                    "resources": set(),
+                    "datasets": set(),
+                }
 
             gwas_counts: dict[str, dict] = defaultdict(_new_counts)
             pqtl_counts: dict[str, dict] = defaultdict(_new_counts)
             eqtl_counts: dict[str, dict] = defaultdict(_new_counts)
-            caqtl_counts: dict[str, dict] = defaultdict(lambda: {"variants": set(), "resources": set(), "datasets": set()})
+            caqtl_counts: dict[str, dict] = defaultdict(
+                lambda: {"variants": set(), "resources": set(), "datasets": set()}
+            )
             tissue_eqtl_variants: dict[str, set] = defaultdict(set)
             pqtl_variants: set[str] = set()
             variants_with_cs: set[str] = set()
@@ -3499,7 +3627,14 @@ class ToolExecutor:
                         "resource": ", ".join(sorted(d["resources"])),
                         "dataset": ", ".join(sorted(d["datasets"])),
                         "n_variants": len(d["variants"]),
-                        **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
+                        **(
+                            {
+                                "n_consistent": len(d["consistent"]),
+                                "n_inconsistent": len(d["inconsistent"]),
+                            }
+                            if has_betas
+                            else {}
+                        ),
                     }
                     for trait, d in gwas_counts.items()
                 ],
@@ -3513,7 +3648,14 @@ class ToolExecutor:
                         "resource": ", ".join(sorted(d["resources"])),
                         "dataset": ", ".join(sorted(d["datasets"])),
                         "n_variants": len(d["variants"]),
-                        **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
+                        **(
+                            {
+                                "n_consistent": len(d["consistent"]),
+                                "n_inconsistent": len(d["inconsistent"]),
+                            }
+                            if has_betas
+                            else {}
+                        ),
                     }
                     for gene, d in pqtl_counts.items()
                 ],
@@ -3528,7 +3670,14 @@ class ToolExecutor:
                         "resource": ", ".join(sorted(d["resources"])),
                         "dataset": ", ".join(sorted(d["datasets"])),
                         "n_variants": len(d["variants"]),
-                        **({"n_consistent": len(d["consistent"]), "n_inconsistent": len(d["inconsistent"])} if has_betas else {}),
+                        **(
+                            {
+                                "n_consistent": len(d["consistent"]),
+                                "n_inconsistent": len(d["inconsistent"]),
+                            }
+                            if has_betas
+                            else {}
+                        ),
                     }
                     for key, d in eqtl_counts.items()
                 ],
@@ -3549,7 +3698,10 @@ class ToolExecutor:
             )
 
             tissue_enrichment = sorted(
-                [{"tissue": tissue, "n_eqtl_variants": len(vids)} for tissue, vids in tissue_eqtl_variants.items()],
+                [
+                    {"tissue": tissue, "n_eqtl_variants": len(vids)}
+                    for tissue, vids in tissue_eqtl_variants.items()
+                ],
                 key=lambda x: -x["n_eqtl_variants"],
             )
 
@@ -3585,7 +3737,9 @@ class ToolExecutor:
         Optional header row detected by first field not matching variant pattern.
         """
         # canonical form uses : as CPRA separator
-        variant_pattern = re.compile(r"^(?:chr)?(\d{1,2}|X|Y|MT):(\d+):([ACGT]+):([ACGT]+)$", re.IGNORECASE)
+        variant_pattern = re.compile(
+            r"^(?:chr)?(\d{1,2}|X|Y|MT):(\d+):([ACGT]+):([ACGT]+)$", re.IGNORECASE
+        )
         # accepted CPRA separators: : - _ | / \
         cpra_sep_pattern = re.compile(r"[-_|/\\]")
         results = []
@@ -3723,9 +3877,7 @@ class ToolExecutor:
                 }
             return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
         except Exception as e:
-            logger.error(
-                f"Error in get_nearest_genes({variant}): {e}\n{traceback.format_exc()}"
-            )
+            logger.error(f"Error in get_nearest_genes({variant}): {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
     async def get_genes_in_region(
@@ -3787,9 +3939,7 @@ class ToolExecutor:
         params["exclude_olfactory"] = exclude_olfactory
 
         try:
-            resp = await self.client.get(
-                f"{self.base_url}/v1/gene_group/members", params=params
-            )
+            resp = await self.client.get(f"{self.base_url}/v1/gene_group/members", params=params)
             if resp.status_code == 200:
                 data = resp.json()
                 count = data.get("count", 0)
@@ -3810,7 +3960,9 @@ class ToolExecutor:
                     )
                 return result
             if resp.status_code == 404:
-                queried = f"group_id={group_id}" if group_id is not None else f"group_name={group_name!r}"
+                queried = (
+                    f"group_id={group_id}" if group_id is not None else f"group_name={group_name!r}"
+                )
                 return {"success": False, "error": f"Unknown gene group ({queried})"}
             return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
         except Exception as e:
@@ -3846,8 +3998,7 @@ class ToolExecutor:
             return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
         except Exception as e:
             logger.error(
-                f"Error in normalize_gene_symbols(symbols={cleaned}): "
-                f"{e}\n{traceback.format_exc()}"
+                f"Error in normalize_gene_symbols(symbols={cleaned}): {e}\n{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
@@ -3906,14 +4057,11 @@ class ToolExecutor:
             }
         except Exception as e:
             logger.error(
-                f"Error in search_mgi({query!r}, type={query_type}): {e}\n"
-                f"{traceback.format_exc()}"
+                f"Error in search_mgi({query!r}, type={query_type}): {e}\n{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
-    async def _mousemine_query(
-        self, path_query_xml: str, size: int
-    ) -> dict[str, Any]:
+    async def _mousemine_query(self, path_query_xml: str, size: int) -> dict[str, Any]:
         """Execute a MouseMine PathQuery and return the parsed JSON body.
 
         Returns the raw InterMine response dict on success, or a sentinel
@@ -3934,9 +4082,7 @@ class ToolExecutor:
             # ConnectError path never fires. Without this the timeout reaches search_mgi's
             # generic handler and a routine upstream outage is reported to the user as an
             # internal error and to the log as a traceback.
-            logger.warning(
-                "MouseMine did not respond within %ss", self._MOUSEMINE_TIMEOUT
-            )
+            logger.warning("MouseMine did not respond within %ss", self._MOUSEMINE_TIMEOUT)
             return {"_error": MOUSEMINE_UNAVAILABLE_MSG}
         if resp.status_code != 200:
             # truncate body to keep error messages bounded
@@ -3974,9 +4120,9 @@ class ToolExecutor:
         pheno_xml = (
             '<query name="" model="genomic" '
             'view="Gene.primaryIdentifier Gene.symbol Gene.name '
-            'Gene.alleles.genotypes.ontologyAnnotations.ontologyTerm.identifier '
-            'Gene.alleles.genotypes.ontologyAnnotations.ontologyTerm.name '
-            'Gene.alleles.primaryIdentifier Gene.alleles.symbol '
+            "Gene.alleles.genotypes.ontologyAnnotations.ontologyTerm.identifier "
+            "Gene.alleles.genotypes.ontologyAnnotations.ontologyTerm.name "
+            "Gene.alleles.primaryIdentifier Gene.alleles.symbol "
             'Gene.alleles.name">'
             f'<constraint path="Gene.symbol" op="=" value={quoteattr(gene_symbol)}/>'
             '<constraint path="Gene.organism.taxonId" op="=" value="10090"/>'
@@ -4013,19 +4159,17 @@ class ToolExecutor:
                     "url": self._marker_url(mgi_id),
                 },
             )
-            if mp_id and not any(
-                p["mp_id"] == mp_id for p in entry["phenotype_terms"]
-            ):
+            if mp_id and not any(p["mp_id"] == mp_id for p in entry["phenotype_terms"]):
                 entry["phenotype_terms"].append({"mp_id": mp_id, "term": mp_term})
-            if allele_id and not any(
-                a["mgi_id"] == allele_id for a in entry["alleles"]
-            ):
-                entry["alleles"].append({
-                    "mgi_id": allele_id,
-                    "symbol": allele_symbol,
-                    "name": allele_name,
-                    "url": self._allele_url(allele_id),
-                })
+            if allele_id and not any(a["mgi_id"] == allele_id for a in entry["alleles"]):
+                entry["alleles"].append(
+                    {
+                        "mgi_id": allele_id,
+                        "symbol": allele_symbol,
+                        "name": allele_name,
+                        "url": self._allele_url(allele_id),
+                    }
+                )
 
         return list(by_gene.values())[:size]
 
@@ -4055,9 +4199,9 @@ class ToolExecutor:
         xml = (
             '<query name="" model="genomic" '
             'view="OntologyAnnotation.ontologyTerm.identifier '
-            'OntologyAnnotation.ontologyTerm.name '
-            'OntologyAnnotation.subject.alleles.feature.primaryIdentifier '
-            'OntologyAnnotation.subject.alleles.feature.symbol '
+            "OntologyAnnotation.ontologyTerm.name "
+            "OntologyAnnotation.subject.alleles.feature.primaryIdentifier "
+            "OntologyAnnotation.subject.alleles.feature.symbol "
             'OntologyAnnotation.subject.alleles.feature.name">'
             f"{term_constraint}"
             '<constraint path="OntologyAnnotation.ontologyTerm" type="MPTerm"/>'
@@ -4088,9 +4232,7 @@ class ToolExecutor:
                     "url": self._marker_url(mgi_id),
                 },
             )
-            if mp_id and not any(
-                p["mp_id"] == mp_id for p in entry["phenotype_terms"]
-            ):
+            if mp_id and not any(p["mp_id"] == mp_id for p in entry["phenotype_terms"]):
                 entry["phenotype_terms"].append({"mp_id": mp_id, "term": mp_term})
 
         return list(by_gene.values())[:size]
@@ -4100,9 +4242,7 @@ class ToolExecutor:
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """Look up allele details by MGI allele ID or symbol."""
         is_mgi_id = allele_query.upper().startswith("MGI:")
-        constraint_path = (
-            "Allele.primaryIdentifier" if is_mgi_id else "Allele.symbol"
-        )
+        constraint_path = "Allele.primaryIdentifier" if is_mgi_id else "Allele.symbol"
         constraint_value = allele_query.upper() if is_mgi_id else allele_query
 
         # MP terms hang off Genotype.ontologyAnnotations.ontologyTerm (the old
@@ -4111,12 +4251,12 @@ class ToolExecutor:
         xml = (
             '<query name="" model="genomic" '
             'view="Allele.primaryIdentifier Allele.symbol Allele.name '
-            'Allele.alleleType Allele.feature.primaryIdentifier '
-            'Allele.feature.symbol Allele.feature.name '
-            'Allele.genotypes.ontologyAnnotations.ontologyTerm.identifier '
+            "Allele.alleleType Allele.feature.primaryIdentifier "
+            "Allele.feature.symbol Allele.feature.name "
+            "Allele.genotypes.ontologyAnnotations.ontologyTerm.identifier "
             'Allele.genotypes.ontologyAnnotations.ontologyTerm.name">'
             f'<constraint path="{constraint_path}" op="=" '
-            f'value={quoteattr(constraint_value)}/>'
+            f"value={quoteattr(constraint_value)}/>"
             '<constraint path="Allele.genotypes.ontologyAnnotations'
             '.ontologyTerm" type="MPTerm"/>'
             "</query>"
@@ -4144,20 +4284,20 @@ class ToolExecutor:
                     "mgi_id": gene_id,
                     "symbol": gene_symbol,
                     "name": gene_name,
-                    "alleles": [{
-                        "mgi_id": allele_id,
-                        "symbol": allele_symbol,
-                        "name": allele_name,
-                        "allele_type": allele_type,
-                        "url": self._allele_url(allele_id),
-                    }],
+                    "alleles": [
+                        {
+                            "mgi_id": allele_id,
+                            "symbol": allele_symbol,
+                            "name": allele_name,
+                            "allele_type": allele_type,
+                            "url": self._allele_url(allele_id),
+                        }
+                    ],
                     "phenotype_terms": [],
                     "url": self._marker_url(gene_id),
                 },
             )
-            if mp_id and not any(
-                p["mp_id"] == mp_id for p in entry["phenotype_terms"]
-            ):
+            if mp_id and not any(p["mp_id"] == mp_id for p in entry["phenotype_terms"]):
                 entry["phenotype_terms"].append({"mp_id": mp_id, "term": mp_term})
 
         return list(by_allele.values())[:size]
@@ -4177,9 +4317,9 @@ class ToolExecutor:
         xml = (
             '<query name="" model="genomic" '
             'view="Gene.primaryIdentifier Gene.symbol Gene.name '
-            'Gene.homologues.homologue.primaryIdentifier '
-            'Gene.homologues.homologue.symbol '
-            'Gene.homologues.homologue.name '
+            "Gene.homologues.homologue.primaryIdentifier "
+            "Gene.homologues.homologue.symbol "
+            "Gene.homologues.homologue.name "
             'Gene.homologues.homologue.organism.shortName">'
             f'<constraint path="Gene.symbol" op="=" value={quoteattr(gene_symbol)}/>'
             f'<constraint path="Gene.organism.taxonId" op="=" '
@@ -4211,15 +4351,15 @@ class ToolExecutor:
                     "url": self._marker_url(mgi_id),
                 },
             )
-            if ortho_id and not any(
-                o["mgi_id"] == ortho_id for o in entry["orthologs"]
-            ):
-                entry["orthologs"].append({
-                    "mgi_id": ortho_id,
-                    "symbol": ortho_symbol,
-                    "name": ortho_name,
-                    "organism": ortho_organism,
-                })
+            if ortho_id and not any(o["mgi_id"] == ortho_id for o in entry["orthologs"]):
+                entry["orthologs"].append(
+                    {
+                        "mgi_id": ortho_id,
+                        "symbol": ortho_symbol,
+                        "name": ortho_name,
+                        "organism": ortho_organism,
+                    }
+                )
 
         return list(by_gene.values())[:size]
 
@@ -4233,9 +4373,7 @@ class ToolExecutor:
     _CBIO_API = "https://www.cbioportal.org/api"
     _CBIO_STUDY_URL = "https://www.cbioportal.org/study/summary"
 
-    _CBIO_ATTRIBUTION = (
-        "Data from cBioPortal (ODbL). Cite cBioPortal and the originating studies."
-    )
+    _CBIO_ATTRIBUTION = "Data from cBioPortal (ODbL). Cite cBioPortal and the originating studies."
 
     # cBioPortal is majority GRCh37 and does not lift over, so genomic coordinates
     # from it must never be compared against this suite's GRCh38 positions. Gene
@@ -4282,9 +4420,7 @@ class ToolExecutor:
             if query_type == "gene_summary":
                 result = await self._cbio_gene_summary(query)
             elif query_type == "gene_by_cancer_type":
-                result = await self._cbio_gene_by_cancer_type(
-                    query, cancer_types, size
-                )
+                result = await self._cbio_gene_by_cancer_type(query, cancer_types, size)
             elif query_type == "gene_mutations":
                 result = await self._cbio_gene_mutations(query, size)
             elif query_type == "gene_fusions":
@@ -4424,7 +4560,9 @@ class ToolExecutor:
         return re.sub(r"[^a-z0-9]+", " ", (label or "").lower()).strip()
 
     @staticmethod
-    def _cbio_gene_filter(entrez_gene_id: int, symbol: str, profile_ids: list[str]) -> dict[str, Any]:
+    def _cbio_gene_filter(
+        entrez_gene_id: int, symbol: str, profile_ids: list[str]
+    ) -> dict[str, Any]:
         """StudyViewFilter gene filter selecting samples altered in one gene.
 
         The include* flags mirror what the cBioPortal web UI sends with all
@@ -4433,18 +4571,22 @@ class ToolExecutor:
         """
         return {
             "molecularProfileIds": profile_ids,
-            "geneQueries": [[{
-                "hugoGeneSymbol": symbol,
-                "entrezGeneId": entrez_gene_id,
-                "includeSomatic": True,
-                "includeGermline": True,
-                "includeUnknownStatus": True,
-                "includeDriver": True,
-                "includeVUS": True,
-                "includeUnknownOncogenicity": True,
-                "includeUnknownTier": True,
-                "tiersBooleanMap": {},
-            }]],
+            "geneQueries": [
+                [
+                    {
+                        "hugoGeneSymbol": symbol,
+                        "entrezGeneId": entrez_gene_id,
+                        "includeSomatic": True,
+                        "includeGermline": True,
+                        "includeUnknownStatus": True,
+                        "includeDriver": True,
+                        "includeVUS": True,
+                        "includeUnknownOncogenicity": True,
+                        "includeUnknownTier": True,
+                        "tiersBooleanMap": {},
+                    }
+                ]
+            ],
         }
 
     @staticmethod
@@ -4572,9 +4714,7 @@ class ToolExecutor:
             "studyViewFilter": {
                 "studyIds": [s["studyId"] for s in studies],
                 "geneFilters": [
-                    self._cbio_gene_filter(
-                        gene["entrez_gene_id"], gene["hugo_symbol"], profile_ids
-                    )
+                    self._cbio_gene_filter(gene["entrez_gene_id"], gene["hugo_symbol"], profile_ids)
                 ],
             },
         }
@@ -4588,11 +4728,7 @@ class ToolExecutor:
             return denominators
 
         numerators = self._cbio_counts_by_label(num_data)
-        wanted = (
-            {self._cbio_normalize_label(c) for c in cancer_types}
-            if cancer_types
-            else None
-        )
+        wanted = {self._cbio_normalize_label(c) for c in cancer_types} if cancer_types else None
 
         rows = []
         for key, num in numerators.items():
@@ -4601,12 +4737,14 @@ class ToolExecutor:
             den = denominators.get(key)
             if not den or not den["count"]:
                 continue
-            rows.append({
-                "cancer_type": den["label"],
-                "altered_samples": num["count"],
-                "profiled_samples": den["count"],
-                "frequency": round(num["count"] / den["count"], 5),
-            })
+            rows.append(
+                {
+                    "cancer_type": den["label"],
+                    "altered_samples": num["count"],
+                    "profiled_samples": den["count"],
+                    "frequency": round(num["count"] / den["count"], 5),
+                }
+            )
 
         # a 2-of-3 "frequency" from a tiny cohort outranks every real signal
         min_cohort = 100
@@ -4678,13 +4816,16 @@ class ToolExecutor:
         builds: dict[str, int] = defaultdict(int)
         for rec in data:
             change = rec.get("proteinChange") or "(unspecified)"
-            entry = by_change.setdefault(change, {
-                "protein_change": change,
-                "protein_position": rec.get("proteinPosStart"),
-                "mutation_type": rec.get("mutationType"),
-                "sample_count": 0,
-                "coordinates_by_build": {},
-            })
+            entry = by_change.setdefault(
+                change,
+                {
+                    "protein_change": change,
+                    "protein_position": rec.get("proteinPosStart"),
+                    "mutation_type": rec.get("mutationType"),
+                    "sample_count": 0,
+                    "coordinates_by_build": {},
+                },
+            )
             key = rec.get("uniqueSampleKey") or f"{rec.get('studyId')}:{rec.get('sampleId')}"
             if key in seen[change]:
                 continue
@@ -4695,12 +4836,15 @@ class ToolExecutor:
             builds[build] += 1
             # keyed by build and never merged: the same protein change sits at
             # different genomic positions in GRCh37 and GRCh38
-            entry["coordinates_by_build"].setdefault(build, {
-                "chromosome": rec.get("chr"),
-                "start_position": rec.get("startPosition"),
-                "reference_allele": rec.get("referenceAllele"),
-                "variant_allele": rec.get("variantAllele"),
-            })
+            entry["coordinates_by_build"].setdefault(
+                build,
+                {
+                    "chromosome": rec.get("chr"),
+                    "start_position": rec.get("startPosition"),
+                    "reference_allele": rec.get("referenceAllele"),
+                    "variant_allele": rec.get("variantAllele"),
+                },
+            )
 
         ranked = sorted(by_change.values(), key=lambda e: -e["sample_count"])
         return {
@@ -4750,12 +4894,15 @@ class ToolExecutor:
             site2 = rec.get("site2HugoSymbol") or ""
             partner = site2 if site1 == gene["hugo_symbol"] else site1
             partner = partner or "(intergenic)"
-            entry = partners.setdefault(partner, {
-                "partner_gene": partner,
-                "sample_count": 0,
-                "studies": set(),
-                "variant_classes": set(),
-            })
+            entry = partners.setdefault(
+                partner,
+                {
+                    "partner_gene": partner,
+                    "sample_count": 0,
+                    "studies": set(),
+                    "variant_classes": set(),
+                },
+            )
             entry["sample_count"] += 1
             entry["studies"].add(rec.get("studyId"))
             if rec.get("variantClass"):
@@ -4788,10 +4935,11 @@ class ToolExecutor:
         """
         parts = query.replace(":", " ").split()
         if len(parts) < 2:
-            return {"_error": (
-                "variant_hotspot needs a gene and a residue, e.g. 'TP53 R175H' or "
-                "'TP53 175'."
-            )}
+            return {
+                "_error": (
+                    "variant_hotspot needs a gene and a residue, e.g. 'TP53 R175H' or 'TP53 175'."
+                )
+            }
         symbol, residue = parts[0], parts[1]
         match = re.search(r"(\d+)", residue)
         if not match:
@@ -4804,11 +4952,13 @@ class ToolExecutor:
 
         data = await self._cbio_post(
             "/mutation-counts-by-position/fetch",
-            [{
-                "entrezGeneId": gene["entrez_gene_id"],
-                "proteinPosStart": position,
-                "proteinPosEnd": position,
-            }],
+            [
+                {
+                    "entrezGeneId": gene["entrez_gene_id"],
+                    "proteinPosStart": position,
+                    "proteinPosEnd": position,
+                }
+            ],
         )
         if isinstance(data, dict) and data.get("_error"):
             return data
@@ -4838,7 +4988,8 @@ class ToolExecutor:
 
         term = query.strip().lower()
         matches = [
-            s for s in studies
+            s
+            for s in studies
             if term in (s.get("name") or "").lower()
             or term in (s.get("studyId") or "").lower()
             or term in (s.get("cancerTypeId") or "").lower()
@@ -4849,16 +5000,19 @@ class ToolExecutor:
         return {
             "returned": len(matches[:size]),
             "matched": len(matches),
-            "results": [{
-                "study_id": s.get("studyId"),
-                "name": s.get("name"),
-                "cancer_type_id": s.get("cancerTypeId"),
-                "sample_count": s.get("allSampleCount"),
-                "reference_genome": s.get("referenceGenome"),
-                "citation": s.get("citation"),
-                "pmid": s.get("pmid"),
-                "url": f"{self._CBIO_STUDY_URL}?id={quote(s.get('studyId') or '')}",
-            } for s in matches[:size]],
+            "results": [
+                {
+                    "study_id": s.get("studyId"),
+                    "name": s.get("name"),
+                    "cancer_type_id": s.get("cancerTypeId"),
+                    "sample_count": s.get("allSampleCount"),
+                    "reference_genome": s.get("referenceGenome"),
+                    "citation": s.get("citation"),
+                    "pmid": s.get("pmid"),
+                    "url": f"{self._CBIO_STUDY_URL}?id={quote(s.get('studyId') or '')}",
+                }
+                for s in matches[:size]
+            ],
             "cohort": self._cbio_cohort_summary(studies),
         }
 
@@ -4993,8 +5147,7 @@ class ToolExecutor:
             for gc in row.get("gene_consequence_counts") or []:
                 gene = gc.get("gene_most_severe") or "unknown"
                 counts = {
-                    item["most_severe"]: item["len"]
-                    for item in gc.get("consequence_count") or []
+                    item["most_severe"]: item["len"] for item in gc.get("consequence_count") or []
                 }
                 gcc.append({"gene": gene, "consequence_counts": counts})
 
@@ -5045,9 +5198,7 @@ class ToolExecutor:
         # like ENSG00000187608_L1 recur across QTD studies. Grouping on cs_id alone merged
         # those into one row each, undercounting credible sets by up to 4x and silently
         # dropping whole cell types from the summary (13 -> 9 for IL7R caQTL).
-        key_cols = [
-            c for c in ("resource", "dataset", "trait", "cell_type") if c in df.columns
-        ]
+        key_cols = [c for c in ("resource", "dataset", "trait", "cell_type") if c in df.columns]
         key_cols.append("cs_id")
 
         lead_variant_cols = [
@@ -5075,20 +5226,24 @@ class ToolExecutor:
 
         # both aggregations in one pass: joining them would have to match on nullable key
         # columns (cell_type is null for GWAS), where null != null drops rows
-        result = df.group_by(key_cols).agg(
-            [
-                pl.col(c)
-                .sort_by(["pip", "mlog10p"], descending=[True, True], nulls_last=True)
-                .first()
-                for c in lead_variant_cols
-            ]
-            + [
-                pl.col("aaf").min().alias("min_aaf"),
-                pl.col("aaf").max().alias("max_aaf"),
-                pl.col("most_severe").is_in(CODING_VARIANTS).sum().alias("n_coding"),
-                pl.col("most_severe").is_in(LOF_VARIANTS).sum().alias("n_lof"),
-            ]
-        ).sort("mlog10p", descending=True, nulls_last=True)
+        result = (
+            df.group_by(key_cols)
+            .agg(
+                [
+                    pl.col(c)
+                    .sort_by(["pip", "mlog10p"], descending=[True, True], nulls_last=True)
+                    .first()
+                    for c in lead_variant_cols
+                ]
+                + [
+                    pl.col("aaf").min().alias("min_aaf"),
+                    pl.col("aaf").max().alias("max_aaf"),
+                    pl.col("most_severe").is_in(CODING_VARIANTS).sum().alias("n_coding"),
+                    pl.col("most_severe").is_in(LOF_VARIANTS).sum().alias("n_lof"),
+                ]
+            )
+            .sort("mlog10p", descending=True, nulls_last=True)
+        )
 
         # group by data_type
         grouped: dict[str, list] = {}
@@ -5158,9 +5313,7 @@ class ToolExecutor:
                 # variant-level row count: what an equivalent BigQuery COUNT(*) returns
                 "n_associations": sub.height,
                 "n_variants": (
-                    sub.select(variant_cols).unique().height
-                    if len(variant_cols) == 4
-                    else None
+                    sub.select(variant_cols).unique().height if len(variant_cols) == 4 else None
                 ),
                 "n_traits": _n_distinct(sub, "trait"),
                 "n_cell_types": _n_distinct(sub, "cell_type"),
@@ -5206,12 +5359,20 @@ class ToolExecutor:
                 if resp.status_code == 404:
                     return {"success": True, "variant": variant, "found": False, "annotations": {}}
                 if resp.status_code == 429:
-                    return {"success": False, "error": "myvariant.info rate limit exceeded. Try again shortly."}
+                    return {
+                        "success": False,
+                        "error": "myvariant.info rate limit exceeded. Try again shortly.",
+                    }
                 resp.raise_for_status()
 
                 data = resp.json()
                 annotations = self._flatten_myvariant_result(data)
-                return {"success": True, "variant": variant, "found": bool(annotations), "annotations": annotations}
+                return {
+                    "success": True,
+                    "variant": variant,
+                    "found": bool(annotations),
+                    "annotations": annotations,
+                }
 
             elif variants:
                 if len(variants) > 1000:
@@ -5227,7 +5388,10 @@ class ToolExecutor:
                         conversion_errors.append(v)
 
                 if not hgvs_ids:
-                    return {"success": False, "error": f"Could not convert any variants to HGVS format. Invalid: {conversion_errors}"}
+                    return {
+                        "success": False,
+                        "error": f"Could not convert any variants to HGVS format. Invalid: {conversion_errors}",
+                    }
 
                 # batch query via POST
                 url = f"{base_url}/variant"
@@ -5245,7 +5409,10 @@ class ToolExecutor:
                 )
 
                 if resp.status_code == 429:
-                    return {"success": False, "error": "myvariant.info rate limit exceeded. Try again shortly."}
+                    return {
+                        "success": False,
+                        "error": "myvariant.info rate limit exceeded. Try again shortly.",
+                    }
                 resp.raise_for_status()
 
                 results_list = resp.json()
@@ -5253,7 +5420,7 @@ class ToolExecutor:
                     results_list = [results_list]
 
                 # map back to original variant IDs
-                hgvs_to_original = dict(zip(hgvs_ids, variants[:len(hgvs_ids)]))
+                hgvs_to_original = dict(zip(hgvs_ids, variants[: len(hgvs_ids)]))
                 annotations = {}
                 for item in results_list:
                     hgvs_key = item.get("_id", item.get("query", ""))
@@ -5275,7 +5442,10 @@ class ToolExecutor:
                 return result
 
             else:
-                return {"success": False, "error": "Provide either 'variant' or 'variants' parameter."}
+                return {
+                    "success": False,
+                    "error": "Provide either 'variant' or 'variants' parameter.",
+                }
 
         except httpx.TimeoutException:
             logger.error("myvariant.info request timed out")
@@ -5358,9 +5528,7 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         """Map protein-level variants (e.g. P70A) to genomic coordinates."""
         try:
-            return await self.uniprot.map_protein_variants(
-                variants, query, organism_id=organism_id
-            )
+            return await self.uniprot.map_protein_variants(variants, query, organism_id=organism_id)
         except Exception as e:
             logger.error(
                 f"Error in map_protein_variants({query!r}, {variants!r}): {e}\n"
@@ -5377,8 +5545,7 @@ class ToolExecutor:
             result = await self.uniprot.get_variant_protein_effect(variants)
         except Exception as e:
             logger.error(
-                f"Error in get_variant_protein_effect({variants!r}): {e}\n"
-                f"{traceback.format_exc()}"
+                f"Error in get_variant_protein_effect({variants!r}): {e}\n{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
         return self._download_hint(result, "variant_protein_effect.tsv")
@@ -5410,9 +5577,7 @@ class ToolExecutor:
                 f"{traceback.format_exc()}"
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
-        return self._download_hint(
-            result, "uniprot_search.tsv", min_rows=self._DOWNLOAD_THRESHOLD
-        )
+        return self._download_hint(result, "uniprot_search.tsv", min_rows=self._DOWNLOAD_THRESHOLD)
 
     # -------------------------------------------------------------------------
     # ChEMBL
@@ -5455,9 +5620,7 @@ class ToolExecutor:
             async with semaphore:
                 return await call(query)
 
-        settled = await asyncio.gather(
-            *(one(q) for q in queries), return_exceptions=True
-        )
+        settled = await asyncio.gather(*(one(q) for q in queries), return_exceptions=True)
         results, errors = {}, {}
         for query, outcome in zip(queries, settled):
             if isinstance(outcome, BaseException):
@@ -5499,9 +5662,7 @@ class ToolExecutor:
             if not isinstance(result, dict) or not result.get("success"):
                 if query not in errors:
                     errors[query] = (
-                        (result or {}).get("error")
-                        or (result or {}).get("note")
-                        or "no result"
+                        (result or {}).get("error") or (result or {}).get("note") or "no result"
                     )
                 continue
             found = result.get(rows_key) or []
@@ -5523,9 +5684,7 @@ class ToolExecutor:
             "per_query": {q: results[q] for q in queries if q in results},
             rows_key: rows,
         }
-        return self._download_hint(
-            out, filename, min_rows=self._DOWNLOAD_THRESHOLD, key=rows_key
-        )
+        return self._download_hint(out, filename, min_rows=self._DOWNLOAD_THRESHOLD, key=rows_key)
 
     async def get_drug_targets_for_gene(
         self,
@@ -5557,9 +5716,7 @@ class ToolExecutor:
                     max_results=max_results,
                 ),
             )
-            return self._batched(
-                batch, results, errors, "drugs", "chembl_drugs.tsv"
-            )
+            return self._batched(batch, results, errors, "drugs", "chembl_drugs.tsv")
         try:
             result = await self.chembl.get_drug_targets_for_gene(
                 query,
@@ -5598,9 +5755,7 @@ class ToolExecutor:
             # `indications` rather than a `drugs` list: the single-drug result puts the
             # drug in a scalar `drug` key, so per_query is where the profiles live and
             # the flat table is the indications, one row each
-            return self._batched(
-                batch, results, errors, "indications", "chembl_profiles.tsv"
-            )
+            return self._batched(batch, results, errors, "indications", "chembl_profiles.tsv")
         try:
             result = await self.chembl.get_drug_profile(query)
         except Exception as e:
@@ -5645,9 +5800,7 @@ class ToolExecutor:
             # path never names it because it downloads `_all_compounds` instead, so a
             # plausible-looking "compounds" here would flatten to an empty table for
             # every target and report n_rows 0 with no error
-            return self._batched(
-                batch, results, errors, "top_compounds", "chembl_bioactivity.tsv"
-            )
+            return self._batched(batch, results, errors, "top_compounds", "chembl_bioactivity.tsv")
         try:
             result = await self.chembl.get_target_bioactivity(
                 query, pchembl_min=pchembl_min, max_results=max_results
@@ -5717,9 +5870,7 @@ class ToolExecutor:
         except ValueError as e:
             return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error(
-                f"Error in list_capabilities({module!r}): {e}\n{traceback.format_exc()}"
-            )
+            logger.error(f"Error in list_capabilities({module!r}): {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
 
@@ -5844,8 +5995,7 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
 # this catalogue outside the sandbox would have to import, since the alias ships only in the
 # sandbox image.
 _SDK_USAGE = (
-    "import genetics  (in a run_analysis script; the package itself is "
-    "genetics_mcp_server.sdk)"
+    "import genetics  (in a run_analysis script; the package itself is genetics_mcp_server.sdk)"
 )
 
 # How a name in each module is actually written at a call site. The import line alone reads as

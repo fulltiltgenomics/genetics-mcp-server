@@ -41,9 +41,7 @@ class LoopRunner:
         with self._lock:
             if self._loop is None:
                 loop = asyncio.new_event_loop()
-                thread = threading.Thread(
-                    target=loop.run_forever, name=self._name, daemon=True
-                )
+                thread = threading.Thread(target=loop.run_forever, name=self._name, daemon=True)
                 thread.start()
                 self._loop, self._thread = loop, thread
             return self._loop

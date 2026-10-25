@@ -114,7 +114,11 @@ class TestToolHints:
     @pytest.mark.parametrize("answer", [(), None], ids=["none served", "api silent"])
     def test_a_deployment_without_one_never_mentions_it(self, deployment_answers, answer):
         deployment_answers(answer)
-        for tools in (get_anthropic_tools(), get_anthropic_tools(code_execution=True), all_anthropic_tools()):
+        for tools in (
+            get_anthropic_tools(),
+            get_anthropic_tools(code_execution=True),
+            all_anthropic_tools(),
+        ):
             for tool in tools:
                 blob = repr(tool)
                 assert "custom GWAS" not in blob and "finngen_custom" not in blob, tool["name"]
@@ -138,11 +142,14 @@ class TestProbe:
         def handler(request):
             seen["path"] = request.url.path
             seen["params"] = dict(request.url.params)
-            return httpx.Response(200, json=[
-                {"dataset_id": "a", "resource": "finngen_custom_r14", "data_type": "gwas"},
-                {"dataset_id": "b", "resource": "finngen_custom_r14", "data_type": "hla"},
-                {"dataset_id": "c", "resource": "finngen_custom_r13", "data_type": "gwas"},
-            ])
+            return httpx.Response(
+                200,
+                json=[
+                    {"dataset_id": "a", "resource": "finngen_custom_r14", "data_type": "gwas"},
+                    {"dataset_id": "b", "resource": "finngen_custom_r14", "data_type": "hla"},
+                    {"dataset_id": "c", "resource": "finngen_custom_r13", "data_type": "gwas"},
+                ],
+            )
 
         executor = ToolExecutor(api_base_url="http://api.test/api")
         executor.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

@@ -14,6 +14,7 @@ from genetics_mcp_server.auth.core import (
 
 logger = logging.getLogger(__name__)
 
+
 def auth_is_required() -> bool:
     """Whether to require the X-Goog-Authenticated-User-Email header (set by IAP or oauth2-proxy).
 
@@ -134,6 +135,7 @@ async def admin_required(
     When REQUIRE_AUTH is true, user must be in the ADMIN_USERS list.
     """
     from genetics_mcp_server.config import get_settings
+
     settings = get_settings()
 
     if not settings.enable_admin_page:

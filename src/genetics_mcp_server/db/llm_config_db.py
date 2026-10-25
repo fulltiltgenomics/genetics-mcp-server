@@ -118,6 +118,25 @@ class UserApiToken:
     expires_at: datetime | None = None
 
 
+@dataclass
+class AccessGrant:
+    """A time-boxed admission of one address that the static allow-list does not cover."""
+
+    email: str
+    granted_by: str
+    granted_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None
+    email_sent_at: datetime | None
+    email_error: str | None
+    # set once the reconciler has withdrawn an ended grant from Keycloak, so an address is
+    # disabled there exactly once rather than on every pass
+    deactivated_at: datetime | None
+
+    def is_active(self, now: datetime) -> bool:
+        return self.revoked_at is None and self.expires_at > now
+
+
 class LLMConfigDB(object, metaclass=Singleton):
     """
     SQLite database for LLM configuration with versioned history.
@@ -127,9 +146,7 @@ class LLMConfigDB(object, metaclass=Singleton):
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._connections: dict[int, sqlite3.Connection] = dd(
-            lambda: self._create_connection()
-        )
+        self._connections: dict[int, sqlite3.Connection] = dd(lambda: self._create_connection())
         self._init_db()
 
     def _create_connection(self) -> sqlite3.Connection:
@@ -146,9 +163,7 @@ class LLMConfigDB(object, metaclass=Singleton):
         return self._connections[threading.get_ident()]
 
     def _table_exists(self, cursor: sqlite3.Cursor, name: str) -> bool:
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-        )
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
         return cursor.fetchone() is not None
 
     def _migrate_to_history_tables(self, cursor: sqlite3.Cursor) -> None:
@@ -423,6 +438,24 @@ class LLMConfigDB(object, metaclass=Singleton):
         cursor.execute("PRAGMA table_info(user_api_tokens)")
         if "expires_at" not in {row["name"] for row in cursor.fetchall()}:
             cursor.execute("ALTER TABLE user_api_tokens ADD COLUMN expires_at TIMESTAMP")
+
+        # temporary admissions granted by an admin at runtime; the oauth2-proxy file and the
+        # Keycloak realm attribute are derived from this table, never the other way round, so a
+        # deploy that re-renders them from terraform loses nothing
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS access_grants (
+                email TEXT PRIMARY KEY,
+                granted_by TEXT NOT NULL,
+                granted_at TIMESTAMP NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                revoked_at TIMESTAMP,
+                email_sent_at TIMESTAMP,
+                email_error TEXT,
+                deactivated_at TIMESTAMP
+            )
+        """
+        )
 
         self._conn.commit()
 
@@ -864,9 +897,7 @@ class LLMConfigDB(object, metaclass=Singleton):
             body=body,
             created_at=cls._as_utc_or_epoch(row["created_at"]),
             updated_at=cls._as_utc_or_epoch(row["updated_at"]),
-            archived_at=(
-                cls._as_utc_or_epoch(row["archived_at"]) if row["archived_at"] else None
-            ),
+            archived_at=(cls._as_utc_or_epoch(row["archived_at"]) if row["archived_at"] else None),
             body_over_cap=len(body) > INSTRUCTION_SET_MAX_BODY_CHARS,
         )
 
@@ -1281,13 +1312,9 @@ class LLMConfigDB(object, metaclass=Singleton):
                 token_prefix=row["token_prefix"],
                 name=row["name"],
                 created_at=self._as_utc(row["created_at"]),
-                last_used_at=(
-                    self._as_utc(row["last_used_at"]) if row["last_used_at"] else None
-                ),
+                last_used_at=(self._as_utc(row["last_used_at"]) if row["last_used_at"] else None),
                 is_active=bool(row["is_active"]),
-                expires_at=(
-                    self._as_utc(row["expires_at"]) if row["expires_at"] else None
-                ),
+                expires_at=(self._as_utc(row["expires_at"]) if row["expires_at"] else None),
             )
             for row in cursor.fetchall()
         ]
@@ -1347,9 +1374,7 @@ class LLMConfigDB(object, metaclass=Singleton):
                 logger.info("rejected idle-expired API token id=%s", row["id"])
                 return None
 
-        new_expires_at = (
-            self._utc_stamp(now + timedelta(days=ttl_days)) if ttl_days > 0 else None
-        )
+        new_expires_at = self._utc_stamp(now + timedelta(days=ttl_days)) if ttl_days > 0 else None
         try:
             cursor.execute(
                 "UPDATE user_api_tokens SET last_used_at = ?, expires_at = ? WHERE id = ?",
@@ -1377,6 +1402,131 @@ class LLMConfigDB(object, metaclass=Singleton):
             conn.rollback()
             raise
         return row["user_id"]
+
+    # access grants
+
+    @staticmethod
+    def _normalize_email(email: str) -> str:
+        # the same folding get_authenticated_user applies, so a grant matches the identity
+        # oauth2-proxy and Keycloak will present
+        return email.strip().lower()
+
+    def _access_grant_from_row(self, row: sqlite3.Row) -> AccessGrant:
+        def opt(name: str) -> datetime | None:
+            return self._as_utc(row[name]) if row[name] else None
+
+        return AccessGrant(
+            email=row["email"],
+            granted_by=row["granted_by"],
+            granted_at=self._as_utc(row["granted_at"]),
+            expires_at=self._as_utc(row["expires_at"]),
+            revoked_at=opt("revoked_at"),
+            email_sent_at=opt("email_sent_at"),
+            email_error=row["email_error"],
+            deactivated_at=opt("deactivated_at"),
+        )
+
+    def upsert_access_grant(self, email: str, granted_by: str, expires_at: datetime) -> AccessGrant:
+        """Create a grant, or re-arm an ended one for the same address.
+
+        One row per address: re-granting resets the deadline and clears the revocation, the
+        e-mail bookkeeping and the deactivation mark, so the reconciler re-enables the Keycloak
+        account it disabled when the earlier grant ended.
+        """
+        email = self._normalize_email(email)
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        now = self._utc_stamp(datetime.now(timezone.utc))
+        try:
+            conn.execute(
+                """
+                INSERT INTO access_grants (email, granted_by, granted_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    granted_by = excluded.granted_by,
+                    granted_at = excluded.granted_at,
+                    expires_at = excluded.expires_at,
+                    revoked_at = NULL,
+                    email_sent_at = NULL,
+                    email_error = NULL,
+                    deactivated_at = NULL
+                """,
+                (email, granted_by, now, self._utc_stamp(expires_at)),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        grant = self.get_access_grant(email)
+        assert grant is not None
+        return grant
+
+    def get_access_grant(self, email: str) -> AccessGrant | None:
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        row = conn.execute(
+            "SELECT * FROM access_grants WHERE email = ?", (self._normalize_email(email),)
+        ).fetchone()
+        return self._access_grant_from_row(row) if row else None
+
+    def list_access_grants(self) -> list[AccessGrant]:
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        rows = conn.execute(
+            "SELECT * FROM access_grants ORDER BY granted_at DESC, email"
+        ).fetchall()
+        return [self._access_grant_from_row(r) for r in rows]
+
+    def has_active_access_grant(self, email: str, now: datetime | None = None) -> bool:
+        grant = self.get_access_grant(email)
+        return grant is not None and grant.is_active(now or datetime.now(timezone.utc))
+
+    def active_access_grant_emails(self, now: datetime | None = None) -> set[str]:
+        now = now or datetime.now(timezone.utc)
+        return {g.email for g in self.list_access_grants() if g.is_active(now)}
+
+    def revoke_access_grant(self, email: str) -> bool:
+        """End a grant now. False when the address holds no active grant."""
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        try:
+            cursor = conn.execute(
+                "UPDATE access_grants SET revoked_at = ? WHERE email = ? AND revoked_at IS NULL",
+                (self._utc_stamp(datetime.now(timezone.utc)), self._normalize_email(email)),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return cursor.rowcount > 0
+
+    def record_access_grant_email(self, email: str, error: str | None) -> None:
+        """Note the outcome of the notification e-mail: a send time, or the failure text."""
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        sent_at = None if error else self._utc_stamp(datetime.now(timezone.utc))
+        try:
+            conn.execute(
+                "UPDATE access_grants SET email_sent_at = ?, email_error = ? WHERE email = ?",
+                (sent_at, error, self._normalize_email(email)),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def mark_access_grant_deactivated(self, email: str) -> None:
+        conn = self._conn
+        self._discard_stale_transaction(conn)
+        try:
+            conn.execute(
+                "UPDATE access_grants SET deactivated_at = ? WHERE email = ?",
+                (self._utc_stamp(datetime.now(timezone.utc)), self._normalize_email(email)),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
 
 # module-level instance, initialized lazily

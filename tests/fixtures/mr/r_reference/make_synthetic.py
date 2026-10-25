@@ -32,9 +32,21 @@ def main():
         beta_x = bx + rng.gauss(0, se_x)
         beta_y = THETA * bx + alpha + rng.gauss(0, se_y)
         g = lambda x: f"{x:.10g}"  # noqa: E731
-        rows.append({"variant": f"syn{j + 1:02d}", "beta_x": g(beta_x), "se_x": g(se_x),
-                     "beta_y": g(beta_y), "se_y": g(se_y), "af_x": g(af), "af_y": g(af),
-                     "n_x": N_X, "n_y": N_Y, "pleiotropic": int(j in pleio), "alpha_true": g(alpha)})
+        rows.append(
+            {
+                "variant": f"syn{j + 1:02d}",
+                "beta_x": g(beta_x),
+                "se_x": g(se_x),
+                "beta_y": g(beta_y),
+                "se_y": g(se_y),
+                "af_x": g(af),
+                "af_y": g(af),
+                "n_x": N_X,
+                "n_y": N_Y,
+                "pleiotropic": int(j in pleio),
+                "alpha_true": g(alpha),
+            }
+        )
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_synthetic.csv")
     with open(out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]), lineterminator="\n")

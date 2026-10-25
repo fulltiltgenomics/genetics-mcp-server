@@ -127,20 +127,25 @@ class SubagentService:
             validated_tasks.append((skill, task.get("query", ""), task.get("context")))
 
         logger.info(
-            f"Launching {len(validated_tasks)} subagents: "
-            f"{[s.name for s, _, _ in validated_tasks]}"
+            f"Launching {len(validated_tasks)} subagents: {[s.name for s, _, _ in validated_tasks]}"
         )
 
         timeout = settings.subagent_timeout
 
         async def _run_with_timeout(
-            skill: SkillDefinition, query: str, context: str | None,
+            skill: SkillDefinition,
+            query: str,
+            context: str | None,
             subagent_id: str,
         ) -> SubagentResult:
             try:
                 return await asyncio.wait_for(
                     self._run_subagent(
-                        skill, query, context, progress_callback, subagent_id,
+                        skill,
+                        query,
+                        context,
+                        progress_callback,
+                        subagent_id,
                         user=user,
                         session_id=session_id,
                         gateway_asserted=gateway_asserted,
@@ -150,7 +155,9 @@ class SubagentService:
             except asyncio.TimeoutError:
                 logger.error(f"Subagent '{skill.name}' [{subagent_id}] timed out after {timeout}s")
                 if progress_callback:
-                    progress_callback(f"Subagent '{skill.name}' [{subagent_id}] timed out after {timeout}s")
+                    progress_callback(
+                        f"Subagent '{skill.name}' [{subagent_id}] timed out after {timeout}s"
+                    )
                 return SubagentResult(
                     skill_name=skill.name,
                     subagent_id=subagent_id,
@@ -179,26 +186,32 @@ class SubagentService:
             skill_name = validated_tasks[i][0].name
             subagent_id = f"sa-{i + 1}"
             if isinstance(result, Exception):
-                logger.error(f"Subagent '{skill_name}' [{subagent_id}] failed with exception: {result}")
-                processed.append({
-                    "skill": skill_name,
-                    "subagent_id": subagent_id,
-                    "success": False,
-                    "error": str(result),
-                })
+                logger.error(
+                    f"Subagent '{skill_name}' [{subagent_id}] failed with exception: {result}"
+                )
+                processed.append(
+                    {
+                        "skill": skill_name,
+                        "subagent_id": subagent_id,
+                        "success": False,
+                        "error": str(result),
+                    }
+                )
             else:
-                processed.append({
-                    "skill": result.skill_name,
-                    "subagent_id": result.subagent_id,
-                    "success": result.success,
-                    "output": result.output,
-                    "tools_used": result.tools_used,
-                    "iterations": result.iterations,
-                    "input_tokens": result.input_tokens,
-                    "output_tokens": result.output_tokens,
-                    "error": result.error,
-                    "truncated": result.truncated,
-                })
+                processed.append(
+                    {
+                        "skill": result.skill_name,
+                        "subagent_id": result.subagent_id,
+                        "success": result.success,
+                        "output": result.output,
+                        "tools_used": result.tools_used,
+                        "iterations": result.iterations,
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": result.output_tokens,
+                        "error": result.error,
+                        "truncated": result.truncated,
+                    }
+                )
 
         return {"success": True, "results": processed}
 
@@ -353,9 +366,13 @@ class SubagentService:
                         f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}"
                     )
                     if progress_callback:
-                        progress_callback(f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}")
+                        progress_callback(
+                            f"Subagent '{skill.name}' [{subagent_id}] calling {tool_use.name}{params_str}"
+                        )
                     result = await self._execute_subagent_tool(
-                        tool_use.name, dict(tool_use.input), skill,
+                        tool_use.name,
+                        dict(tool_use.input),
+                        skill,
                         user=user,
                         session_id=session_id,
                         gateway_asserted=gateway_asserted,
@@ -369,16 +386,21 @@ class SubagentService:
                             + "\n\n[TRUNCATED: Response too large]"
                         )
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": result_json,
-                    })
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": result_json,
+                        }
+                    )
 
                 # continue conversation with tool results
                 messages = [
                     *messages,
-                    {"role": "assistant", "content": [b.model_dump(exclude_none=True) for b in message.content]},
+                    {
+                        "role": "assistant",
+                        "content": [b.model_dump(exclude_none=True) for b in message.content],
+                    },
                     {"role": "user", "content": tool_results},
                 ]
 
@@ -388,7 +410,9 @@ class SubagentService:
                 f"input_tokens={total_input_tokens} output_tokens={total_output_tokens}"
             )
             if progress_callback:
-                progress_callback(f"Subagent '{skill.name}' [{subagent_id}] completed ({len(tools_used)} tool calls)")
+                progress_callback(
+                    f"Subagent '{skill.name}' [{subagent_id}] completed ({len(tools_used)} tool calls)"
+                )
 
             return SubagentResult(
                 skill_name=skill.name,
@@ -550,9 +574,7 @@ class SubagentService:
                     # subagent's tool result is JSON going back to the subagent, so the
                     # base64 is tokens nobody can see. The names survive — they are what the
                     # caller has to work with.
-                    names = [
-                        img.get("name") for img in result["images"] if isinstance(img, dict)
-                    ]
+                    names = [img.get("name") for img in result["images"] if isinstance(img, dict)]
                     result = {k: v for k, v in result.items() if k != "images"}
                     result["note"] = (
                         "Image artifacts are not displayed from a subagent. Name them in "

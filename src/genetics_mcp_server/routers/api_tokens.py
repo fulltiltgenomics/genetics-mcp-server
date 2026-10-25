@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from genetics_mcp_server.auth import IDENTITY_HEADER, auth_required, is_internal_caller
+from genetics_mcp_server.auth.core import _email_allowed
 from genetics_mcp_server.db import get_llm_config_db
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,12 @@ async def validate_token(body: TokenValidateRequest, request: Request):
 
     db = get_llm_config_db()
     user_id = db.validate_api_token(body.token)
+    # a token is only as valid as its owner's access: an address admitted by a runtime grant
+    # loses every key the moment the grant ends, with no revocation step. Static users are
+    # unaffected — they match the allow-list the same way their browser session does
+    if user_id and not _email_allowed(user_id):
+        logger.info("rejected API token of %s: owner no longer allow-listed", user_id)
+        return {"valid": False}
     if user_id:
         return {"valid": True, "user_id": user_id}
     return {"valid": False}

@@ -24,8 +24,21 @@ from genetics_mcp_server.sdk.client import GeneticsClient, _frame
 from genetics_mcp_server.tools.executor import ToolExecutor
 
 HLA_COLUMNS = [
-    "resource", "version", "phenotype", "chr", "pos", "gene", "allele", "pval",
-    "mlog10p", "beta", "se", "af", "af_cases", "af_controls", "info",
+    "resource",
+    "version",
+    "phenotype",
+    "chr",
+    "pos",
+    "gene",
+    "allele",
+    "pval",
+    "mlog10p",
+    "beta",
+    "se",
+    "af",
+    "af_cases",
+    "af_controls",
+    "info",
 ]
 
 
@@ -76,6 +89,7 @@ _ADVERTISING_PATHS = (
 
 def _api_client(body, columns=("phenotype", "mlog10p"), status=200) -> GeneticsClient:
     """A fake results-api that advertises only where the real one does."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         headers = (
             {"X-Columns": ",".join(columns)}
@@ -91,6 +105,7 @@ def _api_client(body, columns=("phenotype", "mlog10p"), status=200) -> GeneticsC
 
 def _client(body, headers=None) -> GeneticsClient:
     """A real ToolExecutor whose HTTP layer is a stub, wired the way the SDK wires it."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=body, headers=headers or {})
 
@@ -169,7 +184,9 @@ async def test_an_endpoint_that_does_not_advertise_degrades_to_the_old_behaviour
 
 def test_a_default_executor_adds_nothing_to_its_result_dicts():
     """The MCP tool payload IS the executor dict, and this epic forbids changing it."""
-    resp = httpx.Response(200, headers={"X-Columns": "a,b"}, request=httpx.Request("GET", "http://t"))
+    resp = httpx.Response(
+        200, headers={"X-Columns": "a,b"}, request=httpx.Request("GET", "http://t")
+    )
     assert ToolExecutor()._columns_meta(resp) == {}
     assert ToolExecutor(row_limit=None)._columns_meta(resp) == {}
     assert ToolExecutor(expose_columns=True)._columns_meta(resp) == {"column_names": ["a", "b"]}
@@ -224,7 +241,9 @@ _NESTED_COLUMNS = ["variant", "consequences"]
 
 def test_an_annotated_row_gives_a_typed_struct_column_that_csv_refuses():
     frame = _frame([["1:1:A:T", [_CONSEQUENCE]], ["1:2:A:T", []]], columns=_NESTED_COLUMNS)
-    assert frame.schema["consequences"] == pl.List(pl.Struct(frame.schema["consequences"].inner.fields))
+    assert frame.schema["consequences"] == pl.List(
+        pl.Struct(frame.schema["consequences"].inner.fields)
+    )
     flat = frame.explode("consequences").unnest("consequences")
     assert flat["gene_symbol"].to_list() == ["PCSK9", None]
     with pytest.raises(pl.exceptions.ComputeError, match="nested"):
@@ -250,9 +269,7 @@ def test_a_result_with_no_annotation_loses_the_struct_dtype(rows):
 def test_unnest_refuses_a_struct_field_named_like_a_kept_column():
     """`SELECT variant, consequences, c FROM v, UNNEST(v.consequences) AS c`: the struct's
     inner `consequences` collides with the array it came from."""
-    frame = _frame(
-        [["1:1:A:T", [_CONSEQUENCE], _CONSEQUENCE]], columns=[*_NESTED_COLUMNS, "c"]
-    )
+    frame = _frame([["1:1:A:T", [_CONSEQUENCE], _CONSEQUENCE]], columns=[*_NESTED_COLUMNS, "c"])
     with pytest.raises(pl.exceptions.DuplicateError, match="consequences"):
         frame.unnest("c")
 
@@ -266,12 +283,26 @@ def test_unnest_refuses_a_struct_field_named_like_a_kept_column():
 # header, lifted by the same `_columns_meta` — which is the point of checking them here.
 
 GENE_COLUMNS = [
-    "gene_name", "chrom", "gene_start", "gene_end", "gene_strand", "gene_type",
-    "hgnc_symbol", "hgnc_name", "hgnc_alias_symbol", "hgnc_prev_symbol",
+    "gene_name",
+    "chrom",
+    "gene_start",
+    "gene_end",
+    "gene_strand",
+    "gene_type",
+    "hgnc_symbol",
+    "hgnc_name",
+    "hgnc_alias_symbol",
+    "hgnc_prev_symbol",
 ]
 DISEASE_COLUMNS = [
-    "resource", "uuid", "gene_symbol", "disease_curie", "disease_title",
-    "classification", "mode_of_inheritance", "submitter",
+    "resource",
+    "uuid",
+    "gene_symbol",
+    "disease_curie",
+    "disease_title",
+    "classification",
+    "mode_of_inheritance",
+    "submitter",
 ]
 
 
@@ -308,6 +339,7 @@ async def test_empty_gene_group_membership_keeps_its_columns():
 
 async def test_empty_gene_disease_keeps_its_columns_across_the_404():
     """This endpoint expresses "no associations" as a 404 that the client reads as empty."""
+
     def handler(request):
         return httpx.Response(
             404,

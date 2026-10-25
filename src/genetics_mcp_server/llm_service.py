@@ -43,7 +43,7 @@ from genetics_mcp_server.tools import (
     ServerToolExecutor,
     get_anthropic_tools,
 )
-from genetics_mcp_server.tools.definitions import code_execution_requested, tool_category
+from genetics_mcp_server.tools.definitions import code_execution_requested, tool_group
 from genetics_mcp_server.tools.orchestration import ARTIFACTS_RETAINED_IN_CLEAR_NOTE
 
 logger = logging.getLogger(__name__)
@@ -92,9 +92,7 @@ def _retry_after_seconds(e: Exception) -> float | None:
 #    that replaced it, so the disclosure survives a reload the same way [IMAGE:...] does.
 #
 # Both still occur: the first across all stored history, the second in everything new.
-_TOOL_USE_MARKER_RE = re.compile(
-    r"\*\[Using tool:.*?\]\*|\[TOOLUSE:[A-Za-z0-9+/=]*\]", re.DOTALL
-)
+_TOOL_USE_MARKER_RE = re.compile(r"\*\[Using tool:.*?\]\*|\[TOOLUSE:[A-Za-z0-9+/=]*\]", re.DOTALL)
 
 # a cell the model wrote as a stand-in for data it never fetched, e.g. "*[from query]*"
 _PLACEHOLDER_CELL_RE = re.compile(
@@ -145,7 +143,7 @@ def _has_unfilled_output(text: str) -> bool:
         columns = len(line.strip().strip("|").split("|"))
         data_cells: list[str] = []
         rows = 0
-        for row in lines[i + 1:]:
+        for row in lines[i + 1 :]:
             if not row.strip().startswith("|"):
                 break  # end of this table; a later table is judged on its own
             rows += 1
@@ -221,12 +219,14 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
                 next_content = messages[i + 1].get("content")
                 if isinstance(next_content, list):
                     next_tool_result_ids = {
-                        b.get("tool_use_id") for b in next_content
+                        b.get("tool_use_id")
+                        for b in next_content
                         if isinstance(b, dict) and b.get("type") == "tool_result"
                     }
             # keep tool_use blocks only if they have a matching tool_result
             content = [
-                b for b in content
+                b
+                for b in content
                 if not isinstance(b, dict)
                 or b.get("type") != "tool_use"
                 or b.get("id") in next_tool_result_ids
@@ -238,12 +238,14 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
                 prev_content = messages[i - 1].get("content")
                 if isinstance(prev_content, list):
                     prev_tool_use_ids = {
-                        b.get("id") for b in prev_content
+                        b.get("id")
+                        for b in prev_content
                         if isinstance(b, dict) and b.get("type") == "tool_use"
                     }
             # keep tool_result blocks only if they have a matching tool_use
             content = [
-                b for b in content
+                b
+                for b in content
                 if not isinstance(b, dict)
                 or b.get("type") != "tool_result"
                 or b.get("tool_use_id") in prev_tool_use_ids
@@ -473,7 +475,9 @@ def _refusal_retry_params(
     """
     params = {k: v for k, v in request_params.items() if k not in ("extra_body", "extra_headers")}
     params["model"] = retry_model
-    extra_body = {k: v for k, v in (request_params.get("extra_body") or {}).items() if k != "fallbacks"}
+    extra_body = {
+        k: v for k, v in (request_params.get("extra_body") or {}).items() if k != "fallbacks"
+    }
     if shape != "plain":
         extra_body["fallback_credit_token"] = token
     if extra_body:
@@ -521,9 +525,7 @@ def _last_fallback_index(content: list[Any]) -> int:
     return max((i for i, b in enumerate(content) if b.type == "fallback"), default=-1)
 
 
-def _replayable_content(
-    content: list[Any], drop_tool_use: bool = False
-) -> list[dict[str, Any]]:
+def _replayable_content(content: list[Any], drop_tool_use: bool = False) -> list[dict[str, Any]]:
     """The assistant turn as it goes back to the API.
 
     After a mid-output fallback the blocks before the last `fallback` marker were written
@@ -543,6 +545,7 @@ def _replayable_content(
         and not (drop_tool_use and b.type == "tool_use")
         and not (i < cut and b.type in ("thinking", "redacted_thinking", "tool_use"))
     ]
+
 
 # Appended to the turn when the agentic loop stops at `mcp_max_iterations`. It is the ONLY
 # signal a stream consumer has that the final iteration ran tools whose phase was never
@@ -697,7 +700,10 @@ def _convert_to_tsv(download_info: dict) -> bytes:
 
 def _add_include_in_response(result: dict, value: str) -> dict:
     """Add INCLUDE_IN_RESPONSE at the front of the dict so it survives JSON truncation."""
-    return {"INCLUDE_IN_RESPONSE": value, **{k: v for k, v in result.items() if k != "INCLUDE_IN_RESPONSE"}}
+    return {
+        "INCLUDE_IN_RESPONSE": value,
+        **{k: v for k, v in result.items() if k != "INCLUDE_IN_RESPONSE"},
+    }
 
 
 def _count_result_items(result: Any) -> int | None:
@@ -777,7 +783,9 @@ DOWNLOAD_SHAPE_NOTE = (
 )
 
 
-def _process_download_hints(result: dict, owner: str | None = None, tool_name: str | None = None) -> dict:
+def _process_download_hints(
+    result: dict, owner: str | None = None, tool_name: str | None = None
+) -> dict:
     """Convert _download_url / _download_data hints into INCLUDE_IN_RESPONSE links.
 
     Uses relative URLs so links work regardless of deployment domain. `owner` binds the
@@ -799,6 +807,7 @@ def _process_download_hints(result: dict, owner: str | None = None, tool_name: s
         url = result.pop("_download_url")
         # convert absolute URL to relative path for browser rendering
         from urllib.parse import urlparse
+
         parsed = urlparse(url)
         relative_url = f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
         link = f"\U0001f4e5 [Download full results as TSV]({relative_url})"
@@ -886,7 +895,9 @@ def _script_result_payload(
         "timed_out": ran and status == "timeout",
         "exception": None if ok else error_type,
         "limit": limit if isinstance(limit, str) else None,
-        "duration_ms": duration_ms if isinstance(duration_ms, int) and not isinstance(duration_ms, bool) else None,
+        "duration_ms": duration_ms
+        if isinstance(duration_ms, int) and not isinstance(duration_ms, bool)
+        else None,
     }
 
 
@@ -933,9 +944,7 @@ class ResolvedLocalTools:
         return {t["name"] for t in self.definitions}
 
 
-def _refused_tool_result(
-    tool_name: str, error: str, error_type: str
-) -> dict[str, Any]:
+def _refused_tool_result(tool_name: str, error: str, error_type: str) -> dict[str, Any]:
     """A refusal the model reads as a tool_result, not as something to retry.
 
     run_analysis carries the sandbox's own operator-error type whatever the reason,
@@ -1062,8 +1071,8 @@ class LLMService:
         Both halves go through the same resolution the request itself uses
         (`resolve_local_tools`, `resolve_proxied_tools`), so the panel cannot list a tool
         the model is not given, or miss one it is. `source` distinguishes them because only
-        the local half has a category to group by — proxied tools carry the remote server's
-        own name and description and have no category at all.
+        the local half has a `group` to file under — proxied tools carry the remote server's
+        own name and description and belong to no panel group.
 
         Takes the wire value rather than the boolean because it is called straight off a
         query parameter; it is coerced here through the same edge function a chat request
@@ -1077,7 +1086,7 @@ class LLMService:
             {
                 "name": t["name"],
                 "description": t["description"],
-                "category": tool_category(t["name"]),
+                "group": tool_group(t["name"]),
                 "source": "local",
             }
             for t in local.definitions
@@ -1093,7 +1102,7 @@ class LLMService:
                 {
                     "name": t["name"],
                     "description": t.get("description", ""),
-                    "category": None,
+                    "group": None,
                     "source": source,
                 }
                 for t in definitions
@@ -1202,8 +1211,13 @@ class LLMService:
                 yield chunk
         elif provider == "anthropic":
             async for chunk in self._stream_anthropic(
-                messages, model, system_prompt, enable_tools, custom_tool_descriptions,
-                literature_backend, tool_profile,
+                messages,
+                model,
+                system_prompt,
+                enable_tools,
+                custom_tool_descriptions,
+                literature_backend,
+                tool_profile,
                 code_execution=code_execution,
                 secret=secret,
                 user=user,
@@ -1342,6 +1356,7 @@ class LLMService:
                 break
             except Exception as e:
                 from anthropic import APIConnectionError, APIStatusError
+
                 # mid-stream overload/internal errors arrive as a base
                 # APIStatusError with status_code=200, so also match on the
                 # error type carried in the body.
@@ -1363,7 +1378,7 @@ class LLMService:
                     is_retryable = True
                 if not is_retryable or attempt >= max_retries:
                     raise
-                wait = 2 ** attempt
+                wait = 2**attempt
                 # Anthropic says when to come back; obey it rather than guessing, but
                 # bound it so one header cannot park this worker indefinitely. Above
                 # the cap the wait is refused outright rather than silently clamped:
@@ -1425,9 +1440,7 @@ class LLMService:
         # 'system' at the API boundary: this method is also callable with raw dicts,
         # and both provider paths should be safe on their own.
         anthropic_messages = _sanitize_tool_blocks(
-            _strip_tool_use_markers(
-                [msg for msg in messages if msg.get("role") != "system"]
-            )
+            _strip_tool_use_markers([msg for msg in messages if msg.get("role") != "system"])
         )
 
         # cache the replayed conversation history: mark the last content block of the last
@@ -1471,9 +1484,7 @@ class LLMService:
             request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
 
         request_params.update(
-            _refusal_fallback_params(
-                model, settings.refusal_fallback, settings.refusal_retry_model
-            )
+            _refusal_fallback_params(model, settings.refusal_fallback, settings.refusal_retry_model)
         )
 
         # the system prompt goes out as two separately cached blocks. Block 0 is identical
@@ -1535,10 +1546,14 @@ class LLMService:
             #     `stream_chat(enable_tools=True, local_tools=...)` yields external+RAG
             #     tools and zero local ones, where pre-4h6.77 it yielded the full local
             #     set. Dormant: chat_api passes `request.enable_tools` to both.
-            resolved = local_tools if local_tools is not None else self.resolve_local_tools(
-                code_execution=code_execution,
-                enable_tools=enable_tools,
-                custom_tool_descriptions=custom_tool_descriptions,
+            resolved = (
+                local_tools
+                if local_tools is not None
+                else self.resolve_local_tools(
+                    code_execution=code_execution,
+                    enable_tools=enable_tools,
+                    custom_tool_descriptions=custom_tool_descriptions,
+                )
             )
             tool_definitions = list(resolved.definitions)
             local_count = len(tool_definitions)
@@ -1731,9 +1746,9 @@ class LLMService:
 
                 model_ms = int((time.monotonic() - model_started) * 1000)
 
-                (
-                    served_model, iter_cost, input_tok, cache_read, cache_create, output_tok
-                ) = _book(message)
+                (served_model, iter_cost, input_tok, cache_read, cache_create, output_tok) = _book(
+                    message
+                )
 
                 # both budgets are checked after the spend is booked and before anything
                 # is dispatched. The hard cap ends the loop at the first iteration that
@@ -1802,20 +1817,22 @@ class LLMService:
                 # this chunk is emitted before any tool of iteration N runs.
                 yield StreamChunk(
                     type="usage",
-                    content=json.dumps({
-                        "iteration": iteration,
-                        "input_tokens": context_tokens,
-                        "cache_read": cache_read,
-                        "cache_create": cache_create,
-                        "output_tokens": output_tok,
-                        "total_input_tokens": total_input_tokens,
-                        "total_output_tokens": total_output_tokens,
-                        "context_window": context_window,
-                        "context_percent": round(context_tokens / context_window * 100, 1),
-                        "turn_elapsed_ms": int((time.monotonic() - turn_started) * 1000),
-                        "model_ms": model_ms,
-                        "model_attempts": model_attempts,
-                    }),
+                    content=json.dumps(
+                        {
+                            "iteration": iteration,
+                            "input_tokens": context_tokens,
+                            "cache_read": cache_read,
+                            "cache_create": cache_create,
+                            "output_tokens": output_tok,
+                            "total_input_tokens": total_input_tokens,
+                            "total_output_tokens": total_output_tokens,
+                            "context_window": context_window,
+                            "context_percent": round(context_tokens / context_window * 100, 1),
+                            "turn_elapsed_ms": int((time.monotonic() - turn_started) * 1000),
+                            "model_ms": model_ms,
+                            "model_attempts": model_attempts,
+                        }
+                    ),
                 )
 
                 # add this iteration's content blocks. Thinking blocks are deliberately
@@ -1845,9 +1862,7 @@ class LLMService:
                         if capture_thinking and summary:
                             yield StreamChunk(
                                 type="thinking_summary",
-                                content=json.dumps(
-                                    {"iteration": iteration, "text": summary}
-                                ),
+                                content=json.dumps({"iteration": iteration, "text": summary}),
                             )
                         continue
                     if block.type == "fallback":
@@ -1871,7 +1886,8 @@ class LLMService:
 
                 # check for tool use
                 tool_uses = [
-                    b for i, b in enumerate(message.content)
+                    b
+                    for i, b in enumerate(message.content)
                     if b.type == "tool_use" and i > fallback_cut
                 ]
 
@@ -1929,9 +1945,7 @@ class LLMService:
                         )
                         + f"; continuing ({continuations}/{settings.max_continuations})"
                     )
-                    replay = _replayable_content(
-                        message.content, drop_tool_use=cut_mid_tool_call
-                    )
+                    replay = _replayable_content(message.content, drop_tool_use=cut_mid_tool_call)
                     # a turn that spent its whole budget inside the arguments can leave
                     # nothing replayable once the calls are dropped, and an empty
                     # assistant message is rejected. Say what happened instead.
@@ -2021,7 +2035,9 @@ class LLMService:
                         effective_input.pop("user", None)
                         effective_input.pop("session_id", None)
                     if secret:
-                        logger.info(f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)")
+                        logger.info(
+                            f"{log_prefix}Executing tool: {tool_use.name} (secret, input omitted)"
+                        )
                     else:
                         logger.info(
                             f"{log_prefix}Executing tool: {tool_use.name} with input: "
@@ -2081,7 +2097,9 @@ class LLMService:
                             # log cost just like _execute_tool does
                             if result.get("success") and result.get("results"):
                                 total_in = sum(r.get("input_tokens", 0) for r in result["results"])
-                                total_out = sum(r.get("output_tokens", 0) for r in result["results"])
+                                total_out = sum(
+                                    r.get("output_tokens", 0) for r in result["results"]
+                                )
                                 sa_model = settings.subagent_model or settings.fast_model
                                 sa_cost = estimate_cost(sa_model, total_in, total_out)
                                 logger.info(
@@ -2098,7 +2116,18 @@ class LLMService:
                     if regular_tool_uses:
                         regular_task = asyncio.create_task(
                             asyncio.gather(
-                                *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted, advertised_tools=advertised_tools) for tu in regular_tool_uses)
+                                *(
+                                    self._execute_tool(
+                                        tu.name,
+                                        tu.input,
+                                        literature_backend,
+                                        user,
+                                        session_id,
+                                        gateway_asserted,
+                                        advertised_tools=advertised_tools,
+                                    )
+                                    for tu in regular_tool_uses
+                                )
                             )
                         )
                     else:
@@ -2121,7 +2150,18 @@ class LLMService:
                 else:
                     # no subagent tool — execute all tools in parallel as before
                     regular_results = await asyncio.gather(
-                        *(self._execute_tool(tu.name, tu.input, literature_backend, user, session_id, gateway_asserted, advertised_tools=advertised_tools) for tu in regular_tool_uses)
+                        *(
+                            self._execute_tool(
+                                tu.name,
+                                tu.input,
+                                literature_backend,
+                                user,
+                                session_id,
+                                gateway_asserted,
+                                advertised_tools=advertised_tools,
+                            )
+                            for tu in regular_tool_uses
+                        )
                     )
                     for tu, res in zip(regular_tool_uses, regular_results):
                         raw_results_map[tu.id] = res
@@ -2139,9 +2179,7 @@ class LLMService:
                         yield StreamChunk(
                             type="script_result",
                             content=json.dumps(
-                                _script_result_payload(
-                                    iteration, result, tool_use_id=tool_use.id
-                                )
+                                _script_result_payload(iteration, result, tool_use_id=tool_use.id)
                             ),
                         )
                     # run_analysis returns a LIST: a script can write several figures, and
@@ -2199,7 +2237,9 @@ class LLMService:
                             mime = f.get("content_type") or "application/octet-stream"
                             logger.info(
                                 "Streaming artifact file: name=%s type=%s size=%d chars",
-                                name, mime, len(data),
+                                name,
+                                mime,
+                                len(data),
                             )
                             yield StreamChunk(
                                 type="file",
@@ -2211,17 +2251,24 @@ class LLMService:
                         result = {k: v for k, v in result.items() if k != "files"}
                         if offered:
                             result["note"] = (
-                                (result.get("note", "") + " ").strip() + " "
+                                (result.get("note", "") + " ").strip()
+                                + " "
                                 + "These files are already offered to the user as download "
                                 + f"links above: {', '.join(offered)}. Refer to them by name; "
                                 + "do not paste their contents or invent a URL for them."
                             ).strip()
 
-                    if isinstance(result, dict) and result.get("success") and result.get("image_base64"):
+                    if (
+                        isinstance(result, dict)
+                        and result.get("success")
+                        and result.get("image_base64")
+                    ):
                         image_data = result["image_base64"]
                         image_format = result.get("image_format", "png")
                         if image_data and len(image_data) > 100:
-                            logger.info(f"Streaming image: format={image_format}, size={len(image_data)} chars")
+                            logger.info(
+                                f"Streaming image: format={image_format}, size={len(image_data)} chars"
+                            )
                             yield StreamChunk(
                                 type="image",
                                 content=image_data,
@@ -2229,9 +2276,13 @@ class LLMService:
                                 image_alt=f"{tool_use.name} result",
                             )
                         else:
-                            logger.warning(f"Invalid image data: size={len(image_data) if image_data else 0}")
+                            logger.warning(
+                                f"Invalid image data: size={len(image_data) if image_data else 0}"
+                            )
                         result = {k: v for k, v in result.items() if k != "image_base64"}
-                        result["note"] = "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
+                        result["note"] = (
+                            "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
+                        )
 
                     # convert download hints into INCLUDE_IN_RESPONSE links
                     result = _process_download_hints(result, owner=user, tool_name=tool_use.name)
@@ -2409,9 +2460,7 @@ class LLMService:
         except RuntimeError:
             logger.warning("No running event loop; abandoned turn metrics not recorded")
             return
-        task = loop.create_task(
-            self._record_turn_metrics(secret=secret, outcome=outcome, **fields)
-        )
+        task = loop.create_task(self._record_turn_metrics(secret=secret, outcome=outcome, **fields))
         _DETACHED_METRIC_WRITES.add(task)
         task.add_done_callback(_DETACHED_METRIC_WRITES.discard)
 
@@ -2436,9 +2485,7 @@ class LLMService:
         try:
             from genetics_mcp_server.db.chat_history_db import get_chat_history_db
 
-            await asyncio.to_thread(
-                lambda: get_chat_history_db().record_turn_metrics(**fields)
-            )
+            await asyncio.to_thread(lambda: get_chat_history_db().record_turn_metrics(**fields))
         except Exception as e:
             logger.warning(f"Failed to record turn metrics: {e}")
 

@@ -68,9 +68,7 @@ class TestGetGeneGroupMembers:
         with patch.object(
             self.executor.client, "get", new_callable=AsyncMock, return_value=mock
         ) as mock_get:
-            result = await self.executor.get_gene_group_members(
-                group_name="Solute carriers"
-            )
+            result = await self.executor.get_gene_group_members(group_name="Solute carriers")
 
         assert result["success"] is True
         assert result["count"] == 1
@@ -86,16 +84,12 @@ class TestGetGeneGroupMembers:
         with patch.object(
             self.executor.client, "get", new_callable=AsyncMock, return_value=mock
         ) as mock_get:
-            await self.executor.get_gene_group_members(
-                group_id=139, exclude_olfactory=False
-            )
+            await self.executor.get_gene_group_members(group_id=139, exclude_olfactory=False)
         _, kwargs = mock_get.call_args
         assert kwargs["params"] == {"group_id": 139, "exclude_olfactory": False}
 
     async def test_neither_arg_makes_no_api_call(self):
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock
-        ) as mock_get:
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock) as mock_get:
             result = await self.executor.get_gene_group_members()
 
         assert result["success"] is False
@@ -103,9 +97,7 @@ class TestGetGeneGroupMembers:
         mock_get.assert_not_called()
 
     async def test_both_args_makes_no_api_call(self):
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock
-        ) as mock_get:
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock) as mock_get:
             result = await self.executor.get_gene_group_members(
                 group_id=588, group_name="Solute carriers"
             )
@@ -116,9 +108,7 @@ class TestGetGeneGroupMembers:
 
     async def test_unknown_group_404(self):
         mock = _mock_response(status_code=404, text="not found")
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock, return_value=mock
-        ):
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.get_gene_group_members(group_id=999999)
 
         assert result["success"] is False
@@ -132,9 +122,7 @@ class TestGetGeneGroupMembers:
             "members": [],
         }
         mock = _mock_response(json_data=json_data)
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock, return_value=mock
-        ):
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.get_gene_group_members(group_id=588)
 
         assert result["success"] is True
@@ -162,30 +150,22 @@ class TestNormalizeGeneSymbols:
             "unresolved": ["NOTAGENE"],
         }
         mock = _mock_response(json_data=json_data)
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock, return_value=mock
-        ):
-            result = await self.executor.normalize_gene_symbols(
-                ["PTPN9", "p53", "NOTAGENE"]
-            )
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
+            result = await self.executor.normalize_gene_symbols(["PTPN9", "p53", "NOTAGENE"])
 
         assert result["success"] is True
         assert result["mappings"] == json_data["mappings"]
         assert result["unresolved"] == ["NOTAGENE"]
 
     async def test_empty_list_makes_no_api_call(self):
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock
-        ) as mock_get:
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock) as mock_get:
             result = await self.executor.normalize_gene_symbols([])
 
         assert result["success"] is False
         mock_get.assert_not_called()
 
     async def test_whitespace_only_list_makes_no_api_call(self):
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock
-        ) as mock_get:
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock) as mock_get:
             result = await self.executor.normalize_gene_symbols(["  ", "", "\t"])
 
         assert result["success"] is False
@@ -208,9 +188,7 @@ class TestNormalizeGeneSymbols:
 
     async def test_non_200_returns_failure(self):
         mock = _mock_response(status_code=500, text="server error")
-        with patch.object(
-            self.executor.client, "get", new_callable=AsyncMock, return_value=mock
-        ):
+        with patch.object(self.executor.client, "get", new_callable=AsyncMock, return_value=mock):
             result = await self.executor.normalize_gene_symbols(["TP53"])
 
         assert result["success"] is False

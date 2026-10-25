@@ -34,8 +34,13 @@ SCORES = [1, 2, 3, 4, 5]
 # every success_label bucket (quality labels + non-quality disposition buckets +
 # unknown), plotted together as a share of all conversations.
 DISPOSITION_LABELS = [
-    "successful", "neutral", "unsuccessful",
-    "technical_failure", "out_of_scope", "unfinished", "weird_or_unclear",
+    "successful",
+    "neutral",
+    "unsuccessful",
+    "technical_failure",
+    "out_of_scope",
+    "unfinished",
+    "weird_or_unclear",
     "unknown",
 ]
 
@@ -46,7 +51,10 @@ ISSUE_CATEGORY_NAMES = [c for c, _ in ISSUE_CATEGORIES if c not in NON_ISSUE_CAT
 # so out-of-scope / unfinished / weird / technical conversations don't skew it.
 # empty disposition (pre-disposition records) is kept for backward compatibility.
 _NON_QUALITY_DISPOSITIONS = {
-    "technical_failure", "out_of_scope", "unfinished", "weird_or_unclear",
+    "technical_failure",
+    "out_of_scope",
+    "unfinished",
+    "weird_or_unclear",
 }
 
 
@@ -105,18 +113,15 @@ def _rolling_windows(records: list[dict], grid: list[date], window_days: int):
     offsets = [(r["_date"] - origin).days for r in records]
     for day in grid:
         center = (day - origin).days
-        win = [
-            records[i]
-            for i, off in enumerate(offsets)
-            if center - half <= off <= center + half
-        ]
+        win = [records[i] for i, off in enumerate(offsets) if center - half <= off <= center + half]
         yield day, win
 
 
 def _scored(records: list[dict]) -> list[dict]:
     """Conversations that count toward the agent-quality score trend."""
     return [
-        r for r in records
+        r
+        for r in records
         if isinstance(r.get("llm_quality_score"), int)
         and r.get("llm_disposition", "") not in _NON_QUALITY_DISPOSITIONS
     ]
@@ -126,9 +131,7 @@ def _iso(grid: list[date]) -> list[str]:
     return [d.isoformat() for d in grid]
 
 
-def score_share_series(
-    records: list[dict], grid: list[date], window: int, min_n: int
-) -> dict:
+def score_share_series(records: list[dict], grid: list[date], window: int, min_n: int) -> dict:
     """Rolling share (%) of scored conversations holding each score 1..5.
 
     Below ``min_n`` scored conversations in a window the value is ``None`` so the
@@ -190,9 +193,7 @@ def mean_score_and_volume_series(
     }
 
 
-def disposition_mix_series(
-    records: list[dict], grid: list[date], window: int, min_n: int
-) -> dict:
+def disposition_mix_series(records: list[dict], grid: list[date], window: int, min_n: int) -> dict:
     """Rolling share (%) of ALL conversations in each success_label bucket.
 
     Below ``min_n`` total conversations in a window every bucket is ``None``.
@@ -226,11 +227,7 @@ def issue_category_mix_series(
     series: dict[str, list] = {c: [] for c in ISSUE_CATEGORY_NAMES}
     for _day, win in _rolling_windows(records, grid, window):
         # dedup per conversation so one conversation counts a category once
-        instances = [
-            c
-            for r in win
-            for c in set(r.get("llm_issue_categories") or [])
-        ]
+        instances = [c for r in win for c in set(r.get("llm_issue_categories") or [])]
         total = len(instances)
         if total < min_n:
             for c in ISSUE_CATEGORY_NAMES:
@@ -245,9 +242,7 @@ def issue_category_mix_series(
     return {"dates": _iso(grid), "series": series}
 
 
-def build_all_series(
-    records: list[dict], window: int = 7, min_n: int = 3
-) -> dict:
+def build_all_series(records: list[dict], window: int = 7, min_n: int = 3) -> dict:
     """Compute all four panels from raw records in one call.
 
     Records are prepared (date-parsed, sorted) internally; the grid spans the

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class FakeMetrics:
     """Minimal ConversationMetrics-like object for upsert_analysis tests."""
+
     session_id: str
     created_at: str = ""
     user_rating: int | None = None
@@ -20,9 +21,7 @@ class FakeMetrics:
 def _set_updated_at(db, session_id: str, value: str) -> None:
     """Force a deterministic chat_sessions.updated_at (CURRENT_TIMESTAMP has 1s resolution)."""
     conn = db._conn
-    conn.execute(
-        "UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (value, session_id)
-    )
+    conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (value, session_id))
     conn.commit()
 
 
@@ -105,12 +104,16 @@ class TestUpsertAnalysis:
         session = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id, llm_issue_categories=["a", "b", "c"]),
-            analyzer_version=1, source_updated_at=None, message_count=2,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
         )
         # re-analysis with a different issue set must fully replace, not append
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id, llm_issue_categories=["d"]),
-            analyzer_version=1, source_updated_at=None, message_count=3,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=3,
         )
 
         cursor = chat_history_db._conn.cursor()
@@ -131,7 +134,9 @@ class TestUpsertAnalysis:
         session = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id, llm_issue_categories=None),
-            analyzer_version=1, source_updated_at=None, message_count=1,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=1,
         )
         cursor = chat_history_db._conn.cursor()
         cursor.execute(
@@ -146,8 +151,10 @@ class TestStaleOrMissing:
         s1 = chat_history_db.create_session("user@example.com")
         s2 = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
-            FakeMetrics(session_id=s1.id), analyzer_version=1,
-            source_updated_at=None, message_count=1,
+            FakeMetrics(session_id=s1.id),
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=1,
         )
         # keep s1 fresh: analyzed after its updated_at
         _set_updated_at(chat_history_db, s1.id, "2026-06-25T10:00:00")
@@ -160,8 +167,10 @@ class TestStaleOrMissing:
     def test_continued_conversation_is_stale(self, chat_history_db):
         s = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
-            FakeMetrics(session_id=s.id), analyzer_version=1,
-            source_updated_at=None, message_count=1,
+            FakeMetrics(session_id=s.id),
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=1,
         )
         _set_analyzed_at(chat_history_db, s.id, "2026-06-25T10:00:00")
         # new messages arrived after analysis
@@ -173,8 +182,10 @@ class TestStaleOrMissing:
     def test_analyzer_version_mismatch_is_stale(self, chat_history_db):
         s = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
-            FakeMetrics(session_id=s.id), analyzer_version=1,
-            source_updated_at=None, message_count=1,
+            FakeMetrics(session_id=s.id),
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=1,
         )
         _set_updated_at(chat_history_db, s.id, "2026-06-25T10:00:00")
         _set_analyzed_at(chat_history_db, s.id, "2026-06-25T11:00:00")
@@ -190,8 +201,10 @@ class TestStaleOrMissing:
         s1 = chat_history_db.create_session("user@example.com")
         s2 = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
-            FakeMetrics(session_id=s1.id), analyzer_version=1,
-            source_updated_at=None, message_count=1,
+            FakeMetrics(session_id=s1.id),
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=1,
         )
         _set_updated_at(chat_history_db, s1.id, "2026-06-25T10:00:00")
         _set_analyzed_at(chat_history_db, s1.id, "2026-06-25T11:00:00")
@@ -227,7 +240,9 @@ class TestPlotLoadFromDbDelegates:
                 llm_disposition="good_answer",
                 llm_issue_categories=["hallucination"],
             ),
-            analyzer_version=1, source_updated_at=None, message_count=2,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
         )
 
         records = load_from_db(chat_history_db.db_path)
@@ -235,8 +250,11 @@ class TestPlotLoadFromDbDelegates:
         r = records[0]
         # keys the plotter / analysis_timeseries consume
         assert set(r) >= {
-            "created_at", "llm_quality_score", "llm_disposition",
-            "success_label", "llm_issue_categories",
+            "created_at",
+            "llm_quality_score",
+            "llm_disposition",
+            "success_label",
+            "llm_issue_categories",
         }
         assert r["created_at"] == "2026-01-10T12:00:00"
         assert r["llm_quality_score"] == 4
@@ -340,8 +358,11 @@ class TestJudgeModelColumns:
         session = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id),
-            analyzer_version=1, source_updated_at=None, message_count=2,
-            topic_model="claude-sonnet-4-6", quality_model="claude-opus-4-8",
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
+            topic_model="claude-sonnet-4-6",
+            quality_model="claude-opus-4-8",
         )
         row = chat_history_db.get_analysis_map()[session.id]
         assert row["topic_model"] == "claude-sonnet-4-6"
@@ -352,7 +373,9 @@ class TestJudgeModelColumns:
         session = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id),
-            analyzer_version=1, source_updated_at=None, message_count=2,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
         )
         row = chat_history_db.get_analysis_map()[session.id]
         assert row["topic_model"] is None
@@ -364,13 +387,18 @@ class TestJudgeModelColumns:
         session = chat_history_db.create_session("user@example.com")
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id, llm_quality_score=4),
-            analyzer_version=1, source_updated_at=None, message_count=2,
-            topic_model="claude-sonnet-4-6", quality_model="claude-opus-4-8",
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=2,
+            topic_model="claude-sonnet-4-6",
+            quality_model="claude-opus-4-8",
         )
         # replayed from cache on a later run: no LLM ran, so both models are None
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id, llm_quality_score=4),
-            analyzer_version=1, source_updated_at=None, message_count=3,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=3,
         )
         row = chat_history_db.get_analysis_map()[session.id]
         assert row["message_count"] == 3  # the rest of the row still updates
@@ -380,7 +408,9 @@ class TestJudgeModelColumns:
         # a half-recompute (quality re-judged, topic replayed) updates only quality
         chat_history_db.upsert_analysis(
             FakeMetrics(session_id=session.id, llm_quality_score=5),
-            analyzer_version=1, source_updated_at=None, message_count=3,
+            analyzer_version=1,
+            source_updated_at=None,
+            message_count=3,
             quality_model="claude-opus-5",
         )
         row = chat_history_db.get_analysis_map()[session.id]

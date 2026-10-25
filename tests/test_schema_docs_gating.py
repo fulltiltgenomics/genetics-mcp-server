@@ -116,8 +116,7 @@ def test_prompt_and_tool_description_inherit_the_filter(docs, monkeypatch):
             if t["name"] == "get_database_schema"
         )
         blocks = " ".join(
-            b.text
-            for b in (*defaults._PROMPT_BLOCKS, *prompt_condensed.CONDENSED_PROMPT_BLOCKS)
+            b.text for b in (*defaults._PROMPT_BLOCKS, *prompt_condensed.CONDENSED_PROMPT_BLOCKS)
         )
         return desc, blocks
 

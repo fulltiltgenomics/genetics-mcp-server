@@ -74,10 +74,12 @@ class TestConvertToTsv:
     """Tests for TSV conversion helper."""
 
     def test_list_of_dicts(self):
-        data = {"results": [
-            {"gene": "BRCA1", "pvalue": 1e-8},
-            {"gene": "TP53", "pvalue": 1e-5},
-        ]}
+        data = {
+            "results": [
+                {"gene": "BRCA1", "pvalue": 1e-8},
+                {"gene": "TP53", "pvalue": 1e-5},
+            ]
+        }
         tsv = _convert_to_tsv(data)
         lines = tsv.decode("utf-8").strip().split("\n")
         assert lines[0] == "gene\tpvalue"
@@ -140,8 +142,10 @@ class TestProcessDownloadHints:
 
         # reset singletons
         import genetics_mcp_server.download_store as ds
+
         ds._store = None
         from genetics_mcp_server.config import settings as settings_mod
+
         settings_mod.get_settings.cache_clear()
 
         result = {
@@ -239,7 +243,11 @@ class TestShapeDefectsAreNeverSwallowed:
     @pytest.mark.parametrize("case", sorted(MALFORMED_DOWNLOADS))
     def test_malformed_payload_never_returns_quietly(self, case, download_dir):
         """The exact failure mode of bef and buc: a normal-looking result, minus the link."""
-        result = {"success": True, "results": [{"a": 1}], "_download_data": MALFORMED_DOWNLOADS[case]}
+        result = {
+            "success": True,
+            "results": [{"a": 1}],
+            "_download_data": MALFORMED_DOWNLOADS[case],
+        }
         try:
             processed = _process_download_hints(result, tool_name="get_hla_by_allele")
         except DownloadShapeError:
@@ -256,7 +264,11 @@ class TestShapeDefectsAreNeverSwallowed:
         Most producers pass the results-api's parsed body through unvalidated, so this is
         as likely to be upstream drift as a local bug; the answer stays, the link goes.
         """
-        result = {"success": True, "results": [{"a": 1}], "_download_data": MALFORMED_DOWNLOADS[case]}
+        result = {
+            "success": True,
+            "results": [{"a": 1}],
+            "_download_data": MALFORMED_DOWNLOADS[case],
+        }
         with caplog.at_level(logging.ERROR):
             processed = _process_download_hints(result, tool_name="get_summary_stats")
 
@@ -403,42 +415,49 @@ class TestStripTrailingLimit:
 
     def test_strips_trailing_limit(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         sql, stripped = ToolExecutor._strip_trailing_limit("SELECT * FROM t LIMIT 500")
         assert sql == "SELECT * FROM t"
         assert stripped is True
 
     def test_strips_limit_with_semicolon(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         sql, stripped = ToolExecutor._strip_trailing_limit("SELECT * FROM t LIMIT 500;")
         assert sql == "SELECT * FROM t"
         assert stripped is True
 
     def test_strips_limit_with_semicolon_and_space(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         sql, stripped = ToolExecutor._strip_trailing_limit("SELECT * FROM t LIMIT 500 ;")
         assert sql == "SELECT * FROM t"
         assert stripped is True
 
     def test_case_insensitive(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         sql, stripped = ToolExecutor._strip_trailing_limit("SELECT * FROM t limit 100")
         assert sql == "SELECT * FROM t"
         assert stripped is True
 
     def test_no_limit_unchanged(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         sql, stripped = ToolExecutor._strip_trailing_limit("SELECT * FROM t WHERE x > 1")
         assert sql == "SELECT * FROM t WHERE x > 1"
         assert stripped is False
 
     def test_no_limit_with_semicolon(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         sql, stripped = ToolExecutor._strip_trailing_limit("SELECT * FROM t WHERE x > 1;")
         assert sql == "SELECT * FROM t WHERE x > 1"
         assert stripped is False
 
     def test_subquery_limit_not_stripped(self):
         from genetics_mcp_server.tools.executor import ToolExecutor
+
         original = "SELECT * FROM (SELECT * FROM t LIMIT 10) sub ORDER BY x LIMIT 500"
         sql, stripped = ToolExecutor._strip_trailing_limit(original)
         assert sql == "SELECT * FROM (SELECT * FROM t LIMIT 10) sub ORDER BY x"
@@ -457,8 +476,10 @@ class TestDownloadEndpoint:
         monkeypatch.setenv("DOWNLOAD_STORAGE_PATH", str(tmp_path))
 
         import genetics_mcp_server.download_store as ds
+
         ds._store = None
         from genetics_mcp_server.config import settings as settings_mod
+
         settings_mod.get_settings.cache_clear()
 
         store = DownloadStore(str(tmp_path), ttl_seconds=3600)

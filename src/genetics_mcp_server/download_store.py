@@ -9,7 +9,9 @@ from dataclasses import asdict, dataclass
 
 logger = logging.getLogger(__name__)
 
-EXPIRED_MESSAGE = "This download has expired. Please re-run the query to generate a new download link."
+EXPIRED_MESSAGE = (
+    "This download has expired. Please re-run the query to generate a new download link."
+)
 
 
 @dataclass
@@ -91,7 +93,9 @@ class DownloadStore:
 
         elapsed = time.time() - meta.created_at
         if elapsed > self._ttl_seconds:
-            logger.error(f"Download expired: {download_id} (age {elapsed:.0f}s, ttl {self._ttl_seconds}s)")
+            logger.error(
+                f"Download expired: {download_id} (age {elapsed:.0f}s, ttl {self._ttl_seconds}s)"
+            )
             self._remove(download_id)
             return None
 
@@ -143,6 +147,7 @@ def get_download_store() -> DownloadStore:
     global _store
     if _store is None:
         from genetics_mcp_server.config import get_settings
+
         settings = get_settings()
         _store = DownloadStore(
             storage_path=settings.download_storage_path,

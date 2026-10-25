@@ -108,12 +108,15 @@ class _Bundle:
     def __init__(self, path: Path) -> None:
         self.path = path
         manifest = json.loads((path / "manifest.json").read_text())
-        self.release_id = manifest.get("bundle", {}).get("release_id") or manifest.get(
-            "release_id"
-        )
+        self.release_id = manifest.get("bundle", {}).get("release_id") or manifest.get("release_id")
         self.meta = {c["collection"]: c for c in manifest.get("collections", [])}
         self.sets = pl.read_parquet(path / "sets.parquet").select(
-            "set_id", "collection", "name", "url_or_stable_id", "n_given", "n_mapped",
+            "set_id",
+            "collection",
+            "name",
+            "url_or_stable_id",
+            "n_given",
+            "n_mapped",
             "n_unmapped",
         )
         held = self.sets["collection"].unique().to_list()
@@ -344,8 +347,10 @@ class _Bundled:
 
     def flat(self) -> tuple[list[str], pl.DataFrame]:
         """The same (set ids, (row, gene) pairs) `_flatten` makes of a mapping."""
-        rows = self.sets.select("set_id").with_row_index("row").with_columns(
-            pl.col("row").cast(pl.Int64)
+        rows = (
+            self.sets.select("set_id")
+            .with_row_index("row")
+            .with_columns(pl.col("row").cast(pl.Int64))
         )
         members = pl.concat([self.bundle.members(n) for n in self.names])
         flat = members.join(rows, on="set_id", how="inner").select(
@@ -454,10 +459,12 @@ def _flatten(gene_sets: Mapping[str, Iterable[str]]) -> tuple[list[str], pl.Data
 def _membership(flat: pl.DataFrame, n_sets: int, index: dict[str, int]) -> sparse.csr_matrix:
     """Sets x genes 0/1 matrix over the genes in `index`; members outside it are dropped and
     repeated members count once."""
-    universe = pl.DataFrame({
-        "gene": pl.Series(list(index), dtype=pl.Utf8),
-        "col": np.fromiter(index.values(), dtype=np.int64, count=len(index)),
-    })
+    universe = pl.DataFrame(
+        {
+            "gene": pl.Series(list(index), dtype=pl.Utf8),
+            "col": np.fromiter(index.values(), dtype=np.int64, count=len(index)),
+        }
+    )
     hit = flat.join(universe, on="gene", how="inner")
     rows, cols = hit["row"].to_numpy(), hit["col"].to_numpy()
     # the COO -> CSR conversion sums repeated (set, gene) pairs; resetting data dedupes them
@@ -578,26 +585,30 @@ def ora(
     sub = m[tested].tocoo()
     keep = in_list[sub.col]
     overlaps = (
-        pl.DataFrame({
-            "row": sub.row[keep].astype(np.int64),
-            "gene": pl.Series(u_genes, dtype=pl.Utf8).gather(sub.col[keep]),
-        })
+        pl.DataFrame(
+            {
+                "row": sub.row[keep].astype(np.int64),
+                "gene": pl.Series(u_genes, dtype=pl.Utf8).gather(sub.col[keep]),
+            }
+        )
         .sort("row", "gene")
         .group_by("row", maintain_order=True)
         .agg(overlap_genes=pl.col("gene"))
     )
 
     results = (
-        pl.DataFrame({
-            "row": np.arange(tested.size, dtype=np.int64),
-            "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
-            "size": size_t.astype(np.int64),
-            "overlap": k_t.astype(np.int64),
-            "expected": expected,
-            "fold_enrichment": k_t / expected,
-            "pval": pval,
-            "padj": _bh(pval),
-        })
+        pl.DataFrame(
+            {
+                "row": np.arange(tested.size, dtype=np.int64),
+                "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
+                "size": size_t.astype(np.int64),
+                "overlap": k_t.astype(np.int64),
+                "expected": expected,
+                "fold_enrichment": k_t / expected,
+                "pval": pval,
+                "padj": _bh(pval),
+            }
+        )
         .join(overlaps, on="row", how="left")
         .with_columns(pl.col("overlap_genes").fill_null(pl.lit([], dtype=pl.List(pl.Utf8))))
         .drop("row")
@@ -851,9 +862,7 @@ def gsea_preranked(
             leading[t] = [ranked[i] for i in lead]
 
     null = (
-        _null_es(w, uniq, nperm, np.random.default_rng(seed))
-        if uniq.size
-        else np.empty((nperm, 0))
+        _null_es(w, uniq, nperm, np.random.default_rng(seed)) if uniq.size else np.empty((nperm, 0))
     )
     null.sort(axis=0)
     pval, nes = np.empty(tested.size), np.full(tested.size, np.nan)
@@ -873,16 +882,18 @@ def gsea_preranked(
         ok = denom != 0
         nes[sel[ok]] = e[ok] / denom[ok]
 
-    results = pl.DataFrame({
-        "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
-        "size": sizes[tested].astype(np.int64),
-        "es": es,
-        "nes": nes,
-        "pval": pval,
-        "padj": _bh(pval),
-        "n_more_extreme": n_more,
-        "leading_edge": pl.Series(leading, dtype=pl.List(pl.Utf8)),
-    }).sort(["pval", "set_id"])
+    results = pl.DataFrame(
+        {
+            "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
+            "size": sizes[tested].astype(np.int64),
+            "es": es,
+            "nes": nes,
+            "pval": pval,
+            "padj": _bh(pval),
+            "n_more_extreme": n_more,
+            "leading_edge": pl.Series(leading, dtype=pl.List(pl.Utf8)),
+        }
+    ).sort(["pval", "set_id"])
     nonzero = values[values != 0]
     out = {
         "results": results,
@@ -1022,15 +1033,17 @@ def competitive(
     t = beta / se
     pval = t_dist.sf(t, df)
 
-    results = pl.DataFrame({
-        "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
-        "size": sizes[tested].astype(np.int64),
-        "beta": beta,
-        "se": se,
-        "t": t,
-        "pval": pval,
-        "padj": _bh(pval),
-    }).sort(["pval", "set_id"])
+    results = pl.DataFrame(
+        {
+            "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
+            "size": sizes[tested].astype(np.int64),
+            "beta": beta,
+            "se": se,
+            "t": t,
+            "pval": pval,
+            "padj": _bh(pval),
+        }
+    ).sort(["pval", "set_id"])
     out = {
         "results": results,
         "parameters": {
@@ -1279,19 +1292,16 @@ def _map_loci(
     qi, gi, dist = coords.map(leads["chr"].to_numpy(), leads["pos"].to_numpy(), mode, window)
     locus = leads["locus"].to_numpy()
     genes = (
-        pl.DataFrame({
-            "locus": locus[qi], "gene": gi.astype(np.int64), "distance": dist.astype(np.int64)
-        })
+        pl.DataFrame(
+            {"locus": locus[qi], "gene": gi.astype(np.int64), "distance": dist.astype(np.int64)}
+        )
         .group_by("locus", "gene")
         .agg(pl.col("distance").min())
     )
-    genes = (
-        genes.with_columns(
-            ensembl_gene_id=pl.Series(coords.ensembl, dtype=pl.Utf8).gather(genes["gene"]),
-            symbol=pl.Series(coords.symbol, dtype=pl.Utf8).gather(genes["gene"]),
-        )
-        .sort("locus", "distance", "symbol")
-    )
+    genes = genes.with_columns(
+        ensembl_gene_id=pl.Series(coords.ensembl, dtype=pl.Utf8).gather(genes["gene"]),
+        symbol=pl.Series(coords.symbol, dtype=pl.Utf8).gather(genes["gene"]),
+    ).sort("locus", "distance", "symbol")
     label = pl.col("chr").replace_strict(
         _CHROM_LABEL, default=pl.col("chr").cast(pl.Utf8), return_dtype=pl.Utf8
     )
@@ -1304,9 +1314,7 @@ def _map_loci(
             n_leads=pl.len().cast(pl.Int64),
             lead_ids=pl.col("id"),
         )
-        .with_columns(
-            locus_id=pl.format("{}:{}-{}", label, pl.col("start"), pl.col("end"))
-        )
+        .with_columns(locus_id=pl.format("{}:{}-{}", label, pl.col("start"), pl.col("end")))
         # identical positions stay separate loci only with merge_distance=0
         .with_columns(
             locus_id=pl.when(pl.col("locus_id").cum_count().over("locus_id") > 1)
@@ -1570,9 +1578,13 @@ def locus_enrichment(
         uniq = flat["gene"].unique(maintain_order=True)
         resolved, report = bundle.genes.resolve(uniq.to_list(), "gene_sets")
         del report["what"]
-        flat = flat.join(
-            pl.DataFrame({"gene": uniq, "ens": pl.Series(resolved, dtype=pl.Utf8)}), on="gene"
-        ).select("row", pl.col("ens").alias("gene")).drop_nulls()
+        flat = (
+            flat.join(
+                pl.DataFrame({"gene": uniq, "ens": pl.Series(resolved, dtype=pl.Utf8)}), on="gene"
+            )
+            .select("row", pl.col("ens").alias("gene"))
+            .drop_nulls()
+        )
     m = _membership(flat, len(set_ids), coords.index)
     unplaced = flat.filter(~pl.col("gene").is_in(list(coords.index)))
     sizes = np.diff(m.indptr)
@@ -1616,10 +1628,12 @@ def locus_enrichment(
     lead_pos = leads.group_by("locus", maintain_order=True).agg(pl.col("pos")).sort("locus")
     centre = ((loci_df["start"] + loci_df["end"]) // 2).to_numpy()
     l_chr = loci_df["chr"].to_numpy()
-    l_den = np.array([
-        int(coords.by_chr[int(c)].density(np.array([x]), density_window)[0])
-        for c, x in zip(l_chr, centre, strict=True)
-    ])
+    l_den = np.array(
+        [
+            int(coords.by_chr[int(c)].density(np.array([x]), density_window)[0])
+            for c, x in zip(l_chr, centre, strict=True)
+        ]
+    )
     l_bin = np.searchsorted(edges, l_den, "right")
     l_key = l_bin + n_bins * (l_chr == 23)
     for i in np.flatnonzero(per_key[l_key] == 0):
@@ -1636,8 +1650,15 @@ def locus_enrichment(
     if single.any():
         sel = np.flatnonzero(np.isin(g_key, np.unique(l_key[single])))
         q_key = _null_q(
-            coords, mt, g_chr[sel], g_pos[sel], np.zeros(1, dtype=np.int64), g_key[sel],
-            2 * n_bins, mode, window,
+            coords,
+            mt,
+            g_chr[sel],
+            g_pos[sel],
+            np.zeros(1, dtype=np.int64),
+            g_key[sel],
+            2 * n_bins,
+            mode,
+            window,
         )
         q[single] = q_key[l_key[single]]
     clipped = 0
@@ -1656,10 +1677,21 @@ def locus_enrichment(
         clipped += int((~ok).sum())
         sel = sel[ok]
         n_place[i] = sel.size
-        q[i] = _null_q(
-            coords, mt, g_chr[sel], g_pos[sel], offsets, np.zeros(sel.size, dtype=np.int64), 1,
-            mode, window,
-        )[0] if sel.size else 0.0
+        q[i] = (
+            _null_q(
+                coords,
+                mt,
+                g_chr[sel],
+                g_pos[sel],
+                offsets,
+                np.zeros(sel.size, dtype=np.int64),
+                1,
+                mode,
+                window,
+            )[0]
+            if sel.size
+            else 0.0
+        )
     # each locus's own position counts as one of its placements, so q_iS > 0 for every set
     # the locus hits and no p-value can be 0
     q *= n_place[:, None]
@@ -1674,10 +1706,12 @@ def locus_enrichment(
     locus_ids = loci_df["locus_id"]
     order = np.lexsort((hit_coo.row, hit_coo.col))
     hit_loci = (
-        pl.DataFrame({
-            "col": hit_coo.col[order].astype(np.int64),
-            "locus_id": locus_ids.gather(hit_coo.row[order]),
-        })
+        pl.DataFrame(
+            {
+                "col": hit_coo.col[order].astype(np.int64),
+                "locus_id": locus_ids.gather(hit_coo.row[order]),
+            }
+        )
         .group_by("col", maintain_order=True)
         .agg(hit_loci=pl.col("locus_id"))
     )
@@ -1686,10 +1720,12 @@ def locus_enrichment(
     sub = m[tested].tocoo()
     keep = observed_genes[sub.col]
     hit_genes = (
-        pl.DataFrame({
-            "col": sub.row[keep].astype(np.int64),
-            "gene": pl.Series(coords.ensembl, dtype=pl.Utf8).gather(sub.col[keep]),
-        })
+        pl.DataFrame(
+            {
+                "col": sub.row[keep].astype(np.int64),
+                "gene": pl.Series(coords.ensembl, dtype=pl.Utf8).gather(sub.col[keep]),
+            }
+        )
         .sort("col", "gene")
         .group_by("col", maintain_order=True)
         .agg(hit_genes=pl.col("gene"))
@@ -1698,16 +1734,18 @@ def locus_enrichment(
     with np.errstate(divide="ignore", invalid="ignore"):
         fold = obs / expected
     results = (
-        pl.DataFrame({
-            "col": np.arange(tested.size, dtype=np.int64),
-            "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
-            "size": sizes[tested].astype(np.int64),
-            "n_loci_hit": obs,
-            "expected": expected,
-            "fold_enrichment": fold,
-            "pval": pval,
-            "padj": _bh(pval),
-        })
+        pl.DataFrame(
+            {
+                "col": np.arange(tested.size, dtype=np.int64),
+                "set_id": pl.Series([set_ids[i] for i in tested], dtype=pl.Utf8),
+                "size": sizes[tested].astype(np.int64),
+                "n_loci_hit": obs,
+                "expected": expected,
+                "fold_enrichment": fold,
+                "pval": pval,
+                "padj": _bh(pval),
+            }
+        )
         .join(hit_loci, on="col", how="left")
         .join(hit_genes, on="col", how="left")
         .with_columns(pl.col("hit_loci").fill_null(empty), pl.col("hit_genes").fill_null(empty))
@@ -1900,11 +1938,13 @@ def simplify(
         take = (rep_of < 0) & (s >= cutoff)
         rep_of[take], sim[take] = i, s[take]
 
-    clusters = pl.DataFrame({
-        "set_id": pl.Series(ids, dtype=pl.Utf8),
-        "representative": pl.Series([ids[r] for r in rep_of], dtype=pl.Utf8),
-        "similarity": sim,
-    })
+    clusters = pl.DataFrame(
+        {
+            "set_id": pl.Series(ids, dtype=pl.Utf8),
+            "representative": pl.Series([ids[r] for r in rep_of], dtype=pl.Utf8),
+            "similarity": sim,
+        }
+    )
     named = "name" in sig.columns
     other = pl.col("set_id") != pl.col("representative")
     agg = [pl.col("set_id").filter(other).alias("absorbed_ids")]
@@ -1919,8 +1959,7 @@ def simplify(
     reps = sig.join(absorbed, left_on="set_id", right_on="representative", how="inner")
     out = dict(result)
     out["results"] = reps.select(
-        list(sig.columns) + ["n_absorbed", "absorbed_ids"]
-        + (["absorbed_names"] if named else [])
+        list(sig.columns) + ["n_absorbed", "absorbed_ids"] + (["absorbed_names"] if named else [])
     ).sort("pval", "padj", "set_id")
     out["clusters"] = clusters
     out["parameters"] = {

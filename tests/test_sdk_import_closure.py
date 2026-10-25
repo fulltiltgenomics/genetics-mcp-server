@@ -46,10 +46,14 @@ assert _src in _origin.parents, f"imported {{_origin}}, not the checkout under t
 
 
 def _run_probe(body: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(_SRC), os.environ.get("PYTHONPATH", "")])}
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(_SRC), os.environ.get("PYTHONPATH", "")]),
+    }
     return subprocess.run(
         [sys.executable, "-c", body], capture_output=True, text=True, check=False, env=env
     )
+
 
 # Widening this set means the sandbox image ships another genetics_mcp_server source file.
 # Do that deliberately — and update SDK_ALLOWLIST in genetics-results-suite
@@ -293,12 +297,12 @@ print(json.dumps({
 
 
 # Shipped by prune_venv.py's SDK_ALLOWLIST but NOT reachable from `import
-# genetics_mcp_server.sdk`, so the closure probe below cannot see them. sdk/plots.py,
-# sdk/linemodels.py and sdk/mr.py (with the _mr_estimators it imports) are resolved through
-# sdk/__init__.py's module __getattr__ precisely so the servers never import matplotlib or
-# numpy, which means the measurement that keeps this
-# file honest stops at their door — and a deferred `import somethingelse` inside either would
-# ship and fail inside the sandbox with nothing here objecting. Listed rather than measured
+# genetics_mcp_server.sdk`, so the closure probe below cannot see them. They are resolved
+# through sdk/__init__.py's module __getattr__ (mr's _mr_estimators by mr's own import)
+# precisely so the servers never import matplotlib, numpy or scipy, which means the
+# measurement that keeps this file honest stops at their door — and a deferred
+# `import somethingelse` inside any of them would ship and fail inside the sandbox with
+# nothing here objecting. Listed rather than measured
 # because there is nothing to measure: if this list and SDK_ALLOWLIST disagree, the symptom
 # is a shipped file nobody scans.
 SHIPPED_OUTSIDE_CLOSURE = (
@@ -391,8 +395,7 @@ def test_no_shipped_source_names_a_module_the_image_lacks():
         "call inside the sandbox — and neither does a `TYPE_CHECKING` or `try/except "
         "ImportError` guard: the name is in the shipped source whether or not that line "
         "runs. Move the code out of the SDK's import closure, or widen "
-        "genetics-results-suite/sandbox/requirements.txt deliberately:\n  "
-        + "\n  ".join(offenders)
+        "genetics-results-suite/sandbox/requirements.txt deliberately:\n  " + "\n  ".join(offenders)
     )
 
 

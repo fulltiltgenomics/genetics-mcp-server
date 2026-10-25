@@ -120,8 +120,7 @@ def _reject(branch: str, **ignored: Any) -> None:
     supplied = sorted(k for k, v in ignored.items() if v is not None and v is not False)
     if supplied:
         raise GeneticsUsageError(
-            f"{branch} does not accept {', '.join(supplied)}; "
-            f"it would be ignored, not applied"
+            f"{branch} does not accept {', '.join(supplied)}; it would be ignored, not applied"
         )
 
 
@@ -452,9 +451,7 @@ class GeneticsClient:
         if key == "gene":
             _reject("gene_burden(gene=...)", resource=resource)
             traits = [phenotypes] if isinstance(phenotypes, str) else list(phenotypes or [])
-            result = await self._executor.get_gene_based_results(
-                value, traits=traits or None
-            )
+            result = await self._executor.get_gene_based_results(value, traits=traits or None)
         else:
             _reject("gene_burden(phenotype=...)", phenotypes=phenotypes)
             result = await self._executor.get_gene_based_results_by_phenotype(
@@ -504,9 +501,7 @@ class GeneticsClient:
         """
         key, value = _one_of(phenotype=phenotype, allele=allele)
         if key == "phenotype":
-            _reject(
-                "hla(phenotype=...)", min_mlogp=min_mlogp, min_info=min_info, limit=limit
-            )
+            _reject("hla(phenotype=...)", min_mlogp=min_mlogp, min_info=min_info, limit=limit)
             phenotypes = [value] if isinstance(value, str) else list(value)
             return self._rows(
                 await self._executor.get_hla_by_phenotype(
@@ -972,20 +967,29 @@ class GeneticsClient:
             _reject("ld(variant, other)", window=window)
             result = self._payload(
                 await self._executor.get_ld_between_variants(
-                    variant, other, r2_threshold=0.1 if r2_threshold is None else r2_threshold,
-                    panel=panel, fields=fields,
+                    variant,
+                    other,
+                    r2_threshold=0.1 if r2_threshold is None else r2_threshold,
+                    panel=panel,
+                    fields=fields,
                 )
             )
-            statistics = result.get("fields") or [
-                f for f in _LD_STATISTICS if f in result
-            ] or list(_LD_STATISTICS)
-            return _frame([{
-                "variant1": result["variant1"],
-                "variant2": result["variant2"],
-                "in_ld": result["in_ld"],
-                **{f: result.get(f) for f in statistics},
-                "panel": panel,
-            }])
+            statistics = (
+                result.get("fields")
+                or [f for f in _LD_STATISTICS if f in result]
+                or list(_LD_STATISTICS)
+            )
+            return _frame(
+                [
+                    {
+                        "variant1": result["variant1"],
+                        "variant2": result["variant2"],
+                        "in_ld": result["in_ld"],
+                        **{f: result.get(f) for f in statistics},
+                        "panel": panel,
+                    }
+                ]
+            )
         return self._rows(
             await self._executor.get_variants_in_ld(
                 variant,

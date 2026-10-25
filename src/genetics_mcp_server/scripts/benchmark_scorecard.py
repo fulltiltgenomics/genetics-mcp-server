@@ -203,7 +203,8 @@ def render(report: dict[str, Any], csv: bool = False) -> str:
     # replayed before the refusal keep their cost while everything after cascades, so the
     # report looks complete and compares almost nothing. Say so before any number is read.
     limited = [
-        t for t in report.get("turns", [])
+        t
+        for t in report.get("turns", [])
         if t.get("status") == "error" and "429" in str(t.get("error") or "")
     ]
     if limited:
@@ -291,10 +292,14 @@ def render_tool_calls(report: dict[str, Any], width: int = 100, case: str | None
                     args = c.get("input") or {}
                     if isinstance(args, dict) and args:
                         for k, v in args.items():
-                            out.append(f"      {c['seq']}. {c.get('name')}  {k}={_arg_preview(v, width)}")
+                            out.append(
+                                f"      {c['seq']}. {c.get('name')}  {k}={_arg_preview(v, width)}"
+                            )
                             break
                         for k, v in list(args.items())[1:]:
-                            out.append(f"         {' ' * len(str(c['seq']))}   {k}={_arg_preview(v, width)}")
+                            out.append(
+                                f"         {' ' * len(str(c['seq']))}   {k}={_arg_preview(v, width)}"
+                            )
                     else:
                         out.append(f"      {c['seq']}. {c.get('name')}  (no arguments)")
     if not out:
@@ -352,13 +357,14 @@ def _turn_summary(turn: dict) -> list[str]:
         shapes = ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
         lines.append(
             f"  scripts: {turn.get('script_attempts')} attempted, "
-            f"{turn.get('script_failures') or 0} failed"
-            + (f"  [{shapes}]" if shapes else "")
+            f"{turn.get('script_failures') or 0} failed" + (f"  [{shapes}]" if shapes else "")
         )
     if turn.get("retry_loops"):
         # the iterations bought by a failed script rather than by the question: this is the
         # first thing to look at when the code arm is slower than the arm without it
-        lines.append(f"  retry loops: {turn.get('retry_loops')} (extra roundtrips after a script failed)")
+        lines.append(
+            f"  retry loops: {turn.get('retry_loops')} (extra roundtrips after a script failed)"
+        )
     if turn.get("hit_max_iterations"):
         lines.append("  !! hit the iteration ceiling — the answer is whatever it had by then")
     return lines
@@ -577,9 +583,7 @@ def _md_thinking(turn: dict, iteration: Any) -> list[str]:
     `iteration is None` selects the entries whose iteration the stream never carried, so a
     partially-attributed report still shows its text instead of dropping it.
     """
-    rows = [
-        r for r in (turn.get("thinking_detail") or []) if r.get("iteration") == iteration
-    ]
+    rows = [r for r in (turn.get("thinking_detail") or []) if r.get("iteration") == iteration]
     if not rows:
         return []
     label = f"thinking · iteration {iteration}" if iteration is not None else "thinking"
@@ -603,15 +607,10 @@ def _md_prose(turn: dict, after_call: Any) -> list[str]:
     ]
     if not rows:
         return []
-    where = (
-        "before its first tool call"
-        if after_call is None
-        else f"after call {after_call}"
-    )
+    where = "before its first tool call" if after_call is None else f"after call {after_call}"
     lines = []
     for row in rows:
-        lines += [f"> *the assistant wrote, {where} — text the Answer below does not "
-                  "include:*", ""]
+        lines += [f"> *the assistant wrote, {where} — text the Answer below does not include:*", ""]
         lines += [f"> {line}" for line in (row.get("text") or "").splitlines()] + [""]
     return lines
 
@@ -686,7 +685,9 @@ def _md_judge(pairs: list[dict], turn_index: int) -> list[str]:
             reason = " ".join(str(p.get("reason") or "").split())
             lines.append(f"    - shown *{order}* → **{p.get('verdict')}**: {reason}")
         if row.get("arm_identifiable"):
-            lines.append("    - ⚠ the judge could name an arm from the answer text: blinding failed here.")
+            lines.append(
+                "    - ⚠ the judge could name an arm from the answer text: blinding failed here."
+            )
     return lines + [""]
 
 
@@ -741,9 +742,11 @@ def render_markdown(
         title,
         "",
         (
-            f"- arm: `{only_arm}` (of {' vs '.join(f'`{a}`' for a in arms)})" if only_arm
+            f"- arm: `{only_arm}` (of {' vs '.join(f'`{a}`' for a in arms)})"
+            if only_arm
             else f"- arm: `{arms[0]}` (single-arm run — nothing to compare against, "
-                 f"and nothing judged)" if len(arms) == 1
+            f"and nothing judged)"
+            if len(arms) == 1
             else f"- arms: `{arms[0]}` vs `{arms[1]}`"
         )
         + "".join(
@@ -776,8 +779,7 @@ def render_markdown(
             out += [f"> **{label}**: {'; '.join(blockers)}", ""]
         for index in range(max(len(per_arm[a]) for a in arms)):
             turns = {
-                arm: (per_arm[arm][index] if index < len(per_arm[arm]) else None)
-                for arm in arms
+                arm: (per_arm[arm][index] if index < len(per_arm[arm]) else None) for arm in arms
             }
             # the question comes from EITHER arm's record even in a one-arm file: both
             # replayed the same dataset turn, and the arm being rendered may be the one that
@@ -879,11 +881,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"wrote {path} ({len(body):,} chars)")
         return 0
     if args.transcript:
-        print(
-            render_transcript(
-                report, width=args.width, case=args.case, arg_lines=args.arg_lines
-            )
-        )
+        print(render_transcript(report, width=args.width, case=args.case, arg_lines=args.arg_lines))
         return 0
     if args.tools:
         print(render_tool_calls(report, width=args.arg_width, case=args.case))

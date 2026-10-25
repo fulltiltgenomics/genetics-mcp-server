@@ -194,9 +194,7 @@ def input_path(name: str) -> str:
             f"files are attached to the analysis call, not opened from a URL by the script"
         )
     if not isinstance(name, str) or not name or name in (".", ".."):
-        raise GeneticsUsageError(
-            f"input name must be a file name, not {name!r}"
-        )
+        raise GeneticsUsageError(f"input name must be a file name, not {name!r}")
     if any(sep and sep in name for sep in ("/", "\\", os.sep, os.altsep)):
         raise GeneticsUsageError(
             f"input name {name!r} must be a bare file name, not a path: inputs are delivered "
@@ -247,9 +245,7 @@ def _make_sync(name: str):
 
     # drop `self` so help()/inspect show what a script actually passes
     signature = inspect.signature(method)
-    wrapper.__signature__ = signature.replace(
-        parameters=list(signature.parameters.values())[1:]
-    )
+    wrapper.__signature__ = signature.replace(parameters=list(signature.parameters.values())[1:])
     return wrapper
 
 
@@ -265,11 +261,12 @@ _LAZY_MODULES = ("plots", "linemodels", "mr", "enrichment")
 def __getattr__(name: str):
     """`genetics.plots`, `genetics.linemodels`, `genetics.mr` and `genetics.enrichment` resolve on first use, and only then.
 
-    Deliberately lazy rather than an import at the top of this file: plots imports
-    matplotlib.pyplot and linemodels and mr numpy, and this package is imported by chat-backend and
-    mcp-server, where a figure is never drawn and no mixture is fitted. In the sandbox the
-    cost is already paid — the supervisor prewarms both before the first fork — so the
-    laziness buys the servers an import they do not need and costs a script nothing.
+    Deliberately lazy rather than an import at the top of this file: they import numpy,
+    scipy or matplotlib.pyplot (mr through plots), and this package is imported by
+    chat-backend and mcp-server, where a figure is never drawn and no model is fitted. In
+    the sandbox the cost is already paid — the supervisor prewarms those libraries before the
+    first fork (the suite's sandbox/prewarm.py) — so the laziness buys the servers an import
+    they do not need and costs a script nothing.
     """
     if name in _LAZY_MODULES:
         # import_module and NOT `from genetics_mcp_server.sdk import plots`: the `from` form

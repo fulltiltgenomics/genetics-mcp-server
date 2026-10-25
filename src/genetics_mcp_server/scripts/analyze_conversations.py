@@ -53,6 +53,7 @@ ANALYZER_VERSION = 1
 # Data loading
 # ---------------------------------------------------------------------------
 
+
 def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Load chat_sessions and chat_messages into polars DataFrames.
 
@@ -79,9 +80,7 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
         )
         # sqlite stores booleans as integers
         if "thumbs_up" in messages.columns:
-            messages = messages.with_columns(
-                pl.col("thumbs_up").cast(pl.Boolean, strict=False)
-            )
+            messages = messages.with_columns(pl.col("thumbs_up").cast(pl.Boolean, strict=False))
     finally:
         conn.close()
 
@@ -110,9 +109,7 @@ def load_instruction_set_names(db_path: str) -> dict[str, str]:
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            rows = conn.execute(
-                "SELECT id, name FROM user_instruction_sets"
-            ).fetchall()
+            rows = conn.execute("SELECT id, name FROM user_instruction_sets").fetchall()
         finally:
             conn.close()
     except sqlite3.Error as e:
@@ -124,6 +121,7 @@ def load_instruction_set_names(db_path: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Robust JSON extraction from LLM text
 # ---------------------------------------------------------------------------
+
 
 def extract_first_json(text: str):
     """Parse the first complete JSON value (object or array) in text.
@@ -217,8 +215,10 @@ async def create_with_backoff(client, *, delays=RETRY_DELAYS, **kwargs):
             status = getattr(e, "status_code", None)
             if status not in RETRY_STATUS_CODES or delay is None:
                 raise
-            logger.warning(f"Anthropic API returned {status}; retrying in {delay}s "
-                           f"(attempt {attempt + 1}/{len(delays)})")
+            logger.warning(
+                f"Anthropic API returned {status}; retrying in {delay}s "
+                f"(attempt {attempt + 1}/{len(delays)})"
+            )
             await asyncio.sleep(delay)
 
 
@@ -314,12 +314,16 @@ def session_is_literature_bearing(session_msgs) -> bool:
         if not isinstance(raw_blocks, list):
             continue
         for block in raw_blocks:
-            if not (isinstance(block, dict) and block.get("type") == "tool_use"
-                    and block.get("name") == _LITERATURE_SUBAGENT_TOOL):
+            if not (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == _LITERATURE_SUBAGENT_TOOL
+            ):
                 continue
             tasks = (block.get("input") or {}).get("tasks") or []
-            if any(isinstance(t, dict) and t.get("skill") == _LITERATURE_SUBAGENT_SKILL
-                   for t in tasks):
+            if any(
+                isinstance(t, dict) and t.get("skill") == _LITERATURE_SUBAGENT_SKILL for t in tasks
+            ):
                 return True
     return False
 
@@ -337,6 +341,7 @@ class ToolCountCoverage:
     partialMsg path), so a present block list may be truncated at the point the stream
     died and such a row counts as fully covered anyway.
     """
+
     assistant_messages: int = 0
     messages_from_content_json: int = 0
     messages_from_markers: int = 0
@@ -355,17 +360,19 @@ class ToolCountCoverage:
 
         An empty frame is not "exact" — there is nothing to have counted exactly.
         """
-        return self.assistant_messages > 0 and self.assistant_messages == self.messages_from_content_json
+        return (
+            self.assistant_messages > 0
+            and self.assistant_messages == self.messages_from_content_json
+        )
 
     def summary_lines(self) -> list[str]:
         """Markdown lines stating the counting basis and, if partial, the caveat."""
         msg_pct = (
             self.messages_from_content_json / self.assistant_messages * 100
-            if self.assistant_messages else 0.0
+            if self.assistant_messages
+            else 0.0
         )
-        sess_pct = (
-            self.fully_covered_sessions / self.sessions * 100 if self.sessions else 0.0
-        )
+        sess_pct = self.fully_covered_sessions / self.sessions * 100 if self.sessions else 0.0
         lines = [
             "### Counting coverage\n",
             f"- Counted from `content_json` `tool_use` blocks: "
@@ -378,8 +385,9 @@ class ToolCountCoverage:
             f"{self.fully_covered_sessions}/{self.sessions} ({sess_pct:.1f}%)",
         ]
         if self.assistant_messages == 0:
-            lines.append("\nNo assistant messages: there is nothing to count, so no "
-                         "exactness claim is made.")
+            lines.append(
+                "\nNo assistant messages: there is nothing to count, so no exactness claim is made."
+            )
         elif self.is_exact:
             lines.append("\nAll tool counts below are **exact**.")
         else:
@@ -423,21 +431,27 @@ def build_tool_coverage(messages: pl.DataFrame) -> tuple[pl.DataFrame, ToolCount
 
     coverage.sessions = len(per_session)
     coverage.fully_covered_sessions = sum(
-        1 for e in per_session.values()
+        1
+        for e in per_session.values()
         if e["assistant_messages"] == e["messages_from_content_json"]
     )
 
     rows = [
-        {**e, "tool_count_is_lower_bound": e["assistant_messages"] != e["messages_from_content_json"]}
+        {
+            **e,
+            "tool_count_is_lower_bound": e["assistant_messages"] != e["messages_from_content_json"],
+        }
         for e in per_session.values()
     ]
     if not rows:
-        frame = pl.DataFrame({
-            "session_id": pl.Series([], dtype=pl.Utf8),
-            "assistant_messages": pl.Series([], dtype=pl.Int64),
-            "messages_from_content_json": pl.Series([], dtype=pl.Int64),
-            "tool_count_is_lower_bound": pl.Series([], dtype=pl.Boolean),
-        })
+        frame = pl.DataFrame(
+            {
+                "session_id": pl.Series([], dtype=pl.Utf8),
+                "assistant_messages": pl.Series([], dtype=pl.Int64),
+                "messages_from_content_json": pl.Series([], dtype=pl.Int64),
+                "tool_count_is_lower_bound": pl.Series([], dtype=pl.Boolean),
+            }
+        )
     else:
         frame = pl.DataFrame(rows)
     return frame, coverage
@@ -451,34 +465,44 @@ def build_session_tool_stats(messages: pl.DataFrame) -> pl.DataFrame:
     for row in assistant_msgs.iter_rows(named=True):
         tools, _authoritative = message_tool_calls(row)
         if tools:
-            rows.append({
-                "session_id": row["session_id"],
-                "tool_calls": tools,
-                "tool_count": len(tools),
-            })
+            rows.append(
+                {
+                    "session_id": row["session_id"],
+                    "tool_calls": tools,
+                    "tool_count": len(tools),
+                }
+            )
 
     if not rows:
-        return pl.DataFrame({
-            "session_id": pl.Series([], dtype=pl.Utf8),
-            "tool_calls": pl.Series([], dtype=pl.List(pl.Utf8)),
-            "tool_count": pl.Series([], dtype=pl.Int64),
-            "unique_tools": pl.Series([], dtype=pl.Int64),
-            "tool_sequence": pl.Series([], dtype=pl.Utf8),
-            "max_tools_in_message": pl.Series([], dtype=pl.Int64),
-        })
+        return pl.DataFrame(
+            {
+                "session_id": pl.Series([], dtype=pl.Utf8),
+                "tool_calls": pl.Series([], dtype=pl.List(pl.Utf8)),
+                "tool_count": pl.Series([], dtype=pl.Int64),
+                "unique_tools": pl.Series([], dtype=pl.Int64),
+                "tool_sequence": pl.Series([], dtype=pl.Utf8),
+                "max_tools_in_message": pl.Series([], dtype=pl.Int64),
+            }
+        )
 
     tool_df = pl.DataFrame(rows)
 
     # aggregate per session; max_tools_in_message flags excessive tool use within a
     # single assistant turn, which a session-wide total can't (a long conversation
     # legitimately accrues many calls spread across many messages)
-    session_tools = tool_df.group_by("session_id").agg(
-        pl.col("tool_calls").list.explode(keep_nulls=False, empty_as_null=False).alias("all_tools"),
-        pl.col("tool_count").sum().alias("total_tool_calls"),
-        pl.col("tool_count").max().alias("max_tools_in_message"),
-    ).with_columns(
-        pl.col("all_tools").list.n_unique().alias("unique_tools"),
-        pl.col("all_tools").list.join(" -> ").alias("tool_sequence"),
+    session_tools = (
+        tool_df.group_by("session_id")
+        .agg(
+            pl.col("tool_calls")
+            .list.explode(keep_nulls=False, empty_as_null=False)
+            .alias("all_tools"),
+            pl.col("tool_count").sum().alias("total_tool_calls"),
+            pl.col("tool_count").max().alias("max_tools_in_message"),
+        )
+        .with_columns(
+            pl.col("all_tools").list.n_unique().alias("unique_tools"),
+            pl.col("all_tools").list.join(" -> ").alias("tool_sequence"),
+        )
     )
 
     return session_tools
@@ -536,14 +560,17 @@ def parse_sdk_calls(lines) -> list[dict]:
         match = SDK_CALL_RE.search(line)
         if not match:
             continue
-        calls.append({
-            "session_id": match.group("session"),
-            "user": match.group("user"),
-            "execution_id": match.group("execution"),
-            "sdk_function": match.group("function"),
-            "sdk_rows": int(match.group("rows")),
-            "sdk_error": match.group("error") or ("cancelled" if match.group("cancelled") else ""),
-        })
+        calls.append(
+            {
+                "session_id": match.group("session"),
+                "user": match.group("user"),
+                "execution_id": match.group("execution"),
+                "sdk_function": match.group("function"),
+                "sdk_rows": int(match.group("rows")),
+                "sdk_error": match.group("error")
+                or ("cancelled" if match.group("cancelled") else ""),
+            }
+        )
     return calls
 
 
@@ -585,15 +612,17 @@ def load_sdk_log(paths: list[str] | None) -> tuple[list[dict], dict]:
     return calls, notices
 
 
-_EMPTY_SDK_STATS = pl.DataFrame({
-    "session_id": pl.Series([], dtype=pl.Utf8),
-    "total_sdk_calls": pl.Series([], dtype=pl.Int64),
-    "sdk_rows": pl.Series([], dtype=pl.Int64),
-    "sdk_executions": pl.Series([], dtype=pl.Int64),
-    "unique_sdk_functions": pl.Series([], dtype=pl.Int64),
-    "sdk_sequence": pl.Series([], dtype=pl.Utf8),
-    "sdk_function_counts": pl.Series([], dtype=pl.Utf8),
-})
+_EMPTY_SDK_STATS = pl.DataFrame(
+    {
+        "session_id": pl.Series([], dtype=pl.Utf8),
+        "total_sdk_calls": pl.Series([], dtype=pl.Int64),
+        "sdk_rows": pl.Series([], dtype=pl.Int64),
+        "sdk_executions": pl.Series([], dtype=pl.Int64),
+        "unique_sdk_functions": pl.Series([], dtype=pl.Int64),
+        "sdk_sequence": pl.Series([], dtype=pl.Utf8),
+        "sdk_function_counts": pl.Series([], dtype=pl.Utf8),
+    }
+)
 
 # `sdk_sequence` lands in a metrics row and in every CSV cell, and a script can make thousands
 # of SDK calls from one `run_analysis`, so the join is bounded: 10k calls would otherwise be a
@@ -642,8 +671,14 @@ def build_session_sdk_stats(calls: list[dict]) -> pl.DataFrame:
         )
         .drop("_elided")
         .join(function_counts, on="session_id", how="left")
-        .cast({"total_sdk_calls": pl.Int64, "sdk_rows": pl.Int64,
-               "sdk_executions": pl.Int64, "unique_sdk_functions": pl.Int64})
+        .cast(
+            {
+                "total_sdk_calls": pl.Int64,
+                "sdk_rows": pl.Int64,
+                "sdk_executions": pl.Int64,
+                "unique_sdk_functions": pl.Int64,
+            }
+        )
     )
 
 
@@ -653,53 +688,96 @@ def build_session_sdk_stats(calls: list[dict]) -> pl.DataFrame:
 
 TOPIC_KEYWORDS = {
     "gene_lookup": [
-        r"\bgene\b", r"\bgenes\b", r"\bexpression\b", r"\bexome\b",
-        r"\bburden\b", r"\bconstraint\b",
+        r"\bgene\b",
+        r"\bgenes\b",
+        r"\bexpression\b",
+        r"\bexome\b",
+        r"\bburden\b",
+        r"\bconstraint\b",
     ],
     "variant_interpretation": [
-        r"\bvariant\b", r"\brs\d+", r"\b\d+:\d+:[ACGT]+:[ACGT]+\b",
-        r"\bmutation\b", r"\bsnp\b", r"\bsnv\b",
+        r"\bvariant\b",
+        r"\brs\d+",
+        r"\b\d+:\d+:[ACGT]+:[ACGT]+\b",
+        r"\bmutation\b",
+        r"\bsnp\b",
+        r"\bsnv\b",
     ],
     "phenotype_exploration": [
-        r"\bphenotype\b", r"\bpheWAS\b", r"\bloci\b", r"\blocus\b",
-        r"\bgwas\b", r"\bassociat", r"\bendpoint",
+        r"\bphenotype\b",
+        r"\bpheWAS\b",
+        r"\bloci\b",
+        r"\blocus\b",
+        r"\bgwas\b",
+        r"\bassociat",
+        r"\bendpoint",
     ],
     "cross_phenotype_analysis": [
-        r"\bcompare\b.*\bphenotype", r"\bshared\b.*\bsignal",
-        r"\bcross.?phenotype", r"\bpleiotrop",
+        r"\bcompare\b.*\bphenotype",
+        r"\bshared\b.*\bsignal",
+        r"\bcross.?phenotype",
+        r"\bpleiotrop",
     ],
     "colocalization_ld": [
-        r"\bcolocaliz", r"\blinkage\b", r"\b[Ll][Dd]\b",
-        r"\br2\b", r"\bld\b",
+        r"\bcolocaliz",
+        r"\blinkage\b",
+        r"\b[Ll][Dd]\b",
+        r"\br2\b",
+        r"\bld\b",
     ],
     "literature_search": [
-        r"\bliterature\b", r"\bpaper\b", r"\bpubmed\b", r"\barticle\b",
-        r"\bpublication\b", r"\bpmid\b",
+        r"\bliterature\b",
+        r"\bpaper\b",
+        r"\bpubmed\b",
+        r"\barticle\b",
+        r"\bpublication\b",
+        r"\bpmid\b",
     ],
     "data_source_question": [
-        r"\bdata\s*source", r"\bdataset\b", r"\bmethod\b",
-        r"\bhow\s+(do|does|can)\s+you", r"\bwhat\s+(are|is)\s+your\s+source",
+        r"\bdata\s*source",
+        r"\bdataset\b",
+        r"\bmethod\b",
+        r"\bhow\s+(do|does|can)\s+you",
+        r"\bwhat\s+(are|is)\s+your\s+source",
         r"\bavailable\b.*\bdata",
     ],
     "variant_list_analysis": [
-        r"\blist\s+of\s+variant", r"\bvariant\s+list\b",
+        r"\blist\s+of\s+variant",
+        r"\bvariant\s+list\b",
         r"(?:\d+:\d+:[ACGT]+:[ACGT]+\s*\n){2,}",
     ],
     "clinical_genetics": [
-        r"\bclinical\b", r"\bmendelian\b", r"\bpatient\b",
-        r"\bpathogen", r"\bdiagnos", r"\bclingen\b",
-        r"\bheterozygous\b", r"\bhomozygous\b", r"\bframeshift\b",
+        r"\bclinical\b",
+        r"\bmendelian\b",
+        r"\bpatient\b",
+        r"\bpathogen",
+        r"\bdiagnos",
+        r"\bclingen\b",
+        r"\bheterozygous\b",
+        r"\bhomozygous\b",
+        r"\bframeshift\b",
     ],
     "bigquery_advanced": [
-        r"\bbigquery\b", r"\bsql\b", r"\bquery\b.*\btable",
+        r"\bbigquery\b",
+        r"\bsql\b",
+        r"\bquery\b.*\btable",
     ],
     # bare "medication" and "drug data" are deliberately absent: in this corpus they name
     # the drug-purchase endpoints and a GWAS category far more often than a drug question
     "drug_target": [
-        r"\bdrug\s+targets?\b", r"\bdruggab", r"\binhibitors?\b", r"\bagonists?\b",
-        r"\bantagonists?\b", r"\brepurpos", r"\bcompounds?\b", r"\bsmall.?molecule",
-        r"\btherapeutic\s+target", r"\bclinical\s+(?:trial|candidate|phase)",
-        r"\bapproved\s+drug", r"\bmechanism\s+of\s+action\b", r"\bchembl\b",
+        r"\bdrug\s+targets?\b",
+        r"\bdruggab",
+        r"\binhibitors?\b",
+        r"\bagonists?\b",
+        r"\bantagonists?\b",
+        r"\brepurpos",
+        r"\bcompounds?\b",
+        r"\bsmall.?molecule",
+        r"\btherapeutic\s+target",
+        r"\bclinical\s+(?:trial|candidate|phase)",
+        r"\bapproved\s+drug",
+        r"\bmechanism\s+of\s+action\b",
+        r"\bchembl\b",
         r"\bpharmacolog",
     ],
 }
@@ -792,6 +870,7 @@ class CostTracker:
 # LLM-based topic categorization
 # ---------------------------------------------------------------------------
 
+
 async def categorize_with_llm(
     session_first_messages: list[dict[str, str]],
     model: str = "claude-opus-5",
@@ -815,10 +894,8 @@ async def categorize_with_llm(
     batch_size = 20
 
     for i in range(0, len(session_first_messages), batch_size):
-        batch = session_first_messages[i:i + batch_size]
-        messages_text = "\n\n".join(
-            f"[ID: {m['id']}]\n{m['text'][:500]}" for m in batch
-        )
+        batch = session_first_messages[i : i + batch_size]
+        messages_text = "\n\n".join(f"[ID: {m['id']}]\n{m['text'][:500]}" for m in batch)
         prompt = TOPIC_CLASSIFICATION_PROMPT.format(messages=messages_text)
 
         try:
@@ -850,8 +927,10 @@ async def categorize_with_llm(
                 }
 
         if i + batch_size < len(session_first_messages):
-            logger.info(f"  Categorized {min(i + batch_size, len(session_first_messages))}"
-                        f"/{len(session_first_messages)} sessions...")
+            logger.info(
+                f"  Categorized {min(i + batch_size, len(session_first_messages))}"
+                f"/{len(session_first_messages)} sessions..."
+            )
 
     return results
 
@@ -859,6 +938,7 @@ async def categorize_with_llm(
 # ---------------------------------------------------------------------------
 # LLM-based issue categorization
 # ---------------------------------------------------------------------------
+
 
 async def categorize_issues_with_llm(
     issues: list[str],
@@ -894,10 +974,11 @@ async def categorize_issues_with_llm(
     batch_size = 40
 
     for i in range(0, len(issues), batch_size):
-        batch = issues[i:i + batch_size]
+        batch = issues[i : i + batch_size]
         issues_text = "\n".join(f"[{j}] {issue[:300]}" for j, issue in enumerate(batch))
         prompt = ISSUE_CATEGORIZATION_PROMPT.format(
-            categories=categories_text, issues=issues_text,
+            categories=categories_text,
+            issues=issues_text,
         )
 
         try:
@@ -923,9 +1004,9 @@ async def categorize_issues_with_llm(
 
 
 def taxonomy_fingerprint() -> str:
-    return hashlib.sha256(
-        "\n".join(f"{c}: {d}" for c, d in ISSUE_CATEGORIES).encode()
-    ).hexdigest()[:16]
+    return hashlib.sha256("\n".join(f"{c}: {d}" for c, d in ISSUE_CATEGORIES).encode()).hexdigest()[
+        :16
+    ]
 
 
 def load_issue_category_cache(path: Path) -> dict[str, str]:
@@ -953,14 +1034,18 @@ def load_issue_category_cache(path: Path) -> dict[str, str]:
 
 def save_issue_category_cache(path: Path, categories: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(
-        {"taxonomy": taxonomy_fingerprint(), "categories": categories}, indent=2,
-    ))
+    path.write_text(
+        json.dumps(
+            {"taxonomy": taxonomy_fingerprint(), "categories": categories},
+            indent=2,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
 # LLM-based quality evaluation
 # ---------------------------------------------------------------------------
+
 
 def _elide_message(content: str, per_msg_max: int = 8000) -> str:
     """Elide the middle of an over-long message, keeping head and tail.
@@ -1007,7 +1092,9 @@ def _attachment_note(content_json: str | None) -> str:
 
 
 def _format_conversation_for_eval(
-    session_id: str, messages: pl.DataFrame, max_chars: int = 120000,
+    session_id: str,
+    messages: pl.DataFrame,
+    max_chars: int = 120000,
 ) -> str:
     """Format a conversation for LLM quality evaluation, eliding if needed.
 
@@ -1025,9 +1112,9 @@ def _format_conversation_for_eval(
     # opus-4.8 -> opus-5) with no bump and is recorded nowhere per row, so the stored
     # verdicts already mix models under version 1. Existing verdicts keep the old
     # ordering; sessions converge on this one as they are re-analysed anyway.
-    session_msgs = messages.filter(
-        pl.col("session_id") == session_id
-    ).sort(message_sort_keys(messages))
+    session_msgs = messages.filter(pl.col("session_id") == session_id).sort(
+        message_sort_keys(messages)
+    )
 
     parts = []
     total_len = 0
@@ -1077,7 +1164,8 @@ async def evaluate_quality_with_llm(
             continue
 
         prompt = QUALITY_ASSESSMENT_PROMPT.format(
-            conversation=conversation_text, today=today,
+            conversation=conversation_text,
+            today=today,
         )
 
         try:
@@ -1106,6 +1194,7 @@ async def evaluate_quality_with_llm(
 # ---------------------------------------------------------------------------
 # Success/failure metrics
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ConversationMetrics:
@@ -1313,10 +1402,12 @@ def compute_all_metrics(
             .select("session_id", "instruction_set_id")
         )
     else:
-        instruction_sets = pl.DataFrame({
-            "session_id": pl.Series([], dtype=pl.Utf8),
-            "instruction_set_id": pl.Series([], dtype=pl.Utf8),
-        })
+        instruction_sets = pl.DataFrame(
+            {
+                "session_id": pl.Series([], dtype=pl.Utf8),
+                "instruction_set_id": pl.Series([], dtype=pl.Utf8),
+            }
+        )
 
     tool_coverage, _ = build_tool_coverage(messages)
 
@@ -1324,8 +1415,11 @@ def compute_all_metrics(
     error_sessions = set()
     for row in messages.filter(pl.col("role") == "assistant").iter_rows(named=True):
         content_lower = row["content"].lower()
-        if ("error" in content_lower and "tool" in content_lower) or \
-           "i apologize" in content_lower and "unable" in content_lower:
+        if (
+            ("error" in content_lower and "tool" in content_lower)
+            or "i apologize" in content_lower
+            and "unable" in content_lower
+        ):
             error_sessions.add(row["session_id"])
 
     # join everything
@@ -1336,11 +1430,15 @@ def compute_all_metrics(
     combined = combined.join(instruction_sets, left_on="id", right_on="session_id", how="left")
     combined = combined.join(
         tool_coverage.select("session_id", "tool_count_is_lower_bound"),
-        left_on="id", right_on="session_id", how="left",
+        left_on="id",
+        right_on="session_id",
+        how="left",
     )
     combined = combined.join(
         sdk_stats if sdk_stats is not None else _EMPTY_SDK_STATS,
-        left_on="id", right_on="session_id", how="left",
+        left_on="id",
+        right_on="session_id",
+        how="left",
     )
 
     names = instruction_set_names or {}
@@ -1393,6 +1491,7 @@ def compute_all_metrics(
 # ---------------------------------------------------------------------------
 # DB-backed cache (conversation_analysis / conversation_issue tables)
 # ---------------------------------------------------------------------------
+
 
 def _is_cached(row: dict | None) -> bool:
     """A session counts as cached only if it has a current-version analysis row."""
@@ -1539,14 +1638,16 @@ def _session_user_turns(session_msgs: pl.DataFrame) -> list[dict]:
             in_force = row_options
         if row["role"] != "user":
             continue
-        turns.append({
-            "index": len(turns),
-            "message_id": row.get("id"),
-            "created_at": str(row.get("created_at") or ""),
-            # untruncated: a replay has to send exactly what the user sent
-            "content": row["content"],
-            "options": dict(in_force),
-        })
+        turns.append(
+            {
+                "index": len(turns),
+                "message_id": row.get("id"),
+                "created_at": str(row.get("created_at") or ""),
+                # untruncated: a replay has to send exactly what the user sent
+                "content": row["content"],
+                "options": dict(in_force),
+            }
+        )
 
     return turns
 
@@ -1573,10 +1674,12 @@ def export_eval_dataset(
 
     if literature_bearing_only:
         metrics = [
-            m for m in metrics
+            m
+            for m in metrics
             if session_is_literature_bearing(
-                messages.filter(pl.col("session_id") == m.session_id)
-                .sort(message_sort_keys(messages))
+                messages.filter(pl.col("session_id") == m.session_id).sort(
+                    message_sort_keys(messages)
+                )
             )
         ]
 
@@ -1593,21 +1696,23 @@ def export_eval_dataset(
         selected = []
         if max_per_topic and len(convs) >= max_per_topic:
             n = max_per_topic
-            selected = convs[:n // 2] + convs[-(n - n // 2):]
+            selected = convs[: n // 2] + convs[-(n - n // 2) :]
         else:
             selected = convs
 
         for conv in selected:
-            session_msgs = messages.filter(
-                pl.col("session_id") == conv.session_id
-            ).sort(message_sort_keys(messages))
+            session_msgs = messages.filter(pl.col("session_id") == conv.session_id).sort(
+                message_sort_keys(messages)
+            )
 
             turns = []
             for msg_row in session_msgs.iter_rows(named=True):
-                turns.append({
-                    "role": msg_row["role"],
-                    "content": msg_row["content"][:2000],
-                })
+                turns.append(
+                    {
+                        "role": msg_row["role"],
+                        "content": msg_row["content"][:2000],
+                    }
+                )
 
             user_turns = _session_user_turns(session_msgs)
 
@@ -1616,27 +1721,31 @@ def export_eval_dataset(
                 tools, _authoritative = message_tool_calls(msg_row)
                 tools_used.extend(tools)
 
-            eval_cases.append({
-                "session_id": conv.session_id,
-                "topic": conv.topic,
-                "complexity": conv.complexity,
-                "success_score": conv.success_score,
-                "success_label": conv.success_label,
-                "user_rating": conv.user_rating,
-                "first_user_message": conv.first_user_message[:500],
-                "tools_used": tools_used,
-                # already proven True when literature_bearing_only filtered the pool;
-                # otherwise computed fresh, only for the small selected set
-                "literature_bearing": (
-                    True if literature_bearing_only else session_is_literature_bearing(session_msgs)
-                ),
-                "total_tool_calls": conv.total_tool_calls,
-                "tool_count_is_lower_bound": conv.tool_count_is_lower_bound,
-                "turn_count": len(turns),
-                "turns": turns,
-                "user_turn_count": len(user_turns),
-                "user_turns": user_turns,
-            })
+            eval_cases.append(
+                {
+                    "session_id": conv.session_id,
+                    "topic": conv.topic,
+                    "complexity": conv.complexity,
+                    "success_score": conv.success_score,
+                    "success_label": conv.success_label,
+                    "user_rating": conv.user_rating,
+                    "first_user_message": conv.first_user_message[:500],
+                    "tools_used": tools_used,
+                    # already proven True when literature_bearing_only filtered the pool;
+                    # otherwise computed fresh, only for the small selected set
+                    "literature_bearing": (
+                        True
+                        if literature_bearing_only
+                        else session_is_literature_bearing(session_msgs)
+                    ),
+                    "total_tool_calls": conv.total_tool_calls,
+                    "tool_count_is_lower_bound": conv.tool_count_is_lower_bound,
+                    "turn_count": len(turns),
+                    "turns": turns,
+                    "user_turn_count": len(user_turns),
+                    "user_turns": user_turns,
+                }
+            )
 
     # write JSON eval file
     eval_path = output_dir / "eval_dataset.json"
@@ -1650,8 +1759,10 @@ def export_eval_dataset(
     for case in eval_cases:
         transcript_path = transcripts_dir / f"{case['topic']}_{case['session_id'][:8]}.md"
         with open(transcript_path, "w") as f:
-            f.write(f"# {case['topic']} | score={case['success_score']} | "
-                    f"tools={case['total_tool_calls']}\n\n")
+            f.write(
+                f"# {case['topic']} | score={case['success_score']} | "
+                f"tools={case['total_tool_calls']}\n\n"
+            )
             for turn in case["turns"]:
                 role_label = "**User**" if turn["role"] == "user" else "**Assistant**"
                 f.write(f"### {role_label}\n\n{turn['content']}\n\n---\n\n")
@@ -1662,6 +1773,7 @@ def export_eval_dataset(
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
+
 
 def generate_report(
     metrics: list[ConversationMetrics],
@@ -1681,7 +1793,7 @@ def generate_report(
     def tool_count_caveat() -> str:
         """One-line provenance stamp to hang under any aggregate over tool counts."""
         if not lower_bound_sessions:
-            return ("_Tool counts are exact (every assistant message has `content_json`)._")
+            return "_Tool counts are exact (every assistant message has `content_json`)._"
         return (
             f"_Tool counts are a **lower bound**: {lower_bound_sessions}/{len(metrics)} sessions "
             "have assistant messages with no `content_json` and fall back to display markers "
@@ -1719,8 +1831,10 @@ def generate_report(
     quality_metrics = [m for m in metrics if m.success_label in QUALITY_RELEVANT_LABELS]
     success_counts = Counter(m.success_label for m in metrics)
 
-    lines.append(f"**Agent quality** (of {len(quality_metrics)} answerable conversations; "
-                 "excludes technical failures and out-of-scope / unfinished / weird):\n")
+    lines.append(
+        f"**Agent quality** (of {len(quality_metrics)} answerable conversations; "
+        "excludes technical failures and out-of-scope / unfinished / weird):\n"
+    )
     denom = len(quality_metrics) or 1
     for label in ["successful", "neutral", "unsuccessful"]:
         count = success_counts.get(label, 0)
@@ -1781,9 +1895,11 @@ def generate_report(
     # tool call distribution
     tool_counts = [m.total_tool_calls for m in metrics]
     lines.append("### Tool calls per session\n")
-    lines.append(f"- Min: {min(tool_counts)}, Max: {max(tool_counts)}, "
-                 f"Median: {sorted(tool_counts)[len(tool_counts)//2]}, "
-                 f"Mean: {sum(tool_counts)/len(tool_counts):.1f}")
+    lines.append(
+        f"- Min: {min(tool_counts)}, Max: {max(tool_counts)}, "
+        f"Median: {sorted(tool_counts)[len(tool_counts) // 2]}, "
+        f"Mean: {sum(tool_counts) / len(tool_counts):.1f}"
+    )
     lines.append("")
     lines.append(tool_count_caveat())
     lines.append("")
@@ -1858,16 +1974,21 @@ def generate_report(
     # flag excessive tool use within a single message, not session totals: a long
     # conversation with many messages can legitimately accrue many calls
     lines.append("## Sessions with Excessive Tool Use (>10 calls in a single message)\n")
-    heavy = sorted([m for m in metrics if m.max_tools_in_message > 10],
-                   key=lambda m: m.max_tools_in_message, reverse=True)
+    heavy = sorted(
+        [m for m in metrics if m.max_tools_in_message > 10],
+        key=lambda m: m.max_tools_in_message,
+        reverse=True,
+    )
     if heavy:
         lines.append("| Session | Max in msg | Total tools | Topic | Score | First Message |")
         lines.append("|---------|-----------:|------------:|-------|------:|---------------|")
         for m in heavy[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id} | {m.max_tools_in_message} | "
-                         f"{tool_total(m)} | {m.topic} | {m.success_score:.2f} | "
-                         f"{msg_preview} |")
+            lines.append(
+                f"| {m.session_id} | {m.max_tools_in_message} | "
+                f"{tool_total(m)} | {m.topic} | {m.success_score:.2f} | "
+                f"{msg_preview} |"
+            )
         lines.append("")
         lines.append(tool_count_caveat())
     else:
@@ -1876,17 +1997,21 @@ def generate_report(
 
     # --- unsuccessful conversations (genuine agent failures only) ---
     lines.append("## Unsuccessful Conversations\n")
-    lines.append("Genuine agent failures only — the question was answerable but the "
-                 "assistant did not answer it well. Technical failures and out-of-scope "
-                 "/ unfinished / weird requests are in their own sections below.\n")
+    lines.append(
+        "Genuine agent failures only — the question was answerable but the "
+        "assistant did not answer it well. Technical failures and out-of-scope "
+        "/ unfinished / weird requests are in their own sections below.\n"
+    )
     unsuccessful = [m for m in metrics if m.success_label == "unsuccessful"]
     if unsuccessful:
         lines.append("| Session | Score | Topic | Tools | First Message |")
         lines.append("|---------|------:|-------|------:|---------------|")
         for m in sorted(unsuccessful, key=lambda m: m.success_score)[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id} | {m.success_score:.2f} | "
-                         f"{m.topic} | {tool_total(m)} | {msg_preview} |")
+            lines.append(
+                f"| {m.session_id} | {m.success_score:.2f} | "
+                f"{m.topic} | {tool_total(m)} | {msg_preview} |"
+            )
         lines.append("")
         lines.append(tool_count_caveat())
     else:
@@ -1895,16 +2020,28 @@ def generate_report(
 
     # --- disposition buckets (not agent-quality failures) ---
     for label, title, blurb in [
-        ("technical_failure", "Technical Failures",
-         "Infrastructure/backend problems (connection drops, empty tool errors), not "
-         "the agent's fault. Low score, but excluded from the agent-quality metric."),
-        ("out_of_scope", "Out of Scope",
-         "User asked for data or actions the system genuinely cannot provide. Not "
-         "penalized in the quality metric."),
-        ("unfinished", "Unfinished Conversations",
-         "User stopped without a failure by the assistant. Not penalized."),
-        ("weird_or_unclear", "Weird / Unclear Questions",
-         "Unclear or malformed request (e.g. missing attachment). Not penalized."),
+        (
+            "technical_failure",
+            "Technical Failures",
+            "Infrastructure/backend problems (connection drops, empty tool errors), not "
+            "the agent's fault. Low score, but excluded from the agent-quality metric.",
+        ),
+        (
+            "out_of_scope",
+            "Out of Scope",
+            "User asked for data or actions the system genuinely cannot provide. Not "
+            "penalized in the quality metric.",
+        ),
+        (
+            "unfinished",
+            "Unfinished Conversations",
+            "User stopped without a failure by the assistant. Not penalized.",
+        ),
+        (
+            "weird_or_unclear",
+            "Weird / Unclear Questions",
+            "Unclear or malformed request (e.g. missing attachment). Not penalized.",
+        ),
     ]:
         bucket = [m for m in metrics if m.success_label == label]
         if not bucket:
@@ -1915,8 +2052,7 @@ def generate_report(
         lines.append("|---------|-------|------:|---------------|")
         for m in sorted(bucket, key=lambda m: m.session_id)[:20]:
             msg_preview = m.first_user_message[:80].replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id} | {m.topic} | {tool_total(m)} | "
-                         f"{msg_preview} |")
+            lines.append(f"| {m.session_id} | {m.topic} | {tool_total(m)} | {msg_preview} |")
         lines.append("")
         lines.append(tool_count_caveat())
         lines.append("")
@@ -1952,19 +2088,24 @@ def generate_report(
     # --- user engagement ---
     lines.append("## User Engagement\n")
     msg_counts = [m.user_messages for m in metrics]
-    lines.append(f"- Messages per session: min={min(msg_counts)}, max={max(msg_counts)}, "
-                 f"median={sorted(msg_counts)[len(msg_counts)//2]}, "
-                 f"mean={sum(msg_counts)/len(msg_counts):.1f}")
+    lines.append(
+        f"- Messages per session: min={min(msg_counts)}, max={max(msg_counts)}, "
+        f"median={sorted(msg_counts)[len(msg_counts) // 2]}, "
+        f"mean={sum(msg_counts) / len(msg_counts):.1f}"
+    )
     multi_turn = sum(1 for m in metrics if m.user_messages >= 3)
-    lines.append(f"- Multi-turn sessions (3+ user messages): {multi_turn} "
-                 f"({multi_turn/len(metrics)*100:.1f}%)")
+    lines.append(
+        f"- Multi-turn sessions (3+ user messages): {multi_turn} "
+        f"({multi_turn / len(metrics) * 100:.1f}%)"
+    )
 
     # repeat users
     user_session_counts = sessions.group_by("user_id").len().sort("len", descending=True)
     repeat_users = user_session_counts.filter(pl.col("len") > 1).height
     total_users = user_session_counts.height
-    lines.append(f"- Repeat users: {repeat_users}/{total_users} "
-                 f"({repeat_users/total_users*100:.1f}%)")
+    lines.append(
+        f"- Repeat users: {repeat_users}/{total_users} ({repeat_users / total_users * 100:.1f}%)"
+    )
     lines.append("")
 
     # top users
@@ -1991,8 +2132,10 @@ def generate_report(
         answerable = [m for m in evaluated if m.success_label in QUALITY_RELEVANT_LABELS]
         if answerable:
             avg_q = sum(m.llm_quality_score for m in answerable) / len(answerable)
-            lines.append(f"- **Average quality score** (answerable only, n={len(answerable)}): "
-                         f"{avg_q:.1f}/5\n")
+            lines.append(
+                f"- **Average quality score** (answerable only, n={len(answerable)}): "
+                f"{avg_q:.1f}/5\n"
+            )
         else:
             lines.append("")
 
@@ -2019,7 +2162,8 @@ def generate_report(
         if all_issues:
             if issue_categories:
                 categorized = [
-                    (i, issue_categories.get(i, "other")) for i in all_issues
+                    (i, issue_categories.get(i, "other"))
+                    for i in all_issues
                     if issue_categories.get(i, "other") not in NON_ISSUE_CATEGORIES
                 ]
                 cat_counter = Counter(c for _, c in categorized)
@@ -2044,8 +2188,9 @@ def generate_report(
                 for issue, count in issue_freq.most_common(15):
                     iss = issue[:120].replace("|", "/").replace("\n", " ")
                     lines.append(f"| {iss} | {count} |")
-            lines.append(f"\n*{len(all_issues)} issues across "
-                         f"{len(evaluated)} evaluated conversations.*\n")
+            lines.append(
+                f"\n*{len(all_issues)} issues across {len(evaluated)} evaluated conversations.*\n"
+            )
 
         # lowest quality conversations: answerable ones only, so genuine agent
         # weaknesses surface rather than technical/out-of-scope/unfinished cases
@@ -2056,9 +2201,11 @@ def generate_report(
         for m in low_quality:
             issues_str = "; ".join(m.llm_issues) if m.llm_issues else ""
             issues_str = issues_str.replace("|", "/").replace("\n", " ")
-            lines.append(f"| {m.session_id} | {m.llm_quality_score} | "
-                         f"{m.topic} | {tool_total(m)} | {m.llm_answered} | "
-                         f"{issues_str} |")
+            lines.append(
+                f"| {m.session_id} | {m.llm_quality_score} | "
+                f"{m.topic} | {tool_total(m)} | {m.llm_answered} | "
+                f"{issues_str} |"
+            )
         lines.append("")
         lines.append(tool_count_caveat())
         lines.append("")
@@ -2076,9 +2223,11 @@ def generate_report(
                 continue
             avg_s = sum(m.success_score for m in topic_ms) / len(topic_ms)
             if avg_s < overall_avg - 0.05:
-                lines.append(f"- **{topic}** has below-average score ({avg_s:.2f} vs "
-                             f"{overall_avg:.2f} overall) across {len(topic_ms)} "
-                             "answerable sessions")
+                lines.append(
+                    f"- **{topic}** has below-average score ({avg_s:.2f} vs "
+                    f"{overall_avg:.2f} overall) across {len(topic_ms)} "
+                    "answerable sessions"
+                )
 
     # tools that appear in unsuccessful conversations
     unsuccessful_tools: list[str] = []
@@ -2087,14 +2236,18 @@ def generate_report(
             unsuccessful_tools.extend(m.tool_sequence.split(" -> "))
     if unsuccessful_tools:
         ut_freq = Counter(unsuccessful_tools)
-        lines.append(f"- Tools most common in unsuccessful conversations: "
-                     f"{', '.join(t for t, _ in ut_freq.most_common(5))}")
+        lines.append(
+            f"- Tools most common in unsuccessful conversations: "
+            f"{', '.join(t for t, _ in ut_freq.most_common(5))}"
+        )
         lines.append(f"  {tool_count_caveat()}")
 
     if heavy:
         avg_heavy_tools = sum(m.max_tools_in_message for m in heavy) / len(heavy)
-        lines.append(f"- {len(heavy)} sessions made >10 tool calls in a single message "
-                     f"(avg peak {avg_heavy_tools:.0f}) - consider optimizing tool strategies")
+        lines.append(
+            f"- {len(heavy)} sessions made >10 tool calls in a single message "
+            f"(avg peak {avg_heavy_tools:.0f}) - consider optimizing tool strategies"
+        )
 
     lines.append("")
 
@@ -2112,78 +2265,117 @@ def generate_report(
 # Main
 # ---------------------------------------------------------------------------
 
+
 async def main():
     parser = argparse.ArgumentParser(
         description="Analyze conversation history for insights and eval extraction."
     )
     parser.add_argument("--db", required=True, help="Path to chat_history SQLite DB")
     parser.add_argument("--output-dir", default=None, help="Directory for output files")
-    parser.add_argument("--llm-config-db", default=None,
-                        help="Path to llm_config SQLite DB, used to name the instruction sets "
-                             "the report groups by (default: llm_config.db beside --db). "
-                             "If it is missing the report groups by set id instead.")
-    parser.add_argument("--sdk-log", action="append", default=None, metavar="PATH",
-                        help="Log file carrying the sandbox SDK's audit lines "
-                             "('Executing SDK function: ...'). Repeatable. Data accessed "
-                             "from inside run_analysis scripts is one tool call in the chat "
-                             "DB no matter how many queries it issued, so without this the "
-                             "report cannot see it at all.")
-    parser.add_argument("--no-llm", action="store_true",
-                        help="Use keyword categorization instead of LLM")
-    parser.add_argument("--topic-model",
-                        default=os.getenv("ANALYZE_TOPIC_MODEL", "claude-opus-5"),
-                        help="Anthropic model for topic classification. "
-                             "Defaults to $ANALYZE_TOPIC_MODEL if set.")
-    parser.add_argument("--quality-model",
-                        default=os.getenv("ANALYZE_QUALITY_MODEL", "claude-opus-5"),
-                        help="Anthropic model for quality evaluation (judge task). "
-                             "Defaults to $ANALYZE_QUALITY_MODEL if set.")
-    parser.add_argument("--start-from", default=None,
-                        help="Only include sessions created on or after this date (YYYY-MM-DD)")
-    parser.add_argument("--until", default=None,
-                        help="Only include sessions created before this date, exclusive (YYYY-MM-DD)")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Ignore the DB-cached topic AND quality results; recompute "
-                             "everything via the LLM (overwrites the cache). Use after "
-                             "changing prompts or the truncation/eval logic.")
-    parser.add_argument("--refresh-quality", action="store_true",
-                        help="Ignore only the DB-cached quality assessments and re-run "
-                             "them (keeps the cheap topic cache). Use to apply the "
-                             "truncation fix without re-classifying topics.")
-    parser.add_argument("--force", action="store_true",
-                        help="Reanalyze every conversation from scratch, e.g. when the "
-                             "analysis code changed. Recomputes topics AND quality for all "
-                             "in-range sessions and overwrites their cached rows. --force "
-                             "wins over --refresh-quality (it already recomputes everything).")
-    parser.add_argument("--report-file", default=None,
-                        help="Also write the stdout report (GitHub-flavored markdown) "
-                             "to this file (default: <output-dir>/report.md)")
-    parser.add_argument("--report-only", action="store_true",
-                        help="Only print the report, skip eval export")
-    parser.add_argument("--literature-bearing", action="store_true",
-                        help="Restrict the eval dataset export to sessions that called "
-                             "search_scientific_literature or launched a literature_review "
-                             "subagent, sampled before the per-topic top/bottom cut")
-    parser.add_argument("--max-per-topic", type=int, default=None,
-                        help="Cap on conversations sampled per topic (top/bottom split), "
-                             "0 means no cap. Default: 5, except with --literature-bearing "
-                             "and no explicit value here, where the default is no cap — the "
-                             "literature premise is about the whole bearing population, not "
-                             "a per-topic sample of it")
+    parser.add_argument(
+        "--llm-config-db",
+        default=None,
+        help="Path to llm_config SQLite DB, used to name the instruction sets "
+        "the report groups by (default: llm_config.db beside --db). "
+        "If it is missing the report groups by set id instead.",
+    )
+    parser.add_argument(
+        "--sdk-log",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Log file carrying the sandbox SDK's audit lines "
+        "('Executing SDK function: ...'). Repeatable. Data accessed "
+        "from inside run_analysis scripts is one tool call in the chat "
+        "DB no matter how many queries it issued, so without this the "
+        "report cannot see it at all.",
+    )
+    parser.add_argument(
+        "--no-llm", action="store_true", help="Use keyword categorization instead of LLM"
+    )
+    parser.add_argument(
+        "--topic-model",
+        default=os.getenv("ANALYZE_TOPIC_MODEL", "claude-opus-5"),
+        help="Anthropic model for topic classification. Defaults to $ANALYZE_TOPIC_MODEL if set.",
+    )
+    parser.add_argument(
+        "--quality-model",
+        default=os.getenv("ANALYZE_QUALITY_MODEL", "claude-opus-5"),
+        help="Anthropic model for quality evaluation (judge task). "
+        "Defaults to $ANALYZE_QUALITY_MODEL if set.",
+    )
+    parser.add_argument(
+        "--start-from",
+        default=None,
+        help="Only include sessions created on or after this date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--until",
+        default=None,
+        help="Only include sessions created before this date, exclusive (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore the DB-cached topic AND quality results; recompute "
+        "everything via the LLM (overwrites the cache). Use after "
+        "changing prompts or the truncation/eval logic.",
+    )
+    parser.add_argument(
+        "--refresh-quality",
+        action="store_true",
+        help="Ignore only the DB-cached quality assessments and re-run "
+        "them (keeps the cheap topic cache). Use to apply the "
+        "truncation fix without re-classifying topics.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reanalyze every conversation from scratch, e.g. when the "
+        "analysis code changed. Recomputes topics AND quality for all "
+        "in-range sessions and overwrites their cached rows. --force "
+        "wins over --refresh-quality (it already recomputes everything).",
+    )
+    parser.add_argument(
+        "--report-file",
+        default=None,
+        help="Also write the stdout report (GitHub-flavored markdown) "
+        "to this file (default: <output-dir>/report.md)",
+    )
+    parser.add_argument(
+        "--report-only", action="store_true", help="Only print the report, skip eval export"
+    )
+    parser.add_argument(
+        "--literature-bearing",
+        action="store_true",
+        help="Restrict the eval dataset export to sessions that called "
+        "search_scientific_literature or launched a literature_review "
+        "subagent, sampled before the per-topic top/bottom cut",
+    )
+    parser.add_argument(
+        "--max-per-topic",
+        type=int,
+        default=None,
+        help="Cap on conversations sampled per topic (top/bottom split), "
+        "0 means no cap. Default: 5, except with --literature-bearing "
+        "and no explicit value here, where the default is no cap — the "
+        "literature premise is about the whole bearing population, not "
+        "a per-topic sample of it",
+    )
     args = parser.parse_args()
 
     # progress goes to stderr so stdout stays pipeable for the report; the level prefix
     # keeps log collectors from reading progress as failures, since GKE tags every line a
     # container writes to stderr as ERROR regardless of content
-    logging.basicConfig(
-        level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr
-    )
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
 
     if not os.path.exists(args.db):
         logger.error(f"database not found: {args.db}")
         sys.exit(1)
 
-    output_dir = Path(args.output_dir) if args.output_dir else Path(args.db).parent / "analysis_output"
+    output_dir = (
+        Path(args.output_dir) if args.output_dir else Path(args.db).parent / "analysis_output"
+    )
 
     # --- load data ---
     logger.info("Loading data...")
@@ -2196,8 +2388,9 @@ async def main():
             sessions = sessions.filter(pl.col("created_at") < args.until)
         session_ids = sessions.select("id").to_series().to_list()
         messages = messages.filter(pl.col("session_id").is_in(session_ids))
-        logger.info(f"  Filtered to sessions in range "
-                    f"[{args.start_from or '-inf'}, {args.until or '+inf'})")
+        logger.info(
+            f"  Filtered to sessions in range [{args.start_from or '-inf'}, {args.until or '+inf'})"
+        )
 
     logger.info(f"  {sessions.height} sessions, {messages.height} messages")
 
@@ -2219,10 +2412,11 @@ async def main():
     logger.info("Parsing tool usage...")
     tool_stats = build_session_tool_stats(messages)
     sessions_with_tools = tool_stats.height
-    total_tool_calls = tool_stats.select(pl.col("total_tool_calls").sum()).item() if sessions_with_tools > 0 else 0
+    total_tool_calls = (
+        tool_stats.select(pl.col("total_tool_calls").sum()).item() if sessions_with_tools > 0 else 0
+    )
     _, tool_coverage = build_tool_coverage(messages)
-    logger.info(f"  {sessions_with_tools} sessions used tools, "
-                f"{total_tool_calls} total tool calls")
+    logger.info(f"  {sessions_with_tools} sessions used tools, {total_tool_calls} total tool calls")
     logger.info(
         f"  counting basis: {tool_coverage.messages_from_content_json}/"
         f"{tool_coverage.assistant_messages} assistant messages from content_json, "
@@ -2266,16 +2460,14 @@ async def main():
     # the raw stored updated_at per session, passed unchanged to upsert_analysis so
     # staleness comparisons (a string compare against analyzed_at) stay consistent
     updated_at_by_session = {
-        row["id"]: row.get("updated_at")
-        for row in sessions.iter_rows(named=True)
+        row["id"]: row.get("updated_at") for row in sessions.iter_rows(named=True)
     }
 
     # reconstruct topic + quality inputs for already-analyzed sessions so they
     # don't hit the LLM again. --no-cache discards them entirely; --refresh-quality
     # keeps the cheap topic cache but drops cached judgments so they're re-judged.
     cached_topics_db, cached_quality_db, _ = (
-        ({}, {}, {}) if args.no_cache
-        else cached_topic_and_quality(analysis_map)
+        ({}, {}, {}) if args.no_cache else cached_topic_and_quality(analysis_map)
     )
     if args.refresh_quality:
         cached_quality_db = {}
@@ -2289,14 +2481,19 @@ async def main():
     # their cache (no LLM work) but still flow into the report via the same maps,
     # so the report stays a full summary of all in-range conversations.
     in_range_ids = set(updated_at_by_session)
-    stale_ids = set(
-        analysis_db.get_stale_or_missing_session_ids(
-            force=args.force, analyzer_version=ANALYZER_VERSION
+    stale_ids = (
+        set(
+            analysis_db.get_stale_or_missing_session_ids(
+                force=args.force, analyzer_version=ANALYZER_VERSION
+            )
         )
-    ) & in_range_ids
+        & in_range_ids
+    )
     if stale_ids:
-        logger.info(f"  {len(stale_ids)} of {len(in_range_ids)} in-range sessions are stale "
-                    "(missing / continued / version-bumped) and will be reanalyzed")
+        logger.info(
+            f"  {len(stale_ids)} of {len(in_range_ids)} in-range sessions are stale "
+            "(missing / continued / version-bumped) and will be reanalyzed"
+        )
     # force the stale ones to recompute by evicting their cached topic + quality.
     # --force already cleared both maps when it set no_cache-equivalent behavior
     # below, but for the non-force path this is the surgical, minimal-work eviction.
@@ -2346,10 +2543,14 @@ async def main():
 
         uncached_msgs = [m for m in session_first_msgs if m["id"] not in cached_topics]
         if uncached_msgs:
-            logger.info(f"  Using LLM categorization for {len(uncached_msgs)} sessions "
-                        f"(model={args.topic_model})...")
+            logger.info(
+                f"  Using LLM categorization for {len(uncached_msgs)} sessions "
+                f"(model={args.topic_model})..."
+            )
             new_topics = await categorize_with_llm(
-                uncached_msgs, model=args.topic_model, cost_tracker=cost_tracker,
+                uncached_msgs,
+                model=args.topic_model,
+                cost_tracker=cost_tracker,
             )
             cached_topics.update(new_topics)
         topics = cached_topics
@@ -2375,9 +2576,13 @@ async def main():
 
         session_ids = [m.session_id for m in all_metrics if m.session_id not in cached_quality]
         if session_ids:
-            logger.info(f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)...")
+            logger.info(
+                f"Evaluating conversation quality with LLM ({len(session_ids)} conversations)..."
+            )
             new_assessments = await evaluate_quality_with_llm(
-                session_ids, messages, model=args.quality_model,
+                session_ids,
+                messages,
+                model=args.quality_model,
                 cost_tracker=cost_tracker,
             )
             cached_quality.update(new_assessments)
@@ -2395,8 +2600,7 @@ async def main():
         # signal — label them 'unknown' instead of a heuristic successful/neutral
         unknown_n = mark_unscored_unknown(all_metrics)
         if unknown_n:
-            logger.info(f"  {unknown_n} conversations had no quality judgment "
-                        "→ labelled 'unknown'")
+            logger.info(f"  {unknown_n} conversations had no quality judgment → labelled 'unknown'")
 
     # --- categorize detailed issues into recurring problem categories ---
     # raw judge issues are too specific to recur, so we map them onto a fixed
@@ -2405,9 +2609,9 @@ async def main():
     issue_categories: dict[str, str] = {}
     categorization_failures = 0
     if not args.no_llm:
-        distinct_issues = sorted({
-            issue for m in all_metrics if m.llm_issues for issue in m.llm_issues
-        })
+        distinct_issues = sorted(
+            {issue for m in all_metrics if m.llm_issues for issue in m.llm_issues}
+        )
         if distinct_issues:
             cached_cats = {} if args.no_cache else load_issue_category_cache(issue_cat_cache)
             if cached_cats:
@@ -2415,19 +2619,25 @@ async def main():
 
             uncategorized = [t for t in distinct_issues if t not in cached_cats]
             if uncategorized:
-                logger.info(f"Categorizing {len(uncategorized)} distinct issues "
-                            f"(model={args.topic_model})...")
+                logger.info(
+                    f"Categorizing {len(uncategorized)} distinct issues "
+                    f"(model={args.topic_model})..."
+                )
                 new_cats, categorization_failures = await categorize_issues_with_llm(
-                    uncategorized, model=args.topic_model, cost_tracker=cost_tracker,
+                    uncategorized,
+                    model=args.topic_model,
+                    cost_tracker=cost_tracker,
                 )
                 cached_cats.update(new_cats)
                 save_issue_category_cache(issue_cat_cache, cached_cats)
                 left = len(uncategorized) - len(new_cats)
                 if left:
                     # not cached, so the next run retries them; tonight they read as "other"
-                    logger.error(f"  {left} issues left uncategorized "
-                                 f"({categorization_failures} failed batch(es)); "
-                                 "counted as 'other' this run, retried next run")
+                    logger.error(
+                        f"  {left} issues left uncategorized "
+                        f"({categorization_failures} failed batch(es)); "
+                        "counted as 'other' this run, retried next run"
+                    )
             issue_categories = cached_cats
 
             # persist per-conversation categories for downstream use / plotting;
@@ -2435,9 +2645,10 @@ async def main():
             # reaches conversation_issue or the admin chart
             for m in all_metrics:
                 if m.llm_issues:
-                    m.llm_issue_categories = sorted({
-                        issue_categories.get(i, "other") for i in m.llm_issues
-                    } - NON_ISSUE_CATEGORIES)
+                    m.llm_issue_categories = sorted(
+                        {issue_categories.get(i, "other") for i in m.llm_issues}
+                        - NON_ISSUE_CATEGORIES
+                    )
 
     success_dist = Counter(m.success_label for m in all_metrics)
     logger.info(f"  Success: {dict(success_dist)}")
@@ -2464,12 +2675,8 @@ async def main():
             # non-stale and passes None) and neither disturbs the provenance mix of
             # genuinely judged rows. Tightening would mean an
             # `m.session_id in topics` guard here.
-            topic_model=(
-                None if m.session_id in replayed_topic_ids else topic_model_used
-            ),
-            quality_model=(
-                args.quality_model if m.session_id in judged_quality_ids else None
-            ),
+            topic_model=(None if m.session_id in replayed_topic_ids else topic_model_used),
+            quality_model=(args.quality_model if m.session_id in judged_quality_ids else None),
         )
     logger.info(f"  Persisted {len(all_metrics)} analyses to the DB cache")
 
@@ -2478,9 +2685,16 @@ async def main():
 
     # --- generate report ---
     logger.info("Generating report...")
-    report = generate_report(all_metrics, sessions, messages, tool_stats, cost_tracker,
-                             issue_categories=issue_categories, sdk_stats=sdk_stats,
-                             sdk_notices=sdk_notices)
+    report = generate_report(
+        all_metrics,
+        sessions,
+        messages,
+        tool_stats,
+        cost_tracker,
+        issue_categories=issue_categories,
+        sdk_stats=sdk_stats,
+        sdk_notices=sdk_notices,
+    )
     print(report)
 
     # also write the report (stdout content) to a markdown file
@@ -2499,7 +2713,9 @@ async def main():
         else:
             max_per_topic = 5
         export_eval_dataset(
-            all_metrics, messages, output_dir,
+            all_metrics,
+            messages,
+            output_dir,
             max_per_topic=max_per_topic,
             literature_bearing_only=args.literature_bearing,
         )

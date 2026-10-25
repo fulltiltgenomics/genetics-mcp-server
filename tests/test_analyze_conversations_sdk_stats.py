@@ -81,14 +81,38 @@ def test_parser_skips_unrelated_lines_and_reads_formatted_ones():
 
 def test_session_stats_aggregate_calls_rows_and_executions():
     calls = [
-        {"session_id": "s1", "user": "u", "execution_id": "e1",
-         "sdk_function": "expression", "sdk_rows": 10, "sdk_error": ""},
-        {"session_id": "s1", "user": "u", "execution_id": "e1",
-         "sdk_function": "sql", "sdk_rows": 5, "sdk_error": ""},
-        {"session_id": "s1", "user": "u", "execution_id": "e2",
-         "sdk_function": "expression", "sdk_rows": 0, "sdk_error": ""},
-        {"session_id": "s2", "user": "u", "execution_id": "e3",
-         "sdk_function": "ld", "sdk_rows": 3, "sdk_error": ""},
+        {
+            "session_id": "s1",
+            "user": "u",
+            "execution_id": "e1",
+            "sdk_function": "expression",
+            "sdk_rows": 10,
+            "sdk_error": "",
+        },
+        {
+            "session_id": "s1",
+            "user": "u",
+            "execution_id": "e1",
+            "sdk_function": "sql",
+            "sdk_rows": 5,
+            "sdk_error": "",
+        },
+        {
+            "session_id": "s1",
+            "user": "u",
+            "execution_id": "e2",
+            "sdk_function": "expression",
+            "sdk_rows": 0,
+            "sdk_error": "",
+        },
+        {
+            "session_id": "s2",
+            "user": "u",
+            "execution_id": "e3",
+            "sdk_function": "ld",
+            "sdk_rows": 3,
+            "sdk_error": "",
+        },
     ]
     stats = build_session_sdk_stats(calls).sort("session_id")
     assert stats["total_sdk_calls"].to_list() == [3, 1]
@@ -104,33 +128,54 @@ def test_empty_input_gives_the_joinable_empty_frame():
 
 
 def _sessions_and_messages():
-    sessions = pl.DataFrame({
-        "id": ["s1"], "user_id": ["u@x"], "created_at": ["2026-08-01"], "rating": [None],
-    })
-    messages = pl.DataFrame({
-        "session_id": ["s1", "s1"],
-        "role": ["user", "assistant"],
-        "content": ["hi", "*[Using tool: run_analysis; script: ...]*"],
-        "content_json": [
-            None,
-            '[{"type": "tool_use", "name": "run_analysis", "input": {}}]',
-        ],
-        "created_at": ["2026-08-01", "2026-08-01"],
-        "thumbs_up": [None, None],
-        "tool_profile": [None, None],
-        "_rowid": [1, 2],
-    })
+    sessions = pl.DataFrame(
+        {
+            "id": ["s1"],
+            "user_id": ["u@x"],
+            "created_at": ["2026-08-01"],
+            "rating": [None],
+        }
+    )
+    messages = pl.DataFrame(
+        {
+            "session_id": ["s1", "s1"],
+            "role": ["user", "assistant"],
+            "content": ["hi", "*[Using tool: run_analysis; script: ...]*"],
+            "content_json": [
+                None,
+                '[{"type": "tool_use", "name": "run_analysis", "input": {}}]',
+            ],
+            "created_at": ["2026-08-01", "2026-08-01"],
+            "thumbs_up": [None, None],
+            "tool_profile": [None, None],
+            "_rowid": [1, 2],
+        }
+    )
     return sessions, messages
 
 
 def test_sdk_calls_are_counted_alongside_tool_calls():
     sessions, messages = _sessions_and_messages()
-    sdk_stats = build_session_sdk_stats([
-        {"session_id": "s1", "user": "u@x", "execution_id": "e1",
-         "sdk_function": "expression", "sdk_rows": 40, "sdk_error": ""},
-        {"session_id": "s1", "user": "u@x", "execution_id": "e1",
-         "sdk_function": "sql", "sdk_rows": 2, "sdk_error": ""},
-    ])
+    sdk_stats = build_session_sdk_stats(
+        [
+            {
+                "session_id": "s1",
+                "user": "u@x",
+                "execution_id": "e1",
+                "sdk_function": "expression",
+                "sdk_rows": 40,
+                "sdk_error": "",
+            },
+            {
+                "session_id": "s1",
+                "user": "u@x",
+                "execution_id": "e1",
+                "sdk_function": "sql",
+                "sdk_rows": 2,
+                "sdk_error": "",
+            },
+        ]
+    )
     metrics = compute_all_metrics(
         sessions, messages, build_session_tool_stats(messages), {}, sdk_stats=sdk_stats
     )
@@ -162,10 +207,18 @@ def test_report_states_the_absence_of_a_log_rather_than_reporting_zero():
 
 def test_report_lists_sdk_functions_when_a_log_is_supplied():
     sessions, messages = _sessions_and_messages()
-    sdk_stats = build_session_sdk_stats([
-        {"session_id": "s1", "user": "u@x", "execution_id": "e1",
-         "sdk_function": "expression", "sdk_rows": 40, "sdk_error": ""},
-    ])
+    sdk_stats = build_session_sdk_stats(
+        [
+            {
+                "session_id": "s1",
+                "user": "u@x",
+                "execution_id": "e1",
+                "sdk_function": "expression",
+                "sdk_rows": 40,
+                "sdk_error": "",
+            },
+        ]
+    )
     metrics = compute_all_metrics(
         sessions, messages, build_session_tool_stats(messages), {}, sdk_stats=sdk_stats
     )
@@ -180,10 +233,18 @@ def test_report_lists_sdk_functions_when_a_log_is_supplied():
 def test_calls_matching_no_session_are_reported_not_dropped():
     """Until 4h6.43/4h6.44 deliver the token, every line says session=unknown."""
     sessions, messages = _sessions_and_messages()
-    sdk_stats = build_session_sdk_stats([
-        {"session_id": "unknown", "user": "unknown", "execution_id": "unknown",
-         "sdk_function": "sql", "sdk_rows": 9, "sdk_error": ""},
-    ])
+    sdk_stats = build_session_sdk_stats(
+        [
+            {
+                "session_id": "unknown",
+                "user": "unknown",
+                "execution_id": "unknown",
+                "sdk_function": "sql",
+                "sdk_rows": 9,
+                "sdk_error": "",
+            },
+        ]
+    )
     metrics = compute_all_metrics(
         sessions, messages, build_session_tool_stats(messages), {}, sdk_stats=sdk_stats
     )
@@ -245,15 +306,27 @@ def test_the_marker_the_analyzer_looks_for_is_the_one_the_sdk_writes():
 
 def test_report_says_the_trail_is_forgeable_when_the_log_came_from_a_shared_stream():
     sessions, messages = _sessions_and_messages()
-    sdk_stats = build_session_sdk_stats([
-        {"session_id": "s1", "user": "u@x", "execution_id": "e1",
-         "sdk_function": "expression", "sdk_rows": 4, "sdk_error": ""},
-    ])
+    sdk_stats = build_session_sdk_stats(
+        [
+            {
+                "session_id": "s1",
+                "user": "u@x",
+                "execution_id": "e1",
+                "sdk_function": "expression",
+                "sdk_rows": 4,
+                "sdk_error": "",
+            },
+        ]
+    )
     metrics = compute_all_metrics(
         sessions, messages, build_session_tool_stats(messages), {}, sdk_stats=sdk_stats
     )
     report = generate_report(
-        metrics, sessions, messages, build_session_tool_stats(messages), sdk_stats=sdk_stats,
+        metrics,
+        sessions,
+        messages,
+        build_session_tool_stats(messages),
+        sdk_stats=sdk_stats,
         sdk_notices={"shared_stream": True, "truncated": 1, "truncated_at": 1000, "rejected": 7},
     )
     assert "not a tamper-evident audit trail" in report
@@ -265,8 +338,14 @@ def test_the_sequence_is_bounded_while_the_per_function_totals_stay_exact():
     """A script can make thousands of SDK calls from one `run_analysis`; the joined sequence
     would otherwise be a ~150 KB cell in the metrics row and in every CSV."""
     calls = [
-        {"session_id": "s1", "user": "u@x", "execution_id": "e1",
-         "sdk_function": "expression", "sdk_rows": 1, "sdk_error": ""}
+        {
+            "session_id": "s1",
+            "user": "u@x",
+            "execution_id": "e1",
+            "sdk_function": "expression",
+            "sdk_rows": 1,
+            "sdk_error": "",
+        }
         for _ in range(_SDK_SEQUENCE_MAX + 70)
     ]
     stats = build_session_sdk_stats(calls)

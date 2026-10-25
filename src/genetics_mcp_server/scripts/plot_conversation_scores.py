@@ -71,14 +71,13 @@ DISPOSITION_COLORS = {
 }
 
 # distinct colour per issue category from a 20-colour qualitative map
-ISSUE_CATEGORY_COLORS = {
-    name: plt.cm.tab20(i % 20) for i, name in enumerate(ISSUE_CATEGORY_NAMES)
-}
+ISSUE_CATEGORY_COLORS = {name: plt.cm.tab20(i % 20) for i, name in enumerate(ISSUE_CATEGORY_NAMES)}
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
 
 def load_metrics(path: Path) -> list[dict]:
     records = json.loads(path.read_text())
@@ -126,6 +125,7 @@ def load_from_db(db_path: Path) -> list[dict]:
 # Plot panels (render-only; all aggregation comes from analysis_timeseries)
 # ---------------------------------------------------------------------------
 
+
 def _arr(values):
     """None -> nan float array so matplotlib breaks the line at empty windows
     (the series carry JSON-friendly None; matplotlib draws gaps for nan)."""
@@ -135,8 +135,7 @@ def _arr(values):
 def panel_score_shares(ax, data, window):
     xs = [ats.parse_date(d) for d in data["dates"]]
     for s in SCORES:
-        ax.plot(xs, _arr(data["series"][str(s)]), label=f"score {s}",
-                color=SCORE_COLORS[s], lw=2)
+        ax.plot(xs, _arr(data["series"][str(s)]), label=f"score {s}", color=SCORE_COLORS[s], lw=2)
     ax.set_ylabel("share of conversations (%)")
     ax.set_title(f"Quality score distribution over time ({window}-day centered window)")
     ax.set_ylim(0, 100)
@@ -189,39 +188,53 @@ def panel_issue_category_shares(ax, data, window):
         any_data = True
         ax.plot(xs, _arr(vals), label=c, color=ISSUE_CATEGORY_COLORS[c], lw=2)
     ax.set_ylabel("share of issues (%)")
-    ax.set_title(f"Issue category mix over time ({window}-day window, "
-                 "deduped per conversation)")
+    ax.set_title(f"Issue category mix over time ({window}-day window, deduped per conversation)")
     ax.set_ylim(bottom=0)
     ax.legend(loc="upper left", ncol=3, fontsize=7, frameon=False)
     ax.grid(True, alpha=0.3)
     if not any_data:
-        ax.text(0.5, 0.5, "no issues in range",
-                transform=ax.transAxes, ha="center", va="center", color="#888888")
+        ax.text(
+            0.5,
+            0.5,
+            "no issues in range",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="#888888",
+        )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Plot evaluated conversation quality over time from the "
-                    "conversation_analysis DB tables or analyze_conversations "
-                    "metrics.json.",
+        "conversation_analysis DB tables or analyze_conversations "
+        "metrics.json.",
     )
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--db",
-                     help="Path to chat_history.db (reads conversation_analysis "
-                          "/ conversation_issue, read-only)")
-    src.add_argument("--metrics",
-                     help="Path to metrics.json from analyze_conversations")
-    parser.add_argument("--out", default=None,
-                        help="Output image path (default: <source dir>/scores_over_time.png)")
-    parser.add_argument("--window", type=int, default=7,
-                        help="Sliding window width in days, centered (default: 7)")
-    parser.add_argument("--min-n", type=int, default=3,
-                        help="Minimum conversations in a window to plot a point "
-                             "(below this the line breaks instead of spiking; default: 3)")
+    src.add_argument(
+        "--db",
+        help="Path to chat_history.db (reads conversation_analysis "
+        "/ conversation_issue, read-only)",
+    )
+    src.add_argument("--metrics", help="Path to metrics.json from analyze_conversations")
+    parser.add_argument(
+        "--out", default=None, help="Output image path (default: <source dir>/scores_over_time.png)"
+    )
+    parser.add_argument(
+        "--window", type=int, default=7, help="Sliding window width in days, centered (default: 7)"
+    )
+    parser.add_argument(
+        "--min-n",
+        type=int,
+        default=3,
+        help="Minimum conversations in a window to plot a point "
+        "(below this the line breaks instead of spiking; default: 3)",
+    )
     args = parser.parse_args()
 
     if args.db:
@@ -241,22 +254,32 @@ def main():
     meta = series["meta"]
 
     if meta["skipped_no_date"]:
-        print(f"  Skipped {meta['skipped_no_date']} records with no/unparseable "
-              "created_at (re-run analyze_conversations to populate it)",
-              file=sys.stderr)
+        print(
+            f"  Skipped {meta['skipped_no_date']} records with no/unparseable "
+            "created_at (re-run analyze_conversations to populate it)",
+            file=sys.stderr,
+        )
 
     if meta["empty"]:
-        print("Error: no records with a parseable created_at — re-run "
-              "analyze_conversations so the analysis includes session dates.",
-              file=sys.stderr)
+        print(
+            "Error: no records with a parseable created_at — re-run "
+            "analyze_conversations so the analysis includes session dates.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     n_scored = meta["scored"]
-    print(f"  {meta['total']} dated conversations, {n_scored} with an LLM quality "
-          f"score, {meta['date_min']} to {meta['date_max']}", file=sys.stderr)
+    print(
+        f"  {meta['total']} dated conversations, {n_scored} with an LLM quality "
+        f"score, {meta['date_min']} to {meta['date_max']}",
+        file=sys.stderr,
+    )
     if n_scored == 0:
-        print("Warning: no llm_quality_score values — score panels will be empty. "
-              "Run analyze_conversations without --no-llm.", file=sys.stderr)
+        print(
+            "Warning: no llm_quality_score values — score panels will be empty. "
+            "Run analyze_conversations without --no-llm.",
+            file=sys.stderr,
+        )
 
     fig, axes = plt.subplots(4, 1, figsize=(13, 17), sharex=True)
     panel_score_shares(axes[0], series["score_share"], args.window)
@@ -268,8 +291,7 @@ def main():
     axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
     fig.autofmt_xdate()
     fig.suptitle(
-        f"Genie LLM-as-judge quality over time  "
-        f"(n={n_scored} scored, {args.window}-day window)",
+        f"Genie LLM-as-judge quality over time  (n={n_scored} scored, {args.window}-day window)",
         fontsize=13,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.99))

@@ -34,7 +34,7 @@ the same commit. `scripts/check-doc-drift.sh` warns (never blocks) on commits th
 violate this; it runs from the `pre-commit` hook.
 
 The same hook also runs `scripts/lint-staged.sh`, which **does** block: a commit whose
-staged files the linter rejects is refused. Neither hook runs until
+staged files the linter rejects or `ruff format --check` finds unformatted is refused. Neither hook runs until
 `scripts/install-git-hooks.sh` has been run once in the clone — `core.hooksPath` is
 local git config that no clone carries — and because that setting is shared across
 worktrees, one run also covers every worktree, existing and future.
@@ -45,6 +45,8 @@ worktrees, one run also covers every worktree, existing and future.
 | `src/genetics_mcp_server/tools/executor.py` | `docs/project-spec.md`, `docs/variant-list-analysis.md` | tool execution, truncation and download handling; the variant-list doc when `analyze_variant_list` changes |
 | `src/genetics_mcp_server/tools/orchestration.py` | `docs/project-spec.md` | the code-execution tool layer: the `run_analysis` gateway and its identity refusal, artifact scoping, literature and web search. What the sandbox image ships is the suite repo's `sandbox/prune_venv.py` and `docs/code-execution-security.md` |
 | `src/genetics_mcp_server/routers/**` | `docs/project-spec.md` | admin endpoint list, API token endpoints, admin access rules |
+| `src/genetics_mcp_server/skills/**` | `docs/project-spec.md` | the subagent skills: which exist, the core tool list every skill gets, and which skills are granted `run_analysis` |
+| `src/genetics_mcp_server/mcp_server.py`, `llm_service.py`, `subagent.py` | `genetics-results-suite/docs/chat-tool-reference.md` (sibling repo) | the three tool-exclusion layers and the resolved per-surface tool counts; a diff staged here can never contain that doc, so the warning is a reminder to update it there and the suite's `gen-doc-blocks.py --check` is what catches a stale count |
 | `src/genetics_mcp_server/config/**` | `docs/project-spec.md`, `.env.example` | env-var tables, default prompts; every new variable in `.env.example` |
 | `src/genetics_mcp_server/auth/**`, `mcp_server.py`, `mcp_proxy.py` | `docs/project-spec.md`, `README.md` | bearer auth branches, `MCP_API_KEY` being mandatory on remote transports, `MCP_ALLOW_QUERY_TOKEN` gating, external MCP proxying |
 | `src/genetics_mcp_server/scripts/analyze_variants.py` | `docs/variant-list-analysis.md` | CLI flags, input format, output JSON shape |
@@ -84,9 +86,12 @@ requires updating that repo's `docs/project-spec.md`, not just the docs here.
    - Tool executor methods are async
    - MCP and LLM service handlers are async
 4. Private fields and methods should be prefixed with underscore
-5. Code should pass linting at all times (`ruff check`, or `scripts/lint-staged.sh --all`).
-   The `pre-commit` hook runs `scripts/lint-staged.sh`, which lints the **staged** Python
-   files and **blocks the commit** on a finding; `git commit --no-verify` is the bypass.
+5. Code should pass `ruff check` and `ruff format --check` at all times
+   (`scripts/lint-staged.sh --all` runs both). The `pre-commit` hook runs
+   `scripts/lint-staged.sh`, which lints and format-checks the **staged** Python files and
+   **blocks the commit** on a finding or an unformatted file; `git commit --no-verify` is
+   the bypass. Format with `ruff format <file>` before staging; the gate never rewrites
+   files itself.
    The rule set is `[tool.ruff.lint]` in `pyproject.toml` and matches the sibling repos,
    because the same gate runs in all five and a per-repo rule set means the same file
    passes in one and fails in the next

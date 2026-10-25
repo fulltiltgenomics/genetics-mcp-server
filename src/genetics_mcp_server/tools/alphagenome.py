@@ -144,9 +144,7 @@ MODALITIES: dict[str, Modality] = {
 
 # 22 scorers and 9,440 tracks are available; these twelve are the ones with a stated
 # reading rule, and the default asks only for the calibrated ones.
-DEFAULT_MODALITIES: tuple[str, ...] = tuple(
-    name for name, m in MODALITIES.items() if m.tier <= 3
-)
+DEFAULT_MODALITIES: tuple[str, ...] = tuple(name for name, m in MODALITIES.items() if m.tier <= 3)
 
 # The suite's BigQuery views encode X as 23. AlphaGenome accepts 'chrX' and rejects
 # 'chr23', '23' and bare 'X' with ValueError('Chromosome ... not found.'), so this map is
@@ -695,9 +693,7 @@ class AlphaGenomeClient:
             outcome = scored.get(vid)
             if outcome is None or _is_error(outcome):
                 sentinel = outcome or _error("prediction", "no prediction returned")
-                results.append(
-                    _failed(sentinel["_stage"], sentinel["_error"], {"variant_id": vid})
-                )
+                results.append(_failed(sentinel["_stage"], sentinel["_error"], {"variant_id": vid}))
                 continue
             entry = {
                 "success": True,
@@ -756,9 +752,7 @@ class AlphaGenomeClient:
         )
 
 
-def _cache_key(
-    variant: dict[str, Any], cell_type: str | None, names: Sequence[str]
-) -> str:
+def _cache_key(variant: dict[str, Any], cell_type: str | None, names: Sequence[str]) -> str:
     """Everything that can make one prediction differ from another.
 
     The cell type is part of the key and not an afterthought: tracks are resolved per cell
@@ -961,8 +955,7 @@ def _columns(
         by_name = [
             i
             for i, row in enumerate(var_rows[:n_tracks])
-            if _slug(str(_first(row, "biosample_name", "gtex_tissue", "biosample") or ""))
-            in wanted
+            if _slug(str(_first(row, "biosample_name", "gtex_tissue", "biosample") or "")) in wanted
         ]
         if by_name:
             return by_name, True

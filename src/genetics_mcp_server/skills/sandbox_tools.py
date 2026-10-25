@@ -27,9 +27,7 @@ def _validate_path(path: str, allowed_paths: list[str]) -> Path:
         if resolved == allowed_resolved or allowed_resolved in resolved.parents:
             return resolved
 
-    raise ValueError(
-        f"Path '{path}' is outside allowed directories: {allowed_paths}"
-    )
+    raise ValueError(f"Path '{path}' is outside allowed directories: {allowed_paths}")
 
 
 async def read_file(path: str, allowed_paths: list[str]) -> dict[str, Any]:
@@ -72,11 +70,13 @@ async def list_directory(path: str, allowed_paths: list[str]) -> dict[str, Any]:
 
         entries = []
         for entry in sorted(resolved.iterdir()):
-            entries.append({
-                "name": entry.name,
-                "type": "directory" if entry.is_dir() else "file",
-                "size": entry.stat().st_size if entry.is_file() else None,
-            })
+            entries.append(
+                {
+                    "name": entry.name,
+                    "type": "directory" if entry.is_dir() else "file",
+                    "size": entry.stat().st_size if entry.is_file() else None,
+                }
+            )
 
         return {"success": True, "path": str(resolved), "entries": entries}
     except ValueError as e:
@@ -91,33 +91,37 @@ def get_sandbox_tool_definitions(allow_file_read: bool) -> list[dict[str, Any]]:
     tools = []
 
     if allow_file_read:
-        tools.append({
-            "name": "read_file",
-            "description": "Read the contents of a file. Only files within allowed directories can be read.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute path to the file to read",
+        tools.append(
+            {
+                "name": "read_file",
+                "description": "Read the contents of a file. Only files within allowed directories can be read.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the file to read",
+                        },
                     },
+                    "required": ["path"],
                 },
-                "required": ["path"],
-            },
-        })
-        tools.append({
-            "name": "list_directory",
-            "description": "List the contents of a directory. Only directories within allowed paths can be listed.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute path to the directory to list",
+            }
+        )
+        tools.append(
+            {
+                "name": "list_directory",
+                "description": "List the contents of a directory. Only directories within allowed paths can be listed.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the directory to list",
+                        },
                     },
+                    "required": ["path"],
                 },
-                "required": ["path"],
-            },
-        })
+            }
+        )
 
     return tools

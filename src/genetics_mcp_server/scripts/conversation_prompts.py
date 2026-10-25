@@ -42,23 +42,71 @@ Messages:
 # (stayed wrong vs got fixed), capability_gap vs missed_data_source (data the
 # system lacks vs data it has and did not use).
 ISSUE_CATEGORIES = [
-    ("incomplete_answer", "Answered only part of the question, omitted requested detail, or narrowed the scope without being asked"),
-    ("missed_data_source", "Failed to use or find data the system does have; claimed no data when data exists; queried the wrong source"),
-    ("capability_gap", "The requested data or analysis is not available through the assistant's tools (missing dataset, reference panel, plot type, external database, or API filter) and the assistant disclosed the limitation"),
-    ("inaccurate_claim", "Stated something factually wrong, misleading, or unsupported, and it was not corrected within the conversation"),
-    ("self_corrected_error", "Made an error that was later corrected, either by the assistant itself or after the user pushed back"),
-    ("fabrication", "Invented data, results, numbers, citations, or tool output that was not actually returned"),
-    ("weak_grounding", "Conclusions rest on proxies, extrapolation, or speculation and are presented with more rigor than the data supports, even if caveated"),
-    ("inefficient_tool_use", "Redundant, repeated, or unnecessary tool calls; schema or column-name thrashing; per-item calls where a batch was possible"),
-    ("tool_failure_handling", "A tool errored or returned nothing and the assistant gave up, did not retry, or failed to recover"),
-    ("platform_error", "Infrastructure problem outside the assistant's control that the assistant handled acceptably: connection interrupted or response cut off mid-stream, attachment did not reach the assistant, download link or endpoint broken, external API rate-limited or down, tool output truncated"),
-    ("misunderstood_question", "Misinterpreted what the user was actually asking, or proceeded on an unconfirmed assumption where a clarifying question was warranted"),
-    ("no_conclusion", "Did not synthesize results into a clear answer; left the conversation hanging or ended awaiting a go-ahead"),
-    ("missing_interpretation", "Returned raw data or tables without interpreting them for the user"),
-    ("missing_deliverable", "A requested file, table, plot, or download was described or promised but not actually produced or usable"),
-    ("formatting_readability", "Poor formatting or hard to read; dumped raw tables; overly long or dense output relative to the question"),
+    (
+        "incomplete_answer",
+        "Answered only part of the question, omitted requested detail, or narrowed the scope without being asked",
+    ),
+    (
+        "missed_data_source",
+        "Failed to use or find data the system does have; claimed no data when data exists; queried the wrong source",
+    ),
+    (
+        "capability_gap",
+        "The requested data or analysis is not available through the assistant's tools (missing dataset, reference panel, plot type, external database, or API filter) and the assistant disclosed the limitation",
+    ),
+    (
+        "inaccurate_claim",
+        "Stated something factually wrong, misleading, or unsupported, and it was not corrected within the conversation",
+    ),
+    (
+        "self_corrected_error",
+        "Made an error that was later corrected, either by the assistant itself or after the user pushed back",
+    ),
+    (
+        "fabrication",
+        "Invented data, results, numbers, citations, or tool output that was not actually returned",
+    ),
+    (
+        "weak_grounding",
+        "Conclusions rest on proxies, extrapolation, or speculation and are presented with more rigor than the data supports, even if caveated",
+    ),
+    (
+        "inefficient_tool_use",
+        "Redundant, repeated, or unnecessary tool calls; schema or column-name thrashing; per-item calls where a batch was possible",
+    ),
+    (
+        "tool_failure_handling",
+        "A tool errored or returned nothing and the assistant gave up, did not retry, or failed to recover",
+    ),
+    (
+        "platform_error",
+        "Infrastructure problem outside the assistant's control that the assistant handled acceptably: connection interrupted or response cut off mid-stream, attachment did not reach the assistant, download link or endpoint broken, external API rate-limited or down, tool output truncated",
+    ),
+    (
+        "misunderstood_question",
+        "Misinterpreted what the user was actually asking, or proceeded on an unconfirmed assumption where a clarifying question was warranted",
+    ),
+    (
+        "no_conclusion",
+        "Did not synthesize results into a clear answer; left the conversation hanging or ended awaiting a go-ahead",
+    ),
+    (
+        "missing_interpretation",
+        "Returned raw data or tables without interpreting them for the user",
+    ),
+    (
+        "missing_deliverable",
+        "A requested file, table, plot, or download was described or promised but not actually produced or usable",
+    ),
+    (
+        "formatting_readability",
+        "Poor formatting or hard to read; dumped raw tables; overly long or dense output relative to the question",
+    ),
     ("overcautious", "Unnecessarily refused, hedged, or added excessive caveats"),
-    ("not_an_issue", "Not a problem at all: praise, a neutral observation, a limitation the assistant handled well, or a note about a greeting or test message"),
+    (
+        "not_an_issue",
+        "Not a problem at all: praise, a neutral observation, a limitation the assistant handled well, or a note about a greeting or test message",
+    ),
     ("other", "A genuine issue that does not fit any category above"),
 ]
 

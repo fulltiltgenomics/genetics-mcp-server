@@ -113,7 +113,8 @@ LITERATURE_SKILL = "literature_review"
 PROD_CONTEXT = "gke_daly-finngenie_us-central1-a_finngenie"
 DEFAULT_USERS = ("bneale", "mjdaly", "finucane")
 DEFAULT_MODEL = "claude-opus-5"
-# a turn's findings list runs to a few KB of JSON; the nightly judge's 1000 truncates it
+# a turn's findings list runs to a few KB of JSON, more than the max_tokens the nightly quality
+# judge in analyze_conversations.py allows, so that budget cannot be reused here
 DEFAULT_MAX_TOKENS = 8000
 
 # what the answering model could see of one tool result (settings.mcp_max_result_size), so the
@@ -139,6 +140,7 @@ DEFAULT_LABELS_DIR = (
 # ---------------------------------------------------------------------------
 # Turns
 # ---------------------------------------------------------------------------
+
 
 def _json_list(raw) -> list:
     if not raw:
@@ -178,16 +180,16 @@ def is_literature_bearing(row: dict) -> bool:
 
 
 def is_persisted(row: dict) -> bool:
-    return bool(_json_list(row.get("content_json"))) and bool(_json_list(row.get("tool_results_json")))
+    return bool(_json_list(row.get("content_json"))) and bool(
+        _json_list(row.get("tool_results_json"))
+    )
 
 
 def _result_text(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
-        )
+        return "\n".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
     return json.dumps(content, default=str)
 
 
@@ -201,11 +203,13 @@ def literature_results(row: dict) -> list[dict]:
     out = []
     for use in literature_tool_uses(row.get("content_json")):
         result = by_id.get(use.get("id"))
-        out.append({
-            "name": use.get("name"),
-            "input": use.get("input"),
-            "content": _result_text(result.get("content")) if result else "",
-        })
+        out.append(
+            {
+                "name": use.get("name"),
+                "input": use.get("input"),
+                "content": _result_text(result.get("content")) if result else "",
+            }
+        )
     return out
 
 
@@ -244,12 +248,19 @@ def build_turns(rows: list[dict]) -> list[Turn]:
             if r.get("role") != "assistant":
                 continue
             lit = literature_results(r)
-            turns.append(Turn(
-                id=r["id"], question=question, answer=r.get("content") or "",
-                literature_results=lit, earlier_results=list(earlier), session_id=sid,
-                user=(r.get("user_id") or "").split("@")[0],
-                created_at=r.get("created_at") or "", persisted=is_persisted(r),
-            ))
+            turns.append(
+                Turn(
+                    id=r["id"],
+                    question=question,
+                    answer=r.get("content") or "",
+                    literature_results=lit,
+                    earlier_results=list(earlier),
+                    session_id=sid,
+                    user=(r.get("user_id") or "").split("@")[0],
+                    created_at=r.get("created_at") or "",
+                    persisted=is_persisted(r),
+                )
+            )
             earlier.extend(lit)
     return turns
 
@@ -270,8 +281,13 @@ def load_replay(path: Path) -> list[Turn]:
             if isinstance(item, str):
                 out.append({"name": LITERATURE_TOOL, "input": None, "content": item})
             elif isinstance(item, dict) and "content" in item:
-                out.append({"name": item.get("name", LITERATURE_TOOL), "input": item.get("input"),
-                            "content": _result_text(item["content"])})
+                out.append(
+                    {
+                        "name": item.get("name", LITERATURE_TOOL),
+                        "input": item.get("input"),
+                        "content": _result_text(item["content"]),
+                    }
+                )
             else:
                 raise ValueError(f"{path}: a literature result must be a string or have 'content'")
         return out
@@ -299,12 +315,15 @@ def load_replay(path: Path) -> list[Turn]:
             harness_by_group.setdefault((t.get("case_id"), t.get("arm")), []).append(entry)
             entries.append(entry)
         elif "question" in t and "answer" in t:
-            entries.append({
-                "turn_id": str(t.get("id", i)), "question": t["question"] or "",
-                "answer": t["answer"] or "",
-                "literature_results": results(t.get("literature_results")),
-                "earlier_results": results(t.get("earlier_results")),
-            })
+            entries.append(
+                {
+                    "turn_id": str(t.get("id", i)),
+                    "question": t["question"] or "",
+                    "answer": t["answer"] or "",
+                    "literature_results": results(t.get("literature_results")),
+                    "earlier_results": results(t.get("earlier_results")),
+                }
+            )
         else:
             raise ValueError(
                 f"{path}: turn {i} lacks 'question'/'answer' (or the harness's "
@@ -322,10 +341,16 @@ def load_replay(path: Path) -> list[Turn]:
             earlier.extend(entry["literature_results"])
 
     turns = [
-        Turn(id=e["turn_id"], question=e["question"], answer=e["answer"],
-             literature_results=e["literature_results"], earlier_results=e["earlier_results"],
-             arm=e.get("arm", ""))
-        for e in entries if e is not None
+        Turn(
+            id=e["turn_id"],
+            question=e["question"],
+            answer=e["answer"],
+            literature_results=e["literature_results"],
+            earlier_results=e["earlier_results"],
+            arm=e.get("arm", ""),
+        )
+        for e in entries
+        if e is not None
     ]
     if skipped:
         logger.info("--report: skipped %d harness turn(s) with status != 'ok'", skipped)
@@ -383,20 +408,31 @@ def parse_labels(text: str, source: str) -> list[Label]:
         else:
             cats = {int(c) for c in NAMED_CATEGORY_RE.findall(body)}
         sev = SEVERITY_RE.search(body)
-        labels.append(Label(
-            kind=current["kind"], num=current["num"], source=source,
-            session=current["attrs"].get("session", ""), msg=current["attrs"].get("msg", ""),
-            categories=frozenset(c for c in cats if c in CATEGORIES),
-            severity=sev.group("sev").lower().rstrip(".") if sev else "",
-            quotes=QUOTE_RE.findall(body), text=body, void=bool(VOID_RE.search(body)),
-        ))
+        labels.append(
+            Label(
+                kind=current["kind"],
+                num=current["num"],
+                source=source,
+                session=current["attrs"].get("session", ""),
+                msg=current["attrs"].get("msg", ""),
+                categories=frozenset(c for c in cats if c in CATEGORIES),
+                severity=sev.group("sev").lower().rstrip(".") if sev else "",
+                quotes=QUOTE_RE.findall(body),
+                text=body,
+                void=bool(VOID_RE.search(body)),
+            )
+        )
 
     for line in text.splitlines():
         head = LABEL_HEAD_RE.match(line)
         if head:
             close()
-            current = {"kind": head["kind"], "num": int(head["num"]),
-                       "attrs": dict(ATTR_RE.findall(head["attrs"])), "lines": [line]}
+            current = {
+                "kind": head["kind"],
+                "num": int(head["num"]),
+                "attrs": dict(ATTR_RE.findall(head["attrs"])),
+                "lines": [line],
+            }
         elif line.startswith("#"):
             close()
             current = None
@@ -414,15 +450,22 @@ def load_labels(labels_dir: Path) -> tuple[list[Label], list[Label]]:
     return [lab for lab in labels if not lab.void], [lab for lab in labels if lab.void]
 
 
-def resolve_labels(labels: list[Label], turns: list[Turn]) -> tuple[dict[str, list[Label]], list[Label]]:
+def resolve_labels(
+    labels: list[Label], turns: list[Turn]
+) -> tuple[dict[str, list[Label]], list[Label]]:
     """Map labels to turns by message-id prefix; reviewers wrote both full ids and 8-char ones."""
     by_id = {t.id: t for t in turns}
     ids = sorted(by_id)
     resolved: dict[str, list[Label]] = {}
     unresolved = []
     for lab in labels:
-        matches = [i for i in ids if lab.msg and i.startswith(lab.msg)
-                   and (not lab.session or by_id[i].session_id.startswith(lab.session))]
+        matches = [
+            i
+            for i in ids
+            if lab.msg
+            and i.startswith(lab.msg)
+            and (not lab.session or by_id[i].session_id.startswith(lab.session))
+        ]
         if len(matches) == 1:
             resolved.setdefault(matches[0], []).append(lab)
         else:
@@ -438,13 +481,14 @@ def half_of(msg_id: str) -> str:
 # Agreement
 # ---------------------------------------------------------------------------
 
+
 def _words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
 def _shingles(text: str, n: int) -> set[tuple]:
     w = _words(text)
-    return {tuple(w[i:i + n]) for i in range(len(w) - n + 1)}
+    return {tuple(w[i : i + n]) for i in range(len(w) - n + 1)}
 
 
 def quotes_overlap(quote: str, claim: str, n: int = 6) -> bool:
@@ -489,7 +533,9 @@ class Agreement:
         return (self.finding_hits + self.counter_kept) / n if n else None
 
 
-def score_agreement(labels_by_turn: dict[str, list[Label]], judgements: dict[str, dict]) -> Agreement:
+def score_agreement(
+    labels_by_turn: dict[str, list[Label]], judgements: dict[str, dict]
+) -> Agreement:
     agg = Agreement()
     for turn_id, labels in labels_by_turn.items():
         judged = judgements.get(turn_id)
@@ -511,9 +557,12 @@ def score_agreement(labels_by_turn: dict[str, list[Label]], judgements: dict[str
             if lab.kind != "G":
                 continue
             agg.counter_examples += 1
-            hit = [f for f in findings
-                   if (lab.categories & _finding_categories(f))
-                   or any(quotes_overlap(q, str(f.get("claim", ""))) for q in lab.quotes)]
+            hit = [
+                f
+                for f in findings
+                if (lab.categories & _finding_categories(f))
+                or any(quotes_overlap(q, str(f.get("claim", ""))) for q in lab.quotes)
+            ]
             if hit:
                 agg.violated.append((turn_id, lab.key, hit[0].get("claim", "")))
             else:
@@ -525,11 +574,14 @@ def score_agreement(labels_by_turn: dict[str, list[Label]], judgements: dict[str
 # Baseline summary
 # ---------------------------------------------------------------------------
 
+
 def category_mix(category_sets) -> Counter:
     mix = Counter()
     for cats in category_sets:
         rec, clm = bool(cats & RECORD_DECIDABLE), bool(cats & CLAIM_LEVEL)
-        mix["both" if rec and clm else "record_only" if rec else "claim_only" if clm else "other"] += 1
+        mix[
+            "both" if rec and clm else "record_only" if rec else "claim_only" if clm else "other"
+        ] += 1
     return mix
 
 
@@ -544,15 +596,23 @@ def summarize(judgements: dict[str, dict]) -> dict:
         "findings_per_turn": len(findings) / n if n else None,
         "uncategorised_dropped": len(raw) - len(findings),
         "turns_with_finding": sum(
-            1 for j in judgements.values()
-            if any(isinstance(f, dict) and _finding_categories(f) for f in j.get("findings") or [])),
+            1
+            for j in judgements.values()
+            if any(isinstance(f, dict) and _finding_categories(f) for f in j.get("findings") or [])
+        ),
         "high_severity": sum(1 for f in findings if str(f.get("severity", "")).lower() == "high"),
         "by_category": {c: by_cat.get(c, 0) for c in CATEGORIES},
         "category_mix": dict(category_mix(_finding_categories(f) for f in findings)),
         "counter_examples": sum(len(j.get("counter_examples") or []) for j in judgements.values()),
-        "overcautious_turn_rate": (sum(1 for j in judgements.values() if j.get("overcautious")) / n) if n else None,
+        "overcautious_turn_rate": (sum(1 for j in judgements.values() if j.get("overcautious")) / n)
+        if n
+        else None,
         "overcautious_flags": sum(len(j.get("overcautious") or []) for j in judgements.values()),
-        "boilerplate_turn_rate": (sum(1 for j in judgements.values() if j.get("boilerplate_caveats")) / n) if n else None,
+        "boilerplate_turn_rate": (
+            sum(1 for j in judgements.values() if j.get("boilerplate_caveats")) / n
+        )
+        if n
+        else None,
     }
 
 
@@ -575,7 +635,7 @@ def summarize_by_arm(turns: list[Turn], judgements: dict[str, dict]) -> dict[str
 # Prod rows
 # ---------------------------------------------------------------------------
 
-_POD_PROGRAM = '''
+_POD_PROGRAM = """
 import sqlite3, json
 users = {users!r}
 conn = sqlite3.connect("file:/data/chat_history.db?mode=ro", uri=True)
@@ -587,7 +647,7 @@ rows = conn.execute(
     "m.tool_results_json, m.literature_backend, s.user_id FROM chat_messages m "
     "JOIN chat_sessions s ON s.id = m.session_id WHERE " + where, params)
 print(json.dumps([dict(r) for r in rows], default=str))
-'''
+"""
 
 
 def rows_cache_path(context: str, users, cache_dir: Path) -> Path:
@@ -600,14 +660,30 @@ def pull_rows(context: str, users, cache_dir: Path, refresh: bool) -> list[dict]
     if cache.exists() and not refresh:
         return json.loads(cache.read_text())
     r = subprocess.run(
-        ["kubectl", "--context", context, "-n", "genetics", "exec", "-i", "deploy/chat-backend",
-         "--", "python3", "-"],
-        input=_POD_PROGRAM.format(users=tuple(users)), capture_output=True, text=True, timeout=600,
+        [
+            "kubectl",
+            "--context",
+            context,
+            "-n",
+            "genetics",
+            "exec",
+            "-i",
+            "deploy/chat-backend",
+            "--",
+            "python3",
+            "-",
+        ],
+        input=_POD_PROGRAM.format(users=tuple(users)),
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
     try:
         rows = json.loads(r.stdout)
     except ValueError:
-        sys.exit(f"in-pod sqlite read produced no JSON (exit {r.returncode}): {r.stderr.strip()[:400]}")
+        sys.exit(
+            f"in-pod sqlite read produced no JSON (exit {r.returncode}): {r.stderr.strip()[:400]}"
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(rows))
     return rows
@@ -617,8 +693,13 @@ def pull_rows(context: str, users, cache_dir: Path, refresh: bool) -> list[dict]
 # Judge call
 # ---------------------------------------------------------------------------
 
+
 def _cap(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit] + f"\n[... {len(text) - limit} chars cut by the judge harness ...]"
+    return (
+        text
+        if len(text) <= limit
+        else text[:limit] + f"\n[... {len(text) - limit} chars cut by the judge harness ...]"
+    )
 
 
 def _format_results(results: list[dict], per_result: int, total: int | None = None) -> str:
@@ -626,8 +707,10 @@ def _format_results(results: list[dict], per_result: int, total: int | None = No
         return "(none)"
     parts, used = [], 0
     for i, r in enumerate(results, 1):
-        block = (f"### result {i}: {r.get('name')} input={json.dumps(r.get('input'), default=str)[:600]}\n"
-                 f"{_cap(r.get('content') or '(no result persisted)', per_result)}")
+        block = (
+            f"### result {i}: {r.get('name')} input={json.dumps(r.get('input'), default=str)[:600]}\n"
+            f"{_cap(r.get('content') or '(no result persisted)', per_result)}"
+        )
         if total is not None and used + len(block) > total:
             parts.append(f"[... {len(results) - i + 1} earlier results omitted ...]")
             break
@@ -643,7 +726,9 @@ def render_prompt(turn: Turn, today: str) -> str:
         question=_cap(turn.question, QUESTION_CAP),
         answer=_cap(turn.answer, ANSWER_CAP),
         literature_results=_format_results(turn.literature_results, RESULT_CAP),
-        earlier_results=_format_results(list(reversed(turn.earlier_results)), EARLIER_RESULT_CAP, EARLIER_CAP),
+        earlier_results=_format_results(
+            list(reversed(turn.earlier_results)), EARLIER_RESULT_CAP, EARLIER_CAP
+        ),
     )
 
 
@@ -667,8 +752,15 @@ class JudgeCache:
             f.write(json.dumps(rec) + "\n")
 
 
-async def judge_turns(turns: list[Turn], *, model: str, max_tokens: int, cache: JudgeCache,
-                      cost: CostTracker, concurrency: int) -> dict[str, dict]:
+async def judge_turns(
+    turns: list[Turn],
+    *,
+    model: str,
+    max_tokens: int,
+    cache: JudgeCache,
+    cost: CostTracker,
+    concurrency: int,
+) -> dict[str, dict]:
     import anthropic
 
     client = anthropic.AsyncAnthropic()
@@ -687,7 +779,10 @@ async def judge_turns(turns: list[Turn], *, model: str, max_tokens: int, cache: 
         async with sem:
             try:
                 resp = await create_with_backoff(
-                    client, model=model, max_tokens=max_tokens, **thinking_off_kwargs(model),
+                    client,
+                    model=model,
+                    max_tokens=max_tokens,
+                    **thinking_off_kwargs(model),
                     messages=[{"role": "user", "content": prompt}],
                 )
             except Exception as e:
@@ -698,8 +793,15 @@ async def judge_turns(turns: list[Turn], *, model: str, max_tokens: int, cache: 
         if not isinstance(parsed, dict):
             logger.error(f"judge returned no JSON object for {turn.id} (stop={resp.stop_reason})")
             return
-        cache.put({"key": key, "turn": turn.id, "model": model, "judgement": parsed,
-                   "usage": {"input": resp.usage.input_tokens, "output": resp.usage.output_tokens}})
+        cache.put(
+            {
+                "key": key,
+                "turn": turn.id,
+                "model": model,
+                "judgement": parsed,
+                "usage": {"input": resp.usage.input_tokens, "output": resp.usage.output_tokens},
+            }
+        )
         out[turn.id] = parsed
 
     await asyncio.gather(*(one(t) for t in turns))
@@ -710,20 +812,25 @@ async def judge_turns(turns: list[Turn], *, model: str, max_tokens: int, cache: 
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _pct(x) -> str:
     return "n/a" if x is None else f"{100 * x:.1f}%"
 
 
 def _print_summary(title: str, s: dict) -> None:
     print(f"\n== {title}")
-    print(f"turns judged: {s['turns']}; findings: {s['findings']} "
-          f"({s['findings_per_turn'] or 0:.2f}/turn); turns with >=1 finding: {s['turns_with_finding']}; "
-          f"high severity: {s['high_severity']}")
+    print(
+        f"turns judged: {s['turns']}; findings: {s['findings']} "
+        f"({s['findings_per_turn'] or 0:.2f}/turn); turns with >=1 finding: {s['turns_with_finding']}; "
+        f"high severity: {s['high_severity']}"
+    )
     print("by category: " + ", ".join(f"{c}:{n}" for c, n in s["by_category"].items()))
     print(f"category mix: {s['category_mix']}")
     print(f"uncategorised findings dropped: {s['uncategorised_dropped']}")
-    print(f"counter-examples: {s['counter_examples']}; overcautious turns: {_pct(s['overcautious_turn_rate'])} "
-          f"({s['overcautious_flags']} flags); boilerplate-caveat turns: {_pct(s['boilerplate_turn_rate'])}")
+    print(
+        f"counter-examples: {s['counter_examples']}; overcautious turns: {_pct(s['overcautious_turn_rate'])} "
+        f"({s['overcautious_flags']} flags); boilerplate-caveat turns: {_pct(s['boilerplate_turn_rate'])}"
+    )
 
 
 def _in_window(turn: Turn, since: str, until: str) -> bool:
@@ -734,8 +841,14 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--db", action="store_true", help="baseline over persisted prod turns")
-    mode.add_argument("--calibrate", choices=("dev", "heldout"), help="agreement on one half of the labelled turns")
-    mode.add_argument("--report", type=Path, help="judge a replay JSON (shape in the module docstring)")
+    mode.add_argument(
+        "--calibrate",
+        choices=("dev", "heldout"),
+        help="agreement on one half of the labelled turns",
+    )
+    mode.add_argument(
+        "--report", type=Path, help="judge a replay JSON (shape in the module docstring)"
+    )
     p.add_argument("--cache-dir", type=Path, required=True)
     p.add_argument("--context", default=PROD_CONTEXT)
     p.add_argument("--users", default=",".join(DEFAULT_USERS))
@@ -746,7 +859,9 @@ def main(argv=None) -> None:
     p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--refresh-rows", action="store_true")
-    p.add_argument("--dry-run", action="store_true", help="select turns and print counts; no API calls")
+    p.add_argument(
+        "--dry-run", action="store_true", help="select turns and print counts; no API calls"
+    )
     p.add_argument("--out", type=Path, help="write per-turn judgements and the summary as JSON")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -757,39 +872,60 @@ def main(argv=None) -> None:
 
     if args.report:
         turns = load_replay(args.report)
-        print(f"{len(turns)} replay turns, {sum(t.literature_bearing for t in turns)} literature-bearing")
+        print(
+            f"{len(turns)} replay turns, {sum(t.literature_bearing for t in turns)} literature-bearing"
+        )
     else:
         rows = pull_rows(args.context, args.users.split(","), args.cache_dir, args.refresh_rows)
         all_turns = build_turns(rows)
         print(f"{len(rows)} rows, {len(all_turns)} assistant turns")
         if args.db:
-            turns = [t for t in all_turns if t.persisted and t.literature_bearing
-                     and _in_window(t, args.since, args.until)]
-            print(f"{len(turns)} persisted literature-bearing turns in [{args.since}, {args.until})")
+            turns = [
+                t
+                for t in all_turns
+                if t.persisted and t.literature_bearing and _in_window(t, args.since, args.until)
+            ]
+            print(
+                f"{len(turns)} persisted literature-bearing turns in [{args.since}, {args.until})"
+            )
         else:
             labels, voided = load_labels(args.labels_dir)
-            print(f"VOID labels skipped: {len(voided)} ({', '.join(lab.key for lab in voided) or 'none'})")
+            print(
+                f"VOID labels skipped: {len(voided)} ({', '.join(lab.key for lab in voided) or 'none'})"
+            )
             resolved, unresolved = resolve_labels(labels, all_turns)
             by_id = {t.id: t for t in all_turns}
             usable = {tid: labs for tid, labs in resolved.items() if by_id[tid].persisted}
             half = {tid: labs for tid, labs in usable.items() if half_of(tid) == args.calibrate}
             turns = [by_id[tid] for tid in sorted(half)]
             n_lab = lambda d, k: sum(1 for labs in d.values() for lab in labs if lab.kind == k)  # noqa: E731
-            print(f"labels: {n_lab({'x': labels}, 'F')} F / {n_lab({'x': labels}, 'G')} G; "
-                  f"unresolved {len(unresolved)}; on persisted turns {n_lab(usable, 'F')} F / "
-                  f"{n_lab(usable, 'G')} G over {len(usable)} turns")
-            print(f"human category mix, all findings: "
-                  f"{dict(category_mix(lab.categories for lab in labels if lab.kind == 'F'))}")
-            print(f"{args.calibrate} half: {len(turns)} turns "
-                  f"({sum(t.literature_bearing for t in turns)} literature-bearing), "
-                  f"{n_lab(half, 'F')} F / {n_lab(half, 'G')} G")
+            print(
+                f"labels: {n_lab({'x': labels}, 'F')} F / {n_lab({'x': labels}, 'G')} G; "
+                f"unresolved {len(unresolved)}; on persisted turns {n_lab(usable, 'F')} F / "
+                f"{n_lab(usable, 'G')} G over {len(usable)} turns"
+            )
+            print(
+                f"human category mix, all findings: "
+                f"{dict(category_mix(lab.categories for lab in labels if lab.kind == 'F'))}"
+            )
+            print(
+                f"{args.calibrate} half: {len(turns)} turns "
+                f"({sum(t.literature_bearing for t in turns)} literature-bearing), "
+                f"{n_lab(half, 'F')} F / {n_lab(half, 'G')} G"
+            )
 
     if args.dry_run:
         return
-    judgements = asyncio.run(judge_turns(
-        turns, model=args.model, max_tokens=args.max_tokens, cache=cache, cost=cost,
-        concurrency=args.concurrency,
-    ))
+    judgements = asyncio.run(
+        judge_turns(
+            turns,
+            model=args.model,
+            max_tokens=args.max_tokens,
+            cache=cache,
+            cost=cost,
+            concurrency=args.concurrency,
+        )
+    )
     summary = summarize(judgements)
     by_arm = summarize_by_arm(turns, judgements) if args.report else {}
     for arm, arm_summary in by_arm.items():
@@ -802,8 +938,12 @@ def main(argv=None) -> None:
     if args.calibrate:
         agg = score_agreement(half, judgements)
         print(f"\n== agreement ({args.calibrate}, {agg.turns} turns)")
-        print(f"findings: {agg.finding_hits}/{agg.finding_pairs} (turn, category) pairs = {_pct(agg.finding_recall)}")
-        print(f"counter-examples not flagged: {agg.counter_kept}/{agg.counter_examples} = {_pct(agg.counter_precision)}")
+        print(
+            f"findings: {agg.finding_hits}/{agg.finding_pairs} (turn, category) pairs = {_pct(agg.finding_recall)}"
+        )
+        print(
+            f"counter-examples not flagged: {agg.counter_kept}/{agg.counter_examples} = {_pct(agg.counter_precision)}"
+        )
         print(f"combined: {_pct(agg.combined)}")
         print(f"uncategorised findings dropped: {agg.uncategorised}")
         for tid, cat in agg.missed:
@@ -811,8 +951,12 @@ def main(argv=None) -> None:
             print(f"MISSED turn={tid} cat={cat} labels={labs}")
         for tid, key, claim in agg.violated:
             print(f"FLAGGED-GOOD turn={tid} {key}: {str(claim)[:200]!r}")
-        result["agreement"] = {**asdict(agg), "finding_recall": agg.finding_recall,
-                               "counter_precision": agg.counter_precision, "combined": agg.combined}
+        result["agreement"] = {
+            **asdict(agg),
+            "finding_recall": agg.finding_recall,
+            "counter_precision": agg.counter_precision,
+            "combined": agg.combined,
+        }
 
     if cost.usage:
         print("\n== API spend (this run, cache misses only)")

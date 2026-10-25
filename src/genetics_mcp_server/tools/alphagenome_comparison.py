@@ -285,9 +285,7 @@ def _measurement(
         entry["emVar"] = row.get("emVar")
         entry["active"] = row.get("active")
         if _slug(str(context or "")) == "meta":
-            entry["context_note"] = (
-                "cross-cell-line meta-analysis, not one measured cell line"
-            )
+            entry["context_note"] = "cross-cell-line meta-analysis, not one measured cell line"
     else:
         entry["se"] = row.get("se")
         entry["pip"] = row.get("pip")
@@ -296,9 +294,7 @@ def _measurement(
 
 def _gene_names(block: dict[str, Any]) -> list[str]:
     return [
-        str(gene.get("gene_name"))
-        for gene in (block.get("genes") or [])
-        if gene.get("gene_name")
+        str(gene.get("gene_name")) for gene in (block.get("genes") or []) if gene.get("gene_name")
     ]
 
 
@@ -449,9 +445,7 @@ def compare_modality(
     blocked = sorted({p.view for p in pairings} & unavailable)
     blocked_note = ""
     if blocked:
-        blocked_assays = " or ".join(
-            sorted({p.assay for p in pairings if p.view in blocked})
-        )
+        blocked_assays = " or ".join(sorted({p.assay for p in pairings if p.view in blocked}))
         blocked_note = (
             f"the measured lookup in {', '.join(blocked)} failed, so nothing can be said "
             f"about whether this suite has measured this variant as {blocked_assays}"
@@ -481,9 +475,7 @@ def compare_modality(
         # different genes -- exactly the fabrication this module exists to prevent.
         top_gene = next(iter(_gene_names(block)), None)
         other = (
-            f"the strongest predicted gene {top_gene!r}"
-            if top_gene
-            else "no gene in particular"
+            f"the strongest predicted gene {top_gene!r}" if top_gene else "no gene in particular"
         )
         concordance.pop("direction")
         concordance["why_no_direction"] = (

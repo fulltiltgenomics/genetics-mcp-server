@@ -50,7 +50,7 @@ UniProt, panel, R² and F-statistic columns are not carried.
 | protein | Protein |
 | rsid | SNP |
 | chr | chr.exposure |
-| pos_grch38 | pos.exposure (GRCh38: A1BG's rs1265957 at 19:58347310 falls inside the GRCh38 gene) |
+| pos_grch38 | pos.exposure (GRCh38: instruments resolve in the finngen_r12 panel at the workbook position, e.g. 19:58347310 A/G, 7:77284278 T/C, 11:116778822 A/G, and the reversed allele order is refused) |
 | ea, oa | effect_allele.exposure, other_allele.exposure |
 | eaf | eaf.exposure |
 | beta, se, p | beta.exposure, se.exposure, pval.exposure |
@@ -72,8 +72,9 @@ stacked long: one row per `outcome` (`ibd`, `cd`, `uc`, from the block's header)
 `protein` ("Proteins"). For each study `<s>` in `iibdgc`, `finngen`, `combined`: `<s>_or_ci`
 (the "OR(95%CI)" string verbatim), `<s>_or`, `<s>_ci_low`, `<s>_ci_high` (parsed out of it),
 and `<s>_p` ("P-value"). The sheet names no instrument SNP and has no FDR or observational
-column. The IBD block's trailing footnote is dropped; the script refuses a block with data
-after its first break or naming a protein twice. A protein with no IIBDGC estimate keeps its
+column. The IBD block's trailing footnote is dropped; past a block's first break the script
+accepts only rows with text in the first column alone (a footnote), and it refuses a block
+naming a protein twice. A protein with no IIBDGC estimate keeps its
 row with those fields empty.
 
 **`zhou2021_st2_somamer_a2.tsv`** — Zhou Supplementary Table 2, INTERVAL SOMAmer MR on very
@@ -89,3 +90,6 @@ workbook's own header names. The sheet has `Platform_id` twice; the second is
 **`zheng2020_s9_multicis.tsv`** — Zheng TableS9.multi-cis-top, both of its tables stacked with a
 leading `table` column (`9A`: multi-cis agrees with single-cis; `9B`: multi-cis gains power),
 every other column with the workbook's header names.
+
+The R reference outputs the estimators are tested against, and the inputs built from these
+fixtures for them, are in `r_reference/` (its own README).

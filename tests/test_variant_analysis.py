@@ -163,12 +163,44 @@ class TestAnalyzeVariantList:
         # credible set responses
         cs_responses = {
             v1: [
-                {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None, "resource": "FinnGen", "dataset": "FG_R13"},
-                {"data_type": "eQTL", "trait": "expr", "beta": 0.2, "gene_most_severe": "SORT1", "cell_type": "liver", "resource": "GTEx", "dataset": "GTEx_v8"},
+                {
+                    "data_type": "GWAS",
+                    "trait": "T2D",
+                    "beta": 0.1,
+                    "gene_most_severe": "G1",
+                    "cell_type": None,
+                    "resource": "FinnGen",
+                    "dataset": "FG_R13",
+                },
+                {
+                    "data_type": "eQTL",
+                    "trait": "expr",
+                    "beta": 0.2,
+                    "gene_most_severe": "SORT1",
+                    "cell_type": "liver",
+                    "resource": "GTEx",
+                    "dataset": "GTEx_v8",
+                },
             ],
             v2: [
-                {"data_type": "GWAS", "trait": "T2D", "beta": -0.05, "gene_most_severe": "G2", "cell_type": None, "resource": "FinnGen", "dataset": "FG_R13"},
-                {"data_type": "pQTL", "trait": "prot", "beta": 0.3, "gene_most_severe": "PCSK9", "cell_type": "plasma", "resource": "UKB", "dataset": "UKB_pQTL"},
+                {
+                    "data_type": "GWAS",
+                    "trait": "T2D",
+                    "beta": -0.05,
+                    "gene_most_severe": "G2",
+                    "cell_type": None,
+                    "resource": "FinnGen",
+                    "dataset": "FG_R13",
+                },
+                {
+                    "data_type": "pQTL",
+                    "trait": "prot",
+                    "beta": 0.3,
+                    "gene_most_severe": "PCSK9",
+                    "cell_type": "plasma",
+                    "resource": "UKB",
+                    "dataset": "UKB_pQTL",
+                },
             ],
         }
 
@@ -203,7 +235,8 @@ class TestAnalyzeVariantList:
 
         # mock lookup_phenotype_names
         with patch.object(
-            executor, "lookup_phenotype_names",
+            executor,
+            "lookup_phenotype_names",
             new_callable=AsyncMock,
             return_value={"success": True, "names": {"T2D": "Type 2 diabetes"}},
         ):
@@ -257,16 +290,31 @@ class TestAnalyzeVariantList:
             mock_resp.status_code = 200
             if "credible_sets_by_variant" in url:
                 mock_resp.json.return_value = [
-                    {"data_type": "GWAS", "trait": "T2D", "beta": 0.1, "gene_most_severe": "G1", "cell_type": None, "resource": "FG", "dataset": "FG_R13", "chr": 1, "pos": 100, "ref": "A", "alt": "G"},
+                    {
+                        "data_type": "GWAS",
+                        "trait": "T2D",
+                        "beta": 0.1,
+                        "gene_most_severe": "G1",
+                        "cell_type": None,
+                        "resource": "FG",
+                        "dataset": "FG_R13",
+                        "chr": 1,
+                        "pos": 100,
+                        "ref": "A",
+                        "alt": "G",
+                    },
                 ]
             elif "nearest_genes" in url:
-                mock_resp.json.return_value = [{"gene_name": "G1", "hgnc_symbol": "G1", "distance": 0, "variant": "1-100-A-G"}]
+                mock_resp.json.return_value = [
+                    {"gene_name": "G1", "hgnc_symbol": "G1", "distance": 0, "variant": "1-100-A-G"}
+                ]
             return mock_resp
 
         mock_client.post = mock_post
 
         with patch.object(
-            executor, "lookup_phenotype_names",
+            executor,
+            "lookup_phenotype_names",
             new_callable=AsyncMock,
             return_value={"success": True, "names": {"T2D": "Type 2 diabetes"}},
         ):
@@ -302,7 +350,8 @@ class TestAnalyzeVariantList:
         mock_client.get = mock_get
 
         with patch.object(
-            executor, "lookup_phenotype_names",
+            executor,
+            "lookup_phenotype_names",
             new_callable=AsyncMock,
             return_value={"success": True, "names": {}},
         ):

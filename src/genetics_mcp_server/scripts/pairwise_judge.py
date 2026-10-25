@@ -129,17 +129,23 @@ PROVENANCE_MARKERS: tuple[tuple[str, str], ...] = (
     ("sandbox", r"\bsandbox(?:ed|es)?\b"),
     ("python_fence", r"```\s*(?:python|py)\b"),
     ("sql_fence", r"```\s*sql\b"),
-    ("script_self_reference", r"\b(?:wrote|ran|run|running|ex(?:ecut|ecuted|ecuting))\w*\s+"
-                              r"(?:a|the|this|my|some)?\s*(?:python\s+|analysis\s+)?"
-                              r"(?:script|code|snippet)\b"),
+    (
+        "script_self_reference",
+        r"\b(?:wrote|ran|run|running|ex(?:ecut|ecuted|ecuting))\w*\s+"
+        r"(?:a|the|this|my|some)?\s*(?:python\s+|analysis\s+)?"
+        r"(?:script|code|snippet)\b",
+    ),
     ("tool_self_reference", r"\[Using tool:|\bI (?:called|used|invoked) the\b[^.\n]{0,40}\btool\b"),
     ("sdk_self_reference", r"\bgenetics[_ ]sdk\b|\bthe SDK\b"),
     # deliberately NOT a bare `\bartifacts?\b`: in genetics prose "artifact" almost always
     # means a spurious signal ("a batch artifact of imputation", "an artifact of population
     # structure"), which fires on BOTH arms and shrinks the clean control subset for a
     # reason that has nothing to do with provenance
-    ("artifact_reference", r"\bartifacts?\s+(?:file|files|directory|dir|path)\b"
-                           r"|\bartifacts?\s+from\s+the\s+(?:script|run|analysis)\b"),
+    (
+        "artifact_reference",
+        r"\bartifacts?\s+(?:file|files|directory|dir|path)\b"
+        r"|\bartifacts?\s+from\s+the\s+(?:script|run|analysis)\b",
+    ),
     # the iteration-cap notice (`llm_service.MAX_ITERATIONS_NOTICE`) survives
     # `final_answer_text` verbatim and is a near-perfect tell for the many-roundtrip arm.
     # Nothing is scrubbed here either — it is listed so the blinding audit stops reporting
@@ -294,9 +300,7 @@ def dropped_prose_blocks(
             continue
         text = (block.get("text") or "").strip()
         if text:
-            blocks.append(
-                {"after_call": calls_so_far - 1 if calls_so_far else None, "text": text}
-            )
+            blocks.append({"after_call": calls_so_far - 1 if calls_so_far else None, "text": text})
     return blocks
 
 
@@ -479,9 +483,11 @@ async def _judge_once(client: Any, model: str, pair: JudgePair, order: list[str]
     # These prompts carry no cache_control and each is unique, so both are expected to be 0;
     # if they ever are not, over-stating what judging cost is the safe direction for a figure
     # whose only job is to warn about spend.
-    result.input_tokens = _as_int(getattr(usage, "input_tokens", 0)) + _as_int(
-        getattr(usage, "cache_read_input_tokens", 0)
-    ) + _as_int(getattr(usage, "cache_creation_input_tokens", 0))
+    result.input_tokens = (
+        _as_int(getattr(usage, "input_tokens", 0))
+        + _as_int(getattr(usage, "cache_read_input_tokens", 0))
+        + _as_int(getattr(usage, "cache_creation_input_tokens", 0))
+    )
     result.output_tokens = _as_int(getattr(usage, "output_tokens", 0))
     parsed = _parse_verdict(response_text(response))
     if parsed is None:
@@ -573,9 +579,7 @@ async def judge_pairs(
             truncated_arms=[
                 arm for arm, text in pair.answers.items() if len(text) > JUDGE_MAX_ANSWER_CHARS
             ],
-            empty_answer_arms=[
-                arm for arm, text in pair.answers.items() if not text.strip()
-            ],
+            empty_answer_arms=[arm for arm, text in pair.answers.items() if not text.strip()],
         )
 
     results = await asyncio.gather(*(one(p) for p in pairs))
@@ -608,9 +612,9 @@ def summarize_verdicts(
     longer_won = sum(
         1
         for v in judged
-        if v.winner and v.shown_answer_chars.get(v.winner, 0) > max(
-            v.shown_answer_chars.get(a, 0) for a in arms if a != v.winner
-        )
+        if v.winner
+        and v.shown_answer_chars.get(v.winner, 0)
+        > max(v.shown_answer_chars.get(a, 0) for a in arms if a != v.winner)
     )
     identifiable = [v for v in judged if v.arm_identifiable]
     clean = [v for v in judged if not v.arm_identifiable]
@@ -856,12 +860,8 @@ def estimate_lines(estimate: dict[str, Any]) -> list[str]:
 
 def actual_cost(summary: dict[str, Any], model: str) -> dict[str, Any]:
     """Judge spend from the API's own usage counts, as its own line item."""
-    input_tokens = sum(
-        p["input_tokens"] for pair in summary["pairs"] for p in pair["passes"]
-    )
-    output_tokens = sum(
-        p["output_tokens"] for pair in summary["pairs"] for p in pair["passes"]
-    )
+    input_tokens = sum(p["input_tokens"] for pair in summary["pairs"] for p in pair["passes"])
+    output_tokens = sum(p["output_tokens"] for pair in summary["pairs"] for p in pair["passes"])
     usd = estimate_cost(model, input_tokens, output_tokens) if has_pricing(model) else None
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "usd": usd}
 
@@ -924,7 +924,7 @@ def format_judging(summary: dict[str, Any]) -> list[str]:
     )
     lines.append(
         "  READ THE TIES AS A LIMIT ON THE INSTRUMENT, NOT AS A RESULT: every tie counts "
-        "toward passing \"must not regress\", but a large "
+        'toward passing "must not regress", but a large '
         f"{OUTCOME_TIE_POSITION_FLIP} count ({ties[OUTCOME_TIE_POSITION_FLIP]} here) means "
         "position moved this judge more than the answers did — i.e. a regression of this "
         "size could not have been detected, which is not the same as there not being one."
@@ -939,8 +939,10 @@ def format_judging(summary: dict[str, Any]) -> list[str]:
             "the per-pair detail, not a rate."
         )
     else:
-        verdict = "distinguishable from chance" if (p or 1) <= summary["sign_test_alpha"] else (
-            "NOT distinguishable from chance"
+        verdict = (
+            "distinguishable from chance"
+            if (p or 1) <= summary["sign_test_alpha"]
+            else ("NOT distinguishable from chance")
         )
         lines.append(
             f"  SIGN TEST   : p={p:.3f} over {summary['decisive_pairs']} decisive pairs "
@@ -984,7 +986,8 @@ def format_judging(summary: dict[str, Any]) -> list[str]:
     restricted = blind["restricted_to_unidentifiable"]
     per_arm_markers = blind["marker_counts_per_arm"]
     marker_text = "; ".join(
-        f"{arm}: " + (", ".join(f"{k}={v}" for k, v in per_arm_markers.get(arm, {}).items()) or "none")
+        f"{arm}: "
+        + (", ".join(f"{k}={v}" for k, v in per_arm_markers.get(arm, {}).items()) or "none")
         for arm in arms
     )
     lines.append(
@@ -1037,10 +1040,7 @@ def format_judging(summary: dict[str, Any]) -> list[str]:
     lines.append("-" * 78)
     lines.append("PER-PAIR DETAIL (read the losses; that is what the criterion is about)")
     for pair in summary["pairs"]:
-        head = (
-            f"  {pair['case_id'][:12]:<12} turn {pair['turn_index']:<3} "
-            f"{pair['outcome']:<20}"
-        )
+        head = f"  {pair['case_id'][:12]:<12} turn {pair['turn_index']:<3} {pair['outcome']:<20}"
         if pair["winner"]:
             head += f"winner={pair['winner']} ({pair['margin']})"
         lines.append(head)
@@ -1050,8 +1050,7 @@ def format_judging(summary: dict[str, Any]) -> list[str]:
             + (
                 "   markers: "
                 + ", ".join(
-                    f"{arm}:{'/'.join(found)}"
-                    for arm, found in pair["provenance_markers"].items()
+                    f"{arm}:{'/'.join(found)}" for arm, found in pair["provenance_markers"].items()
                 )
                 if pair["provenance_markers"]
                 else ""

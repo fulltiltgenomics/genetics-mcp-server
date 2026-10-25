@@ -22,8 +22,10 @@ default in settings.py moves this baseline the same way it would move production
 
 The chat half is resolved through the two functions the collapse edits — `LLMService.
 resolve_local_tools` and `resolve_proxied_tools` — rather than through `get_anthropic_tools`
-underneath them, so a collapse wired correctly in one and wrongly in the other is invisible
-to a baseline taken below them. The profile names in `PROFILES` reach the local half only
+underneath them, so a baseline taken below them could not see either half mis-wired. That
+the proxied half reaches both surfaces per request is pinned separately, by
+tests/test_llm_service.py::TestProxiedToolsReachBothSurfaces. The profile names in `PROFILES`
+reach the local half only
 through `code_execution_requested`, the edge every chat request goes through; the proxied
 half takes no surface argument at all, so it is recorded once for the whole chat backend
 rather than per profile — six copies of one answer would be six things to keep agreeing.
@@ -162,12 +164,8 @@ def _proxied_inclusion() -> dict[str, bool]:
     while leaving the rule under test the production one.
     """
     with (
-        patch.object(
-            llm_service_module, "get_external_anthropic_tools", lambda: _PROXY_SENTINEL
-        ),
-        patch.object(
-            llm_service_module, "get_rag_anthropic_tools", lambda: _PROXY_SENTINEL
-        ),
+        patch.object(llm_service_module, "get_external_anthropic_tools", lambda: _PROXY_SENTINEL),
+        patch.object(llm_service_module, "get_rag_anthropic_tools", lambda: _PROXY_SENTINEL),
     ):
         external, rag = resolve_proxied_tools()
     return {"external_tools": bool(external), "rag_tools": bool(rag)}
@@ -185,9 +183,7 @@ def _mcp_hardcoded_exclusions() -> set[str]:
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Assign):
             continue
-        if not any(
-            isinstance(t, ast.Name) and t.id == "_mcp_disabled" for t in node.targets
-        ):
+        if not any(isinstance(t, ast.Name) and t.id == "_mcp_disabled" for t in node.targets):
             continue
         value = node.value
         if not isinstance(value, ast.BinOp) or not isinstance(value.op, ast.BitOr):
@@ -212,9 +208,9 @@ def _named(names) -> dict[str, object]:
 
 def build_surface() -> dict:
     """Resolve every surface from the code as it stands right now."""
-    by_category: dict[str, list[str]] = {}
+    by_group: dict[str, list[str]] = {}
     for definition in all_local_tool_definitions():
-        by_category.setdefault(definition["category"], []).append(definition["name"])
+        by_group.setdefault(definition["group"], []).append(definition["name"])
 
     with _deployed_env("chat_backend"):
         service = _ResolverService()
@@ -254,8 +250,8 @@ def build_surface() -> dict:
 
     return {
         "local_tool_definitions": {
-            "count": sum(len(v) for v in by_category.values()),
-            "by_category": {k: _named(v) for k, v in sorted(by_category.items())},
+            "count": sum(len(v) for v in by_group.values()),
+            "by_group": {k: _named(v) for k, v in sorted(by_group.items())},
         },
         "chat_backend": {
             "deployed_flags_set": dict(sorted(DEPLOYED_FLAGS["chat_backend"].items())),
@@ -357,14 +353,12 @@ class TestResolvedProfiles:
         assert "run_analysis" not in nocode["tools"]
 
     def test_the_profile_set_itself_has_not_changed(self, resolved, golden):
-        assert set(resolved["chat_backend"]["profiles"]) == set(
-            golden["chat_backend"]["profiles"]
-        )
+        assert set(resolved["chat_backend"]["profiles"]) == set(golden["chat_backend"]["profiles"])
 
     def test_deployed_disabled_tools_match(self, resolved, golden):
-        assert resolved["chat_backend"]["disabled_tools"] == golden["chat_backend"][
-            "disabled_tools"
-        ]
+        assert (
+            resolved["chat_backend"]["disabled_tools"] == golden["chat_backend"]["disabled_tools"]
+        )
 
 
 class TestMCPToolList:

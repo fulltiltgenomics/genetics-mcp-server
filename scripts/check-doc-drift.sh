@@ -46,6 +46,14 @@ check '^src/genetics_mcp_server/tools/orchestration\.py$' \
 check '^src/genetics_mcp_server/routers/' '^docs/project-spec\.md$' \
     'routers/ -> docs/project-spec.md (admin endpoint list, API token endpoints, admin access rules)'
 
+check '^src/genetics_mcp_server/skills/' '^docs/project-spec\.md$' \
+    'skills/ -> docs/project-spec.md (which subagent skills exist, the core tool list, which skills get run_analysis)'
+
+# the owning doc lives in genetics-results-suite, so no staged file here can satisfy this; it
+# fires as a reminder, and the suite's gen-doc-blocks.py --check is the gate that bites
+check '^src/genetics_mcp_server/(mcp_server|llm_service|subagent)\.py$' '^$' \
+    'mcp_server.py, llm_service.py, subagent.py -> genetics-results-suite/docs/chat-tool-reference.md (the three exclusion layers, resolved per-surface tool counts) - update it in the suite repo'
+
 check '^src/genetics_mcp_server/config/' '^(docs/project-spec\.md|\.env\.example)$' \
     'config/ -> docs/project-spec.md (env var tables) + .env.example (every new variable)'
 

@@ -40,15 +40,17 @@ def write_bundle(path: Path, genes: list[tuple], sets: dict[str, list[str]]) -> 
         },
         schema_overrides={"chr": pl.Int64, "gene_start": pl.Int64, "gene_end": pl.Int64},
     ).write_parquet(path / "genes.parquet")
-    pl.DataFrame({
-        "set_id": list(sets),
-        "collection": ["syn"] * len(sets),
-        "name": [s.lower() for s in sets],
-        "url_or_stable_id": list(sets),
-        "n_given": [len(m) for m in sets.values()],
-        "n_mapped": [len(m) for m in sets.values()],
-        "n_unmapped": [0] * len(sets),
-    }).write_parquet(path / "sets.parquet")
+    pl.DataFrame(
+        {
+            "set_id": list(sets),
+            "collection": ["syn"] * len(sets),
+            "name": [s.lower() for s in sets],
+            "url_or_stable_id": list(sets),
+            "n_given": [len(m) for m in sets.values()],
+            "n_mapped": [len(m) for m in sets.values()],
+            "n_unmapped": [0] * len(sets),
+        }
+    ).write_parquet(path / "sets.parquet")
     pl.DataFrame(
         {
             "set_id": [s for s, m in sets.items() for _ in m],
@@ -57,11 +59,17 @@ def write_bundle(path: Path, genes: list[tuple], sets: dict[str, list[str]]) -> 
         },
         schema={"set_id": pl.Utf8, "ensembl_gene_id": pl.Utf8, "symbol": pl.Utf8},
     ).write_parquet(path / "members.parquet")
-    (path / "manifest.json").write_text(json.dumps({
-        "release_id": "syn",
-        "bundle": {"release_id": "syn.1", "gencode": {"version": "99"}},
-        "collections": [{"collection": "syn", "spdx_license": "CC0-1.0", "attribution": "syn"}],
-    }))
+    (path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "release_id": "syn",
+                "bundle": {"release_id": "syn.1", "gencode": {"version": "99"}},
+                "collections": [
+                    {"collection": "syn", "spdx_license": "CC0-1.0", "attribution": "syn"}
+                ],
+            }
+        )
+    )
     return path
 
 
@@ -303,8 +311,7 @@ def test_calibration_random_loci_do_not_pile_up_near_zero(use_bundle):
     genes = genome(rng)
     names = [g[0] for g in genes]
     sets = {
-        f"S{i}": list(rng.choice(names, int(rng.integers(8, 40)), replace=False))
-        for i in range(40)
+        f"S{i}": list(rng.choice(names, int(rng.integers(8, 40)), replace=False)) for i in range(40)
     }
     use_bundle(genes, sets)
     grid = grid_points(genes, 5_000)
@@ -313,8 +320,13 @@ def test_calibration_random_loci_do_not_pile_up_near_zero(use_bundle):
         pick = rng.choice(len(grid), 25, replace=False)
         df = pl.DataFrame({"chr": [grid[i][0] for i in pick], "pos": [grid[i][1] for i in pick]})
         res = enrichment.locus_enrichment(
-            df, "syn", merge_distance=0, density_window=100_000, grid_step=5_000,
-            density_bins=5, exclude_mhc=False,
+            df,
+            "syn",
+            merge_distance=0,
+            density_window=100_000,
+            grid_step=5_000,
+            density_bins=5,
+            exclude_mhc=False,
         )
         pvals += res["results"]["pval"].to_list()
     pvals = np.array(pvals)
@@ -339,7 +351,12 @@ def test_a_planted_enrichment_is_detected(use_bundle):
     leads = [f"{where[t][1]}:{where[t][2] + 100}" for t in target[:8]]
     leads += ["1:500000", "3:2000000", "1:2000000"]
     res = enrichment.locus_enrichment(
-        leads, "syn", merge_distance=0, density_window=100_000, grid_step=5_000, exclude_mhc=False,
+        leads,
+        "syn",
+        merge_distance=0,
+        density_window=100_000,
+        grid_step=5_000,
+        exclude_mhc=False,
     )
     top = res["results"].row(0, named=True)
     assert top["set_id"] == "TARGET"
@@ -355,8 +372,13 @@ def test_a_locus_with_three_genes_of_one_set_counts_once(use_bundle):
     genes += [(f"N{i}", 1, 200_000 + 50_000 * i, 201_000 + 50_000 * i) for i in range(40)]
     use_bundle(genes, {"PQR": ["P", "Q", "R", "N0", "N1"]})
     res = enrichment.locus_enrichment(
-        ["1:103500"], "syn", mode="window", window=5_000, density_window=50_000,
-        grid_step=1_000, exclude_mhc=False,
+        ["1:103500"],
+        "syn",
+        mode="window",
+        window=5_000,
+        density_window=50_000,
+        grid_step=1_000,
+        exclude_mhc=False,
     )
     row = res["results"].row(0, named=True)
     assert row["n_loci_hit"] == 1
@@ -374,6 +396,7 @@ def test_leads_of_one_locus_count_once(use_bundle):
     kw = {"density_window": 100_000, "grid_step": 5_000, "exclude_mhc": False}
     merged = enrichment.locus_enrichment(leads, "syn", merge_distance=1_000_000, **kw)
     apart = enrichment.locus_enrichment(leads, "syn", merge_distance=0, **kw)
+
     def hits(r):
         return r["results"].filter(pl.col("set_id") == "TARGET")["n_loci_hit"].item()
 
@@ -394,8 +417,12 @@ def test_density_matching_changes_q(use_bundle, bins, matched):
     genes, sets = density_genome()
     use_bundle(genes, sets)
     kw = {
-        "merge_distance": 0, "density_window": 300_000, "grid_step": 5_000,
-        "density_bins": bins, "exclude_mhc": False, "min_size": 1,
+        "merge_distance": 0,
+        "density_window": 300_000,
+        "grid_step": 5_000,
+        "density_bins": bins,
+        "exclude_mhc": False,
+        "min_size": 1,
     }
 
     def expected(lead):
@@ -439,7 +466,10 @@ def test_locus_enrichment_over_the_fixture_collection(monkeypatch):
     monkeypatch.setenv(enrichment.GENESETS_ENV, str(FIXTURE))
     enrichment._BUNDLES.clear()
     res = enrichment.locus_enrichment(
-        ["1:2200", "1:3200", "1:7200"], "coll.a", merge_distance=0, grid_step=100,
+        ["1:2200", "1:3200", "1:7200"],
+        "coll.a",
+        merge_distance=0,
+        grid_step=100,
         density_window=2_000,
     )
     assert set(res["results"].columns) >= {"name", "collection", "hit_symbols", "padj"}
@@ -478,11 +508,13 @@ MAPPING = {
 def result(pvals, padj=None):
     ids = list(pvals)
     return {
-        "results": pl.DataFrame({
-            "set_id": ids,
-            "pval": [pvals[s] for s in ids],
-            "padj": [padj[s] for s in ids] if padj else [pvals[s] for s in ids],
-        }),
+        "results": pl.DataFrame(
+            {
+                "set_id": ids,
+                "pval": [pvals[s] for s in ids],
+                "padj": [padj[s] for s in ids] if padj else [pvals[s] for s in ids],
+            }
+        ),
         "parameters": {"x": 1},
     }
 
@@ -494,7 +526,10 @@ def test_simplify_absorbs_nested_and_keeps_disjoint():
     assert s["results"]["absorbed_ids"].to_list() == [["BIG", "HALF"], []]
     assert s["results"]["n_absorbed"].to_list() == [2, 0]
     assert dict(s["clusters"].select("set_id", "representative").iter_rows()) == {
-        "NESTED": "NESTED", "BIG": "NESTED", "HALF": "NESTED", "DISJOINT": "DISJOINT",
+        "NESTED": "NESTED",
+        "BIG": "NESTED",
+        "HALF": "NESTED",
+        "DISJOINT": "DISJOINT",
     }
     assert s["parameters"]["x"] == 1
     assert s["parameters"]["simplify"]["cutoff"] == 0.7
@@ -594,7 +629,9 @@ def test_simplify_on_competitive_falls_back_to_members(fixture_bundle):
     s = enrichment.simplify(res, padj=1.0)
     p = s["parameters"]["simplify"]
     assert (p["basis"], p["basis_used"], p["genes_from"]) == (
-        "hits", "members", "full bundled membership",
+        "hits",
+        "members",
+        "full bundled membership",
     )
 
 
@@ -683,8 +720,14 @@ def test_locus_enrichment_matches_a_direct_reference(use_bundle):
     leads += [(g[1], g[2] + 50) for g in genes if g[4] != "protein-coding gene"][:4]
     step, dw, n_bins = 5_000, 100_000, 6
     res = enrichment.locus_enrichment(
-        [f"{c}:{p}" for c, p in leads], "syn", merge_distance=0, density_window=dw,
-        grid_step=step, density_bins=n_bins, exclude_mhc=False, min_size=1,
+        [f"{c}:{p}" for c, p in leads],
+        "syn",
+        merge_distance=0,
+        density_window=dw,
+        grid_step=step,
+        density_bins=n_bins,
+        exclude_mhc=False,
+        min_size=1,
     )
     want, hits, edges, lead_density = reference_expected(genes, sets, leads, step, dw, n_bins)
     assert res["parameters"]["null"]["density_bin_edges"] == edges.tolist()
@@ -705,7 +748,10 @@ def test_a_multi_lead_locus_is_centred_on_its_midpoint(use_bundle):
     genes += [(f"F{k}", 1, 2_000_000 + 30_000 * k, 2_001_000 + 30_000 * k) for k in range(30)]
     use_bundle(genes, {"S": ["A", "B", "C0", "F1", "F2"]})
     res = enrichment.locus_enrichment(
-        ["1:1000000", "1:1400000"], "syn", density_window=50_000, grid_step=5_000,
+        ["1:1000000", "1:1400000"],
+        "syn",
+        density_window=50_000,
+        grid_step=5_000,
         exclude_mhc=False,
     )
     assert res["loci"]["density"].to_list() == [3], "C0-C2 lie within 50 kb of 1,200,000"
@@ -728,12 +774,16 @@ def test_autosomal_results_do_not_depend_on_an_x_locus(use_bundle):
     # the X locus hits no set, so it adds nothing to any count or q
     with_x = enrichment.locus_enrichment(auto + ["X:300000"], "syn", **kw)
     cols = ["set_id", "n_loci_hit", "expected", "pval"]
-    assert with_x["results"].select(cols).sort("set_id").equals(
-        without["results"].select(cols).sort("set_id")
+    assert (
+        with_x["results"]
+        .select(cols)
+        .sort("set_id")
+        .equals(without["results"].select(cols).sort("set_id"))
     )
     assert with_x["loci"]["density_bin"].to_list()[:4] == without["loci"]["density_bin"].to_list()
-    assert with_x["parameters"]["null"]["placements_per_bin"] == (
-        without["parameters"]["null"]["placements_per_bin"]
+    assert (
+        with_x["parameters"]["null"]["placements_per_bin"]
+        == (without["parameters"]["null"]["placements_per_bin"])
     )
     assert sum(with_x["parameters"]["null"]["placements_per_bin_x"]) > 0
 
@@ -743,8 +793,13 @@ def test_multi_lead_placements_stay_on_the_gene_span_and_out_of_the_mhc(use_bund
     genes = [(f"G{i}", 6, 23_000_000 + 20_000 * i, 23_005_000 + 20_000 * i) for i in range(150)]
     use_bundle(genes, {"S": [g[0] for g in genes[:10]]})
     res = enrichment.locus_enrichment(
-        ["6:23500000", "6:23800000"], "syn", density_window=100_000, grid_step=10_000,
-        density_bins=1, exclude_mhc=exclude_mhc, min_size=1,
+        ["6:23500000", "6:23800000"],
+        "syn",
+        density_window=100_000,
+        grid_step=10_000,
+        density_bins=1,
+        exclude_mhc=exclude_mhc,
+        min_size=1,
     )
     lo, hi = genes[0][2], genes[-1][3]
     mhc = (25_000_000, 34_000_000)
@@ -778,8 +833,14 @@ def test_an_x_locus_in_an_empty_stratum_takes_the_nearest_filled_one(use_bundle)
     genes += [(f"XC{i}", 23, 5_030_000 + 2_000 * i, 5_030_500 + 2_000 * i) for i in range(16)]
     use_bundle(genes, {"XC": [f"XC{i}" for i in range(16)]})
     r = enrichment.locus_enrichment(
-        ["23:5045000", "1:300000"], "syn", merge_distance=0, density_window=20_000,
-        grid_step=100_000, density_bins=10, exclude_mhc=False, min_size=1,
+        ["23:5045000", "1:300000"],
+        "syn",
+        merge_distance=0,
+        density_window=20_000,
+        grid_step=100_000,
+        density_bins=10,
+        exclude_mhc=False,
+        min_size=1,
     )
     p = r["parameters"]["null"]
     filled = np.flatnonzero(p["placements_per_bin_x"])

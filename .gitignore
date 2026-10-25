@@ -52,3 +52,6 @@ htmlcov/
 # per-session git worktrees, never part of the tree
 .claude/worktrees/
 *~
+
+# the issue tracker lives in the private Dolt remote; its export carries internal detail and is not published
+.beads/issues.jsonl

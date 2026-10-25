@@ -269,7 +269,9 @@ def _correlation_matrix(r_lkhood: Any, m: int) -> np.ndarray:
             f"matrix; got shape {r.shape}"
         )
     if not np.allclose(out, out.T, atol=1e-10) or not np.allclose(np.diag(out), 1.0, atol=1e-10):
-        raise GeneticsUsageError("r_lkhood must be a symmetric correlation matrix with unit diagonal")
+        raise GeneticsUsageError(
+            "r_lkhood must be a symmetric correlation matrix with unit diagonal"
+        )
     if (out < -1).any() or (out > 1).any():
         raise GeneticsUsageError("every value of r_lkhood must lie in [-1, 1]")
     return out
@@ -284,7 +286,9 @@ def _per_model(value: Any, k: int, what: str, default: float | None = None) -> n
     if arr.ndim == 0:
         return np.full(k, float(arr))
     if arr.shape != (k,):
-        raise GeneticsUsageError(f"{what} must have one value per model ({k}); got shape {arr.shape}")
+        raise GeneticsUsageError(
+            f"{what} must have one value per model ({k}); got shape {arr.shape}"
+        )
     return arr
 
 
@@ -353,7 +357,9 @@ def _models(
     else:
         name_list = [str(n) for n in names]
         if len(name_list) != k:
-            raise GeneticsUsageError(f"names must have one entry per model ({k}); got {len(name_list)}")
+            raise GeneticsUsageError(
+                f"names must have one entry per model ({k}); got {len(name_list)}"
+            )
         if len(set(name_list)) != k:
             raise GeneticsUsageError("model names must be unique")
 
@@ -367,11 +373,13 @@ def _models(
 
 def _groups_frame(post: np.ndarray, spec: _Models) -> pl.DataFrame:
     best = post.argmax(axis=1)
-    return pl.DataFrame({
-        **{name: post[:, i].tolist() for i, name in enumerate(spec.names)},
-        "model": [spec.names[i] for i in best],
-        "max_prob": post[np.arange(post.shape[0]), best].tolist(),
-    })
+    return pl.DataFrame(
+        {
+            **{name: post[:, i].tolist() for i, name in enumerate(spec.names)},
+            "model": [spec.names[i] for i in best],
+            "max_prob": post[np.arange(post.shape[0]), best].tolist(),
+        }
+    )
 
 
 # --------------------------------------------------------------------------- functions
@@ -490,13 +498,15 @@ def proportions(
             draws[it - n_burnin] = pis
     post = counts / n_iter
     lo, hi = np.quantile(draws, [0.025, 0.975], axis=0)
-    params = pl.DataFrame({
-        "model": spec.names,
-        "mean": draws.mean(axis=0).tolist(),
-        "low95": lo.tolist(),
-        "up95": hi.tolist(),
-        "sd": draws.std(axis=0, ddof=1).tolist() if n_iter > 1 else [0.0] * k,
-    })
+    params = pl.DataFrame(
+        {
+            "model": spec.names,
+            "mean": draws.mean(axis=0).tolist(),
+            "low95": lo.tolist(),
+            "up95": hi.tolist(),
+            "sd": draws.std(axis=0, ddof=1).tolist() if n_iter > 1 else [0.0] * k,
+        }
+    )
     return {
         "groups": _groups_frame(post, spec),
         "models": spec.frame(),
@@ -675,6 +685,7 @@ def optimize(
         prev = (cur_sc.copy(), cur_sl.copy(), cur_co.copy())
         new_w = post.mean(axis=0)
         if n_optim > 0:
+
             def negative_expected(par):
                 sc, sl, co = unpack(par, cur_sc, cur_sl, cur_co)
                 trial = _Models(spec.names, sc, sl, co, w, dims, spec.scale_source)
@@ -698,11 +709,13 @@ def optimize(
             cur_sc, cur_sl, cur_co = new_sc, new_sl, new_co
         # a step that fails to raise the likelihood is discarded and both criteria then hold
         with np.errstate(divide="ignore", invalid="ignore"):
-            rel = np.concatenate([
-                np.abs((cur_sc - prev[0]) / prev[0]),
-                np.abs((cur_sl - prev[1]) / prev[1]).ravel(),
-                np.abs((cur_co - prev[2]) / prev[2]),
-            ])
+            rel = np.concatenate(
+                [
+                    np.abs((cur_sc - prev[0]) / prev[0]),
+                    np.abs((cur_sl - prev[1]) / prev[1]).ravel(),
+                    np.abs((cur_co - prev[2]) / prev[2]),
+                ]
+            )
         rel = rel[~np.isnan(rel)]
         par_ok = bool((rel <= tol_par).all())
         loglik_ok = (loglik - prev_loglik) < tol_loglik
@@ -744,7 +757,12 @@ def estimator_correlation(
     `shared_controls=min(controls1, controls2)`; cases shared depends on the comorbidity and
     is 0 when unknown. Disjoint studies give 0.
     """
-    for name, value in (("cases1", cases1), ("controls1", controls1), ("cases2", cases2), ("controls2", controls2)):
+    for name, value in (
+        ("cases1", cases1),
+        ("controls1", controls1),
+        ("cases2", cases2),
+        ("controls2", controls2),
+    ):
         if value <= 0:
             raise GeneticsUsageError(f"{name} must be positive")
     return (

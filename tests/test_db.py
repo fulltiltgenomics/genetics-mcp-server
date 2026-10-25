@@ -62,9 +62,7 @@ class TestChatHistoryDB:
 
     def test_create_session_with_phenotype(self, chat_history_db):
         """Test creating a session with phenotype code."""
-        session = chat_history_db.create_session(
-            "user@example.com", phenotype_code="T2D"
-        )
+        session = chat_history_db.create_session("user@example.com", phenotype_code="T2D")
 
         assert session.phenotype_code == "T2D"
 
@@ -126,9 +124,7 @@ class TestChatHistoryDB:
     def test_update_session_title(self, chat_history_db):
         """Test updating session title."""
         session = chat_history_db.create_session("user@example.com")
-        updated = chat_history_db.update_session(
-            session.id, "user@example.com", title="Test Chat"
-        )
+        updated = chat_history_db.update_session(session.id, "user@example.com", title="Test Chat")
 
         assert updated is True
 
@@ -146,9 +142,7 @@ class TestChatHistoryDB:
     def test_update_session_comment(self, chat_history_db):
         """Test updating session comment."""
         session = chat_history_db.create_session("user@example.com")
-        chat_history_db.update_session(
-            session.id, "user@example.com", comment="Great chat!"
-        )
+        chat_history_db.update_session(session.id, "user@example.com", comment="Great chat!")
 
         retrieved = chat_history_db.get_session(session.id, "user@example.com")
         assert retrieved.comment == "Great chat!"
@@ -156,17 +150,13 @@ class TestChatHistoryDB:
     def test_update_session_wrong_user(self, chat_history_db):
         """Test that users can only update their own sessions."""
         session = chat_history_db.create_session("user@example.com")
-        updated = chat_history_db.update_session(
-            session.id, "other@example.com", title="Hacked"
-        )
+        updated = chat_history_db.update_session(session.id, "other@example.com", title="Hacked")
 
         assert updated is False
 
     def test_update_session_not_found(self, chat_history_db):
         """Test updating non-existent session."""
-        updated = chat_history_db.update_session(
-            "nonexistent-id", "user@example.com", title="Test"
-        )
+        updated = chat_history_db.update_session("nonexistent-id", "user@example.com", title="Test")
 
         assert updated is False
 
@@ -222,8 +212,7 @@ class TestChatHistoryDB:
         """Test adding a message with literature backend choice."""
         session = chat_history_db.create_session("user@example.com")
         msg = chat_history_db.add_message(
-            session.id, "msg1", "user", "Search for BRCA1",
-            literature_backend="perplexity"
+            session.id, "msg1", "user", "Search for BRCA1", literature_backend="perplexity"
         )
 
         assert msg.literature_backend == "perplexity"
@@ -239,7 +228,10 @@ class TestChatHistoryDB:
             '[{"type": "tool_result", "tool_use_id": "tu_1", "content": "{\\"rows\\": 5}"}]'
         )
         msg = chat_history_db.add_message(
-            session.id, "msg1", "assistant", "Done",
+            session.id,
+            "msg1",
+            "assistant",
+            "Done",
             content_json='[{"type": "tool_use", "id": "tu_1", "name": "x", "input": {}}]',
             tool_results_json=tool_results_json,
         )
@@ -332,8 +324,7 @@ class TestChatHistoryDB:
         chat_history_db._init_db()
 
         columns = [
-            row[1]
-            for row in chat_history_db._conn.execute("PRAGMA table_info(chat_messages)")
+            row[1] for row in chat_history_db._conn.execute("PRAGMA table_info(chat_messages)")
         ]
         assert columns.count("instruction_set_id") == 1
         assert chat_history_db.get_messages(session.id)[0].instruction_set_id == "set-abc"
@@ -424,11 +415,10 @@ class TestChatHistoryDB:
     def test_touch_session(self, chat_history_db):
         """Test touching a session updates its timestamp."""
         session = chat_history_db.create_session("user@example.com")
-        original_updated = chat_history_db.get_session(
-            session.id, "user@example.com"
-        ).updated_at
+        original_updated = chat_history_db.get_session(session.id, "user@example.com").updated_at
 
         import time
+
         # SQLite timestamp precision is seconds, so wait > 1 second
         time.sleep(1.1)
 
@@ -483,9 +473,7 @@ class TestContextDigestAndPinned:
 
             # re-running the migration over a populated, already-migrated db is a no-op
             db._init_db()
-            columns_after = [
-                row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")
-            ]
+            columns_after = [row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")]
             assert columns_after.count("context_digest") == 1
             assert columns_after.count("pinned_at") == 1
         finally:
@@ -634,8 +622,12 @@ class TestGetRecentSessionsForDigest:
 
         expected_ids = sorted((s.id for s in sessions), reverse=True)
 
-        first_call = [r["id"] for r in chat_history_db.get_recent_sessions_for_digest(USER, limit=2)]
-        second_call = [r["id"] for r in chat_history_db.get_recent_sessions_for_digest(USER, limit=2)]
+        first_call = [
+            r["id"] for r in chat_history_db.get_recent_sessions_for_digest(USER, limit=2)
+        ]
+        second_call = [
+            r["id"] for r in chat_history_db.get_recent_sessions_for_digest(USER, limit=2)
+        ]
 
         assert first_call == expected_ids[:2]
         assert first_call == second_call
@@ -722,9 +714,7 @@ class TestChatProjects:
             assert db.list_projects(USER) == []
 
             db._init_db()
-            columns_after = [
-                row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")
-            ]
+            columns_after = [row[1] for row in db._conn.execute("PRAGMA table_info(chat_sessions)")]
             assert columns_after.count("project_id") == 1
         finally:
             Singleton._instances.pop(ChatHistoryDB, None)
@@ -1048,9 +1038,7 @@ class TestProjectScopedDigestWindow:
             for i in range(2)
         ]
 
-        results = chat_history_db.get_recent_sessions_for_digest(
-            USER, limit=2, project_id=ibd.id
-        )
+        results = chat_history_db.get_recent_sessions_for_digest(USER, limit=2, project_id=ibd.id)
         ids = [r["id"] for r in results]
 
         assert other_project_pin.id not in ids
@@ -1059,9 +1047,7 @@ class TestProjectScopedDigestWindow:
 
     def test_project_scope_still_excludes_other_users(self, chat_history_db):
         project = chat_history_db.create_project(USER, "IBD")
-        mine = self._filed_session(
-            chat_history_db, USER, project.id, "mine", "2024-01-01 00:00:01"
-        )
+        mine = self._filed_session(chat_history_db, USER, project.id, "mine", "2024-01-01 00:00:01")
         self._filed_session(chat_history_db, OTHER, None, "not mine", "2024-01-01 00:00:02")
 
         results = chat_history_db.get_recent_sessions_for_digest(
@@ -1069,9 +1055,10 @@ class TestProjectScopedDigestWindow:
         )
         assert [r["id"] for r in results] == [mine.id]
         # another user asking for this project's id gets nothing rather than its rows
-        assert chat_history_db.get_recent_sessions_for_digest(
-            OTHER, limit=10, project_id=project.id
-        ) == []
+        assert (
+            chat_history_db.get_recent_sessions_for_digest(OTHER, limit=10, project_id=project.id)
+            == []
+        )
 
 
 class TestLLMConfigDB:
@@ -1102,12 +1089,8 @@ class TestLLMConfigDB:
 
     def test_get_tool_descriptions(self, llm_config_db):
         """Test getting all tool descriptions."""
-        llm_config_db.save_tool_description(
-            "tool1", "Description 1", "user@example.com"
-        )
-        llm_config_db.save_tool_description(
-            "tool2", "Description 2", "user@example.com"
-        )
+        llm_config_db.save_tool_description("tool1", "Description 1", "user@example.com")
+        llm_config_db.save_tool_description("tool2", "Description 2", "user@example.com")
 
         descriptions = llm_config_db.get_tool_descriptions()
 
@@ -1119,14 +1102,10 @@ class TestLLMConfigDB:
         """Test that tool descriptions are versioned."""
         import time
 
-        llm_config_db.save_tool_description(
-            "search_genes", "Version 1", "user@example.com"
-        )
+        llm_config_db.save_tool_description("search_genes", "Version 1", "user@example.com")
         # wait to ensure different timestamp
         time.sleep(1.1)
-        llm_config_db.save_tool_description(
-            "search_genes", "Version 2", "user@example.com"
-        )
+        llm_config_db.save_tool_description("search_genes", "Version 2", "user@example.com")
 
         # latest should be version 2
         latest = llm_config_db.get_tool_description("search_genes")
@@ -1141,9 +1120,7 @@ class TestLLMConfigDB:
     def test_tool_description_history_limit(self, llm_config_db):
         """Test tool description history limit."""
         for i in range(5):
-            llm_config_db.save_tool_description(
-                "test_tool", f"Version {i}", "user@example.com"
-            )
+            llm_config_db.save_tool_description("test_tool", f"Version {i}", "user@example.com")
 
         history = llm_config_db.get_tool_description_history("test_tool", limit=3)
 
@@ -1151,9 +1128,7 @@ class TestLLMConfigDB:
 
     def test_add_and_get_user_comments(self, llm_config_db):
         """Test adding and retrieving user comments."""
-        comment = llm_config_db.add_user_comment(
-            "user@example.com", "This is a note"
-        )
+        comment = llm_config_db.add_user_comment("user@example.com", "This is a note")
 
         assert comment.user_id == "user@example.com"
         assert comment.comment == "This is a note"
@@ -1178,9 +1153,7 @@ class TestLLMConfigDB:
 
     def test_delete_user_comment(self, llm_config_db):
         """Test deleting a user comment."""
-        comment = llm_config_db.add_user_comment(
-            "user@example.com", "Comment to delete"
-        )
+        comment = llm_config_db.add_user_comment("user@example.com", "Comment to delete")
         deleted = llm_config_db.delete_user_comment("user@example.com", comment.id)
 
         assert deleted is True
@@ -1189,9 +1162,7 @@ class TestLLMConfigDB:
 
     def test_delete_user_comment_wrong_user(self, llm_config_db):
         """Test that users can only delete their own comments."""
-        comment = llm_config_db.add_user_comment(
-            "user@example.com", "My comment"
-        )
+        comment = llm_config_db.add_user_comment("user@example.com", "My comment")
         deleted = llm_config_db.delete_user_comment("other@example.com", comment.id)
 
         assert deleted is False
@@ -1218,27 +1189,19 @@ class TestLLMConfigDB:
         assert setting.setting_value == "perplexity"
         assert setting.comment == "Switched to Perplexity"
 
-        retrieved = llm_config_db.get_user_setting(
-            "user@example.com", "literature_search_backend"
-        )
+        retrieved = llm_config_db.get_user_setting("user@example.com", "literature_search_backend")
         assert retrieved.setting_value == "perplexity"
 
     def test_get_user_setting_not_found(self, llm_config_db):
         """Test getting a setting that doesn't exist."""
-        setting = llm_config_db.get_user_setting(
-            "user@example.com", "nonexistent_setting"
-        )
+        setting = llm_config_db.get_user_setting("user@example.com", "nonexistent_setting")
 
         assert setting is None
 
     def test_get_user_settings(self, llm_config_db):
         """Test getting all settings for a user."""
-        llm_config_db.save_user_setting(
-            "user@example.com", "setting1", "value1"
-        )
-        llm_config_db.save_user_setting(
-            "user@example.com", "setting2", "value2"
-        )
+        llm_config_db.save_user_setting("user@example.com", "setting1", "value1")
+        llm_config_db.save_user_setting("user@example.com", "setting2", "value2")
 
         settings = llm_config_db.get_user_settings("user@example.com")
 
@@ -1249,12 +1212,8 @@ class TestLLMConfigDB:
 
     def test_user_settings_isolation(self, llm_config_db):
         """Test that settings are isolated per user."""
-        llm_config_db.save_user_setting(
-            "user1@example.com", "theme", "dark"
-        )
-        llm_config_db.save_user_setting(
-            "user2@example.com", "theme", "light"
-        )
+        llm_config_db.save_user_setting("user1@example.com", "theme", "dark")
+        llm_config_db.save_user_setting("user2@example.com", "theme", "light")
 
         user1_settings = llm_config_db.get_user_settings("user1@example.com")
         user2_settings = llm_config_db.get_user_settings("user2@example.com")
@@ -1266,13 +1225,9 @@ class TestLLMConfigDB:
         """Test that settings are versioned (latest wins)."""
         import time
 
-        llm_config_db.save_user_setting(
-            "user@example.com", "backend", "europepmc"
-        )
+        llm_config_db.save_user_setting("user@example.com", "backend", "europepmc")
         time.sleep(1.1)
-        llm_config_db.save_user_setting(
-            "user@example.com", "backend", "perplexity"
-        )
+        llm_config_db.save_user_setting("user@example.com", "backend", "perplexity")
 
         latest = llm_config_db.get_user_setting("user@example.com", "backend")
         assert latest.setting_value == "perplexity"
@@ -1281,9 +1236,7 @@ class TestLLMConfigDB:
         """Test deleting a user setting (soft delete)."""
         import time
 
-        llm_config_db.save_user_setting(
-            "user@example.com", "backend", "perplexity"
-        )
+        llm_config_db.save_user_setting("user@example.com", "backend", "perplexity")
         time.sleep(1.1)
         llm_config_db.delete_user_setting("user@example.com", "backend")
 
@@ -1345,9 +1298,7 @@ class TestSameSecondTiebreak:
             got = llm_config_db.get_user_setting(USER, "backend")
             assert (got.setting_value, got.id) == ("perplexity", later.id)
 
-    def test_get_user_setting_returns_the_last_of_a_run_of_saves_in_one_second(
-        self, llm_config_db
-    ):
+    def test_get_user_setting_returns_the_last_of_a_run_of_saves_in_one_second(self, llm_config_db):
         """One PUT stores one version, so a client that saves on every change of a control writes
         the whole run of them into a second or two."""
         saved = [llm_config_db.save_user_setting(USER, "backend", f"v{i}") for i in range(6)]
@@ -1446,9 +1397,7 @@ class TestSameSecondTiebreak:
                 assert [c.id for c in llm_config_db.get_user_comments(USER)] == newest_first
                 assert [c.id for c in llm_config_db.list_all_user_comments()] == newest_first
 
-    def test_get_tool_description_returns_the_later_of_two_saves_in_one_second(
-        self, llm_config_db
-    ):
+    def test_get_tool_description_returns_the_later_of_two_saves_in_one_second(self, llm_config_db):
         llm_config_db.save_tool_description("search_genes", "Version 1", USER)
         llm_config_db.save_tool_description("search_genes", "Version 2", USER)
         self.tie_timestamps(llm_config_db, "tool_description_history")
@@ -2064,9 +2013,7 @@ class TestValidateApiTokenTransactionSafety:
         db._conn.commit()
         return stamp
 
-    def test_a_failed_deadline_update_still_authenticates(
-        self, llm_config_db, monkeypatch, caplog
-    ):
+    def test_a_failed_deadline_update_still_authenticates(self, llm_config_db, monkeypatch, caplog):
         monkeypatch.setenv("API_TOKEN_TTL_DAYS", "90")
         _, plaintext = llm_config_db.create_api_token(USER)
         block_writes(llm_config_db, "user_api_tokens", event="UPDATE")
@@ -2312,15 +2259,17 @@ CHAT_WRITE_ACCESSORS = [
         "delete_attachment",
         "chat_attachments",
         "DELETE",
-        lambda db: db.add_attachment(
-            "att-1",
-            db.create_session(USER).id,
-            "f.tsv",
-            "tsv",
-            "text/tab-separated-values",
-            10,
-            "/tmp/f.tsv",
-        ).session_id,
+        lambda db: (
+            db.add_attachment(
+                "att-1",
+                db.create_session(USER).id,
+                "f.tsv",
+                "tsv",
+                "text/tab-separated-values",
+                10,
+                "/tmp/f.tsv",
+            ).session_id
+        ),
         lambda db, ctx: db.delete_attachment("att-1", ctx),
     ),
     (
@@ -2575,9 +2524,9 @@ class TestChatTurnMetrics:
     def test_both_ids_may_be_absent(self, chat_history_db):
         """A turn with no client ids still contributes its cost and iteration numbers."""
         self._record(chat_history_db, session_id=None, message_id=None)
-        count = chat_history_db._conn.execute(
-            "SELECT COUNT(*) FROM chat_turn_metrics"
-        ).fetchone()[0]
+        count = chat_history_db._conn.execute("SELECT COUNT(*) FROM chat_turn_metrics").fetchone()[
+            0
+        ]
         assert count == 1
 
     def test_null_message_ids_do_not_collide(self, chat_history_db):
@@ -2657,9 +2606,7 @@ class TestChatTurnMetrics:
         self._record(chat_history_db, session_id=session.id, message_id="m-attributed")
         self._record(chat_history_db, session_id=None, message_id=None, user_id=USER)
         self._record(chat_history_db, session_id=None, message_id="m-orphan", user_id=USER)
-        self._record(
-            chat_history_db, session_id=None, message_id=None, user_id="other@example.com"
-        )
+        self._record(chat_history_db, session_id=None, message_id=None, user_id="other@example.com")
 
         chat_history_db.delete_session(session.id, USER)
 
@@ -2709,21 +2656,15 @@ class TestChatTurnMetrics:
     def test_records_into_own_session(self, chat_history_db):
         """The session guard must not break the normal path."""
         session = chat_history_db.create_session(USER)
-        assert (
-            self._record(chat_history_db, session_id=session.id, user_id=USER) is not None
-        )
+        assert self._record(chat_history_db, session_id=session.id, user_id=USER) is not None
         assert len(chat_history_db.get_turn_metrics(session.id)) == 1
 
-    def test_unauthenticated_deployment_records_into_an_existing_session(
-        self, chat_history_db
-    ):
+    def test_unauthenticated_deployment_records_into_an_existing_session(self, chat_history_db):
         """A NULL user_id has no ownership to check against, so the session guard is
         skipped and the row is recorded. NULL is not what an auth-disabled deployment
         writes (that is "anonymous") — it is only reachable from an in-process caller."""
         session = chat_history_db.create_session("whoever-this-deployment-calls-people")
-        assert (
-            self._record(chat_history_db, session_id=session.id, user_id=None) is not None
-        )
+        assert self._record(chat_history_db, session_id=session.id, user_id=None) is not None
         assert len(chat_history_db.get_turn_metrics(session.id)) == 1
 
     def test_delete_session_keeps_another_users_metrics_row(self, chat_history_db):
@@ -2755,9 +2696,7 @@ class TestChatTurnMetrics:
             ("theirs", "other@example.com")
         ]
 
-    def test_delete_session_still_removes_rows_predating_the_user_id_column(
-        self, chat_history_db
-    ):
+    def test_delete_session_still_removes_rows_predating_the_user_id_column(self, chat_history_db):
         """Rows written before user_id existed carry NULL and belong to nobody in
         particular; leaving them behind would outlive 'delete my conversation'."""
         session = chat_history_db.create_session(USER)
@@ -2805,8 +2744,10 @@ class TestChatTurnMetricsRelaxAndBackfill:
         from genetics_mcp_server.db.singleton import Singleton
 
         path = str(tmp_path / "legacy.db")
-        columns = self.LEGACY_COLUMNS if with_user_id else self.LEGACY_COLUMNS.replace(
-            "user_id TEXT,", ""
+        columns = (
+            self.LEGACY_COLUMNS
+            if with_user_id
+            else self.LEGACY_COLUMNS.replace("user_id TEXT,", "")
         )
         con = sqlite3.connect(path)
         con.execute(f"CREATE TABLE chat_turn_metrics ({columns})")
@@ -2846,12 +2787,17 @@ class TestChatTurnMetricsRelaxAndBackfill:
         assert rows[0]["created_at"] == "2026-08-26 10:17:10"
         # the indexes are recreated after the rebuild
         names = {
-            r[0] for r in db._conn.execute(
+            r[0]
+            for r in db._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='chat_turn_metrics'"
             )
         }
-        assert {"idx_chat_turn_metrics_message", "idx_chat_turn_metrics_session",
-                "idx_chat_turn_metrics_created_at", "idx_chat_turn_metrics_user"} <= names
+        assert {
+            "idx_chat_turn_metrics_message",
+            "idx_chat_turn_metrics_session",
+            "idx_chat_turn_metrics_created_at",
+            "idx_chat_turn_metrics_user",
+        } <= names
         assert not db._conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='chat_turn_metrics_relaxed'"
         ).fetchall()
@@ -2893,19 +2839,30 @@ class TestChatTurnMetricsRelaxAndBackfill:
         from genetics_mcp_server.db.singleton import Singleton
 
         db = self._legacy_db(tmp_path)
-        db._conn.execute("INSERT INTO chat_turn_metrics (id, iterations, input_tokens, "
-                         "output_tokens, cost_usd, source) VALUES ('log:x', 1, 1, 1, 0.1, 'log')")
+        db._conn.execute(
+            "INSERT INTO chat_turn_metrics (id, iterations, input_tokens, "
+            "output_tokens, cost_usd, source) VALUES ('log:x', 1, 1, 1, 0.1, 'log')"
+        )
         db._conn.commit()
         Singleton._instances.pop(ChatHistoryDB, None)
         again = ChatHistoryDB(db.db_path)
-        assert again._conn.execute(
-            "SELECT source FROM chat_turn_metrics WHERE id='log:x'"
-        ).fetchone()[0] == "log"
+        assert (
+            again._conn.execute("SELECT source FROM chat_turn_metrics WHERE id='log:x'").fetchone()[
+                0
+            ]
+            == "log"
+        )
 
     def _turn(self, **overrides):
         t = dict(
-            log_id="abc", created_at="2026-05-01 12:00:00", user_id=USER, session_id="s1",
-            model="claude-opus-4-7", iterations=3, input_tokens=5000, output_tokens=400,
+            log_id="abc",
+            created_at="2026-05-01 12:00:00",
+            user_id=USER,
+            session_id="s1",
+            model="claude-opus-4-7",
+            iterations=3,
+            input_tokens=5000,
+            output_tokens=400,
             cost_usd=1.5,
         )
         t.update(overrides)
@@ -2916,7 +2873,10 @@ class TestChatTurnMetricsRelaxAndBackfill:
             [self._turn(), self._turn(log_id="def", session_id=None)]
         )
         assert result == {
-            "inserted": 2, "already_present": 0, "skipped_after_live": 0, "live_from": None,
+            "inserted": 2,
+            "already_present": 0,
+            "skipped_after_live": 0,
+            "live_from": None,
         }
         rows = chat_history_db.get_turn_metrics("s1")
         assert len(rows) == 1
@@ -2925,8 +2885,12 @@ class TestChatTurnMetricsRelaxAndBackfill:
         assert row["source"] == "log"
         assert row["outcome"] == "complete"
         assert row["message_id"] is None
-        assert (row["tool_call_count"], row["cache_read_tokens"],
-                row["cache_create_tokens"], row["wall_ms"]) == (None, None, None, None)
+        assert (
+            row["tool_call_count"],
+            row["cache_read_tokens"],
+            row["cache_create_tokens"],
+            row["wall_ms"],
+        ) == (None, None, None, None)
         assert (row["iterations"], row["input_tokens"], row["output_tokens"]) == (3, 5000, 400)
         assert row["cost_usd"] == 1.5
         assert row["created_at"] == "2026-05-01 12:00:00"
@@ -2946,9 +2910,17 @@ class TestChatTurnMetricsRelaxAndBackfill:
 
     def test_backfill_stops_at_the_first_live_row(self, chat_history_db):
         chat_history_db.record_turn_metrics(
-            session_id="live", message_id="m1", user_id=USER, iterations=1,
-            tool_call_count=0, input_tokens=1, output_tokens=1, cache_read_tokens=0,
-            cache_create_tokens=0, cost_usd=0.01, wall_ms=1,
+            session_id="live",
+            message_id="m1",
+            user_id=USER,
+            iterations=1,
+            tool_call_count=0,
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cost_usd=0.01,
+            wall_ms=1,
         )
         live_from = chat_history_db.get_turn_metrics("live")[0]["created_at"]
         before = self._turn(log_id="before", created_at="2020-01-01 00:00:00")
@@ -2965,9 +2937,17 @@ class TestChatTurnMetricsRelaxAndBackfill:
         chat_history_db.add_message(session.id, "a1", "assistant", "hello")
         chat_history_db.add_message(session.id, "u2", "user", "more")
         chat_history_db.record_turn_metrics(
-            session_id=session.id, message_id="a1", user_id=USER, iterations=1,
-            tool_call_count=0, input_tokens=1, output_tokens=1, cache_read_tokens=0,
-            cache_create_tokens=0, cost_usd=0.4, wall_ms=1,
+            session_id=session.id,
+            message_id="a1",
+            user_id=USER,
+            iterations=1,
+            tool_call_count=0,
+            input_tokens=1,
+            output_tokens=1,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cost_usd=0.4,
+            wall_ms=1,
         )
         yesterday = chat_history_db._conn.execute("SELECT datetime('now', '-1 day')").fetchone()[0]
         chat_history_db.backfill_turn_metrics_from_log(
@@ -2984,8 +2964,12 @@ class TestChatTurnMetricsRelaxAndBackfill:
         # turn's 0.4 is a conversation's cost; the total still counts both
         assert data["users"] == [
             {
-                "user": USER, "conversations": 1, "avg_messages": 3.0, "max_messages": 3,
-                "usd": pytest.approx(1.0), "avg_usd": pytest.approx(0.4),
+                "user": USER,
+                "conversations": 1,
+                "avg_messages": 3.0,
+                "max_messages": 3,
+                "usd": pytest.approx(1.0),
+                "avg_usd": pytest.approx(0.4),
                 "max_usd": pytest.approx(0.4),
             }
         ]

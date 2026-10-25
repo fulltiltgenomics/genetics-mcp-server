@@ -29,17 +29,13 @@ class TestAllConsumersReadTheSameLiveValue:
         answers 200 whatever is presented and could never show a rejection."""
         with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET=SECRET):
             with TestClient(app) as client:
-                response = client.get(
-                    "/chat/v1/me", headers={"Authorization": f"Bearer {SECRET}"}
-                )
+                response = client.get("/chat/v1/me", headers={"Authorization": f"Bearer {SECRET}"})
                 assert response.status_code == 200
 
     def test_auth_dependency_rejects_a_wrong_bearer(self):
         with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET=SECRET):
             with TestClient(app) as client:
-                response = client.get(
-                    "/chat/v1/me", headers={"Authorization": "Bearer wrong"}
-                )
+                response = client.get("/chat/v1/me", headers={"Authorization": "Bearer wrong"})
                 assert response.status_code == 401
 
     def test_tokens_validate_accepts_the_same_secret(self):
@@ -162,9 +158,7 @@ class TestEmptySecretStaysFailClosed:
         # check, not a property of auth_required.
         client = TestClient(app)
         with settings_env(REQUIRE_AUTH="true", INTERNAL_API_SECRET=""):
-            response = client.get(
-                "/chat/v1/me", headers={"Authorization": f"Bearer {presented}"}
-            )
+            response = client.get("/chat/v1/me", headers={"Authorization": f"Bearer {presented}"})
             assert response.status_code == 401
 
     def test_compare_digest_is_used_rather_than_equality(self):

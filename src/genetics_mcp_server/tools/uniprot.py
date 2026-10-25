@@ -51,12 +51,30 @@ _MAX_ALTERNATIVES = 5
 # GRCh38.p14) and pinned here so a chr:pos:ref:alt is only ever mapped against GRCh38;
 # a bare '12' has no assembly and guessing one would silently answer for the wrong build.
 _GRCH38_REFSEQ: dict[str, str] = {
-    "1": "NC_000001.11", "2": "NC_000002.12", "3": "NC_000003.12", "4": "NC_000004.12",
-    "5": "NC_000005.10", "6": "NC_000006.12", "7": "NC_000007.14", "8": "NC_000008.11",
-    "9": "NC_000009.12", "10": "NC_000010.11", "11": "NC_000011.10", "12": "NC_000012.12",
-    "13": "NC_000013.11", "14": "NC_000014.9", "15": "NC_000015.10", "16": "NC_000016.10",
-    "17": "NC_000017.11", "18": "NC_000018.10", "19": "NC_000019.10", "20": "NC_000020.11",
-    "21": "NC_000021.9", "22": "NC_000022.11", "X": "NC_000023.11", "Y": "NC_000024.10",
+    "1": "NC_000001.11",
+    "2": "NC_000002.12",
+    "3": "NC_000003.12",
+    "4": "NC_000004.12",
+    "5": "NC_000005.10",
+    "6": "NC_000006.12",
+    "7": "NC_000007.14",
+    "8": "NC_000008.11",
+    "9": "NC_000009.12",
+    "10": "NC_000010.11",
+    "11": "NC_000011.10",
+    "12": "NC_000012.12",
+    "13": "NC_000013.11",
+    "14": "NC_000014.9",
+    "15": "NC_000015.10",
+    "16": "NC_000016.10",
+    "17": "NC_000017.11",
+    "18": "NC_000018.10",
+    "19": "NC_000019.10",
+    "20": "NC_000020.11",
+    "21": "NC_000021.9",
+    "22": "NC_000022.11",
+    "X": "NC_000023.11",
+    "Y": "NC_000024.10",
     "MT": "NC_012920.1",
 }
 # chr:pos:ref:alt, the variant id every other tool here already speaks. A leading 'chr'
@@ -641,9 +659,7 @@ class UniProtClient:
         Returns `on_failure` unchanged when the symbol ladder finds nothing either, so a
         genuinely dead or genuinely foreign accession still reports as itself.
         """
-        result = await self._resolve_symbol(
-            accession, organism_id, reviewed_only, allow_text=False
-        )
+        result = await self._resolve_symbol(accession, organism_id, reviewed_only, allow_text=False)
         if _is_error(result):
             return on_failure
         # the discarded reading is preserved rather than dropped: the caller may well have
@@ -775,7 +791,9 @@ class UniProtClient:
         request is made, so there is no status or header to report.
         """
         label = self._label(url)
-        logger.warning(f"{label}: refused a request to an origin outside the configured APIs: {url}")
+        logger.warning(
+            f"{label}: refused a request to an origin outside the configured APIs: {url}"
+        )
         return {
             "_error": (
                 f"{label} refused a request to an origin outside the configured "
@@ -1037,9 +1055,7 @@ class UniProtClient:
             rows = collapse_transcripts(locations, expected_aa=expected_aa)
             variant["locations"] = rows
             variant["agrees"] = (
-                None
-                if expected_aa is None or not rows
-                else all(row.get("agrees") for row in rows)
+                None if expected_aa is None or not rows else all(row.get("agrees") for row in rows)
             )
             if variant["agrees"] is False:
                 variant["disagreement_evidence"] = _disagreement_evidence(entry, position)
@@ -1055,9 +1071,7 @@ class UniProtClient:
             "variants": mapped,
         }
 
-    async def get_variant_protein_effect(
-        self, variants: list[str] | str
-    ) -> dict[str, Any]:
+    async def get_variant_protein_effect(self, variants: list[str] | str) -> dict[str, Any]:
         """Map genomic coding SNVs onto their curated UniProt protein consequence.
 
         The direction map_protein_variants does not cover: a genomic `chr:pos:ref:alt`
@@ -1326,12 +1340,33 @@ _FEATURE_ALIASES: dict[str, str] = {
     "variants": "natural variant",
 }
 _AA3_TO_1: dict[str, str] = {
-    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
-    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
-    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
-    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
-    "SEC": "U", "PYL": "O", "ASX": "B", "GLX": "Z", "XAA": "X",
-    "TER": "*", "STOP": "*",
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
+    "SEC": "U",
+    "PYL": "O",
+    "ASX": "B",
+    "GLX": "Z",
+    "XAA": "X",
+    "TER": "*",
+    "STOP": "*",
 }
 _AA1 = frozenset("ACDEFGHIKLMNPQRSTVWYUOBZX*")
 # 'P70A', 'p.Pro70Ala', 'Pro70Ala', '70'; the reference residue is optional only so a
@@ -1408,7 +1443,7 @@ def one_letter_aa(value: Any) -> str | None:
 def _evidence(feature: dict[str, Any]) -> list[str]:
     """Evidence codes of a feature, from either API's spelling of them."""
     codes: list[str] = []
-    for item in (feature.get("evidences") or feature.get("evidence") or []):
+    for item in feature.get("evidences") or feature.get("evidence") or []:
         if not isinstance(item, dict):
             continue
         code = item.get("evidenceCode") or item.get("code")

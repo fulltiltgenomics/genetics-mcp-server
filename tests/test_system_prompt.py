@@ -1,9 +1,8 @@
 """The system prompt must never name a tool the model was not given.
 
-genetics-results-suite-4h6.69: the prompt and the tool list used to be assembled
-independently and nothing checked them against each other, so the prompt documented
-`launch_subagents` at length while ENABLE_SUBAGENTS defaults false and removes it from the
-tool list, and never mentioned `run_analysis` at all.
+The prompt and the tool list are assembled independently, so without this check a prompt
+can document a tool the flags have removed (`launch_subagents` under ENABLE_SUBAGENTS=false)
+or omit one the model was given.
 
 The scan below is deliberately NOT `defaults.tools_named_in` — that function is what
 DECIDES which blocks are emitted, so using it here would make the test assert that the
@@ -56,10 +55,15 @@ def flag_disabled_tools(
     to True — for the sandbox the opposite of the deployed default, for the key the
     opposite of a bare test environment — because everything below is about what the
     prompt says when a tool IS present; each flag-off direction is asserted explicitly
-    instead (genetics-results-suite-4h6.56).
+    instead.
+
+    Literature search is pinned to its shipped default because Settings would otherwise read
+    ENABLE_LITERATURE_SEARCH from the process, and a checkout's .env setting it false (the
+    benchmark configuration) withdrew the tool from every surface these tests describe.
     """
     return Settings(
         enable_subagents=subagents,
+        enable_literature_search=True,
         sandbox_enabled=sandbox,
         alphagenome_enabled=alphagenome,
         alphagenome_api_key="test-key" if alphagenome else None,
@@ -123,14 +127,16 @@ class TestPromptNamesOnlyAvailableTools:
         assert "variant_list_analysis" not in off
 
     def test_the_sandbox_flag_takes_the_guidance_with_the_tool(self):
-        """4h6.56 cashed in: SANDBOX_ENABLED=false must silence the prompt too.
+        """SANDBOX_ENABLED=false must silence the prompt too.
 
         Asserted through Settings and the real resolution rather than by subtracting the
         name by hand, because the whole point of the flag is that ONE value moves both the
         tool list and the prompt. A prompt that kept steering toward run_analysis while the
         tool was gone would be the worst of the three states.
         """
-        off = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False, sandbox=False))
+        off = default_system_prompt(
+            "FinnGenie", tool_names=resolve(None, subagents=False, sandbox=False)
+        )
         assert "run_analysis" not in off
         assert "Choosing How to Get Data" in off, "the other paths still need routing"
         # the default profile is not the only surface: the code arm resolves to nothing it
@@ -140,7 +146,7 @@ class TestPromptNamesOnlyAvailableTools:
         assert "run_analysis" not in default_system_prompt("FinnGenie", tool_names=code_off)
 
     def test_run_analysis_guidance_follows_the_tool(self):
-        """The gate is what makes the run_analysis flag (4h6.56) free."""
+        """The gate is what makes the run_analysis flag free."""
         with_tool = default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL)
         assert "run_analysis" in with_tool
         without = default_system_prompt("FinnGenie", tool_names=_EVERY_TOOL - {"run_analysis"})
@@ -150,7 +156,7 @@ class TestPromptNamesOnlyAvailableTools:
         assert "Prefer the dedicated API tools over the database" in without
 
     def test_unfiltered_assembly_still_available(self):
-        """tool_names=None keeps the pre-4h6.69 behaviour for callers with no tool list."""
+        """tool_names=None emits every block, for callers with no tool list."""
         full = default_system_prompt("FinnGenie")
         assert "launch_subagents" in full
         assert "get_alphagenome_variant_predictions" in full
@@ -179,15 +185,15 @@ class TestRoutingArbitrationHasOneHomePerSurface:
         assert "Prefer the dedicated API tools over the database" in prompt
 
     def test_a_surface_without_the_api_tools_gets_the_database_wording(self):
-        """Driven by the tool set rather than by a profile: since the collapse no profile
-        value resolves to a database-without-API-tools surface."""
+        """Driven by the tool set rather than by a profile: no profile value resolves to a
+        database-without-API-tools surface."""
         prompt = default_system_prompt("FinnGenie", tool_names=_DATABASE_ONLY)
         assert "The database is the data path here" in prompt
         assert "Prefer the dedicated API tools" not in prompt
 
 
 class TestDomainScienceSurvives:
-    """Routing guidance is per-surface; the science is not (4h6.17).
+    """Routing guidance is per-surface; the science is not.
 
     The MPRA / caQTL / variant-effect / open-chromatin distinction is a statement about
     what the assays measure. It is NOT in the SDK docstrings the code arm can reach
@@ -210,7 +216,7 @@ class TestDomainScienceSurvives:
 
 
 class TestDosageSensitivityBlock:
-    """rCNV / dosage-sensitivity guidance (hpa1.10), gated like the HLA block: it
+    """rCNV / dosage-sensitivity guidance, gated like the HLA block: it
     survives on any surface that has either dedicated tool, query_database or
     run_analysis, and disappears with all four.
     """
@@ -279,7 +285,7 @@ _ARM_ROUTING_SENTENCES = (
 # is the sentinel the routing variants already branch on), the database tool, or a script
 _DATA_PATH_TOOLS = frozenset({"get_credible_sets_by_gene", "query_database", "run_analysis"})
 
-# tool groups a deployment flag plausibly removes as a unit — 4h6.56 proposes one in front of
+# tool groups a deployment flag plausibly removes as a unit, as SANDBOX_ENABLED does for
 # run_analysis. The name-derived families are read off the registry so a tool added to one
 # joins the removal set without editing this list.
 _TOOL_FAMILIES = {
@@ -294,10 +300,10 @@ _TOOL_FAMILIES = {
 def _tool_sets_to_probe() -> dict[str, set[str]]:
     """Tool sets that mostly correspond to no profile the chat surface can be asked for.
 
-    Parametrising over today's five profiles is exactly what missed the defect this guards:
-    every one of them happens to carry all three tools the API-preference bullet cited as
-    examples, so the bullet's dependence on them was invisible. Driving from the full tool
-    set with single tools and plausible flag-shaped groups removed exposes it.
+    Parametrising over PROFILES only ever sees the tool sets a profile resolves to, so a
+    block that depends on tools every one of those sets carries looks unconditional there.
+    Driving from the full tool set with single tools and plausible flag-shaped groups
+    removed exposes that dependence.
     """
     full = _EVERY_TOOL
     sets = {"full": set(full)}
@@ -395,11 +401,9 @@ def _heading_of_each_line(text: str) -> dict[str, set[str | None]]:
 class TestSectionStructureSurvivesFiltering:
     """A dropped heading must never reparent the body that followed it.
 
-    `## Data Sources and Resource Names` was gated on `list_datasets` while its body —
-    the products/`data_type` paragraph, the aggregate-counts and sample-size-provenance
-    paragraphs, and the whole database section — was deliberately ungated. On the `code`
-    profile the heading vanished and ~4 KB of body landed under
-    `### Functional / Regulatory Readouts`, an H3 about MPRA and caQTL assays.
+    A heading gated more narrowly than its body drops on some surfaces while the body
+    stays, and the body then reads as part of whatever section preceded it — an unrelated
+    H3, with nothing in the emitted text to show it.
     """
 
     @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
@@ -425,14 +429,20 @@ class TestSectionStructureSurvivesFiltering:
             if not line.startswith("#"):
                 continue
             rest = lines[i + 1 :]
-            body = [x for x in rest[: next((j for j, y in enumerate(rest) if y.startswith("#")), len(rest))] if x.strip()]
+            body = [
+                x
+                for x in rest[
+                    : next((j for j, y in enumerate(rest) if y.startswith("#")), len(rest))
+                ]
+                if x.strip()
+            ]
             assert body, f"{profile}: heading {line!r} has no body"
 
 
 # Emitted section headings, pinned per profile. A profile losing a section is a real
 # decision, so it has to be made here rather than discovered later from a benchmark:
-# absence-only assertions let a `requires_any` change silently delete 3.5 KB from the
-# `api` prompt and 3.0 KB from `code` with every other test still green.
+# absence-only assertions let a `requires_any` change silently delete a whole section
+# with every other test still green.
 _SHARED_TAIL = [
     "## Response Style",
     "## Handling Uncertainty",
@@ -441,15 +451,16 @@ _SHARED_TAIL = [
     "## Prohibited",
     "## Terminology",
 ]
-# The no-code surface, which is what every profile value except "code" resolves to since
-# the collapse — so the four legacy names and None are pinned to the same list, and that
-# sameness is the collapse itself rather than a coincidence to tidy away.
+# The no-code surface, which is what every profile value except "code" resolves to — so
+# the legacy names, "nocode" and None are pinned to the same list, and that sameness is
+# what the edge coercion guarantees rather than a coincidence to tidy away.
 _DOMAIN_SECTIONS = [
     "## Data Domains and Outside Resources",
     "### Variant Annotation Sources",
     "### Functional / Regulatory Readouts",
     "### AlphaGenome variant predictions (opt-in)",
     "### Users' own custom GWAS (sandbox userresults)",
+    "### FinnGen R12 sex-specific and recessive GWAS",
     "### HLA / the MHC region",
     "### Dosage sensitivity / rare CNVs",
     "### Protein Annotation (UniProt)",
@@ -512,7 +523,7 @@ _LITERATURE_RUBRIC = [
     "Converging evidence is weighed, not counted",
     "not three confirmations",
     "Agreement with the loaded data is reconciled as carefully as disagreement",
-    "\"consistent with\" needs the paper's number beside yours",
+    '"consistent with" needs the paper\'s number beside yours',
     "A caveat stated in Pass 2 survives into Pass 3 and the bottom line",
     "beside the claim it qualifies",
 ]
@@ -534,22 +545,22 @@ _REQUIRED_WITH_A_DATA_PATH = [
     "**A follow-up that narrows an earlier result re-runs that retrieval with the filter added.**",
     "IS the fresh authoritative call",
     "### Users' own custom GWAS (sandbox userresults)",
+    "### FinnGen R12 sex-specific and recessive GWAS",
     "### HLA / the MHC region",
     "LD across the MHC is so extensive",
     "`pval` underflows to 0",
     "low **`info`** (imputation quality)",
 ]
 # derived from tool resolution, not prompt text, so a profile gaining or losing a data-path
-# tool is picked up here without editing this list by hand — that hand-maintenance is what
-# let `nocode` (routed through both get_credible_sets_by_gene and query_database) go unwritten
+# tool is picked up here without editing this list by hand, which is how a profile goes
+# missing from it
 _WITH_A_DATA_PATH = [p for p in PROFILES if _DATA_PATH_TOOLS & resolve(p, subagents=False)]
 
 
 _SCRIPT_ONLY_GUIDANCE = [
     "$GENETICS_SCHEMA_DIR",
-    # the schema is IN the prompt now, so what has to survive is the instruction not to
-    # go and fetch it. The old pin was "one markdown file per view", which described the
-    # on-demand arrangement that cost 32 of 138 scripts in benchmark run a08b371d.
+    # the schema is IN the prompt, so what has to survive is the instruction not to go
+    # and fetch it
     "do not spend a script discovering it",
     "# BigQuery view reference",
     "do not try to widen it with `pl.Config`",
@@ -560,8 +571,8 @@ _SCRIPT_ONLY_GUIDANCE = [
 class TestLoadBearingTextIsPresent:
     """Absence-only assertions cannot see text going missing.
 
-    A `requires_any` mutated from any-match to all-match silently removed 3.5 KB from the
-    `api` prompt and 3.0 KB from `code` while every profile-level test passed.
+    A `requires_any` mutated from any-match to all-match can silently remove whole
+    sections while every profile-level test passes.
     """
 
     @pytest.mark.parametrize("profile", PROFILES, ids=[str(p) for p in PROFILES])
@@ -644,15 +655,15 @@ def _run_analysis_bullet(prompt: str) -> str:
 
 
 class TestRunAnalysisWordingIsArmNeutral:
-    """The A/B in genetics-results-suite-4h6.23 compares arms that differ in TOOLS.
+    """The benchmark's A/B compares arms that differ in TOOLS.
 
     If the bullet describing run_analysis were worded more (or less) encouragingly on the
-    `code` arm than on the baseline, the comparison would be measuring the prompt instead.
-    Nothing asserted this before, so an edit could tilt the benchmark with tests green.
+    `code` arm than on the baseline, the comparison would be measuring the prompt instead,
+    and an edit could tilt the benchmark with every other test green.
     """
 
     def test_the_bullet_is_byte_identical_across_the_arms_that_carry_it(self):
-        """One profile value carries run_analysis since the collapse, so the second arm is
+        """One profile value carries run_analysis, so the second arm is
         constructed: the no-code surface with the sandbox's tools added back. That is the
         shape the benchmark's baseline arm had, and the wording has to match it exactly."""
         carriers = [p for p in PROFILES if "run_analysis" in resolve(p, subagents=False)]
@@ -663,9 +674,7 @@ class TestRunAnalysisWordingIsArmNeutral:
             | {"run_analysis", "list_capabilities", "read_artifact"},
         }
         bullets = {
-            label: _run_analysis_bullet(
-                default_system_prompt("FinnGenie", tool_names=tools)
-            )
+            label: _run_analysis_bullet(default_system_prompt("FinnGenie", tool_names=tools))
             for label, tools in arms.items()
         }
         assert len(set(bullets.values())) == 1, "run_analysis wording differs between arms"
@@ -699,11 +708,11 @@ _SDK_CATALOG_ROUTE = "`genetics.datasets(resource=..., include_stats=True)` insi
 
 
 class TestGuidanceKeyedOnAParameterOrAFieldIsGated:
-    """genetics-results-suite-4h6.75.
+    """Guidance keyed on a parameter or an output field is gated like guidance naming a tool.
 
     The gate matches TOOL NAMES, so a block whose actionability rests on a PARAMETER or an
-    OUTPUT FIELD names no tool and was emitted unconditionally — telling `code` to pass
-    `summarize=true` to tools it does not have, and `rag` to query a database it cannot
+    OUTPUT FIELD names no tool and would be emitted unconditionally — telling a surface to
+    pass `summarize=true` to tools it does not have, or to query a database it cannot
     reach. Everything below reads the RENDERED PROMPT per profile: asserting on `_Block`
     metadata would only restate the constant that was changed.
     """
@@ -732,7 +741,7 @@ class TestGuidanceKeyedOnAParameterOrAFieldIsGated:
         )
 
     def test_a_surface_with_neither_route_is_told_to_count_by_neither(self):
-        """No profile value resolves to this shape since the collapse, so it is built."""
+        """No profile value resolves to this shape, so it is built."""
         available = resolve("nocode", subagents=False) - {"query_database", "run_analysis"}
         assert not {"query_database", "run_analysis"} & available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
@@ -774,11 +783,13 @@ _ANNOTATION_SDK_ONLY = "Fetch them in a script instead: `genetics.variant_annota
 _ANNOTATION_DB_PROTEIN_ROUTE = "The database is not an alternative route to them. For a coding SNV"
 _ANNOTATION_NO_ROUTE = "there is no variant-annotation tool on this surface"
 # the code surface's route: it carries myvariant (an outside resource) without the FinnGen
-# annotation tool, a shape no profile produced before the collapse. The SDK leads and
+# annotation tool. The SDK leads and
 # myvariant is the last resort, never the source for consequence or frequency
 _ANNOTATION_MYVARIANT_ROUTE = "Use `get_myvariant_annotations` only for what those two do not cover"
 # the same shape without a script; no shipped profile, so only the assembly reaches it
-_ANNOTATION_DB_MYVARIANT_ROUTE = "Consequence and allele frequency come from `gnomad_variant_annotation_v` above"
+_ANNOTATION_DB_MYVARIANT_ROUTE = (
+    "Consequence and allele frequency come from `gnomad_variant_annotation_v` above"
+)
 _ANNOTATION_ROUTES = (
     _ANNOTATION_TOOL_ROUTE,
     _ANNOTATION_MYVARIANT_ROUTE,
@@ -790,10 +801,8 @@ _ANNOTATION_ROUTES = (
 )
 
 # A refusal sentence paired with the LOCAL tool whose presence in the SAME rendered prompt
-# would make it false. This is the defect class of genetics-results-suite-4h6.76's second
-# half: a prompt that tells the model to say something is unavailable while itself
-# documenting the tool that returns it. Nothing pinned it before — the no-route variant
-# shipped on `bigquery`, which has `get_variant_protein_effect`.
+# would make it false: a prompt that tells the model to say something is unavailable while
+# itself documenting the tool that returns it.
 _REFUSAL_CONTRADICTED_BY = {
     _ANNOTATION_NO_ROUTE: "get_variant_protein_effect",
     "What it does not cover — clinical significance, pathogenicity scores — is not in the"
@@ -815,13 +824,12 @@ _RETIRED_ANNOTATION_CLAIMS = (
 
 
 class TestTheAnnotationProhibitionAlwaysCarriesARoute:
-    """genetics-results-suite-4h6.76.
+    """The annotation prohibition never leaves a surface at a dead end.
 
     The prohibition ("NEVER query the database for pathogenicity / FinnGen's own AF") is gated on
     `query_database` or `run_analysis`; its remedy NAMES the two annotation tools, so the
-    text gate dropped the remedy on every surface without them — measured on `bigquery` and
-    on `code` — leaving a dead end. Each surface must now get the route it has, or be told
-    plainly that it has none.
+    text gate drops the remedy on every surface without them. Each surface must get the
+    route it has, or be told plainly that it has none.
     """
 
     @pytest.mark.parametrize("sandbox", [True, False], ids=["sandbox_on", "sandbox_off"])
@@ -877,15 +885,15 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
         assert "get_variant_annotations" not in available
         prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
         assert _ANNOTATION_MYVARIANT_ROUTE in prompt
-        route = prompt[prompt.index("Those per-variant annotations are not in the database"):]
-        assert route.index("genetics.variant_annotation(") < route.index("get_myvariant_annotations")
+        route = prompt[prompt.index("Those per-variant annotations are not in the database") :]
+        assert route.index("genetics.variant_annotation(") < route.index(
+            "get_myvariant_annotations"
+        )
         assert "`get_myvariant_annotations` returns a variant's consequence" not in prompt
 
     @pytest.mark.parametrize("variant", ["condensed", "legacy"])
     def test_a_database_surface_with_myvariant_gets_the_gnomad_view_route(self, variant):
-        available = resolve("nocode", subagents=False, sandbox=False) - {
-            "get_variant_annotations"
-        }
+        available = resolve("nocode", subagents=False, sandbox=False) - {"get_variant_annotations"}
         assert "get_myvariant_annotations" in available
         assert "run_analysis" not in available
         prompt = default_system_prompt("FinnGenie", tool_names=available, variant=variant)
@@ -915,11 +923,14 @@ class TestTheAnnotationProhibitionAlwaysCarriesARoute:
             "get_myvariant_annotations",
             "get_variant_protein_effect",
         }
-        assert not {
-            "get_variant_annotations",
-            "get_myvariant_annotations",
-            "get_variant_protein_effect",
-        } & available
+        assert (
+            not {
+                "get_variant_annotations",
+                "get_myvariant_annotations",
+                "get_variant_protein_effect",
+            }
+            & available
+        )
         assert "run_analysis" in available
         prompt = default_system_prompt("FinnGenie", tool_names=available)
         assert _ANNOTATION_PROHIBITION in prompt
@@ -1013,9 +1024,7 @@ class TestPromptVariants:
         from genetics_mcp_server.config import defaults
 
         marker = "SENTINEL-BLOCK-TEXT"
-        monkeypatch.setitem(
-            defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block(marker),)
-        )
+        monkeypatch.setitem(defaults.PROMPT_VARIANTS, "sentinel", (defaults._Block(marker),))
 
         assert marker in defaults.default_system_prompt(variant="sentinel")
         assert marker not in defaults.default_system_prompt()
@@ -1035,9 +1044,7 @@ class TestPromptVariants:
             ),
         )
 
-        with_tool = defaults.default_system_prompt(
-            tool_names={"run_analysis"}, variant="sentinel"
-        )
+        with_tool = defaults.default_system_prompt(tool_names={"run_analysis"}, variant="sentinel")
         without = defaults.default_system_prompt(tool_names=set(), variant="sentinel")
 
         assert "run_analysis" in with_tool
@@ -1193,8 +1200,12 @@ class TestAlphaGenomeOptIn:
         """The flag is the deployment's intent and gates independently of the key: a
         deployment that leaves ALPHAGENOME_ENABLED off must not advertise the tool or its
         prompt block even if a key was ever seeded there."""
-        disabled = Settings(alphagenome_enabled=False, alphagenome_api_key="test-key").disabled_tools
-        available = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
+        disabled = Settings(
+            alphagenome_enabled=False, alphagenome_api_key="test-key"
+        ).disabled_tools
+        available = {
+            t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)
+        }
         assert self.TOOL not in available
         assert "AlphaGenome" not in default_system_prompt(
             "FinnGenie", tool_names=available, variant=variant
@@ -1206,10 +1217,19 @@ class TestAlphaGenomeOptIn:
         variable — os.environ.get returns "" for `ALPHAGENOME_API_KEY=` in a manifest,
         which is exactly what an optional secret key renders to when the deployment has
         no key."""
-        assert self.TOOL not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
-        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
-        assert self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
-        assert self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
+        assert (
+            self.TOOL
+            not in Settings(alphagenome_enabled=True, alphagenome_api_key="k").disabled_tools
+        )
+        assert (
+            self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key="").disabled_tools
+        )
+        assert (
+            self.TOOL in Settings(alphagenome_enabled=True, alphagenome_api_key=None).disabled_tools
+        )
+        assert (
+            self.TOOL in Settings(alphagenome_enabled=False, alphagenome_api_key="k").disabled_tools
+        )
 
     def test_the_tool_description_carries_the_same_rules(self):
         """The strongest wording lives in the description, which the model follows more
@@ -1229,7 +1249,7 @@ class TestAlphaGenomeOptIn:
 
 
 class TestRunAnalysisInputsRules:
-    """genetics-results-suite-vxtv.16: what the model must do with a file it fetched
+    """What the model must do with a file it fetched
     through `run_analysis`'s `inputs`. Gated on `run_analysis` alone — the rule about
     untrusted content only ever bites after a fetch the model chose to make, but that
     choice is only reachable with the tool in hand, so the block cannot be emitted where
@@ -1274,7 +1294,9 @@ class TestRunAnalysisInputsRules:
         assert "run_analysis" not in without
         prompt = default_system_prompt("FinnGenie", tool_names=without, variant=variant)
         for rule in self.RULES:
-            assert rule not in prompt, f"{variant}: lost the gate: {rule!r} survived without run_analysis"
+            assert rule not in prompt, (
+                f"{variant}: lost the gate: {rule!r} survived without run_analysis"
+            )
 
     @pytest.fixture
     def fetcher_allow_list(self, monkeypatch):
@@ -1368,9 +1390,7 @@ class TestRunAnalysisInputsRules:
         """What production does: assembly is called from an async request handler, so the
         probe cannot use the loop it is already on."""
         fetcher_allow_list(self.HOSTS)
-        prompt = default_system_prompt(
-            "FinnGenie", tool_names=resolve("code", subagents=False)
-        )
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("code", subagents=False))
         assert (
             "URL inputs are fetched only from these hosts: "
             "raw.githubusercontent.com, eutils.ncbi.nlm.nih.gov." in prompt
@@ -1437,9 +1457,13 @@ class TestPseudoCredibleSetCaveatIsKeyedOnTheRegistryFlag:
     def test_the_caveat_names_the_flag_and_no_resource_id(self, variant):
         """A resource id in the caveat is a list a new resource silently misses; the
         registry's `pseudo_credible_sets` flag reaches the model through list_datasets."""
-        prompt = default_system_prompt("FinnGenie", tool_names=resolve(None, subagents=False), variant=variant)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve(None, subagents=False), variant=variant
+        )
         assert "`pseudo_credible_sets` flag is true" in prompt
-        assert not re.search(r"finngen_(mvp_)?ukbb", prompt.split("### Pseudo Credible Sets")[1].split("###")[0])
+        assert not re.search(
+            r"finngen_(mvp_)?ukbb", prompt.split("### Pseudo Credible Sets")[1].split("###")[0]
+        )
 
     @pytest.mark.parametrize("variant", _ALL_VARIANTS)
     def test_the_duty_survives_a_surface_without_list_datasets(self, variant):
@@ -1447,7 +1471,10 @@ class TestPseudoCredibleSetCaveatIsKeyedOnTheRegistryFlag:
         and can surface pseudo sets with no list_datasets tool."""
         tools = resolve(None, subagents=False) - {"list_datasets"}
         prompt = default_system_prompt("FinnGenie", tool_names=tools, variant=variant)
-        assert "list_datasets" not in prompt.split("### Pseudo Credible Sets")[1].split("###")[0].split("(`")[0]
+        assert (
+            "list_datasets"
+            not in prompt.split("### Pseudo Credible Sets")[1].split("###")[0].split("(`")[0]
+        )
         assert "### Pseudo Credible Sets" in prompt
         assert "tell the user explicitly" in prompt
         assert "`pseudo_credible_sets` flag is true" in prompt

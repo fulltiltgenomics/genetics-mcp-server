@@ -16,12 +16,15 @@ os.environ["REQUIRE_AUTH"] = "false"
 
 
 # what results-api answers a finngen deployment: the three sandbox custom GWAS releases,
-# R14 also with HLA. Every test sees this deployment (see the autouse fixture below).
+# R14 also with HLA, and the R12 sex-specific and recessive GWAS. Every test sees this
+# deployment (see the autouse fixture below).
 FINNGEN_ON_REQUEST_DATASETS = (
     ("finngen_custom_r12", "gwas"),
     ("finngen_custom_r13", "gwas"),
     ("finngen_custom_r14", "gwas"),
     ("finngen_custom_r14", "hla"),
+    ("finngen_recessive", "gwas_recessive"),
+    ("finngen_sex_specific", "gwas_sex_specific"),
 )
 
 
@@ -163,10 +166,19 @@ def close_and_unlink(db, db_path):
 
 
 @pytest.fixture
-def chat_history_db():
-    """Create a temporary ChatHistoryDB instance for testing."""
+def chat_history_db(monkeypatch):
+    """Create a temporary ChatHistoryDB instance for testing.
+
+    get_chat_history_db() caches whatever the metaclass hands it in a module global, so a call made
+    while this fixture's instance is the singleton would outlive the test and keep pointing
+    at the unlinked file, which the next connection recreates empty. monkeypatch restores
+    the global at teardown.
+    """
+    from genetics_mcp_server.db import chat_history_db as chat_history_db_module
     from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
     from genetics_mcp_server.db.singleton import Singleton
+
+    monkeypatch.setattr(chat_history_db_module, "_chat_history_db", None)
 
     # clear singleton to allow fresh instance
     if ChatHistoryDB in Singleton._instances:
@@ -186,10 +198,19 @@ def chat_history_db():
 
 
 @pytest.fixture
-def llm_config_db():
-    """Create a temporary LLMConfigDB instance for testing."""
+def llm_config_db(monkeypatch):
+    """Create a temporary LLMConfigDB instance for testing.
+
+    get_llm_config_db() caches whatever the metaclass hands it in a module global, so a call made
+    while this fixture's instance is the singleton would outlive the test and keep pointing
+    at the unlinked file, which the next connection recreates empty. monkeypatch restores
+    the global at teardown.
+    """
+    from genetics_mcp_server.db import llm_config_db as llm_config_db_module
     from genetics_mcp_server.db.llm_config_db import LLMConfigDB
     from genetics_mcp_server.db.singleton import Singleton
+
+    monkeypatch.setattr(llm_config_db_module, "_llm_config_db", None)
 
     # clear singleton to allow fresh instance
     if LLMConfigDB in Singleton._instances:

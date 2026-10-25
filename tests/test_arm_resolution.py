@@ -368,9 +368,7 @@ def test_two_arms_with_the_same_spec_are_refused_before_the_dataset_is_read(caps
     as soon as their URLs differ, so this can only fire on a genuine duplicate."""
     import genetics_mcp_server.scripts.replay_benchmark as rb
 
-    code = rb.main(
-        ["--dataset", "/nonexistent.json", "--arm-a", CODE_ARM, "--arm-b", CODE_ARM]
-    )
+    code = rb.main(["--dataset", "/nonexistent.json", "--arm-a", CODE_ARM, "--arm-b", CODE_ARM])
 
     assert code == 2
     err = capsys.readouterr().err

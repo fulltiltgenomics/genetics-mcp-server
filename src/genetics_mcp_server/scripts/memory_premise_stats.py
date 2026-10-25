@@ -45,7 +45,8 @@ WINDOW_DAYS = 90
 MIN_REMENTION_CHARS = 3
 # memory_gate.MEMORY_PROJECT_SESSION_CAP, copied rather than imported because the bundle
 # may import nothing of this package; a drift between the two makes M3 measure a window
-# the product does not have
+# the product does not have. The product's window also admits pinned sessions, which
+# analyse_clusters treats as in-window only when chat_sessions has pinned_at to read
 DIGEST_WINDOW_SESSIONS = 20
 # both linkage thresholds are reported: at 1 a single shared gene merges two lines of
 # work, at 2 a project has to be recognisable by more than one identifier
@@ -247,17 +248,11 @@ def analyse_window(sessions_by_user, summary_by_session, window_start):
         ),
         "remention_kinds": {kind: remention_kinds[kind] for kind in KINDS},
         "first_msg_refer_back_phrase": counters["first_msg_refer_back_phrase"],
-        "refer_back_share_of_returning": share(
-            counters["first_msg_refer_back_phrase"], with_first
-        ),
+        "refer_back_share_of_returning": share(counters["first_msg_refer_back_phrase"], with_first),
         "first_turn_toolarg_overlap": counters["first_turn_toolarg_overlap"],
-        "toolarg_share_of_returning": share(
-            counters["first_turn_toolarg_overlap"], with_first
-        ),
+        "toolarg_share_of_returning": share(counters["first_turn_toolarg_overlap"], with_first),
         "first_turn_toolarg_overlap_strict": counters["first_turn_toolarg_overlap_strict"],
-        "toolarg_share_strict": share(
-            counters["first_turn_toolarg_overlap_strict"], with_first
-        ),
+        "toolarg_share_strict": share(counters["first_turn_toolarg_overlap_strict"], with_first),
         "toolarg_kinds": {kind: toolarg_kinds[kind] for kind in KINDS},
         "inter_session_gap_hours": {
             "n": len(gaps_hours),
@@ -288,9 +283,7 @@ def window_sessions(rows, window_start):
 
 
 def session_entity_sets(rows, summary_by_session):
-    return {
-        row[0]: (summary_by_session.get(row[0]) or (set(), None, set()))[0] for row in rows
-    }
+    return {row[0]: (summary_by_session.get(row[0]) or (set(), None, set()))[0] for row in rows}
 
 
 def analyse_clusters(sessions_by_user, summary_by_session, window_start, min_shared):
@@ -358,9 +351,7 @@ def analyse_clusters(sessions_by_user, summary_by_session, window_start, min_sha
                             is_different = True
                         # the digest surfaces the most recent occurrence, so that is the
                         # one that has to fall outside the window for it to be a miss
-                        newest = max(
-                            (prior_row_by_id[sid] for sid in sources), key=recency_key
-                        )
+                        newest = max((prior_row_by_id[sid] for sid in sources), key=recency_key)
                         if newest[0] not in recent and source_cluster == clusters[session_id]:
                             is_miss = True
                     different_cluster += is_different
@@ -406,9 +397,7 @@ def cluster_quality(sessions_by_user, summary_by_session, min_shared):
         for session_id, cluster_id in clusters.items():
             members[cluster_id].append(session_id)
         entry = {"user": user_hash(user_id), "sessions": len(rows), "clusters": []}
-        for cluster_id, session_ids in sorted(
-            members.items(), key=lambda kv: (-len(kv[1]), kv[0])
-        ):
+        for cluster_id, session_ids in sorted(members.items(), key=lambda kv: (-len(kv[1]), kv[0])):
             cluster = {"size": len(session_ids)}
             if len(session_ids) >= 2:
                 counts = Counter(
@@ -533,9 +522,7 @@ def assistant_payload_sizes(con):
     """Size distribution of stored assistant `content_json`, measured a row at a time."""
     sizes = sorted(
         len(raw or "")
-        for (raw,) in con.execute(
-            "SELECT content_json FROM chat_messages WHERE role='assistant'"
-        )
+        for (raw,) in con.execute("SELECT content_json FROM chat_messages WHERE role='assistant'")
     )
     return {
         "n": len(sizes),
@@ -546,6 +533,9 @@ def assistant_payload_sizes(con):
 
 
 def collect(db_path):
+    # mode=ro still creates a WAL database's -shm/-wal sidecars when they are absent, so in a
+    # read-only directory without them the first read fails (exit 1, empty stdout); a live
+    # chat-backend's database already has both
     con = sqlite3.connect(f"file:{quote(db_path)}?mode=ro", uri=True)
     try:
         pinned_expr, pinned_visible = sessions_pinned_column(con)
@@ -569,9 +559,7 @@ def collect(db_path):
                 "first_session": sessions[0][2] if sessions else None,
                 "last_session": sessions[-1][2] if sessions else None,
             },
-            "all_time": analyse_window(
-                sessions_by_user, summary_by_session, datetime(2000, 1, 1)
-            ),
+            "all_time": analyse_window(sessions_by_user, summary_by_session, datetime(2000, 1, 1)),
             "last_90d": analyse_window(sessions_by_user, summary_by_session, cutoff),
             "clusters": {
                 "notes": CLUSTER_NOTES,
@@ -592,9 +580,7 @@ def collect(db_path):
                 # one dump, over every session a user has: the shapes are what is being
                 # judged, and repeating them per window would say the same thing twice
                 "quality_all_time": {
-                    f"min_shared_{n}": cluster_quality(
-                        sessions_by_user, summary_by_session, n
-                    )
+                    f"min_shared_{n}": cluster_quality(sessions_by_user, summary_by_session, n)
                     for n in CLUSTER_MIN_SHARED
                 },
             },
@@ -609,9 +595,7 @@ def collect(db_path):
 # BUNDLE-ONLY-START
 # the import --bundle strips; the `^from` anchor is what keeps the pattern from matching
 # the indented line that spells it
-_BUNDLE_IMPORT_RE = re.compile(
-    r"^from genetics_mcp_server\.memory_digest import \([^)]*\)\n", re.M
-)
+_BUNDLE_IMPORT_RE = re.compile(r"^from genetics_mcp_server\.memory_digest import \([^)]*\)\n", re.M)
 # this module's own header, replaced because the bundle is a different artifact
 _BUNDLE_DOCSTRING_RE = re.compile(r'\A""".*?"""\n', re.S)
 # the bundle-only region and the `--bundle` branch: both name this package, so a bundle
@@ -651,6 +635,8 @@ def build_bundle():
                 f"made {replaced}"
             )
     return stats_source
+
+
 # BUNDLE-ONLY-END
 
 

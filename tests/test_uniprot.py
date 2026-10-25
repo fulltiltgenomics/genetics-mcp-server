@@ -60,7 +60,11 @@ ENTRY_P07202 = {
         {
             "commentType": "ALTERNATIVE PRODUCTS",
             "isoforms": [
-                {"isoformIds": ["P07202-1"], "name": {"value": "1"}, "isoformSequenceStatus": "Displayed"},
+                {
+                    "isoformIds": ["P07202-1"],
+                    "name": {"value": "1"},
+                    "isoformSequenceStatus": "Displayed",
+                },
                 {"isoformIds": ["P07202-2"], "name": {"value": "2"}},
                 {"isoformIds": ["P07202-3"], "name": {"value": "3"}},
             ],
@@ -85,7 +89,9 @@ ENTRY_P07202 = {
             "type": "Active site",
             "location": {"start": {"value": 239}, "end": {"value": 239}},
             "description": "Proton acceptor",
-            "evidences": [{"evidenceCode": "ECO:0000255", "source": "PROSITE-ProRule", "id": "PRU10012"}],
+            "evidences": [
+                {"evidenceCode": "ECO:0000255", "source": "PROSITE-ProRule", "id": "PRU10012"}
+            ],
         },
         {
             "type": "Sequence conflict",
@@ -185,10 +191,26 @@ class TestUniProtPureFunctions:
 
     def test_parse_all_three_letter_codes_convert(self):
         codes = {
-            "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
-            "Gln": "Q", "Glu": "E", "Gly": "G", "His": "H", "Ile": "I",
-            "Leu": "L", "Lys": "K", "Met": "M", "Phe": "F", "Pro": "P",
-            "Ser": "S", "Thr": "T", "Trp": "W", "Tyr": "Y", "Val": "V",
+            "Ala": "A",
+            "Arg": "R",
+            "Asn": "N",
+            "Asp": "D",
+            "Cys": "C",
+            "Gln": "Q",
+            "Glu": "E",
+            "Gly": "G",
+            "His": "H",
+            "Ile": "I",
+            "Leu": "L",
+            "Lys": "K",
+            "Met": "M",
+            "Phe": "F",
+            "Pro": "P",
+            "Ser": "S",
+            "Thr": "T",
+            "Trp": "W",
+            "Tyr": "Y",
+            "Val": "V",
         }
         for three, one in codes.items():
             assert uniprot.parse_protein_variant(f"{three}10Ala") == (10, one), three
@@ -237,7 +259,9 @@ class TestUniProtPureFunctions:
             "primaryAccession": "A0A1B0GTU1",
             "uniProtkbId": "A0A1B0GTU1_HUMAN",
             "entryType": "UniProtKB unreviewed (TrEMBL)",
-            "proteinDescription": {"submissionNames": [{"fullName": {"value": "Serine protease 55"}}]},
+            "proteinDescription": {
+                "submissionNames": [{"fullName": {"value": "Serine protease 55"}}]
+            },
             "genes": [{"geneName": {"value": "PRSS55"}}],
             "sequence": {"value": "M" * 42, "length": 42},
         }
@@ -289,7 +313,9 @@ class TestUniProtPureFunctions:
         assert sorted(f["start"] for f in features) == [1, 239]
 
     def test_flatten_features_type_filter_no_match(self):
-        assert uniprot.flatten_features(ENTRY_P07202["features"], feature_types=["Propeptide"]) == []
+        assert (
+            uniprot.flatten_features(ENTRY_P07202["features"], feature_types=["Propeptide"]) == []
+        )
 
     def test_flatten_features_range_keeps_overlapping_not_only_contained(self):
         # 150-160 lies strictly inside the 100-200 domain: the domain overlaps and must
@@ -337,7 +363,9 @@ class TestUniProtPureFunctions:
 
     def test_flatten_features_does_not_mutate_input(self):
         before = json.dumps(ENTRY_P07202["features"], sort_keys=True)
-        uniprot.flatten_features(ENTRY_P07202["features"], feature_types=["Domain"], residue_range="1-500")
+        uniprot.flatten_features(
+            ENTRY_P07202["features"], feature_types=["Domain"], residue_range="1-500"
+        )
         assert json.dumps(ENTRY_P07202["features"], sort_keys=True) == before
 
     # -- collapse_transcripts --------------------------------------------------
@@ -670,7 +698,9 @@ class TestUniProtToolMethods:
         # second; only the gene_exact tier pins the real thyroid peroxidase
         def resolver(url):
             if "gene_exact" in url:
-                return _resp(_search_body(_summary("P07202", "PERT_HUMAN", "Thyroid peroxidase", "TPO")))
+                return _resp(
+                    _search_body(_summary("P07202", "PERT_HUMAN", "Thyroid peroxidase", "TPO"))
+                )
             if "/uniprotkb/search" in url:
                 return _resp(
                     _search_body(
@@ -697,7 +727,9 @@ class TestUniProtToolMethods:
         # gene:PRSS55 answers with one curated entry and three TrEMBL fragments; the
         # motivating session asserted Q7Z5A4 and Q9H0E5 before reaching Q6UWB4
         trembl = [
-            _summary("A0A1B0GTU1", "A0A1B0GTU1_HUMAN", "Serine protease 55", "PRSS55", reviewed=False),
+            _summary(
+                "A0A1B0GTU1", "A0A1B0GTU1_HUMAN", "Serine protease 55", "PRSS55", reviewed=False
+            ),
             _summary("H7C1P1", "H7C1P1_HUMAN", "Serine protease 55", "PRSS55", reviewed=False),
             _summary("C9JH25", "C9JH25_HUMAN", "Serine protease 55", "PRSS55", reviewed=False),
         ]
@@ -710,7 +742,9 @@ class TestUniProtToolMethods:
                 # relevance order alone puts the unreviewed fragments first
                 return _resp(_search_body(*trembl, reviewed))
             if "Q6UWB4" in url:
-                return _resp({**ENTRY_P07202, "primaryAccession": "Q6UWB4", "uniProtkbId": "PRS55_HUMAN"})
+                return _resp(
+                    {**ENTRY_P07202, "primaryAccession": "Q6UWB4", "uniProtkbId": "PRS55_HUMAN"}
+                )
             return None
 
         patcher, _calls = self._patch_get(resolver)
@@ -926,22 +960,35 @@ class TestUniProtToolMethods:
                 "accession": "A0ACI8UJW1",
                 "entryName": "A0ACI8UJW1_HUMAN",
                 "proteinExistence": "Predicted",
-                "features": [{"type": "VARIANT", "begin": "2019", "wildType": "G",
-                              "mutatedType": "S", "locations": [{"loc": "p.Gly2019Ser"}]}],
+                "features": [
+                    {
+                        "type": "VARIANT",
+                        "begin": "2019",
+                        "wildType": "G",
+                        "mutatedType": "S",
+                        "locations": [{"loc": "p.Gly2019Ser"}],
+                    }
+                ],
             },
             {
                 "accession": "Q5S007",
                 "entryName": "LRRK2_HUMAN",
                 "geneName": "LRRK2",
                 "proteinExistence": "Evidence at protein level",
-                "features": [{
-                    "type": "VARIANT", "begin": "2019", "wildType": "G", "mutatedType": "S",
-                    "consequenceType": "missense", "ftId": "VAR_024958",
-                    "clinicalSignificances": [{"type": "Pathogenic"}],
-                    "association": [{"name": "Autosomal dominant Parkinson disease 8"}],
-                    "locations": [{"loc": "p.Gly2019Ser"}],
-                    "xrefs": [{"name": "dbSNP", "id": "rs34637584"}],
-                }],
+                "features": [
+                    {
+                        "type": "VARIANT",
+                        "begin": "2019",
+                        "wildType": "G",
+                        "mutatedType": "S",
+                        "consequenceType": "missense",
+                        "ftId": "VAR_024958",
+                        "clinicalSignificances": [{"type": "Pathogenic"}],
+                        "association": [{"name": "Autosomal dominant Parkinson disease 8"}],
+                        "locations": [{"loc": "p.Gly2019Ser"}],
+                        "xrefs": [{"name": "dbSNP", "id": "rs34637584"}],
+                    }
+                ],
             },
         ]
 
@@ -993,14 +1040,16 @@ class TestUniProtToolMethods:
     async def test_map_protein_variants_attaches_curated_variant(self):
         entry_with_variant = {
             **ENTRY_P07202,
-            "features": [{
-                "type": "Natural variant",
-                "location": {"start": {"value": 70}, "end": {"value": 70}},
-                "description": "in a disease; dbSNP:rs777",
-                "featureId": "VAR_000070",
-                "alternativeSequence": {"originalSequence": "P", "alternativeSequences": ["A"]},
-                "featureCrossReferences": [{"database": "dbSNP", "id": "rs777"}],
-            }],
+            "features": [
+                {
+                    "type": "Natural variant",
+                    "location": {"start": {"value": 70}, "end": {"value": 70}},
+                    "description": "in a disease; dbSNP:rs777",
+                    "featureId": "VAR_000070",
+                    "alternativeSequence": {"originalSequence": "P", "alternativeSequences": ["A"]},
+                    "featureCrossReferences": [{"database": "dbSNP", "id": "rs777"}],
+                }
+            ],
         }
 
         def resolver(url):

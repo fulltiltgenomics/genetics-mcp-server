@@ -62,7 +62,13 @@ class TestToolDefinitions:
         "['A', 'B']".
         """
         json_schema_types = {
-            "string", "number", "integer", "boolean", "array", "object", "null",
+            "string",
+            "number",
+            "integer",
+            "boolean",
+            "array",
+            "object",
+            "null",
         }
         for tool in TOOL_DEFINITIONS:
             params = tool["parameters"]
@@ -173,9 +179,9 @@ class TestMCPToolRegistration:
         # verify expected tools are registered. run_analysis is the one definition with no
         # registration block at all — see the comment in register_mcp_tools; it is a
         # security control, so this exemption is the assertion, not a gap in it.
-        expected = {
-            t["name"] for t in TOOL_DEFINITIONS + CODE_EXECUTION_TOOL_DEFINITIONS
-        } - {"run_analysis"}
+        expected = {t["name"] for t in TOOL_DEFINITIONS + CODE_EXECUTION_TOOL_DEFINITIONS} - {
+            "run_analysis"
+        }
 
         # if we have tool manager access, verify all tools
         if registered_names:
@@ -367,7 +373,7 @@ class TestMCPDisabledTools:
     def test_run_analysis_is_named_in_the_hardcoded_exclusion_set(self):
         """Belt and braces on the above: the entry is what §5 names, what an operator
 
-        greps for, and what catches a register_mcp_tools block added later.
+        greps for, and what catches a register_mcp_tools handler added later.
         """
         from genetics_mcp_server import mcp_server
 
@@ -415,9 +421,7 @@ class TestMCPRegistrationGate:
         if not hasattr(mcp, "_tool_manager"):
             # fail rather than skip: a skip here retires every assertion below on a FastMCP
             # upgrade and leaves the run green
-            pytest.fail(
-                "FastMCP exposes no _tool_manager; cannot enumerate registered tools"
-            )
+            pytest.fail("FastMCP exposes no _tool_manager; cannot enumerate registered tools")
         return set(mcp._tool_manager._tools.keys())
 
     def test_every_handler_registers_through_the_gate(self):
@@ -455,8 +459,7 @@ class TestMCPRegistrationGate:
         raw = [
             ast.unparse(node.func)
             for node in ast.walk(registrar)
-            if isinstance(node, ast.Call)
-            and ast.unparse(node.func) in {"mcp.tool", "mcp.add_tool"}
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in {"mcp.tool", "mcp.add_tool"}
         ]
         assert raw == [], f"registration bypassing the gate: {raw}"
         # names, not a count: a count is satisfied by any mismatched pair of the same size
@@ -564,9 +567,7 @@ class TestToolDescriptions:
         for tool in TOOL_DEFINITIONS:
             desc_lower = tool["description"].lower()
             has_guidance = any(kw in desc_lower for kw in guidance_keywords)
-            assert has_guidance, (
-                f"Tool {tool['name']} description lacks usage guidance"
-            )
+            assert has_guidance, f"Tool {tool['name']} description lacks usage guidance"
 
     def test_parameter_descriptions_exist(self):
         """Test that parameters have descriptions where useful."""
@@ -575,8 +576,7 @@ class TestToolDescriptions:
                 # required params should always have descriptions
                 if param_def.get("required"):
                     assert "description" in param_def, (
-                        f"Required param '{param_name}' in {tool['name']} "
-                        "should have description"
+                        f"Required param '{param_name}' in {tool['name']} should have description"
                     )
 
 
@@ -607,9 +607,7 @@ class TestBearerAuthMiddleware:
         from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
 
         # bypass _validate_user_token so only static keys matter
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", lambda _: False)
 
         call_log: list[dict] = []
 
@@ -654,9 +652,7 @@ class TestBearerAuthMiddleware:
         from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
 
         monkeypatch.setenv("MCP_ALLOW_QUERY_TOKEN", "true")
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", lambda _: False)
 
         call_log: list[dict] = []
 
@@ -745,9 +741,7 @@ class TestBearerAuthMiddleware:
         from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
 
         monkeypatch.setenv("MCP_ALLOW_QUERY_TOKEN", "true")
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", lambda _: False)
 
         call_log: list[dict] = []
 
@@ -784,8 +778,7 @@ class TestBearerAuthMiddleware:
 
         assert len(call_log) == 0, "Inner app should NOT have been called for healthz"
         assert any(
-            m.get("type") == "http.response.start" and m.get("status") == 200
-            for m in messages
+            m.get("type") == "http.response.start" and m.get("status") == 200 for m in messages
         )
 
     @pytest.mark.asyncio
@@ -799,9 +792,7 @@ class TestBearerAuthMiddleware:
             seen.append(token)
             return token == "good-user-token"
 
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", fake_validator
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", fake_validator)
 
         call_log: list[dict] = []
 
@@ -864,19 +855,13 @@ class TestBearerAuthJWT:
         from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
 
         # short-circuit user-token path so unexpected fallback would not silently pass
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", lambda _: False)
 
         # avoid touching the real Google transport
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._get_google_request", lambda: object()
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._get_google_request", lambda: object())
 
         # inject deterministic settings for allow-list checks
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server.get_settings", lambda: settings
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server.get_settings", lambda: settings)
 
         # mock the lazy import target: google.oauth2.id_token.verify_oauth2_token
         import google.oauth2.id_token as _id_token_mod
@@ -993,7 +978,6 @@ class TestBearerAuthJWT:
 
         assert len(call_log) == 0
         assert any(m.get("status") == 401 for m in messages)
-
 
     # --- oauth2-proxy allow-list parity (genetics-results-suite-ol7) --------------------
     # This path used to carry a private _email_allowed copy that had drifted from
@@ -1349,9 +1333,7 @@ class TestBearerAuthKeycloak:
         """End-to-end: a valid Keycloak token reaches the inner app without hitting Google."""
         from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
 
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", lambda _: False)
         monkeypatch.setattr(
             "genetics_mcp_server.mcp_server.get_settings",
             lambda: _KeycloakSettings(allowed_email_domains={"finngen.fi"}),
@@ -1361,9 +1343,7 @@ class TestBearerAuthKeycloak:
         import google.oauth2.id_token as _id_token_mod
 
         def _fail(token, request):
-            raise AssertionError(
-                "Google id_token path should not run for a valid Keycloak token"
-            )
+            raise AssertionError("Google id_token path should not run for a valid Keycloak token")
 
         monkeypatch.setattr(_id_token_mod, "verify_oauth2_token", _fail)
 
@@ -1426,12 +1406,8 @@ class TestOAuthMetadataDiscovery:
     def _build_app(self, monkeypatch, settings):
         from genetics_mcp_server.mcp_server import _wrap_with_bearer_auth
 
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server._validate_user_token", lambda _: False
-        )
-        monkeypatch.setattr(
-            "genetics_mcp_server.mcp_server.get_settings", lambda: settings
-        )
+        monkeypatch.setattr("genetics_mcp_server.mcp_server._validate_user_token", lambda _: False)
+        monkeypatch.setattr("genetics_mcp_server.mcp_server.get_settings", lambda: settings)
 
         call_log: list[dict] = []
 
@@ -1470,8 +1446,7 @@ class TestOAuthMetadataDiscovery:
 
         assert len(call_log) == 0, "metadata must be served without hitting the inner app"
         assert any(
-            m.get("type") == "http.response.start" and m.get("status") == 200
-            for m in messages
+            m.get("type") == "http.response.start" and m.get("status") == 200 for m in messages
         )
         payload = self._get_json(messages)
         assert payload["resource"] == _KeycloakSettings.RESOURCE_URL
@@ -1526,7 +1501,7 @@ class TestOAuthMetadataDiscovery:
         # RFC 9728: well-known inserted between host and path (…/.well-known/…/mcp),
         # not appended after the /mcp path
         expected = (
-            'Bearer resource_metadata='
+            "Bearer resource_metadata="
             '"https://mcp.example.org/.well-known/oauth-protected-resource/mcp"'
         )
         assert self._www_authenticate(messages) == expected
@@ -1629,9 +1604,7 @@ class TestWildcardAllowListDivergence:
         from genetics_mcp_server import mcp_server
 
         monkeypatch.setattr(_sys, "argv", ["mcp-server", "--transport", transport])
-        monkeypatch.setattr(
-            mcp_server, "get_settings", lambda: self._core_settings(domains)
-        )
+        monkeypatch.setattr(mcp_server, "get_settings", lambda: self._core_settings(domains))
         monkeypatch.setattr(mcp_server, "require_internal_api_secret", lambda _label: None)
         monkeypatch.setattr(mcp_server, "_wrap_with_bearer_auth", lambda app, keys: app)
         monkeypatch.setattr(mcp_server.mcp, "run", lambda: None)
@@ -1644,7 +1617,8 @@ class TestWildcardAllowListDivergence:
     @staticmethod
     def _wildcard_warnings(caplog):
         return [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if r.levelname == "WARNING" and "ALLOWED_EMAIL_DOMAINS contains a literal" in r.message
         ]
 

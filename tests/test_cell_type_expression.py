@@ -18,16 +18,36 @@ from genetics_mcp_server.tools.executor import ToolExecutor
 TOOL = "get_cell_type_expression"
 
 SUMMARY_ROW = {
-    "gene_id": "ENSG00000169174.11", "gene_name": "PCSK9", "cell_type_rollup": "hepatocyte",
-    "tissue_general": "liver", "n_cells": 5000, "n_donors": 12, "n_datasets": 3,
-    "mean_log1p_cp10k": 1.21, "frac_expressing": 0.43, "donor_pseudobulk_mean_cp10k": 2.9,
-    "donor_pseudobulk_n_donors": 12, "tau": 0.91,
+    "gene_id": "ENSG00000169174.11",
+    "gene_name": "PCSK9",
+    "cell_type_rollup": "hepatocyte",
+    "tissue_general": "liver",
+    "n_cells": 5000,
+    "n_donors": 12,
+    "n_datasets": 3,
+    "mean_log1p_cp10k": 1.21,
+    "frac_expressing": 0.43,
+    "donor_pseudobulk_mean_cp10k": 2.9,
+    "donor_pseudobulk_n_donors": 12,
+    "tau": 0.91,
 }
 DATASET_ROWS = [
-    {"gene_name": "PCSK9", "dataset_id": "d1", "cell_type": "hepatocyte",
-     "mean_log1p_cp10k": 1.3, "frac_expressing": 0.5, "status": "present"},
-    {"gene_name": "PCSK9", "dataset_id": "d2", "cell_type": None,
-     "mean_log1p_cp10k": 0, "frac_expressing": 0, "status": "measured_no_row"},
+    {
+        "gene_name": "PCSK9",
+        "dataset_id": "d1",
+        "cell_type": "hepatocyte",
+        "mean_log1p_cp10k": 1.3,
+        "frac_expressing": 0.5,
+        "status": "present",
+    },
+    {
+        "gene_name": "PCSK9",
+        "dataset_id": "d2",
+        "cell_type": None,
+        "mean_log1p_cp10k": 0,
+        "frac_expressing": 0,
+        "status": "measured_no_row",
+    },
 ]
 
 
@@ -44,9 +64,7 @@ def _executor(status=200, body=None, text=None, headers=None, seen=None) -> Tool
     return executor
 
 
-@pytest.mark.parametrize(
-    ("level", "body"), [("summary", [SUMMARY_ROW]), ("dataset", DATASET_ROWS)]
-)
+@pytest.mark.parametrize(("level", "body"), [("summary", [SUMMARY_ROW]), ("dataset", DATASET_ROWS)])
 async def test_both_levels_reach_the_endpoint_and_return_rows(level, body):
     seen: list[httpx.Request] = []
     executor = _executor(body=body, headers={"X-Dataset-Version": "2026-10-01"}, seen=seen)
@@ -155,7 +173,9 @@ def _sdk(status=200, body=None, text=None, headers=None) -> GeneticsClient:
 
 
 async def test_sdk_function_returns_a_frame():
-    frame = await _sdk(body=DATASET_ROWS).cell_type_expression("ENSG00000169174.11", level="dataset")
+    frame = await _sdk(body=DATASET_ROWS).cell_type_expression(
+        "ENSG00000169174.11", level="dataset"
+    )
     assert frame.height == 2
     assert frame["status"].to_list() == ["present", "measured_no_row"]
 
@@ -196,9 +216,7 @@ def test_tool_text_names_no_gated_view():
     ],
 )
 def test_offered_only_where_enabled_on_a_profile_that_serves_the_data(profile, enabled, offered):
-    disabled = Settings(
-        config_profile=profile, cell_type_expression_enabled=enabled
-    ).disabled_tools
+    disabled = Settings(config_profile=profile, cell_type_expression_enabled=enabled).disabled_tools
     names = {t["name"] for t in get_anthropic_tools(code_execution=False, disabled_tools=disabled)}
     assert (TOOL in names) is offered
 

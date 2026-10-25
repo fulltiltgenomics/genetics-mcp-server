@@ -57,6 +57,7 @@ def mock_llm_response(payload, *, leading_thinking: bool = False):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def sample_db(tmp_path):
     """Create a temporary SQLite DB with sample data."""
@@ -120,6 +121,7 @@ def sample_db(tmp_path):
 # Tool parsing tests
 # ---------------------------------------------------------------------------
 
+
 class TestParseToolCalls:
     def test_basic_tool_marker(self):
         content = "*[Using tool: search_genes; query: BRCA1]*"
@@ -132,7 +134,9 @@ class TestParseToolCalls:
             "*[Using tool: get_gene_expression; gene: TP53]*"
         )
         assert parse_tool_calls(content) == [
-            "search_genes", "get_credible_sets_by_gene", "get_gene_expression"
+            "search_genes",
+            "get_credible_sets_by_gene",
+            "get_gene_expression",
         ]
 
     def test_ellipsis_marker(self):
@@ -160,7 +164,8 @@ class TestParseToolCallsFromContentJson:
             {"type": "tool_use", "id": "t2", "name": "get_gene_expression", "input": {}},
         )
         assert parse_tool_calls_from_content_json(content_json) == [
-            "search_genes", "get_gene_expression"
+            "search_genes",
+            "get_gene_expression",
         ]
 
     def test_ignores_non_tool_use_blocks(self):
@@ -189,9 +194,9 @@ class TestParseToolCallsFromContentJson:
         content_json = _blocks(
             "a bare string",
             None,
-            {"type": "tool_use"},               # no name
-            {"type": "tool_use", "name": ""},   # empty name
-            {"type": "tool_use", "name": 7},    # wrong type
+            {"type": "tool_use"},  # no name
+            {"type": "tool_use", "name": ""},  # empty name
+            {"type": "tool_use", "name": 7},  # wrong type
             {"type": "tool_use", "name": "ok_tool"},
         )
         assert parse_tool_calls_from_content_json(content_json) == ["ok_tool"]
@@ -224,20 +229,36 @@ class TestMessageToolCalls:
 class TestToolCoverage:
     @staticmethod
     def _messages(rows):
-        return pl.DataFrame(rows, schema={
-            "session_id": pl.Utf8, "role": pl.Utf8,
-            "content": pl.Utf8, "content_json": pl.Utf8,
-        })
+        return pl.DataFrame(
+            rows,
+            schema={
+                "session_id": pl.Utf8,
+                "role": pl.Utf8,
+                "content": pl.Utf8,
+                "content_json": pl.Utf8,
+            },
+        )
 
     def test_counts_split_by_source(self):
-        messages = self._messages([
-            {"session_id": "a", "role": "user", "content": "q", "content_json": None},
-            {"session_id": "a", "role": "assistant", "content": "x",
-             "content_json": _blocks({"type": "tool_use", "name": "t1"},
-                                     {"type": "tool_use", "name": "t2"})},
-            {"session_id": "b", "role": "assistant",
-             "content": "*[Using tool: legacy]*", "content_json": None},
-        ])
+        messages = self._messages(
+            [
+                {"session_id": "a", "role": "user", "content": "q", "content_json": None},
+                {
+                    "session_id": "a",
+                    "role": "assistant",
+                    "content": "x",
+                    "content_json": _blocks(
+                        {"type": "tool_use", "name": "t1"}, {"type": "tool_use", "name": "t2"}
+                    ),
+                },
+                {
+                    "session_id": "b",
+                    "role": "assistant",
+                    "content": "*[Using tool: legacy]*",
+                    "content_json": None,
+                },
+            ]
+        )
         frame, coverage = build_tool_coverage(messages)
 
         assert coverage.assistant_messages == 2
@@ -254,20 +275,32 @@ class TestToolCoverage:
         assert flags == {"a": False, "b": True}
 
     def test_partially_covered_session_is_a_lower_bound(self):
-        messages = self._messages([
-            {"session_id": "a", "role": "assistant", "content": "x",
-             "content_json": _blocks({"type": "tool_use", "name": "t1"})},
-            {"session_id": "a", "role": "assistant",
-             "content": "*[Using tool: legacy]*", "content_json": None},
-        ])
+        messages = self._messages(
+            [
+                {
+                    "session_id": "a",
+                    "role": "assistant",
+                    "content": "x",
+                    "content_json": _blocks({"type": "tool_use", "name": "t1"}),
+                },
+                {
+                    "session_id": "a",
+                    "role": "assistant",
+                    "content": "*[Using tool: legacy]*",
+                    "content_json": None,
+                },
+            ]
+        )
         frame, coverage = build_tool_coverage(messages)
         assert coverage.fully_covered_sessions == 0
         assert frame["tool_count_is_lower_bound"].item() is True
 
     def test_exact_when_everything_has_content_json(self):
-        messages = self._messages([
-            {"session_id": "a", "role": "assistant", "content": "x", "content_json": "[]"},
-        ])
+        messages = self._messages(
+            [
+                {"session_id": "a", "role": "assistant", "content": "x", "content_json": "[]"},
+            ]
+        )
         _, coverage = build_tool_coverage(messages)
         assert coverage.is_exact is True
         assert "exact" in " ".join(coverage.summary_lines())
@@ -291,9 +324,13 @@ class TestToolCoverage:
         conn = sqlite3.connect(sample_db)
         conn.execute(
             "UPDATE chat_messages SET content_json = ? WHERE id = 'm2'",
-            (_blocks({"type": "tool_use", "name": "real_a"},
-                     {"type": "tool_use", "name": "real_b"},
-                     {"type": "tool_use", "name": "real_c"}),),
+            (
+                _blocks(
+                    {"type": "tool_use", "name": "real_a"},
+                    {"type": "tool_use", "name": "real_b"},
+                    {"type": "tool_use", "name": "real_c"},
+                ),
+            ),
         )
         conn.commit()
         conn.close()
@@ -342,6 +379,7 @@ class TestToolCoverageInMetricsAndReport:
 # Keyword categorization tests
 # ---------------------------------------------------------------------------
 
+
 class TestKeywordCategorization:
     def test_gene_query(self):
         topic, conf = categorize_by_keywords("What do we know about gene BRCA1?")
@@ -365,9 +403,7 @@ class TestKeywordCategorization:
         assert topic == "literature_search"
 
     def test_clinical_query(self):
-        topic, _ = categorize_by_keywords(
-            "Patient has heterozygous frameshift in SLC9B1"
-        )
+        topic, _ = categorize_by_keywords("Patient has heterozygous frameshift in SLC9B1")
         assert topic == "clinical_genetics"
 
     def test_drug_target_query(self):
@@ -395,6 +431,7 @@ class TestKeywordCategorization:
 # Success metrics tests
 # ---------------------------------------------------------------------------
 
+
 class TestSuccessMetrics:
     def test_rated_session_uses_rating(self):
         m = ConversationMetrics(session_id="s1", user_rating=5)
@@ -413,28 +450,37 @@ class TestSuccessMetrics:
 
     def test_error_penalty(self):
         m = ConversationMetrics(
-            session_id="s1", user_messages=2, total_tool_calls=3, has_error_response=True,
+            session_id="s1",
+            user_messages=2,
+            total_tool_calls=3,
+            has_error_response=True,
         )
         score = compute_success_score(m)
         assert score < 0.5
 
     def test_excessive_tools_penalty(self):
         m = ConversationMetrics(
-            session_id="s1", user_messages=1, total_tool_calls=15,
+            session_id="s1",
+            user_messages=1,
+            total_tool_calls=15,
         )
         score = compute_success_score(m)
         assert score < 0.5
 
     def test_multi_turn_bonus(self):
         m = ConversationMetrics(
-            session_id="s1", user_messages=5, total_tool_calls=5,
+            session_id="s1",
+            user_messages=5,
+            total_tool_calls=5,
         )
         score = compute_success_score(m)
         assert score > 0.5
 
     def test_abandoned_session_penalty(self):
         m = ConversationMetrics(
-            session_id="s1", user_messages=1, assistant_messages=1,
+            session_id="s1",
+            user_messages=1,
+            assistant_messages=1,
             total_tool_calls=0,
         )
         score = compute_success_score(m)
@@ -442,8 +488,11 @@ class TestSuccessMetrics:
 
     def test_thumbs_up_boost(self):
         m = ConversationMetrics(
-            session_id="s1", user_messages=2, total_tool_calls=3,
-            thumbs_up_count=2, thumbs_down_count=0,
+            session_id="s1",
+            user_messages=2,
+            total_tool_calls=3,
+            thumbs_up_count=2,
+            thumbs_down_count=0,
         )
         score = compute_success_score(m)
         assert score > 0.5
@@ -461,6 +510,7 @@ class TestSuccessMetrics:
 # ---------------------------------------------------------------------------
 # Data loading tests
 # ---------------------------------------------------------------------------
+
 
 class TestLoadData:
     def test_load_sessions_and_messages(self, sample_db):
@@ -483,6 +533,7 @@ class TestLoadData:
 # Tool stats tests
 # ---------------------------------------------------------------------------
 
+
 class TestBuildSessionToolStats:
     def test_tool_stats(self, sample_db):
         _, messages = load_data(sample_db)
@@ -492,17 +543,21 @@ class TestBuildSessionToolStats:
 
         s1_stats = stats.filter(pl.col("session_id") == "s1")
         assert s1_stats.height == 1
-        assert s1_stats["total_tool_calls"].item() == 3  # search_genes, get_credible_sets, get_gene_expression
+        assert (
+            s1_stats["total_tool_calls"].item() == 3
+        )  # search_genes, get_credible_sets, get_gene_expression
         # m2 calls 2 tools, m4 calls 1 -> peak in a single message is 2
         assert "max_tools_in_message" in stats.columns
         assert s1_stats["max_tools_in_message"].item() == 2
 
     def test_empty_messages(self):
-        messages = pl.DataFrame({
-            "session_id": pl.Series([], dtype=pl.Utf8),
-            "role": pl.Series([], dtype=pl.Utf8),
-            "content": pl.Series([], dtype=pl.Utf8),
-        })
+        messages = pl.DataFrame(
+            {
+                "session_id": pl.Series([], dtype=pl.Utf8),
+                "role": pl.Series([], dtype=pl.Utf8),
+                "content": pl.Series([], dtype=pl.Utf8),
+            }
+        )
         stats = build_session_tool_stats(messages)
         assert stats.height == 0
 
@@ -510,6 +565,7 @@ class TestBuildSessionToolStats:
 # ---------------------------------------------------------------------------
 # Integration: compute_all_metrics
 # ---------------------------------------------------------------------------
+
 
 class TestComputeAllMetrics:
     def test_all_metrics(self, sample_db):
@@ -520,7 +576,8 @@ class TestComputeAllMetrics:
         first_msgs = (
             messages.filter(pl.col("role") == "user")
             .sort("created_at")
-            .group_by("session_id").first()
+            .group_by("session_id")
+            .first()
         )
         topics = {}
         for row in first_msgs.iter_rows(named=True):
@@ -545,6 +602,7 @@ class TestComputeAllMetrics:
 # ---------------------------------------------------------------------------
 # Report generation test
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateReport:
     def test_report_contains_sections(self, sample_db):
@@ -582,8 +640,9 @@ class TestGenerateReport:
             "did not query exome data despite it being available": "missed_data_source",
             "ignored the available eQTL dataset for this gene": "missed_data_source",
         }
-        report = generate_report(metrics, sessions, messages, tool_stats,
-                                 issue_categories=issue_categories)
+        report = generate_report(
+            metrics, sessions, messages, tool_stats, issue_categories=issue_categories
+        )
 
         # both distinct raw issues collapse to one category with count 2
         assert "Most common issue categories" in report
@@ -609,6 +668,7 @@ class TestGenerateReport:
 # ---------------------------------------------------------------------------
 # Eval export test
 # ---------------------------------------------------------------------------
+
 
 class TestExportEvalDataset:
     def test_export_creates_files(self, sample_db, tmp_path):
@@ -659,13 +719,19 @@ def eight_session_db(tmp_path):
         sid = f"s{i}"
         conn.execute(
             "INSERT INTO chat_sessions VALUES (?, 'u@test.com', ?, '2026-01-01', "
-            "'2026-01-01', NULL, NULL, NULL)", (sid, sid))
+            "'2026-01-01', NULL, NULL, NULL)",
+            (sid, sid),
+        )
         conn.execute(
             "INSERT INTO chat_messages VALUES (?, ?, 'user', ?, '2026-01-01 10:00:00', "
-            "NULL, NULL, NULL, NULL)", (f"{sid}-q", sid, "any papers?"))
+            "NULL, NULL, NULL, NULL)",
+            (f"{sid}-q", sid, "any papers?"),
+        )
         conn.execute(
             "INSERT INTO chat_messages VALUES (?, ?, 'assistant', ?, '2026-01-01 10:00:01', "
-            "NULL, NULL, NULL, NULL)", (f"{sid}-a", sid, "yes"))
+            "NULL, NULL, NULL, NULL)",
+            (f"{sid}-a", sid, "yes"),
+        )
     conn.commit()
     conn.close()
     return db_path
@@ -726,24 +792,55 @@ def literature_db(tmp_path):
     """)
     rows = [
         ("lit-q", "lit", "user", "any papers on GPR17?", None),
-        ("lit-a", "lit", "assistant", "yes", json.dumps(
-            [{"type": "tool_use", "id": "t1", "name": "search_scientific_literature",
-              "input": {"query": "GPR17"}}]
-        )),
+        (
+            "lit-a",
+            "lit",
+            "assistant",
+            "yes",
+            json.dumps(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "search_scientific_literature",
+                        "input": {"query": "GPR17"},
+                    }
+                ]
+            ),
+        ),
         ("sub-q", "sub", "user", "any papers on GPR17?", None),
-        ("sub-a", "sub", "assistant", "yes", json.dumps(
-            [{"type": "tool_use", "id": "t2", "name": "launch_subagents",
-              "input": {"tasks": [{"skill": "literature_review", "prompt": "GPR17"}]}}]
-        )),
+        (
+            "sub-a",
+            "sub",
+            "assistant",
+            "yes",
+            json.dumps(
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "launch_subagents",
+                        "input": {"tasks": [{"skill": "literature_review", "prompt": "GPR17"}]},
+                    }
+                ]
+            ),
+        ),
         ("plain-q", "plain", "user", "what variants are near GPR17?", None),
-        ("plain-a", "plain", "assistant", "some", json.dumps(
-            [{"type": "tool_use", "id": "t3", "name": "get_variants", "input": {}}]
-        )),
+        (
+            "plain-a",
+            "plain",
+            "assistant",
+            "some",
+            json.dumps([{"type": "tool_use", "id": "t3", "name": "get_variants", "input": {}}]),
+        ),
     ]
     conn.executemany(
         "INSERT INTO chat_messages "
         "(id, session_id, role, content, created_at, content_json) VALUES (?, ?, ?, ?, ?, ?)",
-        [(mid, sid, role, content, "2026-01-01 10:00:00", cj) for mid, sid, role, content, cj in rows],
+        [
+            (mid, sid, role, content, "2026-01-01 10:00:00", cj)
+            for mid, sid, role, content, cj in rows
+        ],
     )
     conn.commit()
     conn.close()
@@ -773,12 +870,16 @@ class TestLiteratureBearingSelection:
         metrics, messages = self._metrics_and_messages(literature_db)
         output_dir = tmp_path / "eval_output"
         export_eval_dataset(metrics, messages, output_dir)
-        cases = {c["session_id"]: c for c in json.loads((output_dir / "eval_dataset.json").read_text())}
+        cases = {
+            c["session_id"]: c for c in json.loads((output_dir / "eval_dataset.json").read_text())
+        }
         assert cases["lit"]["literature_bearing"] is True
         assert cases["sub"]["literature_bearing"] is True
         assert cases["plain"]["literature_bearing"] is False
 
-    def test_literature_bearing_only_restricts_the_pool_before_sampling(self, literature_db, tmp_path):
+    def test_literature_bearing_only_restricts_the_pool_before_sampling(
+        self, literature_db, tmp_path
+    ):
         metrics, messages = self._metrics_and_messages(literature_db)
         output_dir = tmp_path / "eval_output"
         export_eval_dataset(metrics, messages, output_dir, literature_bearing_only=True)
@@ -854,7 +955,9 @@ class TestUserTurnExport:
         case = self._case(replay_db, tmp_path)
         assert case["user_turn_count"] == 3
         assert [t["content"] for t in case["user_turns"]] == [
-            "first question", "second question", "third question"
+            "first question",
+            "second question",
+            "third question",
         ]
         assert [t["index"] for t in case["user_turns"]] == [0, 1, 2]
         assert [t["message_id"] for t in case["user_turns"]] == ["q1", "q2", "q3"]
@@ -864,39 +967,49 @@ class TestUserTurnExport:
         opts = [t["options"] for t in case["user_turns"]]
 
         assert opts[0] == {
-            "verbosity": "brief", "tool_profile": None,
-            "instruction_set_id": "iset-1", "literature_backend": "europepmc",
+            "verbosity": "brief",
+            "tool_profile": None,
+            "instruction_set_id": "iset-1",
+            "literature_backend": "europepmc",
         }
         assert opts[1] == {
-            "verbosity": "detailed", "tool_profile": None,
-            "instruction_set_id": "iset-1", "literature_backend": "europepmc",
+            "verbosity": "detailed",
+            "tool_profile": None,
+            "instruction_set_id": "iset-1",
+            "literature_backend": "europepmc",
         }
         # a2 ran under tool_profile='bigquery'; q3 switched back to all tools, which the
         # client persists as NULL. carrying the last non-null value forward would export
         # q3 as still running 'bigquery' and a replay would reproduce the wrong conditions.
         assert opts[2] == {
-            "verbosity": "detailed", "tool_profile": None,
-            "instruction_set_id": "iset-2", "literature_backend": "europepmc",
+            "verbosity": "detailed",
+            "tool_profile": None,
+            "instruction_set_id": "iset-2",
+            "literature_backend": "europepmc",
         }
 
     def test_options_carry_forward_only_on_fully_null_rows(self):
         # a row written by the current client always carries at least verbosity and
         # literature_backend, so an all-null row predates that wiring and inherits
-        messages = pl.DataFrame({
-            "id": ["q1", "a1", "q2"],
-            "role": ["user", "assistant", "user"],
-            "content": ["one", "answer", "two"],
-            "created_at": ["2025-12-10 10:00:00"] * 3,
-            "verbosity": ["brief", None, None],
-            "tool_profile": ["api", None, None],
-            "instruction_set_id": ["iset-1", None, None],
-            "literature_backend": ["perplexity", None, None],
-        })
+        messages = pl.DataFrame(
+            {
+                "id": ["q1", "a1", "q2"],
+                "role": ["user", "assistant", "user"],
+                "content": ["one", "answer", "two"],
+                "created_at": ["2025-12-10 10:00:00"] * 3,
+                "verbosity": ["brief", None, None],
+                "tool_profile": ["api", None, None],
+                "instruction_set_id": ["iset-1", None, None],
+                "literature_backend": ["perplexity", None, None],
+            }
+        )
         turns = _session_user_turns(messages)
 
         assert turns[1]["options"] == {
-            "verbosity": "brief", "tool_profile": "api",
-            "instruction_set_id": "iset-1", "literature_backend": "perplexity",
+            "verbosity": "brief",
+            "tool_profile": "api",
+            "instruction_set_id": "iset-1",
+            "literature_backend": "perplexity",
         }
 
     def test_user_turn_content_is_not_truncated(self, replay_db, tmp_path):
@@ -925,8 +1038,10 @@ class TestUserTurnExport:
         turns = _session_user_turns(session_msgs)
         assert len(turns) == 1
         assert turns[0]["options"] == {
-            "verbosity": None, "tool_profile": "api",
-            "instruction_set_id": None, "literature_backend": None,
+            "verbosity": None,
+            "tool_profile": "api",
+            "instruction_set_id": None,
+            "literature_backend": None,
         }
 
 
@@ -934,22 +1049,34 @@ class TestUserTurnExport:
 # LLM categorization tests (mocked)
 # ---------------------------------------------------------------------------
 
+
 class TestLLMCategorization:
     @pytest.mark.asyncio
     async def test_successful_categorization(self):
-        mock_response = mock_llm_response([
-            {"id": "s1", "topic": "gene_lookup", "complexity": 1, "brief_reason": "gene query"},
-            {"id": "s2", "topic": "variant_interpretation", "complexity": 2, "brief_reason": "variant"},
-        ])
+        mock_response = mock_llm_response(
+            [
+                {"id": "s1", "topic": "gene_lookup", "complexity": 1, "brief_reason": "gene query"},
+                {
+                    "id": "s2",
+                    "topic": "variant_interpretation",
+                    "complexity": 2,
+                    "brief_reason": "variant",
+                },
+            ]
+        )
 
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
-            result = await categorize_with_llm([
-                {"id": "s1", "text": "What about BRCA1?"},
-                {"id": "s2", "text": "What does 1:123:A:G do?"},
-            ])
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
+            result = await categorize_with_llm(
+                [
+                    {"id": "s1", "text": "What about BRCA1?"},
+                    {"id": "s2", "text": "What does 1:123:A:G do?"},
+                ]
+            )
 
         assert result["s1"]["topic"] == "gene_lookup"
         assert result["s2"]["topic"] == "variant_interpretation"
@@ -966,7 +1093,9 @@ class TestLLMCategorization:
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result = await categorize_with_llm([{"id": "s1", "text": "What about BRCA1?"}])
 
         assert result["s1"]["topic"] == "gene_lookup"
@@ -976,10 +1105,14 @@ class TestLLMCategorization:
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
-            result = await categorize_with_llm([
-                {"id": "s1", "text": "What about gene BRCA1?"},
-            ])
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
+            result = await categorize_with_llm(
+                [
+                    {"id": "s1", "text": "What about gene BRCA1?"},
+                ]
+            )
 
         assert "s1" in result
         # should fall back to keyword categorization
@@ -990,17 +1123,22 @@ class TestLLMCategorization:
 # Issue categorization tests
 # ---------------------------------------------------------------------------
 
+
 class TestIssueCategorization:
     @pytest.mark.asyncio
     async def test_maps_issues_to_categories(self):
-        mock_response = mock_llm_response([
-            {"id": 0, "category": "missed_data_source"},
-            {"id": 1, "category": "inefficient_tool_use"},
-        ])
+        mock_response = mock_llm_response(
+            [
+                {"id": 0, "category": "missed_data_source"},
+                {"id": 1, "category": "inefficient_tool_use"},
+            ]
+        )
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result, failed = await categorize_issues_with_llm(
                 ["did not query exome data", "made 12 redundant tool calls"],
             )
@@ -1011,13 +1149,17 @@ class TestIssueCategorization:
 
     @pytest.mark.asyncio
     async def test_unknown_category_coerced_to_other(self):
-        mock_response = mock_llm_response([
-            {"id": 0, "category": "totally_made_up"},
-        ])
+        mock_response = mock_llm_response(
+            [
+                {"id": 0, "category": "totally_made_up"},
+            ]
+        )
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result, _ = await categorize_issues_with_llm(["some issue"])
 
         assert result["some issue"] == "other"
@@ -1027,7 +1169,9 @@ class TestIssueCategorization:
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(side_effect=Exception("API error"))
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result, failed = await categorize_issues_with_llm(["issue a", "issue b"])
 
         # a failed batch must not be defaulted: the caller caches whatever comes
@@ -1041,7 +1185,9 @@ class TestIssueCategorization:
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result, failed = await categorize_issues_with_llm(["issue a", "issue b"])
 
         assert result == {"issue b": "fabrication"}
@@ -1113,6 +1259,7 @@ class TestIssueCategoryCache:
 # Quality evaluation tests
 # ---------------------------------------------------------------------------
 
+
 class TestQualityEvaluation:
     def test_format_conversation(self, sample_db):
         _, messages = load_data(sample_db)
@@ -1127,9 +1274,13 @@ class TestQualityEvaluation:
         assert "truncated" in text
 
     def test_attachment_note_from_content_json(self):
-        cj = json.dumps({"attachments": [
-            {"id": "x", "name": "PANSINUSITIS.tsv", "size": 67386, "type": "tsv"},
-        ]})
+        cj = json.dumps(
+            {
+                "attachments": [
+                    {"id": "x", "name": "PANSINUSITIS.tsv", "size": 67386, "type": "tsv"},
+                ]
+            }
+        )
         note = _attachment_note(cj)
         assert "PANSINUSITIS.tsv" in note
         assert "tsv" in note
@@ -1144,17 +1295,20 @@ class TestQualityEvaluation:
 
     def test_format_includes_attachment_note(self):
         # a user turn with an attachment recorded only in content_json
-        messages = pl.DataFrame({
-            "session_id": ["s9", "s9"],
-            "role": ["user", "assistant"],
-            "content": ["what do you think about the results?", "Here is the analysis."],
-            "created_at": ["2026-01-01 10:00:00", "2026-01-01 10:00:01"],
-            "content_json": [
-                json.dumps({"attachments": [
-                    {"name": "results.tsv", "size": 1000, "type": "tsv"}]}),
-                None,
-            ],
-        })
+        messages = pl.DataFrame(
+            {
+                "session_id": ["s9", "s9"],
+                "role": ["user", "assistant"],
+                "content": ["what do you think about the results?", "Here is the analysis."],
+                "created_at": ["2026-01-01 10:00:00", "2026-01-01 10:00:01"],
+                "content_json": [
+                    json.dumps(
+                        {"attachments": [{"name": "results.tsv", "size": 1000, "type": "tsv"}]}
+                    ),
+                    None,
+                ],
+            }
+        )
         text = _format_conversation_for_eval("s9", messages)
         assert "User attached file(s): results.tsv" in text
 
@@ -1162,14 +1316,16 @@ class TestQualityEvaluation:
         # created_at has one-second resolution, so a user turn and its own reply routinely
         # share a timestamp; only rowid separates them. Rows are handed over reply-first so
         # a sort on created_at alone would leave the answer above the question.
-        messages = pl.DataFrame({
-            "session_id": ["s10", "s10"],
-            "role": ["assistant", "user"],
-            "content": ["BRCA1 is on chromosome 17.", "where is BRCA1?"],
-            "created_at": ["2026-01-01 10:00:00", "2026-01-01 10:00:00"],
-            "content_json": [None, None],
-            "_rowid": [2, 1],
-        })
+        messages = pl.DataFrame(
+            {
+                "session_id": ["s10", "s10"],
+                "role": ["assistant", "user"],
+                "content": ["BRCA1 is on chromosome 17.", "where is BRCA1?"],
+                "created_at": ["2026-01-01 10:00:00", "2026-01-01 10:00:00"],
+                "content_json": [None, None],
+                "_rowid": [2, 1],
+            }
+        )
         # the guard in message_sort_keys must not have fallen back to the single key
         assert message_sort_keys(messages) == ["created_at", "_rowid"]
 
@@ -1203,8 +1359,11 @@ class TestQualityEvaluation:
 
     def test_llm_score_overrides_heuristic(self):
         m = ConversationMetrics(
-            session_id="s1", user_messages=1, total_tool_calls=0,
-            assistant_messages=1, llm_quality_score=5,
+            session_id="s1",
+            user_messages=1,
+            total_tool_calls=0,
+            assistant_messages=1,
+            llm_quality_score=5,
         )
         # without LLM score this would be penalized as abandoned
         score = compute_success_score(m)
@@ -1213,20 +1372,26 @@ class TestQualityEvaluation:
     def test_binary_flags_adjust_quality_score(self):
         # answered=no and concluded=no pull a middling quality_score down
         m = ConversationMetrics(
-            session_id="s1", llm_quality_score=3,
-            llm_answered="no", llm_concluded="no",
+            session_id="s1",
+            llm_quality_score=3,
+            llm_answered="no",
+            llm_concluded="no",
         )
         # (3-1)/4 = 0.5 base, -0.1 (answered=no) -0.05 (concluded=no)
         assert compute_success_score(m) == 0.35
         # answered=yes nudges it up
         m2 = ConversationMetrics(
-            session_id="s2", llm_quality_score=3, llm_answered="yes",
+            session_id="s2",
+            llm_quality_score=3,
+            llm_answered="yes",
         )
         assert compute_success_score(m2) == 0.55
 
     def test_user_rating_still_takes_priority(self):
         m = ConversationMetrics(
-            session_id="s1", user_rating=1, llm_quality_score=5,
+            session_id="s1",
+            user_rating=1,
+            llm_quality_score=5,
         )
         score = compute_success_score(m)
         assert score == 0.0  # user rating wins
@@ -1248,40 +1413,59 @@ class TestDisposition:
     def test_out_of_scope_not_unsuccessful_despite_low_score(self):
         # a low-scored but out-of-scope conversation must NOT be labelled unsuccessful
         metrics = [ConversationMetrics(session_id="s1", user_messages=1)]
-        apply_quality_assessments(metrics, {
-            "s1": {"quality_score": 1, "answered": "no", "disposition": "out_of_scope",
-                   "issues": []},
-        })
+        apply_quality_assessments(
+            metrics,
+            {
+                "s1": {
+                    "quality_score": 1,
+                    "answered": "no",
+                    "disposition": "out_of_scope",
+                    "issues": [],
+                },
+            },
+        )
         assert metrics[0].llm_disposition == "out_of_scope"
         assert metrics[0].success_label == "out_of_scope"
         assert metrics[0].success_label not in {"successful", "neutral", "unsuccessful"}
 
     def test_technical_failure_labelled_separately(self):
         metrics = [ConversationMetrics(session_id="s1", user_messages=1)]
-        apply_quality_assessments(metrics, {
-            "s1": {"quality_score": 1, "answered": "no",
-                   "disposition": "technical_failure", "issues": []},
-        })
+        apply_quality_assessments(
+            metrics,
+            {
+                "s1": {
+                    "quality_score": 1,
+                    "answered": "no",
+                    "disposition": "technical_failure",
+                    "issues": [],
+                },
+            },
+        )
         assert metrics[0].success_label == "technical_failure"
 
     def test_agent_failure_still_unsuccessful(self):
         metrics = [ConversationMetrics(session_id="s1", user_messages=1)]
-        apply_quality_assessments(metrics, {
-            "s1": {"quality_score": 1, "answered": "no",
-                   "disposition": "agent_failure", "issues": ["gave up"]},
-        })
+        apply_quality_assessments(
+            metrics,
+            {
+                "s1": {
+                    "quality_score": 1,
+                    "answered": "no",
+                    "disposition": "agent_failure",
+                    "issues": ["gave up"],
+                },
+            },
+        )
         assert metrics[0].success_label == "unsuccessful"
 
     def test_mark_unscored_unknown(self):
         metrics = [
             # judged -> keeps its disposition-derived label
-            ConversationMetrics(session_id="s1", llm_quality_score=5,
-                                success_label="successful"),
+            ConversationMetrics(session_id="s1", llm_quality_score=5, success_label="successful"),
             # no LLM score, no rating -> unknown
             ConversationMetrics(session_id="s2", success_label="neutral"),
             # no LLM score but has a user rating -> rating is a real signal, keep it
-            ConversationMetrics(session_id="s3", user_rating=4,
-                                success_label="successful"),
+            ConversationMetrics(session_id="s3", user_rating=4, success_label="successful"),
         ]
         n = mark_unscored_unknown(metrics)
         assert n == 1
@@ -1291,29 +1475,43 @@ class TestDisposition:
 
     @pytest.mark.asyncio
     async def test_evaluate_quality_with_llm(self):
-        mock_response = mock_llm_response({
-            "answered": "yes", "accurate": "yes", "efficient": "yes",
-            "concluded": "yes", "quality_score": 5, "issues": [],
-        })
+        mock_response = mock_llm_response(
+            {
+                "answered": "yes",
+                "accurate": "yes",
+                "efficient": "yes",
+                "concluded": "yes",
+                "quality_score": 5,
+                "issues": [],
+            }
+        )
 
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        _, messages = load_data.__wrapped__("nonexistent") if hasattr(load_data, "__wrapped__") else (None, None)
+        _, messages = (
+            load_data.__wrapped__("nonexistent")
+            if hasattr(load_data, "__wrapped__")
+            else (None, None)
+        )
         # build minimal messages DataFrame
-        messages = pl.DataFrame({
-            "id": ["m1", "m2"],
-            "session_id": ["s1", "s1"],
-            "role": ["user", "assistant"],
-            "content": ["What about BRCA1?", "BRCA1 is a tumor suppressor gene."],
-            "created_at": ["2025-01-01", "2025-01-01"],
-            "thumbs_up": [None, None],
-            "content_json": [None, None],
-            "literature_backend": [None, None],
-            "tool_profile": [None, None],
-        })
+        messages = pl.DataFrame(
+            {
+                "id": ["m1", "m2"],
+                "session_id": ["s1", "s1"],
+                "role": ["user", "assistant"],
+                "content": ["What about BRCA1?", "BRCA1 is a tumor suppressor gene."],
+                "created_at": ["2025-01-01", "2025-01-01"],
+                "thumbs_up": [None, None],
+                "content_json": [None, None],
+                "literature_backend": [None, None],
+                "tool_profile": [None, None],
+            }
+        )
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result = await evaluate_quality_with_llm(["s1"], messages)
 
         assert "s1" in result
@@ -1323,27 +1521,38 @@ class TestDisposition:
     @pytest.mark.asyncio
     async def test_evaluate_quality_skips_leading_thinking_block(self):
         """Regression: judging a conversation on a thinking-capable model."""
-        mock_response = mock_llm_response({
-            "answered": "yes", "accurate": "yes", "efficient": "yes",
-            "concluded": "yes", "quality_score": 4, "issues": [],
-        }, leading_thinking=True)
+        mock_response = mock_llm_response(
+            {
+                "answered": "yes",
+                "accurate": "yes",
+                "efficient": "yes",
+                "concluded": "yes",
+                "quality_score": 4,
+                "issues": [],
+            },
+            leading_thinking=True,
+        )
 
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=mock_response)
 
-        messages = pl.DataFrame({
-            "id": ["m1", "m2"],
-            "session_id": ["s1", "s1"],
-            "role": ["user", "assistant"],
-            "content": ["What about BRCA1?", "BRCA1 is a tumor suppressor gene."],
-            "created_at": ["2025-01-01", "2025-01-01"],
-            "thumbs_up": [None, None],
-            "content_json": [None, None],
-            "literature_backend": [None, None],
-            "tool_profile": [None, None],
-        })
+        messages = pl.DataFrame(
+            {
+                "id": ["m1", "m2"],
+                "session_id": ["s1", "s1"],
+                "role": ["user", "assistant"],
+                "content": ["What about BRCA1?", "BRCA1 is a tumor suppressor gene."],
+                "created_at": ["2025-01-01", "2025-01-01"],
+                "thumbs_up": [None, None],
+                "content_json": [None, None],
+                "literature_backend": [None, None],
+                "tool_profile": [None, None],
+            }
+        )
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result = await evaluate_quality_with_llm(["s1"], messages)
 
         assert result["s1"]["quality_score"] == 4
@@ -1352,6 +1561,7 @@ class TestDisposition:
 # ---------------------------------------------------------------------------
 # Date filter tests
 # ---------------------------------------------------------------------------
+
 
 class TestDateFilter:
     def test_start_from_filters_sessions(self, sample_db):
@@ -1369,12 +1579,19 @@ class TestDateFilter:
 # Cached-row reconstruction (pure helper)
 # ---------------------------------------------------------------------------
 
+
 class TestCachedTopicAndQuality:
     def test_reconstructs_only_current_version_rows(self):
         m_current = ConversationMetrics(
-            session_id="s1", topic="gene_lookup", complexity=3, topic_reason="gene",
-            llm_quality_score=4, llm_answered="yes", llm_disposition="good_answer",
-            llm_issues=["x"], llm_issue_categories=["other"],
+            session_id="s1",
+            topic="gene_lookup",
+            complexity=3,
+            topic_reason="gene",
+            llm_quality_score=4,
+            llm_answered="yes",
+            llm_disposition="good_answer",
+            llm_issues=["x"],
+            llm_issue_categories=["other"],
         )
         analysis_map = {
             "s1": {
@@ -1415,21 +1632,32 @@ class TestCachedTopicAndQuality:
 # DB-backed cache: end-to-end main() behavior
 # ---------------------------------------------------------------------------
 
+
 def _patch_llm():
     """Patch the three network-calling LLM helpers with counting AsyncMocks.
 
     topic + issue mocks return per-input results; quality returns a judgment for
     every requested session so each conversation gets a quality score.
     """
+
     async def fake_topics(msgs, **kw):
-        return {m["id"]: {"topic": "gene_lookup", "complexity": 1,
-                          "brief_reason": "t"} for m in msgs}
+        return {
+            m["id"]: {"topic": "gene_lookup", "complexity": 1, "brief_reason": "t"} for m in msgs
+        }
 
     async def fake_quality(session_ids, messages, **kw):
-        return {sid: {"quality_score": 4, "answered": "yes", "accurate": "yes",
-                      "efficient": "yes", "concluded": "yes",
-                      "disposition": "good_answer", "issues": ["some issue"]}
-                for sid in session_ids}
+        return {
+            sid: {
+                "quality_score": 4,
+                "answered": "yes",
+                "accurate": "yes",
+                "efficient": "yes",
+                "concluded": "yes",
+                "disposition": "good_answer",
+                "issues": ["some issue"],
+            }
+            for sid in session_ids
+        }
 
     async def fake_issue_cats(issues, **kw):
         return {i: "other" for i in issues}, 0
@@ -1470,9 +1698,7 @@ def _analysis_rows(db_path):
             "SELECT session_id, analyzer_version, source_updated_at, message_count, "
             "llm_quality_score, success_label, topic FROM conversation_analysis"
         ).fetchall()
-        issues = conn.execute(
-            "SELECT session_id, category FROM conversation_issue"
-        ).fetchall()
+        issues = conn.execute("SELECT session_id, category FROM conversation_issue").fetchall()
     finally:
         conn.close()
     return rows, issues
@@ -1543,9 +1769,7 @@ class TestDBBackedCache:
         conn = sqlite3.connect(sample_db)
         try:
             bumped = "2099-01-01 00:00:00"
-            conn.execute(
-                "UPDATE chat_sessions SET updated_at = ? WHERE id = 's1'", (bumped,)
-            )
+            conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = 's1'", (bumped,))
             conn.commit()
         finally:
             conn.close()
@@ -1553,13 +1777,22 @@ class TestDBBackedCache:
         # only s1 is stale now, so the quality judge must see exactly s1
         async def fake_quality_capture(session_ids, messages, **kw):
             fake_quality_capture.seen = list(session_ids)
-            return {sid: {"quality_score": 4, "answered": "yes", "accurate": "yes",
-                          "efficient": "yes", "concluded": "yes",
-                          "disposition": "good_answer", "issues": ["some issue"]}
-                    for sid in session_ids}
+            return {
+                sid: {
+                    "quality_score": 4,
+                    "answered": "yes",
+                    "accurate": "yes",
+                    "efficient": "yes",
+                    "concluded": "yes",
+                    "disposition": "good_answer",
+                    "issues": ["some issue"],
+                }
+                for sid in session_ids
+            }
 
         from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
         from genetics_mcp_server.db.singleton import Singleton
+
         if ChatHistoryDB in Singleton._instances:
             del Singleton._instances[ChatHistoryDB]
 
@@ -1613,6 +1846,7 @@ class TestDBBackedCache:
 # ---------------------------------------------------------------------------
 # Instruction set breakdown
 # ---------------------------------------------------------------------------
+
 
 def _messages_with_instruction_sets(messages):
     """Attach instruction_set_id to the sample messages: s1 -> set-a, s3 -> set-b, s2 none."""
@@ -1703,7 +1937,10 @@ class TestInstructionSetMetrics:
         messages = _messages_with_instruction_sets(messages)
         tool_stats = build_session_tool_stats(messages)
         metrics = compute_all_metrics(
-            sessions, messages, tool_stats, _topics(),
+            sessions,
+            messages,
+            tool_stats,
+            _topics(),
             {"set-a": "Statistician", "set-b": "Terse"},
         )
         report = generate_report(metrics, sessions, messages, tool_stats)
@@ -1836,9 +2073,12 @@ class TestJudgeModelProvenance:
         # keyword categorization ran no model at all, so the arg defaults must not
         # be recorded as if a judge had produced these rows
         assert all(v == (None, None) for v in models.values())
+
+
 # ---------------------------------------------------------------------------
 # JSON-list extraction: array vs one-object-per-line responses
 # ---------------------------------------------------------------------------
+
 
 class TestExtractJsonList:
     def test_plain_array(self):
@@ -1846,7 +2086,10 @@ class TestExtractJsonList:
 
     def test_one_object_per_line(self):
         text = '{"id": 0, "category": "a"}\n{"id": 1, "category": "b"}\n'
-        assert ac.extract_json_list(text) == [{"id": 0, "category": "a"}, {"id": 1, "category": "b"}]
+        assert ac.extract_json_list(text) == [
+            {"id": 0, "category": "a"},
+            {"id": 1, "category": "b"},
+        ]
 
     def test_fenced_array_with_prose(self):
         text = 'Here you go:\n```json\n[{"id": 0}]\n```\nDone.'
@@ -1862,14 +2105,18 @@ class TestExtractJsonList:
     @pytest.mark.asyncio
     async def test_categorizer_accepts_one_object_per_line(self):
         response = MagicMock()
-        response.content = [MagicMock(
-            type="text",
-            text='{"id": 0, "category": "fabrication"}\n{"id": 1, "category": "no_conclusion"}',
-        )]
+        response.content = [
+            MagicMock(
+                type="text",
+                text='{"id": 0, "category": "fabrication"}\n{"id": 1, "category": "no_conclusion"}',
+            )
+        ]
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(return_value=response)
 
-        with patch.dict("sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}):
+        with patch.dict(
+            "sys.modules", {"anthropic": MagicMock(AsyncAnthropic=lambda: mock_client)}
+        ):
             result, failed = await categorize_issues_with_llm(["issue a", "issue b"])
 
         assert failed == 0

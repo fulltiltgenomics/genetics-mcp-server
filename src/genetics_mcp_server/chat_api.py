@@ -65,6 +65,7 @@ from genetics_mcp_server.memory_gate import (
 from genetics_mcp_server.rate_limit import check_rate_limit
 from genetics_mcp_server.rate_limit import configure as configure_rate_limit
 from genetics_mcp_server.routers import (
+    access_grants_router,
     admin_router,
     api_tokens_router,
     chat_history_router,
@@ -306,7 +307,7 @@ def _reject_inlined_file_blocks(content: Any) -> None:
         size = len(text.encode("utf-8"))
         if size > limit:
             # cut at the first newline too, or a header without "]" echoes the file body
-            name = text[len(_FILE_BLOCK_PREFIX):].split("\n", 1)[0].split("]", 1)[0][:200]
+            name = text[len(_FILE_BLOCK_PREFIX) :].split("\n", 1)[0].split("]", 1)[0][:200]
             raise HTTPException(
                 status_code=413,
                 detail=(
@@ -373,19 +374,13 @@ def _validate_latest_message(messages: list["ChatMessage"]) -> None:
         _reject_inlined_file_blocks(content)
         # data files arrive as [File: reference blocks and images as image blocks; both are
         # attachments, excluded from the typed-text length but counted
-        text_blocks = [
-            b for b in content if isinstance(b, dict) and b.get("type") == "text"
-        ]
+        text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
         file_text_blocks = [
             b for b in text_blocks if str(b.get("text", "")).startswith(_FILE_BLOCK_PREFIX)
         ]
-        text_len = sum(
-            len(b.get("text", "")) for b in text_blocks if b not in file_text_blocks
-        )
+        text_len = sum(len(b.get("text", "")) for b in text_blocks if b not in file_text_blocks)
         attachment_count = len(file_text_blocks) + sum(
-            1
-            for b in content
-            if isinstance(b, dict) and b.get("type") in ("image", "document")
+            1 for b in content if isinstance(b, dict) and b.get("type") in ("image", "document")
         )
 
     if text_len > settings.max_message_chars:
@@ -440,9 +435,18 @@ async def lifespan(app: FastAPI):
                 logger.error(f"Download cleanup error: {e}")
 
     cleanup_task = asyncio.create_task(_download_cleanup_loop())
+    # re-derives the oauth2-proxy file and the Keycloak attribute from the grant table; None
+    # when no ACCESS_GRANT_BUTTON_LABEL is set
+    from genetics_mcp_server.access_grants import get_reconciler
+
+    reconciler = get_reconciler()
+    if reconciler is not None:
+        reconciler.start()
     yield
     # cleanup
     cleanup_task.cancel()
+    if reconciler is not None:
+        reconciler.stop()
     # turns outlive their HTTP responses, so uvicorn's connection drain does not cover them.
     # Waiting here is what turns a deploy landing mid-answer into a persisted answer; the
     # bound keeps the pod inside its termination grace period (see chat-backend.yaml)
@@ -474,6 +478,7 @@ app.include_router(chat_history_router, prefix="/chat/v1", tags=["chat-history"]
 app.include_router(llm_config_router, prefix="/chat/v1", tags=["llm-config"])
 
 app.include_router(admin_router, prefix="/chat/v1", tags=["admin"])
+app.include_router(access_grants_router, prefix="/chat/v1", tags=["access-grants"])
 
 
 class ChatMessage(BaseModel):
@@ -495,13 +500,9 @@ class ChatRequest(BaseModel):
     """Request body for chat endpoint."""
 
     messages: list[ChatMessage] = Field(..., description="Chat message history")
-    provider: str | None = Field(
-        None, description="LLM provider: 'openai' or 'anthropic'"
-    )
+    provider: str | None = Field(None, description="LLM provider: 'openai' or 'anthropic'")
     model: str | None = Field(None, description="Specific model to use")
-    enable_tools: bool = Field(
-        True, description="Enable MCP tools (only for Anthropic)"
-    )
+    enable_tools: bool = Field(True, description="Enable MCP tools (only for Anthropic)")
     literature_backend: str | None = Field(
         None, description="Backend for literature search: 'europepmc' or 'perplexity'"
     )
@@ -592,11 +593,25 @@ async def auth(request: Request):
             is_admin = True
         elif user and user.lower() in settings.admin_users_list:
             is_admin = True
-    return JSONResponse({
-        "authenticated": user is not None,
-        "user": user,
-        "is_admin": is_admin,
-    })
+    # the access-grant button: admins only, and only where the deployment configured a label.
+    # Everyone else gets null, so a browser without the key behaves exactly as before
+    access_grants = None
+    if is_admin and settings.access_grants_enabled:
+        from genetics_mcp_server.access_grants import parse_expires_at
+
+        expires_at = parse_expires_at(settings.access_grant_expires_at)
+        access_grants = {
+            "label": settings.access_grant_button_label,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+        }
+    return JSONResponse(
+        {
+            "authenticated": user is not None,
+            "user": user,
+            "is_admin": is_admin,
+            "access_grants": access_grants,
+        }
+    )
 
 
 @app.get("/chat/v1/me")
@@ -653,7 +668,7 @@ async def list_tools(
     `resolved=true` answers the question the browser's tools panel actually asks — what
     *this* conversation's assistant can do — by going through `describe_available_tools`,
     which resolves the local surface and the proxied ones exactly as a chat request does.
-    It carries `category` and `source` per tool instead of `parameters`: the panel groups
+    It carries `group` and `source` per tool instead of `parameters`: the panel groups
     by them, and the schemas are for the model, not the reader.
 
     Both shapes are a list of tool objects, so a caller that ignores the new fields is
@@ -898,8 +913,8 @@ async def _resolve_user_memory(
     The gate is `memory_gate_open` — opt-in, gateway-asserted, non-secret, a named person.
     Every failure past it degrades to 'no memory' the way instruction sets do: memory is a
     convenience, and a convenience must never fail a chat turn. The opt-in read is inside
-    the try for that reason — it is a query against a second database, and it used to be
-    able to fail the turn.
+    the try for that reason: it is a query against a second database, which can fail on
+    its own.
     """
     try:
         return await asyncio.to_thread(
@@ -925,13 +940,8 @@ async def stream_chat(
     """
     Stream chat responses as Server-Sent Events (SSE).
 
-    The response is a stream of JSON objects:
-    - {"type": "content", "content": "text chunk"}
-    - {"type": "thinking"}  (keepalive while the model reasons; no content)
-    - {"type": "thinking_summary", "iteration": N, "text": "..."}  (only when the request
-      set `capture_thinking`; the model's SUMMARIZED reasoning, never the raw chain)
-    - {"type": "done", "message_content": [...]}
-    - {"type": "error", "error": "message"}
+    Each event is one JSON object keyed by `type`; read the types off what
+    `event_generator` below yields rather than from a list here.
     """
     settings = get_settings()
     service = get_llm_service()
@@ -990,16 +1000,15 @@ async def stream_chat(
 
     # convert messages to dicts, dropping the base64 the client's [IMAGE:...] markers carry
     messages = [
-        {"role": msg.role, "content": _strip_image_markers(msg.content)}
-        for msg in request.messages
+        {"role": msg.role, "content": _strip_image_markers(msg.content)} for msg in request.messages
     ]
     # decoding a large image takes long enough to stall every other stream on this worker
     messages = await asyncio.to_thread(
         lambda: [{**m, "content": _shrink_images(m["content"])} for m in messages]
     )
-    stripped_chars = sum(
-        _message_text_len(m.content) for m in request.messages
-    ) - sum(_message_text_len(m["content"]) for m in messages)
+    stripped_chars = sum(_message_text_len(m.content) for m in request.messages) - sum(
+        _message_text_len(m["content"]) for m in messages
+    )
     if stripped_chars:
         logger.info(
             f"[user={user}] [session={request.session_id}] "
@@ -1057,12 +1066,15 @@ async def stream_chat(
             # populated only on a fresh, non-empty render (see _load_user_memory) — never
             # on a withheld turn or a later turn reading the stored digest
             if user_memory and "sessions" in memory_stats:
-                yield "message", {
-                    "type": "memory",
-                    "project": memory_stats.get("project"),
-                    "sessions": memory_stats["sessions"],
-                    "chars": memory_stats["chars"],
-                }
+                yield (
+                    "message",
+                    {
+                        "type": "memory",
+                        "project": memory_stats.get("project"),
+                        "sessions": memory_stats["sessions"],
+                        "chars": memory_stats["chars"],
+                    },
+                )
             async for chunk in service.stream_chat(
                 messages=messages,
                 provider=provider,
@@ -1085,19 +1097,25 @@ async def stream_chat(
                 if chunk.type == "text":
                     yield "message", {"type": "content", "content": chunk.content}
                 elif chunk.type == "image":
-                    yield "message", {
-                        "type": "image",
-                        "image_data": chunk.content,
-                        "image_format": chunk.image_format or "png",
-                        "image_alt": chunk.image_alt or "Generated image",
-                    }
+                    yield (
+                        "message",
+                        {
+                            "type": "image",
+                            "image_data": chunk.content,
+                            "image_format": chunk.image_format or "png",
+                            "image_alt": chunk.image_alt or "Generated image",
+                        },
+                    )
                 elif chunk.type == "file":
-                    yield "message", {
-                        "type": "file",
-                        "file_data": chunk.content,
-                        "file_mime": chunk.file_mime or "application/octet-stream",
-                        "file_name": chunk.file_name or "artifact",
-                    }
+                    yield (
+                        "message",
+                        {
+                            "type": "file",
+                            "file_data": chunk.content,
+                            "file_mime": chunk.file_mime or "application/octet-stream",
+                            "file_name": chunk.file_name or "artifact",
+                        },
+                    )
                 elif chunk.type == "tool_use":
                     # one per tool call, carrying the input WHOLE — a run_analysis script is
                     # the thing the user most needs to read, and the prose marker this
@@ -1122,11 +1140,14 @@ async def stream_chat(
                     # which is why the replay benchmark's script metrics need this branch.
                     yield "message", {"type": "script_result", **json.loads(chunk.content)}
                 elif chunk.type == "done":
-                    yield "message", {
-                        "type": "done",
-                        "message_content": chunk.message_content,
-                        "tool_results": chunk.tool_results,
-                    }
+                    yield (
+                        "message",
+                        {
+                            "type": "done",
+                            "message_content": chunk.message_content,
+                            "tool_results": chunk.tool_results,
+                        },
+                    )
 
         except Exception as e:
             logger.error(f"Error in chat stream: {e}", exc_info=True)
@@ -1278,6 +1299,7 @@ async def download_file(download_id: str, user: str | None = Depends(auth_requir
     data, filename, content_type = result
     logger.info(f"Serving download {download_id}: {filename} ({len(data)} bytes)")
     from starlette.responses import Response
+
     return Response(
         content=data,
         media_type=content_type,
@@ -1300,5 +1322,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     uvicorn.run(
-        "genetics_mcp_server.chat_api:app", host="0.0.0.0", port=args.port, reload=True, log_config=None
+        "genetics_mcp_server.chat_api:app",
+        host="0.0.0.0",
+        port=args.port,
+        reload=True,
+        log_config=None,
     )

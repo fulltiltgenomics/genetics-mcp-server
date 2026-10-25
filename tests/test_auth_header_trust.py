@@ -149,12 +149,14 @@ class TestHeaderAloneIsNotACredential:
 
     def test_ascii_secret_is_unaffected(self, prod_auth):
         """The codecs agree on ASCII, so the deployed shape behaves exactly as before."""
-        assert core.is_internal_caller(
-            _request({"Authorization": f"Bearer {INTERNAL_SECRET}"})
-        ) is True
-        assert core.is_internal_caller(
-            _request({core.INTERNAL_MARKER_HEADER: INTERNAL_SECRET})
-        ) is True
+        assert (
+            core.is_internal_caller(_request({"Authorization": f"Bearer {INTERNAL_SECRET}"}))
+            is True
+        )
+        assert (
+            core.is_internal_caller(_request({core.INTERNAL_MARKER_HEADER: INTERNAL_SECRET}))
+            is True
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +217,7 @@ class TestPrecedence:
     async def test_marker_with_an_empty_header_is_the_service_identity(self, prod_auth):
         """oauth2-proxy sets an empty value when it has no session; nginx passes it through."""
         assert (
-            await _resolve(
-                {USER_HEADER: "", "Authorization": f"Bearer {INTERNAL_SECRET}"}
-            )
+            await _resolve({USER_HEADER: "", "Authorization": f"Bearer {INTERNAL_SECRET}"})
             == "mcp-tool"
         )
 

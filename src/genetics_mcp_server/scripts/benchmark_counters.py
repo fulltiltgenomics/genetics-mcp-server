@@ -144,8 +144,6 @@ def counters(report: dict[str, Any], arm: str) -> dict[str, Any]:
     return result
 
 
-
-
 def render(
     now: dict[str, Any],
     base: dict[str, Any] | None,
@@ -165,10 +163,15 @@ def render(
         if base:
             prior = base.get(key, 0)
             delta = value - prior
-            pct = f"{100*delta/prior:+.0f}%" if prior else "  n/a"
+            pct = f"{100 * delta / prior:+.0f}%" if prior else "  n/a"
             row += f"  {prior:>7}  {pct:>8}"
         lines.append(row)
-    if base and concurrency is not None and base_concurrency is not None and concurrency != base_concurrency:
+    if (
+        base
+        and concurrency is not None
+        and base_concurrency is not None
+        and concurrency != base_concurrency
+    ):
         lines += [
             "",
             f"  NOTE: this run used --concurrency {concurrency}, the baseline {base_concurrency}.",

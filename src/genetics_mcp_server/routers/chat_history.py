@@ -40,8 +40,10 @@ router = APIRouter()
 
 # --- Pydantic Models ---
 
+
 class SessionListItem(BaseModel):
     """Session summary for list view."""
+
     id: str
     title: Optional[str]
     created_at: str
@@ -54,12 +56,14 @@ class SessionListItem(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     """Request to create a new session, optionally filed into a project."""
+
     phenotype_code: Optional[str] = None
     project_id: Optional[str] = None
 
 
 class SessionCreateResponse(BaseModel):
     """Response after creating a session."""
+
     id: str
     created_at: str
     project_id: Optional[str] = None
@@ -67,6 +71,7 @@ class SessionCreateResponse(BaseModel):
 
 class SessionUpdateRequest(BaseModel):
     """Request to update session metadata."""
+
     title: Optional[str] = None
     rating: Optional[int] = Field(None, ge=1, le=5)
     comment: Optional[str] = None
@@ -74,6 +79,7 @@ class SessionUpdateRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     """A chat message."""
+
     id: str
     role: str
     content: str
@@ -82,18 +88,22 @@ class MessageResponse(BaseModel):
     content_json: Optional[str] = None  # JSON string of full message content blocks
     literature_backend: Optional[str] = None  # europepmc or perplexity
     tool_profile: Optional[str] = None  # api, bigquery, rag, code, or None (all)
-    tool_results_json: Optional[str] = None  # JSON string of tool_result blocks for this assistant turn
+    tool_results_json: Optional[str] = (
+        None  # JSON string of tool_result blocks for this assistant turn
+    )
     instruction_set_id: Optional[str] = None  # user instruction set in force for this turn
     verbosity: Optional[str] = None  # answer detail in force for this turn: brief or detailed
 
 
 class ActiveTurnResponse(BaseModel):
     """A turn of this session that is still running or not yet written to history."""
+
     message_id: str
 
 
 class SessionDetailResponse(BaseModel):
     """Full session details with messages."""
+
     id: str
     title: Optional[str]
     created_at: str
@@ -111,16 +121,19 @@ class SessionDetailResponse(BaseModel):
 
 class ShareRequest(BaseModel):
     """Request to toggle session sharing."""
+
     shared: bool
 
 
 class PinRequest(BaseModel):
     """Request to pin or unpin a session."""
+
     pinned: bool
 
 
 class MemorySessionItem(BaseModel):
     """One session as it enters the memory digest."""
+
     id: str
     title: Optional[str]
     pinned: bool
@@ -129,6 +142,7 @@ class MemorySessionItem(BaseModel):
 
 class MemoryResponse(BaseModel):
     """What the memory dialog shows: the opt-in state and a preview of the digest."""
+
     enabled: bool
     digest: str
     sessions: list[MemorySessionItem]
@@ -140,16 +154,19 @@ class MemoryResponse(BaseModel):
 
 class ProjectCreateRequest(BaseModel):
     """Request to create a project."""
+
     name: str
 
 
 class ProjectUpdateRequest(BaseModel):
     """Request to rename a project."""
+
     name: str
 
 
 class ProjectResponse(BaseModel):
     """A project as the sidebar shows it."""
+
     id: str
     name: str
     created_at: str
@@ -160,42 +177,60 @@ class ProjectResponse(BaseModel):
 
 class SessionProjectRequest(BaseModel):
     """Request to file a session into a project, or unfile it with project_id=None."""
+
     project_id: Optional[str] = None
 
 
 class SessionProjectResponse(BaseModel):
     """Response after filing or unfiling a session."""
+
     id: str
     project_id: Optional[str] = None
 
 
 class MessageSaveRequest(BaseModel):
     """Request to save a message."""
+
     id: str = Field(..., description="Message ID (generated on frontend)")
     role: str = Field(..., description="user or assistant")
     content: str
-    content_json: Optional[str] = Field(None, description="JSON string of full message content blocks")
-    literature_backend: Optional[str] = Field(None, description="Literature search backend: europepmc or perplexity")
-    tool_profile: Optional[str] = Field(None, description="Tool profile: api, bigquery, rag, code, or null (all)")
-    tool_results_json: Optional[str] = Field(None, description="JSON string of tool_result blocks for this assistant turn")
+    content_json: Optional[str] = Field(
+        None, description="JSON string of full message content blocks"
+    )
+    literature_backend: Optional[str] = Field(
+        None, description="Literature search backend: europepmc or perplexity"
+    )
+    tool_profile: Optional[str] = Field(
+        None, description="Tool profile: api, bigquery, rag, code, or null (all)"
+    )
+    tool_results_json: Optional[str] = Field(
+        None, description="JSON string of tool_result blocks for this assistant turn"
+    )
     # add_message re-saves the whole row on conflict, so a re-save that omits this clears the
     # stored value — same semantics as tool_profile above. Every save of a message must carry it
-    instruction_set_id: Optional[str] = Field(None, description="Instruction set in force for this turn")
-    verbosity: Optional[str] = Field(None, description="Answer detail in force for this turn: brief or detailed")
+    instruction_set_id: Optional[str] = Field(
+        None, description="Instruction set in force for this turn"
+    )
+    verbosity: Optional[str] = Field(
+        None, description="Answer detail in force for this turn: brief or detailed"
+    )
 
 
 class MessageRatingRequest(BaseModel):
     """Request to rate a message."""
+
     thumbs_up: Optional[bool] = Field(None, description="true=up, false=down, null=clear")
 
 
 class TitleGenerateResponse(BaseModel):
     """Response with generated title."""
+
     title: str
 
 
 class AttachmentResponse(BaseModel):
     """A file attachment."""
+
     id: str
     name: str
     type: str  # image, tsv, excel
@@ -229,9 +264,24 @@ EXTENSION_TO_TYPE = {
     ".webp": "image",
     ".tsv": "tsv",
     ".csv": "tsv",
+    ".txt": "tsv",
     ".xlsx": "excel",
     ".xls": "excel",
 }
+
+
+# TextEdit saves rich text unless told otherwise, so a table pasted into it and saved as
+# .tsv arrives as "{\rtf1..." with every cell wrapped in formatting codes; parsed as a table
+# that is garbage columns, so it is refused with the fix spelled out instead
+_RTF_SIGNATURE = b"{\\rtf"
+RTF_REFUSAL = (
+    "This file is a rich-text (RTF) document, not a plain-text table. In TextEdit choose "
+    "Format > Make Plain Text and save it again, or export the table as TSV or CSV."
+)
+
+
+def is_rtf(content: bytes) -> bool:
+    return content.lstrip()[: len(_RTF_SIGNATURE)] == _RTF_SIGNATURE
 
 
 def get_attachment_type(mime_type: str, filename: str) -> str | None:
@@ -264,6 +314,7 @@ def excel_to_tsv(content: bytes) -> str:
 
 # --- Session Endpoints ---
 
+
 @router.get(
     "/chat/sessions",
     summary="List user's chat sessions",
@@ -289,16 +340,18 @@ async def list_sessions(
             if preview_text:
                 preview = preview_text[:80] + "..." if len(preview_text) > 80 else preview_text
 
-        result.append(SessionListItem(
-            id=session.id,
-            title=session.title,
-            created_at=session.created_at.isoformat(),
-            updated_at=session.updated_at.isoformat(),
-            preview=preview,
-            rating=session.rating,
-            pinned=session.pinned_at is not None,
-            project_id=session.project_id,
-        ))
+        result.append(
+            SessionListItem(
+                id=session.id,
+                title=session.title,
+                created_at=session.created_at.isoformat(),
+                updated_at=session.updated_at.isoformat(),
+                preview=preview,
+                rating=session.rating,
+                pinned=session.pinned_at is not None,
+                project_id=session.project_id,
+            )
+        )
 
     return result
 
@@ -533,6 +586,7 @@ async def set_session_project(
 
 # --- Project Endpoints ---
 
+
 def _find_project(db, user: str, project_id: str):
     """The caller's own project by id, or None. Owner-only lookup mirroring get_session."""
     for project in db.list_projects(user):
@@ -694,16 +748,18 @@ async def list_project_sessions(
             if preview_text:
                 preview = preview_text[:80] + "..." if len(preview_text) > 80 else preview_text
 
-        result.append(SessionListItem(
-            id=session.id,
-            title=session.title,
-            created_at=session.created_at.isoformat(),
-            updated_at=session.updated_at.isoformat(),
-            preview=preview,
-            rating=session.rating,
-            pinned=session.pinned_at is not None,
-            project_id=session.project_id,
-        ))
+        result.append(
+            SessionListItem(
+                id=session.id,
+                title=session.title,
+                created_at=session.created_at.isoformat(),
+                updated_at=session.updated_at.isoformat(),
+                preview=preview,
+                rating=session.rating,
+                pinned=session.pinned_at is not None,
+                project_id=session.project_id,
+            )
+        )
 
     return result
 
@@ -795,6 +851,7 @@ async def fork_session(
 
 # --- Message Endpoints ---
 
+
 @router.post(
     "/chat/sessions/{session_id}/messages",
     summary="Save a message to a session",
@@ -870,6 +927,7 @@ async def rate_message(
 
 # --- Title Generation ---
 
+
 @router.post(
     "/chat/sessions/{session_id}/generate-title",
     summary="Generate a title using LLM",
@@ -894,9 +952,7 @@ async def generate_title(
 
     # build context from first few messages
     context_messages = messages[:4]
-    conversation_text = "\n".join(
-        f"{msg.role}: {msg.content[:500]}" for msg in context_messages
-    )
+    conversation_text = "\n".join(f"{msg.role}: {msg.content[:500]}" for msg in context_messages)
 
     # generate title using Anthropic (simpler non-streaming call)
     try:
@@ -908,7 +964,8 @@ async def generate_title(
         # visible text together — 50 tokens of thinking would leave nothing for the
         # title. Models that think by default (Opus 5) have to be told explicitly.
         thinking_kwargs = (
-            {} if model_rejects_disabled_thinking(settings.fast_model)
+            {}
+            if model_rejects_disabled_thinking(settings.fast_model)
             else {"thinking": {"type": "disabled"}}
         )
         response = client.messages.create(
@@ -924,9 +981,7 @@ async def generate_title(
         )
         # never index content[0]: a thinking-capable model leads with a block that
         # has no .text
-        title = "".join(
-            b.text for b in response.content if b.type == "text"
-        ).strip().strip('"\'')
+        title = "".join(b.text for b in response.content if b.type == "text").strip().strip("\"'")
         if not title:
             # e.g. the whole budget went to thinking on a model that can't be
             # turned off — fall back to the first user message rather than
@@ -944,7 +999,9 @@ async def generate_title(
         # fallback: use first user message
         first_msg = next((m for m in messages if m.role == "user"), None)
         if first_msg:
-            fallback_title = first_msg.content[:40] + "..." if len(first_msg.content) > 40 else first_msg.content
+            fallback_title = (
+                first_msg.content[:40] + "..." if len(first_msg.content) > 40 else first_msg.content
+            )
             db.update_session(session_id, user, title=fallback_title)
             return TitleGenerateResponse(title=fallback_title)
         raise HTTPException(status_code=500, detail="Failed to generate title")
@@ -1000,7 +1057,7 @@ async def upload_attachment(
     if file_type is None:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Allowed: images, TSV, CSV, Excel"
+            detail=f"Unsupported file type: {file.content_type}. Allowed: images, TSV, CSV, Excel",
         )
 
     # read file content
@@ -1011,8 +1068,11 @@ async def upload_attachment(
     if file_size > settings.max_attachment_size:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large. Maximum size: {settings.max_attachment_size // (1024*1024)}MB"
+            detail=f"File too large. Maximum size: {settings.max_attachment_size // (1024 * 1024)}MB",
         )
+
+    if file_type == "tsv" and is_rtf(content):
+        raise HTTPException(status_code=400, detail=RTF_REFUSAL)
 
     # parse Excel to TSV up front so a bad file fails before anything is written
     parsed_tsv: str | None = None
@@ -1031,9 +1091,7 @@ async def upload_attachment(
     # Excel is measured on its TSV sidecar, not the workbook: the sidecar is what the sandbox
     # receives, and the zipped workbook's size bounds it from neither side
     if file_type != "image":
-        delivered_size = (
-            len(parsed_tsv.encode("utf-8")) if parsed_tsv is not None else file_size
-        )
+        delivered_size = len(parsed_tsv.encode("utf-8")) if parsed_tsv is not None else file_size
         if delivered_size > MAX_INPUT_BYTES:
             raise HTTPException(
                 status_code=400,

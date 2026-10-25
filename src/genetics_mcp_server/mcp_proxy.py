@@ -69,7 +69,9 @@ class OAuthRefreshTokenSource:
     def __init__(self, seed: dict[str, Any], state_path: Path | None = None, name: str = ""):
         for key in ("token_endpoint", "client_id", "refresh_token"):
             if not seed.get(key):
-                raise ValueError(f"OAuth credentials for {name or 'external MCP server'} lack {key!r}")
+                raise ValueError(
+                    f"OAuth credentials for {name or 'external MCP server'} lack {key!r}"
+                )
         self.name = name
         self.token_endpoint: str = seed["token_endpoint"]
         self.client_id: str = seed["client_id"]
@@ -108,7 +110,10 @@ class OAuthRefreshTokenSource:
             tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
             tmp.write_text(
                 json.dumps(
-                    {"seed_fingerprint": self._seed_fingerprint, "refresh_token": self._refresh_token}
+                    {
+                        "seed_fingerprint": self._seed_fingerprint,
+                        "refresh_token": self._refresh_token,
+                    }
                 )
             )
             tmp.chmod(0o600)
@@ -145,7 +150,10 @@ class OAuthRefreshTokenSource:
     def access_token(self) -> str:
         """A currently valid access token, refreshing when the held one is near expiry."""
         with self._lock:
-            if not self._access_token or time.monotonic() >= self._expires_at - _TOKEN_REFRESH_MARGIN:
+            if (
+                not self._access_token
+                or time.monotonic() >= self._expires_at - _TOKEN_REFRESH_MARGIN
+            ):
                 self._refresh()
             return self._access_token  # type: ignore[return-value]
 
@@ -159,7 +167,9 @@ class OAuthRefreshTokenSource:
     def from_env(cls, env_var: str, state_dir: str | None) -> "OAuthRefreshTokenSource":
         raw = os.environ.get(env_var, "")
         if not raw:
-            raise ValueError(f"{env_var} is not set; run the device-code login and store its output there")
+            raise ValueError(
+                f"{env_var} is not set; run the device-code login and store its output there"
+            )
         seed = json.loads(raw)
         state_path = Path(state_dir) / f"{env_var}.json" if state_dir else None
         if state_path is None:
@@ -312,7 +322,9 @@ class MCPProxyClient:
             if "result" in message or "error" in message:
                 response = message
             elif message.get("method"):
-                logger.debug(f"{self.base_url} sent {message['method']}: {json.dumps(message.get('params'))[:300]}")
+                logger.debug(
+                    f"{self.base_url} sent {message['method']}: {json.dumps(message.get('params'))[:300]}"
+                )
         return response
 
     def _notify_sync(self, method: str) -> None:
@@ -332,11 +344,15 @@ class MCPProxyClient:
         url = self.url
         headers = self._headers()
 
-        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self._has_auth() else 'no'}")
+        logger.debug(
+            f"POST {url} method={payload.get('method')} auth={'yes' if self._has_auth() else 'no'}"
+        )
 
         with httpx.Client(timeout=self.timeout) as client:
             response = client.post(url, json=payload, headers=headers)
-            logger.debug(f"Response status={response.status_code} content-type={response.headers.get('content-type')}")
+            logger.debug(
+                f"Response status={response.status_code} content-type={response.headers.get('content-type')}"
+            )
             logger.debug(f"Response body (first 500 chars): {response.text[:500]}")
             response.raise_for_status()
 
@@ -358,11 +374,15 @@ class MCPProxyClient:
         # a token refresh is a blocking HTTP round trip; keep it off the event loop
         headers = await asyncio.get_running_loop().run_in_executor(None, self._headers)
 
-        logger.debug(f"POST {url} method={payload.get('method')} auth={'yes' if self._has_auth() else 'no'}")
+        logger.debug(
+            f"POST {url} method={payload.get('method')} auth={'yes' if self._has_auth() else 'no'}"
+        )
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(url, json=payload, headers=headers)
-            logger.debug(f"Response status={response.status_code} content-type={response.headers.get('content-type')}")
+            logger.debug(
+                f"Response status={response.status_code} content-type={response.headers.get('content-type')}"
+            )
             logger.debug(f"Response body (first 500 chars): {response.text[:500]}")
             response.raise_for_status()
 
@@ -430,7 +450,9 @@ class MCPProxyClient:
 
             if "result" in result and "tools" in result["result"]:
                 self._tools = result["result"]["tools"]
-                logger.info(f"Found {len(self._tools)} tools from {self.base_url}: {[t.get('name') for t in self._tools]}")
+                logger.info(
+                    f"Found {len(self._tools)} tools from {self.base_url}: {[t.get('name') for t in self._tools]}"
+                )
                 return self._tools
 
             logger.warning(f"Unexpected tools/list response format from {self.base_url}: {result}")
@@ -596,7 +618,9 @@ def register_proxy_tools(
     registered_count = 0
     for tool in tools:
         original_name = tool.get("name", "")
-        if original_name in exclude_tools or (allow_tools is not None and original_name not in allow_tools):
+        if original_name in exclude_tools or (
+            allow_tools is not None and original_name not in allow_tools
+        ):
             logger.debug(f"Skipping excluded tool: {original_name}")
             continue
 
@@ -622,11 +646,11 @@ def register_proxy_tools(
         all_params = required_params + optional_params
         params_str = ", ".join(all_params) if all_params else ""
 
-        func_code = f'''
+        func_code = f"""
 async def {prefixed_name}({params_str}) -> dict:
     kwargs = {{k: v for k, v in locals().items() if v is not None}}
     return await _proxy_client.call_tool(_original_name, kwargs)
-'''
+"""
 
         namespace = {
             "_proxy_client": proxy_client,
@@ -685,11 +709,13 @@ def get_external_anthropic_tools() -> list[dict[str, Any]]:
                 seen_tools.add(tool_name)
                 input_schema = tool.get("inputSchema", {})
 
-                anthropic_tools.append({
-                    "name": prefixed_name,
-                    "description": tool.get("description", f"External tool: {tool_name}"),
-                    "input_schema": input_schema,
-                })
+                anthropic_tools.append(
+                    {
+                        "name": prefixed_name,
+                        "description": tool.get("description", f"External tool: {tool_name}"),
+                        "input_schema": input_schema,
+                    }
+                )
                 break
 
     return anthropic_tools
@@ -713,11 +739,13 @@ def get_rag_anthropic_tools() -> list[dict[str, Any]]:
             prefixed_name = proxy_client.get_prefixed_name(tool.get("name", ""))
             if prefixed_name == tool_name:
                 seen_tools.add(tool_name)
-                anthropic_tools.append({
-                    "name": prefixed_name,
-                    "description": tool.get("description", f"RAG tool: {tool_name}"),
-                    "input_schema": tool.get("inputSchema", {}),
-                })
+                anthropic_tools.append(
+                    {
+                        "name": prefixed_name,
+                        "description": tool.get("description", f"RAG tool: {tool_name}"),
+                        "input_schema": tool.get("inputSchema", {}),
+                    }
+                )
                 break
 
     return anthropic_tools
@@ -741,7 +769,7 @@ async def execute_external_tool(tool_name: str, arguments: dict[str, Any]) -> di
     # find the original tool name (without prefix)
     original_name = tool_name
     if proxy_client.prefix and tool_name.startswith(f"{proxy_client.prefix}_"):
-        original_name = tool_name[len(proxy_client.prefix) + 1:]
+        original_name = tool_name[len(proxy_client.prefix) + 1 :]
 
     return await proxy_client.call_tool(original_name, arguments)
 
@@ -837,7 +865,9 @@ def initialize_external_servers() -> int:
 
     external_servers = os.environ.get("EXTERNAL_MCP_SERVERS", "")
     if external_servers:
-        logger.info(f"Initializing external MCP servers from config (found {len(external_servers.split(','))} entries)")
+        logger.info(
+            f"Initializing external MCP servers from config (found {len(external_servers.split(','))} entries)"
+        )
 
         for server_entry in external_servers.split(","):
             server_entry = server_entry.strip()
@@ -855,7 +885,9 @@ def initialize_external_servers() -> int:
                 tools = proxy_client.list_tools_sync()
 
                 if not tools:
-                    logger.warning(f"No tools returned from {server_url} - server may not be MCP-compatible")
+                    logger.warning(
+                        f"No tools returned from {server_url} - server may not be MCP-compatible"
+                    )
                     continue
 
                 registered = 0
@@ -869,10 +901,14 @@ def initialize_external_servers() -> int:
                     total_tools += 1
                     registered += 1
 
-                logger.info(f"Registered {registered} tools from {server_url} (excluded {len(tools) - registered})")
+                logger.info(
+                    f"Registered {registered} tools from {server_url} (excluded {len(tools) - registered})"
+                )
 
             except Exception as e:
-                logger.error(f"Failed to connect to external MCP server {server_url}: {e}", exc_info=True)
+                logger.error(
+                    f"Failed to connect to external MCP server {server_url}: {e}", exc_info=True
+                )
     else:
         logger.debug("EXTERNAL_MCP_SERVERS not set, skipping external server initialization")
 

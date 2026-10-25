@@ -82,7 +82,9 @@ class TestRegistry:
         registry = TurnRegistry(retain_seconds=60)
         gate = asyncio.Event()
         turn = Turn("t2", session_id="s1", user="u", secret=False)
-        registry.start(turn, _source([_content("a"), _content("b"), _content("c"), DONE], gate=gate), None)
+        registry.start(
+            turn, _source([_content("a"), _content("b"), _content("c"), DONE], gate=gate), None
+        )
         await asyncio.sleep(0)
         assert turn.next_seq == 2
 
@@ -107,7 +109,9 @@ class TestRegistry:
             finished.append(turn.outcome)
 
         turn = Turn("t3", session_id="s1", user="u", secret=False)
-        registry.start(turn, _source([_content("a"), _content("b")], gate=gate, closed=closed), on_finish)
+        registry.start(
+            turn, _source([_content("a"), _content("b")], gate=gate, closed=closed), on_finish
+        )
         await asyncio.sleep(0)
         assert turn.cancel()
         await turn.task
@@ -146,7 +150,9 @@ class TestRegistry:
         turn = Turn("t5", session_id="s1", user="u", secret=False)
         registry.start(turn, _source([DONE]), None)
         with pytest.raises(TurnAlreadyRunning):
-            registry.start(Turn("t5", session_id="s1", user="u", secret=False), _source([DONE]), None)
+            registry.start(
+                Turn("t5", session_id="s1", user="u", secret=False), _source([DONE]), None
+            )
         await turn.task
 
     @pytest.mark.asyncio
@@ -212,33 +218,81 @@ class TestRenderTranscript:
         assert render_transcript(events) == "Hello world"
 
     def test_an_image_becomes_a_marker_the_browser_can_parse(self):
-        events = [_ev(0, {"type": "image", "image_data": "AAAA", "image_format": "png", "image_alt": "a:b[c]"})]
+        events = [
+            _ev(
+                0,
+                {
+                    "type": "image",
+                    "image_data": "AAAA",
+                    "image_format": "png",
+                    "image_alt": "a:b[c]",
+                },
+            )
+        ]
         m = IMAGE_RE.search(render_transcript(events))
         assert m and m.groups() == ("png", "a b c ", "AAAA")
 
     def test_a_file_marker_survives_a_name_with_delimiters(self):
-        events = [_ev(0, {"type": "file", "file_data": "QUJD", "file_mime": "text/csv", "file_name": "a:b].csv"})]
+        events = [
+            _ev(
+                0,
+                {
+                    "type": "file",
+                    "file_data": "QUJD",
+                    "file_mime": "text/csv",
+                    "file_name": "a:b].csv",
+                },
+            )
+        ]
         m = FILE_RE.search(render_transcript(events))
         assert m and m.group(1) == "text/csv" and m.group(3) == "QUJD"
         assert m.group(2) == "a%3Ab%5D.csv"
 
     def test_an_empty_file_payload_is_not_written(self):
-        events = [_ev(0, {"type": "file", "file_data": "", "file_mime": "text/csv", "file_name": "x"})]
+        events = [
+            _ev(0, {"type": "file", "file_data": "", "file_mime": "text/csv", "file_name": "x"})
+        ]
         assert render_transcript(events) == ""
 
     def test_a_tool_call_and_its_outcome_round_trip(self):
         events = [
-            _ev(0, {"type": "tool_use", "id": "tu_1", "name": "run_analysis", "input": {"code": "print(1)\n"}}),
+            _ev(
+                0,
+                {
+                    "type": "tool_use",
+                    "id": "tu_1",
+                    "name": "run_analysis",
+                    "input": {"code": "print(1)\n"},
+                },
+            ),
             _ev(1, {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "ä"}}),
-            _ev(2, {"type": "script_result", "tool_use_id": "tu_1", "ran": True, "ok": False,
-                    "status": "error", "duration_ms": 12, "exception": "ValueError"}),
+            _ev(
+                2,
+                {
+                    "type": "script_result",
+                    "tool_use_id": "tu_1",
+                    "ran": True,
+                    "ok": False,
+                    "status": "error",
+                    "duration_ms": 12,
+                    "exception": "ValueError",
+                },
+            ),
         ]
         markers = TOOL_RE.findall(render_transcript(events))
         assert len(markers) == 2
         first, second = (json.loads(base64.b64decode(m)) for m in markers)
         assert first == {
-            "id": "tu_1", "name": "run_analysis", "input": {"code": "print(1)\n"},
-            "outcome": {"ran": True, "ok": False, "status": "error", "durationMs": 12, "exception": "ValueError"},
+            "id": "tu_1",
+            "name": "run_analysis",
+            "input": {"code": "print(1)\n"},
+            "outcome": {
+                "ran": True,
+                "ok": False,
+                "status": "error",
+                "durationMs": 12,
+                "exception": "ValueError",
+            },
         }
         assert second == {"id": "tu_2", "name": "search", "input": {"q": "ä"}}
 
@@ -264,7 +318,9 @@ def client(history_db):
     app.dependency_overrides[auth_required] = mock_auth
     turns._registry = TurnRegistry(retain_seconds=60)
     with (
-        patch("genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=history_db),
+        patch(
+            "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=history_db
+        ),
         patch("genetics_mcp_server.chat_api.get_chat_history_db", return_value=history_db),
         patch.object(llm_service_module.get_llm_service(), "anthropic_client", True),
         TestClient(app) as c,
@@ -278,12 +334,14 @@ def _stream(chunks, *, hold_before=None, release=None):
     """A stream_chat stand-in. With `hold_before`, it waits before yielding that chunk until
     the test sets `release` — a threading.Event, because the test drives it from outside
     the TestClient's event loop."""
+
     async def stream_chat(**kwargs):
         for i, chunk in enumerate(chunks):
             if hold_before is not None and i == hold_before:
                 while not release.is_set():
                     await asyncio.sleep(0.01)
             yield chunk
+
     return stream_chat
 
 
@@ -340,15 +398,24 @@ class TestChatTurnEndpoints:
             StreamChunk(type="text", content="Hel"),
             StreamChunk(type="text", content="lo"),
             StreamChunk(type="image", content="AAAA", image_format="png", image_alt="plot"),
-            StreamChunk(type="done", message_content=[{"type": "text", "text": "Hello"}],
-                        tool_results=[{"type": "tool_result", "tool_use_id": "x", "content": "y"}]),
+            StreamChunk(
+                type="done",
+                message_content=[{"type": "text", "text": "Hello"}],
+                tool_results=[{"type": "tool_result", "tool_use_id": "x", "content": "y"}],
+            ),
         ]
         with patch.object(llm_service_module.get_llm_service(), "stream_chat", _stream(chunks)):
-            r = client.post("/chat/v1/chat", json={
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-1", "verbosity": "brief",
-                "tool_profile": "code", "instruction_set_id": "ins-1",
-            })
+            r = client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-1",
+                    "verbosity": "brief",
+                    "tool_profile": "code",
+                    "instruction_set_id": "ins-1",
+                },
+            )
         assert r.status_code == 200
         events = _events(r)
         assert [e["id"] for e in events] == ["0", "1", "2", "3"]
@@ -359,16 +426,28 @@ class TestChatTurnEndpoints:
         assert msgs[0].content.startswith("Hello\n\n[IMAGE:png:plot:AAAA]")
         assert json.loads(msgs[0].content_json) == [{"type": "text", "text": "Hello"}]
         assert json.loads(msgs[0].tool_results_json)[0]["tool_use_id"] == "x"
-        assert (msgs[0].verbosity, msgs[0].tool_profile, msgs[0].instruction_set_id) == ("brief", "code", "ins-1")
+        assert (msgs[0].verbosity, msgs[0].tool_profile, msgs[0].instruction_set_id) == (
+            "brief",
+            "code",
+            "ins-1",
+        )
 
     def test_a_secret_turn_writes_nothing(self, client, history_db):
         session = history_db.create_session("test@example.com")
-        chunks = [StreamChunk(type="text", content="x"), StreamChunk(type="done", message_content=[])]
+        chunks = [
+            StreamChunk(type="text", content="x"),
+            StreamChunk(type="done", message_content=[]),
+        ]
         with patch.object(llm_service_module.get_llm_service(), "stream_chat", _stream(chunks)):
-            r = client.post("/chat/v1/chat", json={
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-s", "secret": True,
-            })
+            r = client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-s",
+                    "secret": True,
+                },
+            )
         assert r.status_code == 200
         time.sleep(0.1)
         assert history_db.get_messages(session.id) == []
@@ -377,14 +456,20 @@ class TestChatTurnEndpoints:
         session = history_db.create_session("test@example.com")
         chunks = [StreamChunk(type="done", message_content=[])]
         with patch.object(llm_service_module.get_llm_service(), "stream_chat", _stream(chunks)):
-            client.post("/chat/v1/chat", json={
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-e",
-            })
+            client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-e",
+                },
+            )
         time.sleep(0.1)
         assert history_db.get_messages(session.id) == []
 
-    def test_reattaching_replays_the_buffer_and_the_session_names_the_turn(self, client, history_db):
+    def test_reattaching_replays_the_buffer_and_the_session_names_the_turn(
+        self, client, history_db
+    ):
         session = history_db.create_session("test@example.com")
         chunks = [
             StreamChunk(type="text", content="a"),
@@ -392,10 +477,14 @@ class TestChatTurnEndpoints:
             StreamChunk(type="done", message_content=[{"type": "text", "text": "ab"}]),
         ]
         with patch.object(llm_service_module.get_llm_service(), "stream_chat", _stream(chunks)):
-            r = client.post("/chat/v1/chat", json={
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-r",
-            })
+            r = client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-r",
+                },
+            )
             assert len(_events(r)) == 3
             tail = client.get("/chat/v1/chat/turns/msg-r/events", params={"from_seq": 1})
         assert tail.status_code == 200
@@ -413,13 +502,22 @@ class TestChatTurnEndpoints:
             StreamChunk(type="done", message_content=[{"type": "text", "text": "a"}]),
         ]
         registry = turns.get_turn_registry()
-        with patch.object(llm_service_module.get_llm_service(), "stream_chat",
-                          _stream(chunks, hold_before=1, release=release)):
-            thread, result = _post_in_background(client, {
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-live",
-            })
-            assert _wait_until(lambda: (t := registry.get("msg-live")) is not None and t.next_seq == 1)
+        with patch.object(
+            llm_service_module.get_llm_service(),
+            "stream_chat",
+            _stream(chunks, hold_before=1, release=release),
+        ):
+            thread, result = _post_in_background(
+                client,
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-live",
+                },
+            )
+            assert _wait_until(
+                lambda: (t := registry.get("msg-live")) is not None and t.next_seq == 1
+            )
             detail = client.get(f"/chat/v1/chat/sessions/{session.id}").json()
             assert detail["active_turn"] == {"message_id": "msg-live"}
             assert detail["messages"] == []
@@ -440,17 +538,27 @@ class TestChatTurnEndpoints:
             StreamChunk(type="done", message_content=[{"type": "text", "text": "partial never"}]),
         ]
         registry = turns.get_turn_registry()
-        with patch.object(llm_service_module.get_llm_service(), "stream_chat",
-                          _stream(chunks, hold_before=1, release=release)):
-            thread, result = _post_in_background(client, {
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-c",
-            })
+        with patch.object(
+            llm_service_module.get_llm_service(),
+            "stream_chat",
+            _stream(chunks, hold_before=1, release=release),
+        ):
+            thread, result = _post_in_background(
+                client,
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-c",
+                },
+            )
             assert _wait_until(lambda: (t := registry.get("msg-c")) is not None and t.next_seq == 1)
             assert client.post("/chat/v1/chat/turns/msg-c/cancel").json() == {"cancelled": True}
             thread.join(timeout=5)
         assert result["response"].status_code == 200
-        assert [json.loads(e["data"])["type"] for e in _events(result["response"])] == ["content", "cancelled"]
+        assert [json.loads(e["data"])["type"] for e in _events(result["response"])] == [
+            "content",
+            "cancelled",
+        ]
         msgs = _wait_for_messages(history_db, session.id, 1)
         assert [m.content for m in msgs] == ["partial"]
         assert msgs[0].content_json is None
@@ -460,12 +568,19 @@ class TestChatTurnEndpoints:
 
     def test_another_user_sees_no_turn(self, client, history_db):
         session = history_db.create_session("test@example.com")
-        chunks = [StreamChunk(type="text", content="a"), StreamChunk(type="done", message_content=[])]
+        chunks = [
+            StreamChunk(type="text", content="a"),
+            StreamChunk(type="done", message_content=[]),
+        ]
         with patch.object(llm_service_module.get_llm_service(), "stream_chat", _stream(chunks)):
-            client.post("/chat/v1/chat", json={
-                "messages": [{"role": "user", "content": "hi"}],
-                "session_id": session.id, "message_id": "msg-o",
-            })
+            client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "session_id": session.id,
+                    "message_id": "msg-o",
+                },
+            )
         turn = turns.get_turn_registry().get("msg-o")
         turn.user = "someone-else@example.com"
         assert client.get("/chat/v1/chat/turns/msg-o/events").status_code == 404
@@ -473,7 +588,10 @@ class TestChatTurnEndpoints:
         assert client.get("/chat/v1/chat/turns/nope/events").status_code == 404
 
     def test_a_duplicate_message_id_is_refused(self, client, history_db):
-        chunks = [StreamChunk(type="text", content="a"), StreamChunk(type="done", message_content=[])]
+        chunks = [
+            StreamChunk(type="text", content="a"),
+            StreamChunk(type="done", message_content=[]),
+        ]
         body = {"messages": [{"role": "user", "content": "hi"}], "message_id": "msg-dup"}
         with patch.object(llm_service_module.get_llm_service(), "stream_chat", _stream(chunks)):
             assert client.post("/chat/v1/chat", json=body).status_code == 200
@@ -481,6 +599,7 @@ class TestChatTurnEndpoints:
 
     def test_shutdown_drains_a_turn_nobody_is_watching(self, history_db):
         """The lifespan waits for a detached turn, so its row lands before the app stops."""
+
         async def mock_auth():
             return "test@example.com"
 
@@ -496,15 +615,24 @@ class TestChatTurnEndpoints:
             with (
                 patch("genetics_mcp_server.chat_api.get_chat_history_db", return_value=history_db),
                 patch.object(llm_service_module.get_llm_service(), "anthropic_client", True),
-                patch.object(llm_service_module.get_llm_service(), "stream_chat",
-                             _stream(chunks, hold_before=1, release=release)),
+                patch.object(
+                    llm_service_module.get_llm_service(),
+                    "stream_chat",
+                    _stream(chunks, hold_before=1, release=release),
+                ),
             ):
                 with TestClient(app) as c:
-                    thread, result = _post_in_background(c, {
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "session_id": session.id, "message_id": "msg-drain",
-                    })
-                    assert _wait_until(lambda: (t := registry.get("msg-drain")) is not None and t.next_seq == 1)
+                    thread, result = _post_in_background(
+                        c,
+                        {
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "session_id": session.id,
+                            "message_id": "msg-drain",
+                        },
+                    )
+                    assert _wait_until(
+                        lambda: (t := registry.get("msg-drain")) is not None and t.next_seq == 1
+                    )
                     # the pod is told to stop while the turn is mid-answer; the answer arrives
                     # a little later and shutdown has to still be waiting for it
                     threading.Timer(0.3, release.set).start()

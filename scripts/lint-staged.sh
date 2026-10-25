@@ -1,5 +1,7 @@
 #!/usr/bin/env sh
-# Lints the Python files in the index and FAILS the commit when ruff reports anything.
+# Lints and format-checks the Python files in the index and FAILS the commit when ruff
+# reports anything. Formatting is gated, not applied: a hook that rewrites files behind the
+# commit stages something the author never saw.
 #
 # Deliberately blocking, unlike the doc-drift check next to it in the hook: a gate that
 # only warns is one nobody reads. `git commit --no-verify` is the escape hatch.
@@ -10,13 +12,13 @@
 #     that properly means materialising the index somewhere, or stashing, and a hook
 #     that stashes can lose work if it is interrupted. The gap only bites when a file is
 #     partially staged, so that case is detected and reported rather than hidden.
-#   * It does not lint the whole repo, so a finding in a file you did not touch never
+#   * It does not check the whole repo, so a finding in a file you did not touch never
 #     blocks you. The cost is that pre-existing findings are only cleared by touching
 #     the file; `scripts/lint-staged.sh --all` runs the repo-wide check.
 #
 # Usage:
-#   scripts/lint-staged.sh         lint the staged Python files (what the hook runs)
-#   scripts/lint-staged.sh --all   lint the whole repo
+#   scripts/lint-staged.sh         check the staged Python files (what the hook runs)
+#   scripts/lint-staged.sh --all   check the whole repo
 
 set -eu
 
@@ -61,7 +63,7 @@ fi
 if [ "${1:-}" = "--all" ]; then
     # word splitting is wanted: $ruff may be `uvx ruff@<pin>`
     # shellcheck disable=SC2086
-    exec $ruff check .
+    $ruff check . && exec $ruff format --check .
 fi
 
 tmp=$(mktemp -d)
@@ -90,5 +92,12 @@ if ! xargs -0 $ruff check --force-exclude -- < "$tmp/staged"; then
     printf '  Auto-fixable?  %s check --fix <file>\n' "$ruff" >&2
     printf '  Deliberate?    add a targeted `# noqa: <CODE>` with a reason\n' >&2
     printf '  Bypass:        git commit --no-verify\n\n' >&2
+    exit 1
+fi
+# shellcheck disable=SC2086
+if ! xargs -0 $ruff format --check --force-exclude -- < "$tmp/staged"; then
+    printf '\nlint-staged: the staged Python files above are not ruff-formatted.\n\n' >&2
+    printf '  Fix:     %s format <file>   then re-stage it\n' "$ruff" >&2
+    printf '  Bypass:  git commit --no-verify\n\n' >&2
     exit 1
 fi
