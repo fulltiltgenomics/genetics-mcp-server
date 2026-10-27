@@ -53,7 +53,7 @@ class OAuthRefreshTokenSource:
     """Bearer tokens for a server behind OAuth 2.1, minted from a stored refresh token.
 
     Servers such as C3PO accept no client-credentials grant, so a service process cannot log
-    itself in: an operator runs the device-code login once (`scripts/mcp_oauth_login.py`) and
+    itself in: an operator runs the browser login once (`scripts/mcp_oauth_login.py`) and
     the refresh token it yields is what this process holds. Access tokens are short-lived and
     are re-minted here on demand.
 
@@ -168,7 +168,7 @@ class OAuthRefreshTokenSource:
         raw = os.environ.get(env_var, "")
         if not raw:
             raise ValueError(
-                f"{env_var} is not set; run the device-code login and store its output there"
+                f"{env_var} is not set; run scripts/mcp_oauth_login.py and store its output there"
             )
         seed = json.loads(raw)
         state_path = Path(state_dir) / f"{env_var}.json" if state_dir else None

@@ -30,6 +30,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import secrets
 import sys
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -53,10 +54,48 @@ def _get_json(client: httpx.Client, url: str) -> dict:
     return response.json()
 
 
-def discover(client: httpx.Client, server_url: str) -> tuple[dict, str]:
+def _endpoint(server_url: str, path: str) -> str:
+    return server_url.rstrip("/") + ("" if path == "/" else path)
+
+
+def _metadata_hint(client: httpx.Client, endpoint: str) -> str | None:
+    """The protected-resource metadata URL an unauthenticated call to the endpoint names in
+    its WWW-Authenticate header, when the server follows the MCP authorization spec."""
+    try:
+        response = client.post(
+            endpoint,
+            json={"jsonrpc": "2.0", "id": 0, "method": "ping"},
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+    except httpx.HTTPError:
+        return None
+    match = re.search(r'resource_metadata="([^"]+)"', response.headers.get("www-authenticate", ""))
+    return match.group(1) if match else None
+
+
+def discover(client: httpx.Client, server_url: str, path: str) -> tuple[dict, str]:
     """The authorization server's metadata and the resource identifier, found through the
-    MCP server's own protected-resource metadata."""
-    resource = _get_json(client, f"{server_url.rstrip('/')}/.well-known/oauth-protected-resource")
+    MCP server's own protected-resource metadata.
+
+    RFC 9728 lets a server publish that document at the origin root or under the resource's
+    own path, and servers pick one: C3PO answers at the root and DepMap only under `/mcp`.
+    The 401's WWW-Authenticate header is authoritative when present, so it is tried first.
+    """
+    base = server_url.rstrip("/")
+    candidates = [
+        _metadata_hint(client, _endpoint(server_url, path)),
+        f"{base}/.well-known/oauth-protected-resource",
+        f"{base}/.well-known/oauth-protected-resource{'' if path == '/' else path}",
+    ]
+    resource: dict | None = None
+    for url in dict.fromkeys(c for c in candidates if c):
+        try:
+            resource = _get_json(client, url)
+            break
+        except httpx.HTTPStatusError:
+            continue
+    if resource is None:
+        sys.exit(f"{server_url} publishes no protected-resource metadata at any known location")
     issuers = resource.get("authorization_servers") or []
     if not issuers:
         sys.exit(f"{server_url} names no authorization server in its protected-resource metadata")
@@ -179,7 +218,8 @@ def main() -> None:
     parser.add_argument(
         "--scope",
         default="openid offline_access",
-        help="offline_access is what yields a refresh token",
+        help="offline_access is what yields a refresh token at C3PO; an issuer that refuses "
+        "scopes it does not advertise (DepMap) wants its own scopes_supported here",
     )
     parser.add_argument("--out", help="write the credential JSON here instead of stdout")
     parser.add_argument(
@@ -188,12 +228,14 @@ def main() -> None:
     args = parser.parse_args()
 
     with httpx.Client(timeout=30.0) as client:
-        metadata, resource = discover(client, args.server_url)
+        metadata, resource = discover(client, args.server_url, args.path)
         client_id = args.client_id or register_client(client, metadata, args.client_name)
         tokens = code_login(client, metadata, client_id, args.scope, resource)
 
     if not tokens.get("refresh_token"):
-        sys.exit("the login yielded no refresh token; the scope must include offline_access")
+        sys.exit(
+            "the login yielded no refresh token; at some issuers the scope must include offline_access"
+        )
 
     credentials = {
         "server_url": args.server_url,

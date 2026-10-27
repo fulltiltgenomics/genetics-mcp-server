@@ -2745,11 +2745,15 @@ server's names cannot shadow a local tool's), and anything else is a static bear
 keeps the original `URL|TOKEN` form parsing. `build_proxy_client` turns an entry into a client
 and is the one constructor path for chat-backend, the RAG server and the standalone MCP server.
 
-`oauth=<ENV>` is for a server behind OAuth 2.1 with no client-credentials grant (C3PO). The env
+`oauth=<ENV>` is for a server behind OAuth 2.1 with no client-credentials grant (C3PO, DepMap). The env
 var holds the JSON that `scripts/mcp_oauth_login.py` writes after an operator completes the
 authorization-code flow once, pasting the redirect address back since the browser is not on
 the machine running it (AuthKit refuses the device-code grant to a dynamically registered
-client): `token_endpoint`, `client_id`, `refresh_token`. `OAuthRefreshTokenSource`
+client): `token_endpoint`, `client_id`, `refresh_token`. The helper locates the protected-resource
+metadata through the `resource_metadata` hint in the endpoint's 401, then the root and the
+path-suffixed RFC 9728 locations (C3PO serves the root form, DepMap only `/mcp`'s), and takes
+`--scope` because DepMap refuses `offline_access` yet issues a refresh token without it.
+`OAuthRefreshTokenSource`
 mints access tokens from it on demand, refreshing inside a 60 s margin of expiry and after any
 401/403 on a call, and writes the rotated refresh token to `EXTERNAL_MCP_STATE_DIR/<ENV>.json`,
 reading it back ahead of the seed on the next start unless the seed itself changed. A token
@@ -3262,6 +3266,7 @@ Default external servers:
 - gnomAD: `https://gnomad-mcp-dpsnoyqx6q-uc.a.run.app`
 - Open Targets: `https://mcp.platform.opentargets.org`
 - C3PO: `https://mcp.c3po.bio|path=/|timeout=120|oauth=C3PO_MCP_OAUTH|prefix=c3po|tools=<read-only names>` — the deployed entry is in genetics-results-suite's `docs/chat-tool-reference.md` § 6
+- DepMap (daly only): `https://mcp.depmap.org|timeout=120|oauth=DEPMAP_MCP_OAUTH|prefix=depmap|tools=<query and analysis names>` — same place
 
 ### Subagent options
 
