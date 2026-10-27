@@ -885,10 +885,12 @@ async def execute_external_tool(tool_name: str, arguments: dict[str, Any]) -> di
 
 
 async def read_external_app_view(tool_name: str) -> dict[str, Any]:
-    """The HTML of a tool's MCP App view and the `_meta.ui` it was served with.
+    """The HTML of a tool's MCP App view, the `_meta.ui` it was served with, and the tool.
 
-    `{"uri", "html", "ui"}`, where `ui` carries the view's `csp`, `permissions` and
-    `prefersBorder` for the host to apply. Cached per server and URI for _UI_RESOURCE_TTL_S.
+    `{"uri", "html", "ui", "tool"}`, where `ui` carries the view's `csp`, `permissions` and
+    `prefersBorder` for the host to apply and `tool` is the upstream tool definition, which
+    the view's SDK expects whole (`inputSchema` included) in the host context it is handed.
+    Cached per server and URI for _UI_RESOURCE_TTL_S.
 
     Raises LookupError for a tool with no view, ProxyCallError when the server fails or the
     resource is not an HTML document.
@@ -897,7 +899,8 @@ async def read_external_app_view(tool_name: str) -> dict[str, Any]:
     found = _upstream(tool_name)
     if not app or not found:
         raise LookupError(f"{tool_name} has no MCP App view")
-    proxy_client, _ = found
+    proxy_client, original_name = found
+    tool = proxy_client.tool_definition(original_name) or {}
     uri = app["resource_uri"]
     key = (id(proxy_client), uri)
     now = time.monotonic()
@@ -917,7 +920,7 @@ async def read_external_app_view(tool_name: str) -> dict[str, Any]:
             continue
         meta = item.get("_meta")
         ui = meta.get("ui") if isinstance(meta, dict) and isinstance(meta.get("ui"), dict) else {}
-        view = {"uri": uri, "html": html, "ui": ui}
+        view = {"uri": uri, "html": html, "ui": ui, "tool": tool}
         _ui_resource_cache[key] = (now, view)
         logger.info(f"Fetched MCP App view {uri} for {tool_name} ({len(html)} chars)")
         return view

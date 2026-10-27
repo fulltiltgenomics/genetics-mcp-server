@@ -833,8 +833,9 @@ through whoever hosts it. `mcp_proxy.py` supports exactly that shape, and nothin
   stream chunk (`tool_use_id`, `tool`, `input`, `resource_uri`, `result`) before the model's
   `tool_result` is built, so the model reads the text and the browser gets the rest.
 - **The browser's two routes**, both `auth_required`: `GET /chat/v1/mcp-apps/{tool}/view`
-  answers `{uri, html, ui}` — the view read with `resources/read` and cached per server
-  and URI for `_UI_RESOURCE_TTL_S` — and `POST /chat/v1/mcp-apps/{tool}/call`
+  answers `{uri, html, ui, tool}` — the view read with `resources/read` and cached per
+  server and URI for `_UI_RESOURCE_TTL_S`, plus the upstream tool definition, which the
+  view's SDK validates whole (`inputSchema` included) in the host context — and `POST /chat/v1/mcp-apps/{tool}/call`
   (`{name, arguments}`) relays a view's `tools/call` to the one server that serves it,
   answering the CallToolResult; 403 for a tool without `"app"` visibility, 404 for a name
   the server does not have or a host tool without a view, 502 when the server fails. They

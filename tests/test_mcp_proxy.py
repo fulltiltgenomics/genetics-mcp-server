@@ -438,6 +438,7 @@ class TestMcpApps:
             "uri": "ui://plot/view.html",
             "html": _AppServer.VIEW_HTML,
             "ui": {"csp": {"connectDomains": ["https://api.example"]}},
+            "tool": app_server.tools[0],
         }
         reads = len([r for r in app_server.requests if b"resources/read" in r.content])
         assert await mcp_proxy.read_external_app_view("dm_show_plot") == view
