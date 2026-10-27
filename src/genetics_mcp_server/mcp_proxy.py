@@ -6,6 +6,7 @@ and creates wrapper functions that forward calls.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import keyword
@@ -47,6 +48,16 @@ _rag_proxy_clients: dict[str, "MCPProxyClient"] = {}
 # refresh this many seconds before the access token's stated expiry, so a call that starts
 # just under the wire does not arrive with a token the server already considers dead
 _TOKEN_REFRESH_MARGIN = 60.0
+
+# an MCP App view (a `ui://` HTML resource, 2.4 MB for DepMap's) is fetched once per server
+# and URI and reused for this long; the server sends no change notification to a
+# request/response client like this one, so a redeployed view shows up after at most this
+_UI_RESOURCE_TTL_S = 900.0
+_ui_resource_cache: dict[tuple[int, str], tuple[float, dict[str, Any]]] = {}
+
+
+class ProxyCallError(RuntimeError):
+    """The remote server could not be called, or refused the call; the message is for the log."""
 
 
 class OAuthRefreshTokenSource:
@@ -269,6 +280,7 @@ class MCPProxyClient:
         self._request_id = 0
         self._tools: list[dict] = []
         self._initialized = False
+        self.server_capabilities: dict[str, Any] = {}
 
     def _headers(self) -> dict[str, str]:
         """Request headers; with a token source this may block on a token refresh."""
@@ -418,6 +430,8 @@ class MCPProxyClient:
                 return False
 
             self._initialized = True
+            capabilities = result.get("result", {}).get("capabilities")
+            self.server_capabilities = capabilities if isinstance(capabilities, dict) else {}
             # the spec has the client confirm before its first request; servers holding a
             # session refuse tools/list until they see it, stateless ones ignore it
             self._notify_sync("notifications/initialized")
@@ -467,70 +481,124 @@ class MCPProxyClient:
             logger.error(f"Failed to list tools from {self.base_url}: {e}")
             return []
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool on the remote MCP server."""
-        # reinitialize if session expired
+    def tool_definition(self, original_name: str) -> dict | None:
+        """The upstream tools/list entry for a tool, `_meta` and annotations included."""
+        for tool in self._tools:
+            if tool.get("name") == original_name:
+                return tool
+        return None
+
+    async def _request_async(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """One JSON-RPC request, initialising first when the session is new or was dropped.
+
+        Raises ProxyCallError when the server is unreachable or answers an HTTP error; a
+        400, 401 or 403 also forgets the session and the access token, so the next request
+        starts over rather than repeating the refusal.
+        """
         if not self._initialized:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self.initialize_sync)
-
+        payload = self._jsonrpc_request(method, params)
         try:
-            payload = self._jsonrpc_request(
-                "tools/call",
-                {"name": name, "arguments": arguments},
-            )
-            result = await self._post_async(payload)
-            result_str = json.dumps(result)
-            logger.info(
-                f"External tool {name} response ({len(result_str)} chars): "
-                f"{result_str[:500]}{'...[truncated]' if len(result_str) > 500 else ''}"
-            )
-
-            if "error" in result:
-                error_msg = result["error"]
-                if isinstance(error_msg, dict):
-                    error_msg = error_msg.get("message", str(error_msg))
-                return {"success": False, "error": f"Remote MCP error: {error_msg}"}
-
-            if "result" in result:
-                mcp_result = result["result"]
-                # extract text content from MCP response
-                if isinstance(mcp_result, dict) and "content" in mcp_result:
-                    content = mcp_result["content"]
-                    if isinstance(content, list):
-                        texts = []
-                        for item in content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                texts.append(item.get("text", ""))
-                        if texts:
-                            combined = "\n".join(texts)
-                            # try to parse as JSON
-                            try:
-                                return json.loads(combined)
-                            except json.JSONDecodeError:
-                                return {"success": True, "result": combined}
-                return {"success": True, "result": mcp_result}
-
-            return {"success": True, "result": result}
-
+            return await self._post_async(payload)
         except httpx.HTTPStatusError as e:
-            # session may have expired, try to reinitialize
             if e.response.status_code in (400, 401, 403):
                 self._initialized = False
                 self.session_id = None
                 if self.token_source:
                     self.token_source.invalidate()
-            return {"success": False, "error": f"HTTP {e.response.status_code}: {e.response.text}"}
-
+            raise ProxyCallError(f"HTTP {e.response.status_code}: {e.response.text}") from e
         except Exception as e:
-            logger.error(f"Error calling remote tool {name}: {e}")
+            logger.error(f"Error in {method} to {self.base_url}: {e}")
+            raise ProxyCallError(str(e)) from e
+
+    async def call_tool_raw(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """A tools/call as the server answered it: `{"result": CallToolResult}` or `{"error": ...}`.
+
+        The CallToolResult keeps what `call_tool` discards — `structuredContent`, `_meta`,
+        `isError`, non-text content — which is what an MCP App view is sent.
+        """
+        response = await self._request_async("tools/call", {"name": name, "arguments": arguments})
+        response_str = json.dumps(response)
+        logger.info(
+            f"External tool {name} response ({len(response_str)} chars): "
+            f"{response_str[:500]}{'...[truncated]' if len(response_str) > 500 else ''}"
+        )
+        return response
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Call a tool on the remote MCP server, collapsed to what the model reads."""
+        try:
+            response = await self.call_tool_raw(name, arguments)
+        except ProxyCallError as e:
             return {"success": False, "error": str(e)}
+        return collapse_tool_response(response)
+
+    async def read_resource(self, uri: str) -> dict[str, Any]:
+        """A resources/read result: `{"contents": [{uri, mimeType, text | blob, _meta}]}`."""
+        response = await self._request_async("resources/read", {"uri": uri})
+        if "error" in response:
+            raise ProxyCallError(f"Remote MCP error: {_error_message(response['error'])}")
+        result = response.get("result")
+        return result if isinstance(result, dict) else {}
 
     def get_prefixed_name(self, original_name: str) -> str:
         """Get the prefixed tool name."""
         if self.prefix:
             return f"{self.prefix}_{original_name}"
         return original_name
+
+
+def _error_message(error: Any) -> str:
+    if isinstance(error, dict):
+        return str(error.get("message", error))
+    return str(error)
+
+
+def collapse_tool_response(response: dict[str, Any]) -> Any:
+    """The model's view of a tools/call response: its text content, parsed as JSON when it is.
+
+    Everything else in the CallToolResult — `structuredContent`, `_meta`, images, embedded
+    resources — is for a renderer, which the model is not; `call_tool_raw` keeps it.
+    """
+    if "error" in response:
+        return {"success": False, "error": f"Remote MCP error: {_error_message(response['error'])}"}
+    if "result" not in response:
+        return {"success": True, "result": response}
+    mcp_result = response["result"]
+    if isinstance(mcp_result, dict) and isinstance(mcp_result.get("content"), list):
+        texts = [
+            item.get("text", "")
+            for item in mcp_result["content"]
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        if texts:
+            combined = "\n".join(texts)
+            try:
+                return json.loads(combined)
+            except json.JSONDecodeError:
+                return {"success": True, "result": combined}
+    return {"success": True, "result": mcp_result}
+
+
+def tool_ui(tool: dict[str, Any]) -> dict[str, Any]:
+    """The MCP Apps `_meta.ui` block of an upstream tool definition; `{}` for a plain tool."""
+    meta = tool.get("_meta")
+    ui = meta.get("ui") if isinstance(meta, dict) else None
+    return ui if isinstance(ui, dict) else {}
+
+
+def tool_visible_to(tool: dict[str, Any], audience: str) -> bool:
+    """Whether `_meta.ui.visibility` admits the audience, `"model"` or `"app"`.
+
+    The MCP Apps spec defaults an absent list to both: a tool that names only `"app"` is the
+    view's data loader and must stay out of the model's tool list, and one that names only
+    `"model"` must be refused when a view calls it.
+    """
+    visibility = tool_ui(tool).get("visibility")
+    if not isinstance(visibility, list):
+        return True
+    return audience in visibility
 
 
 def _json_type_to_python(json_type: str, is_required: bool = True) -> str:
@@ -618,8 +686,10 @@ def register_proxy_tools(
     registered_count = 0
     for tool in tools:
         original_name = tool.get("name", "")
-        if original_name in exclude_tools or (
-            allow_tools is not None and original_name not in allow_tools
+        if (
+            original_name in exclude_tools
+            or (allow_tools is not None and original_name not in allow_tools)
+            or not tool_visible_to(tool, "model")
         ):
             logger.debug(f"Skipping excluded tool: {original_name}")
             continue
@@ -751,9 +821,40 @@ def get_rag_anthropic_tools() -> list[dict[str, Any]]:
     return anthropic_tools
 
 
+def _upstream(tool_name: str) -> tuple[MCPProxyClient, str] | None:
+    """The client serving a registered (prefixed) tool name, and the tool's upstream name."""
+    proxy_client = _proxy_clients.get(tool_name) or _rag_proxy_clients.get(tool_name)
+    if not proxy_client:
+        return None
+    original_name = tool_name
+    if proxy_client.prefix and tool_name.startswith(f"{proxy_client.prefix}_"):
+        original_name = tool_name[len(proxy_client.prefix) + 1 :]
+    return proxy_client, original_name
+
+
+def external_tool_app(tool_name: str) -> dict[str, Any] | None:
+    """The MCP App a registered tool renders its result with: `{"resource_uri": "ui://..."}`.
+
+    None for a tool without `_meta.ui.resourceUri`, which is every tool but the few whose
+    result is a view (DepMap's `show_data_explorer_plot`).
+    """
+    found = _upstream(tool_name)
+    if not found:
+        return None
+    proxy_client, original_name = found
+    uri = tool_ui(proxy_client.tool_definition(original_name) or {}).get("resourceUri")
+    if isinstance(uri, str) and uri.startswith("ui://"):
+        return {"resource_uri": uri}
+    return None
+
+
 async def execute_external_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """
     Execute a tool on an external MCP server.
+
+    For a tool with an MCP App view the model's result carries, under `_mcp_app`, the
+    CallToolResult the view is sent (`structuredContent` and all); the chat loop lifts it
+    out into its own stream event before the model reads the result.
 
     Args:
         tool_name: Name of the tool (may be prefixed)
@@ -762,16 +863,101 @@ async def execute_external_tool(tool_name: str, arguments: dict[str, Any]) -> di
     Returns:
         Tool execution result
     """
-    proxy_client = _proxy_clients.get(tool_name) or _rag_proxy_clients.get(tool_name)
-    if not proxy_client:
+    found = _upstream(tool_name)
+    if not found:
         return {"success": False, "error": f"No proxy client found for tool: {tool_name}"}
+    proxy_client, original_name = found
 
-    # find the original tool name (without prefix)
-    original_name = tool_name
-    if proxy_client.prefix and tool_name.startswith(f"{proxy_client.prefix}_"):
-        original_name = tool_name[len(proxy_client.prefix) + 1 :]
+    app = external_tool_app(tool_name)
+    if not app:
+        return await proxy_client.call_tool(original_name, arguments)
 
-    return await proxy_client.call_tool(original_name, arguments)
+    try:
+        response = await proxy_client.call_tool_raw(original_name, arguments)
+    except ProxyCallError as e:
+        return {"success": False, "error": str(e)}
+    result = collapse_tool_response(response)
+    if not isinstance(result, dict):
+        result = {"success": True, "result": result}
+    if isinstance(response.get("result"), dict):
+        result["_mcp_app"] = {"resource_uri": app["resource_uri"], "result": response["result"]}
+    return result
+
+
+async def read_external_app_view(tool_name: str) -> dict[str, Any]:
+    """The HTML of a tool's MCP App view and the `_meta.ui` it was served with.
+
+    `{"uri", "html", "ui"}`, where `ui` carries the view's `csp`, `permissions` and
+    `prefersBorder` for the host to apply. Cached per server and URI for _UI_RESOURCE_TTL_S.
+
+    Raises LookupError for a tool with no view, ProxyCallError when the server fails or the
+    resource is not an HTML document.
+    """
+    app = external_tool_app(tool_name)
+    found = _upstream(tool_name)
+    if not app or not found:
+        raise LookupError(f"{tool_name} has no MCP App view")
+    proxy_client, _ = found
+    uri = app["resource_uri"]
+    key = (id(proxy_client), uri)
+    now = time.monotonic()
+    cached = _ui_resource_cache.get(key)
+    if cached and now - cached[0] < _UI_RESOURCE_TTL_S:
+        return cached[1]
+    result = await proxy_client.read_resource(uri)
+    for item in result.get("contents", []):
+        if not isinstance(item, dict) or not str(item.get("mimeType") or "").startswith(
+            "text/html"
+        ):
+            continue
+        html = item.get("text")
+        if not isinstance(html, str) and isinstance(item.get("blob"), str):
+            html = base64.b64decode(item["blob"]).decode("utf-8", "replace")
+        if not isinstance(html, str):
+            continue
+        meta = item.get("_meta")
+        ui = meta.get("ui") if isinstance(meta, dict) and isinstance(meta.get("ui"), dict) else {}
+        view = {"uri": uri, "html": html, "ui": ui}
+        _ui_resource_cache[key] = (now, view)
+        logger.info(f"Fetched MCP App view {uri} for {tool_name} ({len(html)} chars)")
+        return view
+    raise ProxyCallError(f"{uri} is not an HTML MCP App view")
+
+
+async def call_external_tool_for_app(
+    host_tool: str, name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """A tools/call made by a rendered view, answered with the CallToolResult.
+
+    `name` is an upstream name on the one server that serves `host_tool`'s view: the spec
+    lets a view reach only its own server, and only tools whose visibility admits `"app"`.
+    The `tools=` allow-list does not apply — it is the model's surface, and the view's data
+    loader is deliberately outside it.
+
+    Raises LookupError for a host tool without a view or an unknown name, PermissionError
+    for a tool the view may not call, ProxyCallError when the server fails.
+    """
+    found = _upstream(host_tool)
+    if not external_tool_app(host_tool) or not found:
+        raise LookupError(f"{host_tool} has no MCP App view")
+    proxy_client, _ = found
+    tool = proxy_client.tool_definition(name)
+    if tool is None:
+        raise LookupError(f"{name} is not a tool of {proxy_client.base_url}")
+    if not tool_visible_to(tool, "app"):
+        raise PermissionError(f"{name} is not callable by an app view")
+    response = await proxy_client.call_tool_raw(name, arguments)
+    if "error" in response:
+        return {
+            "isError": True,
+            "content": [
+                {"type": "text", "text": f"Remote MCP error: {_error_message(response['error'])}"}
+            ],
+        }
+    result = response.get("result")
+    if isinstance(result, dict):
+        return result
+    return {"isError": True, "content": [{"type": "text", "text": "malformed tools/call result"}]}
 
 
 def build_proxy_client(entry: str, default_timeout: float) -> tuple[MCPProxyClient, ServerConfig]:
@@ -895,6 +1081,11 @@ def initialize_external_servers() -> int:
                     original_name = tool.get("name", "")
                     if original_name in exclude_tools or not config.admits(original_name):
                         logger.debug(f"Skipping excluded tool: {original_name}")
+                        continue
+                    if not tool_visible_to(tool, "model"):
+                        # an MCP App's own data loader: its view calls it through
+                        # call_external_tool_for_app, the model never sees it
+                        logger.info(f"Skipping app-only tool: {original_name}")
                         continue
                     tool_name = proxy_client.get_prefixed_name(original_name)
                     _proxy_clients[tool_name] = proxy_client

@@ -813,6 +813,44 @@ fault and reads as "not found" rather than as a read.
 | `query_open_targets_graphql` | Execute GraphQL queries against the Open Targets Platform API |
 | `batch_query_open_targets_graphql` | Execute the same GraphQL query with multiple variable sets |
 
+#### MCP App views (DepMap's Data Explorer plots)
+
+A proxied tool may carry `_meta.ui.resourceUri` (the MCP Apps extension, `io.modelcontextprotocol/ui`):
+its result is meant to be drawn by an HTML view the same server serves as a `ui://` resource,
+rather than read as text. DepMap's `show_data_explorer_plot` is one; its view is a
+self-contained React + Plotly page that loads its points by calling `get_plot_data` back
+through whoever hosts it. `mcp_proxy.py` supports exactly that shape, and nothing wider:
+
+- **Visibility.** `_meta.ui.visibility` (default `["model", "app"]`) is honoured at both
+  registration sites: a tool without `"model"` — the view's data loader — never enters the
+  model's tool list, whatever the entry's `tools=` says; a tool without `"app"` is refused
+  when a view calls it.
+- **The result keeps its structure.** `MCPProxyClient.call_tool_raw` returns the JSON-RPC
+  response whole, and `collapse_tool_response` reduces it to what `call_tool` always gave the
+  model (the text content, parsed as JSON when it is). For a tool with a view,
+  `execute_external_tool` attaches the CallToolResult — `content`, `structuredContent`,
+  `_meta`, `isError` — under `_mcp_app`; `llm_service` lifts that out into an `mcp_app`
+  stream chunk (`tool_use_id`, `tool`, `input`, `resource_uri`, `result`) before the model's
+  `tool_result` is built, so the model reads the text and the browser gets the rest.
+- **The browser's two routes**, both `auth_required`: `GET /chat/v1/mcp-apps/{tool}/view`
+  answers `{uri, html, ui}` — the view read with `resources/read` and cached per server
+  and URI for `_UI_RESOURCE_TTL_S` — and `POST /chat/v1/mcp-apps/{tool}/call`
+  (`{name, arguments}`) relays a view's `tools/call` to the one server that serves it,
+  answering the CallToolResult; 403 for a tool without `"app"` visibility, 404 for a name
+  the server does not have or a host tool without a view, 502 when the server fails. They
+  exist because the server sits behind the operator's OAuth login, which this process holds
+  and the browser does not.
+- **Persistence.** The browser embeds the `mcp_app` event in the message's `content` as
+  `[MCPAPP:<base64 json>]` (`id`, `tool`, `input`, `result`), and `turns.render_transcript`
+  writes the same marker when the server persists a turn, so a reopened session re-renders
+  the view from the record and fetches the HTML again. `_TOOL_USE_MARKER_RE` and
+  `chat_api._strip_image_markers` strip the marker from replayed assistant text.
+
+How the browser sandboxes the view is its business (`genetics-results-browser`,
+`src/features/chat/mcpApps/` and `public/mcp-app-sandbox.html`): a frame with an opaque
+origin, a CSP built from what the server declared, and no route to this process but the two
+above.
+
 ## Tool Profiles
 
 ## Tool surfaces
@@ -1633,7 +1671,7 @@ it, the model ran inside the response and the browser was the only writer of cha
   source has closed: cancelling during the write below would lose the row.
 - **Persistence** is the finish hook `_turn_persister` builds per request: `render_transcript`
   turns the buffered events into the same `content` string the browser accumulates on screen —
-  prose, plus the `[IMAGE:…]`, `[FILE:…]` and `[TOOLUSE:…]` markers by the grammar of the
+  prose, plus the `[IMAGE:…]`, `[FILE:…]`, `[TOOLUSE:…]` and `[MCPAPP:…]` markers by the grammar of the
   browser's `imageMarker.ts`, `fileMarker.ts` and `toolCallMarker.ts` — and `add_message` writes it
   with `content_json` and `tool_results_json` from the `done` event, in a worker thread. It runs
   for every ending (complete, error, cancelled) that produced any content; a secret chat or a
