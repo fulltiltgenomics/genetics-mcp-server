@@ -813,6 +813,45 @@ fault and reads as "not found" rather than as a read.
 | `query_open_targets_graphql` | Execute GraphQL queries against the Open Targets Platform API |
 | `batch_query_open_targets_graphql` | Execute the same GraphQL query with multiple variable sets |
 
+#### MCP App views (DepMap's Data Explorer plots)
+
+A proxied tool may carry `_meta.ui.resourceUri` (the MCP Apps extension, `io.modelcontextprotocol/ui`):
+its result is meant to be drawn by an HTML view the same server serves as a `ui://` resource,
+rather than read as text. DepMap's `show_data_explorer_plot` is one; its view is a
+self-contained React + Plotly page that loads its points by calling `get_plot_data` back
+through whoever hosts it. `mcp_proxy.py` supports exactly that shape, and nothing wider:
+
+- **Visibility.** `_meta.ui.visibility` (default `["model", "app"]`) is honoured at both
+  registration sites: a tool without `"model"` — the view's data loader — never enters the
+  model's tool list, whatever the entry's `tools=` says; a tool without `"app"` is refused
+  when a view calls it.
+- **The result keeps its structure.** `MCPProxyClient.call_tool_raw` returns the JSON-RPC
+  response whole, and `collapse_tool_response` reduces it to what `call_tool` always gave the
+  model (the text content, parsed as JSON when it is). For a tool with a view,
+  `execute_external_tool` attaches the CallToolResult — `content`, `structuredContent`,
+  `_meta`, `isError` — under `_mcp_app`; `llm_service` lifts that out into an `mcp_app`
+  stream chunk (`tool_use_id`, `tool`, `input`, `resource_uri`, `result`) before the model's
+  `tool_result` is built, so the model reads the text and the browser gets the rest.
+- **The browser's two routes**, both `auth_required`: `GET /chat/v1/mcp-apps/{tool}/view`
+  answers `{uri, html, ui, tool}` — the view read with `resources/read` and cached per
+  server and URI for `_UI_RESOURCE_TTL_S`, plus the upstream tool definition, which the
+  view's SDK validates whole (`inputSchema` included) in the host context — and `POST /chat/v1/mcp-apps/{tool}/call`
+  (`{name, arguments}`) relays a view's `tools/call` to the one server that serves it,
+  answering the CallToolResult; 403 for a tool without `"app"` visibility, 404 for a name
+  the server does not have or a host tool without a view, 502 when the server fails. They
+  exist because the server sits behind the operator's OAuth login, which this process holds
+  and the browser does not.
+- **Persistence.** The browser embeds the `mcp_app` event in the message's `content` as
+  `[MCPAPP:<base64 json>]` (`id`, `tool`, `input`, `result`), and `turns.render_transcript`
+  writes the same marker when the server persists a turn, so a reopened session re-renders
+  the view from the record and fetches the HTML again. `_TOOL_USE_MARKER_RE` and
+  `chat_api._strip_image_markers` strip the marker from replayed assistant text.
+
+How the browser sandboxes the view is its business (`genetics-results-browser`,
+`src/features/chat/mcpApps/` and `public/mcp-app-sandbox.html`): a frame with an opaque
+origin, a CSP built from what the server declared, and no route to this process but the two
+above.
+
 ## Tool Profiles
 
 ## Tool surfaces
@@ -1633,7 +1672,7 @@ it, the model ran inside the response and the browser was the only writer of cha
   source has closed: cancelling during the write below would lose the row.
 - **Persistence** is the finish hook `_turn_persister` builds per request: `render_transcript`
   turns the buffered events into the same `content` string the browser accumulates on screen —
-  prose, plus the `[IMAGE:…]`, `[FILE:…]` and `[TOOLUSE:…]` markers by the grammar of the
+  prose, plus the `[IMAGE:…]`, `[FILE:…]`, `[TOOLUSE:…]` and `[MCPAPP:…]` markers by the grammar of the
   browser's `imageMarker.ts`, `fileMarker.ts` and `toolCallMarker.ts` — and `add_message` writes it
   with `content_json` and `tool_results_json` from the `done` event, in a worker thread. It runs
   for every ending (complete, error, cancelled) that produced any content; a secret chat or a
@@ -2745,11 +2784,15 @@ server's names cannot shadow a local tool's), and anything else is a static bear
 keeps the original `URL|TOKEN` form parsing. `build_proxy_client` turns an entry into a client
 and is the one constructor path for chat-backend, the RAG server and the standalone MCP server.
 
-`oauth=<ENV>` is for a server behind OAuth 2.1 with no client-credentials grant (C3PO). The env
+`oauth=<ENV>` is for a server behind OAuth 2.1 with no client-credentials grant (C3PO, DepMap). The env
 var holds the JSON that `scripts/mcp_oauth_login.py` writes after an operator completes the
 authorization-code flow once, pasting the redirect address back since the browser is not on
 the machine running it (AuthKit refuses the device-code grant to a dynamically registered
-client): `token_endpoint`, `client_id`, `refresh_token`. `OAuthRefreshTokenSource`
+client): `token_endpoint`, `client_id`, `refresh_token`. The helper locates the protected-resource
+metadata through the `resource_metadata` hint in the endpoint's 401, then the root and the
+path-suffixed RFC 9728 locations (C3PO serves the root form, DepMap only `/mcp`'s), and takes
+`--scope` because DepMap refuses `offline_access` yet issues a refresh token without it.
+`OAuthRefreshTokenSource`
 mints access tokens from it on demand, refreshing inside a 60 s margin of expiry and after any
 401/403 on a call, and writes the rotated refresh token to `EXTERNAL_MCP_STATE_DIR/<ENV>.json`,
 reading it back ahead of the seed on the next start unless the seed itself changed. A token
@@ -3262,6 +3305,7 @@ Default external servers:
 - gnomAD: `https://gnomad-mcp-dpsnoyqx6q-uc.a.run.app`
 - Open Targets: `https://mcp.platform.opentargets.org`
 - C3PO: `https://mcp.c3po.bio|path=/|timeout=120|oauth=C3PO_MCP_OAUTH|prefix=c3po|tools=<read-only names>` — the deployed entry is in genetics-results-suite's `docs/chat-tool-reference.md` § 6
+- DepMap (daly only): `https://mcp.depmap.org|timeout=120|oauth=DEPMAP_MCP_OAUTH|prefix=depmap|tools=<query and analysis names>` — same place
 
 ### Subagent options
 

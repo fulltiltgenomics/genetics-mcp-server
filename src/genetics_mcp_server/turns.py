@@ -229,21 +229,29 @@ def get_turn_registry() -> TurnRegistry:
 
 # --- transcript rendering -----------------------------------------------------------------
 #
-# The browser writes a turn into one `content` string: prose, plus a marker per image, file
-# and tool call, which is the only form anything displaying a stored message ever reads.
-# The server has to produce the same string from the same events, or a turn persisted here
-# would render differently from one the browser saved. The marker grammars below are the
-# ones in genetics-results-browser's imageMarker.ts, fileMarker.ts and toolCallMarker.ts;
-# the two ends cannot import one module, so the shape is stated in both.
+# The browser writes a turn into one `content` string: prose, plus a marker per image, file,
+# tool call and MCP App view, which is the only form anything displaying a stored message
+# ever reads. The server has to produce the same string from the same events, or a turn
+# persisted here would render differently from one the browser saved. The marker grammars
+# below are the ones in genetics-results-browser's imageMarker.ts, fileMarker.ts,
+# toolCallMarker.ts and mcpAppMarker.ts; the two ends cannot import one module, so the shape
+# is stated in both.
 
 _TOOL_CALL_MARKER_RE = re.compile(r"\[TOOLUSE:([A-Za-z0-9+/=]*)\]")
 
 
-def _encode_tool_call(record: dict[str, Any]) -> str:
-    encoded = base64.b64encode(
+def _encode_record(record: dict[str, Any]) -> str:
+    return base64.b64encode(
         json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode()
     ).decode()
-    return f"[TOOLUSE:{encoded}]"
+
+
+def _encode_tool_call(record: dict[str, Any]) -> str:
+    return f"[TOOLUSE:{_encode_record(record)}]"
+
+
+def _encode_mcp_app(record: dict[str, Any]) -> str:
+    return f"[MCPAPP:{_encode_record(record)}]"
 
 
 def _decode_tool_call(encoded: str) -> dict[str, Any] | None:
@@ -290,6 +298,14 @@ def render_transcript(events: list[TurnEvent]) -> str:
         elif kind == "tool_use" and p.get("name"):
             record = {"id": p.get("id") or "", "name": p["name"], "input": p.get("input") or {}}
             content += f"\n\n{_encode_tool_call(record)}\n\n"
+        elif kind == "mcp_app" and p.get("tool_use_id"):
+            record = {
+                "id": p["tool_use_id"],
+                "tool": p.get("tool") or "",
+                "input": p.get("input") or {},
+                "result": p.get("result") or {},
+            }
+            content += f"\n\n{_encode_mcp_app(record)}\n\n"
         elif kind == "script_result" and p.get("tool_use_id"):
             duration = p.get("duration_ms")
             outcome = {

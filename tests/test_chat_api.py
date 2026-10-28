@@ -2502,3 +2502,99 @@ class TestImageShrinking:
         assert response.status_code == 200
         replayed = seen["messages"][0]["content"][0]
         assert _decoded_size(replayed)[0][0] == _MAX_IMAGE_EDGE
+
+
+class TestMcpAppRoutes:
+    """The browser's two routes for an external tool's MCP App view."""
+
+    def test_the_view_is_served_as_the_proxy_read_it(self, test_client):
+        from unittest.mock import AsyncMock
+
+        view = {"uri": "ui://plot/view.html", "html": "<html></html>", "ui": {"csp": {}}}
+        with patch(
+            "genetics_mcp_server.chat_api.read_external_app_view", AsyncMock(return_value=view)
+        ) as read:
+            response = test_client.get("/chat/v1/mcp-apps/depmap_show_data_explorer_plot/view")
+        assert response.status_code == 200
+        assert response.json() == view
+        read.assert_awaited_once_with("depmap_show_data_explorer_plot")
+
+    def test_a_tool_without_a_view_is_404_and_a_failing_server_502(self, test_client):
+        from unittest.mock import AsyncMock
+
+        from genetics_mcp_server.mcp_proxy import ProxyCallError
+
+        with patch(
+            "genetics_mcp_server.chat_api.read_external_app_view",
+            AsyncMock(side_effect=LookupError("no view")),
+        ):
+            assert test_client.get("/chat/v1/mcp-apps/plain/view").status_code == 404
+        with patch(
+            "genetics_mcp_server.chat_api.read_external_app_view",
+            AsyncMock(side_effect=ProxyCallError("down")),
+        ):
+            assert test_client.get("/chat/v1/mcp-apps/plain/view").status_code == 502
+
+    def test_a_views_call_is_relayed_with_its_arguments(self, test_client):
+        from unittest.mock import AsyncMock
+
+        result = {"content": [{"type": "text", "text": "{}"}], "structuredContent": {"rows": []}}
+        with patch(
+            "genetics_mcp_server.chat_api.call_external_tool_for_app",
+            AsyncMock(return_value=result),
+        ) as call:
+            response = test_client.post(
+                "/chat/v1/mcp-apps/depmap_show_data_explorer_plot/call",
+                json={"name": "get_plot_data", "arguments": {"api_version": 1, "params": {}}},
+            )
+        assert response.status_code == 200
+        assert response.json() == result
+        call.assert_awaited_once_with(
+            "depmap_show_data_explorer_plot", "get_plot_data", {"api_version": 1, "params": {}}
+        )
+
+    def test_a_refused_call_is_403_and_an_unknown_one_404(self, test_client):
+        from unittest.mock import AsyncMock
+
+        body = {"name": "x"}
+        with patch(
+            "genetics_mcp_server.chat_api.call_external_tool_for_app",
+            AsyncMock(side_effect=PermissionError("model only")),
+        ):
+            assert test_client.post("/chat/v1/mcp-apps/t/call", json=body).status_code == 403
+        with patch(
+            "genetics_mcp_server.chat_api.call_external_tool_for_app",
+            AsyncMock(side_effect=LookupError("nope")),
+        ):
+            assert test_client.post("/chat/v1/mcp-apps/t/call", json=body).status_code == 404
+
+    def test_a_call_needs_a_name(self, test_client):
+        assert (
+            test_client.post("/chat/v1/mcp-apps/t/call", json={"arguments": {}}).status_code == 422
+        )
+
+
+class TestStripMcpAppMarkers:
+    def test_the_marker_is_replaced_by_a_note_naming_the_tool(self):
+        import base64
+
+        from genetics_mcp_server import chat_api
+
+        record = {"id": "tu", "tool": "depmap_show_data_explorer_plot", "input": {}, "result": {}}
+        encoded = base64.b64encode(json.dumps(record).encode()).decode()
+        content = f"plot:\n\n[MCPAPP:{encoded}]\n\nsee above"
+
+        stripped = chat_api._strip_image_markers(content)
+
+        assert stripped == (
+            "plot:\n\n[interactive view shown to the user: depmap_show_data_explorer_plot]"
+            "\n\nsee above"
+        )
+
+    def test_a_marker_that_does_not_decode_still_goes(self):
+        from genetics_mcp_server import chat_api
+
+        assert chat_api._strip_image_markers("[MCPAPP:!!!]") == "[MCPAPP:!!!]"
+        assert chat_api._strip_image_markers("[MCPAPP:AAAA]") == (
+            "[interactive view shown to the user: ]"
+        )

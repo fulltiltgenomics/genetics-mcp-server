@@ -55,6 +55,11 @@ from genetics_mcp_server.db import get_chat_history_db, get_llm_config_db
 from genetics_mcp_server.db.llm_config_db import INSTRUCTION_SET_MAX_BODY_CHARS
 from genetics_mcp_server.download_store import EXPIRED_MESSAGE, get_download_store
 from genetics_mcp_server.llm_service import anthropic_error_type, get_llm_service
+from genetics_mcp_server.mcp_proxy import (
+    ProxyCallError,
+    call_external_tool_for_app,
+    read_external_app_view,
+)
 from genetics_mcp_server.memory_digest import render_digest
 from genetics_mcp_server.memory_gate import (
     MEMORY_PROJECT_SESSION_CAP,
@@ -164,6 +169,18 @@ _IMAGE_MARKER_RE = re.compile(r"\[IMAGE:([^:\]]+):([^:\]]+):[^\]]+\]")
 # an invitation to answer from a stale copy of the data instead of re-querying.
 _FILE_MARKER_RE = re.compile(r"\[FILE:([^:\]]+):([^:\]]+):[^\]]+\]")
 
+# and for an MCP App view: [MCPAPP:<base64 json>], whose payload is the tool result the model
+# already read as text plus the structured copy its view renders from
+_MCP_APP_MARKER_RE = re.compile(r"\[MCPAPP:([A-Za-z0-9+/=]*)\]")
+
+
+def _mcp_app_tool(encoded: str) -> str:
+    try:
+        record = json.loads(base64.b64decode(encoded))
+    except Exception:
+        return ""
+    return str(record.get("tool") or "") if isinstance(record, dict) else ""
+
 
 def _strip_image_markers(content: Any) -> Any:
     """Replace inline [IMAGE:...] payloads with a short note.
@@ -180,8 +197,11 @@ def _strip_image_markers(content: Any) -> Any:
 
     def sub(text: str) -> str:
         text = _IMAGE_MARKER_RE.sub(lambda m: f"[image shown to the user: {m.group(2)}]", text)
-        return _FILE_MARKER_RE.sub(
+        text = _FILE_MARKER_RE.sub(
             lambda m: f"[file offered to the user as a download: {m.group(2)}]", text
+        )
+        return _MCP_APP_MARKER_RE.sub(
+            lambda m: f"[interactive view shown to the user: {_mcp_app_tool(m.group(1))}]", text
         )
 
     if isinstance(content, str):
@@ -1139,6 +1159,11 @@ async def stream_chat(
                     # not here. Unhandled chunk types are dropped silently by this dispatch,
                     # which is why the replay benchmark's script metrics need this branch.
                     yield "message", {"type": "script_result", **json.loads(chunk.content)}
+                elif chunk.type == "mcp_app":
+                    # one per call of a tool that renders with an MCP App: the tool's input
+                    # and its whole CallToolResult, which the browser hands to the view it
+                    # fetches from /chat/v1/mcp-apps/{tool}/view
+                    yield "message", {"type": "mcp_app", **json.loads(chunk.content)}
                 elif chunk.type == "done":
                     yield (
                         "message",
@@ -1305,6 +1330,50 @@ async def download_file(download_id: str, user: str | None = Depends(auth_requir
         media_type=content_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# -----------------------------------------------------------------------------
+# MCP App views: the browser's side of an external tool whose result is rendered by HTML the
+# tool's own server serves (the MCP Apps extension). The browser fetches the view here rather
+# than from the server because the server is behind the operator's OAuth login, which this
+# process holds and the browser does not; the view's own tools/call requests come back the
+# same way. Both routes need a logged-in user and nothing more: a view holds nothing a chat
+# user could not ask the model to call.
+# -----------------------------------------------------------------------------
+
+
+class McpAppCallRequest(BaseModel):
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.get("/chat/v1/mcp-apps/{tool_name}/view")
+async def mcp_app_view(tool_name: str, user: str | None = Depends(auth_required)):
+    """The HTML view of an external tool's MCP App and the `ui` metadata it was served with."""
+    try:
+        return await read_external_app_view(tool_name)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ProxyCallError as e:
+        logger.error(f"MCP App view for {tool_name} failed: {e}")
+        raise HTTPException(status_code=502, detail="The tool's server did not serve its view")
+
+
+@app.post("/chat/v1/mcp-apps/{tool_name}/call")
+async def mcp_app_call(
+    tool_name: str, request: McpAppCallRequest, user: str | None = Depends(auth_required)
+):
+    """A tools/call made by a rendered view, relayed to the server that serves the view."""
+    logger.info(f"MCP App call by {user}: {tool_name} -> {request.name}")
+    try:
+        return await call_external_tool_for_app(tool_name, request.name, request.arguments)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ProxyCallError as e:
+        logger.error(f"MCP App call {tool_name} -> {request.name} failed: {e}")
+        raise HTTPException(status_code=502, detail="The tool's server did not answer the call")
 
 
 if __name__ == "__main__":

@@ -642,3 +642,31 @@ class TestChatTurnEndpoints:
         finally:
             app.dependency_overrides.clear()
             turns._registry = None
+
+
+class TestRenderMcpApp:
+    def test_an_mcp_app_event_becomes_a_marker_carrying_the_views_share(self):
+        events = [
+            _ev(
+                0,
+                {
+                    "type": "mcp_app",
+                    "tool_use_id": "tu-1",
+                    "tool": "depmap_show_data_explorer_plot",
+                    "input": {"plot_json_string": "{}"},
+                    "resource_uri": "ui://plot/view.html",
+                    "result": {"content": [], "structuredContent": {"type": "plot"}},
+                },
+            )
+        ]
+        m = re.search(r"\[MCPAPP:([A-Za-z0-9+/=]*)\]", render_transcript(events))
+        assert m
+        assert json.loads(base64.b64decode(m.group(1))) == {
+            "id": "tu-1",
+            "tool": "depmap_show_data_explorer_plot",
+            "input": {"plot_json_string": "{}"},
+            "result": {"content": [], "structuredContent": {"type": "plot"}},
+        }
+
+    def test_an_mcp_app_event_without_a_tool_use_id_is_not_written(self):
+        assert render_transcript([_ev(0, {"type": "mcp_app", "tool": "x"})]) == ""

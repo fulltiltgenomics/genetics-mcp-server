@@ -90,9 +90,13 @@ def _retry_after_seconds(e: Exception) -> float | None:
 #    params (e.g. SQL) doesn't truncate the match; DOTALL because params can span lines.
 #  [TOOLUSE:<base64>]          — written by the CLIENT from the structured `tool_use` chunk
 #    that replaced it, so the disclosure survives a reload the same way [IMAGE:...] does.
+#  [MCPAPP:<base64>]           — the same carriage for an MCP App view's tool result, which
+#    the client renders in a sandboxed frame and the model has already read as text.
 #
-# Both still occur: the first across all stored history, the second in everything new.
-_TOOL_USE_MARKER_RE = re.compile(r"\*\[Using tool:.*?\]\*|\[TOOLUSE:[A-Za-z0-9+/=]*\]", re.DOTALL)
+# All still occur: the first across all stored history, the others in everything new.
+_TOOL_USE_MARKER_RE = re.compile(
+    r"\*\[Using tool:.*?\]\*|\[TOOLUSE:[A-Za-z0-9+/=]*\]|\[MCPAPP:[A-Za-z0-9+/=]*\]", re.DOTALL
+)
 
 # a cell the model wrote as a stand-in for data it never fetched, e.g. "*[from query]*"
 _PLACEHOLDER_CELL_RE = re.compile(
@@ -578,7 +582,7 @@ class StreamChunk:
     """A chunk from the LLM stream."""
 
     type: str  # "text", "thinking", "thinking_summary", "done", "image", "file", "usage",
-    # "script_result", "tool_use"
+    # "script_result", "tool_use", "mcp_app"
     content: str = ""
     # full message content blocks for persistence (only set when type="done")
     message_content: list[dict[str, Any]] | None = None
@@ -2283,6 +2287,25 @@ class LLMService:
                         result["note"] = (
                             "The image has been displayed to the user above. Do not output any image placeholder or markdown - just describe what the plot shows."
                         )
+
+                    # the view's share of an MCP App tool's result (the CallToolResult with its
+                    # structuredContent), lifted out for the reason images are: the browser
+                    # renders it, and the model has the text beside it
+                    if isinstance(result, dict) and isinstance(result.get("_mcp_app"), dict):
+                        app = result["_mcp_app"]
+                        yield StreamChunk(
+                            type="mcp_app",
+                            content=json.dumps(
+                                {
+                                    "tool_use_id": tool_use.id,
+                                    "tool": tool_use.name,
+                                    "input": dict(tool_use.input),
+                                    "resource_uri": app.get("resource_uri"),
+                                    "result": app.get("result"),
+                                }
+                            ),
+                        )
+                        result = {k: v for k, v in result.items() if k != "_mcp_app"}
 
                     # convert download hints into INCLUDE_IN_RESPONSE links
                     result = _process_download_hints(result, owner=user, tool_name=tool_use.name)

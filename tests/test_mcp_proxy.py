@@ -305,3 +305,170 @@ class TestRegistration:
         monkeypatch.setattr(mcp_proxy, "_rag_proxy_clients", {})
         assert mcp_proxy.initialize_external_servers() == 2
         assert {c.base_url for c in mcp_proxy._proxy_clients.values()} == {"https://b.invalid"}
+
+
+class _AppServer(_Server):
+    """A server with one MCP App: a view tool, its app-only data loader, and a plain tool."""
+
+    VIEW_HTML = "<!DOCTYPE html><html><head></head><body><script>1</script></body></html>"
+
+    def __init__(self):
+        super().__init__(tools=())
+        self.tools = [
+            {
+                "name": "show_plot",
+                "description": "d",
+                "inputSchema": {"type": "object"},
+                "_meta": {"ui": {"resourceUri": "ui://plot/view.html"}},
+            },
+            {
+                "name": "get_plot_data",
+                "description": "d",
+                "inputSchema": {"type": "object"},
+                "_meta": {"ui": {"visibility": ["app"]}},
+            },
+            {
+                "name": "model_only",
+                "description": "d",
+                "inputSchema": {"type": "object"},
+                "_meta": {"ui": {"visibility": ["model"]}},
+            },
+            {"name": "plain", "description": "d", "inputSchema": {"type": "object"}},
+        ]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content) if request.content else {}
+        method = payload.get("method")
+        if method == "resources/read":
+            self.requests.append(request)
+            result = {
+                "contents": [
+                    {
+                        "uri": payload["params"]["uri"],
+                        "mimeType": "text/html;profile=mcp-app",
+                        "text": self.VIEW_HTML,
+                        "_meta": {"ui": {"csp": {"connectDomains": ["https://api.example"]}}},
+                    }
+                ]
+            }
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result}
+            )
+        if method == "tools/call" and payload["params"]["name"] == "show_plot":
+            self.requests.append(request)
+            result = {
+                "content": [{"type": "text", "text": "Showing a plot. Link: https://p"}],
+                "structuredContent": {"type": "plot", "params": payload["params"]["arguments"]},
+                "isError": False,
+            }
+            return httpx.Response(
+                200, json={"jsonrpc": "2.0", "id": payload["id"], "result": result}
+            )
+        if method == "tools/call" and payload["params"]["name"] == "get_plot_data":
+            self.requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "error": {"code": -32000, "message": "no such dataset"},
+                },
+            )
+        return super().__call__(request)
+
+
+@pytest.fixture
+def app_server(monkeypatch):
+    fake = _AppServer()
+    real_client, real_async = httpx.Client, httpx.AsyncClient
+    monkeypatch.setattr(
+        mcp_proxy.httpx,
+        "Client",
+        lambda **kw: real_client(transport=httpx.MockTransport(fake), **kw),
+    )
+    monkeypatch.setattr(
+        mcp_proxy.httpx,
+        "AsyncClient",
+        lambda **kw: real_async(transport=httpx.MockTransport(fake), **kw),
+    )
+    monkeypatch.setenv("EXTERNAL_MCP_SERVERS", "https://a.invalid|prefix=dm")
+    monkeypatch.delenv("EXTERNAL_MCP_EXCLUDE_TOOLS", raising=False)
+    monkeypatch.delenv("RAG_MCP_SERVER", raising=False)
+    monkeypatch.setattr(mcp_proxy, "_proxy_clients", {})
+    monkeypatch.setattr(mcp_proxy, "_rag_proxy_clients", {})
+    monkeypatch.setattr(mcp_proxy, "_ui_resource_cache", {})
+    assert mcp_proxy.initialize_external_servers() == 3
+    return fake
+
+
+class TestMcpApps:
+    def test_an_app_only_tool_is_kept_from_the_model(self, app_server):
+        assert set(mcp_proxy._proxy_clients) == {"dm_show_plot", "dm_model_only", "dm_plain"}
+        assert "dm_get_plot_data" not in {
+            t["name"] for t in mcp_proxy.get_external_anthropic_tools()
+        }
+
+    def test_only_a_tool_with_a_view_has_an_app(self, app_server):
+        assert mcp_proxy.external_tool_app("dm_show_plot") == {
+            "resource_uri": "ui://plot/view.html"
+        }
+        assert mcp_proxy.external_tool_app("dm_plain") is None
+        assert mcp_proxy.external_tool_app("nope") is None
+
+    async def test_a_view_tool_result_carries_the_whole_call_result_beside_the_text(
+        self, app_server
+    ):
+        result = await mcp_proxy.execute_external_tool("dm_show_plot", {"plot_type": "scatter"})
+        assert result["result"] == "Showing a plot. Link: https://p"
+        assert result["_mcp_app"] == {
+            "resource_uri": "ui://plot/view.html",
+            "result": {
+                "content": [{"type": "text", "text": "Showing a plot. Link: https://p"}],
+                "structuredContent": {"type": "plot", "params": {"plot_type": "scatter"}},
+                "isError": False,
+            },
+        }
+
+    async def test_a_plain_tool_result_is_unchanged(self, app_server):
+        assert await mcp_proxy.execute_external_tool("dm_plain", {}) == {"ok": "tools/call"}
+
+    async def test_the_view_is_read_once_and_served_with_its_ui_metadata(self, app_server):
+        view = await mcp_proxy.read_external_app_view("dm_show_plot")
+        assert view == {
+            "uri": "ui://plot/view.html",
+            "html": _AppServer.VIEW_HTML,
+            "ui": {"csp": {"connectDomains": ["https://api.example"]}},
+            "tool": app_server.tools[0],
+        }
+        reads = len([r for r in app_server.requests if b"resources/read" in r.content])
+        assert await mcp_proxy.read_external_app_view("dm_show_plot") == view
+        assert len([r for r in app_server.requests if b"resources/read" in r.content]) == reads
+
+    async def test_a_tool_without_a_view_has_nothing_to_read(self, app_server):
+        with pytest.raises(LookupError):
+            await mcp_proxy.read_external_app_view("dm_plain")
+
+    async def test_a_view_calls_its_servers_app_tools_by_upstream_name(self, app_server):
+        result = await mcp_proxy.call_external_tool_for_app("dm_show_plot", "plain", {"q": 1})
+        assert result == {"content": [{"type": "text", "text": json.dumps({"ok": "tools/call"})}]}
+        sent = json.loads(app_server.requests[-1].content)["params"]
+        assert sent == {"name": "plain", "arguments": {"q": 1}}
+
+    async def test_a_remote_error_reaches_the_view_as_an_error_result(self, app_server):
+        result = await mcp_proxy.call_external_tool_for_app("dm_show_plot", "get_plot_data", {})
+        assert result["isError"] is True
+        assert "no such dataset" in result["content"][0]["text"]
+
+    async def test_a_view_may_not_call_a_model_only_tool_or_a_stranger(self, app_server):
+        with pytest.raises(PermissionError):
+            await mcp_proxy.call_external_tool_for_app("dm_show_plot", "model_only", {})
+        with pytest.raises(LookupError):
+            await mcp_proxy.call_external_tool_for_app("dm_show_plot", "not_there", {})
+        with pytest.raises(LookupError):
+            await mcp_proxy.call_external_tool_for_app("dm_plain", "plain", {})
+
+    def test_visibility_defaults_to_both_audiences(self):
+        assert mcp_proxy.tool_visible_to({}, "model") and mcp_proxy.tool_visible_to({}, "app")
+        app_only = {"_meta": {"ui": {"visibility": ["app"]}}}
+        assert not mcp_proxy.tool_visible_to(app_only, "model")
+        assert mcp_proxy.tool_visible_to(app_only, "app")
