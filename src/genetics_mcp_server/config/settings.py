@@ -438,6 +438,16 @@ class Settings:
     keycloak_access_grants_client_secret: str = field(
         default_factory=lambda: os.environ.get("KEYCLOAK_ACCESS_GRANTS_CLIENT_SECRET", "")
     )
+    # partner clients that may provision users through POST /provision/{alias}; each is also
+    # the alias of the identity provider its jwt-bearer assertions come from
+    # (broker_provisioning.py). Empty = the endpoint is 404
+    broker_provisioning_clients: set[str] = field(
+        default_factory=lambda: {
+            c.strip()
+            for c in os.environ.get("BROKER_PROVISIONING_CLIENTS", "").split(",")
+            if c.strip()
+        }
+    )
     # notification e-mail over authenticated SMTP (STARTTLS). Unset host = grants are made
     # but nobody is mailed, and the response says so. `or` rather than a default: deploy.sh
     # renders an unset .env variable as "", which int() would refuse at startup

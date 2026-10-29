@@ -3177,6 +3177,39 @@ as valid as its owner's allow-list standing**, so a granted user's keys stop the
 does and work again on a re-grant, with no revocation step. `/chat/v1/auth` advertises
 `access_grants: {label, expires_at}` to admins when the label is set and `null` to everyone else.
 
+### Partner user provisioning for the jwt-bearer grant
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BROKER_PROVISIONING_CLIENTS` | Comma-separated Keycloak client ids allowed to call `POST /provision/{alias}`; each is also the alias of the identity provider its RFC 7523 assertions come from. Empty = the route is 404 | `""` |
+
+`broker_provisioning.py` owns it; `routers/broker_provisioning.py` exposes it, mounted with **no
+`/chat/v1` prefix** because auth-gateway routes `/provision/` here without an oauth2 session, as it
+does `/mcp`. The need: Keycloak's JWT Authorization Grant resolves an assertion's `sub` only through
+an existing federated-identity link on the partner's identity provider and never creates one, so a
+partner (brainzzz is the first) vouching for someone who has never signed in to GeneGenie gets
+`invalid_grant "User not found"`. The partner then calls `POST /provision/{alias}` with
+`{"email"}` and a **client-credentials token of its own Keycloak client** as the bearer: the token
+is verified against the realm JWKS (in-cluster URL when `KEYCLOAK_ADMIN_URL` is set), `iss` must be
+`OAUTH_ISSUER`, `azp` must equal the alias and `preferred_username` must be
+`service-account-<azp>` — a *user* token the partner obtained through the grant names a person,
+not the partner, and is refused with 401. The audience is deliberately not checked: the client's
+audience mapper stamps `/mcp` onto every token it issues, and who the token was issued to is what
+matters here. The address is normalised (trimmed, lower-cased, one `@`) and must pass the same
+`_matches_allow_list(allow_wildcard=False)` as the token paths; then, as the access-grants service
+account (`KEYCLOAK_ACCESS_GRANTS_CLIENT_SECRET` is one of the switches, with the admin URL,
+`OAUTH_ISSUER` and the client list), the user is created when missing (`enabled`,
+`emailVerified`, username = e-mail) and linked to the provider when unlinked (`userId` and
+`userName` = the e-mail, which is what the partner sends as `sub`). The response is
+`{email, created, newly_linked}`; a repeat is a no-op. An account the access-grant reconciler has
+**disabled stays disabled** and answers 409 — the partner's word is not a re-grant. 403 for an
+address outside the allow-list, 400 for a non-address, 502 when Keycloak fails, 404 for an alias
+not on the list or when any switch is unset. Trust, stated plainly: a listed client can make any
+allow-listed address reachable through its own assertions; that is what "no GeneGenie login"
+means, and the allow-list is the boundary that stays ours. The suite's
+`docs/mcp-oauth-onboarding.md` has the partner-side contract and the staging proving ground that
+drives this route.
+
 When `ENABLE_ADMIN_PAGE=true`, admin endpoints are available at `/chat/v1/admin/`. Access control depends on `REQUIRE_AUTH`:
 - `REQUIRE_AUTH=false` (dev mode): any user can access admin endpoints
 - `REQUIRE_AUTH=true`: only users listed in `ADMIN_USERS` can access admin endpoints
