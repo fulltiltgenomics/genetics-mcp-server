@@ -2396,6 +2396,7 @@ src/genetics_mcp_server/
 ├── __init__.py                     # Genetics MCP Server - MCP tools and LLM service for genetics data.
 ├── access_check.py                 # Ask chat-backend whether an address holds a runtime access grant.
 ├── access_grants.py                # Runtime access grants: admit an address for a bounded time without a deploy.
+├── broker_provisioning.py          # On-demand user provisioning for partner apps whose users reach /mcp through the RFC 7523 jwt-bearer grant (routers/broker_provisioning.py exposes it).
 ├── chat_api.py                     # FastAPI chat router for LLM-powered conversations about genetics data.
 ├── cost.py                         # Estimate API call cost from Anthropic token usage.
 ├── download_store.py               # Disk-persisted download storage for tool result TSV files.
@@ -2432,6 +2433,7 @@ src/genetics_mcp_server/
 │   ├── access_grants.py            # Admin endpoints for runtime access grants, plus the internal check other services call.
 │   ├── admin.py                    # Admin router for viewing all conversations and usage analytics.
 │   ├── api_tokens.py               # API token router for managing per-user MCP server access tokens.
+│   ├── broker_provisioning.py      # POST /provision/{alias}: a partner app provisions one of its users for the jwt-bearer grant.
 │   ├── chat_history.py             # Chat history router for managing persistent chat sessions.
 │   └── llm_config.py               # LLM Configuration router for managing editable system prompts and tool descriptions.
 ├── schema_docs/
