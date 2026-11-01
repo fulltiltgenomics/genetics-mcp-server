@@ -481,12 +481,17 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         )
 
     async def _send_oauth_metadata(send, settings):
+        # clients register with exactly this list and keycloak confines a dynamically
+        # registered client to its registered scopes; offline_access must be listed because
+        # claude code appends it at authorize time and the login fails with invalid_request
+        # without it. profile is not requested: its only claim read here, preferred_username,
+        # is a fallback for e-mail-less accounts the realm's allow-list authenticator refuses
         body = json.dumps(
             {
                 "resource": settings.oauth_resource_url,
                 "authorization_servers": [settings.oauth_issuer],
                 "bearer_methods_supported": ["header"],
-                "scopes_supported": ["openid", "email", "profile"],
+                "scopes_supported": ["openid", "email", "offline_access"],
             }
         ).encode()
         await send(

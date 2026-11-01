@@ -1452,7 +1452,7 @@ class TestOAuthMetadataDiscovery:
         assert payload["resource"] == _KeycloakSettings.RESOURCE_URL
         assert payload["authorization_servers"] == [_KeycloakSettings.ISSUER]
         assert payload["bearer_methods_supported"] == ["header"]
-        assert payload["scopes_supported"] == ["openid", "email", "profile"]
+        assert payload["scopes_supported"] == ["openid", "email", "offline_access"]
 
     @pytest.mark.asyncio
     async def test_metadata_not_served_when_oauth_disabled(self, monkeypatch):
