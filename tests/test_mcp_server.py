@@ -1241,12 +1241,22 @@ class TestBearerAuthKeycloak:
         token = self._make_token(exp=int(time.time()) - 10)
         assert _validate_keycloak_token(token, settings) is False
 
-    def test_preferred_username_email_fallback(self):
+    def test_service_account_username_without_email_rejected(self):
+        from genetics_mcp_server.mcp_server import _validate_keycloak_token
+
+        # an anonymously registered client picks its own clientId, so its service account's
+        # username can look like an allow-listed address while the token carries no email
+        settings = _KeycloakSettings(allowed_email_domains={"broadinstitute.org"})
+        token = self._make_token(
+            email=None, preferred_username="service-account-probe@broadinstitute.org"
+        )
+        assert _validate_keycloak_token(token, settings) is False
+
+    def test_allow_listed_email_passes_whatever_the_username(self):
         from genetics_mcp_server.mcp_server import _validate_keycloak_token
 
         settings = _KeycloakSettings(allowed_email_domains={"finngen.fi"})
-        # drop the explicit email claim so the preferred_username fallback runs
-        token = self._make_token(email=None, preferred_username="carol@finngen.fi")
+        token = self._make_token(email="carol@finngen.fi", preferred_username="carol")
         assert _validate_keycloak_token(token, settings) is True
 
     def test_no_email_rejected(self):

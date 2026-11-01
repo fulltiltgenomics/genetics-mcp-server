@@ -240,13 +240,12 @@ def _validate_keycloak_token(token: str, settings) -> bool:
         logger.debug("Keycloak token validation failed: %s", e)
         return False
 
-    # keycloak exposes email when the client has the email scope/mapper;
-    # fall back to preferred_username only when it is itself an email.
+    # the email claim only, never preferred_username: a service account's username is
+    # service-account-<clientId> and the clientId is chosen by whoever registers the client,
+    # so a username asserts nothing. brokered accounts are created only with an allow-listed
+    # e-mail (first-broker-login authenticator) and provisioned ones with email set, so a
+    # token without the claim is a service account or an unvetted account and is refused.
     email = payload.get("email")
-    if not email:
-        username = payload.get("preferred_username", "")
-        if "@" in username:
-            email = username
     if not email:
         logger.warning("Keycloak token does not contain an email")
         return False
@@ -484,8 +483,8 @@ def _wrap_with_bearer_auth(app, api_keys: list[str]):
         # clients register with exactly this list and keycloak confines a dynamically
         # registered client to its registered scopes; offline_access must be listed because
         # claude code appends it at authorize time and the login fails with invalid_request
-        # without it. profile is not requested: its only claim read here, preferred_username,
-        # is a fallback for e-mail-less accounts the realm's allow-list authenticator refuses
+        # without it. profile is not requested because nothing here reads any of its claims;
+        # identity comes from the email claim alone
         body = json.dumps(
             {
                 "resource": settings.oauth_resource_url,
