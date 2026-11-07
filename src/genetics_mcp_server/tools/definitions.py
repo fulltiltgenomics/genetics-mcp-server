@@ -388,7 +388,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_gene_expression",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get tissue-specific gene expression levels from bulk-tissue resources (e.g. GTEx). Returns expression data across tissues. Use this to understand where a gene is expressed. For single-cell, cell-type-resolved expression (which cell types within a tissue express the gene) use get_cell_type_expression where it is available.",
+        "description": "Get tissue-specific gene expression levels from bulk-tissue resources (e.g. GTEx). Returns expression data across tissues. Use this to understand where a gene is expressed.",
         "parameters": {
             "gene": {
                 "type": "string",

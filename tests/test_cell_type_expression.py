@@ -128,6 +128,17 @@ async def test_not_configured_404_says_not_available_on_this_deployment():
     assert "not available on this deployment" in result["error"]
 
 
+async def test_a_deployment_without_the_route_is_reported_as_unavailable():
+    # a results-api with no release pointer registers no route, so the 404 is FastAPI's own
+    executor = _executor(status=404, text='{"detail":"Not Found"}')
+    try:
+        result = await executor.get_cell_type_expression("PCSK9")
+    finally:
+        await executor.close()
+    assert result["success"] is False
+    assert result["error_code"] == "not_available"
+
+
 async def test_unknown_gene_404_is_not_reported_as_unavailable():
     executor = _executor(status=404, text='{"detail":"Gene NOPE not found"}')
     try:
@@ -187,12 +198,51 @@ async def test_sdk_function_raises_on_a_deployment_without_the_data():
     assert info.value.code == "not_available"
 
 
-def test_sdk_exports_it_under_a_name_that_is_not_a_view_stem():
+@pytest.fixture
+def sdk_for_profile(monkeypatch):
+    """The `genetics` package as imported under a given CONFIG_PROFILE, restored afterwards."""
+    import importlib
+
     import genetics_mcp_server.sdk as sdk
 
+    def _load(profile):
+        if profile is None:
+            monkeypatch.delenv("CONFIG_PROFILE", raising=False)
+        else:
+            monkeypatch.setenv("CONFIG_PROFILE", profile)
+        return importlib.reload(sdk)
+
+    yield _load
+    monkeypatch.undo()
+    importlib.reload(sdk)
+
+
+def test_sdk_exports_it_on_daly_under_a_name_that_is_not_a_view_stem(sdk_for_profile):
+    sdk = sdk_for_profile("daly")
     assert "cell_type_expression" in sdk.__all__
     assert callable(sdk.cell_type_expression)
     assert not any(name.lower().startswith("cellxgene") for name in sdk.__all__)
+
+
+@pytest.mark.parametrize("profile", ["finngen", None, "unknown"])
+def test_sdk_neither_lists_nor_binds_it_elsewhere(sdk_for_profile, profile):
+    # the SDK fails closed like the tool: a sandbox on finngen, or one with no profile at all,
+    # has no genetics.cell_type_expression to call and no stub line naming it
+    sdk = sdk_for_profile(profile)
+    assert "cell_type_expression" not in sdk.__all__
+    assert "cell_type_expression" not in dir(sdk)
+    with pytest.raises(AttributeError):
+        sdk.cell_type_expression
+    assert "expression" in sdk.__all__
+
+
+def test_sdk_gating_table_is_the_tool_profile_rule():
+    # gen-sandbox-docs.py reads this literal to filter the stubs; the tool reads
+    # CELL_TYPE_EXPRESSION_PROFILES. One rule, two readers.
+    import genetics_mcp_server.sdk as sdk
+    from genetics_mcp_server.config.settings import CELL_TYPE_EXPRESSION_PROFILES
+
+    assert set(sdk._PROFILE_GATED["cell_type_expression"]) == set(CELL_TYPE_EXPRESSION_PROFILES)
 
 
 def test_tool_text_names_no_gated_view():
@@ -200,8 +250,10 @@ def test_tool_text_names_no_gated_view():
     text = str(tool).lower()
     assert "cellxgene_" not in text
     assert "tpm" in text and "log1p cp10k" in text and "measured_no_row" in text
+    # the bulk tool's text must not name this one: on a deployment where it is withdrawn the
+    # model would read about a tool it cannot call
     gene_expr = next(t for t in TOOL_DEFINITIONS if t["name"] == "get_gene_expression")
-    assert TOOL in gene_expr["description"]
+    assert TOOL not in gene_expr["description"]
 
 
 @pytest.mark.parametrize(

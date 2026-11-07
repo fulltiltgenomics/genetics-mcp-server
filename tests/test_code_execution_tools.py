@@ -108,7 +108,7 @@ class TestListCapabilities:
 
         result = await executor.list_capabilities()
         genetics = next(m for m in result["modules"] if m["module"] == "genetics")
-        assert set(sdk._FUNCTIONS) <= set(genetics["names"])
+        assert set(sdk._OFFERED) <= set(genetics["names"])
 
     async def test_genetics_module_renders_sync_signatures(self, executor):
         result = await executor.list_capabilities(module="genetics")

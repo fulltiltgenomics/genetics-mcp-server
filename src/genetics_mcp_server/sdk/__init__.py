@@ -114,6 +114,23 @@ _FUNCTIONS = (
     "show",
 )
 
+# The functions only some deployments serve, keyed by the profiles whose results-api can
+# answer them. Decided at import from CONFIG_PROFILE — the name every service process and
+# the sandbox image already carry — and failing closed: with no profile the function is
+# neither bound nor listed, so a misconfigured deployment hides data it may have rather than
+# advertising data it does not. The sandbox stubs are filtered by this same table
+# (genetics-results-suite scripts/gen-sandbox-docs.py reads it with ast, so keep it a
+# literal), which is what keeps the stub and the import surface from disagreeing.
+_PROFILE_GATED = {"cell_type_expression": ("daly",)}
+
+
+def _offered(name: str) -> bool:
+    profiles = _PROFILE_GATED.get(name)
+    return profiles is None or os.environ.get("CONFIG_PROFILE") in profiles
+
+
+_OFFERED = tuple(name for name in _FUNCTIONS if _offered(name))
+
 _client: GeneticsClient | None = None
 
 # the child's environment names the directory; the SDK never guesses a path for it
@@ -250,7 +267,11 @@ def _make_sync(name: str):
 
 
 for _name in _FUNCTIONS:
-    globals()[_name] = _make_sync(_name)
+    if _name in _OFFERED:
+        globals()[_name] = _make_sync(_name)
+    else:
+        # dropped explicitly so a reload under another CONFIG_PROFILE unbinds it
+        globals().pop(_name, None)
 del _name
 
 # the submodules a script reaches as `genetics.<name>`, resolved on first use and never
@@ -292,7 +313,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    *_FUNCTIONS,
+    *_OFFERED,
     "GeneticsClient",
     "GeneticsError",
     "GeneticsUsageError",
