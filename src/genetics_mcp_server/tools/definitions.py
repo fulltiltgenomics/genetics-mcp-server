@@ -120,7 +120,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "search_phenotypes",
         "group": "lookup",
         "sdk_replaceable": False,
-        "description": "Look up phenotypes. Use when you need to find if there is a phenotype for a disease/trait name or the exact phenotype code for a disease/trait name. Do NOT use this to find disease associations - use get_credible_sets_by_gene instead.",
+        "description": "Look up phenotypes. Use when you need to find if there is a phenotype for a disease/trait name or the exact phenotype code for a disease/trait name. Each row names its resource, data_type and version (the release label, e.g. R14), and a code present in several releases of one resource is one row per release. Do NOT use this to find disease associations - use get_credible_sets_by_gene instead.",
         "parameters": {
             "query": {
                 "type": "string",
@@ -388,7 +388,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_gene_expression",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get tissue-specific gene expression levels from bulk-tissue resources (e.g. GTEx). Returns expression data across tissues. Use this to understand where a gene is expressed. For single-cell, cell-type-resolved expression (which cell types within a tissue express the gene) use get_cell_type_expression where it is available.",
+        "description": "Get tissue-specific gene expression levels from bulk-tissue resources (e.g. GTEx). Returns expression data across tissues. Use this to understand where a gene is expressed.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -562,11 +562,11 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "get_gene_to_peaks",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get the Open4Gene chromatin PEAKS linked to a gene, per cell type — the inverse of get_peak_to_genes. Answers 'which regulatory regions act on this gene, and in which cell types'. Distinct from get_open_chromatin_by_gene, which returns measured accessibility near the gene by coordinate overlap with no link evidence. Rows are capped at 500 inline; `truncated` says whether more exist.",
+        "description": "Get the Open4Gene chromatin PEAKS linked to a gene, per cell type — the inverse of get_peak_to_genes. Answers 'which regulatory regions act on this gene, and in which cell types'. The links come from FinnGen PBMC single-cell multiome data over predicted immune cell types, and only significant links are published: an empty result for a known gene means no significant link in any PBMC cell type (a gene not expressed in PBMC cell types has none), not that the gene is unknown — an unknown gene is an error. Distinct from get_open_chromatin_by_gene, which returns measured accessibility near the gene by coordinate overlap with no link evidence. Rows are capped at 500 inline; `truncated` says whether more exist.",
         "parameters": {
             "gene": {
                 "type": "string",
-                "description": "Gene symbol or ENSG ID (e.g. 'PCSK9', 'ENSG00000169174')",
+                "description": "Gene symbol or ENSG ID (e.g. 'IL7R', 'ENSG00000168685')",
                 "required": True,
             },
             "resources": {
@@ -926,7 +926,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
             },
             "phenotype": {
                 "type": "string",
-                "description": "Phenotype or study code (e.g. 'categorical_41210_both_sexes_S068_', 'schizophrenia', 'bipolar_disorder', 'inflammatory_bowel_disease', 'AFib', 'AFib|EUR'). These are trait_original values from the burden results, which for IBD spell the disease out rather than using the IBD/UC/CD codes the exome variant results use, and which for BRaVa address an ancestry stratum as its own code ('AFib' is the cross-ancestry meta, 'AFib|EUR' the EUR stratum)",
+                "description": "Phenotype or study code as search_phenotypes returns it (e.g. 'categorical_41210_both_sexes_S068_', 'SCZ', 'BIP', 'IBD', 'UC', 'CD', 'AFib', 'AFib|EUR'). These are trait_original values from the burden results; BRaVa addresses an ancestry stratum as its own code ('AFib' is the cross-ancestry meta, 'AFib|EUR' the EUR stratum)",
                 "required": True,
             },
         },

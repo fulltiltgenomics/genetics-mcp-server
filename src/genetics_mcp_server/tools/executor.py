@@ -476,6 +476,15 @@ CELL_TYPE_EXPRESSION_LEVELS = ("summary", "dataset")
 _VERSIONED_ENSG = re.compile(r"^(ENSG\d+)\.\d+$", re.IGNORECASE)
 
 
+def _detail(resp: httpx.Response) -> str | None:
+    """results-api's error `detail`, when the body is one; None for anything else."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    return body.get("detail") if isinstance(body, dict) else None
+
+
 def _unversioned_ensg(gene: str) -> str:
     """results-api matches ENSG ids unversioned, so `ENSG00000169174.11` would be a 404."""
     m = _VERSIONED_ENSG.match(gene)
@@ -1740,9 +1749,12 @@ class ToolExecutor:
                     "filename": f"{genes}_cell_type_expression_{level}.tsv",
                 },
             }
-        # results-api answers 404 both for an unknown gene and for a deployment with no
-        # cell-type data; only the latter is a statement about the deployment
-        if resp.status_code == 404 and "not configured" in resp.text:
+        # results-api answers 404 for an unknown gene too; a deployment with no cell-type data
+        # registers no route at all, so its 404 is FastAPI's own, and only that is a statement
+        # about the deployment ("not configured" is what older servers answered)
+        if resp.status_code == 404 and (
+            "not configured" in resp.text or _detail(resp) == "Not Found"
+        ):
             return {
                 "success": False,
                 "error_code": "not_available",
@@ -5958,10 +5970,10 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
     from genetics_mcp_server.sdk import errors as sdk_errors
 
     if module == "genetics":
-        names = list(sdk._FUNCTIONS) + list(_SDK_EXTRA_FUNCTIONS)
+        names = list(sdk._OFFERED) + list(_SDK_EXTRA_FUNCTIONS)
         return [(n, getattr(sdk, n)) for n in names if hasattr(sdk, n)]
     if module == "client":
-        names = list(sdk._FUNCTIONS) + ["close"]
+        names = list(sdk._OFFERED) + ["close"]
         return [
             (n, getattr(sdk_client.GeneticsClient, n))
             for n in names

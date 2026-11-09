@@ -73,6 +73,7 @@ from genetics_mcp_server.routers import (
     access_grants_router,
     admin_router,
     api_tokens_router,
+    broker_provisioning_router,
     chat_history_router,
     llm_config_router,
 )
@@ -499,6 +500,9 @@ app.include_router(llm_config_router, prefix="/chat/v1", tags=["llm-config"])
 
 app.include_router(admin_router, prefix="/chat/v1", tags=["admin"])
 app.include_router(access_grants_router, prefix="/chat/v1", tags=["access-grants"])
+# no /chat/v1 prefix: auth-gateway routes /provision/ to this service with no oauth2 session,
+# the way it routes /mcp; the partner's client-credentials token is the whole authentication
+app.include_router(broker_provisioning_router, prefix="", tags=["broker-provisioning"])
 
 
 class ChatMessage(BaseModel):

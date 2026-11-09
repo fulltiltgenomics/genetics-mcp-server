@@ -772,7 +772,7 @@ async def test_resources_are_normalized_to_the_comma_string_the_executor_expects
 
 
 def test_sync_facade_exposes_every_client_function(monkeypatch):
-    for name in genetics._FUNCTIONS:
+    for name in genetics._OFFERED:
         assert callable(getattr(genetics, name))
         assert hasattr(GeneticsClient, name)
 
