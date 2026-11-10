@@ -455,7 +455,7 @@ class GeneticsClient:
         else:
             _reject("gene_burden(phenotype=...)", phenotypes=phenotypes)
             result = await self._executor.get_gene_based_results_by_phenotype(
-                resource or "finngen", value
+                resource or "finngen", value, summarize=False
             )
         return self._rows(result)
 

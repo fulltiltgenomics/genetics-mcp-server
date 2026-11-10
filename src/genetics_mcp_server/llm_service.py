@@ -14,6 +14,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, AsyncIterator
 
 from genetics_mcp_server.config import (
@@ -38,6 +39,7 @@ from genetics_mcp_server.mcp_proxy import (
     initialize_external_servers,
     is_external_tool,
 )
+from genetics_mcp_server.prompt_cache import PromptCacheKeeper, cache_usage
 from genetics_mcp_server.subagent import SubagentService
 from genetics_mcp_server.tools import (
     ServerToolExecutor,
@@ -260,12 +262,26 @@ def _sanitize_tool_blocks(messages: list[dict]) -> list[dict]:
     return result
 
 
-# every breakpoint asks for the 1-hour cache. Measured over four months of production:
-# cache writes were 52% of all model spend, and 742 turns started 5 to 60 minutes after
-# the previous call and rewrote their whole history under the 5-minute TTL (152M tokens).
-# The hour costs 2x base per written token against 1.25x, which the writes inside a
-# tool-heavy turn pay for nothing, and the priced counterfactual still came out ahead
+# the tool definitions and the shared system block are the same for every conversation
+# and are read across long gaps, so they take the 1-hour cache (2x input per written
+# token) and prompt_cache.py re-reads them before it lapses
 _CACHE_CONTROL: dict[str, str] = {"type": "ephemeral", "ttl": "1h"}
+
+
+def _history_cache_control() -> dict[str, str]:
+    """The cache breakpoint for what belongs to one conversation: its user block and history.
+
+    The 5-minute cache (1.25x input) while prompt_cache.py keeps the conversation alive
+    between turns, since most of what a tool-heavy turn writes is read back within
+    seconds; the 1-hour cache when the keep-alive is off, because a reply 5 to 60
+    minutes later would otherwise rewrite the whole history. The API requires 1-hour
+    breakpoints to precede 5-minute ones, which the tools -> system -> messages order
+    already gives.
+    """
+    if get_settings().cache_keepalive_minutes > 0:
+        return {"type": "ephemeral"}
+    return dict(_CACHE_CONTROL)
+
 
 _CLEARED_RESULT_NOTE = (
     "[CLEARED: the {size:,}-character result of {tool} was removed from this conversation "
@@ -278,26 +294,32 @@ def _prune_replayed_tool_results(
     messages: list[dict], *, trigger_chars: int, target_chars: int, keep_turns: int
 ) -> tuple[int, int]:
     """Replace the oldest replayed tool results with a one-line note once the history
-    passes `trigger_chars`, until it is under `target_chars`.
+    passes `trigger_chars`, bringing it back to about `target_chars`.
 
     Returns (results cleared, characters removed). Mutates list slots, never the dicts.
 
-    The gap between trigger and target is what keeps the prompt cache useful: a pass
-    changes the oldest live result and everything after it is re-cached, so pruning in
-    one chunk per crossing costs one rewrite per `trigger - target` characters of
-    growth, where pruning to the trigger on every turn would cost one per turn. The
-    pass is oldest-first and the history only grows, so a result cleared once stays
-    cleared and the cached prefix ahead of the next victim survives.
+    The client replays the whole history every turn and nothing records what an earlier
+    turn cleared, so the set of cleared results has to be a function of the history
+    alone, and one that holds still while the history grows: a pass changes the oldest
+    live result and everything after it is re-cached. The amount to remove is therefore
+    a whole number of `trigger - target` steps. It stays the same until the history has
+    grown by another step, the pass is oldest-first, and old messages do not change, so
+    every turn inside a step clears exactly the same results and the cache is rewritten
+    once per step. Clearing "until under the target" instead moves the boundary on every
+    turn that adds anything, which is one full rewrite per turn.
 
     The last `keep_turns` assistant turns keep their results whatever the size: the
     model is answering a follow-up to them, and the note tells it to re-run a tool
-    rather than guess.
+    rather than guess. When they hold so much that the amount cannot be reached, the
+    boundary follows them and the cache is rewritten each turn until it can.
     """
     if trigger_chars <= 0 or not messages:
         return 0, 0
     size = sum(len(json.dumps(m, separators=(",", ":"))) for m in messages)
     if size <= trigger_chars:
         return 0, 0
+    step = max(trigger_chars - target_chars, 1)
+    to_remove = step * ((size - target_chars) // step)
     names: dict[str, str] = {}
     for m in messages:
         if m.get("role") == "assistant" and isinstance(m.get("content"), list):
@@ -315,7 +337,7 @@ def _prune_replayed_tool_results(
         frozen_from = len(messages)
     cleared = removed = 0
     for i, m in enumerate(messages[:frozen_from]):
-        if size <= target_chars:
+        if removed >= to_remove:
             break
         content = m.get("content")
         if m.get("role") != "user" or not isinstance(content, list):
@@ -334,7 +356,6 @@ def _prune_replayed_tool_results(
                     size=before, tool=names.get(b.get("tool_use_id", ""), "a tool")
                 )
                 new_content.append({**b, "content": note})
-                size -= before - len(note)
                 removed += before - len(note)
                 cleared += 1
                 changed = True
@@ -382,7 +403,7 @@ def _mark_history_cache_breakpoint(messages: list[dict]) -> None:
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
     if isinstance(content, list) and content and isinstance(content[-1], dict):
-        content = [*content[:-1], {**content[-1], "cache_control": dict(_CACHE_CONTROL)}]
+        content = [*content[:-1], {**content[-1], "cache_control": _history_cache_control()}]
         messages[-1] = {**last, "content": content}
 
 
@@ -974,6 +995,16 @@ class LLMService:
         self.subagent_service: SubagentService | None = None
         self._initialize_clients()
 
+    @cached_property
+    def cache_keeper(self) -> PromptCacheKeeper:
+        settings = get_settings()
+        return PromptCacheKeeper(
+            self._send_cache_ping,
+            self._record_cache_spend,
+            keepalive_s=settings.cache_keepalive_minutes * 60,
+            prewarm=settings.cache_prewarm,
+        )
+
     def _initialize_clients(self):
         """Initialize LLM provider clients based on available API keys."""
         settings = get_settings()
@@ -1520,7 +1551,7 @@ class LLMService:
         )
         if user_block:
             system_blocks.append(
-                {"type": "text", "text": user_block, "cache_control": dict(_CACHE_CONTROL)}
+                {"type": "text", "text": user_block, "cache_control": _history_cache_control()}
             )
         if system_blocks:
             request_params["system"] = system_blocks
@@ -1582,6 +1613,9 @@ class LLMService:
                     f"{len(external_tools)} external, {len(rag_tools)} RAG)"
                 )
 
+        self.cache_keeper.begin_turn(session_id, request_params, user=user, secret=secret)
+        self.cache_keeper.note_prefix(request_params)
+
         log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
         # initialised ahead of the try so the finally below can read them however early
         # the turn dies. `priced_iterations` counts model calls whose usage arrived, which
@@ -1621,21 +1655,19 @@ class LLMService:
             # client-side refusal retry moves the turn onto the model that answered
             turn_model = model
 
-            def _book(message: Any, note: str = "") -> tuple[str, float, int, int, int, int]:
+            def _book(message: Any, note: str = "") -> tuple[str, float, int, int, int, int, int]:
                 """Price one model call into the turn's totals and log it."""
                 nonlocal total_cost, priced_iterations, total_input_tokens
                 nonlocal total_output_tokens, total_cache_read, total_cache_create
                 usage = message.usage
-                input_tok = usage.input_tokens
                 output_tok = usage.output_tokens
-                cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-                cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                input_tok, cache_read, cache_create, cache_create_1h = cache_usage(usage)
                 # the response names the model that produced it, which after a refusal
                 # fallback is not the one requested: that is the model whose rates apply
                 # and whose context window the meter should read against
                 served_model = getattr(message, "model", None) or model
                 iter_cost = estimate_cost(
-                    served_model, input_tok, output_tok, cache_read, cache_create
+                    served_model, input_tok, output_tok, cache_read, cache_create, cache_create_1h
                 )
                 total_cost += iter_cost
                 priced_iterations += 1
@@ -1649,7 +1681,15 @@ class LLMService:
                     f"cache_read={cache_read} cache_create={cache_create} "
                     f"stop_reason={message.stop_reason} cost=${iter_cost:.4f}"
                 )
-                return served_model, iter_cost, input_tok, cache_read, cache_create, output_tok
+                return (
+                    served_model,
+                    iter_cost,
+                    input_tok,
+                    cache_read,
+                    cache_create,
+                    cache_create_1h,
+                    output_tok,
+                )
 
             while iteration < max_iterations:
                 iteration += 1
@@ -1750,9 +1790,15 @@ class LLMService:
 
                 model_ms = int((time.monotonic() - model_started) * 1000)
 
-                (served_model, iter_cost, input_tok, cache_read, cache_create, output_tok) = _book(
-                    message
-                )
+                (
+                    served_model,
+                    iter_cost,
+                    input_tok,
+                    cache_read,
+                    cache_create,
+                    cache_create_1h,
+                    output_tok,
+                ) = _book(message)
 
                 # both budgets are checked after the spend is booked and before anything
                 # is dispatched. The hard cap ends the loop at the first iteration that
@@ -1794,7 +1840,9 @@ class LLMService:
                 # — it is what the browser's context meter renders against context_window,
                 # so its meaning is fixed. `cache_read` and `cache_create` are the two
                 # cached components of it, reported separately because a cache write is
-                # priced far above a cache read (`_PRICING` in cost.py): billed uncached
+                # priced far above a cache read (`_PRICING` in cost.py), and
+                # `cache_create_1h` is the part of the write that took the dearer 1-hour
+                # rate: billed uncached
                 # input is `input_tokens - cache_read - cache_create`, which is exactly
                 # the per-iteration increment of `total_input_tokens`. A consumer with no
                 # database row (secret chat writes none) needs all three to price a turn.
@@ -1827,6 +1875,7 @@ class LLMService:
                             "input_tokens": context_tokens,
                             "cache_read": cache_read,
                             "cache_create": cache_create,
+                            "cache_create_1h": cache_create_1h,
                             "output_tokens": output_tok,
                             "total_input_tokens": total_input_tokens,
                             "total_output_tokens": total_output_tokens,
@@ -2428,6 +2477,8 @@ class LLMService:
             logger.error(f"Error streaming Anthropic chat: {e}")
             raise
         finally:
+            # an abandoned turn is kept too: the user is as likely to come back to it
+            self.cache_keeper.end_turn(session_id, answered=priced_iterations > 0)
             # the spend of a turn that never reached "Chat complete" is real money too:
             # measured on one production's log sink, about one turn in seventeen ended
             # this way and their finished iterations were about five percent of all
@@ -2668,8 +2719,58 @@ class LLMService:
             logger.error(f"Error executing tool {tool_name}: {e}")
             return {"success": False, "error": str(e)}
 
+    async def _send_cache_ping(self, params: dict[str, Any]) -> Any:
+        """One zero-output request for prompt_cache.py. Not streamed: the API rejects
+        `max_tokens: 0` on a stream, and streaming is not part of what the cache keys on."""
+        if not self.anthropic_client:
+            raise RuntimeError("Anthropic client not initialized")
+        return await self.anthropic_client.messages.create(**params, timeout=60)
+
+    async def _record_cache_spend(
+        self,
+        kind: str,
+        messages: list[Any],
+        *,
+        model: str | None,
+        session_id: str | None,
+        user: str | None,
+        secret: bool,
+    ) -> None:
+        """Log and persist what a run of zero-output cache requests cost."""
+        input_tokens = cache_read = cache_create = 0
+        cost = 0.0
+        for message in messages:
+            inp, read, written, written_1h = cache_usage(message.usage)
+            input_tokens += inp
+            cache_read += read
+            cache_create += written
+            cost += estimate_cost(
+                getattr(message, "model", None) or model or "", inp, 0, read, written, written_1h
+            )
+        logger.info(
+            f"[session={session_id or 'none'}] Cache {kind}: requests={len(messages)} "
+            f"cache_read={cache_read} cache_create={cache_create} cost=${cost:.4f}"
+        )
+        await self._record_turn_metrics(
+            secret=secret,
+            source="cache",
+            session_id=session_id,
+            message_id=None,
+            user_id=user,
+            iterations=len(messages),
+            tool_call_count=0,
+            input_tokens=input_tokens,
+            output_tokens=0,
+            cache_read_tokens=cache_read,
+            cache_create_tokens=cache_create,
+            cost_usd=cost,
+            wall_ms=0,
+            model=model,
+        )
+
     async def close(self):
         """Close resources."""
+        await self.cache_keeper.close()
         if self.executor:
             await self.executor.close()
 

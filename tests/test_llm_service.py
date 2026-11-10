@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from conftest import settings_env
 from test_stream_truncation import (
     _Block,
     _delta_event,
@@ -265,10 +266,10 @@ class TestPruneReplayedToolResults:
             messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
         )
         results = _results(messages)
-        # 60K of results over a 50K trigger: the oldest go until the history is under 25K
-        assert cleared == 4 and removed > 0
-        assert all(r.startswith("[CLEARED:") for r in results[:4])
-        assert all(r == "x" * 10_000 for r in results[4:])
+        # 60K of results over a 50K trigger: one 25K step comes off, oldest first
+        assert cleared == 3 and removed >= 25_000
+        assert all(r.startswith("[CLEARED:") for r in results[:3])
+        assert all(r == "x" * 10_000 for r in results[3:])
         note = results[0]
         assert "10,000-character result of search_phenotypes" in note
         assert "Call the tool again" in note
@@ -282,6 +283,25 @@ class TestPruneReplayedToolResults:
         assert cleared == 1
         assert results[0].startswith("[CLEARED:")
         assert results[1] == results[2] == "x" * 30_000
+
+    def test_the_cleared_set_holds_still_while_the_replayed_history_grows(self):
+        """The client replays the whole, unpruned history every turn. The results cleared
+        must be the same ones until the history has grown by a full step, or every turn
+        changes an old message and rewrites the prompt cache behind it."""
+
+        def cleared(turns: int) -> list[bool]:
+            messages = _history(turns, 10_000)
+            _prune_replayed_tool_results(
+                messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
+            )
+            return [r.startswith("[CLEARED:") for r in _results(messages)]
+
+        assert cleared(6) == [True] * 3 + [False] * 3
+        # one more 10K turn is inside the same 25K step: nothing old changes
+        assert cleared(7) == [True] * 3 + [False] * 4
+        # the next step is crossed once, and then holds in its turn
+        assert cleared(8) == [True] * 6 + [False] * 2
+        assert cleared(9)[:8] == cleared(8)
 
     def test_a_second_pass_clears_nothing_new_while_under_the_trigger(self):
         """Between crossings the history is byte-identical to the last request's, so the
@@ -304,7 +324,7 @@ class TestPruneReplayedToolResults:
         _prune_replayed_tool_results(
             messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
         )
-        notes = _results(messages)[:4]
+        notes = _results(messages)[:3]
         # grow past the trigger again: the old notes survive untouched, the next-oldest goes
         for i in range(6, 9):
             messages[-1:] = [
@@ -315,7 +335,7 @@ class TestPruneReplayedToolResults:
             messages, trigger_chars=50_000, target_chars=25_000, keep_turns=2
         )
         assert cleared == 3
-        assert _results(messages)[:4] == notes
+        assert _results(messages)[:3] == notes
 
     def test_disabled_by_a_zero_trigger(self):
         messages = _history(6, 10_000)
@@ -463,7 +483,7 @@ class TestTurnMetrics:
         assert row["tool_profile"] == "bigquery"
         assert row["model"] == MODEL
         assert row["wall_ms"] >= 0
-        expected_cost = estimate_cost(MODEL, 100, 50, 900, 40) + estimate_cost(
+        expected_cost = estimate_cost(MODEL, 100, 50, 900, 40, 40) + estimate_cost(
             MODEL, 200, 80, 1100, 0
         )
         assert row["cost_usd"] == pytest.approx(expected_cost)
@@ -553,6 +573,8 @@ class TestTurnMetrics:
                 history_prune_trigger_chars=0,
                 history_prune_target_chars=0,
                 history_prune_keep_turns=2,
+                cache_keepalive_minutes=0,
+                cache_prewarm=False,
                 max_continuations=1,
                 max_turn_cost_usd=20.0,
                 max_turn_cost_hard_usd=50.0,
@@ -711,7 +733,7 @@ class TestAbandonedTurnMetrics:
         assert row["output_tokens"] == 50
         assert row["cache_read_tokens"] == 900
         assert row["cache_create_tokens"] == 40
-        assert row["cost_usd"] == pytest.approx(estimate_cost(MODEL, 100, 50, 900, 40))
+        assert row["cost_usd"] == pytest.approx(estimate_cost(MODEL, 100, 50, 900, 40, 40))
         assert row["message_id"] == "msg1"
         assert row["session_id"] == "sess1"
         assert row["model"] == MODEL
@@ -790,7 +812,7 @@ class TestAbandonedTurnMetrics:
         assert len(aborted) == 1
         assert "outcome=error" in aborted[0]
         assert "iterations=1" in aborted[0]
-        assert f"total_cost=${estimate_cost(MODEL, 100, 50, 900, 40):.4f}" in aborted[0]
+        assert f"total_cost=${estimate_cost(MODEL, 100, 50, 900, 40, 40):.4f}" in aborted[0]
 
     @pytest.mark.asyncio
     async def test_a_timed_out_model_call_is_recorded_as_a_timeout(self, chat_history_db):
@@ -909,6 +931,7 @@ class TestUsageChunk:
                 p["output_tokens"],
                 p["cache_read"],
                 p["cache_create"],
+                p["cache_create_1h"],
             )
             for p in self._payloads(chunks)
         )
@@ -1598,3 +1621,122 @@ class TestHistoryBreakpointFollowsTheTurn:
         # the newest message of a tool iteration is the tool_result turn
         assert calls[1]["messages"][-1]["content"][-1]["type"] == "tool_result"
         assert TestUserMemoryBlock._breakpoints(calls[2]) == 3  # no per-user block here
+
+
+class _RecordingKeeper:
+    def __init__(self):
+        self.calls = []
+
+    def begin_turn(self, session_id, request_params, *, user, secret):
+        self.calls.append(("begin", session_id, dict(request_params), user, secret))
+
+    def note_prefix(self, request_params):
+        self.calls.append(("prefix", request_params["model"]))
+
+    def end_turn(self, session_id, *, answered):
+        self.calls.append(("end", session_id, answered))
+
+
+ONE_HOUR = {"type": "ephemeral", "ttl": "1h"}
+FIVE_MINUTES = {"type": "ephemeral"}
+
+
+class TestConversationCacheLifetime:
+    """With the keep-alive on, what belongs to one conversation is written with the
+    5-minute TTL and the turn's first request is handed over to be kept readable."""
+
+    def _turns(self):
+        return [
+            _tool_turn("t1", input_tokens=1, output_tokens=1),
+            _answer_turn(input_tokens=1, output_tokens=1),
+        ]
+
+    async def _run_kept(self, svc, **kwargs):
+        svc.cache_keeper = _RecordingKeeper()
+        with settings_env(CACHE_KEEPALIVE_MINUTES=20):
+            await _run(
+                svc,
+                enable_tools=True,
+                system_prompt="SHARED",
+                user_instructions="THIS USER",
+                user="u1",
+                **kwargs,
+            )
+        return svc.anthropic_client.messages.calls, svc.cache_keeper.calls
+
+    @pytest.mark.asyncio
+    async def test_shared_blocks_take_the_hour_and_the_conversation_five_minutes(self):
+        calls, _ = await self._run_kept(_with_tools(_service(self._turns())))
+
+        for params in calls:
+            # the API rejects a 1-hour breakpoint after a 5-minute one
+            assert params["tools"][-1]["cache_control"] == ONE_HOUR
+            assert params["system"][0]["cache_control"] == ONE_HOUR
+            assert params["system"][1]["cache_control"] == FIVE_MINUTES
+            assert params["messages"][-1]["content"][-1]["cache_control"] == FIVE_MINUTES
+
+    @pytest.mark.asyncio
+    async def test_the_turns_first_request_is_handed_to_the_keep_alive(self):
+        calls, kept = await self._run_kept(_with_tools(_service(self._turns())))
+
+        assert len(calls) == 2
+        assert kept == [
+            ("begin", "sess1", calls[0], "u1", False),
+            ("prefix", MODEL),
+            ("end", "sess1", True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_turn_with_no_priced_call_is_not_kept(self):
+        svc = _service([])
+        svc.anthropic_client.messages.stream = lambda **_: _FailingStream(RuntimeError("boom"))
+        with pytest.raises(RuntimeError):
+            await self._run_kept(svc)
+        assert svc.cache_keeper.calls[-1] == ("end", "sess1", False)
+
+    @pytest.mark.asyncio
+    async def test_each_ttl_is_priced_at_its_own_rate(self, chat_history_db):
+        turn = _answer_turn(input_tokens=10, output_tokens=5, cache_read=900, cache_create=100)
+        turn[1].usage.cache_creation = SimpleNamespace(ephemeral_1h_input_tokens=60)
+        svc = _service([turn])
+        with patch(
+            "genetics_mcp_server.db.chat_history_db.get_chat_history_db",
+            return_value=chat_history_db,
+        ):
+            chunks = await _run(svc)
+
+        row = chat_history_db.get_turn_metrics("sess1")[0]
+        assert row["cost_usd"] == pytest.approx(estimate_cost(MODEL, 10, 5, 900, 100, 60))
+        usage = [json.loads(c.content) for c in chunks if c.type == "usage"][0]
+        assert (usage["cache_create"], usage["cache_create_1h"]) == (100, 60)
+
+    @pytest.mark.asyncio
+    async def test_cache_requests_are_recorded_as_spend_that_is_not_a_turn(self, chat_history_db):
+        svc = _service([])
+        ping = SimpleNamespace(
+            model=MODEL,
+            usage=SimpleNamespace(
+                input_tokens=4, cache_read_input_tokens=200_000, cache_creation_input_tokens=0
+            ),
+        )
+        with patch(
+            "genetics_mcp_server.db.chat_history_db.get_chat_history_db",
+            return_value=chat_history_db,
+        ):
+            for secret in (False, True):
+                await svc._record_cache_spend(
+                    "keep-alive",
+                    [ping, ping],
+                    model=MODEL,
+                    session_id="sess1",
+                    user="u1",
+                    secret=secret,
+                )
+
+        # the secret conversation's run leaves no row, like its turns
+        (row,) = chat_history_db.get_turn_metrics("sess1")
+        assert row["source"] == "cache"
+        assert row["iterations"] == 2
+        assert row["message_id"] is None
+        assert row["cache_read_tokens"] == 400_000
+        assert row["cost_usd"] == pytest.approx(2 * estimate_cost(MODEL, 4, 0, 200_000))

@@ -359,8 +359,12 @@ class ChatHistoryDB(object, metaclass=Singleton):
         # partial unique index gives the "one row per assistant turn" guarantee without
         # forcing a key onto rows that have no message id.
         #
-        # source is 'live' for rows written by the stream and 'log' for rows recovered
-        # from the "Chat complete:" log line of turns that ran before this table existed.
+        # source is 'live' for rows written by the stream, 'log' for rows recovered
+        # from the "Chat complete:" log line of turns that ran before this table existed,
+        # and 'cache' for the zero-output requests prompt_cache.py sends between turns: a
+        # conversation's keep-alive run (iterations = the number sent) or one re-read of
+        # the shared prefix (no session, no user). A 'cache' row is spend, not a turn, so
+        # a consumer that counts or averages turns must leave it out.
         # The log line carries only iterations, the two token totals and the cost, so a
         # 'log' row holds NULL — not 0 — in tool_call_count, the cache token counts and
         # wall_ms; a consumer that averages those must skip NULL rather than read a
@@ -1755,6 +1759,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
         tool_profile: str | None = None,
         model: str | None = None,
         outcome: str = "complete",
+        source: str = "live",
     ) -> str | None:
         """Record the cost and roundtrip profile of one assistant turn.
 
@@ -1811,9 +1816,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
                 INSERT INTO chat_turn_metrics (
                     id, session_id, message_id, user_id, iterations, tool_call_count,
                     input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
-                    cost_usd, wall_ms, tool_profile, model, outcome
+                    cost_usd, wall_ms, tool_profile, model, outcome, source
                 )
-                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 WHERE NOT EXISTS (
                     SELECT 1 FROM chat_sessions
                     WHERE id = ? AND ? IS NOT NULL AND user_id IS NOT ?
@@ -1849,6 +1854,7 @@ class ChatHistoryDB(object, metaclass=Singleton):
                     tool_profile,
                     model,
                     outcome,
+                    source,
                     session_id,
                     user_id,
                     user_id,
