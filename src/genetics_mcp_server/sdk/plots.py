@@ -1440,8 +1440,8 @@ _PHEWAS_LABEL_CHARS = 30
 _PHEWAS_TICK_WIDTH = 26
 _PHEWAS_TICK_LINES = 2
 
-# where a phenotype has no `phenotypes_v` row — a QTL trait, a dataset whose codes are
-# already readable, a lookup that failed — its point still needs a group
+# where a phenotype has no `phenotypes_v` row or no category in it — a QTL trait, a
+# single-disease study, a lookup that failed — its point still needs a group
 _PHEWAS_UNCATEGORISED = "Other"
 
 # past this many categories the axis is a wall of chapter names under groups of one or two

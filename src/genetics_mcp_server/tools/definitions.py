@@ -917,7 +917,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "get_gene_based_results_by_phenotype",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get the complete, unfiltered gene burden test results for one phenotype: every gene and annotation class tested in that trait, with no p-value cutoff. Use this to check whether a gene was tested in a trait and what the result was even when it is not significant, or to rank all genes within one trait. For a gene across many traits use get_gene_based_results instead.",
+        "description": "Get gene burden test results for one phenotype from the unfiltered per-trait table: every gene and annotation class tested in that trait, with no p-value cutoff. To check whether a gene was tested in a trait and what the result was even when it is not significant, pass `genes` — only those genes' rows come back, and `genes_not_found` lists any that have no row (not tested). Without `genes` the default is a summary: row and gene totals, per-annotation counts, the number of exome-wide significant genes and the strongest rows. With summarize=false rows are sorted by mlog10p_burden descending and capped at 500 inline; `truncated` says whether more exist, `total_count` how many matched, and the full table is at `_download_url`. For a gene across many traits use get_gene_based_results instead.",
         "parameters": {
             "resource": {
                 "type": "string",
@@ -928,6 +928,23 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
                 "type": "string",
                 "description": "Phenotype or study code as search_phenotypes returns it (e.g. 'categorical_41210_both_sexes_S068_', 'SCZ', 'BIP', 'IBD', 'UC', 'CD', 'AFib', 'AFib|EUR'). These are trait_original values from the burden results; BRaVa addresses an ancestry stratum as its own code ('AFib' is the cross-ancestry meta, 'AFib|EUR' the EUR stratum)",
                 "required": True,
+            },
+            "genes": {
+                "type": "string",
+                "description": "Gene symbol or comma-separated list of gene symbols or Ensembl gene IDs (e.g. 'SETD1A', 'SETD1A,CUL1'), matched case-insensitively. Returns only these genes' rows, significant or not; summarize is ignored",
+            },
+            "annotation": {
+                "type": "string",
+                "description": "Restrict to one annotation class (mask) exactly as the data spells it, e.g. 'PTV' or 'pLoF'. The summary's `by_annotation` lists the values a trait carries",
+            },
+            "min_mlog10p": {
+                "type": "number",
+                "description": "Minimum -log10 p-value of the burden test (mlog10p_burden)",
+            },
+            "summarize": {
+                "type": "boolean",
+                "description": "If true (default), return the summary instead of rows. Read its counts for any 'how many' question. If false, rows are capped at 500 and `truncated` says whether more exist.",
+                "default": True,
             },
         },
     },
@@ -3179,9 +3196,18 @@ def register_mcp_tools(
         return await executor.get_gene_based_results(gene)
 
     @_tool()
-    async def get_gene_based_results_by_phenotype(resource: str, phenotype: str) -> dict:
-        """Get the complete unfiltered gene burden results for one phenotype."""
-        return await executor.get_gene_based_results_by_phenotype(resource, phenotype)
+    async def get_gene_based_results_by_phenotype(
+        resource: str,
+        phenotype: str,
+        genes: str | None = None,
+        annotation: str | None = None,
+        min_mlog10p: float | None = None,
+        summarize: bool = True,
+    ) -> dict:
+        """Get gene burden results for one phenotype: a summary, named genes' rows, or a capped ranking."""
+        return await executor.get_gene_based_results_by_phenotype(
+            resource, phenotype, genes, annotation, min_mlog10p, summarize
+        )
 
     @_tool()
     async def lookup_phenotype_names(codes: list[str]) -> dict:
