@@ -528,6 +528,43 @@ class TestLoadData:
         _, messages = load_data(sample_db)
         assert messages.schema["thumbs_up"] == pl.Boolean
 
+    def test_unread_columns_and_inline_payloads_are_not_loaded(self, sample_db):
+        payload = "iVBORw0KGgo" * 1000
+        conn = sqlite3.connect(sample_db)
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN tool_results_json TEXT")
+        conn.execute(
+            "UPDATE chat_messages SET tool_results_json = ?, content = ? WHERE id = 'm2'",
+            (
+                '[{"big": "result"}]',
+                f"Here is the plot.\n\n[IMAGE:png:phewas:{payload}]\n\n"
+                f"[FILE:text/csv:hits.csv:{payload}]\n\nDone.",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        _, messages = load_data(sample_db)
+
+        assert "tool_results_json" not in messages.columns
+        assert {"content_json", "_rowid"} <= set(messages.columns)
+        assert messages.filter(pl.col("id") == "m2")["content"].item() == (
+            "Here is the plot.\n\n[image shown to the user: phewas]\n\n"
+            "[file offered to the user as a download: hits.csv]\n\nDone."
+        )
+        # a message with no payload marker is loaded as stored
+        assert messages.filter(pl.col("id") == "m1")["content"].item() == (
+            "What do we know about gene BRCA1?"
+        )
+
+    def test_payload_notes_match_what_chat_api_replays(self):
+        from genetics_mcp_server.chat_api import _strip_image_markers
+
+        text = (
+            "before [IMAGE:png:create_phewas_plot result:AAAA+/==] middle "
+            "[FILE:application/vnd.ms-excel:table S1.xlsx:BBBB] [IMAGE:png:no payload] after"
+        )
+        assert ac.drop_marker_payloads(text) == _strip_image_markers(text)
+
 
 # ---------------------------------------------------------------------------
 # Tool stats tests

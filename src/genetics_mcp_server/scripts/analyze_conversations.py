@@ -54,8 +54,41 @@ ANALYZER_VERSION = 1
 # ---------------------------------------------------------------------------
 
 
+# chat_messages is loaded whole, so a column costs its full size in memory on every run.
+# Nothing in this module reads these; a script that does (literature_judge) runs its own query
+UNREAD_MESSAGE_COLUMNS = frozenset({"tool_results_json"})
+
+# [IMAGE:<format>:<alt>:<base64>] and [FILE:<mime>:<name>:<base64>], the inline carriage for
+# plots and downloads in a message's text. Mirrors chat_api's _IMAGE_MARKER_RE and
+# _FILE_MARKER_RE, which cannot be imported here without constructing the FastAPI app; a
+# test pins the patterns together.
+_PAYLOAD_MARKER_RE = re.compile(r"\[(IMAGE|FILE):([^:\]]+):([^:\]]+):[^\]]+\]")
+
+
+def drop_marker_payloads(content: str | None) -> str | None:
+    """Replace inline image and file payloads with the note the model itself is replayed.
+
+    The payloads are most of chat_messages by volume and nothing here can use them: the
+    judge cannot read base64, and left in place it is what the head and tail of a
+    middle-elided message consist of. Kept, they set the memory this job needs.
+    """
+    if not content or ("[IMAGE:" not in content and "[FILE:" not in content):
+        return content
+    return _PAYLOAD_MARKER_RE.sub(
+        lambda m: (
+            f"[image shown to the user: {m.group(3)}]"
+            if m.group(1) == "IMAGE"
+            else f"[file offered to the user as a download: {m.group(3)}]"
+        ),
+        content,
+    )
+
+
 def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Load chat_sessions and chat_messages into polars DataFrames.
+
+    Messages come back without UNREAD_MESSAGE_COLUMNS and with the inline image and file
+    payloads in `content` replaced by a note (drop_marker_payloads).
 
     Read-only: this runs nightly against the live chat_history.db on a shared RWO PVC
     while chat-backend is serving it, and nothing here writes (genetics-results-suite-4zd).
@@ -72,12 +105,22 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
 
         # rowid comes along so the "last message wins" below can tiebreak on insertion order,
         # matching ChatHistoryDB.get_messages. created_at alone has one-second resolution
-        cursor = conn.execute("SELECT *, rowid AS _rowid FROM chat_messages")
+        wanted = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(chat_messages)")
+            if row[1] not in UNREAD_MESSAGE_COLUMNS
+        ]
+        select_list = ", ".join(f'"{col}"' for col in wanted)
+        cursor = conn.execute(f"SELECT {select_list}, rowid AS _rowid FROM chat_messages")
         cols = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        messages = pl.DataFrame(
-            {col: [row[i] for row in rows] for i, col in enumerate(cols)},
-        )
+        content_idx = cols.index("content")
+        # row by row rather than fetchall: a row's payload is dropped before the next row is
+        # read, so the peak is one raw message on top of the stripped table
+        columns: list[list] = [[] for _ in cols]
+        for row in cursor:
+            for i, value in enumerate(row):
+                columns[i].append(drop_marker_payloads(value) if i == content_idx else value)
+        messages = pl.DataFrame(dict(zip(cols, columns, strict=True)))
         # sqlite stores booleans as integers
         if "thumbs_up" in messages.columns:
             messages = messages.with_columns(pl.col("thumbs_up").cast(pl.Boolean, strict=False))
