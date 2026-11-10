@@ -258,6 +258,9 @@ class IterationUsage:
     # does not report them, which is what forces the turn back onto the cost interval.
     cache_read: int | None = None
     cache_create: int | None = None
+    # the part of cache_create written with the 1-hour TTL, priced above the rest. None
+    # from a server that wrote every breakpoint with that TTL and did not report a split
+    cache_create_1h: int | None = None
 
     # SINCE THE TURN STARTED, not since the previous iteration, and sampled when this
     # iteration's model response completed. Cumulative on purpose: the per-iteration
@@ -690,7 +693,13 @@ def _cost_bounds(
         )
         return None, None
     low = estimate_cost(model, input_tokens, output_tokens, cache_read_tokens=cached_tokens)
-    high = estimate_cost(model, input_tokens, output_tokens, cache_creation_tokens=cached_tokens)
+    high = estimate_cost(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens=cached_tokens,
+        cache_creation_1h_tokens=cached_tokens,
+    )
     return low, high
 
 
@@ -700,6 +709,7 @@ def _exact_cost(
     output_tokens: int,
     cache_read: int,
     cache_create: int,
+    cache_create_1h: int,
 ) -> float | None:
     """Price the turn exactly from the reported cache split.
 
@@ -715,6 +725,7 @@ def _exact_cost(
         output_tokens,
         cache_read_tokens=cache_read,
         cache_creation_tokens=cache_create,
+        cache_creation_1h_tokens=cache_create_1h,
     )
 
 
@@ -912,6 +923,7 @@ async def replay_turn(
                                 # measurement and must not degrade the turn to the interval
                                 cache_read=_opt_int(data, "cache_read"),
                                 cache_create=_opt_int(data, "cache_create"),
+                                cache_create_1h=_opt_int(data, "cache_create_1h"),
                                 turn_elapsed_ms=_opt_float(data, "turn_elapsed_ms"),
                                 model_ms=_opt_float(data, "model_ms"),
                                 model_attempts=_opt_int(data, "model_attempts"),
@@ -1031,6 +1043,10 @@ async def replay_turn(
                 record.output_tokens,
                 record.cache_read_tokens,
                 record.cache_create_tokens,
+                sum(
+                    u.cache_create or 0 if u.cache_create_1h is None else u.cache_create_1h
+                    for u in usages
+                ),
             )
         if record.cost_usd_min is None:
             record.cost_basis = COST_BASIS_UNPRICED

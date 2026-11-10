@@ -2,28 +2,28 @@
 
 import re
 
-# USD per million tokens: (input, output, cache_read, cache_creation), keyed by model family
-# and the lowest version the row applies to. Rows within a family are ordered newest first
-# and the first row whose floor the model meets wins, so a new minor release inherits its
-# family's latest row until a price change adds one above it.
+# USD per million tokens: (input, output, cache_read, cache_write_5m, cache_write_1h), keyed
+# by model family and the lowest version the row applies to. Rows within a family are
+# ordered newest first and the first row whose floor the model meets wins, so a new minor
+# release inherits its family's latest row until a price change adds one above it.
 #
-# cache_creation is the 1-hour TTL write (2x input), because every breakpoint the chat
-# path sends asks for that TTL (`_CACHE_CONTROL` in llm_service.py); the 5-minute write
-# would be 1.25x. Cache reads are 0.1x input everywhere except Fable 5.1, where Anthropic
-# cut them to 0.025x.
-_PRICING: list[tuple[str, tuple[int, int], tuple[float, float, float, float]]] = [
-    ("fable", (5, 1), (10.0, 50.0, 0.25, 20.0)),
-    ("fable", (5, 0), (10.0, 50.0, 1.0, 20.0)),
-    ("opus", (4, 5), (5.0, 25.0, 0.50, 10.0)),
-    ("opus", (0, 0), (15.0, 75.0, 1.50, 30.0)),
-    ("sonnet", (5, 0), (2.0, 10.0, 0.20, 4.0)),
-    ("sonnet", (0, 0), (3.0, 15.0, 0.30, 6.0)),
-    ("haiku", (4, 5), (1.0, 5.0, 0.10, 2.0)),
-    ("haiku", (0, 0), (0.80, 4.0, 0.08, 1.6)),
+# The two write rates are 1.25x and 2x input. A request mixes them (`_history_cache_control` in
+# llm_service.py), so `estimate_cost` takes the 1-hour share separately. Cache reads are
+# 0.1x input everywhere except Fable 5.1 and later, where Anthropic cut them to 0.025x.
+_PRICING: list[tuple[str, tuple[int, int], tuple[float, float, float, float, float]]] = [
+    ("fable", (5, 2), (8.0, 40.0, 0.20, 10.0, 16.0)),
+    ("fable", (5, 1), (10.0, 50.0, 0.25, 12.5, 20.0)),
+    ("fable", (5, 0), (10.0, 50.0, 1.0, 12.5, 20.0)),
+    ("opus", (4, 5), (5.0, 25.0, 0.50, 6.25, 10.0)),
+    ("opus", (0, 0), (15.0, 75.0, 1.50, 18.75, 30.0)),
+    ("sonnet", (5, 0), (2.0, 10.0, 0.20, 2.5, 4.0)),
+    ("sonnet", (0, 0), (3.0, 15.0, 0.30, 3.75, 6.0)),
+    ("haiku", (4, 5), (1.0, 5.0, 0.10, 1.25, 2.0)),
+    ("haiku", (0, 0), (0.80, 4.0, 0.08, 1.0, 1.6)),
 ]
 
 # what an unrecognised model is priced at; `has_pricing` lets callers refuse instead
-_FALLBACK_PRICING = (3.0, 15.0, 0.30, 6.0)
+_FALLBACK_PRICING = (3.0, 15.0, 0.30, 3.75, 6.0)
 
 _CONTEXT_WINDOWS: dict[str, int] = {
     "fable": 1_000_000,
@@ -67,7 +67,7 @@ def has_pricing(model: str) -> bool:
     return _parse_model(model) is not None
 
 
-def _match_pricing(model: str) -> tuple[float, float, float, float]:
+def _match_pricing(model: str) -> tuple[float, float, float, float, float]:
     """Find pricing by model family and version."""
     parsed = _parse_model(model)
     if parsed:
@@ -85,13 +85,21 @@ def estimate_cost(
     output_tokens: int,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    cache_creation_1h_tokens: int = 0,
 ) -> float:
-    """Return estimated cost in USD."""
-    inp, out, cache_rd, cache_cr = _match_pricing(model)
+    """Return estimated cost in USD.
+
+    `cache_creation_tokens` is every token written to the cache, as the API's
+    `cache_creation_input_tokens` reports it; `cache_creation_1h_tokens` is the part of
+    it written with the 1-hour TTL, and the rest is priced at the 5-minute rate.
+    """
+    inp, out, cache_rd, cache_w5, cache_w1 = _match_pricing(model)
+    one_hour = min(cache_creation_1h_tokens, cache_creation_tokens)
     cost = (
         input_tokens * inp
         + output_tokens * out
         + cache_read_tokens * cache_rd
-        + cache_creation_tokens * cache_cr
+        + (cache_creation_tokens - one_hour) * cache_w5
+        + one_hour * cache_w1
     ) / 1_000_000
     return cost

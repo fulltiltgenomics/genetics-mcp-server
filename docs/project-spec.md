@@ -28,7 +28,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 - **File attachments**: Upload/download/delete endpoints in `routers/chat_history.py` store files on disk (`ATTACHMENT_STORAGE_PATH`) with metadata in the `chat_attachments` table. Files are classified as `image`, `tsv`, or `excel`; `.txt` and `text/plain` count as `tsv`, since a table from a cluster or a text editor is a `.txt` as often as a `.tsv` and browsers send it with no useful MIME type. A text upload that begins with the RTF signature is refused with HTTP 400 naming the fix (TextEdit's Format > Make Plain Text): TextEdit saves rich text by default, and the markup parses as garbage columns. The browser makes the same check on the picked file, because an upload refusal does not reach the user as text — the turn goes on with an `upload failed` block — so only a check before the upload can show the message. Excel is a binary format, so `.xlsx`/`.xls` uploads are parsed to TSV at upload time via `excel_to_tsv()` (polars `read_excel`, calamine/`fastexcel` engine; all sheets, each prefixed `# Sheet: <name>` when multiple) and the parsed text is stored as a `.tsv` sidecar (`text_path` column); a file that fails to parse is rejected with HTTP 400 and nothing is written. A data file (`tsv` or `excel`) over `sandbox_client.MAX_INPUT_BYTES` is refused with HTTP 400 and an ask for an extract, because a data file is only analysed by delivering it to the sandbox; Excel is measured on its TSV sidecar, which is what is delivered. Images keep `MAX_ATTACHMENT_SIZE`. `run_analysis` delivers an Excel attachment as that sidecar, with type `text/tab-separated-values` and the name the script asked for, or `<file_name>.tsv` when it gave none, passed through `_sanitised_input_name` like any delivered name (so the model reads it by the name `inputs_delivered` reports), since the sandbox image has no spreadsheet parser. The download endpoint serves the original bytes by default, or the model-ready text via `?as=text` (parsed TSV for excel, original for tsv/csv). The frontend uploads every attachment before the turn is sent, because the upload is what produces the `attachment_id` the model reads the file by; it parses Excel→TSV client-side with SheetJS (`excelToTsv.ts`) only for the preview and the size check, so the server-side parse is what the sandbox is delivered. `?as=text` is available for any client that wants the parsed text back
 - **Cost logging**: Estimated USD cost logged for every Anthropic API call based on token usage and model pricing
 - **Context usage tracking**: `get_context_window()` in `cost.py` maps model families to context window sizes (tokens); pricing in the same module is keyed by family and version, so a price change between releases (Sonnet 5, Haiku 4.5, Fable 5.1's cache reads) is a row, not a rename. During streaming, `usage` SSE events are emitted after each agentic loop iteration, enabling the frontend to display a live context usage progress bar. The browser acts on the reading: past 50% of the window it advises a new chat and says why (a bigger context makes every answer slower, dearer and less accurate), and past 90% it refuses to send until one is started
-- **Replayed tool results are cleared past a budget**: `_prune_replayed_tool_results` (in `llm_service.py`) runs once per turn over the history the client sent, after the orphan-block sanitiser and before the cache breakpoint is marked. Once the serialised history passes `HISTORY_PRUNE_TRIGGER_CHARS` it replaces `tool_result` contents, oldest first, with a one-line `[CLEARED: …]` note naming the tool and the size and telling the model to call the tool again if it needs the data, until the history is under `HISTORY_PRUNE_TARGET_CHARS`; the last `HISTORY_PRUNE_KEEP_TURNS` assistant turns keep theirs whatever the size. The gap between trigger and target is the prompt-cache design: a pass rewrites the cached prefix from the first cleared result onward, so clearing in one chunk per crossing costs one rewrite per `trigger − target` characters of growth rather than one per turn, and because the pass is oldest-first over a history that only grows, a result cleared once stays cleared and the next request's prefix matches the last. Measured over four months of production (`genetics_chat_logs.stdout`, every `API call iteration=` line): tool results were 81% of the replayed characters in every session that passed a quarter of the window, `search_phenotypes` alone 16.6M characters. The limits are characters because the server has no tokenizer; JSON tool output runs about three characters per token. The client's stored transcript is untouched: the browser still replays everything, and the server clears the same results again on every request
+- **Replayed tool results are cleared past a budget**: `_prune_replayed_tool_results` (in `llm_service.py`) runs once per turn over the history the client sent, after the orphan-block sanitiser and before the cache breakpoint is marked. Once the serialised history passes `HISTORY_PRUNE_TRIGGER_CHARS` it replaces `tool_result` contents, oldest first, with a one-line `[CLEARED: …]` note naming the tool and the size and telling the model to call the tool again if it needs the data; the last `HISTORY_PRUNE_KEEP_TURNS` assistant turns keep theirs whatever the size. How much it removes is the prompt-cache design. The browser replays the whole unpruned history every turn and nothing records what an earlier turn cleared, so the cleared set has to be a function of the history alone that holds still while the history grows: a pass rewrites the cached prefix from the first cleared result onward. The amount removed is therefore a whole number of `trigger − target` steps — it does not change until the history has grown by another step, and since the pass is oldest-first over messages that never change, every turn inside a step clears exactly the same results. That is one cache rewrite per step; clearing "until under the target" moves the boundary on every turn that adds anything, which measured on production as a 180–310k-token rewrite on most turns of the longest sessions. When the kept turns hold so much that the amount cannot be reached, the boundary follows them until it can. Measured over four months of production (`genetics_chat_logs.stdout`, every `API call iteration=` line): tool results were 81% of the replayed characters in every session that passed a quarter of the window, `search_phenotypes` alone 16.6M characters. The limits are characters because the server has no tokenizer; JSON tool output runs about three characters per token. The client's stored transcript is untouched: the browser still replays everything, and the server clears the same results again on every request
 - **Server-owned chat turns**: a turn runs as a registry task that outlives the HTTP response; the browser reattaches by sequence number after a lost connection and the server writes the assistant message itself (see "Server-owned turns")
 - **Chat history persistence**: SQLite-based storage of conversation threads. Assistant turns persist both their content blocks (`content_json`: text + `tool_use`) and the tool outputs (`tool_results_json`: the `tool_result` blocks). Persisting tool results means a **resumed** conversation replays the actual data the model saw, not just its prose summary — preventing factual drift across turns/sessions (see "Tool result persistence" under Architecture decisions)
 - **Configurable prompts**: Per-user LLM configuration stored in database
@@ -1866,6 +1866,11 @@ the BigQuery log sink; `chat_messages.content_json` is not a substitute, because
 whole turn's blocks into one assistant record, leaving parallel and sequential tool calls
 indistinguishable and roundtrips per turn underivable.
 
+- **`source`.** `live` for a turn the stream recorded, `log` for one recovered from the log
+  sink, `cache` for the zero-output requests of `prompt_cache.py`: one row per keep-alive run
+  (`iterations` is the number of re-sends, the session and user are the conversation's) and one
+  per pre-warm (no session, no user). A `cache` row is spend, not a turn — sum it into cost,
+  leave it out of anything that counts or averages turns.
 - **`outcome` and abandoned turns.** `complete` for a turn that reached `Chat complete:`;
   `error`, `timeout` (the 300 s model-call timeout) or `cancelled` (the client went away, which
   arrives as a cancellation or a `GeneratorExit` at whatever the generator was awaiting) for one
@@ -2314,16 +2319,29 @@ may be asserted, and that the rules above win on conflict.
 
 ### Two cached system blocks
 
-`_stream_anthropic` emits `system` as two blocks, each with its own `cache_control`. Every
-breakpoint the chat path sends — these two, the tool list, the replayed history — asks for the
-**1-hour** cache (`_CACHE_CONTROL` in `llm_service.py`), and `cost.py` prices cache writes at
-that TTL's 2x-input rate. Measured over four months of production before the switch: cache
-writes were 52% of all model spend ($2,645 of $5,106), because 742 turns started 5 to 60
-minutes after the previous call and rewrote their whole history under the 5-minute TTL (152M
-tokens, $1,278); a 500k-token Opus 5 history re-sent after a coffee break cost about $3 before
-the model had read the question. The hour makes every write 2x base instead of 1.25x, which
-the writes inside a tool-heavy turn pay for nothing, and the priced counterfactual over the
-same calls still came out about $500 lower.
+`_stream_anthropic` emits `system` as two blocks, each with its own `cache_control`. The four
+breakpoints take two different lifetimes:
+
+- **The tool list and block 0 take the 1-hour cache** (`_CACHE_CONTROL`, 2x input per written
+  token). They are the same for every conversation and are read across long gaps.
+  `prompt_cache.py` re-reads them with a zero-output request (`max_tokens: 0`, billed as a
+  cache read) before the hour is up, so a conversation that starts after a quiet hour does not
+  write them again; `CACHE_PREWARM=false` turns that off.
+- **Block 1 and the replayed history take the 5-minute cache** (`_history_cache_control()`,
+  1.25x input). Most of what a tool-heavy turn writes is read back within seconds, so the
+  1-hour premium on it buys nothing. What the hour did buy — a reply 5 to 60 minutes later
+  reading the history instead of rewriting it — is kept by re-sending the turn's last request
+  with `max_tokens: 0` every 270 s for `CACHE_KEEPALIVE_MINUTES` after the turn ends. On Fable
+  a cache read is 0.025x input, so those re-sends cost far less than the premium. The next turn
+  of the conversation cancels them; a re-send that writes more than it reads stops the run,
+  because the entry had already lapsed. `CACHE_KEEPALIVE_MINUTES=0` turns the re-sends off and
+  puts block 1 and the history back on the 1-hour cache.
+
+The API requires 1-hour breakpoints to precede 5-minute ones, which the tools → system →
+messages order gives. `cost.py` prices the two write rates separately from the response's
+`usage.cache_creation` breakdown. The zero-output requests are spend that no turn carries, so
+each keep-alive run and each pre-warm is logged (`Cache keep-alive:` / `Cache pre-warm:`) and
+written to `chat_turn_metrics` with `source = 'cache'`.
 
 | Block | Content | Cache behaviour |
 |---|---|---|
@@ -2407,6 +2425,7 @@ src/genetics_mcp_server/
 ├── mcp_server.py                   # Standalone MCP server for genetics data tools.
 ├── memory_digest.py                # Entity extraction and cross-session digest rendering for chat memory.
 ├── memory_gate.py                  # The single place that decides whether a caller gets cross-session chat memory.
+├── prompt_cache.py                 # Keep Anthropic prompt-cache entries alive between real requests.
 ├── rate_limit.py                   # Per-user rate limiting for chat API requests.
 ├── sandbox_client.py               # HTTP transport between chat-backend and the sandbox supervisor.
 ├── sandbox_token.py                # Mint the per-execution, audience-scoped tokens the sandbox uses to reach db-api and results-api.
@@ -2914,7 +2933,7 @@ All configuration is via environment variables (`.env` file supported):
 |----------|-------------|---------|
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude | - |
 | `OPENAI_API_KEY` | OpenAI API key. Still read and still plumbed through, but unreachable: `stream_chat` refuses `provider="openai"` with a 400 since `genetics-results-suite-c4s` | - |
-| `DEFAULT_MODEL` | Default chat model. The nightly analysis job does not read it: `ANALYZE_TOPIC_MODEL` / `ANALYZE_QUALITY_MODEL` have their own defaults | `claude-fable-5-1` |
+| `DEFAULT_MODEL` | Default chat model. The nightly analysis job does not read it: `ANALYZE_TOPIC_MODEL` / `ANALYZE_QUALITY_MODEL` have their own defaults | `claude-fable-5-2` |
 | `TEMPERATURE` | Sampling temperature. Unset by default: `model_rejects_temperature()` (in `settings.py`) knows that Fable and Opus 4.7+ reject the parameter outright, so it is opt-in for the models that still accept it | unset |
 | `MAX_TOKENS` | Output token ceiling per model call. Caps thinking and visible text together; only generated tokens are billed, so headroom is cheap, but one turn must still finish inside the 5-minute per-iteration timeout | `16384` |
 | `MAX_CONTINUATIONS` | How many times a turn stopped by `stop_reason: max_tokens` is resumed before the truncation is reported to the user | `3` |
@@ -3413,6 +3432,7 @@ Tests are in `tests/` using pytest with pytest-asyncio:
 | `test_memory_digest.py` | Entity extraction from stored `tool_use` inputs (real parameter names, views and column-keyed literals mined out of SQL and script text, free-text search queries excluded, tool results never read, malformed `content_json`) and the premise script over a synthetic DB carrying only the production tables — the returning/re-mention counts, the absent `chat_turn_metrics` reported rather than raised, no user id or session id in the output, and the `--bundle` output agreeing with the module it was cut from. Also `cluster_sessions` (chain linkage, the `min_shared` threshold, strict kinds only, order-independent numbering) and the M1/M2/M3 shares over a two-project synthetic history, including the pseudonym agreeing with `memory_gate.user_log_hash` |
 | `test_admin_router.py` | Admin router endpoints, auth guards, DB methods |
 | `test_cost.py` | Cost estimation and context window lookup |
+| `test_prompt_cache.py` | The zero-output cache requests: keep-alive timing, cancellation by the next turn, the stop on a re-send that writes, pre-warm cadence, idle and mismatch drops |
 | `test_replay_benchmark.py` | Replay harness: SSE/usage parsing, the discarded pre-answer prose kept with the call it followed, `--capture-thinking` (not requested by default, recorded against the iteration the stream names, falling back to the usage count when it names none), paired ordering, matched-pair analysis, tool_result replay, percentiles, error handling, and the per-call metadata taken from the stream's ordering rather than the `done` chunk — a call is attributed to the iteration whose `usage` chunk preceded it, `run_analysis` carries the sandbox's own clock, and arguments still come from the `done` chunk because `llm_service` rewrites the copy it streams (all over a local stub SSE server); `literature_results` captured for a `search_scientific_literature` call or a `literature_review` subagent task and capped, `LITERATURE_TOOL`/`LITERATURE_SUBAGENT_TOOL`/`LITERATURE_SUBAGENT_SKILL`/`LITERATURE_RESULT_CAP` pinned against `literature_judge`/`settings.mcp_max_result_size`, and `--literature-bearing`/`is_case_literature_bearing` filtering `load_cases` before `--limit` |
 | `test_arm_resolution.py` | The benchmark's arm preflight: the `nocode`/`code` defaults; the harness's own arm and code-execution-tool literals pinned against `code_execution_requested` and `resolve_tools`; and the three refusals — an unknown `tool_profile` (rather than silently falling back to the no-code surface), an arm that is not the surface it names (a `code` arm resolved without `run_analysis`, or another arm resolved with it), and two arms whose resolved names are equal — against the two that are deliberately survivable, an endpoint-less server and one arm failing to resolve |
 | `test_tool_call_detail.py` | The call listing is complete, in emission order, keeps arguments untruncated, and does not count display prose imitating a tool marker |

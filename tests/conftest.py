@@ -13,6 +13,10 @@ import pytest
 os.environ.setdefault("GENETICS_API_URL", "http://0.0.0.0:2000/api")
 # disable auth for tests by default (overrides .env which may have REQUIRE_AUTH=true)
 os.environ["REQUIRE_AUTH"] = "false"
+# no background cache requests unless a test asks for them: a keep-alive or pre-warm task
+# scheduled by one test would still be pending when its event loop closes
+os.environ["CACHE_KEEPALIVE_MINUTES"] = "0"
+os.environ["CACHE_PREWARM"] = "false"
 
 
 # what results-api answers a finngen deployment: the three sandbox custom GWAS releases,

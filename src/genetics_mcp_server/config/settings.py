@@ -144,7 +144,7 @@ class Settings:
     # LLM defaults
     default_provider: str = "anthropic"
     default_model: str = field(
-        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-fable-5-1")
+        default_factory=lambda: os.environ.get("DEFAULT_MODEL", "claude-fable-5-2")
     )
     fast_model: str = "claude-haiku-4-5"
     # caps thinking + visible text together, and is a ceiling rather than a
@@ -249,6 +249,22 @@ class Settings:
     )
     history_prune_keep_turns: int = field(
         default_factory=lambda: int(os.environ.get("HISTORY_PRUNE_KEEP_TURNS", "2"))
+    )
+
+    # how long after a turn ends its conversation is kept in the prompt cache by
+    # zero-output re-sends (prompt_cache.py). While this is on, the conversation is written
+    # with the 5-minute TTL (1.25x input) instead of the 1-hour one (2x), and a reply inside
+    # the window still reads it. On Fable a cache read is 0.025x input, so a few re-sends
+    # cost far less than the 1-hour premium on every written token. 0 turns the re-sends
+    # off and puts the conversation back on the 1-hour TTL
+    cache_keepalive_minutes: float = field(
+        default_factory=lambda: float(os.environ.get("CACHE_KEEPALIVE_MINUTES", "20"))
+    )
+    # re-read the tool definitions and the shared system block before their 1-hour cache
+    # entry lapses, so a conversation that starts after a quiet hour does not write them
+    # again at 2x input
+    cache_prewarm: bool = field(
+        default_factory=lambda: os.environ.get("CACHE_PREWARM", "true").lower() == "true"
     )
 
     # optional tools (disabled by default)
