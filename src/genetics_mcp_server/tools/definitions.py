@@ -408,7 +408,7 @@ UNITS ARE log1p CP10K, NOT TPM. Never compare these numbers with bulk TPM values
 - SECONDARY: `donor_pseudobulk_mean_cp10k` (counts pooled per donor, then averaged across donors; linear CP10K, not log; NA when fewer than 3 donors have a nonzero library, or at dataset level on measured_no_row rows) — a robustness check against a few donors dominating, not the headline number and not for ranking.
 - `n_cells`, `n_donors` (and `n_datasets` at summary level) are the support behind a row; weigh a row with few donors accordingly. Cell groups with fewer than 50 cells or 3 donors are dropped, not shown. `tau` (summary level, same value on every row of a gene) is the gene's cell-type specificity index: 0 = ubiquitous, 1 = one cell type only.
 
-level='summary' (default): normal tissue, pooled across datasets, one row per (cell type, tissue), leaving out broad lineage labels such as 'leukocyte' or 'epithelial cell' (level='dataset' keeps them). Start here.
+level='summary' (default): normal tissue, pooled across datasets, one row per (cell type, tissue), leaving out broad lineage labels such as 'leukocyte' or 'epithelial cell' and datasets whose donors are all prenatal (level='dataset' keeps both). Start here.
 level='dataset': per-dataset groups (tissue, cell type, disease, assay), for per-dataset detail or to check that a summary value is not one dataset's artefact. Unlike the summary it includes disease samples — read the `disease` column. Rows are SPARSE: a `status: "present"` row exists only for a group where at least one cell expressed the gene, so in a dataset with any present row, a group passing the size thresholds (50 cells and 3 donors) that is missing had zero expressing cells; a below-threshold group never has a row, so its absence is unknown, not zero. One `status: "measured_no_row"` row per dataset means the dataset measured the gene and has groups passing the size thresholds, but no cell in any of those groups expressed it: real zeros, not missing data. A dataset absent from the result either did not measure the gene or had every group below the thresholds — unknown, not zero.
 
 A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before the lookup.""",
@@ -2990,12 +2990,13 @@ def register_mcp_tools(
 
         Units are log1p CP10K, not TPM. Primary metrics: `mean_log1p_cp10k` and
         `frac_expressing`; `donor_pseudobulk_mean_cp10k` is secondary. level='summary' pools
-        normal tissue across datasets per (cell type, tissue); level='dataset' gives per-dataset
-        rows, sparse: a group passing the size thresholds (50 cells and 3 donors) with no
-        expressing cell has no row, and a below-threshold group never has one, so its absence
-        is unknown, not zero. One `status: "measured_no_row"` row per dataset means it measured
-        the gene and no cell in its groups passing the thresholds expressed it (a real zero);
-        an absent dataset did not measure the gene or had every group below the thresholds.
+        normal tissue across datasets per (cell type, tissue), all-prenatal datasets left out;
+        level='dataset' gives per-dataset rows, sparse: a group passing the size thresholds (50
+        cells and 3 donors) with no expressing cell has no row, and a below-threshold group never
+        has one, so its absence is unknown, not zero. One `status: "measured_no_row"` row per
+        dataset means it measured the gene and no cell in its groups passing the thresholds
+        expressed it (a real zero); an absent dataset did not measure the gene or had every group
+        below the thresholds.
         """
         return await executor.get_cell_type_expression(gene, level)
 
