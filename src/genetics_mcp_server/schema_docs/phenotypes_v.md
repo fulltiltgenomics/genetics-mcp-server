@@ -13,17 +13,17 @@ FinnGen R14 stores trait='Height,_inverse-rank_normalized' with trait_original='
 gene_burden_results_v for Genebass stores trait='Mean corpuscular volume' with
 trait_original='continuous_30040_both_sexes__irnt', and QTL rows store a gene symbol in
 trait with the Ensembl id in trait_original. Joining on trait returns zero rows silently.
-COVERAGE IS PARTIAL BY DESIGN. Only datasets that ship a phenotype metadata file have rows:
-FinnGen R14/R12/Kanta/drugs, the FinnGen multi-cohort (UKBB, MVP, AoU) meta-analyses, Open
-Targets GWAS, Genebass, BRaVa, COVID-19 HGI and IIBDGC. QTL datasets (FinnGen_snRNAseq,
-FinnGen_ATACseq, FinnGen_Olink*, UKB_PPP, Open_Targets_QTL_*, every QTD*) have NO rows —
-their traits are genes, proteins and peaks, resolved through gene_annotations_v and
-peak_to_gene_v instead. Datasets whose codes are already readable (PGC, GP2, BipEx2,
-SCHEMA2, IBD_exome) have no rows either. Use a LEFT JOIN when the dataset is not known in
-advance. Ranked fuzzy phenotype SEARCH is not here and cannot be — for "find me traits
-matching this free-text description" use the results-api search endpoint. This table serves
-exact resolution and SQL-expressible filtering. Small table (~33k rows), so an unfiltered
-scan is cheap.
+COVERAGE IS PARTIAL BY DESIGN. Datasets whose traits are phenotypes have rows: FinnGen
+R14/R12/Kanta/drugs, the FinnGen multi-cohort (UKBB, MVP, AoU) meta-analyses, Open Targets
+GWAS, Genebass, BRaVa, COVID-19 HGI and IIBDGC, and the single-disease studies (PGC, GP2,
+BipEx2, SCHEMA2, IBD_exome, ASC2), whose codes are short disease abbreviations (SCZ, BIP,
+PD, IBD, UC, CD, ASD). QTL datasets (FinnGen_snRNAseq, FinnGen_ATACseq, FinnGen_Olink*,
+UKB_PPP, Open_Targets_QTL_*, every QTD*) have NO rows — their traits are genes, proteins and
+peaks, resolved through gene_annotations_v and peak_to_gene_v instead. Use a LEFT JOIN when
+the dataset is not known in advance. Ranked fuzzy phenotype SEARCH is not here and cannot be
+— for "find me traits matching this free-text description" use the results-api search
+endpoint. This table serves exact resolution and SQL-expressible filtering. Small table
+(tens of thousands of rows), so an unfiltered scan is cheap.
 
 ## Scan pruning
 
