@@ -114,7 +114,7 @@ Four evidence types that must not be conflated, because a user question about "r
 | `get_summary_stats` | Get summary statistics (p-value, beta, SE, allele frequencies) for specific variant-phenotype pairs; a sandbox custom GWAS run is reached with its release's resource and the run name as the phenotype, named in the hint where the deployment serves one |
 | `get_summary_stats_by_region` | Every summary stat record in a `chr:start-end` region for one or more phenotypes — the full association profile of a locus, including sub-threshold variants credible sets omit. Phenotypes are REQUIRED (sumstats are stored per phenotype); rows capped at 500 inline |
 | `get_hla_by_phenotype` | Every imputed classical HLA allele tested against one or more phenotypes (187 alleles across HLA-A/-B/-C/-DPB1/-DQA1/-DQB1/-DRB1/-DRB3/-DRB4/-DRB5, FinnGen R14) — the interpretable answer whenever a signal lands in the MHC, where SNP sumstats are unreadable because of the LD. Optional `genes` filter. Read `mlog10p`, not `pval` (it underflows to 0 at these effect sizes), and check `info`: a rare allele imputed below 0.5 yields a huge unstable beta that is an artifact |
-| `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,712 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
+| `get_hla_by_allele` | The inverse — every phenotype one HLA allele is associated with, across all 2,808 FinnGen R14 endpoints (a PheWAS of the allele; MHC pleiotropy across autoimmune traits is the norm). Goes through BigQuery `hla_associations_v` because the per-phenotype files results-api serves cannot span traits. Allele names are gene-stripped and two-field (`B*27:05`); a written `HLA-` prefix is stripped for the caller. Filtered to `min_info` 0.5 by default |
 | `get_dosage_sensitivity` | pHaplo / pTriplo dosage-sensitivity scores for a list of genes (Collins et al. 2022, 18,641 autosomal protein-coding genes from rare CNVs in 950,278 individuals). Executor-side SQL over BigQuery `dosage_sensitivity_v`. Symbols are matched case-insensitively against the current symbol, the GENCODE v19 symbol the paper published and the Ensembl ID in one pass, so a gene renamed since 2013 still resolves. `haploinsufficient`/`triplosensitive` are the paper's own cutoffs (0.86 / 0.94) returned as columns |
 | `get_rcnv_associations` | Rare-CNV gene associations: which HPO phenotype group a DEL or DUP of a gene is associated with (54 groups x {DEL, DUP} x 17,263 genes). Executor-side SQL over BigQuery `rcnv_gene_associations_v`, LEFT JOINed to `phenotypes_v` for the readable name. At least one of `gene` or `phenotype`; `phenotype` takes an HPO id in either spelling, `UNKNOWN`, or a case-insensitive substring of the phenotype name, because `search_phenotypes` does not index this BigQuery-only dataset. The 65% of rows that are "tested, no estimate" (NULL in every statistic column, `beta` through `mlog10_fdr_q_secondary`) are excluded unless `include_no_estimate`; `significant_only` applies the paper's full rule, both tiers plus the secondary-evidence gate |
 | `get_variant_annotations` | Get variant annotations (consequence, allele frequency, rsID, enrichment) by variant, region, gene, or batch variants. `source` is `finngen` (default) or `gnomad` (4.1.1); the gnomad row's `consequences` is a JSON string, `NA` when none, with the same keys as the typed array in the `gnomad_variant_annotation_v` view — the view is the route for joins and bulk questions. `version` is the source's release, relayed from results-api's `X-Dataset-Version` header |
@@ -301,11 +301,11 @@ traceback and tell the user "internal error" for what is a routine EBI stall.
 plus `get_protein_annotations` declare `"type": ["string", "array"]`, and the executor fans a
 list out with `_fan_out` — `asyncio.gather` under a semaphore of `_BATCH_CONCURRENCY` (5),
 capped at `_BATCH_MAX` (50) inputs, with per-item failures isolated. **That cap is not in the
-schema, and cannot be.** `_to_anthropic_format` forwards `minimum`, `maximum` and `pattern`
-only, so no `maxItems` ever reaches the model; every array bound in this server — this one,
+schema.** `_to_anthropic_format` forwards `maxItems` alongside `minimum`, `maximum` and
+`pattern` when a parameter declares it, but these parameters declare none, so this cap — like
 the variant cap on `get_alphagenome_variant_predictions` — is stated in the parameter's
-description and enforced by the executor, and any future tool wanting one is in the same
-position. **The HTTP is not what this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
+description and enforced by the executor. `run_analysis.inputs` is the one parameter that
+declares a `maxItems`. **The HTTP is not what this saves.** Benchmark run a08b371d had one turn spend 37 tool calls and $4.80 asking
 `get_drug_targets_for_gene` about 25 genes one at a time, because the schema offered no way to
 ask about more than one; what a list removes is the ~8s model iteration and full context
 re-read between each call. Verified end to end: the same five-gene question now resolves in one
@@ -2815,7 +2815,7 @@ The subagent system enables the main agent to launch parallel specialized agents
 Each skill has:
 - A markdown instruction file (system prompt) in `skills/instructions/`
 - An explicit set of tool names controlling which tools the subagent can use
-- Configurable model, max iterations, and timeout
+- Configurable model, output-token cap (`max_tokens`) and max iterations; the timeout is the deployment-wide `SUBAGENT_TIMEOUT`, not per skill
 - Optional file read, for skills that inspect uploaded files
 - `include_external` flag — when `True`, external MCP server tools (e.g. gnomAD, Open Targets) are appended to the subagent's tool set via `get_external_anthropic_tools()`. Currently enabled for `genetics_data_extraction`.
 
@@ -2873,8 +2873,10 @@ partial findings instead of treating a fragment as the subagent's complete answe
 - Each skill names the tools it gets (`skills/definitions.py`), so retuning a tool profile for
   the main agent cannot widen a subagent's surface
 - File access is read-only and restricted to `SUBAGENT_ALLOWED_PATHS`
-- Subagents cannot execute code: `run_analysis` is excluded by name and a subagent has no
-  session identity for a per-execution credential to be minted from
+- Only the `data_analysis` skill can execute code: it is the one skill that names
+  `run_analysis`, and the execution is minted against the caller's authenticated identity
+  threaded into `run_subagents` (see **Identity** above); a caller that threads none gets
+  `run_analysis`'s own refusal
 - Per-subagent timeout
 
 ## Configuration
@@ -2895,7 +2897,8 @@ All configuration is via environment variables (`.env` file supported):
 | `GENETICS_PUBLIC_API_URL` | Externally reachable base URL used when building download links shown to users; falls back to `GENETICS_API_URL`, which in a cluster is an internal address | `GENETICS_API_URL` |
 | `INTERNAL_API_SECRET` | Shared secret sent as `Authorization: Bearer` on every call to results-api and the BigQuery proxy. Optional only for a local run against services that require no internal auth: since `genetics-results-suite-618` the **deployed** entrypoints refuse to start without it (`config.settings.require_internal_api_secret()`, called from `mcp_server.main()` on the remote transports and from `chat_api`'s lifespan when `REQUIRE_AUTH` is true), because the alternative was sending every call **anonymously** with no local signal and nothing in the far end's log to tell it apart from an authenticated one. Only attached to `ToolExecutor.client` — the separate `external_client` carries no default auth, so the secret can never leak to a third-party API such as MouseMine or myvariant.info. The pruned sandbox install holds none by design and uses `SANDBOX_TOKEN_FILE` instead; since `genetics-results-suite-4h6.44` it is no longer exempt from needing *a* credential — a pruned install with neither raises `SandboxCredentialError` at client construction | - |
 | `SANDBOX_TOKEN_FILE` | Path (never the tokens) to the per-execution token file the sandbox supervisor writes before it forks — a JSON object keyed by audience, `{"db-api": ..., "results-api": ...}`. Read **once** and unlinked on the first client build (`tools/executor.py`), then attached per request bound to the destination's audience; mutually exclusive with `INTERNAL_API_SECRET`, and a file that does not yield a usable pair raises rather than degrading to no credential. Set only by the supervisor in the sandbox image; unset everywhere else. Read-once-and-unlink is **not** an exposure bound — see `genetics-results-suite-4h6.55` | - |
-| `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem. Authenticated with `INTERNAL_API_SECRET` | - |
+| `CHAT_BACKEND_URL` | Base URL of the chat backend, used by the MCP server to validate per-user API tokens via `POST /v1/tokens/validate` when the two services do not share a filesystem, and to consult runtime access grants via `GET /v1/access-grants/check` (`access_check.py`). Authenticated with `INTERNAL_API_SECRET` | - |
+| `CONFIG_PROFILE` | The deployment's data profile (genetics-results-suite `configs/datasets.yaml`), the same variable `schema_docs` gates views on. Tools whose data only some profiles serve are withdrawn by `Settings.disabled_tools` everywhere else, failing closed when it is unset | unset |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. False withholds `run_analysis` from every resolved tool list — and, since the prompt is built from that list, its guidance too. A deployment fact, flipped by the deploy that creates the sandbox | `false` |
 | `CELL_TYPE_EXPRESSION_ENABLED` | Whether this deployment's results-api has a cell-type expression release pointer. False (or a `CONFIG_PROFILE` outside `CELL_TYPE_EXPRESSION_PROFILES`) withholds `get_cell_type_expression`. The SDK's `genetics.cell_type_expression` is gated on the profile half alone (`sdk/__init__.py`'s `_PROFILE_GATED`, read from `CONFIG_PROFILE` at import, failing closed): unbound and unlisted off those profiles, bound on them and failing with `not_available` while the flag is false. Same truthy parsing as `SANDBOX_ENABLED` | `false` |
 | `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments. **No default**: building a `SandboxClient` without it raises `SandboxNotConfigured` before any request is sent (`genetics-results-suite-6um`), because the default it used to carry — `127.0.0.1:8080` — is db-api's port on a dev machine, and a real authenticating service's 404s and auth errors classify as sandbox failures instead of "nothing is configured". Set in the cluster by `k8s/deployments/chat-backend.yaml` (`http://sandbox.genetics.svc.cluster.local:8080`) and locally by `dev-stack.sh` | - |
@@ -2923,6 +2926,7 @@ All configuration is via environment variables (`.env` file supported):
 | `ANTHROPIC_RETRY_RATE_LIMIT` | Whether an Anthropic **429** is also retried. Off by default and deliberately so: a 429 means the account's capacity is spent, so retrying in front of a waiting user buys a longer spinner and takes capacity from the next request. A benchmark has no waiting user and turns it on | `false` |
 | `ANTHROPIC_RETRY_AFTER_MAX_S` | Ceiling on a honoured `retry-after`. Above it the wait is refused and the error propagates rather than being silently clamped — returning before the server said to is what the header asks us not to do | `60` |
 | `APP_NAME` | Product/brand name substituted into the assistant persona system prompt | `FinnGenie` |
+| `PROMPT_VARIANT` | Which registered system-prompt variant this deployment serves (see "Prompt variants"). Empty, or a name this build does not define, serves `DEFAULT_PROMPT_VARIANT` and logs a warning | `condensed` |
 
 ### myvariant.info (optional, chat-backend only)
 
@@ -4313,7 +4317,7 @@ run covers every worktree too.
 
 ## Documentation
 
-- `README.md`: Installation, quick start, tool reference
+- `README.md`: Installation, quick start, the main environment variables, development and the lint gate (the tool reference is "Available tools" above)
 - `.env.example`: All configuration variables
 - This document: Architecture and implementation details
 
