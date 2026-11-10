@@ -2732,10 +2732,53 @@ class ToolExecutor:
             )
             return {"success": False, "error": INTERNAL_ERROR_MSG}
 
+    # the summary states the threshold beside the count so the model can re-threshold
+    _EXOME_WIDE_MLOG10P = 6.0
+    _BURDEN_SUMMARY_TOP = 20
+
+    @staticmethod
+    def _burden_mlog10p(row: dict[str, Any]) -> float:
+        value = row.get("mlog10p_burden")
+        return float(value) if isinstance(value, (int, float)) else float("-inf")
+
+    def _summarize_gene_burden(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Summarize one trait's burden rows, which must already be sorted strongest first."""
+        threshold = self._EXOME_WIDE_MLOG10P
+        by_annotation: dict[str, dict[str, int]] = {}
+        significant_genes = set()
+        for row in rows:
+            counts = by_annotation.setdefault(
+                str(row.get("annotation")), {"n_rows": 0, "n_significant": 0}
+            )
+            counts["n_rows"] += 1
+            if self._burden_mlog10p(row) >= threshold:
+                counts["n_significant"] += 1
+                significant_genes.add(row.get("gene"))
+        return {
+            "total_count": len(rows),
+            "n_genes": len({row.get("gene") for row in rows}),
+            "significance_mlog10p": threshold,
+            "n_significant_genes": len(significant_genes),
+            "by_annotation": by_annotation,
+            "top_results": rows[: self._BURDEN_SUMMARY_TOP],
+        }
+
     async def get_gene_based_results_by_phenotype(
-        self, resource: str, phenotype: str
+        self,
+        resource: str,
+        phenotype: str,
+        genes: str | list[str] | None = None,
+        annotation: str | None = None,
+        min_mlog10p: float | None = None,
+        summarize: bool = True,
     ) -> dict[str, Any]:
-        """Get unfiltered gene burden results for one phenotype."""
+        """Get gene burden results for one phenotype, unfiltered by significance.
+
+        One trait is every gene x annotation, tens of thousands of rows, so the whole
+        table never goes inline: the default is a summary, `genes` returns just the rows
+        asked for (the tested-and-null check), and rows are otherwise capped like the
+        region tools. The full table stays behind `_download_url`.
+        """
         try:
             resp = await self.client.get(
                 f"{self.base_url}/v1/gene_based_results_by_phenotype/{_seg(resource)}/{_seg(phenotype)}",
@@ -2744,17 +2787,45 @@ class ToolExecutor:
             )
             if resp.status_code == 200:
                 results = resp.json()
-                return {
+                gene_list = (
+                    [g.strip() for g in genes.split(",")] if isinstance(genes, str) else genes
+                )
+                gene_list = [g for g in gene_list or [] if g]
+                payload: dict[str, Any] = {
                     "success": True,
                     **self._columns_meta(resp),
                     "resource": resource,
                     "phenotype": phenotype,
-                    "count": len(results),
-                    "results": results,
-                    "_download_url": self._build_download_url(
-                        f"/v1/gene_based_results_by_phenotype/{resource}/{phenotype}"
-                    ),
                 }
+                if gene_list:
+                    wanted = {g.upper() for g in gene_list}
+                    results = [
+                        r
+                        for r in results
+                        if str(r.get("gene")).upper() in wanted
+                        or str(r.get("gene_id")).upper() in wanted
+                    ]
+                    found = {str(r.get(k)).upper() for r in results for k in ("gene", "gene_id")}
+                    # a gene with no row was not tested in this trait, which is a different
+                    # answer from tested-and-null
+                    payload["genes_not_found"] = [g for g in gene_list if g.upper() not in found]
+                if annotation:
+                    results = [r for r in results if r.get("annotation") == annotation]
+                if min_mlog10p is not None:
+                    results = [r for r in results if self._burden_mlog10p(r) >= min_mlog10p]
+                # strongest first, so a capped result is the top of the ranking
+                results.sort(key=self._burden_mlog10p, reverse=True)
+                if summarize and not gene_list:
+                    payload.update(self._summarize_gene_burden(results))
+                else:
+                    rows, truncated = self._cap_rows(results)
+                    payload.update(
+                        {"total_count": len(results), "truncated": truncated, "results": rows}
+                    )
+                payload["_download_url"] = self._build_download_url(
+                    f"/v1/gene_based_results_by_phenotype/{resource}/{phenotype}"
+                )
+                return payload
             if resp.status_code == 404:
                 return {
                     "success": False,

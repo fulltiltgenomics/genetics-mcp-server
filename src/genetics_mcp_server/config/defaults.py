@@ -56,6 +56,7 @@ _SUMMARIZE_PARAM_TOOLS = _fs(
     "get_credible_sets_by_qtl_gene",
     "get_credible_sets_by_region",
     "get_credible_sets_by_variant",
+    "get_gene_based_results_by_phenotype",
 )
 
 
@@ -153,7 +154,7 @@ Now, looking only at the extracted data and literature above, provide your analy
         "- **When investigating genes**, always check both GWAS evidence (get_credible_sets_by_gene) and rare-variant burden evidence (get_gene_based_results, get_exome_results_by_gene). Gene-based burden results are an independent line of evidence from GWAS and should be included in any gene-focused analysis\n"
     ),
     _Block(
-        "- **get_gene_based_results returns only genebass and BRaVa p < 1e-4 rows, so a gene missing from it is not a gene without a burden result.** To say a gene was tested and came out null in a given trait, use get_gene_based_results_by_phenotype (unfiltered, one trait) or query gene_burden_results_v in the database (unfiltered, every gene x annotation x trait)\n"
+        "- **get_gene_based_results returns only genebass and BRaVa p < 1e-4 rows, so a gene missing from it is not a gene without a burden result.** To say a gene was tested and came out null in a given trait, use get_gene_based_results_by_phenotype with `genes` (one trait, unfiltered, only the named genes' rows) or query gene_burden_results_v in the database (unfiltered, every gene x annotation x trait)\n"
     ),
     _Block(
         """- **A tool result marked `[TRUNCATED: ...]` is a PREFIX of an ordered result, not a sample of it.** Whatever sorts last — the weakest signals, the later chromosomes, entire data types or resources — is what got cut, and you cannot see what is missing. Never answer a counting question ("how many X"), an inventory question ("which cell types / datasets / traits"), or an absence question ("is there any caQTL data for this gene") from a truncated result, and never state that something is not in the data because it was not in the visible part."""
