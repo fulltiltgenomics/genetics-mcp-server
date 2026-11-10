@@ -1627,14 +1627,14 @@ class _RecordingKeeper:
     def __init__(self):
         self.calls = []
 
-    def begin_turn(self, session_id):
-        self.calls.append(("begin", session_id))
+    def begin_turn(self, session_id, request_params, *, user, secret):
+        self.calls.append(("begin", session_id, dict(request_params), user, secret))
 
     def note_prefix(self, request_params):
         self.calls.append(("prefix", request_params["model"]))
 
-    def end_turn(self, session_id, request_params, sent_at, *, user, secret):
-        self.calls.append(("end", session_id, request_params, user, secret))
+    def end_turn(self, session_id, *, answered):
+        self.calls.append(("end", session_id, answered))
 
 
 ONE_HOUR = {"type": "ephemeral", "ttl": "1h"}
@@ -1643,7 +1643,7 @@ FIVE_MINUTES = {"type": "ephemeral"}
 
 class TestConversationCacheLifetime:
     """With the keep-alive on, what belongs to one conversation is written with the
-    5-minute TTL and the turn's last request is handed over to be kept readable."""
+    5-minute TTL and the turn's first request is handed over to be kept readable."""
 
     def _turns(self):
         return [
@@ -1676,13 +1676,15 @@ class TestConversationCacheLifetime:
             assert params["messages"][-1]["content"][-1]["cache_control"] == FIVE_MINUTES
 
     @pytest.mark.asyncio
-    async def test_the_turns_last_request_is_handed_to_the_keep_alive(self):
+    async def test_the_turns_first_request_is_handed_to_the_keep_alive(self):
         calls, kept = await self._run_kept(_with_tools(_service(self._turns())))
 
-        assert kept[0] == ("begin", "sess1")
-        assert kept[1] == ("prefix", MODEL)
-        assert kept[2] == ("end", "sess1", calls[-1], "u1", False)
-        assert len(kept) == 3
+        assert len(calls) == 2
+        assert kept == [
+            ("begin", "sess1", calls[0], "u1", False),
+            ("prefix", MODEL),
+            ("end", "sess1", True),
+        ]
 
     @pytest.mark.asyncio
     async def test_a_turn_with_no_priced_call_is_not_kept(self):
@@ -1690,7 +1692,7 @@ class TestConversationCacheLifetime:
         svc.anthropic_client.messages.stream = lambda **_: _FailingStream(RuntimeError("boom"))
         with pytest.raises(RuntimeError):
             await self._run_kept(svc)
-        assert [c[0] for c in svc.cache_keeper.calls] == ["begin", "prefix"]
+        assert svc.cache_keeper.calls[-1] == ("end", "sess1", False)
 
     @pytest.mark.asyncio
     async def test_each_ttl_is_priced_at_its_own_rate(self, chat_history_db):

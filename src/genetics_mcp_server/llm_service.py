@@ -1613,10 +1613,8 @@ class LLMService:
                     f"{len(external_tools)} external, {len(rag_tools)} RAG)"
                 )
 
-        self.cache_keeper.begin_turn(session_id)
+        self.cache_keeper.begin_turn(session_id, request_params, user=user, secret=secret)
         self.cache_keeper.note_prefix(request_params)
-        # the request the keep-alive re-sends once the turn is over, and when it went out
-        last_sent: tuple[dict[str, Any], float] | None = None
 
         log_prefix = f"[user={user or 'unknown'}] [session={session_id or 'unknown'}] "
         # initialised ahead of the try so the finally below can read them however early
@@ -1701,7 +1699,6 @@ class LLMService:
                 model_started = time.monotonic()
 
                 out: dict[str, Any] = {}
-                last_sent = (dict(request_params), time.monotonic())
                 async for chunk in self._stream_with_retries(
                     request_params, out, log_prefix, settings
                 ):
@@ -2480,15 +2477,8 @@ class LLMService:
             logger.error(f"Error streaming Anthropic chat: {e}")
             raise
         finally:
-            # an abandoned turn is kept too: its finished calls are in the cache and the
-            # user is as likely to come back to it. Not after a refusal retry moved the
-            # turn to another model, whose cache the next turn will not read.
-            if last_sent and priced_iterations and last_sent[0].get("model") == model:
-                try:
-                    self.cache_keeper.end_turn(session_id, *last_sent, user=user, secret=secret)
-                except RuntimeError:
-                    # no running loop to schedule on; the next turn pays a cache write
-                    pass
+            # an abandoned turn is kept too: the user is as likely to come back to it
+            self.cache_keeper.end_turn(session_id, answered=priced_iterations > 0)
             # the spend of a turn that never reached "Chat complete" is real money too:
             # measured on one production's log sink, about one turn in seventeen ended
             # this way and their finished iterations were about five percent of all
