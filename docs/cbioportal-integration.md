@@ -78,8 +78,8 @@ cBioPortal figure:
 
 ## Testing note
 
-The worktree's `.venv` has an editable install pointing at the parent checkout,
-so `uv run pytest` inside a worktree imports the parent's sources and the new
-tests fail with `AttributeError`. Run them as:
+A worktree without its own environment imports the parent checkout's sources
+through the editable install. `tests/conftest.py` now refuses such a run at
+startup; the fix it prints is to run, in the worktree:
 
-    PYTHONPATH=$PWD/src uv run pytest -q
+    uv sync --extra dev
