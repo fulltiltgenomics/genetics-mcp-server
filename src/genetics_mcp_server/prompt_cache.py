@@ -4,9 +4,9 @@ A request with `max_tokens: 0` produces no output and is billed for its input on
 for a prompt already in the cache is a cache read; the read restarts the entry's timer.
 Two things are kept alive that way:
 
-- a conversation, for a while after each turn, so it can be written with the 5-minute TTL
-  (1.25x input per token) rather than the 1-hour one (2x) and still be read when the user
-  replies a quarter of an hour later;
+- a conversation, during each turn and for a while after it, so it can be written with the
+  5-minute TTL (1.25x input per token) rather than the 1-hour one (2x) and still be read
+  when the user replies a quarter of an hour later;
 - the prefix every conversation shares (tool definitions and the first system block), so
   one that starts after a quiet hour does not write it again.
 
@@ -39,6 +39,8 @@ PREWARM_IDLE_DROP_S = 72 * 3600.0
 MAX_PREFIXES = 4
 # each holds one request body (up to a few MB) until its window closes
 MAX_KEEPALIVE_SESSIONS = 200
+# a run whose turn never reports its end stops after this long
+MAX_TURN_S = 2 * 3600.0
 
 _PREFIX_FIELDS = ("model", "thinking", "tools", "extra_body", "extra_headers")
 
@@ -54,6 +56,13 @@ def cache_usage(usage: Any) -> tuple[int, int, int, int]:
     if not isinstance(one_hour, int):
         one_hour = written
     return usage.input_tokens, read, written, one_hour
+
+
+@dataclass
+class _Run:
+    # when the re-sends stop: a cap while the turn runs, the window once it has ended
+    until: float
+    task: asyncio.Task | None = None
 
 
 @dataclass
@@ -87,65 +96,81 @@ class PromptCacheKeeper:
         self._prewarm = prewarm
         self._clock = clock
         self._sleep = sleep
-        self._sessions: dict[str, asyncio.Task] = {}
+        self._runs: dict[str, _Run] = {}
         self._prefixes: dict[str, _Prefix] = {}
         self._prewarm_task: asyncio.Task | None = None
 
-    # -- a conversation, between turns ------------------------------------------------
+    # -- a conversation, from the start of a turn until a while after it ---------------
 
-    def begin_turn(self, session_id: str | None) -> None:
-        """Stop re-sending for a conversation whose next turn has arrived."""
-        task = self._sessions.pop(session_id or "", None)
-        if task:
-            task.cancel()
-
-    def end_turn(
+    def begin_turn(
         self,
         session_id: str | None,
         request_params: dict[str, Any],
-        sent_at: float,
         *,
         user: str | None,
         secret: bool,
     ) -> None:
-        """Keep the turn's last request readable for the keep-alive window.
+        """Start keeping a turn's FIRST request readable; it is about to be sent.
 
-        `sent_at` is when that request was sent, on this keeper's clock: the entry it
-        wrote lapses five minutes from then, not from when the turn finished.
+        The first request, not the last: the client replays a finished turn as one
+        assistant message and one message of tool results, which is not the shape the
+        tool loop sent it in, so the next turn's prompt matches this turn's requests only
+        up to the user's question. The entry ending there is the one the next turn reads,
+        and nothing later in the turn is known to restart its timer, so the re-sends run
+        from now, through the turn, until `end_turn`'s window closes.
         """
+        self._cancel(session_id)
         if self._keepalive_s <= 0 or not session_id:
             return
-        self.begin_turn(session_id)
-        if len(self._sessions) >= MAX_KEEPALIVE_SESSIONS:
+        if len(self._runs) >= MAX_KEEPALIVE_SESSIONS:
             logger.warning("Cache keep-alive skipped: too many conversations being kept")
             return
-        task = asyncio.get_running_loop().create_task(
-            self._keep_alive(session_id, request_params, sent_at, user, secret)
+        run = _Run(until=self._clock() + MAX_TURN_S)
+        run.task = asyncio.get_running_loop().create_task(
+            self._keep_alive(run, session_id, dict(request_params), user, secret)
         )
-        self._sessions[session_id] = task
-        task.add_done_callback(
-            lambda t: (
-                self._sessions.pop(session_id, None)
-                if self._sessions.get(session_id) is t
-                else None
+        self._runs[session_id] = run
+        run.task.add_done_callback(
+            lambda _: (
+                self._runs.pop(session_id, None) if self._runs.get(session_id) is run else None
             )
         )
 
+    def end_turn(self, session_id: str | None, *, answered: bool) -> None:
+        """The turn is over: keep its conversation for the keep-alive window from now.
+
+        Not when no model call of the turn was answered: the entry may never have been
+        written, and a re-send would then pay for writing it.
+        """
+        run = self._runs.get(session_id or "")
+        if run is None:
+            return
+        if answered:
+            run.until = self._clock() + self._keepalive_s
+        else:
+            self._cancel(session_id)
+
+    def _cancel(self, session_id: str | None) -> None:
+        run = self._runs.pop(session_id or "", None)
+        if run and run.task:
+            run.task.cancel()
+
     async def _keep_alive(
         self,
+        run: "_Run",
         session_id: str,
         request_params: dict[str, Any],
-        sent_at: float,
         user: str | None,
         secret: bool,
     ) -> None:
         ping = {**request_params, "max_tokens": 0}
-        until = self._clock() + self._keepalive_s
-        next_at = sent_at + KEEPALIVE_INTERVAL_S
+        next_at = self._clock() + KEEPALIVE_INTERVAL_S
         sent: list[Any] = []
         try:
-            while next_at < until:
+            while True:
                 await self._sleep(max(0.0, next_at - self._clock()))
+                if next_at >= run.until:
+                    break
                 next_at = self._clock() + KEEPALIVE_INTERVAL_S
                 message = await self._send(ping)
                 sent.append(message)
@@ -250,10 +275,10 @@ class PromptCacheKeeper:
         )
 
     async def close(self) -> None:
-        tasks = [*self._sessions.values()]
+        tasks = [run.task for run in self._runs.values() if run.task]
         if self._prewarm_task:
             tasks.append(self._prewarm_task)
-        self._sessions.clear()
+        self._runs.clear()
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -2330,8 +2330,12 @@ breakpoints take two different lifetimes:
 - **Block 1 and the replayed history take the 5-minute cache** (`_history_cache_control()`,
   1.25x input). Most of what a tool-heavy turn writes is read back within seconds, so the
   1-hour premium on it buys nothing. What the hour did buy — a reply 5 to 60 minutes later
-  reading the history instead of rewriting it — is kept by re-sending the turn's last request
-  with `max_tokens: 0` every 270 s for `CACHE_KEEPALIVE_MINUTES` after the turn ends. On Fable
+  reading the history instead of rewriting it — is kept by re-sending the turn's **first**
+  request with `max_tokens: 0` every 270 s, from the start of the turn until
+  `CACHE_KEEPALIVE_MINUTES` after it ends. The first request, because the browser replays a
+  finished turn as one assistant message plus one message of tool results, not in the shape
+  the tool loop sent it; the next turn's prompt therefore matches this turn's requests only up
+  to the user's question, and the entry ending there is the one it reads. On Fable
   a cache read is 0.025x input, so those re-sends cost far less than the premium. The next turn
   of the conversation cancels them; a re-send that writes more than it reads stops the run,
   because the entry had already lapsed. `CACHE_KEEPALIVE_MINUTES=0` turns the re-sends off and

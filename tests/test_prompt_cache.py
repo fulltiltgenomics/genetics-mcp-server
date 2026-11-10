@@ -76,10 +76,17 @@ class TestCacheUsage:
 
 
 class TestKeepAlive:
-    async def test_re_sends_the_turns_last_request_until_the_window_closes(self):
+    def _begin(self, h, session_id="s1"):
+        h.keeper.begin_turn(session_id, REQUEST, user="u1", secret=False)
+
+    async def _finish(self, h):
+        await asyncio.gather(*(run.task for run in h.keeper._runs.values()))
+
+    async def test_re_sends_the_turns_first_request_until_the_window_closes(self):
         h = _Harness()
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user="u1", secret=False)
-        await asyncio.gather(*h.keeper._sessions.values())
+        self._begin(h)
+        h.keeper.end_turn("s1", answered=True)
+        await self._finish(h)
 
         # every 270s while under the 1200s window: the last one keeps the entry to 1380s
         assert [t for t, _ in h.sent] == [270.0, 540.0, 810.0, 1080.0]
@@ -91,40 +98,74 @@ class TestKeepAlive:
                 {"model": "claude-fable-5-2", "session_id": "s1", "user": "u1", "secret": False},
             )
         ]
-        assert h.keeper._sessions == {}
+        assert h.keeper._runs == {}
 
-    async def test_the_first_re_send_is_timed_from_when_the_request_went_out(self):
-        """The entry lapses five minutes after the request STARTED; a long final answer
-        has used most of that by the time the turn ends."""
+    async def test_the_request_is_kept_as_it_was_when_the_turn_began(self):
+        """The tool loop goes on to change the same dict; the entry the next turn reads
+        is the one the first request wrote."""
         h = _Harness()
-        h.now = 200.0
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user=None, secret=False)
-        await asyncio.gather(*h.keeper._sessions.values())
-        assert h.sent[0][0] == 270.0
+        params = dict(REQUEST)
+        h.keeper.begin_turn("s1", params, user=None, secret=False)
+        params["messages"] = [*params["messages"], {"role": "assistant", "content": "more"}]
+        params["tool_choice"] = {"type": "none"}
+        h.keeper.end_turn("s1", answered=True)
+        await self._finish(h)
+        assert h.sent[0][1] == {**REQUEST, "max_tokens": 0}
+
+    async def test_a_long_turn_is_kept_while_it_runs_and_the_window_starts_at_its_end(self):
+        h = _Harness(stop_after=3)
+        self._begin(h)
+        await h.done.wait()
+        # three re-sends in, the turn ends
+        assert [t for t, _ in h.sent] == [270.0, 540.0, 810.0]
+        h.keeper.end_turn("s1", answered=True)
+        ended = h.now
+        await self._finish(h)
+        assert h.sent[-1][0] < ended + 1200.0 <= h.sent[-1][0] + 270.0
+
+    async def test_a_turn_that_never_reports_its_end_is_given_up(self):
+        h = _Harness()
+        self._begin(h)
+        await self._finish(h)
+        assert h.sent[-1][0] < prompt_cache.MAX_TURN_S
+        assert h.keeper._runs == {}
 
     async def test_the_next_turn_stops_it_and_what_was_sent_is_still_recorded(self):
         h = _Harness(stop_after=2)
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user="u1", secret=False)
-        task = h.keeper._sessions["s1"]
+        self._begin(h)
+        task = h.keeper._runs["s1"].task
         await h.done.wait()
-        h.keeper.begin_turn("s1")
+        self._begin(h)
         await asyncio.gather(task, return_exceptions=True)
 
         assert task.cancelled()
-        assert len(h.sent) == 2
-        assert [(kind, n) for kind, n, _ in h.spend] == [("keep-alive", 2)]
+        assert h.spend[0][:2] == ("keep-alive", 2)
+        # the new turn has a run of its own
+        assert h.keeper._runs["s1"].task is not task
+        await h.keeper.close()
+
+    async def test_a_turn_no_model_call_answered_is_not_kept(self):
+        h = _Harness()
+        self._begin(h)
+        task = h.keeper._runs["s1"].task
+        h.keeper.end_turn("s1", answered=False)
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+        assert h.sent == [] and h.keeper._runs == {}
 
     async def test_stops_when_a_re_send_writes_instead_of_reading(self):
         h = _Harness(replies=[_message(), _message(read=0, written=5000)])
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user=None, secret=False)
-        await asyncio.gather(*h.keeper._sessions.values())
+        self._begin(h)
+        h.keeper.end_turn("s1", answered=True)
+        await self._finish(h)
         assert len(h.sent) == 2
         assert [(kind, n) for kind, n, _ in h.spend] == [("keep-alive", 2)]
 
     async def test_a_failed_re_send_ends_the_run_quietly(self):
         h = _Harness(replies=[RuntimeError("overloaded")])
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user=None, secret=False)
-        await asyncio.gather(*h.keeper._sessions.values())
+        self._begin(h)
+        h.keeper.end_turn("s1", answered=True)
+        await self._finish(h)
         assert len(h.sent) == 1
         assert h.spend == []
 
@@ -133,18 +174,9 @@ class TestKeepAlive:
         self, session_id, keepalive_s
     ):
         h = _Harness(keepalive_s=keepalive_s)
-        h.keeper.end_turn(session_id, REQUEST, sent_at=0.0, user=None, secret=False)
-        assert h.keeper._sessions == {}
-
-    async def test_a_new_turn_end_replaces_the_previous_run(self):
-        h = _Harness()
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user=None, secret=False)
-        first = h.keeper._sessions["s1"]
-        h.keeper.end_turn("s1", REQUEST, sent_at=0.0, user=None, secret=False)
-        await asyncio.gather(first, return_exceptions=True)
-        assert first.cancelled()
-        assert h.keeper._sessions["s1"] is not first
-        await h.keeper.close()
+        h.keeper.begin_turn(session_id, REQUEST, user=None, secret=False)
+        h.keeper.end_turn(session_id, answered=True)
+        assert h.keeper._runs == {}
 
 
 class TestPrewarm:
