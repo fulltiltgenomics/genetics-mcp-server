@@ -2773,6 +2773,8 @@ async def main():
             json.dump([asdict(m) for m in all_metrics], f, indent=2, default=str)
         logger.info(f"  Wrote metrics to {metrics_path}")
 
+    # genetics-results-suite's monitor alerts unless it finds this exact line from last night's
+    # run (scripts/monitor/health.py, ANALYSIS_DONE_LINE); keep it last and change both together
     logger.info("Done!")
     # a failed categorization batch is the one part of the run that is not
     # retried within the run; a non-zero exit lets the CronJob's OnFailure
