@@ -388,7 +388,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_gene_expression",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get tissue-specific gene expression levels from bulk-tissue resources (e.g. GTEx). Returns expression data across tissues. Use this to understand where a gene is expressed.",
+        "description": "Get tissue-specific gene expression levels from bulk-tissue resources: GTEx RNA (median TPM per tissue) and Human Protein Atlas protein (IHC staining category per tissue and cell type; HPA covers only part of the genome). Use this to understand where a gene is expressed.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -798,7 +798,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "get_colocalization",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get colocalization results for a variant. Returns trait pairs that share the same causal signal at this locus. Use this to find traits that may share biological mechanisms.",
+        "description": "Get colocalization results for a variant. Returns the trait pairs where the variant is a member of the credible set of either trait; it need not be the lead variant. Use this to find traits that may share biological mechanisms.",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -811,7 +811,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "get_colocalization_by_credible_set",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get the credible sets that colocalize with ONE specific credible set, identified by resource + phenotype + cs_id. Use this after get_credible_sets_by_gene/_by_variant/_by_region has given you a cs_id and you want that signal's colocalizations specifically — get_colocalization takes a variant and returns everything colocalizing at the position, which mixes in other signals at the same locus.",
+        "description": "Get the credible sets that colocalize with ONE specific credible set, identified by resource + phenotype + cs_id. Use this after get_credible_sets_by_gene/_by_variant/_by_region has given you a cs_id and you want that signal's colocalizations specifically — get_colocalization takes a variant and returns every pair with that variant in either credible set, which mixes in the other signals the variant belongs to.",
         "parameters": {
             "resource": {
                 "type": "string",

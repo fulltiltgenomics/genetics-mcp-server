@@ -1277,7 +1277,9 @@ class ToolExecutor:
         if not codes:
             return {"success": False, "error": "No phenotype codes provided"}
 
-        resp = await self.client.get(f"{self.base_url}/v1/trait_name_mapping")
+        resp = await self.client.get(
+            f"{self.base_url}/v1/trait_name_mapping", params={"format": "json"}
+        )
         if resp.status_code == 200:
             full_mapping = resp.json()
             result = {code: full_mapping.get(code, f"Unknown: {code}") for code in codes}
