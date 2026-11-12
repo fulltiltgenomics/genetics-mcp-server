@@ -442,6 +442,13 @@ _EPMC_SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 # doi.org links and publisher pages that carry the DOI in a /doi/ path segment (pnas.org,
 # science.org, ...)
 _DOI_IN_URL = re.compile(r"(?:doi\.org/|/doi/(?:abs/|full/|pdf/|epdf/)?)(10\.\d{4,9}/[^?#\s]+)")
+# PubMed is also served from mirror hosts (pubmed-d.ncbi.nlm.nih.gov) and the old /pubmed/ path
+_PUBMED_URL = re.compile(r"(?:pubmed[\w-]*\.ncbi\.nlm\.nih\.gov|ncbi\.nlm\.nih\.gov/pubmed)/(\d+)")
+# identifiers as Perplexity writes them into its summary prose
+_DOI_IN_PROSE = re.compile(r"\b(10\.\d{4,9}/[^\s\]\[)(<>\"',;]+)")
+_PMID_IN_PROSE = re.compile(r"\bPMID:?\s*(\d{6,9})\b", re.IGNORECASE)
+# a summary names a handful of identifiers; the cap bounds the batch query, not the norm
+_SUMMARY_ID_LIMIT = 15
 # nature.com article slugs are the DOI suffix under the 10.1038 prefix
 _NATURE_ARTICLE = re.compile(r"nature\.com/articles/([A-Za-z0-9._-]+?)(?:\.pdf)?(?:[/?#]|$)")
 # bioRxiv/medRxiv content paths embed the DOI followed by a version and a view suffix
@@ -488,10 +495,9 @@ _TITLE_PREFIX_MIN_WORDS = 6
 def _literature_ids_from_url(url: str) -> tuple[str | None, str | None, str | None]:
     """(pmid, doi, pmcid) recoverable from a hit's URL."""
     pmid = doi = pmcid = None
-    if "pubmed.ncbi.nlm.nih.gov/" in url:
-        match = re.search(r"/(\d+)", url)
-        if match:
-            pmid = match.group(1)
+    match = _PUBMED_URL.search(url)
+    if match:
+        pmid = match.group(1)
     for pattern, prefix in ((_DOI_IN_URL, ""), (_RXIV_CONTENT, ""), (_NATURE_ARTICLE, "10.1038/")):
         match = pattern.search(url)
         if match:
@@ -628,8 +634,62 @@ def _is_database_page(url: str) -> bool:
 _SUMMARY_MARKER = re.compile(r"\[(\d+)\]")
 _SUMMARY_NOTE = (
     "AI-generated prose by Perplexity: its claims belong to Perplexity, not to any paper; "
-    "check each against the record its [n] resolves to in summary_citations."
+    "check each against the record its [n] resolves to in summary_citations. A DOI or PMID "
+    "written in the prose is real only if a results record carries it or summary_identifiers "
+    "lists it as verified."
 )
+
+
+def _summary_identifier_stubs(summary: str, results: list[dict]) -> list[dict]:
+    """One lookup stub per DOI or PMID the summary prose names that no hit's URL gave."""
+    known = {str(r.get(key)).lower() for r in results for key in ("doi", "pmid") if r.get(key)}
+    stubs: dict[str, dict] = {}
+    for match in _PMID_IN_PROSE.finditer(summary):
+        stubs.setdefault(match.group(1), {"pmid": match.group(1)})
+    for match in list(_PUBMED_URL.finditer(summary)):
+        stubs.setdefault(match.group(1), {"pmid": match.group(1)})
+    for match in _DOI_IN_PROSE.finditer(summary):
+        doi = match.group(1).rstrip(".")
+        stubs.setdefault(doi.lower(), {"doi": doi})
+    return [
+        # batch_only: these ride the hits' one batched lookup and get no follow-up of their
+        # own, so the summary's identifiers cannot lengthen a search
+        {**stub, "title": "", "url": "", "batch_only": True}
+        for key, stub in stubs.items()
+        if key not in known
+    ][:_SUMMARY_ID_LIMIT]
+
+
+def _summary_identifiers(stubs: list[dict], results: list[dict]) -> list[dict]:
+    """The stubs after hydration, as the result reports them."""
+    known = {str(r.get(key)).lower() for r in results for key in ("doi", "pmid") if r.get(key)}
+    out = []
+    for stub in stubs:
+        verified = stub.get("record_kind") == "europepmc"
+        ids = {k: stub[k] for k in ("doi", "pmid") if stub.get(k)}
+        # hydration fills in a hit's missing ids, so one may now be a ranked record's own
+        if any(str(v).lower() in known for v in ids.values()):
+            continue
+        if verified:
+            pmid, doi = stub.get("pmid"), stub.get("doi")
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else f"https://doi.org/{doi}"
+            # a citation needs the lead authors, and a consortium paper lists hundreds
+            names = (stub.get("authors") or "").rstrip(".").split(", ")
+            authors = ", ".join(names[:3]) + (", et al." if len(names) > 3 else "")
+            out.append(
+                {
+                    **ids,
+                    "verified": True,
+                    "title": stub.get("title"),
+                    "authors": authors,
+                    "journal": stub.get("journal"),
+                    "year": stub.get("year"),
+                    "url": url,
+                }
+            )
+        else:
+            out.append({**ids, "verified": False})
+    return out
 
 
 def _summary_markers(summary: str) -> list[int]:
@@ -958,10 +1018,15 @@ class ServerToolExecutor(ToolExecutor):
             data = resp.json()
             formatted = self._format_perplexity_literature_results(data, query, max_results)
             snapshot = copy.deepcopy(formatted["results"])
+            stubs = _summary_identifier_stubs(formatted["summary"], formatted["results"])
             try:
                 await self._hydrate_literature_metadata(
-                    [r for r in formatted["results"] if r["record_kind"] != "cited_only"]
+                    [r for r in formatted["results"] if r["record_kind"] != "cited_only"] + stubs
                 )
+                if stubs:
+                    formatted["summary_identifiers"] = _summary_identifiers(
+                        stubs, formatted["results"]
+                    )
             except Exception:
                 logger.warning("Literature metadata hydration failed", exc_info=True)
                 formatted["results"] = snapshot
@@ -1068,7 +1133,7 @@ class ServerToolExecutor(ToolExecutor):
         missed: dict[str, dict] = {}
         for record in results:
             query = _single_record_query(record)
-            if query and not self._europepmc_match(record, by_id):
+            if query and not record.get("batch_only") and not self._europepmc_match(record, by_id):
                 missed.setdefault(query, record)
         idless = [r for r in results if not _batch_clause(r) and title_searchable(r)]
         id_queries = list(missed.items())[:_HYDRATION_LOOKUP_LIMIT]
@@ -1264,7 +1329,9 @@ class ServerToolExecutor(ToolExecutor):
                 {
                     "title": strip_html(paper.get("title", "")),
                     "authors": paper.get("authorString", ""),
-                    "journal": paper.get("journalTitle", "")
+                    # a core record nests the title; the lite shape has it flat
+                    "journal": paper.get("journalTitle")
+                    or ((paper.get("journalInfo") or {}).get("journal") or {}).get("title")
                     or paper.get("bookOrReportDetails", {}).get("publisher", ""),
                     "year": paper.get("pubYear", ""),
                     "abstract": strip_html(paper.get("abstractText", "") or "")[

@@ -496,6 +496,8 @@ class TestLiteratureIdsFromUrl:
                 (None, None, None),
             ),
             ("https://connect.biorxiv.org/relate/feed/214", (None, None, None)),
+            ("https://pubmed-d.ncbi.nlm.nih.gov/21983784/", ("21983784", None, None)),
+            ("https://www.ncbi.nlm.nih.gov/pubmed/21983784", ("21983784", None, None)),
         ],
     )
     def test_ids(self, url, expected):
@@ -903,3 +905,80 @@ class TestSummaryCitations:
             "record_kind": "europepmc",
         }
         assert result["summary_citations"][2]["record_kind"] == "cited_only"
+
+
+class TestSummaryIdentifiers:
+    """DOIs and PMIDs the Perplexity prose names are checked in the hits' own batch lookup."""
+
+    SUMMARY = (
+        "Sun et al. 2023 (doi: 10.1038/s41586-023-06592-6). Also PMID: 34580418 [1], "
+        "and an invented one, https://doi.org/10.9999/not.a.paper."
+    )
+
+    async def _run(self, sent):
+        def handle(request: httpx.Request) -> httpx.Response:
+            sent.append(request.url.params["query"])
+            return httpx.Response(
+                200,
+                json={
+                    "hitCount": 2,
+                    "resultList": {
+                        "result": [
+                            EPMC_RESPONSE["resultList"]["result"][0],
+                            {
+                                "pmid": "37794186",
+                                "doi": "10.1038/s41586-023-06592-6",
+                                "title": "Plasma proteomic associations",
+                                "authorString": "Sun BB, Chiou J.",
+                                "journalInfo": {"journal": {"title": "Nature"}},
+                                "pubYear": "2023",
+                                "source": "MED",
+                            },
+                        ]
+                    },
+                },
+            )
+
+        executor = _executor_with_transport(handle)
+        try:
+            data = {
+                "choices": [{"message": {"content": self.SUMMARY}}],
+                "search_results": PERPLEXITY_RESPONSE["search_results"][:1],
+            }
+            formatted = executor._format_perplexity_literature_results(data, "q", 10)
+            stubs = orchestration._summary_identifier_stubs(self.SUMMARY, formatted["results"])
+            await executor._hydrate_literature_metadata(formatted["results"] + stubs)
+        finally:
+            await executor.close()
+        return orchestration._summary_identifiers(stubs, formatted["results"])
+
+    async def test_a_named_paper_is_verified_and_an_invented_one_is_not(self):
+        sent: list[str] = []
+        identifiers = await self._run(sent)
+
+        assert identifiers == [
+            {
+                "doi": "10.1038/s41586-023-06592-6",
+                "pmid": "37794186",
+                "verified": True,
+                "title": "Plasma proteomic associations",
+                "authors": "Sun BB, Chiou J",
+                "journal": "Nature",
+                "year": "2023",
+                "url": "https://pubmed.ncbi.nlm.nih.gov/37794186/",
+            },
+            {"doi": "10.9999/not.a.paper", "verified": False},
+        ]
+
+    async def test_the_summary_identifiers_cost_no_request_of_their_own(self):
+        sent: list[str] = []
+        await self._run(sent)
+
+        # the invented DOI is missed by the batch and still gets no follow-up
+        assert len(sent) == 1
+        assert "10.9999/not.a.paper" in sent[0] and "EXT_ID:34580418" in sent[0]
+
+    def test_an_identifier_a_hit_already_carries_is_not_listed(self):
+        hits = [{"pmid": "34580418", "doi": None}]
+        stubs = orchestration._summary_identifier_stubs("PMID 34580418 again.", hits)
+        assert stubs == []
