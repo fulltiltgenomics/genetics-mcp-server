@@ -1305,6 +1305,19 @@ class TestQualityEvaluation:
         assert "[ASSISTANT]" in text
         assert "BRCA1" in text
 
+    def test_format_marks_a_refused_request_where_it_happened(self, sample_db):
+        _, messages = load_data(sample_db)
+        times = sorted(
+            str(t) for t in messages.filter(pl.col("session_id") == "s1")["created_at"].to_list()
+        )
+        text = _format_conversation_for_eval(
+            "s1", messages, refusals=[("0000", "too_large"), ("9999", "rate_limited")]
+        )
+        assert len(times) >= 1
+        assert text.startswith("[SERVICE NOTICE]") and "request size cap" in text.split("[USER]")[0]
+        assert text.rstrip().endswith("the assistant never received it.")
+        assert "rate limit" in text.rsplit("[SERVICE NOTICE]", 1)[1]
+
     def test_format_truncates_long_messages(self, sample_db):
         _, messages = load_data(sample_db)
         text = _format_conversation_for_eval("s1", messages, max_chars=100)

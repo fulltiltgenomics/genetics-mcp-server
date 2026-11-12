@@ -703,9 +703,13 @@ class ServerToolExecutor(ToolExecutor):
                 "stage": "internal",
                 "error": INTERNAL_ERROR_MSG,
             }
+        from genetics_mcp_server.tools.alphagenome import fit_to_budget
+
         # the label spreads LAST: it is the one thing a client response must not be able
         # to overwrite, and no key of the client's collides with it today
-        return {**result, **_ALPHAGENOME_LABEL}
+        labelled = {**result, **_ALPHAGENOME_LABEL}
+        # headroom for the truncation notice the caller's own cap reserves
+        return fit_to_budget(labelled, _resolve_settings().mcp_max_result_size - 2000)
 
     async def compare_alphagenome_with_measured(
         self,

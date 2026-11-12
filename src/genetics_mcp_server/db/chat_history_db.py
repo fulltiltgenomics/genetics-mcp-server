@@ -376,6 +376,9 @@ class ChatHistoryDB(object, metaclass=Singleton):
         # before the turn died, a floor on what the turn cost. Spend is spend, so cost
         # aggregates take every outcome; a per-turn distribution filters on 'complete',
         # or a cut-off turn reads as a cheap one.
+        # 'rate_limited' and 'too_large' are requests chat_api refused before a turn
+        # began: all-zero rows that exist so a saved user message with no reply can be
+        # told from a turn that died.
         cursor.execute(f"CREATE TABLE IF NOT EXISTS chat_turn_metrics ({_TURN_METRICS_COLUMNS})")
         self._relax_turn_metrics_columns(cursor)
 

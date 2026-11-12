@@ -339,6 +339,47 @@ class TestChatEndpoint:
 
         assert response.status_code == 413
 
+    def test_size_refusal_is_recorded_as_a_turn_row(self, test_client):
+        with patch("genetics_mcp_server.chat_api.get_chat_history_db") as get_db:
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={
+                    "messages": [{"role": "user", "content": "x" * 50001}],
+                    "session_id": "s-refused",
+                    "message_id": "m-refused",
+                },
+            )
+        assert response.status_code == 413
+        fields = get_db.return_value.record_turn_metrics.call_args.kwargs
+        assert (fields["outcome"], fields["session_id"], fields["message_id"]) == (
+            "too_large",
+            "s-refused",
+            "m-refused",
+        )
+        assert fields["cost_usd"] == 0.0
+
+    def test_rate_limit_refusal_says_when_it_lifts_and_is_recorded(self, test_client, monkeypatch):
+        monkeypatch.setattr(rate_limit, "_max_per_hour", 0)
+        with patch("genetics_mcp_server.chat_api.get_chat_history_db") as get_db:
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={"messages": [{"role": "user", "content": "hi"}], "session_id": "s-limited"},
+            )
+        assert response.status_code == 429
+        assert "lifts in about 1 h" in response.json()["detail"]
+        assert int(response.headers["retry-after"]) > 0
+        assert get_db.return_value.record_turn_metrics.call_args.kwargs["outcome"] == "rate_limited"
+
+    def test_refusal_of_a_secret_chat_leaves_no_row(self, test_client, monkeypatch):
+        monkeypatch.setattr(rate_limit, "_max_per_hour", 0)
+        with patch("genetics_mcp_server.chat_api.get_chat_history_db") as get_db:
+            response = test_client.post(
+                "/chat/v1/chat",
+                json={"messages": [{"role": "user", "content": "hi"}], "secret": True},
+            )
+        assert response.status_code == 429
+        get_db.return_value.record_turn_metrics.assert_not_called()
+
     @staticmethod
     def _reference_block(preview: str = "a\tb\n1\t2\n") -> dict:
         return {
