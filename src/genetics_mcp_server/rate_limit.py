@@ -37,31 +37,48 @@ def configure(max_per_hour: int, max_per_day: int, max_per_week: int) -> None:
     )
 
 
-def check_rate_limit(user: str) -> tuple[bool, str | None]:
+def _wait_text(seconds: float) -> str:
+    minutes = max(1, -(-int(seconds) // 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} h {rest} min" if rest else f"{hours} h"
+    days, hours = divmod(hours, 24)
+    return f"{days} d {hours} h" if hours else f"{days} d"
+
+
+def check_rate_limit(user: str) -> tuple[bool, str | None, int | None]:
     """Check if user is within the hourly, daily and weekly rate limits.
 
-    Returns (allowed, reason) where reason is None if allowed or a description of which limit was hit.
+    Returns (allowed, reason, retry_after_s). For a refusal, reason names the limit and how
+    long until it lifts, and retry_after_s is that wait in seconds; both are None if allowed.
     """
     now = time.monotonic()
-    week_cutoff = now - _WEEK
-    day_cutoff = now - _DAY
-    hour_cutoff = now - _HOUR
 
     with _lock:
         # the weekly window is the longest, so it bounds what is worth keeping
-        _requests[user] = timestamps = [t for t in _requests[user] if t > week_cutoff]
+        _requests[user] = timestamps = [t for t in _requests[user] if t > now - _WEEK]
 
-        hour_count = sum(1 for t in timestamps if t > hour_cutoff)
-        day_count = sum(1 for t in timestamps if t > day_cutoff)
+        # a refusal reports the longest wait among the limits it hit: quoting the hourly
+        # one to a user who is also over the daily one promises a retry that will fail
+        refusal: tuple[float, str] | None = None
+        for window, limit, name in (
+            (_HOUR, _max_per_hour, "hourly limit {}/hour"),
+            (_DAY, _max_per_day, "daily limit {}/day"),
+            (_WEEK, _max_per_week, "weekly limit {}/week"),
+        ):
+            in_window = [t for t in timestamps if t > now - window]
+            if len(in_window) < limit:
+                continue
+            # the request that must age out before one more fits; a limit of 0 never lifts
+            wait = in_window[len(in_window) - limit] + window - now if limit > 0 else window
+            if refusal is None or wait > refusal[0]:
+                refusal = (wait, name.format(limit))
 
-        if hour_count >= _max_per_hour:
-            return False, f"hourly limit {_max_per_hour}/hour"
-
-        if day_count >= _max_per_day:
-            return False, f"daily limit {_max_per_day}/day"
-
-        if len(timestamps) >= _max_per_week:
-            return False, f"weekly limit {_max_per_week}/week"
+        if refusal is not None:
+            wait, name = refusal
+            return False, f"{name}, lifts in about {_wait_text(wait)}", max(1, int(wait) + 1)
 
         timestamps.append(now)
-        return True, None
+        return True, None, None

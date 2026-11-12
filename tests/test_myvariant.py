@@ -92,46 +92,53 @@ class TestFlattenMyvariantResult:
         }
         assert set(result["clinvar"]["conditions"]) == {"Breast cancer", "Ovarian cancer"}
 
-    def test_cadd(self):
+    def test_cadd_comes_from_dbnsfp_on_hg38(self):
+        data = {"dbnsfp": {"cadd": {"phred": 23.0, "raw_score": 3.6, "raw_rankscore": 0.5}}}
+        result = ToolExecutor._flatten_myvariant_result(data)
+        assert result["cadd"] == {"phred": 23.0, "raw_score": 3.6}
+
+    def test_top_level_cadd_wins_when_an_index_has_it(self):
         data = {
-            "cadd": {
-                "phred": 25.3,
-                "rawscore": 4.5,
-                "consequence": "NON_SYNONYMOUS",
-            }
+            "cadd": {"phred": 25.3, "rawscore": 4.5, "consequence": "NON_SYNONYMOUS"},
+            "dbnsfp": {"cadd": {"phred": 1.0}},
         }
         result = ToolExecutor._flatten_myvariant_result(data)
-        assert result["cadd"]["phred"] == 25.3
-        assert result["cadd"]["raw_score"] == 4.5
-        assert result["cadd"]["consequence"] == "NON_SYNONYMOUS"
+        assert result["cadd"] == {"phred": 25.3, "raw_score": 4.5, "consequence": "NON_SYNONYMOUS"}
 
     def test_dbnsfp_predictions(self):
+        # shapes as the hg38 index answers them: polyphen2 nested per model, metalr with
+        # `rankscore`, per-transcript lists
         data = {
             "dbnsfp": {
-                "sift": {"score": 0.01, "pred": "D"},
-                "polyphen2": {"score": 0.99, "pred": "D"},
-                "mutationtaster": {"score": 0.95, "pred": "D", "converted_rankscore": 0.88},
-                "genename": "PCSK9",
+                "sift": {"score": 0.01, "pred": "D", "converted_rankscore": 0.9},
+                "polyphen2": {
+                    "hdiv": {"score": 0.971, "pred": "D", "rankscore": 0.57},
+                    "hvar": {"score": 0.943, "pred": "D", "rankscore": 0.68},
+                },
+                "metalr": {"score": 0.0855, "pred": "T", "rankscore": 0.33},
+                "revel": {"score": 0.931, "rankscore": 0.98},
+                "alphamissense": {"score": [0.98, 0.99], "pred": ["P", "P"], "rankscore": 0.97},
+                "mutationtaster": {"score": [1.0, 1.0], "pred": ["N", "N"]},
+                "genename": ["PCSK9", "PCSK9"],
             }
         }
-        result = ToolExecutor._flatten_myvariant_result(data)
-        assert result["functional_predictions"]["sift"]["score"] == 0.01
-        assert result["functional_predictions"]["sift"]["prediction"] == "D"
-        assert result["functional_predictions"]["polyphen2"]["score"] == 0.99
-        assert result["functional_predictions"]["mutationtaster"]["rankscore"] == 0.88
-        assert result["gene"] == "PCSK9"
+        preds = ToolExecutor._flatten_myvariant_result(data)["functional_predictions"]
+        assert preds["sift"] == {"score": 0.01, "prediction": "D", "rankscore": 0.9}
+        assert preds["polyphen2_hdiv"] == {"score": 0.971, "prediction": "D", "rankscore": 0.57}
+        assert preds["polyphen2_hvar"]["score"] == 0.943
+        assert preds["metalr"]["rankscore"] == 0.33
+        assert preds["revel"] == {"score": 0.931, "rankscore": 0.98}
+        assert preds["alphamissense"] == {
+            "score": [0.98, 0.99],
+            "prediction": "P",
+            "rankscore": 0.97,
+        }
+        assert preds["mutationtaster"] == {"score": 1.0, "prediction": "N"}
+        assert ToolExecutor._flatten_myvariant_result(data)["gene"] == "PCSK9"
 
-    def test_cosmic(self):
-        data = {"cosmic": {"cosmic_id": "COSM12345", "tumor_site": "lung"}}
-        result = ToolExecutor._flatten_myvariant_result(data)
-        assert result["cosmic"]["cosmic_id"] == "COSM12345"
-        assert result["cosmic"]["tumor_site"] == "lung"
-
-    def test_civic(self):
-        data = {"civic": {"variant_id": 42, "name": "V600E", "entrez_name": "BRAF"}}
-        result = ToolExecutor._flatten_myvariant_result(data)
-        assert result["civic"]["variant_id"] == 42
-        assert result["civic"]["gene"] == "BRAF"
+    def test_a_variant_dbnsfp_does_not_cover_has_no_scores(self):
+        result = ToolExecutor._flatten_myvariant_result({"dbsnp": {"rsid": "rs12740374"}})
+        assert result == {"rsid": "rs12740374"}
 
     def test_dbsnp_rsid(self):
         data = {"dbsnp": {"rsid": "rs429358"}}

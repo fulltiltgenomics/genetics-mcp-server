@@ -206,8 +206,8 @@ The variant annotation sources are complementary. Use the right one based on wha
 |--------|------|----------------------|
 | FinnGen | `get_variant_annotations` | FinnGen allele frequency, variant consequence, rsID, exome/genome enrichment |
 | gnomAD 4.1.1 | `get_variant_annotations` with `source='gnomad'`; `gnomad_variant_annotation_v` in the database for bulk questions and joins | Allele frequency overall and per genetic ancestry group, VEP consequence and gene, rsID, site filters |
-| gnomAD browser | gnomAD MCP tools | Live browser-level detail the view does not hold: gene constraint (pLI/LOEUF), coverage, structural variants |
-| myvariant.info | `get_myvariant_annotations` | Clinical significance (ClinVar), pathogenicity scores (CADD), functional predictions (SIFT, PolyPhen2), cancer annotations (COSMIC, CIViC) |
+| gnomAD browser | gnomAD MCP tools | Live browser-level detail the view does not hold: gene constraint (pLI/LOEUF), coverage, structural variants, and CADD and other in-silico predictors for any variant, coding or not (`get_variant_details`) |
+| myvariant.info | `get_myvariant_annotations` | Clinical significance (ClinVar) for any variant; for protein-altering SNVs only, CADD and functional predictions (REVEL, AlphaMissense, SIFT, PolyPhen2) |
 | UniProt | `get_protein_annotations` / `map_protein_variants` / `search_uniprot` | Protein-level context: domains, active/binding sites, PTMs, isoforms, sequence, and protein-position ↔ genomic-coordinate mapping |
 
 - For a comprehensive variant characterization, you may need to call multiple sources

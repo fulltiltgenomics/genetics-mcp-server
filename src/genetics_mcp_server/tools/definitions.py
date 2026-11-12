@@ -388,7 +388,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_gene_expression",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get tissue-specific gene expression levels from bulk-tissue resources (e.g. GTEx). Returns expression data across tissues. Use this to understand where a gene is expressed.",
+        "description": "Get tissue-specific gene expression levels from bulk-tissue resources: GTEx RNA (median TPM per tissue) and Human Protein Atlas protein (IHC staining category per tissue and cell type; HPA covers only part of the genome). Use this to understand where a gene is expressed.",
         "parameters": {
             "gene": {
                 "type": "string",
@@ -798,7 +798,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "get_colocalization",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get colocalization results for a variant. Returns trait pairs that share the same causal signal at this locus. Use this to find traits that may share biological mechanisms.",
+        "description": "Get colocalization results for a variant. Returns the trait pairs where the variant is a member of the credible set of either trait; it need not be the lead variant. Use this to find traits that may share biological mechanisms.",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -811,7 +811,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "get_colocalization_by_credible_set",
         "group": "results",
         "sdk_replaceable": True,
-        "description": "Get the credible sets that colocalize with ONE specific credible set, identified by resource + phenotype + cs_id. Use this after get_credible_sets_by_gene/_by_variant/_by_region has given you a cs_id and you want that signal's colocalizations specifically — get_colocalization takes a variant and returns everything colocalizing at the position, which mixes in other signals at the same locus.",
+        "description": "Get the credible sets that colocalize with ONE specific credible set, identified by resource + phenotype + cs_id. Use this after get_credible_sets_by_gene/_by_variant/_by_region has given you a cs_id and you want that signal's colocalizations specifically — get_colocalization takes a variant and returns every pair with that variant in either credible set, which mixes in the other signals the variant belongs to.",
         "parameters": {
             "resource": {
                 "type": "string",
@@ -1567,7 +1567,7 @@ NEVER cite a ChEMBL id, pChEMBL value or activity count from memory — they mus
             "variants": {
                 "type": ["string", "array"],
                 "items": {"type": "string"},
-                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 25 per call, and one call per variant is the expensive mistake here. A variant the model cannot score comes back as its own failed row, leaving the rest of the batch intact.",
+                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 10 per call, and one call per variant is the expensive mistake here. A variant the model cannot score comes back as its own failed row, leaving the rest of the batch intact. A batch too large to return whole comes back with shorter track and gene lists and says so in `detail`; every variant keeps its strongest value and quantile per modality, and a single-variant call returns every track and gene.",
                 "required": True,
             },
             "cell_type": {
@@ -1625,7 +1625,7 @@ HOW TO READ THE RESULT. It carries BOTH kinds of number, so the envelope has no 
             "variants": {
                 "type": ["string", "array"],
                 "items": {"type": "string"},
-                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 25 per call.",
+                "description": "GRCh38 variants as chr:pos:ref:alt, e.g. ['19:44908684:T:C']. A leading 'chr' is accepted and X may be spelled 23. Pass a list and batch them: at most 10 per call.",
                 "required": True,
             },
             "cell_type": {
@@ -2034,18 +2034,18 @@ Returns (source=finngen): variant ID, chromosome, position, ref/alt alleles, all
         "description": """Get clinical and functional variant annotations from myvariant.info.
 
 Use this tool when:
-- The user asks about clinical significance or pathogenicity of a variant (ClinVar data)
-- The user wants deleteriousness or pathogenicity scores (CADD scores)
-- The user wants functional impact predictions (SIFT, PolyPhen2, MutationTaster, etc.)
-- The user asks about cancer relevance of a variant (COSMIC, CIViC data)
+- The user asks about clinical significance or pathogenicity of a variant (ClinVar data; any variant type)
+- The user wants pathogenicity scores or functional impact predictions for a PROTEIN-ALTERING SNV: CADD, REVEL, AlphaMissense, SIFT, PolyPhen2, ClinPred, PrimateAI, MutationTaster
 - The user asks "is this variant pathogenic?" or "what is the clinical interpretation?"
 
 Do NOT use this tool for:
 - Population allele frequencies → use get_variant_annotations with source='gnomad' (or the gnomad_variant_annotation_v view for a list of variants) instead
 - Gene constraint scores (pLI, LOEUF) → use gnomAD MCP get_gene instead
 - FinnGen-specific annotations (AF, consequence, enrichment) → use get_variant_annotations instead
+- CADD for a non-coding variant or an indel → use gnomAD MCP get_variant_details instead. The scores here come from dbNSFP, which covers only missense, nonsense and splice-site SNVs, so for anything else `cadd` and `functional_predictions` are simply absent — that is "not covered here", never "no score exists"
+- Cancer annotations (COSMIC, CIViC) → not available: this tool queries GRCh38, where myvariant.info does not index them
 
-Returns: ClinVar clinical significance and conditions, CADD phred score, functional predictions (SIFT, PolyPhen2, MutationTaster, etc.), COSMIC cancer data, CIViC clinical evidence, and rsID.""",
+Returns: ClinVar clinical significance and conditions and rsID for any variant it knows; for a protein-altering SNV also the gene, CADD phred and raw score, and `functional_predictions` keyed by predictor (score, prediction, rankscore; polyphen2 as `polyphen2_hdiv` and `polyphen2_hvar`). A value that differs between transcripts comes back as a list.""",
         "parameters": {
             "variant": {
                 "type": "string",
@@ -2058,8 +2058,8 @@ Returns: ClinVar clinical significance and conditions, CADD phred score, functio
             },
             "fields": {
                 "type": "string",
-                "description": "Comma-separated annotation sources to query (default: clinvar,cadd,dbnsfp,cosmic,civic,dbsnp). Do not include gnomad_genome or gnomad_exome.",
-                "default": "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp",
+                "description": "Comma-separated annotation sources to query (default: clinvar,dbnsfp,dbsnp — the sources the GRCh38 index holds that this tool reports). Leave it unset; cadd, cosmic and civic are not indexed on GRCh38 and return nothing. Do not include gnomad_genome or gnomad_exome.",
+                "default": "clinvar,dbnsfp,dbsnp",
             },
         },
     },
@@ -2204,6 +2204,9 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "table rather than many. The result lists anything not delivered under "
             "artifacts_not_delivered with the reason; never describe a plot that was not "
             "shown or name a file the user was not offered.\n\n"
+            "A spreadsheet is written with xlsxwriter — `df.write_excel(path)` on a polars "
+            "frame, or `xlsxwriter.Workbook(path)` for several sheets, formats and "
+            "hyperlinks. There is no openpyxl and no way to read an .xlsx back.\n\n"
             "CONCURRENCY: at most 4 data requests may be in flight at once from one script. "
             "Going over answers 429 and, under `asyncio.gather`, loses the results of the "
             "requests that did succeed — batch at 4 and pass `return_exceptions=True`.\n\n"
@@ -3528,9 +3531,9 @@ def register_mcp_tools(
     async def get_myvariant_annotations(
         variant: str | None = None,
         variants: list[str] | None = None,
-        fields: str = "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp",
+        fields: str = "clinvar,dbnsfp,dbsnp",
     ) -> dict:
-        """Get clinical/functional variant annotations from myvariant.info (ClinVar, CADD, functional predictions, cancer data)."""
+        """Get clinical/functional variant annotations from myvariant.info (ClinVar; CADD and functional predictions for protein-altering SNVs)."""
         return await executor.get_myvariant_annotations(
             variant=variant, variants=variants, fields=fields
         )

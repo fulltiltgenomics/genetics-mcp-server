@@ -219,6 +219,7 @@ Now, looking only at the extracted data and literature above, provide your analy
     _Block("""
 - **Write one script with run_analysis when an answer needs several retrievals combined.** One script queries, joins, filters and summarises in a single call, and its intermediate rows never enter this conversation — so prefer it for a chain (fetch, fetch again keyed on the first result, aggregate) or when the intermediate data is large and only the summary matters. Call list_capabilities first for the exact SDK signatures rather than guessing, and print a SUMMARY — counts, top rows, the statistic asked for — rather than raw rows.
 - **One script means one chain of work, not everything at once.** A run is bounded by its wall clock and returns NOTHING when it overruns, so a script bundling five independent sections loses all five to the slowest; independent retrievals go in separate calls. Your own reply is bounded too, and a script long enough to exhaust it is discarded before it ever runs. If you are writing numbered section headers into a script, split it.
+- **Calls issued together cannot see each other's results.** A script that needs an identifier another call is still looking up — a lead variant, a credible-set id, a region — belongs in the same script as the lookup or in the next round; never fill the gap with a variant id or coordinates from memory.
 - For a question a single tool answers, call the tool. A script is not cheaper than one call.
 """),
     _Block(
@@ -435,8 +436,8 @@ Where each kind of evidence lives, and which tool reaches it.
 |--------|------|----------------------|
 | FinnGen | `get_variant_annotations` | FinnGen allele frequency, variant consequence, rsID, exome/genome enrichment |
 | gnomAD 4.1.1 | `get_variant_annotations` with `source='gnomad'`; `gnomad_variant_annotation_v` in the database for bulk questions and joins | Allele frequency overall and per genetic ancestry group, VEP consequence and gene, rsID, site filters |
-| gnomAD browser | gnomAD MCP tools | Live browser-level detail the view does not hold: gene constraint (pLI/LOEUF), coverage, structural variants |
-| myvariant.info | `get_myvariant_annotations` | Clinical significance (ClinVar), pathogenicity scores (CADD), functional predictions (SIFT, PolyPhen2), cancer (COSMIC, CIViC) |
+| gnomAD browser | gnomAD MCP tools | Live browser-level detail the view does not hold: gene constraint (pLI/LOEUF), coverage, structural variants, and CADD and other in-silico predictors for any variant, coding or not (`get_variant_details`) |
+| myvariant.info | `get_myvariant_annotations` | Clinical significance (ClinVar) for any variant; for protein-altering SNVs only, CADD and functional predictions (REVEL, AlphaMissense, SIFT, PolyPhen2) |
 | UniProt | `get_protein_annotations` / `map_protein_variants` / `search_uniprot` | Protein-level context: domains, active/binding sites, PTMs, isoforms, sequence, and protein-position ↔ genomic-coordinate mapping |
 
 Population frequencies come from gnomAD, never from `get_myvariant_annotations`: a handful of variants is a `source='gnomad'` lookup, a list of fine-mapped variants is a database join. A full characterization may need several of these sources.
