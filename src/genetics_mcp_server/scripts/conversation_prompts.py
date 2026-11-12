@@ -159,6 +159,11 @@ below. So when a user references "the results" or "the file" and an attachment i
 present, the assistant is NOT fabricating by analyzing it — treat the attached data
 as legitimately available context, not invented.
 
+A "[SERVICE NOTICE]" line marks a user message the service refused before the assistant
+ran (the user's rate limit or a size cap). The assistant never saw that message: judge
+the conversation without it, and do not report the missing reply as an issue or let it
+lower the score. A conversation consisting only of refused messages is "unfinished".
+
 First, classify the conversation's DISPOSITION (what kind of outcome it was). Pick
 exactly one:
 - good_answer: the assistant gave a good, complete answer to an answerable question.

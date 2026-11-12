@@ -504,6 +504,20 @@ UPSTREAM_UNREACHABLE_MSG = (
 # from a real upstream 503
 _UNREACHABLE_HEADER = "x-fg-upstream-unreachable"
 
+# dbNSFP predictors get_myvariant_annotations reports as {score, prediction, rankscore};
+# polyphen2 is reported per model (hdiv, hvar) because that is how dbNSFP nests it
+_MYVARIANT_PREDICTORS = (
+    "revel",
+    "alphamissense",
+    "sift",
+    "clinpred",
+    "primateai",
+    "mutationtaster",
+    "metalr",
+    "metasvm",
+    "fathmm",
+)
+
 # MouseMine fails by accepting the connection and then never answering, so it needs its
 # own message: _ResilientAsyncClient only rewrites connect-level failures, and a read
 # timeout is not "the genetics data service is down" — every other tool still works
@@ -864,52 +878,51 @@ class ToolExecutor:
                 "variant_id": clinvar.get("variant_id"),
             }
 
-        # CADD
-        cadd = data.get("cadd")
-        if cadd:
+        dbnsfp = data.get("dbnsfp") or {}
+
+        # the hg38 index has no top-level cadd source; dbNSFP carries the score for the
+        # protein-altering SNVs it covers
+        cadd = data.get("cadd") or dbnsfp.get("cadd")
+        if isinstance(cadd, dict):
             result["cadd"] = {
                 "phred": cadd.get("phred"),
-                "raw_score": cadd.get("rawscore"),
-                "consequence": cadd.get("consequence"),
+                "raw_score": cadd.get("rawscore", cadd.get("raw_score")),
+                **({"consequence": cadd["consequence"]} if "consequence" in cadd else {}),
             }
 
-        # dbNSFP functional predictions
-        dbnsfp = data.get("dbnsfp")
-        if dbnsfp:
-            preds: dict[str, Any] = {}
-            for predictor in ("sift", "polyphen2", "mutationtaster", "metalr", "metasvm", "fathmm"):
-                pred_data = dbnsfp.get(predictor)
-                if pred_data and isinstance(pred_data, dict):
-                    entry: dict[str, Any] = {}
-                    if "score" in pred_data:
-                        entry["score"] = pred_data["score"]
-                    if "pred" in pred_data:
-                        entry["prediction"] = pred_data["pred"]
-                    if "converted_rankscore" in pred_data:
-                        entry["rankscore"] = pred_data["converted_rankscore"]
-                    if entry:
-                        preds[predictor] = entry
-            if preds:
-                result["functional_predictions"] = preds
-            if dbnsfp.get("genename"):
-                result["gene"] = dbnsfp["genename"]
+        def collapsed(value: Any) -> Any:
+            # dbNSFP repeats a value once per transcript
+            if isinstance(value, list):
+                unique = list(dict.fromkeys(value))
+                return unique[0] if len(unique) == 1 else unique
+            return value
 
-        # COSMIC
-        cosmic = data.get("cosmic")
-        if cosmic:
-            result["cosmic"] = {
-                "cosmic_id": cosmic.get("cosmic_id"),
-                "tumor_site": cosmic.get("tumor_site"),
+        preds: dict[str, Any] = {}
+        for name, pred_data in (
+            *((p, dbnsfp.get(p)) for p in _MYVARIANT_PREDICTORS),
+            *(
+                (f"polyphen2_{model}", (dbnsfp.get("polyphen2") or {}).get(model))
+                for model in ("hdiv", "hvar")
+            ),
+        ):
+            if not isinstance(pred_data, dict):
+                continue
+            entry = {
+                out: collapsed(pred_data[key])
+                for key, out in (
+                    ("score", "score"),
+                    ("pred", "prediction"),
+                    ("converted_rankscore", "rankscore"),
+                    ("rankscore", "rankscore"),
+                )
+                if key in pred_data
             }
-
-        # CIViC
-        civic = data.get("civic")
-        if civic:
-            result["civic"] = {
-                "variant_id": civic.get("variant_id"),
-                "name": civic.get("name"),
-                "gene": civic.get("entrez_name"),
-            }
+            if entry:
+                preds[name] = entry
+        if preds:
+            result["functional_predictions"] = preds
+        if dbnsfp.get("genename"):
+            result["gene"] = collapsed(dbnsfp["genename"])
 
         # dbSNP
         dbsnp = data.get("dbsnp")
@@ -5416,7 +5429,7 @@ class ToolExecutor:
     # myvariant.info
     # -------------------------------------------------------------------------
 
-    _MYVARIANT_DEFAULT_FIELDS = "clinvar,cadd,dbnsfp,cosmic,civic,dbsnp"
+    _MYVARIANT_DEFAULT_FIELDS = "clinvar,dbnsfp,dbsnp"
 
     async def get_myvariant_annotations(
         self,

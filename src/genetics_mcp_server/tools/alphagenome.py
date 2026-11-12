@@ -18,6 +18,7 @@ per-modality, not per-caller: see MODALITIES.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -67,7 +68,12 @@ _QUOTA_BACKOFF_BASE = 2.0
 # it re-raises the first failure and returns nothing for any variant. A failed batch is
 # therefore re-run one variant at a time, which is what bounds the batch size rather than any
 # API limit. The metadata call would stop counting if the SDK ever cached it across calls.
-_MAX_VARIANTS = 25
+#
+# What sets the number is the response: a variant is about 4,300 characters at
+# fit_to_budget's last step with the default modalities (measured on a production batch),
+# and a tool result is cut to a prefix past settings.mcp_max_result_size. Raising either
+# the default modality set or this number needs that product rechecked.
+_MAX_VARIANTS = 10
 
 # per-modality track detail on the response, ordered by |value|
 _TOP_TRACKS = 5
@@ -1030,6 +1036,78 @@ def _expose(value: Any, quantity: str) -> float | None:
         return None
     number = float(value)
     return number if quantity == _SIGNED else abs(number)
+
+
+# (tracks per modality, genes per modality, tracks per gene), tried in order until the batch
+# fits. The first step that differs from the full response only shortens the per-gene track
+# lists, which are most of a gene-resolved modality's size.
+_DETAIL_STEPS = ((_TOP_TRACKS, _MAX_GENES, 1), (2, 5, 1), (1, 1, 0))
+
+
+def _rounded(value: Any) -> Any:
+    if isinstance(value, float):
+        return float(f"{value:.4g}")
+    if isinstance(value, dict):
+        return {k: _rounded(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rounded(v) for v in value]
+    return value
+
+
+def _reduced(result: dict[str, Any], tracks: int, genes: int, gene_tracks: int) -> dict[str, Any]:
+    """A copy of a batch result with its lists cut; the input may be the cache's own dicts."""
+
+    def modality(entry: dict[str, Any]) -> dict[str, Any]:
+        out = {**entry, "top_tracks": (entry.get("top_tracks") or [])[:tracks]}
+        if "genes" in entry:
+            out["genes"] = [
+                {k: v for k, v in gene.items() if k != "top_tracks"}
+                | (
+                    {"top_tracks": (gene.get("top_tracks") or [])[:gene_tracks]}
+                    if gene_tracks
+                    else {}
+                )
+                for gene in entry["genes"][:genes]
+            ]
+        return out
+
+    def variant(entry: dict[str, Any]) -> dict[str, Any]:
+        if "modalities" not in entry:
+            return entry
+        return {**entry, "modalities": {k: modality(v) for k, v in entry["modalities"].items()}}
+
+    return _rounded({**result, "results": [variant(r) for r in result.get("results") or []]})
+
+
+def fit_to_budget(result: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """A batch result cut down, evenly across its variants, until it serialises in max_chars.
+
+    A result over the caller's size cap is otherwise cut to a prefix, which keeps the first
+    variants whole and loses the rest. Values and quantiles are never dropped, only how many
+    tracks and genes stand behind each. If even the last step is too large it is returned
+    anyway, for the caller's own cap to deal with.
+    """
+    if not result.get("success") or len(json.dumps(result)) <= max_chars:
+        return result
+    reduced = result
+    for tracks, genes, gene_tracks in _DETAIL_STEPS:
+        reduced = {
+            **_reduced(result, tracks, genes, gene_tracks),
+            "detail": {
+                "reduced": True,
+                "tracks_per_modality": tracks,
+                "genes_per_modality": genes,
+                "tracks_per_gene": gene_tracks,
+                "note": (
+                    "Lists were shortened and numbers rounded to fit this batch in one "
+                    "response; every value and quantile is still the strongest one. Ask for "
+                    "a single variant to get every track and gene."
+                ),
+            },
+        }
+        if len(json.dumps(reduced)) <= max_chars:
+            break
+    return reduced
 
 
 def _failed(stage: str, message: str, context: dict[str, Any] | None = None) -> dict[str, Any]:

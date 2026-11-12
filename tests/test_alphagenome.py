@@ -7,6 +7,8 @@ rows carrying the variant they came from -- so the flattening and the batch spli
 exercised against the shape the API actually answers in. Nothing here needs an API key.
 """
 
+import json
+
 import anndata
 import numpy as np
 import pandas as pd
@@ -958,3 +960,65 @@ async def test_a_metadata_failure_is_not_frozen_into_the_cache():
     assert recovered["matched"] is True
     assert recovered["resolved_biosamples"] == ["biosample_1"]
     assert len(fake.single_calls) == 2
+
+
+# --------------------------------------------------------------------------- #
+# a batch is cut evenly to fit the caller's result cap
+# --------------------------------------------------------------------------- #
+
+
+def _wide_variant(vid):
+    track = {"track": "CL:0002584 DNase-seq", "biosample": "renal cortical epithelial cell"}
+    tracks = [{**track, "value": 0.5382306575775146, "quantile": 0.9917675852775574}] * 5
+    gene = {"gene_id": "ENSG00000166164.17", "gene_name": "BRD7", "value": -0.0117, "quantile": 0.8}
+    genes = [{**gene, "top_tracks": tracks}] * alphagenome._MAX_GENES
+    base = {"value": 0.5382306575775146, "quantile": 0.99, "top_tracks": tracks}
+    return {
+        "success": True,
+        "variant": {"id": vid},
+        "modalities": {
+            name: {**base, "validation": alphagenome.validation_metadata(name), "genes": genes}
+            for name in ("RNA_SEQ", "SPLICE_JUNCTIONS")
+        },
+    }
+
+
+def _batch(n):
+    results = [_wide_variant(f"1:{i}:A:G") for i in range(n)]
+    return {"success": True, "n_requested": n, "n_scored": n, "results": results}
+
+
+def test_a_result_inside_the_budget_is_returned_untouched():
+    batch = _batch(1)
+    assert alphagenome.fit_to_budget(batch, 10**6) is batch
+
+
+def test_an_oversized_batch_keeps_every_variant_and_says_what_was_cut():
+    batch = _batch(alphagenome._MAX_VARIANTS)
+    before = json.dumps(batch)
+    fitted = alphagenome.fit_to_budget(batch, 50_000)
+
+    assert len(json.dumps(fitted)) <= 50_000
+    assert [r["variant"]["id"] for r in fitted["results"]] == [
+        r["variant"]["id"] for r in batch["results"]
+    ]
+    detail = fitted["detail"]
+    for result in fitted["results"]:
+        for modality in result["modalities"].values():
+            assert modality["value"] == 0.5382 and modality["quantile"] == 0.99
+            assert len(modality["top_tracks"]) == detail["tracks_per_modality"]
+            assert len(modality["genes"]) == detail["genes_per_modality"]
+            assert "validation" in modality
+    # the input is the cache's own dicts on a warm batch
+    assert json.dumps(batch) == before
+
+
+def test_the_mildest_step_that_fits_is_the_one_taken():
+    fitted = alphagenome.fit_to_budget(_batch(2), len(json.dumps(_batch(2))) - 1)
+    assert fitted["detail"]["genes_per_modality"] == alphagenome._MAX_GENES
+    assert fitted["detail"]["tracks_per_gene"] == 1
+
+
+def test_a_failed_batch_is_not_reshaped():
+    failed = {"success": False, "error": "x" * 100}
+    assert alphagenome.fit_to_budget(failed, 10) is failed

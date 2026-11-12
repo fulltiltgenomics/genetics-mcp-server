@@ -130,6 +130,36 @@ def load_data(db_path: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     return sessions, messages
 
 
+# chat_turn_metrics outcomes chat_api writes for a request it refused before a turn began
+REFUSAL_NOTES = {
+    "rate_limited": "the user's per-user rate limit",
+    "too_large": "the request size cap",
+}
+
+
+def load_refusals(db_path: str) -> dict[str, list[tuple[str, str]]]:
+    """(created_at, outcome) of every refused request, by session, oldest first.
+
+    Empty for a database that predates chat_turn_metrics or its outcome column.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        marks = ", ".join("?" for _ in REFUSAL_NOTES)
+        rows = conn.execute(
+            "SELECT session_id, created_at, outcome FROM chat_turn_metrics "
+            f"WHERE session_id IS NOT NULL AND outcome IN ({marks}) ORDER BY created_at",
+            tuple(REFUSAL_NOTES),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+    refusals: dict[str, list[tuple[str, str]]] = {}
+    for sid, created_at, outcome in rows:
+        refusals.setdefault(sid, []).append((str(created_at), outcome))
+    return refusals
+
+
 def resolve_llm_config_db(db: str, explicit: str | None) -> str:
     """Where to look for llm_config.db: alongside --db unless told otherwise.
 
@@ -1138,6 +1168,7 @@ def _format_conversation_for_eval(
     session_id: str,
     messages: pl.DataFrame,
     max_chars: int = 120000,
+    refusals: list[tuple[str, str]] | None = None,
 ) -> str:
     """Format a conversation for LLM quality evaluation, eliding if needed.
 
@@ -1159,9 +1190,24 @@ def _format_conversation_for_eval(
         message_sort_keys(messages)
     )
 
+    # the user message of a refused request is saved before the refusal, so the notice
+    # goes in front of the first message that is later than the refusal
+    pending = list(refusals or [])
+
+    def notices(before: str | None) -> list[str]:
+        out = []
+        while pending and (before is None or pending[0][0] < before):
+            _, outcome = pending.pop(0)
+            out.append(
+                f"[SERVICE NOTICE]\nThe service refused the user's previous message "
+                f"({REFUSAL_NOTES[outcome]}); the assistant never received it.\n"
+            )
+        return out
+
     parts = []
     total_len = 0
     for row in session_msgs.iter_rows(named=True):
+        parts.extend(notices(str(row["created_at"])))
         role = row["role"].upper()
         content = _elide_message(row["content"])
         note = _attachment_note(row.get("content_json"))
@@ -1172,6 +1218,8 @@ def _format_conversation_for_eval(
             parts.append("[... conversation truncated for length ...]")
             break
         parts.append(part)
+    else:
+        parts.extend(notices(None))
 
     return "\n".join(parts)
 
@@ -1181,6 +1229,7 @@ async def evaluate_quality_with_llm(
     messages: pl.DataFrame,
     model: str = "claude-opus-5",
     cost_tracker: "CostTracker | None" = None,
+    refusals: dict[str, list[tuple[str, str]]] | None = None,
 ) -> dict[str, dict]:
     """Evaluate conversation quality using Anthropic API.
 
@@ -1200,7 +1249,9 @@ async def evaluate_quality_with_llm(
     total = len(session_ids)
 
     for idx, sid in enumerate(session_ids):
-        conversation_text = _format_conversation_for_eval(sid, messages)
+        conversation_text = _format_conversation_for_eval(
+            sid, messages, refusals=(refusals or {}).get(sid)
+        )
 
         # skip sessions with no real content
         if len(conversation_text.strip()) < 20:
@@ -2627,6 +2678,7 @@ async def main():
                 messages,
                 model=args.quality_model,
                 cost_tracker=cost_tracker,
+                refusals=load_refusals(args.db),
             )
             cached_quality.update(new_assessments)
         else:

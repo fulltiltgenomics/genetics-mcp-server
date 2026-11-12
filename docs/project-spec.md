@@ -252,7 +252,7 @@ Available tools (after exclusions):
 
 #### myvariant.info (native tool, chat-backend only)
 
-The `get_myvariant_annotations` tool queries myvariant.info for clinical and functional variant annotations not available from gnomAD MCP or the local API. Provides ClinVar clinical significance, CADD deleteriousness scores, functional predictions (SIFT, PolyPhen2, MutationTaster), cancer annotations (COSMIC, CIViC), and dbSNP rsIDs. Excluded from the MCP server — only available via the chat API. gnomAD population frequency fields are excluded by default to avoid overlap with gnomAD MCP.
+The `get_myvariant_annotations` tool queries myvariant.info for clinical and functional variant annotations not available from gnomAD MCP or the local API. Provides ClinVar clinical significance and dbSNP rsIDs for any variant, and for protein-altering SNVs the CADD score and functional predictions dbNSFP carries (`_MYVARIANT_PREDICTORS` in `tools/executor.py`). It queries GRCh38, where myvariant.info indexes no top-level CADD, COSMIC or CIViC source, so CADD for a non-coding variant or an indel comes from gnomAD MCP `get_variant_details` instead. Excluded from the MCP server — only available via the chat API. gnomAD population frequency fields are excluded by default to avoid overlap with gnomAD MCP.
 
 #### UniProt (native tools, chat-backend only)
 
@@ -1871,6 +1871,11 @@ indistinguishable and roundtrips per turn underivable.
   (`iterations` is the number of re-sends, the session and user are the conversation's) and one
   per pre-warm (no session, no user). A `cache` row is spend, not a turn — sum it into cost,
   leave it out of anything that counts or averages turns.
+- **Refused requests.** `rate_limited` and `too_large` are requests `chat_api` refused (429,
+  413) before a turn began: all-zero rows, written because the browser saves the user message
+  before it posts, so a refusal otherwise looks like a turn that died. Never for a secret chat.
+  The nightly judge is shown them as `[SERVICE NOTICE]` lines and told to judge the
+  conversation without the refused message.
 - **`outcome` and abandoned turns.** `complete` for a turn that reached `Chat complete:`;
   `error`, `timeout` (the 300 s model-call timeout) or `cancelled` (the client went away, which
   arrives as a cancellation or a `GeneratorExit` at whatever the generator was awaiting) for one
@@ -3351,7 +3356,7 @@ The `/chat/v1/auth` endpoint includes an `is_admin` boolean in its response, use
 | `RATE_LIMIT_PER_DAY` | Max chat messages per user per day | `40` |
 | `RATE_LIMIT_PER_WEEK` | Max chat messages per user per week | `100` |
 
-Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. All three limits use sliding windows over one in-memory timestamp list per user, so a pod restart empties every window. Returns HTTP 429 with the specific limit hit when exceeded.
+Rate limiting is per user email (from `X-Goog-Authenticated-User-Email` header) and applies to `POST /chat/v1/chat`. All three limits use sliding windows over one in-memory timestamp list per user, so a pod restart empties every window. Returns HTTP 429 naming the limit hit and how long until it lifts (also as `Retry-After`); when several limits are hit it quotes the longest wait. The refusal is recorded as a zero-cost `chat_turn_metrics` row, `outcome='rate_limited'`.
 
 ### MCP server options
 

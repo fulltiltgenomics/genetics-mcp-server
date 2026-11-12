@@ -975,6 +975,40 @@ async def _resolve_user_memory(
         return None
 
 
+async def _record_refusal(request: "ChatRequest", user: str | None, outcome: str) -> None:
+    """Leave a zero-cost chat_turn_metrics row for a request refused before its turn began.
+
+    The browser saves the user message before it posts, so without this row a refusal is
+    indistinguishable from a turn that died silently. Best effort, off the event loop, and
+    skipped for a secret chat, for the reasons LLMService._record_turn_metrics gives.
+    """
+    if request.secret:
+        return
+
+    def write() -> None:
+        get_chat_history_db().record_turn_metrics(
+            session_id=request.session_id,
+            message_id=request.message_id,
+            user_id=user,
+            iterations=0,
+            tool_call_count=0,
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cost_usd=0.0,
+            wall_ms=0,
+            tool_profile=request.tool_profile,
+            model=request.model,
+            outcome=outcome,
+        )
+
+    try:
+        await asyncio.to_thread(write)
+    except Exception as e:
+        logger.warning(f"Failed to record {outcome} refusal: {e}")
+
+
 @app.post("/chat/v1/chat")
 async def stream_chat(
     request: ChatRequest,
@@ -992,17 +1026,24 @@ async def stream_chat(
     provider = request.provider or settings.default_provider
 
     # per-user rate limiting
-    allowed, limit_reason = check_rate_limit(user)
+    allowed, limit_reason, retry_after = check_rate_limit(user)
     if not allowed:
         logger.warning(f"Rate limit exceeded for user={user}: {limit_reason}")
+        await _record_refusal(request, user, "rate_limited")
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded ({limit_reason}). Please try again later.",
+            detail=f"Rate limit exceeded ({limit_reason}).",
+            headers={"Retry-After": str(retry_after)},
         )
 
     # enforce per-message size limits before any model call
-    _validate_request_size(request.messages)
-    _validate_latest_message(request.messages)
+    try:
+        _validate_request_size(request.messages)
+        _validate_latest_message(request.messages)
+    except HTTPException as e:
+        logger.warning(f"[user={user}] [session={request.session_id}] Request refused: {e.detail}")
+        await _record_refusal(request, user, "too_large")
+        raise
 
     # validate provider
     if provider == "anthropic" and not service.anthropic_client:
