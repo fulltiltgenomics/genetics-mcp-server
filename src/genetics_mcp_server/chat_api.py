@@ -131,6 +131,16 @@ def _classify_error(e: Exception) -> str:
                 "a side), and it is resent on every turn. Start a new chat and attach a "
                 "smaller copy."
             )
+        # an exhausted spend limit is a 400 as well, and nothing the user types or retries
+        # changes it; the provider's own sentence says when access returns
+        if "API usage limits" in str(e):
+            resumes = re.search(r"regain access on ([^.'\"]+)", str(e))
+            return (
+                "The assistant has reached its API usage limit, so it cannot answer until "
+                "the limit resets or is raised"
+                + (f" (access returns on {resumes.group(1).strip()})" if resumes else "")
+                + ". Retrying will not help; please contact the service administrators."
+            )
         return "Invalid request sent to LLM service."
     if name == "InternalServerError" or err_type in ("api_error", "internal_server_error"):
         return "Claude had a temporary upstream error. Please try again."
@@ -229,12 +239,18 @@ _MAX_IMAGE_EDGE = 1568
 # decoding is what costs memory (4 bytes a pixel), so a picture above this is refused from
 # its header alone rather than decoded; a 50 MB upload can still be a compression bomb
 _MAX_IMAGE_PIXELS = 100_000_000
+# the provider refuses a zero-byte image with a 400, and the client replays the attachment
+# on every later turn; a clipboard that offers an image flavour with nothing in it (a
+# spreadsheet selection does) is how one gets attached. Text in its place lets the turn run
+# and lets the model say what happened.
+_EMPTY_IMAGE_NOTE = "[An attached image was empty (0 bytes) and was not sent.]"
 
 
 def _shrink_image_block(block: dict) -> dict:
     """Return `block` with its base64 image downscaled to _MAX_IMAGE_EDGE, if it exceeds it.
 
-    A block this cannot decode is returned unchanged for the provider to judge.
+    An empty image becomes a text block saying so. Any other block this cannot decode is
+    returned unchanged for the provider to judge.
     """
     source = block.get("source")
     if not (
@@ -244,7 +260,11 @@ def _shrink_image_block(block: dict) -> dict:
     ):
         return block
     try:
-        with Image.open(io.BytesIO(base64.b64decode(source["data"]))) as img:
+        raw = base64.b64decode(source["data"])
+        if not raw:
+            logger.warning("Dropped an empty attached image from the request")
+            return {"type": "text", "text": _EMPTY_IMAGE_NOTE}
+        with Image.open(io.BytesIO(raw)) as img:
             width, height = img.size
             if max(width, height) <= _MAX_IMAGE_EDGE:
                 return block

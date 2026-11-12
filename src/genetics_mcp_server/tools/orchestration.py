@@ -110,6 +110,37 @@ def _capability_absent_message(capability: str, module: str) -> str:
     )
 
 
+# what ddgs raises when every engine answered and none had a hit. Matched on its text because
+# the package raises its base exception for this and for engine faults alike; if a release
+# rewords it, a domain with no hits is reported as a failed search instead of an empty one.
+_DDGS_NO_RESULTS = "No results found."
+
+# domain-restricted searches are one backend query per domain, so this bounds the burst one
+# tool call can send from the pod's single egress address
+_DDGS_CONCURRENCY = 3
+
+
+def _search_domains(values: Iterable[str] | None) -> list[str]:
+    """Model-supplied domains as bare hostnames, deduplicated in order.
+
+    Models pass `www.` forms, wildcard and leading-dot forms and whole URLs for the same
+    thing, and a `site:` operator matches none of those spellings.
+    """
+    hosts: list[str] = []
+    for value in values or ():
+        text = str(value).strip().lower()
+        host = (urlparse(text if "//" in text else f"//{text}").hostname or "").lstrip("*.")
+        host = host.removeprefix("www.")
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _url_in_domains(url: str, domains: list[str]) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith(f".{d}") for d in domains)
+
+
 def _absent_capability_named(message: Any) -> str | None:
     """The pruned module a supervisor-reported error message names, if any.
 
@@ -1281,7 +1312,9 @@ class ServerToolExecutor(ToolExecutor):
             except Exception as e:
                 logger.warning(f"Tavily search failed, falling back to DuckDuckGo: {e}")
 
-        return await self._search_duckduckgo(query, min(max_results, 10))
+        return await self._search_duckduckgo(
+            query, min(max_results, 10), include_domains, exclude_domains
+        )
 
     def _build_date_filter(self, date_range: str) -> str:
         """Build Europe PMC date filter clause."""
@@ -1401,8 +1434,19 @@ class ServerToolExecutor(ToolExecutor):
 
         raise Exception(f"Tavily API error: HTTP {resp.status_code}")
 
-    async def _search_duckduckgo(self, query: str, max_results: int) -> dict[str, Any]:
-        """Search using DuckDuckGo (free fallback)."""
+    async def _search_duckduckgo(
+        self,
+        query: str,
+        max_results: int,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Search using DuckDuckGo (free fallback).
+
+        The backend takes no domain arguments and honours exactly one `site:` operator per
+        query: an OR of two raises "no results" and `-site:` is ignored. So an include list
+        is one query per domain, merged, and an exclude list is filtered out of the results.
+        """
         import asyncio
 
         try:
@@ -1419,28 +1463,78 @@ class ServerToolExecutor(ToolExecutor):
                 "error_type": CAPABILITY_UNAVAILABLE,
             }
 
-        def sync_search():
-            return DDGS().text(query, max_results=max_results)
+        include = _search_domains(include_domains)
+        exclude = _search_domains(exclude_domains)
+        queries = [f"{query} site:{domain}" for domain in include] or [query]
+        # filtering happens after the fetch, so ask for spares to filter from
+        fetch = max_results * 2 if exclude else max_results
+        slots = asyncio.Semaphore(_DDGS_CONCURRENCY)
 
-        try:
-            results = await asyncio.to_thread(sync_search)
-            formatted = [
-                {
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "content": (r.get("body", "") or "")[:500],
-                }
-                for r in results
-            ]
-            return {
-                "success": True,
-                "query": query,
-                "source": "duckduckgo",
-                "results": formatted,
-            }
-        except Exception as e:
-            logger.error(f"DuckDuckGo search error: {e}")
-            return {"success": False, "error": f"Web search failed: {str(e)}"}
+        async def search(text: str) -> list[dict[str, Any]]:
+            async with slots:
+                return await asyncio.to_thread(lambda: DDGS().text(text, max_results=fetch))
+
+        outcomes = await asyncio.gather(*(search(q) for q in queries), return_exceptions=True)
+
+        failed: dict[str, str] = {}
+        per_query: list[list[dict[str, Any]]] = []
+        for label, outcome in zip(include or [query], outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                if not isinstance(outcome, Exception):
+                    raise outcome
+                if not (include and str(outcome) == _DDGS_NO_RESULTS):
+                    logger.error(f"DuckDuckGo search error: {outcome}")
+                    failed[label] = str(outcome)
+                outcome = []
+            per_query.append(list(outcome))
+
+        if failed and not include:
+            return {"success": False, "error": f"Web search failed: {failed[query]}"}
+
+        # round-robin, so one prolific domain cannot crowd the others out of the cap
+        formatted: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for rank in range(max(map(len, per_query), default=0)):
+            for hits in per_query:
+                if rank >= len(hits):
+                    continue
+                url = hits[rank].get("href", "")
+                if url in seen or (include and not _url_in_domains(url, include)):
+                    continue
+                if exclude and _url_in_domains(url, exclude):
+                    continue
+                seen.add(url)
+                formatted.append(
+                    {
+                        "title": hits[rank].get("title", ""),
+                        "url": url,
+                        "content": (hits[rank].get("body", "") or "")[:500],
+                    }
+                )
+        formatted = formatted[:max_results]
+
+        if failed and not formatted:
+            detail = "; ".join(f"{domain}: {error}" for domain, error in failed.items())
+            return {"success": False, "error": f"Web search failed: {detail}"}
+
+        result: dict[str, Any] = {
+            "success": True,
+            "query": query,
+            "source": "duckduckgo",
+            "results": formatted,
+        }
+        if failed:
+            result["note"] = (
+                "The search of these domains failed, so their absence from the results says "
+                f"nothing about them: {', '.join(failed)}."
+            )
+        elif include and not formatted:
+            result["note"] = (
+                f"No page on {', '.join(include)} matched this query. The restriction was "
+                "applied; a different wording, or the same query without include_domains, "
+                "may still find something."
+            )
+        return result
 
     # THE CAP IS THE TRANSPORT'S, NOT THIS LAYER'S (genetics-results-suite-4h6.52). It used
     # to be 4 MiB, chosen for a local read that no longer exists: every read now goes over

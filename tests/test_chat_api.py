@@ -1867,6 +1867,30 @@ class TestClassifyErrorSubclasses:
         assert "image" in message.lower() and "8000" in message
         assert "invalid request" not in message.lower()
 
+    def test_an_exhausted_usage_limit_is_named_with_its_reset_time(self):
+        """A 400 no rewording of the user's message can fix, so it must not read as one."""
+        import anthropic
+        import httpx
+
+        from genetics_mcp_server import chat_api
+
+        detail = (
+            "You have reached your specified API usage limits. You will regain access on "
+            "2026-11-01 at 00:00 UTC."
+        )
+        req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        err = anthropic.BadRequestError(
+            f"Error code: 400 - {{'type': 'error', 'error': {{'message': '{detail}'}}}}",
+            response=httpx.Response(400, request=req),
+            body={"error": {"type": "invalid_request_error", "message": detail}},
+        )
+
+        message = chat_api._classify_error(err)
+
+        assert "usage limit" in message
+        assert "(access returns on 2026-11-01 at 00:00 UTC)" in message
+        assert "invalid request" not in message.lower()
+
     def test_other_bad_requests_keep_the_generic_message(self):
         import anthropic
         import httpx
@@ -2499,6 +2523,18 @@ class TestImageShrinking:
         }
 
         assert _shrink_image_block(block) is block
+
+    def test_an_empty_image_is_replaced_by_a_note(self):
+        """The provider answers a zero-byte image with a 400 that fails the whole turn."""
+        from genetics_mcp_server.chat_api import _EMPTY_IMAGE_NOTE, _shrink_images
+
+        empty = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": ""},
+        }
+        text = {"type": "text", "text": "pasted rows"}
+
+        assert _shrink_images([empty, text]) == [{"type": "text", "text": _EMPTY_IMAGE_NOTE}, text]
 
     def test_pixel_bomb_is_refused_without_decoding(self):
         from fastapi import HTTPException

@@ -172,7 +172,17 @@ def url_input_hosts_rule() -> str | None:
     )
     if _PREPRINT_HOSTS <= set(hosts):
         rule += _PREPRINT_ROUTE_RULE
+    if all(_host_listed(host, hosts) for host in _FINNGEN_DOCS_HOSTS):
+        rule += _FINNGEN_DOCS_RULE
     return rule
+
+
+def _host_listed(host: str, hosts: tuple[str, ...]) -> bool:
+    """Whether the fetcher's list covers `host`, counting its leading-dot domain entries."""
+    return any(
+        host == entry or (entry.startswith(".") and (host == entry[1:] or host.endswith(entry)))
+        for entry in hosts
+    )
 
 
 # the preprint servers answer a bot challenge on the URLs a user pastes, so listing the hosts
@@ -185,6 +195,28 @@ _PREPRINT_ROUTE_RULE = (
     "and abstract; the last record's `jatsxml` field is the URL of the full-text XML, which "
     "can be fetched as a URL input. That host rate-limits: if the XML fetch fails, do not "
     "retry it — work from the abstract and say the full text was unavailable.\n"
+)
+
+
+# a host being listed does not tell the model that FinnGen's own documentation is behind it,
+# or how to read it: the Handbook has a page index and a markdown form of every page, and a
+# Risteys endpoint page is static HTML far larger than a script's stdout window. Without the
+# route the model answers documentation questions from a search snippet or from memory.
+_FINNGEN_DOCS_HOSTS = ("docs.finngen.fi", "risteys.finngen.fi")
+_FINNGEN_DOCS_RULE = (
+    "- **FinnGen's own documentation can be read as a URL input; read the page before "
+    "answering from a search snippet or from memory.** The FinnGen Handbook (endpoints, "
+    "registers, releases, analysis proposals, acknowledgement wording) lists every page in "
+    "`https://docs.finngen.fi/llms.txt`, and each page is served as markdown at its URL "
+    "with `.md` appended. An endpoint's Risteys "
+    "page, `https://risteys.finngen.fi/endpoints/<ENDPOINT_CODE>`, carries its definition "
+    "(the rules and codes, the control definition) and its key figures overall and by sex, "
+    "for FinnGen and for FinRegistry separately. That host serves the latest release and "
+    "`r<N>.risteys.finngen.fi` an earlier one, so name the release and the cohort each "
+    "number is from. The page is large HTML: have the script strip the markup and print "
+    "only the section asked about. When the page does not state what was asked, say so "
+    "rather than filling the gap. The Handbook's pages on individual-level data and the "
+    "Sandbox are not for answering from: point the user to them instead.\n"
 )
 
 
