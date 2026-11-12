@@ -3620,3 +3620,742 @@ def test_mr_refuses_what_it_cannot_draw():
         plots.mr()
     with pytest.raises(GeneticsUsageError, match="nothing to plot"):
         plots.mr(frame=frame.with_columns(in_outcome=pl.lit(False)))
+
+
+# --------------------------------------------------------------------------- protein track
+
+
+def track_residues(length=300, windows=None, accession="P00001", gene="GENE1"):
+    """Residue rows in the shape `protein_residues` returns.
+
+    `windows` is [(model_file_id, start, end, owned_start, owned_end)]; a position covered
+    by two windows gets a row from each, and the window that does not own it carries a
+    pLDDT of 10 so a figure that drew it would say so.
+    """
+    windows = windows or [("AF-P00001-F1-model_v6", 1, length, 1, length)]
+    rows = []
+    for model, start, end, owned_start, owned_end in windows:
+        for position in range(start, end + 1):
+            owner = owned_start <= position <= owned_end
+            rows.append(
+                {
+                    "gene_name": gene,
+                    "accession": accession,
+                    "model_file_id": model,
+                    "file_position": position - start + 1,
+                    "protein_position": position,
+                    "residue": "A",
+                    "is_owner": owner,
+                    "plddt": (95.0 if position <= length // 3 else 40.0) if owner else 10.0,
+                    "mu": None if position == 1 else position * 1e-9,
+                }
+            )
+    return pl.DataFrame(rows)
+
+
+def track_features(rows):
+    return pl.DataFrame(
+        [
+            {
+                "accession": "P00001",
+                "source": source,
+                "feature_type": feature_type,
+                "start": start,
+                "end": end,
+                "description": description,
+                "evidence_tier": tier,
+            }
+            for source, feature_type, start, end, description, tier in rows
+        ]
+    )
+
+
+TRACK_FEATURES = track_features(
+    [
+        ("ted", "TED domain", 10, 90, "TED01 high consensus CATH 3.30.70.330 (H, foldseek)", "predicted"),
+        ("uniprot", "Domain", 20, 100, "RRM", "curated"),
+        ("uniprot", "Domain", 80, 160, "Overlapping", "experimental"),
+        ("uniprot", "Domain", 200, 280, "SET", "curated"),
+        ("uniprot", "Region", 110, 190, "Disordered", "predicted"),
+        ("uniprot", "Helix", 30, 40, None, "experimental"),
+    ]
+)  # fmt: skip
+
+
+def drawn_track(**kwargs):
+    """Draw into an axis the test keeps, so what was drawn can be read back off it."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, ax = plt.subplots(figsize=(6.5, 2.5))
+    kwargs.setdefault("residues", track_residues())
+    kwargs.setdefault("features", TRACK_FEATURES)
+    result = plots.protein_track("P00001", ax=ax, **kwargs)
+    plt.close(figure)
+    return result, ax
+
+
+def test_protein_track_writes_a_figure_and_reports_what_it_drew(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX_ARTIFACTS_DIR", str(tmp_path))
+    result = plots.protein_track(
+        "GENE1",
+        residues=track_residues(),
+        features=TRACK_FEATURES,
+        scores="mu",
+        rows=[
+            {
+                "name": "credible sets",
+                "data": pl.DataFrame({"aa_pos": [25, 150], "pip": [0.9, 0.2]}),
+                "weight": "pip",
+            },
+            {"name": "neighbourhood", "data": [30, 31, 32, 60], "kind": "span"},
+        ],
+    )
+    assert result["path"] == str(tmp_path / "protein_track.png")
+    assert (tmp_path / "protein_track.png").stat().st_size > 0
+    assert (result["accession"], result["gene"], result["length"]) == ("P00001", "GENE1", 300)
+    assert result["region"] == (1, 300)
+    assert [(r["feature_type"], r["n"], r["lanes"]) for r in result["feature_rows"]] == [
+        ("TED domain", 1, 1),
+        ("Domain", 3, 2),
+        ("Region", 1, 1),
+    ]
+    assert result["plddt_fractions"] == {"> 90": 0.3333, "70–90": 0.0, "50–70": 0.0, "< 50": 0.6667}
+    assert result["scores"] == [{"name": "mu", "range": (2 * 1e-9, 300 * 1e-9), "bin": "max"}]
+    assert result["rows"] == [
+        {
+            "name": "credible sets",
+            "kind": "lollipop",
+            "n": 2,
+            "n_out_of_view": 0,
+            "n_outside": 0,
+            "n_no_weight": 0,
+        },
+        {"name": "neighbourhood", "kind": "span", "n": 2, "n_out_of_view": 0, "n_outside": 0},
+    ]
+    assert result["models"] == ["AF-P00001-F1-model_v6"]
+    assert result["note"] == (
+        "predicted structure: AlphaFold Protein Structure Database model AF-P00001-F1-model_v6"
+    )
+    assert (result["features_dropped"], result["feature_note"]) == (0, None)
+
+
+def test_a_position_covered_by_two_windows_is_drawn_once_from_its_owner():
+    residues = track_residues(
+        windows=[
+            ("AF-P00001-F1-model_v6", 1, 200, 1, 150),
+            ("AF-P00001-F2-model_v6", 101, 300, 151, 300),
+        ]
+    )
+    assert residues.height == 400
+    result, ax = drawn_track(residues=residues, feature_types=[])
+    assert result["length"] == 300
+    # a non-owner row's pLDDT of 10 would move both of these
+    assert result["plddt_fractions"] == {"> 90": 0.3333, "70–90": 0.0, "50–70": 0.0, "< 50": 0.6667}
+    strip = ax.images[0].get_array()
+    assert strip.shape == (1, 300) and float(strip.min()) == 40.0
+    assert result["models"] == ["AF-P00001-F1-model_v6", "AF-P00001-F2-model_v6"]
+    assert result["note"] == (
+        "predicted structure: AlphaFold Protein Structure Database models "
+        "AF-P00001-F1-model_v6, AF-P00001-F2-model_v6"
+    )
+
+
+def test_repeated_positions_without_owner_flags_are_refused_not_picked_by_row_order():
+    """Two windows at pLDDT 90 and 20 gave `< 50` as 0.4 one way round and 0.6 the other."""
+    windows = [("AF-P00001-F1-model_v6", 1, 200, 1, 150), ("AF-P00001-F2-model_v6", 101, 300, 151, 300)]  # fmt: skip
+    residues = track_residues(windows=windows).drop("is_owner")
+    for frame in (residues, residues.reverse()):
+        with pytest.raises(GeneticsUsageError, match="no 'is_owner'.*keep 'is_owner'"):
+            plots.protein_track("P00001", residues=frame, feature_types=[])
+    # one row per position needs no flag
+    _result, ax = drawn_track(residues=track_residues().drop("is_owner"), feature_types=[])
+    assert ax.images[0].get_array().shape == (1, 300)
+
+
+def test_overlapping_features_take_the_first_free_lane():
+    assert plots._track_lanes([(1, 10), (5, 20), (11, 15), (21, 30), (22, 23)]) == [0, 1, 0, 0, 1]
+    # ends are inclusive: a feature starting on the residue another ends on overlaps it
+    assert plots._track_lanes([(1, 10), (10, 20)]) == [0, 1]
+
+
+def test_a_label_that_does_not_fit_its_box_hangs_beside_it_and_holds_the_lane():
+    features = track_features(
+        [
+            ("uniprot", "Domain", 10, 12, "Short box long name", "curated"),
+            ("uniprot", "Domain", 14, 20, None, "curated"),
+            ("uniprot", "Domain", 200, 290, "Fits", "curated"),
+        ]
+    )
+    result, ax = drawn_track(features=features)
+    # the unnamed box would share the first lane were the label beside its neighbour not there
+    assert result["feature_rows"] == [
+        {"feature_type": "Domain", "n": 3, "lanes": 2, "n_unlabelled": 1}
+    ]
+    placed = {t.get_text().strip(): t.get_ha() for t in ax.texts if t.get_text().strip()}
+    assert placed["Short box long name"] == "left" and placed["Fits"] == "center"
+
+
+def test_hanging_labels_are_dropped_before_they_fill_more_lanes_than_the_boxes_need():
+    crowded = track_features(
+        [("uniprot", "Domain", 10 + 3 * i, 11 + 3 * i, f"Long name {i}", "curated") for i in range(8)]
+    )  # fmt: skip
+    result, _ax = drawn_track(features=crowded)
+    assert result["feature_rows"] == [
+        {"feature_type": "Domain", "n": 8, "lanes": 1, "n_unlabelled": 8}
+    ]
+
+
+def test_the_evidence_tier_of_a_feature_is_the_fill_of_its_box():
+    from matplotlib.colors import to_rgba
+
+    result, ax = drawn_track()
+    faces = {tuple(c.get_facecolor()[0]) for c in ax.collections}
+    for tier in ("experimental", "curated", "predicted"):
+        assert to_rgba(plots._TRACK_TIERS[tier][0]) in faces, tier
+    legend = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert legend == [
+        "pLDDT > 90",
+        "70–90",
+        "50–70",
+        "< 50",
+        "evidence: experimental",
+        "curated",
+        "predicted",
+    ]
+
+
+def test_a_tier_the_release_does_not_classify_is_drawn_as_unknown():
+    features = track_features([("uniprot", "Domain", 10, 90, "X", "something new")])
+    _result, ax = drawn_track(features=features)
+    assert [t.get_text() for t in ax.get_legend().get_texts()][4:] == ["evidence: unknown"]
+
+
+def test_the_caller_chooses_the_feature_types_and_their_order():
+    result, _ax = drawn_track()
+    assert "Helix" not in [r["feature_type"] for r in result["feature_rows"]]
+    result, ax = drawn_track(feature_types=["helix", "Domain", "Zinc finger"])
+    assert [r["feature_type"] for r in result["feature_rows"]] == ["Helix", "Domain"]
+    assert [t.get_text() for t in ax.get_yticklabels()] == ["Helix", "Domain", "pLDDT"]
+
+
+def test_a_ted_domain_is_named_by_its_number_and_cath_superfamily():
+    row = {"source": "ted", "description": "TED02 high consensus CATH 3.30.70.330 (H, foldseek)"}
+    assert plots._track_feature_labels(row) == ["TED02 3.30.70.330", "TED02"]
+    assert plots._track_feature_labels({"source": "ted", "description": "TED01 medium consensus"}) == ["TED01"]  # fmt: skip
+    assert plots._track_feature_labels({"source": "uniprot", "description": None}) == []
+
+
+def test_region_zooms_the_axis_and_counts_only_what_is_in_view():
+    residues = track_residues(
+        windows=[
+            ("AF-P00001-F1-model_v6", 1, 200, 1, 150),
+            ("AF-P00001-F2-model_v6", 101, 300, 151, 300),
+        ]
+    )
+    result, ax = drawn_track(
+        residues=residues,
+        region=(180, 400),
+        rows={"hits": [10, 190, 250, 999]},
+    )
+    assert result["region"] == (180, 300)
+    assert ax.get_xlim() == (179.5, 300.5)
+    assert [(r["feature_type"], r["n"]) for r in result["feature_rows"]] == [
+        ("Domain", 1),
+        ("Region", 1),
+    ]
+    assert result["rows"] == [
+        {"name": "hits", "kind": "tick", "n": 2, "n_out_of_view": 1, "n_outside": 1}
+    ]
+    assert result["models"] == ["AF-P00001-F2-model_v6"]
+    assert ax.images[0].get_array().shape == (1, 121)
+
+
+def test_a_protein_longer_than_the_figure_is_wide_is_binned_not_drawn_per_residue():
+    length = 34_350
+    position = np.arange(1, length + 1)
+    score = np.zeros(length)
+    score[20_000] = 5.0
+    residues = pl.DataFrame(
+        {
+            "accession": "Q8WZ42",
+            "protein_position": position,
+            "is_owner": True,
+            "plddt": np.where(position < 10_000, 30.0, 80.0),
+            "score": score,
+        }
+    )
+    result, ax = drawn_track(residues=residues, feature_types=[], scores="score")
+    plddt, heat = (image.get_array() for image in ax.images)
+    pixels = ax.get_position().width * ax.get_figure().get_figwidth() * ax.get_figure().dpi
+    assert result["bin_size"] > 1
+    assert plddt.shape[1] <= pixels and heat.shape[1] == plddt.shape[1]
+    assert plddt.shape[1] * result["bin_size"] >= length
+    assert f"{result['bin_size']} residues per column" in result["note"]
+    # one hot residue among thousands of zeros survives the binning
+    assert float(heat.max()) == 5.0
+    # and nothing is drawn one artist per residue
+    assert len(ax.patches) + len(ax.collections) + len(ax.lines) < 20
+
+
+def test_strips_are_binned_by_mean_or_by_max_and_ignore_missing_values():
+    values = np.array([1.0, 3.0, np.nan, 5.0, np.nan, np.nan, 7.0])
+    assert plots._track_binned(values, 1, 7, 2, "mean").tolist()[:2] == [2.0, 5.0]
+    assert plots._track_binned(values, 1, 7, 2, "max").tolist()[:2] == [3.0, 5.0]
+    tail = plots._track_binned(values, 1, 7, 2, "mean")[2:]
+    assert math.isnan(tail[0]) and tail[1] == 7.0
+    assert plots._track_binned(values, 2, 4, 1, "mean").tolist()[0] == 3.0
+
+
+def test_row_kinds_follow_the_data_unless_the_caller_says():
+    spans = pl.DataFrame({"start": [10, 250], "end": [20, 400]})
+    weighted = pl.DataFrame({"aa_pos": [5, 6, None], "pip": [0.5, None, 0.1], "c": ["red"] * 3})
+    row = plots._track_row({"name": "a", "data": [3, 4, 5, 9, 0]}, 0, 300)
+    assert (row["kind"], row["positions"].tolist(), row["n_outside"]) == ("tick", [3, 4, 5, 9], 1)
+    row = plots._track_row({"name": "b", "data": weighted, "weight": "pip", "colour": "c"}, 1, 300)
+    assert (row["kind"], row["weights"].tolist(), row["top"]) == ("lollipop", [0.5], 1.0)
+    assert (row["colours"], row["n_no_weight"]) == (["red"], 1)
+    row = plots._track_row({"name": "c", "data": spans}, 2, 300)
+    assert (row["kind"], row["spans"]) == ("span", [(10, 20), (250, 300)])
+    row = plots._track_row({"name": "d", "data": [7, 5, 6, 9], "kind": "span"}, 3, 300)
+    assert row["spans"] == [(5, 7), (9, 9)]
+    counts = pl.DataFrame({"position": [5, 6], "n": [3.0, 12.0]})
+    assert plots._track_row({"name": "e", "data": counts, "weight": "n"}, 4, 300)["top"] == 12.0
+
+
+@pytest.mark.parametrize(
+    "row, message",
+    [
+        ({"data": [1]}, "at least 'name' and 'data'"),
+        ({"name": "r", "data": [1], "size": "pip"}, "has keys"),
+        ({"name": "r", "data": pl.DataFrame({"x": [1]})}, "no position column"),
+        ({"name": "r", "data": [1], "kind": "bar"}, "kind must be one of"),
+        ({"name": "r", "data": [1], "kind": "lollipop"}, "needs weight="),
+        ({"name": "r", "data": [1], "weight": "pip"}, "no column 'pip'"),
+        ({"name": "r", "data": [1], "colour": "not-a-colour"}, "neither a colour nor a column"),
+        ({"name": "r", "data": pl.DataFrame({"start": [1], "end": [2]}), "kind": "tick"}, "only start/end"),
+        ({"name": "r", "data": pl.DataFrame({"aa_pos": [1], "w": [-1.0]}), "weight": "w"}, "negative"),
+        ({"name": "r", "data": "abc"}, "list of protein positions"),
+    ],
+)  # fmt: skip
+def test_protein_track_refuses_a_row_it_cannot_draw(row, message):
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.protein_track("P00001", residues=track_residues(), feature_types=[], rows=[row])
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"scores": "nope"}, "scores name columns the residues do not have"),
+        ({"scores": "residue"}, "not numeric"),
+        ({"region": (250, 200)}, "leaves nothing to draw"),
+        ({"region": "x"}, r"region is \(start, end\)"),
+        ({"residues": pl.DataFrame({"plddt": [1.0]})}, "need a 'protein_position' column"),
+        ({"features": pl.DataFrame({"start": [1]})}, "features need"),
+    ],
+)
+def test_protein_track_refuses_what_it_cannot_draw(kwargs, message):
+    kwargs.setdefault("residues", track_residues())
+    kwargs.setdefault("features", TRACK_FEATURES)
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.protein_track("P00001", **kwargs)
+
+
+def test_a_gene_with_two_proteins_is_refused_rather_than_overlaid():
+    residues = pl.concat([track_residues(), track_residues(accession="P00002")])
+    with pytest.raises(GeneticsUsageError, match=r"2 proteins \(\['P00001', 'P00002'\]\)"):
+        plots.protein_track("GENE1", residues=residues, feature_types=[])
+
+
+def test_scores_take_a_label_and_colour_over_the_whole_proteins_range():
+    result, ax = drawn_track(scores={"mutation rate": "mu"}, region=(100, 200), feature_types=[])
+    assert result["scores"] == [
+        {"name": "mutation rate", "range": (2 * 1e-9, 300 * 1e-9), "bin": "max"}
+    ]
+    assert [t.get_text() for t in ax.get_yticklabels()] == ["pLDDT", "mutation rate"]
+    heat = ax.images[1]
+    # zooming does not rescale the colours
+    assert heat.get_clim() == (2 * 1e-9, 300 * 1e-9)
+
+
+def test_the_note_names_the_release_when_the_frames_or_the_caller_carry_it():
+    result, _ax = drawn_track(release="2026-11-01")
+    assert result["note"].endswith("features frozen at release 2026-11-01")
+    carried = TRACK_FEATURES.with_columns(release=pl.lit("r7"))
+    result, _ax = drawn_track(features=carried)
+    assert result["note"].endswith("features frozen at release r7")
+    result, _ax = drawn_track()
+    assert "release" not in result["note"]
+
+
+def test_many_model_files_are_named_by_their_first_and_last():
+    windows = [(f"AF-P00001-F{i + 1}-model_v6", 1 + 100 * i, 100 * (i + 1), 1 + 100 * i, 100 * (i + 1)) for i in range(3)]  # fmt: skip
+    result, _ax = drawn_track(residues=track_residues(windows=windows), feature_types=[])
+    assert result["note"] == (
+        "predicted structure: AlphaFold Protein Structure Database models "
+        "AF-P00001-F1-model_v6 … AF-P00001-F3-model_v6 (3 files)"
+    )
+
+
+def test_protein_track_fetches_what_it_was_not_given(monkeypatch, tmp_path):
+    from genetics_mcp_server import sdk
+
+    asked = []
+
+    def residues(protein):
+        asked.append(("residues", protein))
+        return track_residues()
+
+    def features(protein):
+        asked.append(("features", protein))
+        return TRACK_FEATURES
+
+    monkeypatch.setattr(sdk, "protein_residues", residues, raising=False)
+    monkeypatch.setattr(sdk, "protein_features", features, raising=False)
+    result = plots.protein_track("GENE1", path=str(tmp_path / "t.png"))
+    assert asked == [("residues", "GENE1"), ("features", "GENE1")]
+    assert len(result["feature_rows"]) == 3
+
+    # no feature type asked for, no feature fetch
+    asked.clear()
+    plots.protein_track("GENE1", feature_types=[], path=str(tmp_path / "t.png"))
+    assert asked == [("residues", "GENE1")]
+
+
+def test_a_protein_with_no_features_still_has_a_track(monkeypatch, tmp_path):
+    from genetics_mcp_server import sdk
+
+    def no_features(protein):
+        error = GeneticsError("no features")
+        error.code = "not_found"
+        raise error
+
+    def unavailable(protein):
+        error = GeneticsError("release not loaded")
+        error.code = "release_not_loaded"
+        raise error
+
+    monkeypatch.setattr(sdk, "protein_features", no_features, raising=False)
+    result = plots.protein_track("P00001", residues=track_residues(), path=str(tmp_path / "t.png"))
+    assert result["feature_rows"] == []
+    # the residues were the caller's, so nothing here has shown the name to be a protein
+    said = "no features: the release has none for 'P00001', or 'P00001' is not a protein in the release"  # fmt: skip
+    assert result["feature_note"] == said and said in result["note"]
+    # fetched here, the residues vouch for the name
+    monkeypatch.setattr(sdk, "protein_residues", lambda protein: track_residues(), raising=False)
+    result = plots.protein_track("P00001", path=str(tmp_path / "t.png"))
+    assert result["feature_note"] == "no features: the release has none for 'P00001'"
+    monkeypatch.setattr(sdk, "protein_features", unavailable, raising=False)
+    with pytest.raises(GeneticsError, match="release not loaded"):
+        plots.protein_track("P00001", residues=track_residues())
+
+
+def test_a_deployment_without_the_structure_layer_is_told_to_pass_frames(monkeypatch):
+    from genetics_mcp_server import sdk
+
+    monkeypatch.delattr(sdk, "protein_residues", raising=False)
+    with pytest.raises(GeneticsUsageError, match="not offered on this deployment"):
+        plots.protein_track("P00001")
+
+
+def test_fetched_features_of_another_protein_are_reported_not_silently_dropped(monkeypatch):
+    from genetics_mcp_server import sdk
+
+    other = TRACK_FEATURES.with_columns(accession=pl.lit("P99999"))
+    monkeypatch.setattr(sdk, "protein_features", lambda protein: other, raising=False)
+    result, ax = drawn_track(features=None)
+    assert result["feature_rows"] == []
+    said = "no features: those fetched for 'P00001' are of P99999, not P00001"
+    assert result["feature_note"] == said and said in result["note"]
+    assert said in " ".join(t.get_text().replace("\n", " ") for t in ax.texts)
+    # a frame the caller passed is the caller's business: no fetch, no note
+    result, _ax = drawn_track(features=other)
+    assert (result["feature_rows"], result["feature_note"]) == ([], None)
+
+
+def test_an_empty_features_frame_or_no_feature_types_fetches_nothing(monkeypatch):
+    from genetics_mcp_server import sdk
+
+    def boom(protein):
+        raise AssertionError("fetched")
+
+    monkeypatch.setattr(sdk, "protein_features", boom, raising=False)
+    for off in ({"features": pl.DataFrame()}, {"features": TRACK_FEATURES.clear()}, {"feature_types": []}):  # fmt: skip
+        result, _ax = drawn_track(**off)
+        assert (result["feature_rows"], result["feature_note"]) == ([], None)
+
+
+def test_a_failed_feature_fetch_does_not_say_to_pass_the_residues_already_passed(monkeypatch):
+    from genetics_mcp_server import sdk
+
+    monkeypatch.delattr(sdk, "protein_features", raising=False)
+    with pytest.raises(GeneticsUsageError) as caught:
+        plots.protein_track("P00001", residues=track_residues())
+    assert "pass features= as well, or feature_types=[]" in str(caught.value)
+    assert "pass residues=" not in str(caught.value)
+
+
+def long_residues(length=34_350, low=(20_000, 20_039)):
+    position = np.arange(1, length + 1)
+    dipped = (position >= low[0]) & (position <= low[1])
+    return pl.DataFrame(
+        {
+            "accession": "Q8WZ42",
+            "model_file_id": "AF3-Q8WZ42-F1-model_v6",
+            "protein_position": position,
+            "is_owner": True,
+            "plddt": np.where(dipped, 20.0, 85.0),
+            # lower is worse, one damaging residue; and its mirror image
+            "llr": np.where(position == 5_000, -12.0, 0.0),
+            "hot": np.where(position == 5_000, 12.0, 0.0),
+        }
+    )
+
+
+def test_a_short_low_confidence_stretch_survives_binning_as_its_own_band():
+    result, ax = drawn_track(residues=long_residues(), feature_types=[])
+    size = result["bin_size"]
+    assert size > 40, "the stretch must be shorter than a column for this to test anything"
+    strip = ax.images[0]
+    columns = np.asarray(strip.get_array())[0]
+    hit = {(20_000 - 1) // size, (20_039 - 1) // size}
+    assert {int(i) for i in np.flatnonzero(columns < 50)} == hit
+    low = strip.cmap(strip.norm(columns[min(hit)]))
+    assert low == pytest.approx(matplotlib_rgba(plots._PLDDT_BANDS[3][1]))
+    # the fractions stay per residue: 40 of 34,350
+    assert result["plddt_fractions"]["< 50"] == round(40 / 34_350, 4)
+    assert "pLDDT: lowest band in the column" in result["note"]
+
+
+def matplotlib_rgba(colour):
+    from matplotlib.colors import to_rgba
+
+    return to_rgba(colour)
+
+
+def test_each_score_says_how_it_is_binned_and_the_note_repeats_it():
+    result, ax = drawn_track(
+        residues=long_residues(),
+        feature_types=[],
+        scores={
+            "LLR": {"column": "llr", "bin": "min"},
+            "LLR by default": "llr",
+            "hot": "hot",
+            "hot mean": {"column": "hot", "bin": "mean"},
+        },
+    )
+    _plddt, llr_min, llr_max, hot_max, hot_mean = (np.asarray(i.get_array())[0] for i in ax.images)
+    assert llr_min.min() == -12.0
+    # the default hides exactly the residue a lower-is-worse score is drawn for
+    assert llr_max.min() == 0.0
+    assert hot_max.max() == 12.0
+    assert 0 < hot_mean.max() < 1
+    assert [s["bin"] for s in result["scores"]] == ["min", "max", "max", "mean"]
+    assert "LLR: min; LLR by default: max; hot: max; hot mean: mean" in result["note"]
+
+
+def test_binning_rules_are_not_in_the_note_when_nothing_is_binned():
+    result, _ax = drawn_track(scores={"mu": {"column": "mu", "bin": "min"}})
+    assert result["bin_size"] == 1 and "per column" not in result["note"]
+
+
+@pytest.mark.parametrize(
+    "scores, message",
+    [
+        ({"x": {"column": "mu", "bin": "median"}}, "bin must be one of"),
+        ({"x": {"bin": "max"}}, "is a column name or"),
+        ({"x": {"column": "mu", "how": "max"}}, "is a column name or"),
+    ],
+)
+def test_a_score_spec_it_cannot_read_is_refused(scores, message):
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.protein_track("P00001", residues=track_residues(), feature_types=[], scores=scores)
+
+
+def test_positions_that_arrive_as_strings_or_floats_are_cast_when_exact():
+    as_text = track_residues().with_columns(pl.col("protein_position").cast(pl.Utf8))
+    as_float = track_residues().with_columns(pl.col("protein_position").cast(pl.Float64))
+    features = TRACK_FEATURES.with_columns(pl.col("start", "end").cast(pl.Utf8))
+    hits = pl.DataFrame({"aa_pos": ["25", "150"]})
+    for residues in (as_text, as_float):
+        result, _ax = drawn_track(residues=residues, features=features, rows={"hits": hits})
+        assert result["length"] == 300 and result["rows"][0]["n"] == 2
+        assert [r["n"] for r in result["feature_rows"]] == [1, 3, 1]
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"residues": track_residues().with_columns(pl.col("protein_position") + 0.5)}, "residues for 'P00001': column 'protein_position'"),
+        ({"residues": track_residues().with_columns(protein_position=pl.lit("x"))}, "not whole numbers"),
+        ({"features": TRACK_FEATURES.with_columns(start=pl.lit("ten"))}, "features: column 'start'"),
+        ({"rows": {"r": pl.DataFrame({"aa_pos": ["a"]})}}, "row 'r': column 'aa_pos'"),
+        ({"rows": {"r": pl.DataFrame({"start": ["a"], "end": ["b"]})}}, "row 'r': column 'start'"),
+        ({"rows": {"r": [1, 12.5]}}, r"whole number \(got 12.5\)"),
+        ({"rows": {"r": ["5"]}}, r"whole number \(got '5'\)"),
+        ({"rows": pl.DataFrame({"aa_pos": [1]})}, "rows= is a list of row dicts.*not a DataFrame"),
+        ({"rows": "aa_pos"}, "not a str"),
+        ({"rows": [{"name": "r", "data": pl.DataFrame({"aa_pos": [1, 2], "c": ["red", None]}), "colour": "c"}]}, "colour column 'c' holds None"),
+        ({"rows": [{"name": "r", "data": pl.DataFrame({"aa_pos": [1], "c": ["nope"]}), "colour": "c"}]}, "holds 'nope'"),
+        ({"rows": [{"name": "r", "data": [1], "colour": ["a", "b"]}]}, "neither a colour nor a column"),
+        ({"rows": [{"name": "r", "data": pl.DataFrame({"aa_pos": [1], "w": [float("inf")]}), "weight": "w"}]}, "infinite"),
+        ({"rows": [{"name": "r", "data": pl.DataFrame({"aa_pos": [1], "w": ["x"]}), "weight": "w"}]}, "not numeric"),
+    ],
+)  # fmt: skip
+def test_bad_input_is_a_usage_error_that_names_the_column(kwargs, message):
+    kwargs.setdefault("residues", track_residues())
+    kwargs.setdefault("features", TRACK_FEATURES)
+    with pytest.raises(GeneticsUsageError, match=message):
+        plots.protein_track("P00001", **kwargs)
+
+
+def test_a_lollipop_without_a_weight_is_left_out_and_counted_not_drawn_at_zero():
+    data = pl.DataFrame(
+        {
+            "aa_pos": [10, 20, 30, 250, 999, None],
+            "pip": [0.5, None, float("nan"), 0.25, 0.75, 0.5],
+        }
+    )
+    result, ax = drawn_track(
+        rows=[{"name": "cs", "data": data, "weight": "pip"}], region=(1, 100), feature_types=[]
+    )
+    row = result["rows"][0]
+    assert row == {
+        "name": "cs",
+        "kind": "lollipop",
+        "n": 1,
+        "n_out_of_view": 1,
+        "n_outside": 1,
+        "n_no_weight": 2,
+    }
+    # every row with a position is in exactly one of the four
+    assert sum(v for k, v in row.items() if k == "n" or k.startswith("n_")) == 5
+    assert "pip 0–1 (2 without)" in [t.get_text() for t in ax.texts]
+
+
+def test_the_counts_of_a_row_sum_to_its_input_under_a_region():
+    result, _ax = drawn_track(
+        region=(100, 200),
+        feature_types=[],
+        rows=[
+            {"name": "ticks", "data": [5, 100, 150, 200, 201, 300, 301, 0]},
+            {"name": "spans", "data": pl.DataFrame({"start": [1, 90, 190, 250, 400], "end": [50, 110, 260, 260, 500]})},
+            {"name": "runs", "data": [10, 11, 12, 150, 151, 280], "kind": "span"},
+        ],
+    )  # fmt: skip
+    ticks, spans, runs = result["rows"]
+    assert (ticks["n"], ticks["n_out_of_view"], ticks["n_outside"]) == (3, 3, 2)
+    # a span overlapping the edge of the view is drawn; one wholly outside it is not
+    assert (spans["n"], spans["n_out_of_view"], spans["n_outside"]) == (2, 2, 1)
+    assert (runs["n"], runs["n_out_of_view"], runs["n_outside"]) == (1, 2, 0)
+
+
+def test_a_region_of_one_residue_draws_that_residue():
+    result, ax = drawn_track(region=(25, 25), rows={"hits": [24, 25, 26]})
+    assert result["region"] == (25, 25)
+    assert ax.get_xlim() == (24.5, 25.5)
+    assert ax.images[0].get_extent()[:2] == [24.5, 25.5]
+    assert result["rows"][0]["n"] == 1
+
+
+def test_a_feature_with_start_past_end_is_dropped_and_counted_and_duplicates_drawn_once():
+    features = pl.concat(
+        [
+            TRACK_FEATURES,
+            TRACK_FEATURES.filter(pl.col("description") == "SET"),
+            track_features(
+                [
+                    ("uniprot", "Domain", 150, 120, "Backwards", "curated"),
+                    ("uniprot", "Domain", None, 120, "No start", "curated"),
+                    ("uniprot", "Helix", 9, 3, "Not asked for", "curated"),
+                ]
+            ),
+        ]
+    )
+    result, ax = drawn_track(features=features)
+    assert [(r["feature_type"], r["n"], r["lanes"]) for r in result["feature_rows"]] == [
+        ("TED domain", 1, 1),
+        ("Domain", 3, 2),
+        ("Region", 1, 1),
+    ]
+    assert result["features_dropped"] == 2
+    assert "2 features with no usable start–end not drawn" in result["note"]
+    assert "Backwards" not in [t.get_text().strip() for t in ax.texts]
+
+
+def boxes(ax):
+    """(left edge, right edge) of every rectangle drawn as a collection, in data units."""
+    spans = set()
+    for collection in ax.collections:
+        for drawn in collection.get_paths():
+            xs = drawn.vertices[:, 0]
+            spans.add((float(xs.min()), float(xs.max())))
+    return spans
+
+
+def test_a_feature_box_covers_its_first_and_last_residue_whole():
+    features = track_features([("uniprot", "Domain", 20, 100, "RRM", "curated")])
+    _result, ax = drawn_track(features=features)
+    assert boxes(ax) == {(19.5, 100.5)}
+    # clipped to the view, not drawn past it
+    _result, ax = drawn_track(features=features, region=(50, 80))
+    assert boxes(ax) == {(49.5, 80.5)}
+
+
+def test_a_span_row_is_cut_to_the_region_and_covers_whole_residues():
+    spans = pl.DataFrame({"start": [10, 60], "end": [20, 70]})
+    _result, ax = drawn_track(rows={"nbhd": spans}, feature_types=[])
+    assert boxes(ax) == {(0.5, 300.5), (9.5, 20.5), (59.5, 70.5)}
+    result, ax = drawn_track(rows={"nbhd": spans}, feature_types=[], region=(40, 100))
+    assert boxes(ax) == {(39.5, 100.5), (59.5, 70.5)}
+    assert result["rows"][0]["n_out_of_view"] == 1
+
+
+def test_a_strip_column_sits_on_the_residue_it_is_the_value_of():
+    _result, ax = drawn_track(scores="mu", feature_types=[])
+    for image in ax.images:
+        assert image.get_extent()[:2] == [0.5, 300.5]
+    # residue 1 has no mu and residue 2 the lowest: the first column is the masked one
+    heat = ax.images[1].get_array()
+    assert bool(np.ma.getmaskarray(heat)[0, 0]) and heat[0, 1] == 2 * 1e-9
+    _result, ax = drawn_track(scores="mu", feature_types=[], region=(101, 150))
+    assert ax.images[1].get_extent()[:2] == [100.5, 150.5]
+    assert ax.images[1].get_array()[0, 0] == 101 * 1e-9
+    # binned, the last column may overhang the view but the first still starts on `lo`
+    result, ax = drawn_track(residues=long_residues(), feature_types=[], region=(1001, 34_350))
+    left, right = ax.images[0].get_extent()[:2]
+    assert left == 1000.5 and right == 1000.5 + result["bin_size"] * ax.images[0].get_array().shape[1]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "plddt, band",
+    [(100.0, "> 90"), (90.0, "> 90"), (89.99, "70–90"), (70.0, "70–90"), (69.99, "50–70"),
+     (50.0, "50–70"), (49.99, "< 50"), (0.0, "< 50")],
+)  # fmt: skip
+def test_a_plddt_on_a_threshold_is_drawn_and_counted_in_the_band_that_starts_there(plddt, band):
+    residues = track_residues().with_columns(plddt=pl.lit(plddt))
+    result, ax = drawn_track(residues=residues, feature_types=[])
+    colour = {label: colour for _floor, colour, label in plots._PLDDT_BANDS}[band]
+    strip = ax.images[0]
+    assert strip.cmap(strip.norm(strip.get_array()[0, 0])) == pytest.approx(matplotlib_rgba(colour))
+    assert result["plddt_fractions"][band] == 1.0
+
+
+@pytest.mark.parametrize(
+    "models, said",
+    [
+        (["AF-P1-F1-model_v6"], "predicted structure: AlphaFold Protein Structure Database model AF-P1-F1-model_v6"),
+        (["AF3-P1-F1-model_v6"], "predicted structure: AlphaFold 3 (AlphaFold Server) prediction AF3-P1-F1-model_v6"),
+        (["AF3-P1-F1", "AF3-P1-F2", "AF3-P1-F3"], "predicted structure: AlphaFold 3 (AlphaFold Server) predictions AF3-P1-F1 … AF3-P1-F3 (3 files)"),
+        (["AF-P1-F1", "AF3-P1-F1", "AF-P1-F2", "x.pdb"], "predicted structure: AlphaFold Protein Structure Database models AF-P1-F1, AF-P1-F2; AlphaFold 3 (AlphaFold Server) prediction AF3-P1-F1; model file x.pdb"),
+        ([], "predicted structure"),
+    ],
+)  # fmt: skip
+def test_the_note_says_predicted_and_names_the_source_by_the_model_ids(models, said):
+    assert plots._track_source(models) == said
+
+
+def test_a_track_with_no_model_ids_still_says_the_structure_is_predicted():
+    result, _ax = drawn_track(residues=track_residues().drop("model_file_id"))
+    assert result["note"] == "predicted structure"
