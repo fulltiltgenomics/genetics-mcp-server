@@ -276,11 +276,11 @@ del _name
 
 # the submodules a script reaches as `genetics.<name>`, resolved on first use and never
 # imported by this package: they are the analysis surfaces, not the data client
-_LAZY_MODULES = ("plots", "linemodels", "mr", "enrichment")
+_LAZY_MODULES = ("plots", "linemodels", "mr", "enrichment", "structure")
 
 
 def __getattr__(name: str):
-    """`genetics.plots`, `genetics.linemodels`, `genetics.mr` and `genetics.enrichment` resolve on first use, and only then.
+    """`genetics.plots`, `genetics.linemodels`, `genetics.mr`, `genetics.enrichment` and `genetics.structure` resolve on first use, and only then.
 
     Deliberately lazy rather than an import at the top of this file: they import numpy,
     scipy or matplotlib.pyplot (mr through plots), and this package is imported by
