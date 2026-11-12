@@ -473,6 +473,14 @@ def _seg(value: Any) -> str:
 
 CELL_TYPE_EXPRESSION_LEVELS = ("summary", "dataset")
 
+# the variant-annotation source that reads the protein structure release
+PROTEIN_ANNOTATION_SOURCE = "protein"
+PROTEIN_STRUCTURE_NOT_AVAILABLE = {
+    "success": False,
+    "error_code": "not_available",
+    "error": "The protein structure layer is not available on this deployment.",
+}
+
 _VERSIONED_ENSG = re.compile(r"^(ENSG\d+)\.\d+$", re.IGNORECASE)
 
 
@@ -3294,6 +3302,29 @@ class ToolExecutor:
         source: str = "finngen",
     ) -> dict[str, Any]:
         """Get variant annotations by variant, region, gene, or batch variants."""
+        # `source` is a free string, so without this the residue map is one argument away on
+        # every surface that offers this tool, whatever the deployment's flag says
+        if source == PROTEIN_ANNOTATION_SOURCE and not self._protein_structure_offered():
+            return dict(PROTEIN_STRUCTURE_NOT_AVAILABLE)
+        return await self._variant_annotations(variant, region, gene, variants, source)
+
+    @staticmethod
+    def _protein_structure_offered() -> bool:
+        settings = _resolve_settings()
+        # the sandbox image carries no deployment flags; there results-api, which registers
+        # the source only where it serves a release, is the gate
+        if settings is _PRUNED_INSTALL_SETTINGS:
+            return True
+        return settings.protein_structure_offered
+
+    async def _variant_annotations(
+        self,
+        variant: str | None = None,
+        region: str | None = None,
+        gene: str | None = None,
+        variants: list[str] | None = None,
+        source: str = "finngen",
+    ) -> dict[str, Any]:
         # exactly one query type must be provided
         provided = sum(x is not None for x in [variant, region, gene, variants])
         if provided != 1:
@@ -3357,12 +3388,769 @@ class ToolExecutor:
                             "filename": "variant_annotations.tsv",
                         }
                 return result
+            if source == PROTEIN_ANNOTATION_SOURCE:
+                return self._structure_failure(resp)
             if resp.status_code == 404:
                 return {"success": False, "error": f"Not found: {resp.text}"}
             return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
         except Exception as e:
             logger.error(f"Error in get_variant_annotations: {e}\n{traceback.format_exc()}")
             return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    # -------------------------------------------------------------------------
+    # Protein Structure Layer
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _structure_failure(resp: httpx.Response) -> dict[str, Any]:
+        """A refusal from the protein structure routes, worded for whoever has to act on it."""
+        status, detail = resp.status_code, _detail(resp)
+        if status == 404:
+            # a deployment without a release pointer registers neither the routes nor the
+            # `protein` annotation source. FastAPI's own 404 is read as that only because
+            # `_structure_path_arg` has already refused the arguments that miss every route
+            # on a deployment that has them; a 404 with any other detail is results-api's
+            # own answer about what was asked for
+            if detail == "Not Found" or str(detail).startswith("Unknown annotation source"):
+                return dict(PROTEIN_STRUCTURE_NOT_AVAILABLE)
+            return {
+                "success": False,
+                "error_code": "not_found",
+                "error": detail or f"Not found: {resp.text}",
+            }
+        if status == 503 and not resp.headers.get(_UNREACHABLE_HEADER):
+            return {
+                "success": False,
+                "error_code": "release_not_loaded",
+                "error": (
+                    "The protein structure layer is temporarily unavailable: the server has "
+                    "not loaded its release yet. Try again in a few minutes."
+                ),
+            }
+        # 413 is the route's own limit on a JSON body; a sandbox execution's per-response
+        # limit arrives as 429 with this code
+        if status == 413 or (status == 429 and "sandbox_response_bytes" in resp.text):
+            return {
+                "success": False,
+                "error_code": "too_large",
+                "error": (
+                    f"The response is over the per-response size limit ({detail or resp.text}). "
+                    "For PAE, ask for the rows of the positions you need (positions=[...]) "
+                    "instead of the whole matrix."
+                ),
+            }
+        if status == 422:
+            return {
+                "success": False,
+                "error_code": "invalid_request",
+                "error": str(detail or resp.text),
+            }
+        return {"success": False, "error": f"HTTP {status}: {resp.text}"}
+
+    @staticmethod
+    def _structure_path_arg(value: Any, what: str) -> str | dict[str, Any]:
+        """A `protein` or `model_file_id` fit to be a path segment, or the failure to return."""
+        text = _unversioned_ensg(str(value if value is not None else "").strip())
+        if not text or re.search(r"[\s/\\]", text):
+            return {
+                "success": False,
+                "error_code": "invalid_request",
+                "error": f"{what} must be one name without spaces or slashes, got {value!r}",
+            }
+        return text
+
+    async def get_protein_models(self, protein: str) -> dict[str, Any]:
+        """The model files of a protein (UniProt accession, gene name or ENSG id)."""
+        protein = self._structure_path_arg(protein, "protein")
+        if isinstance(protein, dict):
+            return protein
+        resp = await self.client.get(f"{self.base_url}/v1/protein_structure/models/{_seg(protein)}")
+        if resp.status_code != 200:
+            return self._structure_failure(resp)
+        results = resp.json()
+        return {
+            "success": True,
+            **self._columns_meta(resp),
+            "protein": protein,
+            "release": resp.headers.get("X-Dataset-Version"),
+            "count": len(results),
+            "results": results,
+        }
+
+    async def _protein_rows(self, kind: str, protein: str) -> dict[str, Any]:
+        import io
+
+        import polars as pl
+
+        protein = self._structure_path_arg(protein, "protein")
+        if isinstance(protein, dict):
+            return protein
+        # TSV, because results-api refuses the JSON form of a gene whose rows pass its
+        # per-response limit
+        resp = await self.client.get(
+            f"{self.base_url}/v1/protein_structure/{kind}/{_seg(protein)}",
+            params={"format": "tsv"},
+        )
+        if resp.status_code != 200:
+            return self._structure_failure(resp)
+        # quote_char=None: feature descriptions are free text and may hold a quote
+        frame = pl.read_csv(
+            io.BytesIO(resp.content),
+            separator="\t",
+            null_values="NA",
+            infer_schema_length=None,
+            quote_char=None,
+        )
+        return {
+            "success": True,
+            **self._columns_meta_from(frame.columns),
+            "protein": protein,
+            "release": resp.headers.get("X-Dataset-Version"),
+            "count": frame.height,
+            "results": frame.to_dicts(),
+        }
+
+    async def get_protein_residues(self, protein: str) -> dict[str, Any]:
+        """Per-residue rows of every model file of a protein."""
+        return await self._protein_rows("residues", protein)
+
+    async def get_protein_features(self, protein: str) -> dict[str, Any]:
+        """Sequence features (UniProt features and TED domains) of a protein."""
+        return await self._protein_rows("features", protein)
+
+    @staticmethod
+    def _variant_key(variant: Any) -> str:
+        """A variant id in the spelling the variant-to-residue map uses, to match rows to input."""
+        parts = re.split(r"[:_-]", str(variant).strip().upper().removeprefix("CHR"))
+        if len(parts) != 4:
+            return str(variant).strip()
+        parts[0] = {"X": "23", "Y": "24"}.get(parts[0], parts[0])
+        return ":".join(parts)
+
+    async def get_protein_variant_residues(self, variants: list[str] | str) -> dict[str, Any]:
+        """The residue each variant changes, one row per (variant, protein), values typed.
+
+        `variants_without_residue_row` lists the variants given that came back with no row.
+        """
+        variants = [variants] if isinstance(variants, str) else [str(v) for v in variants or []]
+        result = await self._variant_annotations(
+            variants=variants, source=PROTEIN_ANNOTATION_SOURCE
+        )
+        if not result.get("success"):
+            return result
+        rows = []
+        for raw in result["results"]:
+            row = {k: (None if v in ("NA", "") else v) for k, v in raw.items()}
+            for column in ("pos", "aa_pos", "file_position"):
+                if row.get(column) is not None:
+                    row[column] = int(row[column])
+            if row.get("mu_snp") is not None:
+                row["mu_snp"] = float(row["mu_snp"])
+            rows.append(row)
+        found = {self._variant_key(r["variant"]) for r in rows}
+        result["results"] = rows
+        result["variants_without_residue_row"] = [
+            v for v in variants if self._variant_key(v) not in found
+        ]
+        if "_download_data" in result:
+            result["_download_data"] = {"results": rows, "filename": "variant_residues.tsv"}
+        return result
+
+    async def get_protein_structure_file(self, model_file_id: str) -> dict[str, Any]:
+        """One model file of the release, as PDB text bytes in `content`."""
+        model_file_id = self._structure_path_arg(model_file_id, "model_file_id")
+        if isinstance(model_file_id, dict):
+            return model_file_id
+        resp = await self.client.get(
+            f"{self.base_url}/v1/protein_structure/structure/{_seg(model_file_id)}"
+        )
+        if resp.status_code != 200:
+            return self._structure_failure(resp)
+        return {
+            "success": True,
+            "model_file_id": model_file_id,
+            "release": resp.headers.get("X-Dataset-Version"),
+            "content": resp.content,
+        }
+
+    @staticmethod
+    def _position_ranges(positions: list[int]) -> str:
+        """Ascending positions as the routes' `positions` value, runs folded to N-M."""
+        parts: list[str] = []
+        start = prev = positions[0]
+        for p in positions[1:] + [None]:
+            if p is not None and p == prev + 1:
+                prev = p
+                continue
+            parts.append(str(start) if start == prev else f"{start}-{prev}")
+            if p is not None:
+                start = prev = p
+        return ",".join(parts)
+
+    async def get_protein_pae(
+        self,
+        model_file_id: str,
+        positions: list[int] | None = None,
+        n_residues: int | None = None,
+    ) -> dict[str, Any]:
+        """PAE of one model file in the release's uint8 encoding, in `pae`.
+
+        Without `positions` it is the whole n x n matrix as bytes; with them, a dict of
+        {file position: that position's row of n bytes}. `n_residues`, when the caller has
+        it from the model table, lets a whole matrix past the per-response limit be
+        fetched as blocks of rows instead of being refused.
+        """
+        from genetics_mcp_server.sdk import _structure_contract as contract
+
+        model_file_id = self._structure_path_arg(model_file_id, "model_file_id")
+        if isinstance(model_file_id, dict):
+            return model_file_id
+        base = f"{self.base_url}/v1/protein_structure/pae/{_seg(model_file_id)}"
+        whole = positions is None
+        if whole and (n_residues is None or n_residues**2 <= contract.MAX_RESPONSE_BYTES):
+            resp = await self.client.get(base)
+            if resp.status_code != 200:
+                return self._structure_failure(resp)
+            return {
+                "success": True,
+                "model_file_id": model_file_id,
+                "n_residues": int(resp.headers["X-PAE-Size"]),
+                "release": resp.headers.get("X-Dataset-Version"),
+                "pae": resp.content,
+            }
+        if whole:
+            wanted = list(range(1, n_residues + 1))
+        else:
+            try:
+                wanted = sorted({int(p) for p in positions})
+            except (TypeError, ValueError):
+                wanted = []
+            if not wanted or wanted[0] < 1:
+                return {
+                    "success": False,
+                    "error_code": "invalid_request",
+                    "error": f"positions must be file positions (integers from 1), got {positions!r}",
+                }
+        n, release, blocks, done = n_residues, None, [], 0
+        while done < len(wanted):
+            # one row is within the limit whatever the model's length, and its response
+            # carries the length the following blocks are sized by
+            size = contract.pae_rows_per_request(n) if n else 1
+            block = wanted[done : done + size]
+            resp = await self.client.get(
+                f"{base}/rows", params={"positions": self._position_ranges(block)}
+            )
+            if resp.status_code != 200:
+                return self._structure_failure(resp)
+            n = int(resp.headers["X-PAE-Size"])
+            release = resp.headers.get("X-Dataset-Version")
+            if len(resp.content) != len(block) * n:
+                return {
+                    "success": False,
+                    "error": (
+                        f"PAE rows of {model_file_id} came back as {len(resp.content)} bytes "
+                        f"where {len(block)} rows of {n} were asked for"
+                    ),
+                }
+            blocks.append((block, resp.content))
+            done += len(block)
+        if whole:
+            pae: Any = b"".join(body for _, body in blocks)
+        else:
+            pae = {
+                p: body[k * n : (k + 1) * n] for block, body in blocks for k, p in enumerate(block)
+            }
+        return {
+            "success": True,
+            "model_file_id": model_file_id,
+            "n_residues": n,
+            "release": release,
+            "pae": pae,
+        }
+
+    async def get_protein_structure_inputs(
+        self,
+        protein: str | None = None,
+        variants: list[str] | None = None,
+        positions: list[int] | None = None,
+        pae: bool = True,
+    ) -> dict[str, Any]:
+        """Everything `sdk.structure.protein()` takes for one protein: `models`, `structures`, `pae`.
+
+        The protein is named by `protein`, or is the one the `variants` change. With
+        `variants` or `positions` only the model files containing those residues are
+        fetched, and of PAE only those residues' rows — enough for distances among them and
+        for each one's neighbourhood. With neither, every model file and whole PAE matrices.
+        `positions` lists the protein positions that were fetched for, `variants` the
+        variants' residue rows on this protein.
+        """
+        if protein is None and not variants:
+            return {"success": False, "error": "Give a protein, or the variants on one"}
+        variant_rows: list[dict[str, Any]] = []
+        if variants:
+            mapped = await self.get_protein_variant_residues(variants)
+            if not mapped.get("success"):
+                return mapped
+            variant_rows = mapped["results"]
+            if not variant_rows:
+                return {
+                    "success": False,
+                    "error_code": "no_residue_row",
+                    "error": (
+                        "None of the variants has a residue row: each is either not missense on "
+                        "the canonical UniProt isoform under the release's annotation, or on a "
+                        "protein this deployment does not serve."
+                    ),
+                }
+        target = protein
+        if target is None:
+            candidates = sorted({r["accession"] for r in variant_rows})
+            if len(candidates) > 1:
+                return {
+                    "success": False,
+                    "error_code": "ambiguous_protein",
+                    "error": (
+                        f"The variants fall on {len(candidates)} proteins ({', '.join(candidates)}); "
+                        "pass protein=<accession> to choose one."
+                    ),
+                }
+            target = candidates[0]
+        listed = await self.get_protein_models(target)
+        if not listed.get("success"):
+            return listed
+        accessions = sorted({m["accession"] for m in listed["results"]})
+        if len(accessions) > 1 and variant_rows:
+            accessions = [a for a in accessions if any(r["accession"] == a for r in variant_rows)]
+        if len(accessions) != 1:
+            return {
+                "success": False,
+                "error_code": "ambiguous_protein" if accessions else "not_found",
+                "error": (
+                    f"{target} names {len(accessions)} proteins in the release "
+                    f"({', '.join(accessions)}); pass one UniProt accession."
+                    if accessions
+                    else f"None of the variants falls on a protein of {target}."
+                ),
+            }
+        accession = accessions[0]
+        models = sorted(
+            (m for m in listed["results"] if m["accession"] == accession),
+            key=lambda m: m["protein_start"],
+        )
+        variant_rows = [r for r in variant_rows if r["accession"] == accession]
+        length = max(m["protein_end"] for m in models)
+        try:
+            needed = sorted({int(p) for p in positions or []} | {r["aa_pos"] for r in variant_rows})
+        except (TypeError, ValueError):
+            needed = [0]
+        if needed and not 1 <= needed[0] <= needed[-1] <= length:
+            return {
+                "success": False,
+                "error_code": "invalid_request",
+                "error": f"positions must be protein positions of {accession}, 1 to {length}",
+            }
+        structures: dict[str, bytes] = {}
+        matrices: dict[str, Any] = {}
+        for m in models:
+            start, end = m["protein_start"], m["protein_end"]
+            inside = [p - start + 1 for p in needed if start <= p <= end]
+            if needed and not inside:
+                continue
+            mid = m["model_file_id"]
+            fetched = await self.get_protein_structure_file(mid)
+            if not fetched.get("success"):
+                return fetched
+            structures[mid] = fetched["content"]
+            if pae and m["has_pae"]:
+                fetched = await self.get_protein_pae(mid, inside or None, m["n_residues"])
+                if not fetched.get("success"):
+                    return fetched
+                matrices[mid] = fetched["pae"]
+        return {
+            "success": True,
+            "accession": accession,
+            "release": listed.get("release"),
+            "models": models,
+            "structures": structures,
+            "pae": matrices or None,
+            "positions": needed,
+            "variants": variant_rows,
+        }
+
+    _STRUCTURE_MAX_VARIANTS = 50
+    _STRUCTURE_NO_RESIDUE_ROW = (
+        "no residue row: not missense on the canonical UniProt isoform under the release's "
+        "annotation, or on a protein this deployment does not serve"
+    )
+
+    def _structure_variants_arg(self, variants: Any, least: int = 1) -> list[str] | dict[str, Any]:
+        """The tool argument as a list of distinct variants, or the failure to return."""
+        given = [variants] if isinstance(variants, str) else list(variants or [])
+        distinct = list(dict.fromkeys(str(v).strip() for v in given if str(v).strip()))
+        if len(distinct) < least:
+            return {"success": False, "error": f"Give at least {least} different variant(s)"}
+        if len(distinct) > self._STRUCTURE_MAX_VARIANTS:
+            return {
+                "success": False,
+                "error": f"At most {self._STRUCTURE_MAX_VARIANTS} variants per call, got {len(distinct)}",
+            }
+        return distinct
+
+    async def _structure_tool_rows(self, variants: list[str]) -> dict[str, Any]:
+        """`get_protein_variant_residues`, with each row's variant spelled as the caller wrote it.
+
+        The map spells a variant its own way (X is 23, no `chr`), and a result that names a
+        variant differently from the question reads as a different variant.
+        """
+        mapped = await self.get_protein_variant_residues(variants)
+        if mapped.get("success"):
+            written = {self._variant_key(v): v for v in reversed(variants)}
+            for row in mapped["results"]:
+                row["variant"] = written.get(self._variant_key(row["variant"]), row["variant"])
+        return mapped
+
+    async def _structure_tool(self, name: str, call: Any) -> dict[str, Any]:
+        from genetics_mcp_server.sdk.errors import GeneticsUsageError
+
+        try:
+            return await call
+        except GeneticsUsageError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error(f"Error in {name}: {e}\n{traceback.format_exc()}")
+            return {"success": False, "error": INTERNAL_ERROR_MSG}
+
+    async def get_protein_features_at_variant(self, variants: list[str] | str) -> dict[str, Any]:
+        """The residue each variant changes, the features covering it and its pLDDT."""
+        return await self._structure_tool(
+            "get_protein_features_at_variant", self._protein_features_at_variant(variants)
+        )
+
+    async def _protein_features_at_variant(self, variants: Any) -> dict[str, Any]:
+        from genetics_mcp_server.sdk import structure
+
+        variants = self._structure_variants_arg(variants)
+        if isinstance(variants, dict):
+            return variants
+        mapped = await self._structure_tool_rows(variants)
+        if not mapped.get("success"):
+            return mapped
+        features: dict[str, Any] = {}
+        plddt: dict[str, list[float]] = {}
+        results = []
+        for row in mapped["results"]:
+            accession, mid = row["accession"], row["model_file_id"]
+            if accession not in features:
+                fetched = await self.get_protein_features(accession)
+                if fetched.get("success"):
+                    features[accession] = fetched["results"]
+                elif fetched.get("error_code") == "not_found":
+                    # the route answers 404 both for a protein with no feature and for one
+                    # whose rows it cannot reach by accession; only the first is an empty list
+                    no_rows = str(fetched["error"]).startswith("No feature rows")
+                    features[accession] = [] if no_rows else fetched["error"]
+                else:
+                    return fetched
+            if mid and mid not in plddt:
+                fetched = await self.get_protein_structure_file(mid)
+                if not fetched.get("success"):
+                    return fetched
+                plddt[mid] = structure.parse_model(fetched["content"])["plddt"].to_list()
+            entry: dict[str, Any] = {
+                "variant": row["variant"],
+                "gene_name": row.get("gene_name"),
+                "accession": accession,
+                "residue_change": f"{row['aa_ref']}{row['aa_pos']}{row['aa_alt']}",
+                "protein_position": row["aa_pos"],
+                "plddt": round(plddt[mid][row["file_position"] - 1], 2) if mid else None,
+                "model_file_id": mid,
+                "file_position": row["file_position"],
+                "mu_snp": row.get("mu_snp"),
+            }
+            if isinstance(features[accession], str):
+                entry["features"] = None
+                entry["features_unavailable"] = features[accession]
+            else:
+                entry["features"] = [
+                    {
+                        k: f.get(k)
+                        for k in (
+                            "source",
+                            "feature_type",
+                            "start",
+                            "end",
+                            "description",
+                            "evidence_tier",
+                            "evidence",
+                        )
+                    }
+                    for f in features[accession]
+                    if f["start"] <= row["aa_pos"] <= f["end"]
+                ]
+            results.append(entry)
+        result = {
+            "success": True,
+            "release": mapped.get("version"),
+            "count": len(results),
+            "results": results,
+        }
+        if mapped["variants_without_residue_row"]:
+            result["variants_without_residue_row"] = mapped["variants_without_residue_row"]
+            result["without_residue_row_means"] = self._STRUCTURE_NO_RESIDUE_ROW
+        return result
+
+    async def get_3d_distance_between_variants(self, variants: list[str]) -> dict[str, Any]:
+        """Calpha distance, PAE and lower pLDDT for each pair of variants on one protein."""
+        return await self._structure_tool(
+            "get_3d_distance_between_variants", self._distance_between_variants(variants)
+        )
+
+    async def _distance_between_variants(self, variants: Any) -> dict[str, Any]:
+        from itertools import combinations
+
+        from genetics_mcp_server.sdk import structure
+
+        variants = self._structure_variants_arg(variants, least=2)
+        if isinstance(variants, dict):
+            return variants
+        mapped = await self._structure_tool_rows(variants)
+        if not mapped.get("success"):
+            return mapped
+        by_accession: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        for row in mapped["results"]:
+            by_accession[row["accession"]][row["variant"]] = row
+        pairs: list[dict[str, Any]] = []
+        compared: set[frozenset[str]] = set()
+        for accession, rows in by_accession.items():
+            positions = sorted({r["aa_pos"] for r in rows.values()})
+            measured: dict[tuple[int, int], dict[str, Any]] = {}
+            has_pae = None
+            if len(positions) > 1:
+                inputs = await self.get_protein_structure_inputs(
+                    protein=accession, positions=positions
+                )
+                if not inputs.get("success"):
+                    return inputs
+                has_pae = inputs["pae"] is not None
+                protein = structure.protein(inputs["models"], inputs["structures"], inputs["pae"])
+                measured = {
+                    (d["position_a"], d["position_b"]): d
+                    for d in structure.distances(protein, positions).to_dicts()
+                }
+            for a, b in combinations(rows.values(), 2):
+                compared.add(frozenset((a["variant"], b["variant"])))
+                a, b = sorted((a, b), key=lambda r: r["aa_pos"])
+                pair: dict[str, Any] = {
+                    "variant_a": a["variant"],
+                    "variant_b": b["variant"],
+                    "gene_name": a.get("gene_name"),
+                    "accession": accession,
+                    "residue_a": f"{a['aa_ref']}{a['aa_pos']}",
+                    "residue_b": f"{b['aa_ref']}{b['aa_pos']}",
+                }
+                d = measured.get((a["aa_pos"], b["aa_pos"]))
+                if d is None:
+                    pair["status"] = "same_residue"
+                elif d["distance"] is None:
+                    # each model file has its own coordinate frame, so there is no distance
+                    # to give for a pair no file contains
+                    pair |= {
+                        "status": "no_shared_model_file",
+                        "distance": None,
+                        "reason": d["reason"],
+                    }
+                else:
+                    pair |= {
+                        "status": "measured",
+                        "distance": round(d["distance"], 2),
+                        "pae": d["pae"],
+                        "min_plddt": round(d["min_plddt"], 2),
+                        "model_file_id": d["model_file_id"],
+                        "same_window": d["same_window"],
+                    }
+                    if not has_pae:
+                        pair["pae_unavailable"] = "the release holds no PAE for this protein"
+                pairs.append(pair)
+        with_rows = {r["variant"] for r in mapped["results"]}
+        for a, b in combinations(sorted(with_rows), 2):
+            if frozenset((a, b)) not in compared:
+                pairs.append({"variant_a": a, "variant_b": b, "status": "different_proteins"})
+        shown, truncated = self._cap_rows(pairs)
+        result = {
+            "success": True,
+            "release": mapped.get("version"),
+            "units": "distance and pae in angstrom (Calpha to Calpha); plddt 0-100",
+            "count": len(pairs),
+            "pairs": shown,
+        }
+        if truncated:
+            result["truncated"] = True
+            result["note"] = (
+                f"first {len(shown)} of {len(pairs)} pairs shown; ask for fewer variants"
+            )
+        if mapped["variants_without_residue_row"]:
+            result["variants_without_residue_row"] = mapped["variants_without_residue_row"]
+            result["without_residue_row_means"] = self._STRUCTURE_NO_RESIDUE_ROW
+        return result
+
+    async def get_3d_neighbourhood(
+        self,
+        variant: str | None = None,
+        protein: str | None = None,
+        position: int | None = None,
+        radius: float = 15.0,
+        pae_cutoff: int = 15,
+        apply_pae_filter: bool = True,
+        variants: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """The residues within `radius` of a residue, and which of `variants` are among them."""
+        return await self._structure_tool(
+            "get_3d_neighbourhood",
+            self._neighbourhood(
+                variant, protein, position, radius, pae_cutoff, apply_pae_filter, variants
+            ),
+        )
+
+    async def _neighbourhood(
+        self,
+        variant: str | None,
+        protein: str | None,
+        position: int | None,
+        radius: float,
+        pae_cutoff: int,
+        apply_pae_filter: bool,
+        variants: list[str] | None,
+    ) -> dict[str, Any]:
+        from genetics_mcp_server.sdk import structure
+
+        if (variant is None) == (position is None) or (position is not None and not protein):
+            return {
+                "success": False,
+                "error": "Give the centre as `variant`, or as `protein` with `position`",
+            }
+        candidates = self._structure_variants_arg(variants, least=0)
+        if isinstance(candidates, dict):
+            return candidates
+        mapped: dict[str, Any] = {"results": [], "variants_without_residue_row": []}
+        asked = candidates + ([variant.strip()] if variant else [])
+        if asked:
+            mapped = await self._structure_tool_rows(list(dict.fromkeys(asked)))
+            if not mapped.get("success"):
+                return mapped
+        centre_variant = None
+        if variant is not None:
+            if variant.strip() in mapped["variants_without_residue_row"]:
+                return {
+                    "success": False,
+                    "error_code": "no_residue_row",
+                    "error": f"{variant} has {self._STRUCTURE_NO_RESIDUE_ROW}.",
+                }
+            key = self._variant_key(variant)
+            on = [r for r in mapped["results"] if self._variant_key(r["variant"]) == key]
+            # the routes take an accession, a gene name or an ENSG id, so this does too
+            named = _unversioned_ensg(protein.strip()).upper() if protein else None
+            centres = [
+                r
+                for r in on
+                if named is None
+                or named in {str(r.get(k)).upper() for k in ("accession", "gene_id", "gene_name")}
+            ]
+            if len(centres) != 1:
+                return {
+                    "success": False,
+                    "error_code": "ambiguous_protein" if centres else "not_found",
+                    "error": (
+                        f"{variant} changes a residue on "
+                        f"{', '.join(sorted(r['accession'] for r in on))}"
+                        + ("" if centres else f", not on {protein}")
+                        + "; pass protein=<one of these accessions>."
+                    ),
+                }
+            centre_variant = centres[0]
+            protein, position = centre_variant["accession"], centre_variant["aa_pos"]
+        inputs = await self.get_protein_structure_inputs(protein=protein, positions=[position])
+        if not inputs.get("success"):
+            return inputs
+        accession = inputs["accession"]
+        position = inputs["positions"][0]
+        found = structure.neighbourhood(
+            structure.protein(inputs["models"], inputs["structures"], inputs["pae"]),
+            position,
+            radius=radius,
+            pae_cutoff=pae_cutoff if apply_pae_filter else None,
+        )
+        neighbours = [
+            {**n, "distance": round(n["distance"], 2), "plddt": round(n["plddt"], 2)}
+            for n in found["neighbours"].sort("distance").to_dicts()
+        ]
+        by_position = {n["protein_position"]: n for n in neighbours}
+        # one file is the usual case, and its id on every row would be most of the payload
+        files = sorted({n["model_file_id"] for n in neighbours})
+        for n in neighbours:
+            del n["file_position"]
+            if len(files) == 1:
+                del n["model_file_id"]
+        centre = by_position[position]
+        shown, truncated = self._cap_rows(neighbours)
+        result: dict[str, Any] = {
+            "success": True,
+            "release": inputs.get("release"),
+            "accession": accession,
+            "gene_name": inputs["models"][0].get("gene_name"),
+            "centre": {
+                "protein_position": position,
+                "residue": centre["residue"],
+                "plddt": centre["plddt"],
+                **({"variant": centre_variant["variant"]} if centre_variant else {}),
+            },
+            "radius": found["radius"],
+            "pae_cutoff": found["pae_cutoff"],
+            "pae_filter_applied": found["pae_filter_applied"],
+            "units": "distance and pae in angstrom (Calpha to Calpha); plddt 0-100",
+            "model_file_ids": files,
+            "count": len(neighbours),
+            "neighbours": shown,
+        }
+        if not found["pae_filter_applied"]:
+            result["pae_filter_note"] = (
+                "the release holds no PAE for this protein, so the neighbourhood is distance-only"
+                if inputs["pae"] is None
+                else "no PAE filter was asked for, so the neighbourhood is distance-only"
+            )
+        if truncated:
+            result["truncated"] = True
+            result["note"] = f"nearest {len(shown)} of {len(neighbours)} neighbours shown"
+        if candidates:
+            keys = {self._variant_key(v) for v in candidates}
+            rows = [r for r in mapped["results"] if self._variant_key(r["variant"]) in keys]
+            here = {r["variant"] for r in rows if r["accession"] == accession}
+            placed = []
+            for row in rows:
+                if row["accession"] != accession:
+                    if row["variant"] not in here:
+                        placed.append(
+                            {
+                                "variant": row["variant"],
+                                "status": "different_protein",
+                                "accession": row["accession"],
+                            }
+                        )
+                    continue
+                entry = {
+                    "variant": row["variant"],
+                    "residue": f"{row['aa_ref']}{row['aa_pos']}",
+                    "in_neighbourhood": row["aa_pos"] in by_position,
+                }
+                if entry["in_neighbourhood"]:
+                    n = by_position[row["aa_pos"]]
+                    entry |= {k: n[k] for k in ("distance", "pae", "plddt")}
+                placed.append(entry)
+            result["variants"] = placed
+            missing = [v for v in mapped["variants_without_residue_row"] if v in candidates]
+            if missing:
+                result["variants_without_residue_row"] = missing
+                result["without_residue_row_means"] = self._STRUCTURE_NO_RESIDUE_ROW
+        return result
 
     # -------------------------------------------------------------------------
     # Summary Statistics Tools
@@ -5977,7 +6765,16 @@ class ToolExecutor:
 # the modules a script sees, in the order the index reports them. They are the ones the
 # sandbox stubs are generated from (sandbox/stubs/*.pyi), so the tool and the shipped
 # reference describe the same surface.
-_SDK_MODULES = ("genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment")
+_SDK_MODULES = (
+    "genetics",
+    "client",
+    "errors",
+    "plots",
+    "linemodels",
+    "mr",
+    "enrichment",
+    "structure",
+)
 
 # one-line labels written here rather than taken from each module's __doc__. The catalogue
 # renders per-function signatures and docstrings only: module docstrings describe the
@@ -6001,6 +6798,10 @@ _SDK_MODULE_SUMMARIES = {
         "gene set enrichment (over-representation, preranked GSEA, competitive gene-level "
         "test, a density-matched locus test for GWAS leads, and collapsing redundant sets) "
         "against the gene set collections this deployment ships"
+    ),
+    "structure": (
+        "protein structure geometry on predicted models: Calpha distances, PAE and 3D "
+        "neighbourhoods, computed on model files and PAE already in memory"
     ),
 }
 
@@ -6065,7 +6866,7 @@ def _sdk_members(module: str) -> list[tuple[str, Any]]:
             for n in names
             if hasattr(sdk_client.GeneticsClient, n)
         ]
-    if module in ("plots", "linemodels", "mr", "enrichment"):
+    if module in ("plots", "linemodels", "mr", "enrichment", "structure"):
         # __all__ rather than a name list here: the module's own export list is what the
         # generated stub reads too, so the catalogue and the stub cannot disagree about
         # which functions exist
@@ -6110,6 +6911,7 @@ _SDK_CALL_PREFIXES = {
     "linemodels": "genetics.linemodels.",
     "mr": "genetics.mr.",
     "enrichment": "genetics.enrichment.",
+    "structure": "genetics.structure.",
 }
 
 

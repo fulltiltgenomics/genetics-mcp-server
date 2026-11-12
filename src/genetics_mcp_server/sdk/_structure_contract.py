@@ -2,8 +2,9 @@
 
 A copy, not an import: the definition lives in genetics-results-munge
 `scripts/protein_structure_contract.py`, and the SDK ships into a sandbox image that holds no
-other repo's code. Only what the geometry needs is copied: the contract version, the PAE
-encoding, the two window rules and `models.tsv.gz`'s column list.
+other repo's code. Only what the geometry and its fetches need is copied: the contract
+version, the PAE encoding, the two window rules, `models.tsv.gz`'s column list and the
+per-response byte limit.
 tests/test_sdk_structure.py pins these and compares them with the munge module when a
 checkout of it is found.
 """
@@ -42,6 +43,16 @@ MODEL_COLUMNS = [
 PAE_SCALE = 8
 PAE_NO_VALUE = 255
 PAE_MAX_CODE = 254
+
+# SDK limit on one HTTP response
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+def pae_rows_per_request(n: int) -> int:
+    """the most rows of an n x n PAE object one request may ask for: floor(MAX_RESPONSE_BYTES / n)."""
+    if n < 1:
+        raise ValueError("n must be positive")
+    return MAX_RESPONSE_BYTES // n
 
 
 def decode_pae(code: int) -> float | None:

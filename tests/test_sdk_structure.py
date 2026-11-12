@@ -155,9 +155,14 @@ class TestContractMirror:
             "PAE_SCALE",
             "PAE_NO_VALUE",
             "PAE_MAX_CODE",
+            "MAX_RESPONSE_BYTES",
         ):
             assert getattr(contract, name) == getattr(munge, name), name
         assert all(contract.decode_pae(c) == munge.decode_pae(c) for c in range(256))
+        assert all(
+            contract.pae_rows_per_request(n) == munge.pae_rows_per_request(n)
+            for n in (1, 766, 4096, 4097, 34350)
+        )
         rng = np.random.default_rng(0)
         tilings = [
             [(int(r["protein_start"]), int(r["protein_end"])) for r in ROWS[a]] for a in MULTI

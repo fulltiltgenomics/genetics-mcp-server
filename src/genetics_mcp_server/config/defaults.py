@@ -34,6 +34,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _fs,
     block_text,
     custom_gwas_resources,
+    protein_structure_sdk_rule,
     r12_model_datasets,
     url_input_hosts_rule,
 )
@@ -342,6 +343,19 @@ For anything about the protein itself — domains, active/binding/metal sites, c
 
 **Always check the resolution block before using the result.** Every UniProt result reports which entry actually answered — `accession`, `entry_name`, `protein_name`, `gene_names`, `organism`, `match_basis`, `ambiguous`, and `alternatives`. Confirm the returned protein is the one asked about before quoting anything from it. If `ambiguous` is true, or the gene names do not match the gene in question, say so and disambiguate (list the `alternatives`, or set `organism_id`) instead of proceeding on the first hit. Report the accession you actually used alongside the annotation so the user can verify it.
 """),
+    _Block("""
+### Protein Structure (frozen release)
+
+`get_protein_features_at_variant` (the residue a variant changes, the features covering it, its pLDDT), `get_3d_distance_between_variants` and `get_3d_neighbourhood` read this deployment's protein structure release: AlphaFold models, with UniProt features and TED domains frozen when the release was built. Use them when a question starts from variants and asks where they sit in the protein or in 3D; use `get_protein_annotations` for the full, current UniProt entry. The two can disagree. The release wins for anything stated with its structure (which residue a variant changes, pLDDT, distances); live UniProt wins for what is currently annotated. Say which source a statement comes from.
+
+State every distance with its PAE and pLDDT, and give no distance for a pair reported as sharing no model file. A variant with no residue row is "not missense on the canonical UniProt isoform under the release's annotation, or on a protein the deployment does not serve", nothing stronger.
+"""),
+    _Block(
+        "",
+        requires_all=_fs("run_analysis", "get_protein_annotations"),
+        excludes=_fs("get_3d_neighbourhood"),
+        render=protein_structure_sdk_rule,
+    ),
     _Block("""
 ### Drug and Target Evidence (ChEMBL)
 

@@ -67,6 +67,7 @@ _DISABLED_TOOLS_ENV_VARS = (
     "ALPHAGENOME_ENABLED",
     "ALPHAGENOME_API_KEY",
     "CELL_TYPE_EXPRESSION_ENABLED",
+    "PROTEIN_STRUCTURE_ENABLED",
     "CONFIG_PROFILE",
 )
 
@@ -82,6 +83,11 @@ _DISABLED_TOOLS_ENV_VARS = (
 # besides. CONFIG_PROFILE and CELL_TYPE_EXPRESSION_ENABLED are envsubst'd into both manifests;
 # the baseline records the daly profile with the flag on (a deployment that sets the release
 # pointer), so get_cell_type_expression is offered — again the withdrawn direction is trivial.
+# PROTEIN_STRUCTURE_ENABLED is the exception to "read off the manifests": no manifest names
+# it yet. It is recorded as it is intended to be deployed on daly — on, for both surfaces, so
+# the chat backend offers the protein structure tools and /mcp withholds them by
+# `_mcp_disabled` alone. The manifests follow in the suite's deploy-wiring change; until then
+# a deploy leaves the flag unset, which is off.
 DEPLOYED_FLAGS: dict[str, dict[str, str]] = {
     "chat_backend": {
         "SANDBOX_ENABLED": "true",
@@ -89,11 +95,13 @@ DEPLOYED_FLAGS: dict[str, dict[str, str]] = {
         "ALPHAGENOME_ENABLED": "true",
         "ALPHAGENOME_API_KEY": "configured",
         "CELL_TYPE_EXPRESSION_ENABLED": "true",
+        "PROTEIN_STRUCTURE_ENABLED": "true",
         "CONFIG_PROFILE": "daly",
     },
     "mcp_server": {
         "ENABLE_SUBAGENTS": "false",
         "CELL_TYPE_EXPRESSION_ENABLED": "true",
+        "PROTEIN_STRUCTURE_ENABLED": "true",
         "CONFIG_PROFILE": "daly",
     },
 }

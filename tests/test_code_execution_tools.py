@@ -84,6 +84,7 @@ class TestToolDefinitions:
             "linemodels",
             "mr",
             "enrichment",
+            "structure",
         ]
 
 
@@ -99,6 +100,7 @@ class TestListCapabilities:
             "linemodels",
             "mr",
             "enrichment",
+            "structure",
         ]
         assert all(m["summary"] for m in result["modules"])
 

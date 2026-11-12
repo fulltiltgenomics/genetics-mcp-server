@@ -46,6 +46,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _Block,
     _fs,
     custom_gwas_resources,
+    protein_structure_sdk_rule,
     r12_model_datasets,
     url_input_hosts_rule,
 )
@@ -533,6 +534,19 @@ Protein-level questions — domains, active/binding sites, catalytic residues, s
 
 Report the accession you actually used alongside the annotation, so the user can verify it.
 """),
+    _Block("""
+### Protein Structure (frozen release)
+
+`get_protein_features_at_variant` (the residue a variant changes, the features covering it, its pLDDT), `get_3d_distance_between_variants` and `get_3d_neighbourhood` read this deployment's protein structure release: AlphaFold models, with UniProt features and TED domains frozen when the release was built. Use them when a question starts from variants and asks where they sit in the protein or in 3D; use `get_protein_annotations` for the full, current UniProt entry. The two can disagree. The release wins for anything stated with its structure (which residue a variant changes, pLDDT, distances); live UniProt wins for what is currently annotated. Say which source a statement comes from.
+
+State every distance with its PAE and pLDDT, and give no distance for a pair reported as sharing no model file. A variant with no residue row is "not missense on the canonical UniProt isoform under the release's annotation, or on a protein the deployment does not serve", nothing stronger.
+"""),
+    _Block(
+        "",
+        requires_all=_fs("run_analysis", "get_protein_annotations"),
+        excludes=_fs("get_3d_neighbourhood"),
+        render=protein_structure_sdk_rule,
+    ),
     _Block("""
 ### Drug and Target Evidence (ChEMBL)
 

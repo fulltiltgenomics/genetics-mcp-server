@@ -98,6 +98,13 @@ _FUNCTIONS = (
     "expression",
     "cell_type_expression",
     "gene_disease",
+    "protein_models",
+    "protein_residues",
+    "protein_features",
+    "protein_variants",
+    "protein_structure_file",
+    "protein_pae",
+    "protein_structure",
     "summary_stats",
     "ld",
     "ld_panels",
@@ -121,7 +128,16 @@ _FUNCTIONS = (
 # advertising data it does not. The sandbox stubs are filtered by this same table
 # (genetics-results-suite scripts/gen-sandbox-docs.py reads it with ast, so keep it a
 # literal), which is what keeps the stub and the import surface from disagreeing.
-_PROFILE_GATED = {"cell_type_expression": ("daly",)}
+_PROFILE_GATED = {
+    "cell_type_expression": ("daly",),
+    "protein_models": ("daly",),
+    "protein_residues": ("daly",),
+    "protein_features": ("daly",),
+    "protein_variants": ("daly",),
+    "protein_structure_file": ("daly",),
+    "protein_pae": ("daly",),
+    "protein_structure": ("daly",),
+}
 
 
 def _offered(name: str) -> bool:
