@@ -1158,7 +1158,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "web_search",
         "group": "lookup",
         "sdk_replaceable": False,
-        "description": "Search the web for general information. Use for finding drug information, clinical guidelines, news, or explanations of concepts. Use search_scientific_literature for research papers instead.",
+        "description": "Search the web for general information. Use for finding drug information, clinical guidelines, news, or explanations of concepts. Use search_scientific_literature for research papers instead. Each result is a title, a URL and a short snippet of the page — not the page: a snippet locates a source, it does not establish what the source says.",
         "parameters": {
             "query": {
                 "type": "string",
@@ -1175,12 +1175,12 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
             "include_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional: only search these domains",
+                "description": "Optional: only return pages on these domains (bare hostnames such as 'docs.finngen.fi'; subdomains are included)",
             },
             "exclude_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional: exclude these domains",
+                "description": "Optional: drop pages on these domains, subdomains included",
             },
         },
     },

@@ -803,7 +803,9 @@ class GeneticsClient:
         """Variant annotations (consequence, AF, gene) for one variant, a region, a gene or a batch.
 
         The columns depend on `source`: finngen rows carry AF, AC_Het/AC_Hom, rsid and the
-        exome/genome enrichment values; gnomad rows carry per-ancestry-group AF_* columns,
+        exome/genome enrichment values. AC_Het and AC_Hom count alt ALLELES, not people: a
+        homozygote adds 2 to AC_Hom, so homozygous individuals = AC_Hom / 2 and carriers =
+        AC_Het + AC_Hom / 2. gnomad rows carry per-ancestry-group AF_* columns,
         AN, filters, rsids and consequences, and no counts or enrichment. Every value is
         a string on both sources (pos, AF included), so cast before comparing or doing
         arithmetic. The gnomad `consequences` cell is a JSON string (`NA` when the variant
@@ -911,7 +913,14 @@ class GeneticsClient:
         resource: str = "finngen",
         data_type: str = "gwas",
     ) -> pl.DataFrame:
-        """Summary statistics, for explicit variant-phenotype pairs or for a whole region."""
+        """Summary statistics, for explicit variant-phenotype pairs or for a whole region.
+
+        Rows of data type `gwas_recessive` carry `ac_het` and `ac_hom`. They are the variant
+        annotation's counts, not the endpoint's: alt ALLELES across the whole genotyped
+        cohort, identical for every endpoint and not split by case status. A homozygote adds
+        2 to `ac_hom`, so homozygous individuals = `ac_hom` / 2, and they are homozygous for
+        the alt allele, which on a `flipped` row is not the allele the recessive test is on.
+        """
         pheno_list = [phenotypes] if isinstance(phenotypes, str) else list(phenotypes)
         key, value = _one_of(variants=variants, region=region)
         if key == "variants":
