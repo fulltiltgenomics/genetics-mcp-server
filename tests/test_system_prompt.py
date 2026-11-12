@@ -1367,6 +1367,51 @@ class TestRunAnalysisInputsRules:
         assert "fetched only from these hosts" in prompt
 
     @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    @pytest.mark.parametrize("hosts", [(".finngen.fi",), ("docs.finngen.fi", "risteys.finngen.fi")])
+    def test_the_finngen_docs_route_is_stated_when_both_sites_are_allowed(
+        self, fetcher_allow_list, variant, hosts
+    ):
+        fetcher_allow_list(self.HOSTS + hosts)
+        prompt = default_system_prompt(
+            "FinnGenie", tool_names=resolve("code", subagents=False), variant=variant
+        )
+        assert "https://docs.finngen.fi/llms.txt" in prompt
+        assert "https://risteys.finngen.fi/endpoints/<ENDPOINT_CODE>" in prompt
+
+    @pytest.mark.parametrize(
+        "hosts", [(), ("docs.finngen.fi",), ("risteys.finngen.fi",), (".notfinngen.fi",)]
+    )
+    def test_the_finngen_docs_route_is_not_stated_with_a_site_missing(
+        self, fetcher_allow_list, hosts
+    ):
+        fetcher_allow_list(self.HOSTS + hosts)
+        prompt = default_system_prompt("FinnGenie", tool_names=resolve("code", subagents=False))
+        assert "docs.finngen.fi/llms.txt" not in prompt
+        assert "fetched only from these hosts" in prompt
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_risteys_is_not_called_unreadable_on_any_surface(self, variant):
+        """The page is static HTML a URL input can fetch, so the ungated out-of-scope text
+        may not claim otherwise; it has to stay true with and without a fetcher."""
+        for surface in ("code", "nocode"):
+            prompt = default_system_prompt(
+                "FinnGenie", tool_names=resolve(surface, subagents=False), variant=variant
+            )
+            assert "https://risteys.finngen.fi/" in prompt
+            assert "cannot retrieve Risteys" not in prompt
+            assert "cannot be retrieved through any of your tools" not in prompt
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
+    def test_individual_level_data_is_refused_on_every_surface(self, variant):
+        for surface in ("code", "nocode"):
+            prompt = default_system_prompt(
+                "FinnGenie", tool_names=resolve(surface, subagents=False), variant=variant
+            )
+            assert "never individual-level data" in prompt
+            assert "do not answer questions about how to access or analyse it" in prompt
+            assert "the FinnGen Slack" in prompt
+
+    @pytest.mark.parametrize("variant", _ALL_VARIANTS)
     def test_nothing_is_said_when_the_fetcher_cannot_say(self, fetcher_allow_list, variant):
         fetcher_allow_list(None)
         prompt = default_system_prompt(

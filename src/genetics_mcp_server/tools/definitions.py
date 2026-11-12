@@ -1124,7 +1124,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
             "Do NOT invent hybrid labels like 'PubMed/Europe PMC' or 'Perplexity/PubMed' — PubMed etc. are content indexed by the europepmc backend, not separate backends. "
             "Perplexity hits carry bibliographic metadata (authors, journal) looked up in Europe PMC where a PMID/DOI/PMCID was available; that is recorded per record in 'metadata_source' and does not change which backend was searched.\n"
             "Every Perplexity record has a 'record_kind': 'europepmc' (matched to an indexed Europe PMC record), 'perplexity_snippet' (a URL and Perplexity's snippet, unmatched), 'database_page' (a database entry such as NCBI Gene, ClinVar, OMIM or UniProt, not a paper), or 'cited_only' (title and url only: a hit the summary cites beyond max_results, not counted in 'returned'). "
-            "'summary_citations' maps each [n] in the 'summary' to that hit's {title, url, record_kind}, or null when no hit has that number; the summary is Perplexity's prose, not any paper's claim.\n"
+            "'summary_citations' maps each [n] in the 'summary' to that hit's {title, url, record_kind}, or null when no hit has that number; the summary is Perplexity's prose, not any paper's claim. 'summary_identifiers' lists each DOI or PMID the prose names that no hit carries: `verified: true` with the Europe PMC title, authors, journal, year and url when the paper exists, `verified: false` when it was not found.\n"
             "Records matched in Europe PMC also carry fields that bound what they can be read as; on a Perplexity hit Europe PMC did not match, 'pub_types', 'subjects', 'cited_by', and 'publication_status' are absent, meaning unknown. "
             "'pub_types': the indexer's publication-type labels, not a reading of the study design. "
             "'subjects': the first few MeSH descriptors; MeSH lags publication by months and never exists for preprints, so an empty list is unknown, not evidence of absence (not 'not animal'). "
@@ -1158,7 +1158,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "name": "web_search",
         "group": "lookup",
         "sdk_replaceable": False,
-        "description": "Search the web for general information. Use for finding drug information, clinical guidelines, news, or explanations of concepts. Use search_scientific_literature for research papers instead.",
+        "description": "Search the web for general information. Use for finding drug information, clinical guidelines, news, or explanations of concepts. Use search_scientific_literature for research papers instead. Each result is a title, a URL and a short snippet of the page — not the page: a snippet locates a source, it does not establish what the source says.",
         "parameters": {
             "query": {
                 "type": "string",
@@ -1175,12 +1175,12 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
             "include_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional: only search these domains",
+                "description": "Optional: only return pages on these domains (bare hostnames such as 'docs.finngen.fi'; subdomains are included)",
             },
             "exclude_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional: exclude these domains",
+                "description": "Optional: drop pages on these domains, subdomains included",
             },
         },
     },
