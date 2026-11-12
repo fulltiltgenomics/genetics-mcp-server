@@ -5,6 +5,7 @@
     genetics.structure.distances(p, [175, 248, 273])        # one row per pair of residues
     genetics.structure.neighbourhood(p, 175)["neighbours"]  # residues within 15 Å, PAE < 15
     genetics.structure.adjacency(p)["adjacency"]            # the whole protein, n x n bool
+    genetics.structure.view(p, [{"position": 175, "label": "p.R175H", "role": "case"}])
 
 A port of the geometry in the Finucane lab's 3D rare-variant scan (`utils.py`:
 `get_pairwise_distances`, `get_distance_matrix_structure`, `get_pae_matrix_structure`,
@@ -39,6 +40,11 @@ larger value. The models give PAE in tenths, and for values on tenths a whole-nu
 selects from the stored codes exactly the pairs it selects from the model's own values; a
 fractional cutoff would not, which is why `pae_cutoff` must be a whole number.
 
+SHOWING IT. `view` writes a `.structure-view.json` artifact, which the chat draws as an
+interactive 3D model with the given residues marked; `pml` writes the same marking as a PyMOL
+script. Both show ONE model file, so for a long protein they say which residues that file
+does not contain rather than placing them in another file's coordinates.
+
 A PROTEIN WITHOUT PAE gets distance-only neighbourhoods, as in the lab's code, and every
 result says so (`pae_filter_applied`). Treat those with care in a multi-file protein: windows
 are predicted independently and low-confidence stretches pack into dense masses.
@@ -47,7 +53,10 @@ are predicted independently and low-confidence stretches pack into dense masses.
 from __future__ import annotations
 
 import gzip
+import json
 import math
+import os
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -67,6 +76,8 @@ __all__ = [
     "adjacency",
     "neighbourhood",
     "distances",
+    "view",
+    "pml",
 ]
 
 _DEFAULT_RADIUS = 15.0
@@ -498,6 +509,15 @@ class Protein:
         return adj
 
 
+def _contract_id(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not contract.MODEL_FILE_ID_RE.match(value):
+        raise GeneticsUsageError(
+            f"{what} must be 1 to 64 letters, digits, '.', '_' and '-', starting with a "
+            f"letter or digit; got {value!r}"
+        )
+    return value
+
+
 def _model_rows(models: Any) -> list[dict]:
     if isinstance(models, pl.DataFrame):
         models = models.to_dicts()
@@ -553,6 +573,10 @@ def protein(
     protein without PAE (`has_pae` false), or when no PAE is wanted.
     """
     rows = _model_rows(models)
+    for r in rows:
+        # both end up in file names, request paths and the files view() and pml() write
+        _contract_id(r["model_file_id"], "a model row's model_file_id")
+        _contract_id(r["accession"], "a model row's accession")
     accessions = sorted({r["accession"] for r in rows})
     if len(accessions) != 1:
         raise GeneticsUsageError(f"model rows of one protein are needed, got {accessions}")
@@ -776,3 +800,529 @@ def distances(
         pl.col("distance", "pae", "min_plddt").fill_nan(None),
         pl.when(pl.Series(found)).then(pl.col("file_position_a", "file_position_b")),
     )
+
+
+# --------------------------------------------------------------------------- showing it
+
+# the chat delivers no artifact above this (the sandbox's ARTIFACT_READ_MAX_BYTES), which is
+# below the viewer's own limit, so a larger view would be written and never drawn
+_MAX_VIEW_BYTES = min(512 * 1024, contract.VIEW_MAX_BYTES)
+
+_HIGHLIGHT_KEYS = ("position", "label", "role", "colour")
+
+# Mol*'s pLDDT confidence theme, which the chat's viewer colours by: each band starts above
+# the pLDDT given, the first covering everything below
+_PLDDT_BANDS = (
+    (None, "plddt_very_low", "#ff7d45"),
+    (50, "plddt_low", "#ffdb13"),
+    (70, "plddt_confident", "#65cbf3"),
+    (90, "plddt_very_high", "#0053d6"),
+)
+# what JavaScript's String.prototype.trim removes (ECMAScript WhiteSpace and LineTerminator),
+# which is how the viewer decides a label is blank. Python's str.strip() differs: it leaves
+# U+FEFF and removes U+001C-U+001F and U+0085
+_JS_TRIMMED = (
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
+_PML_FILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_PML_OBJECT = "structure"
+_PML_RESIDUES_PER_LINE = 50
+
+
+def _artifact_path(path: str | None, default: str, suffix: str) -> str:
+    """the rule genetics.plots writes by: a relative name lands in the artifacts directory."""
+    path = default if path is None else path
+    if not isinstance(path, str) or not path.lower().endswith(suffix):
+        raise GeneticsUsageError(f"path must end with {suffix!r}, got {path!r}")
+    if not os.path.isabs(path):
+        path = os.path.join(os.environ.get("SANDBOX_ARTIFACTS_DIR") or ".", path)
+    if not os.path.isdir(os.path.dirname(path) or "."):
+        raise GeneticsUsageError(
+            f"path {path!r} is in a directory that does not exist; give a bare file name"
+        )
+    return path
+
+
+def _view_text(value: Any, what: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise GeneticsUsageError(f"{what} must be text, got {value!r}")
+    text = value.strip(_JS_TRIMMED)
+    try:
+        length = len(text.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        raise GeneticsUsageError(f"{what} is not valid Unicode text") from None
+    limit = contract.VIEW_MAX_TEXT_LENGTH
+    if length > limit:
+        raise GeneticsUsageError(
+            f"{what} is too long: {length} UTF-16 code units, and the viewer shows at most "
+            f"{limit}. An ordinary character is one unit and an emoji or other character "
+            f"outside the Basic Multilingual Plane is two, so use at most {limit} ordinary "
+            f"characters: {text[:30]!r}..."
+        )
+    return text or None
+
+
+def _highlight(item: Any, i: int) -> dict[str, Any]:
+    what = f"highlights[{i}]"
+    if not isinstance(item, Mapping):
+        return {"position": item, "label": None, "role": None, "colour": None}
+    unknown = sorted(set(item) - set(_HIGHLIGHT_KEYS))
+    if unknown or "position" not in item:
+        raise GeneticsUsageError(
+            f"{what} is a position, or a dict with 'position' and optionally 'label' and "
+            f"one of 'role' and 'colour'; got keys {sorted(item)}"
+        )
+    role, colour = item.get("role"), item.get("colour")
+    if role is not None and colour is not None:
+        raise GeneticsUsageError(f"{what} gives both role and colour; a residue takes one")
+    if role is not None and role not in contract.VIEW_ROLES:
+        raise GeneticsUsageError(
+            f"{what}: role must be one of {', '.join(contract.VIEW_ROLES)}, got {role!r}"
+        )
+    if colour is not None:
+        if not isinstance(colour, str) or not contract.VIEW_COLOUR_RE.match(colour):
+            raise GeneticsUsageError(
+                f"{what}: colour must be '#rrggbb', got {colour!r}; or give a role"
+            )
+        colour = colour.lower()
+    return {
+        "position": item["position"],
+        "label": _view_text(item.get("label"), f"{what}: label"),
+        "role": role,
+        "colour": colour,
+    }
+
+
+def _sphere(sphere: Any) -> tuple[Any, float] | None:
+    if sphere is None:
+        return None
+    if isinstance(sphere, Mapping) and set(sphere) == {"centre", "radius"}:
+        centre, radius = sphere["centre"], sphere["radius"]
+    elif isinstance(sphere, (tuple, list)) and len(sphere) == 2:
+        centre, radius = sphere
+    else:
+        raise GeneticsUsageError(
+            "sphere is (centre, radius) or {'centre': ..., 'radius': ...}, the centre a "
+            "position and the radius in Å"
+        )
+    radius = _check_radius(radius)
+    if not radius <= contract.VIEW_MAX_SPHERE_RADIUS:
+        raise GeneticsUsageError(
+            f"sphere radius must be at most {contract.VIEW_MAX_SPHERE_RADIUS} Å, got {radius!r}"
+        )
+    return centre, radius
+
+
+def _is_address(position: Any) -> bool:
+    return (
+        isinstance(position, (tuple, list)) and len(position) == 2 and isinstance(position[0], str)
+    )
+
+
+def _view_position(n: int, position: Any, what: str) -> int:
+    return _file_index(min(n, contract.VIEW_MAX_POSITION), position, what) + 1
+
+
+class _Layout:
+    """One model file and what is shown on it: what `view` and `pml` both write from."""
+
+    def __init__(
+        self,
+        target: Protein | str,
+        highlights: Any,
+        sphere: Any,
+        colour_mode: str,
+        model_file_id: str | None,
+    ):
+        if colour_mode not in contract.VIEW_COLOUR_MODES:
+            raise GeneticsUsageError(
+                f"colour_mode must be one of {', '.join(contract.VIEW_COLOUR_MODES)}, "
+                f"got {colour_mode!r}"
+            )
+        self.colour_mode = colour_mode
+        if isinstance(highlights, (str, bytes, Mapping)) or not isinstance(
+            highlights, (Sequence, np.ndarray, pl.Series)
+        ):
+            raise GeneticsUsageError("highlights is a list of positions or of dicts")
+        items = [_highlight(h, i) for i, h in enumerate(list(highlights))]
+        ball = _sphere(sphere)
+        self.outside: list[dict[str, Any]] = []
+        self.sphere: dict[str, Any] | None = None
+        self.sphere_left_out = False
+        placed: list[tuple[int, dict[str, Any]]] = []
+
+        if isinstance(target, Protein):
+            self.accession: str | None = target.accession
+            k = self._choose(target, items, ball, model_file_id)
+            # again here: the object's attributes are assignable after protein() checked them
+            self.accession = _contract_id(target.accession, "the protein's accession")
+            self.model_file_id = _contract_id(target.model_file_ids[k], "the model file id")
+            s, e = target.windows[k]
+            for item in items:
+                p = target._position(item["position"])
+                if s <= p <= e:
+                    placed.append((_view_position(e - s + 1, p - s + 1, "file position"), item))
+                else:
+                    owner = target.model_file_ids[int(target._owner(np.array([p]))[0])]
+                    self.outside.append(
+                        {"position": p, "label": item["label"], "model_file_id": owner}
+                    )
+            if ball:
+                centre = target._position(ball[0])
+                if s <= centre <= e:
+                    self.sphere = {
+                        "centre": _view_position(e - s + 1, centre - s + 1, "sphere centre"),
+                        "radius": ball[1],
+                    }
+                else:
+                    self.sphere_left_out = True
+        elif isinstance(target, str) and contract.MODEL_FILE_ID_RE.match(target):
+            if model_file_id not in (None, target):
+                raise GeneticsUsageError(f"model_file_id {model_file_id!r} is not {target!r}")
+            self.accession = None
+            self.model_file_id = target
+            for item in items:
+                placed.append((self._file_position(item["position"], "highlight"), item))
+            if ball:
+                self.sphere = {
+                    "centre": self._file_position(ball[0], "sphere centre"),
+                    "radius": ball[1],
+                }
+        else:
+            raise GeneticsUsageError(
+                "the first argument is a Protein (genetics.protein_structure(...)) or a "
+                f"model file id, got {target!r}"
+            )
+
+        # the viewer's merge, done here so that what is counted and reported is what it draws
+        merged: dict[int, dict[str, Any]] = {}
+        for file_position, item in placed:
+            first = merged.setdefault(file_position, {**item, "file_position": file_position})
+            if first["label"] is None:
+                first["label"] = item["label"]
+        self.residues = list(merged.values())
+        if len(self.residues) > contract.VIEW_MAX_RESIDUES:
+            raise GeneticsUsageError(
+                f"{len(self.residues)} residues to mark; the viewer draws at most "
+                f"{contract.VIEW_MAX_RESIDUES}. Mark fewer"
+            )
+        labelled = [r for r in self.residues if r["label"]]
+        self.labels_not_drawn = [r["label"] for r in labelled[contract.VIEW_MAX_LABELS :]]
+        self.n_labels = len(labelled)
+
+    def _file_position(self, position: Any, what: str) -> int:
+        if _is_address(position):
+            if position[0] != self.model_file_id:
+                raise GeneticsUsageError(
+                    f"{what} {tuple(position)!r} is in another model file than "
+                    f"{self.model_file_id}; pass the Protein to place it"
+                )
+            position = position[1]
+        return _view_position(contract.VIEW_MAX_POSITION, position, f"{what} file position")
+
+    @staticmethod
+    def _choose(
+        protein: Protein, items: list[dict], ball: tuple[Any, float] | None, mid: str | None
+    ) -> int:
+        if mid is not None:
+            if mid not in protein.model_file_ids:
+                raise GeneticsUsageError(f"{mid} is not a model file of {protein.accession}")
+            return protein.model_file_ids.index(mid)
+        if len(protein.windows) == 1:
+            return 0
+        if ball is None and not items:
+            raise GeneticsUsageError(
+                f"{protein.accession} has {len(protein.windows)} model files and nothing was "
+                f"given to choose one by; pass model_file_id, one of {protein.model_file_ids}"
+            )
+        anchor = ball[0] if ball else items[0]["position"]
+        position = protein._position(anchor)
+        if _is_address(anchor):
+            return protein.model_file_ids.index(anchor[0])
+        return int(protein._owner(np.array([position]))[0])
+
+    def report(self) -> dict[str, Any]:
+        others = list(dict.fromkeys(o["model_file_id"] for o in self.outside))
+        notes = []
+        if self.outside:
+            notes.append(
+                f"highlights not in {self.model_file_id} were left out "
+                f"({len(self.outside)}); they are in {', '.join(others)}. A model file has its own "
+                "coordinates, so write one view per file (model_file_id=...)"
+            )
+        if self.sphere_left_out:
+            notes.append(f"the sphere's centre is not in {self.model_file_id}; no sphere")
+        return {
+            "model_file_id": self.model_file_id,
+            "n_residues": len(self.residues),
+            "n_labels": self.n_labels,
+            "outside_model_file": self.outside,
+            "other_model_files": others,
+            "sphere": self.sphere,
+            "sphere_left_out": self.sphere_left_out,
+            "notes": notes,
+        }
+
+
+def view(
+    protein: Protein | str,
+    highlights: Sequence[Any] = (),
+    sphere: tuple[Any, float] | Mapping[str, Any] | None = None,
+    *,
+    colour_mode: str = contract.VIEW_DEFAULT_COLOUR_MODE,
+    gene: str | None = None,
+    model_file_id: str | None = None,
+    path: str | None = None,
+) -> dict[str, Any]:
+    """Show a predicted model in the chat as an interactive 3D view with residues marked.
+
+    Writes `<model_file_id>.structure-view.json` into the execution's artifacts directory;
+    the chat draws a file with that ending as the structure, so do not also describe a
+    download. `path` renames it and must keep the `.structure-view.json` ending.
+
+    `protein` — a `Protein` (`genetics.protein_structure(...)`; no model file or PAE needs to
+    have been fetched), or a model file id, in which case every position is a file position.
+
+    `highlights` — the residues to mark, each a protein position, a
+    (model_file_id, file_position) address, or a dict `{"position": <either>, "label": ...,
+    "role": ...}` with `colour` ("#rrggbb") in place of `role`. Roles are "case", "control",
+    "both" and "neutral", drawn in the viewer's own colours; a residue with neither is
+    neutral grey. Only a residue with a `label` is labelled. A residue given twice is one
+    residue: its first role or colour and its first label stand.
+
+    `sphere` — (centre, radius in Å), drawn as a translucent ball around that residue's Cα.
+    It is a picture of a radius in ONE file's coordinates, not a computed neighbourhood: to
+    show `neighbourhood()`'s residues, list them in `highlights`.
+
+    `colour_mode` — "plddt" (the default: the cartoon in the AlphaFold confidence bands) or
+    "uniform".
+
+    ONE VIEW SHOWS ONE MODEL FILE. For a protein in several files the file is, in order:
+    `model_file_id` if given; the file a (model_file_id, file_position) address names, or
+    else the file that owns the residue, for the sphere's centre if there is a sphere and
+    otherwise for the first highlight. Highlights the file does not contain are NOT drawn
+    and come back in `outside_model_file`; write one more view per file in
+    `other_model_files`, passing `model_file_id=`.
+
+    WHAT A RUN DELIVERS. The chat gets at most four non-image files of one run, taken in
+    name order, and none over 512 KiB. One view per model file plus a `.pml` plus a model
+    file can be more than four: spread them over several runs.
+
+    Returns `path`, `model_file_id`, `n_residues` (distinct residues written), `n_labels`,
+    `labels_not_drawn` (labels past the 40 the viewer draws; those stay visible on hover),
+    `outside_model_file` (one `{position, label, model_file_id}` per highlight left out,
+    `position` the protein position and `model_file_id` the file owning it),
+    `other_model_files`, `sphere` (as written, in file positions, or None),
+    `sphere_left_out` (true when the chosen file does not contain the centre) and `notes`.
+
+    Raises GeneticsUsageError, writing nothing, for what the viewer would refuse or cut:
+    more than 2,000 residues, a label or gene over 80 characters (an emoji counts as two), a
+    radius over 100 Å, a
+    colour that is not #rrggbb, role and colour together, or a file over 512 KiB.
+    """
+    layout = _Layout(protein, highlights, sphere, colour_mode, model_file_id)
+    spec: dict[str, Any] = {
+        "version": contract.VIEW_SPEC_VERSION,
+        "model_file_id": _contract_id(layout.model_file_id, "the model file id"),
+    }
+    if layout.accession:
+        spec["accession"] = _view_text(layout.accession, "accession")
+    if gene := _view_text(gene, "gene"):
+        spec["gene"] = gene
+    spec["residues"] = [
+        {"file_position": r["file_position"]}
+        | {k: r[k] for k in ("label", "role", "colour") if r[k] is not None}
+        for r in layout.residues
+    ]
+    if layout.sphere:
+        spec["sphere"] = layout.sphere
+    spec["colour_mode"] = layout.colour_mode
+    data = json.dumps(spec, ensure_ascii=False).encode("utf-8")
+    if len(data) > _MAX_VIEW_BYTES:
+        raise GeneticsUsageError(
+            f"the view is {len(data)} bytes; the chat delivers at most {_MAX_VIEW_BYTES}. "
+            "Mark fewer residues or shorten the labels"
+        )
+    written = _artifact_path(
+        path, layout.model_file_id + contract.VIEW_NAME_SUFFIX, contract.VIEW_NAME_SUFFIX
+    )
+    with open(written, "wb") as f:
+        f.write(data)
+    report = layout.report()
+    if layout.labels_not_drawn:
+        report["notes"].append(
+            f"{len(layout.labels_not_drawn)} labels are past the "
+            f"{contract.VIEW_MAX_LABELS} the viewer draws; they show on hover only"
+        )
+    return {"path": written, "labels_not_drawn": layout.labels_not_drawn, **report}
+
+
+def _rgb(colour: str) -> str:
+    # as 0-1 fractions: PyMOL reads a triple with no channel above 1 as fractions whatever
+    # was meant, so 0-255 integers would turn #010101 white
+    return "[" + ", ".join(f"{int(colour[i : i + 2], 16) / 255:.4f}" for i in (1, 3, 5)) + "]"
+
+
+_PML_ID = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+_PML_RESI = rf"{_PML_OBJECT} and name CA and resi \d+(\+\d+)*"
+# every command shape pml() emits outside its python block; a line that is none of these is
+# a bug in the writer, and the script is not written
+_PML_FRACTION = r"[01]\.\d{4}"
+_PML_PLAIN_LINE_RE = re.compile(
+    "("
+    + "|".join(
+        (
+            r"# [A-Za-z0-9 ._-]+",
+            rf"load {_PML_ID}, {_PML_OBJECT}",
+            rf"hide everything, {_PML_OBJECT}",
+            rf"show cartoon, {_PML_OBJECT}",
+            rf"set_color [a-z0-9_]+, \[{_PML_FRACTION}, {_PML_FRACTION}, {_PML_FRACTION}\]",
+            rf"color [a-z0-9_]+, {_PML_OBJECT}( and b > \d+)?",
+            rf"show spheres, {_PML_RESI}",
+            rf"color [a-z0-9_]+, {_PML_RESI}",
+            rf"select neighbourhood, byres \(\({_PML_OBJECT} and name CA\) within "
+            rf"\d+\.\d{{3}} of \({_PML_OBJECT} and name CA and resi \d+\)\)",
+            "deselect",
+            rf"orient {_PML_OBJECT}",
+            "python",
+            "python end",
+        )
+    )
+    + r")\Z"
+)
+_PML_BLOCK_LINE_RE = re.compile(
+    rf"(from pymol import cmd|cmd\.label\('{_PML_OBJECT} and name CA and resi \d+', .+\))\Z"
+)
+_PRINTABLE_ASCII_RE = re.compile(r"[\x20-\x7e]*\Z")
+
+
+def _check_pml(lines: list[str]) -> None:
+    in_block = False
+    for line in lines:
+        if line == "python end":
+            in_block = False
+        shape = _PML_BLOCK_LINE_RE if in_block else _PML_PLAIN_LINE_RE
+        if not _PRINTABLE_ASCII_RE.match(line) or not shape.match(line):
+            raise RuntimeError(
+                f"internal error: genetics.structure.pml built a line it does not emit "
+                f"({line[:60]!r}); nothing was written"
+            )
+        if line == "python":
+            in_block = True
+
+
+def _resi(positions: list[int]) -> list[str]:
+    return [
+        "+".join(map(str, positions[i : i + _PML_RESIDUES_PER_LINE]))
+        for i in range(0, len(positions), _PML_RESIDUES_PER_LINE)
+    ]
+
+
+def pml(
+    protein: Protein | str,
+    highlights: Sequence[Any] = (),
+    sphere: tuple[Any, float] | Mapping[str, Any] | None = None,
+    *,
+    colour_mode: str = contract.VIEW_DEFAULT_COLOUR_MODE,
+    model_file_id: str | None = None,
+    model_file: str | None = None,
+    path: str | None = None,
+) -> dict[str, Any]:
+    """The same marking as `view`, as a PyMOL script for someone who opens the model in
+    their own PyMOL.
+
+    Takes what `view` takes and chooses the model file the same way. Writes
+    `<model_file_id>.pml` into the artifacts directory (`path` renames it; it must end
+    `.pml`): the cartoon coloured by pLDDT in the four AlphaFold bands (pLDDT is the
+    B-factor column) or plain grey with `colour_mode="uniform"`, a sphere on the Cα of every
+    highlight in its role's colour, the labels, and for `sphere` a selection named
+    `neighbourhood` of the residues whose Cα is within the radius of the centre's — by
+    distance in this one file only, without PAE.
+
+    THE SCRIPT LOADS THE MODEL FROM A FILE BESIDE IT, named `<model_file_id>.pdb` unless
+    `model_file` gives another bare file name. The chat's viewer offers no download of the
+    model, so write it in the same run for the user to download with the script, gzipped,
+    which PyMOL reads, and pass `model_file=mid + ".pdb.gz"`:
+
+        data = gzip.compress(genetics.protein_structure_file(mid))
+        with open(os.path.join(os.environ["SANDBOX_ARTIFACTS_DIR"], mid + ".pdb.gz"), "wb") as f:
+            f.write(data)
+
+    WHAT A RUN DELIVERS. The chat gets at most four non-image files of one run, taken in
+    name order, and none over 512 KiB, so several scripts and models go in several runs.
+    Check `len(data)`: in the release of 2026-11-12, 25 of the 21,946 models are over 512 KiB
+    even gzipped (all AlphaFold Server `AF3-` models, the largest 784 KiB). A run cannot
+    hand those to the user at all; write the script anyway and say plainly that the model
+    file for it is not downloadable from the chat.
+
+    Returns `path`, `model_file` (the name the script loads) and what `view` returns except
+    the label counts: PyMOL draws every label.
+    """
+    layout = _Layout(protein, highlights, sphere, colour_mode, model_file_id)
+    mid = layout.model_file_id
+    model_file = mid + ".pdb" if model_file is None else model_file
+    # the name is written into a PyMOL command, so it is held to the model ids' own charset
+    _contract_id(mid, "the model file id")
+    if not isinstance(model_file, str) or not _PML_FILE_NAME_RE.match(model_file):
+        raise GeneticsUsageError(
+            f"model_file must be a bare file name of letters, digits, '.', '_' and '-', "
+            f"got {model_file!r}"
+        )
+    obj = _PML_OBJECT
+    lines = [
+        f"# PyMOL script written by genetics.structure.pml for model file {mid}.",
+        f"# It loads {model_file} from the directory PyMOL is run in.",
+        "# Residue numbers are those of that file.",
+        f"load {model_file}, {obj}",
+        f"hide everything, {obj}",
+        f"show cartoon, {obj}",
+    ]
+    if layout.colour_mode == "plddt":
+        for above, name, colour in _PLDDT_BANDS:
+            lines.append(f"set_color {name}, {_rgb(colour)}")
+            lines.append(f"color {name}, {obj}" + (f" and b > {above}" if above else ""))
+    else:
+        lines.append(f"color grey80, {obj}")
+
+    by_colour: dict[str, list[int]] = {}
+    for r in layout.residues:
+        colour = r["colour"] or contract.VIEW_ROLE_COLOURS[r["role"] or "neutral"]
+        by_colour.setdefault(colour, []).append(r["file_position"])
+    for colour, positions in by_colour.items():
+        name = f"highlight_{colour[1:]}"
+        lines.append(f"set_color {name}, {_rgb(colour)}")
+        for resi in _resi(positions):
+            lines.append(f"show spheres, {obj} and name CA and resi {resi}")
+            lines.append(f"color {name}, {obj} and name CA and resi {resi}")
+    if layout.sphere:
+        lines.append(
+            f"select neighbourhood, byres (({obj} and name CA) within "
+            f"{layout.sphere['radius']:.3f} of ({obj} and name CA and resi "
+            f"{layout.sphere['centre']}))"
+        )
+        lines.append("deselect")
+    labelled = [r for r in layout.residues if r["label"]]
+    if labelled:
+        # labels are text a model wrote. PyMOL evaluates a label as a Python expression and
+        # its command parser splits on characters a label may hold, so each goes in as a
+        # Python string literal inside a python block: ascii() leaves nothing in it that can
+        # end the literal, the statement or the line
+        lines += ["python", "from pymol import cmd"]
+        for r in labelled:
+            selection = f"{obj} and name CA and resi {r['file_position']}"
+            lines.append(f"cmd.label({selection!r}, {ascii(ascii(r['label']))})")
+        lines.append("python end")
+    lines.append(f"orient {obj}")
+
+    _check_pml(lines)
+    written = _artifact_path(path, mid + ".pml", ".pml")
+    with open(written, "w", encoding="ascii", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    report = layout.report()
+    del report["n_labels"]
+    return {"path": written, "model_file": model_file, **report}

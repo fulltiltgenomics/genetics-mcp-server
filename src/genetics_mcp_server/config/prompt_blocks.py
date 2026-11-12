@@ -147,7 +147,7 @@ def url_fetch_allowed_hosts() -> tuple[str, ...] | None:
 _PROTEIN_STRUCTURE_SDK_RULE = """
 ### Protein Structure (frozen release)
 
-To place genomic variants on protein residues and in 3D, scripts have `genetics.protein_variants` (variant to residue on the release's AlphaFold model), `genetics.protein_features`/`protein_residues`, and `genetics.protein_structure(...)` with `genetics.structure` (`distances`, `neighbourhood`). `get_protein_annotations` is live protein-level UniProt and can disagree with the frozen release: the release wins for residue changed, pLDDT and distances, live UniProt for current annotation. Say which source a statement comes from.
+To place genomic variants on protein residues and in 3D, scripts have `genetics.protein_variants` (variant to residue on the release's AlphaFold model), `genetics.protein_features`/`protein_residues`, and `genetics.protein_structure(...)` with `genetics.structure` (`distances`, `neighbourhood`, `view` for a 3D view in the chat). `get_protein_annotations` is live protein-level UniProt and can disagree with the frozen release: the release wins for residue changed, pLDDT and distances, live UniProt for current annotation. Say which source a statement comes from.
 
 Give every distance with its PAE and min pLDDT: a small distance with a large PAE (above about 15) is two confident pieces placed against each other at a guess; pLDDT below 70 is low confidence, below 50 usually disorder. No distance for a pair sharing no model file. No residue row means "not missense on the canonical UniProt isoform under the release's annotation, or on a protein the deployment does not serve", nothing stronger.
 """

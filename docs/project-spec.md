@@ -144,7 +144,8 @@ result as `fields`, `r2_floor`, `max_distance`, null for the upstream).
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
-locuszoom, a phewas, an upset, the line-models figure, a forest plot and a volcano — as functions a
+locuszoom, a phewas, an upset, the line-models figure, a forest plot, a volcano and a protein
+track — as functions a
 `run_analysis` script calls, and the figure comes back as an artifact. The upset is the general one: it
 takes any sets a script has in hand (members, a frame of membership columns, or
 intersection counts already tallied) and draws them one way, in greys, with every count
@@ -175,6 +176,20 @@ encodings FinnGen's LAVAA viewer reads that figure with: `ring=` marks the assoc
 fine-mapped to the variant (a boolean column, or `pip` above `ring_min`), and `hulls=True`
 outlines each `colour=` category's hits with their convex hull, so a category the variant
 moves in both directions shows as a hull across the null.
+The protein track (`protein_track`) puts findings on a protein's amino-acid axis: a row per
+feature type (TED domains and UniProt domains, repeats, zinc fingers and regions unless the
+caller names others) with overlapping features stacked in lanes and the evidence tier drawn
+as the fill of the box, pLDDT in AlphaFold's four bands, a heatmap row per per-residue score
+column, and the caller's own rows of positions as ticks, lollipops or spans. It fetches
+`protein_residues` and `protein_features` itself unless handed the frames, and draws only the
+`is_owner` row of a position that several model windows cover; residues that repeat
+positions without that column are refused rather than drawn from whichever row comes first.
+Where a stretch has more residues than the figure has pixels across, the strips are binned
+to one column per pixel, because the renderer would otherwise resample them and drop
+residues by position rather than by value: pLDDT shows the lowest band present in a column,
+and each score the reduction its caller named (`max` unless told `min` or `mean`), with the
+rules printed under the figure. Like the client functions it reads, it only works where the
+structure layer is offered.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -1110,6 +1125,7 @@ winner.
 | `protein_variants(variants)` | `get_protein_variant_residues` — `get_variant_annotations(source="protein")` with the values typed |
 | `protein_structure_file(model_file_id)`, `protein_pae(model_file_id[, positions=])` | `get_protein_structure_file`, `get_protein_pae` — bytes, not frames: what `genetics.structure` takes |
 | `protein_structure(protein \| variants=[, positions=, pae=])` | `get_protein_structure_inputs` — returns a `genetics.structure.Protein`; with variants or positions it fetches only the model files containing them and their PAE rows, otherwise everything, a PAE matrix past the per-response limit in blocks of rows |
+| `structure.view(protein \| model_file_id, highlights[, sphere, colour_mode=, gene=, model_file_id=, path=])`, `structure.pml(...)` | no tool: they write files. `view` writes the `.structure-view.json` artifact the chat draws as a 3D model, `pml` a PyMOL script with the same marking. Each shows one model file and returns the highlights that file does not contain (`outside_model_file`, `other_model_files`) instead of placing them; what the viewer would refuse or cut (the `VIEW_*` limits mirrored in `sdk/_structure_contract.py`, and the 512 KiB the chat delivers) is a `GeneticsUsageError` before anything is written. `tests/test_sdk_structure_view.py` holds the written files to a port of the browser's parser, and to the parser itself when node and a genetics-results-browser checkout are found |
 | `summary_stats(phenotypes=, variants=\|region=)` | `get_summary_stats`, `get_summary_stats_by_region` |
 | `ld(variant[, other][, panel=, fields=])` | `get_variants_in_ld`, `get_ld_between_variants` — signed `r` only on panel `finngen_r12` |
 | `ld_panels()` | `get_ld_panels` — the panels results-api serves itself, with `fields`, `r2_floor`, `max_distance` |

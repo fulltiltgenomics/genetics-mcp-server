@@ -156,8 +156,10 @@ class TestContractMirror:
             "PAE_NO_VALUE",
             "PAE_MAX_CODE",
             "MAX_RESPONSE_BYTES",
+            *(n for n in dir(contract) if n.startswith("VIEW_")),
         ):
             assert getattr(contract, name) == getattr(munge, name), name
+        assert contract.MODEL_FILE_ID_RE.pattern == munge.MODEL_FILE_ID_RE.pattern
         assert all(contract.decode_pae(c) == munge.decode_pae(c) for c in range(256))
         assert all(
             contract.pae_rows_per_request(n) == munge.pae_rows_per_request(n)

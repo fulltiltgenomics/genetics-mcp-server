@@ -986,7 +986,7 @@ def test_code_surface_prompt_carries_the_sdk_block_where_the_layer_is_served(var
         "`genetics.protein_variants`",
         "`genetics.protein_features`/`protein_residues`",
         "`genetics.protein_structure(...)`",
-        "`genetics.structure` (`distances`, `neighbourhood`)",
+        "`genetics.structure` (`distances`, `neighbourhood`, `view` for a 3D view in the chat)",
         "`get_protein_annotations`",
         "its PAE and min pLDDT",
         "PAE (above about 15)",

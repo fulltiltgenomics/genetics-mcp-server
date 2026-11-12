@@ -3,13 +3,17 @@
 A copy, not an import: the definition lives in genetics-results-munge
 `scripts/protein_structure_contract.py`, and the SDK ships into a sandbox image that holds no
 other repo's code. Only what the geometry and its fetches need is copied: the contract
-version, the PAE encoding, the two window rules, `models.tsv.gz`'s column list and the
-per-response byte limit.
+version, the PAE encoding, the two window rules, `models.tsv.gz`'s column list, the
+per-response byte limit, and what a view-spec for the browser's viewer may hold.
 tests/test_sdk_structure.py pins these and compares them with the munge module when a
 checkout of it is found.
 """
 
+import re
+
 CONTRACT_VERSION = 1
+
+MODEL_FILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 MODEL_COLUMNS = [
     ("model_file_id", str),
@@ -46,6 +50,27 @@ PAE_MAX_CODE = 254
 
 # SDK limit on one HTTP response
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+VIEW_SPEC_VERSION = 1
+VIEW_ROLES = ("case", "control", "both", "neutral")
+VIEW_COLOUR_MODES = ("plddt", "uniform")
+VIEW_DEFAULT_COLOUR_MODE = "plddt"
+VIEW_NAME_SUFFIX = ".structure-view.json"
+VIEW_ROLE_COLOURS = {
+    "case": "#d62728",
+    "control": "#1f77b4",
+    "both": "#9467bd",
+    "neutral": "#7f7f7f",
+}
+VIEW_SPHERE_COLOUR = "#ff7f0e"
+VIEW_COLOUR_RE = re.compile(r"^#[0-9a-fA-F]{6}\Z")
+VIEW_MAX_BYTES = 1_000_000
+VIEW_MAX_RESIDUES = 2000
+VIEW_MAX_LABELS = 40
+VIEW_MAX_TEXT_LENGTH = 80
+VIEW_MAX_POSITION = 100_000
+VIEW_MAX_SPHERE_RADIUS = 100
 
 
 def pae_rows_per_request(n: int) -> int:
