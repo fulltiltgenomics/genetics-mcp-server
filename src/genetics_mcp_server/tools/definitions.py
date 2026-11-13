@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from genetics_mcp_server import schema_docs
-from genetics_mcp_server.tools.executor import LD_STATISTICS
+from genetics_mcp_server.tools.executor import (
+    LD_STATISTICS,
+    PROTEIN_ANNOTATION_SOURCE,
+    PROTEIN_STRUCTURE_NOT_AVAILABLE,
+)
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -1436,6 +1440,93 @@ Do NOT use this to look up a protein you can already name; resolving a gene symb
         },
     },
     {
+        "name": "get_protein_features_at_variant",
+        "group": "results",
+        "sdk_replaceable": True,
+        "description": """For genomic variants, the residue each one changes and what is known about that residue in this deployment's protein structure release: the amino-acid change, the sequence features covering the position (UniProt features and TED domains, each with `evidence_tier`: experimental, curated, predicted or unknown) and the residue's pLDDT (AlphaFold per-residue confidence, 0-100) in the model file that owns it.
+
+One result per (variant, protein); a variant on several proteins has several. The release is FROZEN: features are UniProt's as of the release, so they can lag or differ from the live get_protein_annotations. Use this tool when the question starts from a variant and wants its structural context or confidence; use get_protein_annotations for the current full UniProt entry.
+
+A variant listed under `variants_without_residue_row` is not missense on the canonical UniProt isoform under the release's annotation, or is on a protein this deployment does not serve. Say exactly that; do not call it non-coding, synonymous or benign on this evidence. A pLDDT below 70 is low confidence, below 50 usually disorder: say so when quoting a feature or a distance there.""",
+        "parameters": {
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Variants as 'chr:pos:ref:alt' on GRCh38, e.g. ['7:140753336:A:T']. Batch them in one call (at most 50).",
+                "required": True,
+            },
+        },
+    },
+    {
+        "name": "get_3d_distance_between_variants",
+        "group": "results",
+        "sdk_replaceable": True,
+        "description": """3D distance between the residues that variants change, on the predicted (AlphaFold) model in this deployment's protein structure release. Every pair of the given variants that fall on one protein gets a row: `distance` (C-alpha to C-alpha, in angstrom), `pae` (predicted aligned error for that pair, angstrom) and `min_plddt` (the lower of the two residues' pLDDT).
+
+NEVER QUOTE A DISTANCE WITHOUT ITS `pae` AND `min_plddt`. A short distance with a high PAE (above about 15) is two confidently folded pieces placed against each other at a guess, not evidence of proximity; a low pLDDT (below 70) means the residue's own position is uncertain.
+
+`status` says what a row is:
+- `measured`: distance, pae and min_plddt are given.
+- `no_shared_model_file`: a long protein is predicted as overlapping windows, each in its own coordinate frame, and no single model file contains both residues. There is NO distance for this pair; report that, and never estimate one from sequence separation or from other pairs.
+- `same_residue`: both variants change the same residue.
+- `different_proteins`: the variants are on different proteins.
+A variant under `variants_without_residue_row` is not missense on the canonical UniProt isoform under the release's annotation, or is on a protein this deployment does not serve, nothing stronger.
+
+These are distances in a predicted monomer model: no ligands, partners or alternative conformations.""",
+        "parameters": {
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Two or more variants as 'chr:pos:ref:alt' on GRCh38 (at most 50); every pair on a shared protein is measured.",
+                "required": True,
+            },
+        },
+    },
+    {
+        "name": "get_3d_neighbourhood",
+        "group": "results",
+        "sdk_replaceable": True,
+        "description": """The residues in 3D proximity of one residue on the predicted (AlphaFold) model in this deployment's protein structure release, and optionally which of a list of variants fall among them. The centre is a `variant` (the residue it changes) or a `protein` with a `position`.
+
+A residue is a neighbour when its C-alpha is closer than `radius` (default 15 angstrom) AND, where the release has PAE for the protein, the pair's PAE is below `pae_cutoff` (default 15). `pae_filter_applied` says whether the PAE filter was used: it is false for a protein without PAE and when `apply_pae_filter` is false, and such a neighbourhood is distance-only; say so when reporting it. Each neighbour comes with `distance`, `pae` and `plddt`; quote a distance only together with its PAE and pLDDT.
+
+Pass `variants` to ask which of them change a residue in the neighbourhood: each comes back with `in_neighbourhood` and, when true, its distance, PAE and pLDDT. For the exact distance to a variant outside it, use get_3d_distance_between_variants. In a protein predicted as several model files, a neighbourhood never contains a residue that shares no file with the centre.""",
+        "parameters": {
+            "variant": {
+                "type": "string",
+                "description": "Centre as a variant 'chr:pos:ref:alt' (GRCh38). Give this, or `protein` with `position`.",
+            },
+            "protein": {
+                "type": "string",
+                "description": "UniProt accession (preferred) or gene symbol. Required with `position`; with `variant` it chooses the protein when the variant is on several.",
+            },
+            "position": {
+                "type": "integer",
+                "description": "Centre as a protein position (1-based residue number on the canonical UniProt isoform).",
+            },
+            "radius": {
+                "type": "number",
+                "description": "C-alpha distance threshold in angstrom.",
+                "default": 15,
+            },
+            "pae_cutoff": {
+                "type": "integer",
+                "description": "PAE threshold in angstrom, a whole number.",
+                "default": 15,
+            },
+            "apply_pae_filter": {
+                "type": "boolean",
+                "description": "False gives a distance-only neighbourhood (PAE is still reported).",
+                "default": True,
+            },
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional variants ('chr:pos:ref:alt') to place in or out of the neighbourhood (at most 50).",
+            },
+        },
+    },
+    {
         "name": "get_drug_targets_for_gene",
         "group": "lookup",
         "sdk_replaceable": False,
@@ -2145,7 +2236,8 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "script catches), 'plots' (the standard figures), 'linemodels' (clustering "
             "variants by the relationship between their effects in two GWAS, with the "
             "parameter guidance), 'mr' (Mendelian randomization), 'enrichment' (gene set over-representation, preranked"
-            " GSEA, competitive and GWAS-locus tests). Omit `module` for a cheap "
+            " GSEA, competitive and GWAS-locus tests), 'structure' (distances, PAE and 3D "
+            "neighbourhoods on predicted protein models). Omit `module` for a cheap "
             "index of module names and the "
             "functions each exports."
         ),
@@ -2153,7 +2245,16 @@ CODE_EXECUTION_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "module": {
                 "type": "string",
                 "description": "SDK module to describe. Omit for the index.",
-                "enum": ["genetics", "client", "errors", "plots", "linemodels", "mr", "enrichment"],
+                "enum": [
+                    "genetics",
+                    "client",
+                    "errors",
+                    "plots",
+                    "linemodels",
+                    "mr",
+                    "enrichment",
+                    "structure",
+                ],
             },
         },
     },
@@ -2908,6 +3009,13 @@ def register_mcp_tools(
 
     _tool = _gate(mcp, disabled_tools or set(), code_execution)
 
+    # the variant-annotation tool reaches the protein structure release through a free-string
+    # `source`, so withholding that layer's tools from a registration withholds the source
+    # too; otherwise the exclusion would hold for three names and not for the data
+    from genetics_mcp_server.config.settings import PROTEIN_STRUCTURE_TOOLS
+
+    protein_structure_withheld = bool(PROTEIN_STRUCTURE_TOOLS & (disabled_tools or set()))
+
     @_tool()
     async def search_phenotypes(query: str, limit: int = 100, resource: str | None = None) -> dict:
         """Look up phenotypes by disease/trait name. Supports comma-separated values for batch lookup. `resource` restricts hits to one resource and is the only way to find an on-request dataset's phenotypes."""
@@ -3369,6 +3477,31 @@ def register_mcp_tools(
         )
 
     @_tool()
+    async def get_protein_features_at_variant(variants: list[str]) -> dict:
+        """The residue each variant changes, the sequence features covering it and its pLDDT, from the protein structure release."""
+        return await executor.get_protein_features_at_variant(variants)
+
+    @_tool()
+    async def get_3d_distance_between_variants(variants: list[str]) -> dict:
+        """C-alpha distance, PAE and lower pLDDT for each pair of variants on one protein; no distance where no model file holds both."""
+        return await executor.get_3d_distance_between_variants(variants)
+
+    @_tool()
+    async def get_3d_neighbourhood(
+        variant: str | None = None,
+        protein: str | None = None,
+        position: int | None = None,
+        radius: float = 15.0,
+        pae_cutoff: int = 15,
+        apply_pae_filter: bool = True,
+        variants: list[str] | None = None,
+    ) -> dict:
+        """Residues within a radius of one residue on the predicted model (PAE-filtered where PAE exists), and which given variants fall among them."""
+        return await executor.get_3d_neighbourhood(
+            variant, protein, position, radius, pae_cutoff, apply_pae_filter, variants
+        )
+
+    @_tool()
     async def get_alphagenome_variant_predictions(
         variants: list[str],
         cell_type: str | None = None,
@@ -3523,6 +3656,8 @@ def register_mcp_tools(
         source: str = "finngen",
     ) -> dict:
         """Get variant annotations (consequence, allele frequency, rsID, enrichment). AC_Het/AC_Hom are alt allele counts, so a homozygote adds 2 to AC_Hom. `version` is the source's release."""
+        if source == PROTEIN_ANNOTATION_SOURCE and protein_structure_withheld:
+            return dict(PROTEIN_STRUCTURE_NOT_AVAILABLE)
         return await executor.get_variant_annotations(
             variant=variant, region=region, gene=gene, variants=variants, source=source
         )

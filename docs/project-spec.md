@@ -78,6 +78,9 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | `get_gene_expression` | Get tissue-specific gene expression levels (bulk, e.g. GTEx) |
 | `get_cell_type_expression` | Single-cell expression by cell type from human CZ CELLxGENE Discover datasets with raw integer counts on supported assays, primary cells only, `level` summary or dataset; log1p CP10K. Strips an Ensembl version before calling. Offered only where `CELL_TYPE_EXPRESSION_ENABLED` is true and `CONFIG_PROFILE` is in `CELL_TYPE_EXPRESSION_PROFILES` (`daly`), via `Settings.disabled_tools`: the flag follows whether the deployment gives results-api a release pointer, so the tool is advertised only where the endpoint can answer; results-api's 404 "not configured" and 503 (no release loaded yet) come back as `error_code` `not_available` / `release_not_loaded`. SDK: `genetics.cell_type_expression()` |
 | `get_gene_disease_associations` | Get Mendelian disease relationships from GenCC curation submissions and the Monarch Initiative KG |
+| `get_protein_features_at_variant` | For genomic variants, the residue each one changes (from the protein structure release's variant-to-residue map), the sequence features covering it with their `evidence_tier`, and its pLDDT, one result per (variant, protein). The three protein structure tools are offered only where `PROTEIN_STRUCTURE_ENABLED` is true and `CONFIG_PROFILE` is in `PROTEIN_STRUCTURE_PROFILES`, via `Settings.disabled_tools`, are `sdk_replaceable` (a script uses `genetics.protein_structure` and `genetics.structure`), and are withheld from `/mcp` by `_mcp_disabled`. A variant with no residue row is reported as exactly that (`variants_without_residue_row`); results-api's 404 for an unregistered route or source maps to `not_available` and its 503 to `release_not_loaded`. The same release is reachable through `get_variant_annotations(source="protein")`, so that source follows the layer: the executor refuses it with `not_available` where `Settings.protein_structure_offered` is false (the sandbox image has no settings and leaves it to results-api), and the `/mcp` handler in `register_mcp_tools` refuses it whenever any of the three tools is in the registration's `disabled_tools`. On the code surface the layer is SDK functions, and `prompt_blocks.protein_structure_sdk_rule` emits its prompt block only where `protein_structure_offered` is true |
+| `get_3d_distance_between_variants` | Cα distance, PAE and lower pLDDT for every pair of the given variants that fall on one protein, computed by `sdk/structure.py` on the model files and PAE rows the executor fetches for just those residues. A pair no single model file contains gets `status: no_shared_model_file` and no number; `same_residue` and `different_proteins` are the other non-measured answers |
+| `get_3d_neighbourhood` | The residues within `radius` of one residue (a variant's, or `protein` + `position`), PAE-filtered where the release has PAE, each with distance, PAE and pLDDT, and optionally which of a list of variants fall among them. `pae_filter_applied` says whether the filter was used; the defaults are `sdk/structure.py`'s |
 | `get_exome_results_by_gene` | Get rare variant burden test results (genebass filtered to p < 1e-4, IBD exome-wide significant only) |
 | `get_exome_results_by_variant` | Exome results for one specific variant across exome resources — the rare-variant counterpart to `get_credible_sets_by_variant` |
 | `get_exome_results_by_region` | Exome results overlapping a `chr:start-end` region; rows capped at 500 inline with `truncated` set |
@@ -141,7 +144,8 @@ result as `fields`, `r2_floor`, `max_distance`, null for the upstream).
 | `analyze_variant_list` | Analyze a list of variants for shared phenotype associations, QTL patterns, tissue enrichment, and nearest genes |
 
 Figures are not tools: `genetics.plots` (`sdk/plots.py`) holds the standard ones — a
-locuszoom, a phewas, an upset, the line-models figure, a forest plot and a volcano — as functions a
+locuszoom, a phewas, an upset, the line-models figure, a forest plot, a volcano and a protein
+track — as functions a
 `run_analysis` script calls, and the figure comes back as an artifact. The upset is the general one: it
 takes any sets a script has in hand (members, a frame of membership columns, or
 intersection counts already tallied) and draws them one way, in greys, with every count
@@ -172,6 +176,35 @@ encodings FinnGen's LAVAA viewer reads that figure with: `ring=` marks the assoc
 fine-mapped to the variant (a boolean column, or `pip` above `ring_min`), and `hulls=True`
 outlines each `colour=` category's hits with their convex hull, so a category the variant
 moves in both directions shows as a hull across the null.
+The protein track (`protein_track`) puts findings on a protein's amino-acid axis: a row per
+feature type (TED domains and UniProt domains, repeats, zinc fingers and regions unless the
+caller names others) with overlapping features stacked in lanes and the evidence tier drawn
+as the fill of the box, pLDDT in AlphaFold's four bands, a heatmap row per per-residue score
+column, and the caller's own rows of positions as ticks, lollipops or spans. It fetches
+`protein_residues` and `protein_features` itself unless handed the frames, and draws only the
+`is_owner` row of a position that several model windows cover; residues that repeat
+positions without that column are refused rather than drawn from whichever row comes first.
+Where a stretch has more residues than the figure has pixels across, the strips are binned
+to one column per pixel, because the renderer would otherwise resample them and drop
+residues by position rather than by value: pLDDT shows the lowest band present in a column,
+and each score the reduction its caller named (`max` unless told `min` or `mean`), with the
+rules printed under the figure. A score column where low is the finding is named with
+`"higher_is": "light"`, which draws its low end dark and bins by `min` unless told otherwise.
+Missense predictor rows (`predictors=`, fetched through `protein_scores` unless the long frame
+is passed as `predictor_scores=`) are one heatmap row per predictor of its `percentile`,
+turned so that dark always means more damaging: the percentile ranks the raw score ascending,
+so a lower-is-more-damaging predictor is drawn as `100 - percentile`. Which end is damaging
+comes from the frame's `direction` column, else from `SCORE_DIRECTIONS` in
+`sdk/_structure_contract.py`, and a frame that carries `damage_percentile` is drawn from it
+as it stands. A frame the track cannot trust is refused rather than drawn: `percentile` and
+`damage_percentile` that disagree for the stated direction, rows of one predictor that
+state two directions, and a predictor with two rows for a position (rows of another
+accession are left out by the `accession` column and reported; without it they would merge); a predictor neither states is left out and named in the note
+rather than drawn with an unknown dark end. A predictor row bins by the mean of the oriented
+percentile over a column's scored residues (`predictor_bin="max"` keeps the most damaging
+one instead), because the maximum of many ranks is near 100 everywhere; it draws a residue
+without a score as missing, and the note names each predictor's licence tag. Like the client functions it reads, it only works where the
+structure layer is offered.
 
 ### BigQuery tools (fallback for complex queries)
 
@@ -1103,6 +1136,12 @@ winner.
 | `gene_annotations(region=\|nearest_to=\|group=)` | `get_genes_in_region`, `get_nearest_genes`, `get_gene_group_members` |
 | `expression(gene)` | `get_gene_expression` |
 | `gene_disease(gene)` | `get_gene_disease_associations` |
+| `protein_models(protein)`, `protein_residues(protein)`, `protein_features(protein)` | `get_protein_models`, `get_protein_residues`, `get_protein_features` — executor fetches over results-api's `/protein_structure/*`, not chat tools; daly only (`_PROFILE_GATED`). The row tables are read as TSV because results-api refuses the JSON form of the largest genes |
+| `protein_scores(protein, predictors=None)` | `get_protein_scores` — results-api's `/protein_structure/scores/{protein}` as TSV, typed by the mirrored `SCORE_COLUMNS`, one row per (accession, predictor, protein position) after dropping the repeats of an accession under several genes; daly only. The response's `X-Score-Predictors` header (each predictor's direction and licence) reaches the script as `direction` and `licence` columns, with `SCORE_DIRECTIONS` the fallback for a direction the header does not state; only a header piece of exactly the stated shape with one of the contract's two directions is believed, and a name stated twice with different values states nothing. A third added column, `damage_percentile`, is `percentile` turned so that high is more damaging (null where the direction is unknown), so that no script turns it itself; the added columns are listed in `SCORE_SDK_COLUMNS`, which is the SDK's and not part of the mirrored contract. A release without scores raises `scores_not_available`, distinct from the layer's `not_available` |
+| `protein_variants(variants)` | `get_protein_variant_residues` — `get_variant_annotations(source="protein")` with the values typed |
+| `protein_structure_file(model_file_id)`, `protein_pae(model_file_id[, positions=])` | `get_protein_structure_file`, `get_protein_pae` — bytes, not frames: what `genetics.structure` takes |
+| `protein_structure(protein \| variants=[, positions=, pae=])` | `get_protein_structure_inputs` — returns a `genetics.structure.Protein`; with variants or positions it fetches only the model files containing them and their PAE rows, otherwise everything, a PAE matrix past the per-response limit in blocks of rows |
+| `structure.view(protein \| model_file_id, highlights[, sphere, colour_mode=, gene=, model_file_id=, path=])`, `structure.pml(...)` | no tool: they write files. `view` writes the `.structure-view.json` artifact the chat draws as a 3D model, `pml` a PyMOL script with the same marking. Each shows one model file and returns the highlights that file does not contain (`outside_model_file`, `other_model_files`) instead of placing them; what the viewer would refuse or cut (the `VIEW_*` limits mirrored in `sdk/_structure_contract.py`, and the 512 KiB the chat delivers) is a `GeneticsUsageError` before anything is written. `tests/test_sdk_structure_view.py` holds the written files to a port of the browser's parser, and to the parser itself when node and a genetics-results-browser checkout are found |
 | `summary_stats(phenotypes=, variants=\|region=)` | `get_summary_stats`, `get_summary_stats_by_region` |
 | `ld(variant[, other][, panel=, fields=])` | `get_variants_in_ld`, `get_ld_between_variants` — signed `r` only on panel `finngen_r12` |
 | `ld_panels()` | `get_ld_panels` — the panels results-api serves itself, with `fields`, `r2_floor`, `max_distance` |
@@ -2495,12 +2534,14 @@ src/genetics_mcp_server/
 │   ├── __init__.py                 # The `genetics` SDK — importable data access for scripts.
 │   ├── _mr_estimators.py           # Two-sample MR estimators over a harmonised instrument frame.
 │   ├── _runner.py                  # Runs the SDK's async client from synchronous script code.
+│   ├── _structure_contract.py      # The slice of the protein structure release contract that `genetics.structure` computes with.
 │   ├── client.py                   # Async client behind the `genetics` SDK.
 │   ├── enrichment.py               # Gene set enrichment: which gene sets a list of genes, or a gene-level statistic, points at.
 │   ├── errors.py                   # Errors raised by the genetics SDK.
 │   ├── linemodels.py               # Line models: cluster effect estimates by the linear relationship between them.
 │   ├── mr.py                       # Mendelian randomization: instruments, harmonisation, estimates and checks in one call.
-│   └── plots.py                    # Standard plots, drawn the same way every time.
+│   ├── plots.py                    # Standard plots, drawn the same way every time.
+│   └── structure.py                # Protein structure geometry: Cα distances, PAE and 3D neighbourhoods on predicted models.
 ├── skills/
 │   ├── __init__.py                 # Skill definitions and sandbox tools for subagents.
 │   ├── definitions.py              # Skill definitions for subagents.
@@ -2936,6 +2977,7 @@ All configuration is via environment variables (`.env` file supported):
 | `CONFIG_PROFILE` | The deployment's data profile (genetics-results-suite `configs/datasets.yaml`), the same variable `schema_docs` gates views on. Tools whose data only some profiles serve are withdrawn by `Settings.disabled_tools` everywhere else, failing closed when it is unset | unset |
 | `SANDBOX_ENABLED` | Whether a sandbox supervisor is actually serving `SANDBOX_URL`. False withholds `run_analysis` from every resolved tool list — and, since the prompt is built from that list, its guidance too. A deployment fact, flipped by the deploy that creates the sandbox | `false` |
 | `CELL_TYPE_EXPRESSION_ENABLED` | Whether this deployment's results-api has a cell-type expression release pointer. False (or a `CONFIG_PROFILE` outside `CELL_TYPE_EXPRESSION_PROFILES`) withholds `get_cell_type_expression`. The SDK's `genetics.cell_type_expression` is gated on the profile half alone (`sdk/__init__.py`'s `_PROFILE_GATED`, read from `CONFIG_PROFILE` at import, failing closed): unbound and unlisted off those profiles, bound on them and failing with `not_available` while the flag is false. Same truthy parsing as `SANDBOX_ENABLED` | `false` |
+| `PROTEIN_STRUCTURE_ENABLED` | Whether this deployment's results-api has a protein structure release pointer. False (or a `CONFIG_PROFILE` outside `PROTEIN_STRUCTURE_PROFILES`) withholds the tools in `PROTEIN_STRUCTURE_TOOLS`, the `protein` source of `get_variant_annotations` and the code-surface prompt block. The SDK's `genetics.protein_*` functions are gated on the profile half alone (`_PROFILE_GATED`), failing with `not_available` where the route is not registered. Same truthy parsing as `SANDBOX_ENABLED` | `false` |
 | `SANDBOX_URL` | Base URL of the code-execution sandbox supervisor. **One value, deliberately** — it names the in-cluster Service in production and the local Docker container in development, and `sandbox_client.py` branches on nothing else, because the wire contract is identical in both deployments. **No default**: building a `SandboxClient` without it raises `SandboxNotConfigured` before any request is sent (`genetics-results-suite-6um`), because the default it used to carry — `127.0.0.1:8080` — is db-api's port on a dev machine, and a real authenticating service's 404s and auth errors classify as sandbox failures instead of "nothing is configured". Set in the cluster by `k8s/deployments/chat-backend.yaml` (`http://sandbox.genetics.svc.cluster.local:8080`) and locally by `dev-stack.sh` | - |
 | `URL_FETCHER_URL` | Base URL of the url-fetcher, the egress-holding pod that fetches an external file on chat-backend's behalf (`url_fetch_client.py`). **No default**, for the same reason `SANDBOX_URL` has none: a guessed address points a `POST /fetch` at whatever occupies a common port on a dev machine, and that service's answers classify as fetcher failures instead of "nothing is configured". Building a `UrlFetchClient` without it raises `UrlFetchNotConfigured` before any request is sent. In the cluster it is `http://url-fetcher.genetics.svc.cluster.local:8090` | - |
 | `URL_FETCH_CACHE_TTL_SECONDS` | Lifetime of an entry in the per-user fetch cache. The cache is keyed on `(user, url)` and lives **in memory only** — never the chat PVC, which holds conversations and carries retention obligations remotely fetched bytes have no business inheriting. At or below zero disables caching, which changes nothing but latency | `900` |

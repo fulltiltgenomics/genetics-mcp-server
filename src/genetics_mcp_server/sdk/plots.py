@@ -7,6 +7,7 @@
     genetics.plots.forest(frame, label="cohort", scale="log_ratio", pool="fixed")
     genetics.plots.volcano(frame, label="gene", significance="bonferroni")
     genetics.plots.mr(res)
+    genetics.plots.protein_track("SETD1A", scores="mu", rows={"missense": residue_rows})
 
 WHY THESE ARE FUNCTIONS AND NOT INSTRUCTIONS. A locuszoom has conventions a script rederives
 badly under time pressure: which axis is -log10 p, that the LD ramp is binned rather than
@@ -51,7 +52,16 @@ from genetics_mcp_server.sdk.client import parse_region
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import LD_MAX_WINDOW
 
-__all__ = ["locuszoom", "phewas", "upset", "linemodels", "forest", "volcano", "mr"]
+__all__ = [
+    "locuszoom",
+    "phewas",
+    "upset",
+    "linemodels",
+    "forest",
+    "volcano",
+    "mr",
+    "protein_track",
+]
 
 # Asked of the LD server rather than 0.0. At r²≥0 it answers with every variant in the panel,
 # which costs twice: the informative points disappear into a navy cloud of r²≈0, and the answer
@@ -4734,4 +4744,1323 @@ def mr(
         "leave_one_out": returned["leave_one_out"],
         "notes": notes,
         "size_in": (width, height),
+    }
+
+
+# --------------------------------------------------------------------------- protein track
+
+# AlphaFold's own four confidence bands in AlphaFold's own colours, ordered high to low: a
+# reader who has seen a model page decodes these without the legend, so they are data
+# encoding and do not follow the prop_cycle. A band starts at its threshold.
+_PLDDT_BANDS: tuple[tuple[float, str, str], ...] = (
+    (90.0, "#0053D6", "> 90"),
+    (70.0, "#65CBF3", "70–90"),
+    (50.0, "#FFDB13", "50–70"),
+    (0.0, "#FF7D45", "< 50"),
+)
+_TRACK_MISSING = "#EEEEEE"
+_TRACK_INK = "#2C6FB3"
+_TRACK_TINT = "#B5CFEA"
+_TRACK_MUTED = "#8A8A8A"
+
+# One hue, three amounts of ink: the better the evidence for a feature, the more of the box
+# is filled. A second hue per tier would compete with the pLDDT strip directly below, whose
+# colours already mean something. (face, edge, line style, label colour inside the box)
+_TRACK_TIERS: dict[str, tuple[str, str, str, str]] = {
+    "experimental": (_TRACK_INK, _TRACK_INK, "-", "white"),
+    "curated": (_TRACK_TINT, _TRACK_INK, "-", "#1B3F66"),
+    "predicted": ("white", _TRACK_INK, "-", "#1B3F66"),
+    "unknown": ("white", _TRACK_MUTED, ":", "#555555"),
+}
+
+# The features that say what a stretch of the protein IS. Left out by default: the
+# secondary-structure types (helix, strand, turn), which run to hundreds of slivers, the
+# single-residue annotations (sites, modified residues, natural variants), which are marks
+# rather than boxes and belong in a caller's own row, and compositional bias, which on a
+# disordered protein repeats the pLDDT strip twenty times over.
+_TRACK_FEATURE_TYPES = ("TED domain", "Domain", "Repeat", "Zinc finger", "Region")
+
+# Okabe–Ito without its blue and its yellow, which the pLDDT strip has taken
+_TRACK_ROW_COLOURS = ("#009E73", "#D55E00", "#CC79A7", "#8C510A", "#56B4E9", "#000000")
+_TRACK_KINDS = ("tick", "lollipop", "span")
+_TRACK_ROW_KEYS = ("name", "data", "kind", "position", "weight", "colour")
+_TRACK_POSITION_COLUMNS = ("aa_pos", "protein_position", "position")
+_TRACK_FEATURE_COLUMNS = (
+    "source",
+    "feature_type",
+    "start",
+    "end",
+    "description",
+    "evidence_tier",
+    "release",
+)
+_TRACK_BINS = ("max", "min", "mean")
+_TRACK_HIGHER_IS = ("dark", "light")
+_TRACK_PREDICTOR_NAMES = {"alphamissense": "AlphaMissense", "esm1b": "ESM1b"}
+_TRACK_PREDICTOR_BINS = ("mean", "max")
+
+# what a model file id's prefix says about where the prediction came from; "" is any other
+_TRACK_SOURCES = {
+    "AF3-": "AlphaFold 3 (AlphaFold Server) prediction",
+    "AF-": "AlphaFold Protein Structure Database model",
+    "": "model file",
+}
+
+_TRACK_WIDTH_IN = 6.5
+_TRACK_LANE_IN = 0.14
+_TRACK_STRIP_IN = 0.13
+_TRACK_TICK_IN = 0.15
+_TRACK_LOLLIPOP_IN = 0.42
+_TRACK_GAP_IN = 0.08
+_TRACK_TOP_IN = 0.42
+_TRACK_BOTTOM_IN = 0.52
+_TRACK_NOTE_LINE_IN = 0.08
+_TRACK_LABEL_SIZE = 4.5
+_TRACK_LABEL_PAD_IN = 0.02
+_TRACK_LABEL_CHARS = 28
+
+# Lanes a feature type may take while its labels hang beside the boxes too narrow to hold
+# them. Past this the hanging labels are what is filling the lanes, so they are dropped and
+# the boxes packed again on their own.
+_TRACK_MAX_LANES = 3
+
+
+def _track_fetch(name: str, protein: str, have_residues: bool = False, *args: Any) -> pl.DataFrame:
+    from genetics_mcp_server import sdk
+
+    fetch = getattr(sdk, name, None)
+    if fetch is None:
+        if name == "protein_scores":
+            remedy = "pass predictor_scores=, or leave predictors= out to draw no predictor rows"
+        elif have_residues:
+            remedy = "pass features= as well, or feature_types=[] to draw no feature rows"
+        else:
+            remedy = "pass residues= (and features=) to draw frames already in hand"
+        raise GeneticsUsageError(
+            f"genetics.{name} is not offered on this deployment, so protein_track cannot "
+            f"fetch {protein!r} itself; {remedy}"
+        )
+    return fetch(protein, *args)
+
+
+def _track_whole(frame: pl.DataFrame, columns: list[str], what: str) -> pl.DataFrame:
+    """`columns` as Int64, or a usage error: a position that is not a whole number is refused.
+
+    A frame read back from a file carries positions as strings or floats; those are cast
+    when every value is exact, since truncating 12.5 would draw a mark one residue off.
+    """
+    for column in columns:
+        series = frame[column]
+        if not series.dtype.is_integer():
+            try:
+                numbers = series.cast(pl.Float64)
+                exact = bool((numbers.is_null() | (numbers == numbers.round())).all())
+            except Exception:
+                exact = False
+            if not exact:
+                raise GeneticsUsageError(
+                    f"{what}: column {column!r} ({series.dtype}) holds values that are not "
+                    f"whole numbers, and a protein position is an integer"
+                )
+            series = numbers
+        frame = frame.with_columns(series.cast(pl.Int64).alias(column))
+    return frame
+
+
+def _track_owner_rows(residues: pl.DataFrame, protein: str) -> pl.DataFrame:
+    """One row per protein position, sorted: the window that owns each position."""
+    if residues.is_empty() or "protein_position" not in residues.columns:
+        raise GeneticsUsageError(
+            f"residues for {protein!r} need a 'protein_position' column and at least one "
+            f"row; columns are {residues.columns}"
+        )
+    if "accession" in residues.columns:
+        accessions = sorted(set(residues["accession"].drop_nulls().to_list()))
+        if len(accessions) > 1:
+            raise GeneticsUsageError(
+                f"{protein!r} has residues of {len(accessions)} proteins ({accessions}); a "
+                f"track draws one — pass the accession"
+            )
+    residues = _track_whole(residues, ["protein_position"], f"residues for {protein!r}")
+    residues = residues.filter(pl.col("protein_position") >= 1)
+    if "is_owner" in residues.columns:
+        residues = residues.filter(pl.col("is_owner").fill_null(False))
+    elif residues["protein_position"].is_duplicated().any():
+        # which window's pLDDT stands for a position is what `is_owner` says; picking a row
+        # here instead would make the picture depend on the order of the frame
+        raise GeneticsUsageError(
+            f"residues for {protein!r} repeat protein positions and have no 'is_owner' "
+            f"column to say which row to draw: keep 'is_owner' from "
+            f"genetics.protein_residues, or pass one row per position"
+        )
+    # a frame that marks two owners for a position is drawn from the first of them
+    residues = residues.unique(subset="protein_position", keep="first", maintain_order=True)
+    if residues.is_empty():
+        raise GeneticsUsageError(f"residues for {protein!r} have no owner row to draw")
+    return residues.sort("protein_position")
+
+
+def _track_dense(owners: pl.DataFrame, column: str, length: int) -> np.ndarray:
+    """A column laid out by protein position, NaN where the frame has no value."""
+    try:
+        values = owners[column].cast(pl.Float64).to_numpy()
+    except Exception as error:
+        raise GeneticsUsageError(
+            f"column {column!r} is {owners[column].dtype}, not numeric, so it cannot be drawn "
+            f"as a per-residue strip"
+        ) from error
+    dense = np.full(length, np.nan)
+    dense[owners["protein_position"].to_numpy() - 1] = values
+    return dense
+
+
+def _track_binned(values: np.ndarray, lo: int, hi: int, bin_size: int, how: str) -> np.ndarray:
+    """Positions lo..hi reduced to one value per `bin_size` residues, ignoring NaN."""
+    window = values[lo - 1 : hi]
+    if bin_size == 1:
+        return window
+    pad = -len(window) % bin_size
+    if pad:
+        window = np.concatenate([window, np.full(pad, np.nan)])
+    blocks = window.reshape(-1, bin_size)
+    filled = ~np.isnan(blocks)
+    counts = filled.sum(axis=1)
+    if how == "max":
+        reduced = np.where(filled, blocks, -np.inf).max(axis=1)
+    elif how == "min":
+        reduced = np.where(filled, blocks, np.inf).min(axis=1)
+    else:
+        reduced = np.where(filled, blocks, 0.0).sum(axis=1) / np.maximum(counts, 1)
+    return np.where(counts > 0, reduced, np.nan)
+
+
+def _track_scores(scores: Any, columns: list[str]) -> dict[str, dict[str, str]]:
+    """`scores=` in any of its forms as {label: {"column": ..., "bin": ..., "higher_is": ...}}."""
+    if scores is None:
+        return {}
+    if isinstance(scores, str):
+        scores = [scores]
+    if not isinstance(scores, dict):
+        scores = {str(c): c for c in scores}
+    specs = {}
+    for label, spec in scores.items():
+        if not isinstance(spec, dict):
+            spec = {"column": spec}
+        if "column" not in spec or set(spec) - {"column", "bin", "higher_is"}:
+            raise GeneticsUsageError(
+                f"score {label!r} is a column name or "
+                f"{{'column': ..., 'bin': ..., 'higher_is': ...}}; got {spec!r}"
+            )
+        higher_is = spec.get("higher_is", "dark")
+        if higher_is not in _TRACK_HIGHER_IS:
+            raise GeneticsUsageError(
+                f"score {label!r}: higher_is must be one of {_TRACK_HIGHER_IS}, not {higher_is!r}"
+            )
+        # binning keeps the dark end unless told otherwise, since dark is what is looked for
+        how = spec.get("bin", "max" if higher_is == "dark" else "min")
+        if how not in _TRACK_BINS:
+            raise GeneticsUsageError(
+                f"score {label!r}: bin must be one of {_TRACK_BINS}, not {how!r}"
+            )
+        specs[str(label)] = {"column": str(spec["column"]), "bin": how, "higher_is": higher_is}
+    absent = [s["column"] for s in specs.values() if s["column"] not in columns]
+    if absent:
+        raise GeneticsUsageError(
+            f"scores name columns the residues do not have: {absent}; columns are {columns}"
+        )
+    return specs
+
+
+def _track_predictors(
+    frame: pl.DataFrame,
+    names: list[str] | None,
+    accession: str | None,
+    length: int,
+    lo: int,
+    hi: int,
+) -> list[dict[str, Any]]:
+    """One entry per predictor of the long scores frame, its percentile turned towards damage.
+
+    `values` is the percentile by protein position with 100 = most damaging and NaN where
+    the predictor has no score, or None for a predictor whose direction nothing states:
+    drawn raw, its dark end could be the benign one.
+    """
+    from genetics_mcp_server.sdk import _structure_contract as contract
+
+    columns = frame.columns
+    absent = [c for c in ("predictor", "protein_position") if c not in columns]
+    if "percentile" not in columns and "damage_percentile" not in columns:
+        absent.append("percentile")
+    if absent:
+        raise GeneticsUsageError(
+            f"predictor_scores is the frame genetics.protein_scores returns and needs "
+            f"{absent}; columns are {columns}"
+        )
+    others: list[str] = []
+    if accession and "accession" in columns:
+        others = sorted(set(frame["accession"].drop_nulls().to_list()) - {accession})
+        other_rows = frame.filter(pl.col("accession") != accession)
+        frame = frame.filter(pl.col("accession") == accession)
+    frame = _track_whole(frame, ["protein_position"], "predictor_scores")
+    present = frame["predictor"].drop_nulls().unique(maintain_order=True).to_list()
+    if names is None:
+        names = present
+    missing = [n for n in names if n not in present]
+    if missing or not names:
+        raise GeneticsUsageError(
+            f"predictor_scores has no rows of {missing or 'any predictor'} for "
+            f"{accession or 'this protein'}; it has {present}"
+        )
+
+    def numeric(rows: pl.DataFrame, column: str) -> np.ndarray:
+        try:
+            return rows[column].cast(pl.Float64).to_numpy()
+        except Exception as error:
+            raise GeneticsUsageError(
+                f"predictor_scores: column {column!r} is {rows[column].dtype}, not numeric"
+            ) from error
+
+    out = []
+    for name in names:
+        rows = frame.filter(pl.col("predictor") == name)
+        placed = rows.drop_nulls("protein_position")
+        n_no_position = rows.height - placed.height
+        rows = placed
+        if rows["protein_position"].is_duplicated().any():
+            # which protein's residue a position shows is what `accession` says; taking the
+            # first row instead would draw another protein's scores on this track
+            raise GeneticsUsageError(
+                f"predictor_scores repeat protein positions for {name!r}"
+                + (f" on {accession}" if accession else "")
+                + ": keep the 'accession' column from genetics.protein_scores (and from the "
+                "residues), or pass one protein's rows"
+            )
+        stated = (
+            sorted(rows["direction"].drop_nulls().unique().to_list())
+            if "direction" in columns
+            else []
+        )
+        if len(stated) > 1:
+            raise GeneticsUsageError(
+                f"predictor_scores state more than one direction for {name!r}: {stated}; "
+                f"a predictor has one"
+            )
+        direction = stated[0] if stated else contract.SCORE_DIRECTIONS.get(name)
+        flipped = direction == contract.SCORE_LOWER_IS_DAMAGING
+        known = flipped or direction == contract.SCORE_HIGHER_IS_DAMAGING
+        raw = derived = None
+        if "percentile" in columns:
+            raw = numeric(rows, "percentile")
+            derived = (100.0 - raw if flipped else raw) if known else None
+        if "damage_percentile" in columns:
+            oriented = numeric(rows, "damage_percentile")
+            both = np.isfinite(oriented) & np.isfinite(derived) if derived is not None else None
+            if both is not None and not np.allclose(oriented[both], derived[both], atol=1e-6):
+                raise GeneticsUsageError(
+                    f"predictor_scores: for {name!r} ({direction}) 'damage_percentile' is not "
+                    f"'percentile' turned towards damage, so one of the two was overwritten; "
+                    f"pass the frame as genetics.protein_scores returned it"
+                )
+            drawn = known or bool(np.isfinite(oriented).any())
+        else:
+            oriented, drawn = derived, known
+        scored = oriented if drawn or raw is None else raw
+        positions = rows["protein_position"].to_numpy()
+        on = (positions >= 1) & (positions <= length)
+        values = np.full(length, np.nan)
+        values[positions[on] - 1] = scored[on]
+        shown = _TRACK_PREDICTOR_NAMES.get(name, name)
+        out.append(
+            {
+                "name": name,
+                "shown": shown,
+                "label": _plain(shown, 40),
+                "direction": direction,
+                "licence": _first(rows, "licence"),
+                "flipped": flipped,
+                "values": values if drawn else None,
+                "n": int(((positions >= lo) & (positions <= hi)).sum()),
+                "n_no_score": int((~np.isfinite(values[lo - 1 : hi])).sum()),
+                "n_outside": int((~on).sum()),
+                "n_no_position": n_no_position,
+                "n_other_accession": (
+                    other_rows.filter(pl.col("predictor") == name).height if others else 0
+                ),
+                "other_accessions": others,
+            }
+        )
+    return out
+
+
+def _track_scored_fraction(
+    values: np.ndarray, lo: int, hi: int, bin_size: int
+) -> tuple[float | None, int]:
+    """Over the binned columns that hold a score: the smallest scored share, and how many are under half."""
+    window = np.isfinite(values[lo - 1 : hi])
+    pad = -len(window) % bin_size
+    scored = np.concatenate([window, np.zeros(pad, bool)]).reshape(-1, bin_size).sum(axis=1)
+    # the last column holds fewer residues than the others when the stretch does not divide
+    held = np.full(len(scored), bin_size)
+    held[-1] -= pad
+    share = scored[scored > 0] / held[scored > 0]
+    if not share.size:
+        return None, 0
+    return round(float(share.min()), 4), int((share < 0.5).sum())
+
+
+def _track_predictor_note(predictors: list[dict[str, Any]], accession: str | None) -> str | None:
+    drawn = [p for p in predictors if p["values"] is not None]
+    parts = []
+    if drawn:
+        flipped = [f"{p['shown']} drawn as 100 − percentile" for p in drawn if p["flipped"]]
+        licences = ", ".join(f"{p['shown']} {p['licence'] or 'licence not stated'}" for p in drawn)
+        parts.append(
+            "predictor rows: percentile of the residue's mean missense score within the "
+            "release, dark = more damaging"
+            + (f" ({'; '.join(flipped)})" if flipped else "")
+            + f", grey = no score; licences: {licences}"
+        )
+    parts += [
+        f"{p['shown']} not drawn: nothing states which end of its score is damaging"
+        for p in predictors
+        if p["values"] is None
+    ]
+    thin = [f"{p['shown']} {p['n_thin']}" for p in drawn if p.get("n_thin")]
+    if thin:
+        parts.append(f"columns averaging under half their residues: {', '.join(thin)}")
+    others = sorted(
+        {a for p in predictors if p["n_other_accession"] for a in p["other_accessions"]}
+    )
+    if others:
+        parts.append(f"predictor rows of {', '.join(others)} left out, not {accession}")
+    return " · ".join(parts) or None
+
+
+def _track_lanes(spans: list[tuple[float, float]]) -> list[int]:
+    """The lane of each (start, end), given in start order: the first lane free at its start."""
+    ends: list[float] = []
+    lanes = []
+    for start, end in spans:
+        lane = next((i for i, last in enumerate(ends) if start > last), len(ends))
+        if lane == len(ends):
+            ends.append(end)
+        else:
+            ends[lane] = end
+        lanes.append(lane)
+    return lanes
+
+
+def _track_label_in(text: str) -> float:
+    """How wide a feature label draws, in inches, from the font's advance widths.
+
+    Not `_text_width_in`: that traces the outline of every glyph, measured at about 70 ms a
+    string, and a protein with several hundred features has as many distinct labels.
+    """
+    from matplotlib.font_manager import FontProperties, findfont, get_font
+
+    try:
+        font = get_font(findfont(FontProperties()))
+        font.set_size(_TRACK_LABEL_SIZE, 72)
+        font.set_text(text, 0.0)
+        return font.get_width_height()[0] / 64 / 72
+    except Exception:
+        return 0.6 * _TRACK_LABEL_SIZE * len(text) / 72
+
+
+def _track_feature_labels(row: dict[str, Any]) -> list[str]:
+    """What a feature's box may say, longest first."""
+    description = " ".join(str(row.get("description") or "").split())
+    if not description:
+        return []
+    if str(row.get("source") or "").lower() == "ted":
+        # `TED02 high consensus CATH 3.30.70.330 (H, foldseek)`: the domain's number and
+        # its CATH superfamily are the name; the rest is how it was called
+        words = description.split()
+        cath = words[words.index("CATH") + 1] if "CATH" in words[:-1] else None
+        return [f"{words[0]} {cath}", words[0]] if cath else [words[0]]
+    return [_plain(description, _TRACK_LABEL_CHARS)]
+
+
+def _track_feature_rows(
+    features: pl.DataFrame | None, feature_types: list[str], lo: int, hi: int, axis_in: float
+) -> tuple[list[dict[str, Any]], int]:
+    """Each requested feature type with features in view, its boxes laid in lanes.
+
+    Second, how many features of those types were left out for having no usable extent: a
+    null start or end, or a start past its end.
+    """
+    if features is None or features.is_empty() or not feature_types:
+        return [], 0
+    missing = [c for c in ("feature_type", "start", "end") if c not in features.columns]
+    if missing:
+        raise GeneticsUsageError(
+            f"features need 'feature_type', 'start' and 'end' columns; missing {missing}"
+        )
+    known = [c for c in _TRACK_FEATURE_COLUMNS if c in features.columns]
+    features = _track_whole(
+        features.select(known).unique(maintain_order=True), ["start", "end"], "features"
+    )
+    per_in = (hi - lo + 1) / axis_in
+    widths: dict[str, float] = {}
+
+    def needs(text: str) -> float:
+        if text not in widths:
+            widths[text] = _track_label_in(text) + 2 * _TRACK_LABEL_PAD_IN
+        return widths[text]
+
+    rows = []
+    dropped = 0
+    for wanted in feature_types:
+        of_type = features.filter(
+            pl.col("feature_type").cast(pl.Utf8).str.to_lowercase() == wanted.lower()
+        )
+        usable = of_type.filter(pl.col("start") <= pl.col("end"))
+        dropped += of_type.height - usable.height
+        chosen = usable.filter((pl.col("end") >= lo) & (pl.col("start") <= hi)).sort(
+            ["start", "end"], descending=[False, True]
+        )
+        if chosen.is_empty():
+            continue
+        marks = []
+        for row in chosen.iter_rows(named=True):
+            start, end = max(row["start"], lo), min(row["end"], hi)
+            labels = _track_feature_labels(row)
+            box_in = (end - start + 1) / per_in
+            inside = next((t for t in labels if needs(t) <= box_in), None)
+            reach = None
+            if inside is None and labels:
+                reach = end + 0.5 + needs(labels[-1]) * per_in
+                if reach > hi + 0.5:
+                    reach = None
+            tier = str(row.get("evidence_tier") or "unknown").lower()
+            marks.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "tier": tier if tier in _TRACK_TIERS else "unknown",
+                    "inside": inside,
+                    "outside": labels[-1] if reach is not None else None,
+                    "reach": reach,
+                }
+            )
+        lanes = _track_lanes([(m["start"], m["reach"] or m["end"]) for m in marks])
+        if max(lanes) + 1 > _TRACK_MAX_LANES:
+            for mark in marks:
+                mark["outside"] = None
+            lanes = _track_lanes([(m["start"], m["end"]) for m in marks])
+        for mark, lane in zip(marks, lanes):
+            mark["lane"] = lane
+        rows.append(
+            {
+                "feature_type": str(chosen["feature_type"][0]),
+                "marks": marks,
+                "lanes": max(lanes) + 1,
+            }
+        )
+    return rows, dropped
+
+
+def _track_runs(positions: list[int]) -> list[tuple[int, int]]:
+    """Sorted positions as (start, end) runs of consecutive residues."""
+    runs: list[tuple[int, int]] = []
+    for position in sorted(set(positions)):
+        if runs and position == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], position)
+        else:
+            runs.append((position, position))
+    return runs
+
+
+def _track_is_colour(value: Any) -> bool:
+    from matplotlib.colors import is_color_like
+
+    try:
+        return value is not None and bool(is_color_like(value))
+    except Exception:
+        return False
+
+
+def _track_row(spec: Any, index: int, length: int) -> dict[str, Any]:
+    """One caller's row, checked and reduced to what is drawn: positions or spans in 1..length."""
+    if not isinstance(spec, dict) or "name" not in spec or "data" not in spec:
+        raise GeneticsUsageError(
+            f"each of rows= is a dict with at least 'name' and 'data'; got {spec!r:.80}"
+        )
+    unknown = sorted(set(spec) - set(_TRACK_ROW_KEYS))
+    if unknown:
+        raise GeneticsUsageError(
+            f"row {spec['name']!r} has keys {unknown}; a row takes {list(_TRACK_ROW_KEYS)}"
+        )
+    name = _plain(spec["name"], 40)
+    data = spec["data"]
+    if not isinstance(data, pl.DataFrame):
+        try:
+            # a string is refused before int() can read "5" out of it, and 12.5 before
+            # int() can truncate it
+            listed = list(data)
+            inexact = [p for p in listed if isinstance(p, str) or int(p) != p]
+            if inexact:
+                raise ValueError(f"got {inexact[0]!r}")
+            data = pl.DataFrame(
+                {"position": [int(p) for p in listed]}, schema={"position": pl.Int64}
+            )
+        except (TypeError, ValueError) as error:
+            raise GeneticsUsageError(
+                f"row {name!r}: 'data' is a polars frame or a list of protein positions, "
+                f"each a whole number ({error})"
+            ) from error
+    position = spec.get("position") or next(
+        (c for c in _TRACK_POSITION_COLUMNS if c in data.columns), None
+    )
+    spans = position is None and {"start", "end"} <= set(data.columns)
+    if position is None and not spans:
+        raise GeneticsUsageError(
+            f"row {name!r} has no position column: expected one of "
+            f"{list(_TRACK_POSITION_COLUMNS)}, or 'start' and 'end' for spans; columns are "
+            f"{data.columns}"
+        )
+    weight = spec.get("weight")
+    for column in (position, weight):
+        if column is not None and column not in data.columns:
+            raise GeneticsUsageError(
+                f"row {name!r}: no column {column!r}; columns are {data.columns}"
+            )
+    kind = spec.get("kind") or ("span" if spans else "lollipop" if weight else "tick")
+    if kind not in _TRACK_KINDS:
+        raise GeneticsUsageError(f"row {name!r}: kind must be one of {_TRACK_KINDS}, not {kind!r}")
+    if spans and kind != "span":
+        raise GeneticsUsageError(
+            f"row {name!r}: a {kind} row needs positions, and the data has only start/end"
+        )
+    if kind == "lollipop" and weight is None:
+        raise GeneticsUsageError(f"row {name!r}: a lollipop row needs weight= for its heights")
+    data = _track_whole(data, ["start", "end"] if spans else [position], f"row {name!r}")
+
+    colour = spec.get("colour")
+    colours = None
+    if isinstance(colour, str) and colour in data.columns:
+        colours, colour = colour, None
+        bad = [c for c in data[colours].to_list() if not _track_is_colour(c)]
+        if bad:
+            raise GeneticsUsageError(
+                f"row {name!r}: colour column {colours!r} holds {bad[0]!r}, which is not a "
+                f"colour; every row needs one"
+            )
+    elif colour is None:
+        colour = _TRACK_ROW_COLOURS[index % len(_TRACK_ROW_COLOURS)]
+    elif not _track_is_colour(colour):
+        raise GeneticsUsageError(
+            f"row {name!r}: colour {colour!r} is neither a colour nor a column of the data"
+        )
+
+    row: dict[str, Any] = {"name": name, "kind": kind, "weight": weight, "colour": colour}
+    if kind == "span":
+        if spans:
+            kept = data.drop_nulls(["start", "end"])
+            pairs = list(zip(kept["start"].to_list(), kept["end"].to_list()))
+        else:
+            pairs = _track_runs(data[position].drop_nulls().to_list())
+        clipped = [(max(s, 1), min(e, length)) for s, e in pairs]
+        row["spans"] = [(s, e) for s, e in clipped if s <= e]
+        row["n_outside"] = len(pairs) - len(row["spans"])
+        return row
+
+    kept = data.drop_nulls(position)
+    if kind == "lollipop":
+        try:
+            weights = kept[weight].cast(pl.Float64)
+        except Exception as error:
+            raise GeneticsUsageError(
+                f"row {name!r}: weight {weight!r} is {kept[weight].dtype}, not numeric"
+            ) from error
+        if weights.is_infinite().any():
+            raise GeneticsUsageError(
+                f"row {name!r}: weight {weight!r} has an infinite value, which has no height "
+                f"on a scale; cap it or drop the row"
+            )
+        weighted = weights.is_not_null() & weights.is_not_nan()
+        row["n_no_weight"] = kept.height - int(weighted.sum())
+        kept = kept.filter(weighted)
+    inside = kept.filter((pl.col(position) >= 1) & (pl.col(position) <= length))
+    row["n_outside"] = kept.height - inside.height
+    row["positions"] = np.asarray(inside[position].to_list(), dtype=float)
+    row["colours"] = inside[colours].to_list() if colours else None
+    if kind == "lollipop":
+        weights = inside[weight].cast(pl.Float64).to_numpy().astype(float)
+        if weights.size and weights.min() < 0:
+            raise GeneticsUsageError(
+                f"row {name!r}: weight {weight!r} has negative values, and a lollipop's "
+                f"height starts at zero"
+            )
+        row["weights"] = weights
+        # a probability keeps its full scale, so 0.3 does not draw as tall as it can go
+        row["top"] = 1.0 if not weights.size or weights.max() <= 1 else float(weights.max())
+    return row
+
+
+def _track_models(owners: pl.DataFrame, lo: int, hi: int) -> list[str]:
+    """The model files that own positions lo..hi, in the order they run along the protein."""
+    if "model_file_id" not in owners.columns:
+        return []
+    drawn = owners.filter(pl.col("protein_position").is_between(lo, hi))
+    return [m for m in drawn["model_file_id"].unique(maintain_order=True).to_list() if m]
+
+
+def _track_source(models: list[str]) -> str:
+    """Where the structure came from, by what the model file ids say; always "predicted"."""
+    groups: dict[str, list[str]] = {}
+    for model in models:
+        prefix = next((p for p in _TRACK_SOURCES if p and model.startswith(p)), "")
+        groups.setdefault(prefix, []).append(model)
+    parts = []
+    for prefix, ids in groups.items():
+        listed = ", ".join(ids) if len(ids) <= 2 else f"{ids[0]} … {ids[-1]} ({len(ids)} files)"
+        parts.append(f"{_TRACK_SOURCES[prefix]}{'s' if len(ids) > 1 else ''} {listed}")
+    return "predicted structure" + (": " + "; ".join(parts) if parts else "")
+
+
+def _track_release(release: str | None, *frames: pl.DataFrame | None) -> str | None:
+    if release:
+        return str(release)
+    for frame in frames:
+        if frame is not None and "release" in frame.columns:
+            names = frame["release"].drop_nulls().unique().to_list()
+            if len(names) == 1:
+                return str(names[0])
+    return None
+
+
+def protein_track(
+    protein: str,
+    *,
+    residues: pl.DataFrame | None = None,
+    features: pl.DataFrame | None = None,
+    feature_types: Any = _TRACK_FEATURE_TYPES,
+    scores: Any = None,
+    predictors: Any = None,
+    predictor_scores: pl.DataFrame | None = None,
+    predictor_bin: str = "mean",
+    rows: Any = None,
+    region: tuple[int, int] | None = None,
+    release: str | None = None,
+    path: str | None = None,
+    title: str | None = None,
+    ax: Any = None,
+) -> dict[str, Any]:
+    """Protein track: domains, pLDDT, per-residue scores, missense predictors and your own variant rows on one amino-acid axis.
+
+        genetics.plots.protein_track(
+            "SETD1A",
+            scores="mu",
+            predictors=True,
+            rows=[
+                {"name": "SCZ credible sets", "data": cs_residues, "weight": "pip"},
+                {"name": "burden variants", "data": genetics.protein_variants(ids)},
+                {"name": "3D neighbourhood", "data": [96, 97, 98, 130, 131], "kind": "span"},
+            ],
+        )
+
+    `protein` is a UniProt accession or a gene with one protein in the release. Its residues
+    and features are fetched (`genetics.protein_residues`, `genetics.protein_features`)
+    unless passed as `residues=` and `features=`, the frames those two return.
+    `features=None` means fetch: for no feature rows and no fetch pass `feature_types=[]`
+    or an empty frame. A protein modelled as overlapping windows repeats positions, and
+    only the `is_owner` row of each is drawn; residues that repeat positions WITHOUT an
+    `is_owner` column are refused, so keep that column when filtering the frame.
+
+    Rows, top to bottom, all on protein position (1-based):
+
+    - one row per feature type in `feature_types` that the protein has — by default TED
+      domains and UniProt domains, repeats, zinc fingers and regions; pass any
+      `feature_type` values the features frame holds. Features of a type that overlap are
+      stacked in lanes: taken in start order, each goes in the first lane that is free. A
+      box says its description when that fits inside it, else beside it. The fill is the
+      evidence tier: solid for experimental, tinted for curated, hollow for predicted (every
+      TED domain is), dotted grey for unknown.
+    - pLDDT in AlphaFold's four bands; grey where a position has no residue row.
+    - one heatmap row per entry of `scores` — a column of `residues`, a list of them,
+      `{label: column}`, or `{label: {"column": ..., "bin": "max" | "min" | "mean",
+      "higher_is": "dark" | "light"}}`. Each row runs light to dark over that column's own
+      range across the whole protein, printed at its right; to draw a score from elsewhere,
+      join it onto the residues frame by `protein_position`. HIGH values are dark unless
+      `"higher_is": "light"`, which is for a column where LOW is the finding (a
+      log-likelihood ratio, a constraint score): its low values are then the dark ones and
+      `bin` defaults to `"min"`.
+    - one heatmap row per missense predictor when `predictors=` asks: `True` for every
+      predictor served, or names (`"alphamissense"`, `["esm1b"]`). The rows are fetched
+      (`genetics.protein_scores`) unless passed as `predictor_scores=`, the frame that
+      returns; passing the frame alone draws every predictor in it. DIRECTION: a row is the
+      predictor's `percentile` ORIENTED so that dark always means more damaging — as it is
+      for a higher-is-more-damaging predictor (AlphaMissense), as `100 - percentile` for a
+      lower-is-more-damaging one (ESM1b). So read every predictor row the same way, and do
+      NOT flip the frame yourself before passing it: the row is the frame's
+      `damage_percentile` column when it has one, and a frame whose `percentile` and
+      `damage_percentile` disagree for the stated direction is refused, as is a predictor
+      whose rows state two directions or repeat a position (keep the `accession` column so
+      rows of another protein are left out, and reported, rather than merged). The row label is the predictor's name
+      and the note under the figure says the rows are turned and which predictor was drawn
+      as 100 - percentile; the scale is 0-100 for every predictor, and grey is a residue
+      with no score, never a low one. A predictor whose direction neither the frame's `direction` column nor the
+      SDK knows is not drawn, and the note says so.
+    - one row per entry of `rows` (a list), each a dict: `name`, `data` (a frame, or a list
+      of positions), and optionally `kind`, `weight`, `colour`, `position`. Positions are
+      read from `position=`, else `aa_pos` (what `genetics.protein_variants` returns), else
+      `protein_position` or `position`; a frame with `start` and `end` instead is spans.
+      `kind="tick"` is a mark at each position, `"lollipop"` a stem as tall as `weight`
+      (a column, e.g. a PIP; on a 0-1 scale when no weight exceeds 1; a row with no weight
+      is left out and counted), `"span"` shaded stretches — the frame's start/end, or runs
+      of consecutive positions. The default is span for start/end data, lollipop when
+      `weight` is given, else tick. `colour` is one colour or a column of them.
+      `rows={"name": data, ...}` is the short form.
+
+    `region=(start, end)` draws only that stretch. On a stretch with more residues than
+    the figure has pixels across, the strips are binned to one column per pixel, and
+    `bin_size` says how many residues a column holds. pLDDT shows the LOWEST band present
+    in a column, so a short low-confidence stretch stays visible and a column reads as
+    confident only if all of it is. A score shows its `bin`: `"max"` (the default) keeps
+    the highest value in a column and hides the low ones, which suits a score where high
+    is the finding; for one where LOW is the finding say `"higher_is": "light"` (or
+    `"bin": "min"`), or the damaging residues are exactly what the binning removes;
+    `"mean"` keeps neither extreme. A predictor row shows the MEAN oriented percentile of
+    the scored residues in a column (`predictor_bin="mean"`): a percentile row shows where
+    a protein is constrained on average, and the maximum of many ranks is near 100
+    everywhere, so to see single damaging residues zoom with `region=` until nothing is
+    binned; `predictor_bin="max"` keeps the most damaging residue of each column instead.
+    Variant rows are never binned.
+
+    Under the figure: that the structure is predicted and the model file id(s) the
+    residues came from; for predictor rows, what they show, which were turned, and each
+    predictor's licence tag; when `release=` or a `release` column in the frames names it,
+    the release the features were frozen at; why there are no feature rows, when features
+    were fetched and none could be drawn; and the binning rules when binning is in effect.
+
+    Returns a dict describing what was drawn: `path`, `protein`, `accession`, `gene`,
+    `length`, `region`, `feature_rows` (per feature type: `n`, `lanes` and `n_unlabelled`),
+    `features_dropped` (features of the requested types with a null extent or a start past
+    their end), `feature_note` (None, or why fetched features gave no rows),
+    `plddt_fractions` (share of the drawn residues in each band, per residue whatever the
+    binning), `scores` with each column's `range`, `bin` and `higher_is`, `predictors`,
+    `rows`, `models`, `bin_size` and `note`. Each of `predictors` has `name`, `label`,
+    `direction`, `licence`, `drawn`, `oriented` (dark is more damaging; true of every drawn
+    row), `flipped` (drawn as 100 - percentile), `bin`, `n` (score rows in view),
+    `n_no_score` (residues in view without a score), `n_outside` (rows at positions the
+    protein does not have), `n_no_position` (rows with a null position, left out),
+    `n_other_accession` (rows of another protein, left out) and `min_scored_fraction` (the
+    smallest share of scored residues among the drawn columns that hold a score: a binned
+    column's mean can rest on few residues, and the note says how many columns rest on
+    under half). Each of `rows` has `kind`, `n` marks drawn, `n_out_of_view` (on the protein
+    but outside `region`) and `n_outside` (not on the protein at all) — the three sum to
+    the row's marks with a position; a lollipop row also has `n_no_weight`, taken off first.
+
+    `path` may be relative, in which case it is written inside the execution's artifacts
+    directory and returned to the user automatically; that is also where the default goes.
+    Pass `ax` to draw into an existing axis instead, in which case nothing is saved.
+    """
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
+
+    if isinstance(feature_types, str):
+        feature_types = [feature_types]
+    feature_types = [str(t) for t in feature_types or []]
+    own_residues = residues is not None
+    if residues is None:
+        residues = _track_fetch("protein_residues", protein)
+    fetched = features is None and bool(feature_types)
+    not_found = False
+    if fetched:
+        try:
+            features = _track_fetch("protein_features", protein, own_residues)
+        except GeneticsUsageError:
+            raise
+        except GeneticsError as error:
+            # not_found is the answer for a protein with no feature and ALSO for a name the
+            # release does not know; only a residues fetch that succeeded tells them apart
+            if error.code != "not_found":
+                raise
+            not_found = True
+    owners = _track_owner_rows(residues, protein)
+    length = int(owners["protein_position"].max())
+    accession = _first(owners, "accession")
+    gene = _first(owners, "gene_name")
+    feature_note = None
+    if not_found:
+        feature_note = f"no features: the release has none for {protein!r}"
+        if own_residues:
+            feature_note += f", or {protein!r} is not a protein in the release"
+    if features is not None and accession and "accession" in features.columns:
+        others = sorted(set(features["accession"].drop_nulls().to_list()) - {accession})
+        features = features.filter(pl.col("accession") == accession)
+        if fetched and features.is_empty() and others:
+            feature_note = (
+                f"no features: those fetched for {protein!r} are of {', '.join(others)}, "
+                f"not {accession}"
+            )
+    if fetched and feature_note is None and (features is None or features.is_empty()):
+        feature_note = f"no features: the release has none for {protein!r}"
+
+    if region is None:
+        lo, hi = 1, length
+    else:
+        try:
+            lo, hi = max(int(region[0]), 1), min(int(region[1]), length)
+        except (TypeError, ValueError, IndexError) as error:
+            raise GeneticsUsageError(
+                f"region is (start, end) in protein positions, not {region!r}"
+            ) from error
+        if lo > hi:
+            raise GeneticsUsageError(
+                f"region {region!r} leaves nothing to draw on a protein of {length} residues"
+            )
+
+    scores = _track_scores(scores, owners.columns)
+    if predictors is None or isinstance(predictors, bool):
+        predictor_names = None
+        wanted = predictor_scores is not None if predictors is None else predictors
+    else:
+        predictor_names = (
+            [predictors] if isinstance(predictors, str) else [str(p) for p in predictors]
+        )
+        wanted = bool(predictor_names)
+    if predictor_bin not in _TRACK_PREDICTOR_BINS:
+        raise GeneticsUsageError(
+            f"predictor_bin must be one of {_TRACK_PREDICTOR_BINS}, not {predictor_bin!r}"
+        )
+    predictor_rows: list[dict[str, Any]] = []
+    if wanted:
+        if predictor_scores is None:
+            predictor_scores = _track_fetch("protein_scores", protein, False, predictor_names)
+        predictor_rows = _track_predictors(
+            predictor_scores, predictor_names, accession, length, lo, hi
+        )
+    drawn_predictors = [p for p in predictor_rows if p["values"] is not None]
+    if isinstance(rows, dict):
+        rows = [{"name": name, "data": data} for name, data in rows.items()]
+    elif rows is not None and not isinstance(rows, (list, tuple)):
+        raise GeneticsUsageError(
+            f"rows= is a list of row dicts or a {{name: data}} dict, not a "
+            f"{type(rows).__name__}; to draw one frame pass "
+            f"rows=[{{'name': 'variants', 'data': frame}}]"
+        )
+    own_rows = [_track_row(spec, i, length) for i, spec in enumerate(rows or [])]
+
+    own_figure = ax is None
+    row_names = (
+        [*feature_types, "pLDDT"]
+        + [_plain(s, 40) for s in scores]
+        + [p["label"] for p in drawn_predictors]
+        + [r["name"] for r in own_rows]
+    )
+    score_values = {
+        label: _track_dense(owners, spec["column"], length) for label, spec in scores.items()
+    }
+    score_ranges: dict[str, tuple[float, float] | None] = {}
+    scales = {}
+    for label, values in score_values.items():
+        finite = values[np.isfinite(values)]
+        score_ranges[label] = (float(finite.min()), float(finite.max())) if finite.size else None
+        if finite.size:
+            scales[label] = f"{finite.min():.2g}–{finite.max():.2g}"
+            if scores[label]["higher_is"] == "light":
+                scales[label] += ", low = dark"
+    for own in own_rows:
+        if own["kind"] == "lollipop":
+            own["scale"] = f"{_plain(own['weight'], 16)} 0–{own['top']:.3g}"
+            if own["n_no_weight"]:
+                own["scale"] += f" ({own['n_no_weight']} without)"
+    left_in = max(_text_width_in(n, _TICK_SIZE) for n in row_names) + 0.14
+    scale_texts = [*scales.values(), *(r["scale"] for r in own_rows if "scale" in r)]
+    if drawn_predictors:
+        scale_texts.append("0–100")
+    right_in = 0.12 + max((_text_width_in(t, _TRACK_LABEL_SIZE) for t in scale_texts), default=0)
+    if own_figure:
+        axis_in = _TRACK_WIDTH_IN - left_in - right_in
+        dpi = plt.rcParams["figure.dpi"]
+    else:
+        figure = ax.get_figure()
+        axis_in = ax.get_position().width * figure.get_figwidth()
+        dpi = figure.dpi
+    saved_dpi = matplotlib.rcParams["savefig.dpi"]
+    if isinstance(saved_dpi, (int, float)):
+        dpi = max(dpi, saved_dpi)
+    # One strip column per pixel at most. A strip with more columns than pixels is
+    # resampled by the renderer, which drops residues by position rather than by value.
+    bin_size = max(1, math.ceil((hi - lo + 1) / max(int(axis_in * dpi), 1)))
+
+    feature_rows, features_dropped = _track_feature_rows(features, feature_types, lo, hi, axis_in)
+
+    models = _track_models(owners, lo, hi)
+    notes = [_track_source(models)]
+    # ahead of the notes that can run long, so the licence tags are not what a cut removes
+    for drawn in drawn_predictors:
+        drawn["min_scored_fraction"], drawn["n_thin"] = _track_scored_fraction(
+            drawn["values"], lo, hi, bin_size
+        )
+    predictor_note = _track_predictor_note(predictor_rows, accession)
+    if predictor_note:
+        notes.append(predictor_note)
+    frozen = _track_release(release, features, residues)
+    if frozen and feature_rows:
+        notes.append(f"features frozen at release {frozen}")
+    elif frozen:
+        notes.append(f"release {frozen}")
+    if feature_note:
+        notes.append(feature_note)
+    if features_dropped:
+        notes.append(f"{features_dropped} features with no usable start–end not drawn")
+    if bin_size > 1:
+        rules = ["pLDDT: lowest band in the column"]
+        rules += [f"{_plain(label, 40)}: {spec['bin']}" for label, spec in scores.items()]
+        rules += [f"{p['label']}: {predictor_bin}" for p in drawn_predictors]
+        notes.append(f"strips: {bin_size} residues per column ({'; '.join(rules)})")
+    note = _plain(" · ".join(notes), 600)
+    note_lines = textwrap.wrap(
+        note, max(int((axis_in + right_in) / (0.6 * _TRACK_LABEL_SIZE / 72)), 40)
+    )
+
+    # every band is (label, height in inches, what to draw in it), top to bottom; a None
+    # label is a gap
+    bands: list[tuple[str | None, float, Any]] = []
+    for feature_row in feature_rows:
+        bands.append(
+            (feature_row["feature_type"], feature_row["lanes"] * _TRACK_LANE_IN, feature_row)
+        )
+    if feature_rows:
+        bands.append((None, _TRACK_GAP_IN, None))
+    bands.append(("pLDDT", _TRACK_STRIP_IN, "plddt"))
+    if scores or drawn_predictors:
+        bands.append((None, _TRACK_GAP_IN, None))
+    for label in scores:
+        bands.append((_plain(label, 40), _TRACK_STRIP_IN, ("score", label)))
+    for drawn in drawn_predictors:
+        bands.append((drawn["label"], _TRACK_STRIP_IN, ("predictor", drawn)))
+    for own in own_rows:
+        bands.append((None, _TRACK_GAP_IN, None))
+        height = _TRACK_LOLLIPOP_IN if own["kind"] == "lollipop" else _TRACK_TICK_IN
+        bands.append((own["name"], height, own))
+    body_in = sum(height for _label, height, _what in bands)
+
+    if own_figure:
+        top_in = _TRACK_TOP_IN + (0.16 if title else 0.0)
+        bottom_in = _TRACK_BOTTOM_IN + _TRACK_NOTE_LINE_IN * (len(note_lines) - 1)
+        height_in = top_in + body_in + bottom_in
+        figure = plt.figure(figsize=(_TRACK_WIDTH_IN, height_in))
+        ax = figure.add_axes(
+            (
+                left_in / _TRACK_WIDTH_IN,
+                bottom_in / height_in,
+                axis_in / _TRACK_WIDTH_IN,
+                body_in / height_in,
+            )
+        )
+
+    x0 = lo - 0.5
+    x1 = x0 + math.ceil((hi - lo + 1) / bin_size) * bin_size
+
+    def strip(image: np.ndarray, bottom: float, height: float, **how: Any) -> None:
+        ax.imshow(
+            image[None, :],
+            extent=(x0, x1, bottom, bottom + height),
+            aspect="auto",
+            interpolation="nearest",
+            **how,
+        )
+
+    def scale_text(text: str, y: float) -> None:
+        ax.annotate(
+            text,
+            xy=(1, y),
+            xycoords=("axes fraction", "data"),
+            xytext=(3, 0),
+            textcoords="offset points",
+            ha="left",
+            va="center",
+            fontsize=_TRACK_LABEL_SIZE,
+            color=_TRACK_MUTED,
+            annotation_clip=False,
+        )
+
+    plddt = (
+        _track_dense(owners, "plddt", length)
+        if "plddt" in owners.columns
+        else np.full(length, np.nan)
+    )
+    tick_at, tick_labels = [], []
+    tiers_drawn: set[str] = set()
+    drawn_rows = []
+    top = body_in
+    for label, height, what in bands:
+        bottom = top - height
+        if label is not None:
+            tick_at.append(bottom + height / 2)
+            tick_labels.append(label)
+        if isinstance(what, dict) and "marks" in what:
+            unlabelled = 0
+            for mark in what["marks"]:
+                tiers_drawn.add(mark["tier"])
+                unlabelled += mark["inside"] is None and mark["outside"] is None
+            for lane in range(what["lanes"]):
+                y = top - (lane + 1) * _TRACK_LANE_IN + 0.015
+                box = _TRACK_LANE_IN - 0.03
+                for tier, (face, edge, style, ink) in _TRACK_TIERS.items():
+                    marks = [m for m in what["marks"] if m["lane"] == lane and m["tier"] == tier]
+                    if not marks:
+                        continue
+                    ax.broken_barh(
+                        [(m["start"] - 0.5, m["end"] - m["start"] + 1) for m in marks],
+                        (y, box),
+                        facecolors=face,
+                        edgecolors=edge,
+                        linewidths=0.5,
+                        linestyles=style,
+                        zorder=2,
+                    )
+                    for mark in marks:
+                        inside = mark["inside"]
+                        if inside is None and mark["outside"] is None:
+                            continue
+                        ax.text(
+                            (mark["start"] + mark["end"]) / 2 if inside else mark["end"] + 0.5,
+                            y + box / 2,
+                            inside or " " + mark["outside"],
+                            ha="center" if inside else "left",
+                            va="center_baseline",
+                            fontsize=_TRACK_LABEL_SIZE,
+                            color=ink if inside else "#333333",
+                            clip_on=True,
+                            zorder=3,
+                        )
+            what["n_unlabelled"] = unlabelled
+        elif what == "plddt":
+            floors = [floor for floor, _colour, _label in reversed(_PLDDT_BANDS)]
+            cmap = ListedColormap([colour for _floor, colour, _label in reversed(_PLDDT_BANDS)])
+            cmap.set_bad(_TRACK_MISSING)
+            # the minimum of a column falls in the lowest band any of its residues is in;
+            # a mean would turn forty residues at 20 among confident ones into one
+            # mid-confidence column
+            strip(
+                np.ma.masked_invalid(_track_binned(plddt, lo, hi, bin_size, "min")),
+                bottom,
+                height,
+                cmap=cmap,
+                norm=BoundaryNorm([*floors, 100.5], cmap.N),
+            )
+        elif isinstance(what, tuple) and what[0] == "predictor":
+            cmap = plt.get_cmap("OrRd").copy()
+            cmap.set_bad(_TRACK_MISSING)
+            scale_text("0–100", bottom + height / 2)
+            # reduced after orienting, so "max" keeps the most damaging residue of a column
+            # for either direction
+            strip(
+                np.ma.masked_invalid(
+                    _track_binned(what[1]["values"], lo, hi, bin_size, predictor_bin)
+                ),
+                bottom,
+                height,
+                cmap=cmap,
+                vmin=0.0,
+                vmax=100.0,
+            )
+        elif isinstance(what, tuple):
+            values = score_values[what[1]]
+            low, high = score_ranges[what[1]] or (0.0, 1.0)
+            dark_high = scores[what[1]]["higher_is"] == "dark"
+            cmap = plt.get_cmap("OrRd" if dark_high else "OrRd_r").copy()
+            cmap.set_bad(_TRACK_MISSING)
+            if what[1] in scales:
+                scale_text(scales[what[1]], bottom + height / 2)
+            binned = _track_binned(
+                np.where(np.isfinite(values), values, np.nan),
+                lo,
+                hi,
+                bin_size,
+                scores[what[1]]["bin"],
+            )
+            strip(
+                np.ma.masked_invalid(binned),
+                bottom,
+                height,
+                cmap=cmap,
+                vmin=low,
+                vmax=high if high > low else low + 1.0,
+            )
+        elif isinstance(what, dict):
+            colour = what["colour"]
+            ax.broken_barh(
+                [(lo - 0.5, hi - lo + 1)],
+                (bottom, height),
+                facecolors=colour or _TRACK_MUTED,
+                alpha=0.12,
+                linewidth=0,
+                zorder=1,
+            )
+            counts = {}
+            if what["kind"] == "span":
+                spans = [(s, e) for s, e in what["spans"] if e >= lo and s <= hi]
+                if spans:
+                    ax.broken_barh(
+                        [(s - 0.5, e - s + 1) for s, e in spans],
+                        (bottom, height),
+                        facecolors=colour,
+                        alpha=0.75,
+                        linewidth=0,
+                        zorder=2,
+                    )
+                n, total = len(spans), len(what["spans"])
+            else:
+                xs = what["positions"]
+                view = (xs >= lo) & (xs <= hi)
+                total = len(xs)
+                xs = xs[view]
+                colours = (
+                    [c for c, keep in zip(what["colours"], view) if keep]
+                    if what["colours"]
+                    else colour
+                )
+                n = int(view.sum())
+                if n and what["kind"] == "tick":
+                    ax.vlines(xs, bottom, top, colors=colours, linewidth=0.8, zorder=2)
+                elif n:
+                    # the head's own radius is left free above the tallest stem
+                    reach = (height - 0.05) / what["top"]
+                    tips = bottom + what["weights"][view] * reach
+                    ax.vlines(xs, bottom, tips, colors=colours, linewidth=0.5, zorder=2)
+                    ax.scatter(xs, tips, s=7, c=colours, linewidths=0, zorder=3, clip_on=False)
+                if what["kind"] == "lollipop":
+                    scale_text(what["scale"], bottom + height / 2)
+                    counts["n_no_weight"] = what["n_no_weight"]
+            drawn_rows.append(
+                {
+                    "name": what["name"],
+                    "kind": what["kind"],
+                    "n": n,
+                    "n_out_of_view": total - n,
+                    "n_outside": what["n_outside"],
+                    **counts,
+                }
+            )
+        top = bottom
+
+    ax.set_xlim(lo - 0.5, hi + 0.5)
+    ax.set_ylim(0, body_in)
+    ax.set_yticks(tick_at)
+    ax.set_yticklabels(tick_labels)
+    ax.tick_params(axis="y", length=0)
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position("top")
+    name = f"{gene} ({accession})" if gene and accession else gene or accession or str(protein)
+    ax.set_xlabel(f"{_plain(name, 60)} amino-acid position", fontsize=_LABEL_SIZE)
+    if title:
+        ax.set_title(_plain(title, 120), fontsize=_TITLE_SIZE)
+    _size(ax)
+
+    handles = [
+        Patch(facecolor=colour, label=("pLDDT " if i == 0 else "") + label)
+        for i, (_floor, colour, label) in enumerate(_PLDDT_BANDS)
+    ]
+    first_tier = True
+    for tier, (face, edge, style, _ink) in _TRACK_TIERS.items():
+        if tier in tiers_drawn:
+            handles.append(
+                Patch(
+                    facecolor=face,
+                    edgecolor=edge,
+                    linestyle=style,
+                    linewidth=0.5,
+                    label=("evidence: " if first_tier else "") + tier,
+                )
+            )
+            first_tier = False
+    ax.legend(
+        handles=handles,
+        loc="upper left",
+        bbox_to_anchor=(0, 0),
+        ncol=len(handles),
+        fontsize=_TRACK_LABEL_SIZE,
+        frameon=False,
+        handlelength=1.2,
+        handleheight=0.8,
+        columnspacing=1.0,
+        handletextpad=0.4,
+        borderaxespad=0.3,
+    )
+    ax.annotate(
+        "\n".join(note_lines),
+        xy=(0, 0),
+        xycoords="axes fraction",
+        xytext=(0, -19),
+        textcoords="offset points",
+        ha="left",
+        va="top",
+        fontsize=_TRACK_LABEL_SIZE,
+        color=_TRACK_MUTED,
+        annotation_clip=False,
+    )
+
+    written = None
+    if own_figure:
+        written = _resolve_path(path, "protein_track.png")
+        figure.savefig(written)
+        plt.close(figure)
+
+    in_view = plddt[lo - 1 : hi]
+    in_view = in_view[np.isfinite(in_view)]
+    fractions = {}
+    ceiling = np.inf
+    for floor, _colour, label in _PLDDT_BANDS:
+        share = ((in_view >= floor) & (in_view < ceiling)).mean() if in_view.size else 0.0
+        fractions[label] = round(float(share), 4)
+        ceiling = floor
+    return {
+        "path": written,
+        "protein": str(protein),
+        "accession": accession,
+        "gene": gene,
+        "length": length,
+        "region": (lo, hi),
+        "feature_rows": [
+            {
+                "feature_type": r["feature_type"],
+                "n": len(r["marks"]),
+                "lanes": r["lanes"],
+                "n_unlabelled": r["n_unlabelled"],
+            }
+            for r in feature_rows
+        ],
+        "features_dropped": features_dropped,
+        "feature_note": feature_note,
+        "plddt_fractions": fractions,
+        "scores": [
+            {
+                "name": label,
+                "range": score_ranges[label],
+                "bin": spec["bin"],
+                "higher_is": spec["higher_is"],
+            }
+            for label, spec in scores.items()
+        ],
+        "predictors": [
+            {
+                "name": p["name"],
+                "label": p["label"],
+                "direction": p["direction"],
+                "licence": p["licence"],
+                "drawn": p["values"] is not None,
+                "oriented": p["values"] is not None,
+                "flipped": p["flipped"],
+                "bin": predictor_bin,
+                "n": p["n"],
+                "n_no_score": p["n_no_score"],
+                "n_outside": p["n_outside"],
+                "n_no_position": p["n_no_position"],
+                "n_other_accession": p["n_other_accession"],
+                "min_scored_fraction": p.get("min_scored_fraction"),
+            }
+            for p in predictor_rows
+        ],
+        "rows": drawn_rows,
+        "models": models,
+        "bin_size": bin_size,
+        "note": note,
     }

@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 # 404 "not configured", so advertising the tool would only invite failures
 CELL_TYPE_EXPRESSION_PROFILES = frozenset({"daly"})
 
+# the profiles whose results-api can serve a protein structure release; the same two-step
+# gate as above, with PROTEIN_STRUCTURE_ENABLED as the deployment's opt-in
+PROTEIN_STRUCTURE_PROFILES = frozenset({"daly"})
+PROTEIN_STRUCTURE_TOOLS = frozenset(
+    {
+        "get_protein_features_at_variant",
+        "get_3d_distance_between_variants",
+        "get_3d_neighbourhood",
+    }
+)
+
 
 @dataclass
 class Settings:
@@ -335,6 +346,13 @@ class Settings:
             os.environ.get("CELL_TYPE_EXPRESSION_ENABLED", "false").lower() in ("1", "true", "yes")
         )
     )
+    # whether this deployment's results-api has a protein structure release pointer; a profile
+    # outside PROTEIN_STRUCTURE_PROFILES never gets the tools even with this set
+    protein_structure_enabled: bool = field(
+        default_factory=lambda: (
+            os.environ.get("PROTEIN_STRUCTURE_ENABLED", "false").lower() in ("1", "true", "yes")
+        )
+    )
     # predictions are a deterministic function of the variant and the model, and the Atlas
     # response carries no version identifier, so nothing can detect a model update. A bounded
     # ttl is the only staleness control available; an hour absorbs the repeats inside a chat
@@ -601,6 +619,10 @@ class Settings:
         return [p.strip() for p in self.subagent_allowed_paths.split(",") if p.strip()]
 
     @property
+    def protein_structure_offered(self) -> bool:
+        return self.protein_structure_enabled and self.config_profile in PROTEIN_STRUCTURE_PROFILES
+
+    @property
     def disabled_tools(self) -> set[str]:
         disabled = set()
         if not self.enable_credible_sets_stats:
@@ -623,6 +645,8 @@ class Settings:
             or self.config_profile not in CELL_TYPE_EXPRESSION_PROFILES
         ):
             disabled.add("get_cell_type_expression")
+        if not self.protein_structure_offered:
+            disabled |= PROTEIN_STRUCTURE_TOOLS
         if not self.sandbox_enabled:
             # only run_analysis: list_capabilities and read_artifact are inert without a
             # sandbox rather than broken by it, and neither is a tool the prompt prefers

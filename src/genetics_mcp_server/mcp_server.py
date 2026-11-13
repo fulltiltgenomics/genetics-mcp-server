@@ -104,6 +104,10 @@ _mcp_disabled = _settings.disabled_tools | {
     # for it by name.
     "get_alphagenome_variant_predictions",
     "compare_alphagenome_with_measured",
+    # product decision: the protein structure tools are chat-only for now
+    "get_protein_features_at_variant",
+    "get_3d_distance_between_variants",
+    "get_3d_neighbourhood",
     # SECURITY CONTROL, not a product decision: code execution must not be reachable via
     # MCP (genetics-results-suite-4h6). run_analysis IS code execution; read_artifact
     # returns files a script wrote for the chat session that ran it, and resolving a name

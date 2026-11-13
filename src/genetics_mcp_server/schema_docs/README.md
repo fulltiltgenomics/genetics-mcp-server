@@ -59,3 +59,4 @@ each shows the filters that view expects.
 | `cellxgene_groups_v` | CELLxGENE cell groups: tissue x cell type x disease x assay per dataset |
 | `cellxgene_datasets_v` | CELLxGENE dataset versions in the loaded release, with citations |
 | `cellxgene_measured_genes_v` | Which genes each CELLxGENE dataset measured |
+| `missense_residue_v` | Possible missense variants mapped to the protein residue they change |

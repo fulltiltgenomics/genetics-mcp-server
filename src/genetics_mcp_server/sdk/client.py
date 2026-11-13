@@ -902,6 +902,191 @@ class GeneticsClient:
         """Mendelian gene-disease associations, from GenCC and the Monarch Initiative."""
         return self._rows(await self._executor.get_gene_disease_associations(gene))
 
+    # ------------------------------------------------------------------ protein structure
+
+    async def protein_models(self, protein: str) -> pl.DataFrame:
+        """The model files of a protein in the protein structure release, one row each.
+
+        `protein` is a UniProt accession, a gene name or an ENSG id; a gene name can give
+        the rows of more than one accession. A protein longer than one prediction comes as
+        overlapping windows: `protein_start`/`protein_end` is the stretch a file covers,
+        `owned_start`/`owned_end` the positions it is the per-residue source for, and
+        `has_pae` whether the release holds PAE for it. These rows are what
+        `genetics.structure.protein()` takes as `models`. Raises GeneticsError with
+        `code` "not_found" for a protein the release does not hold, "not_available" on a
+        deployment without the structure layer and "release_not_loaded" while the server
+        has no release loaded (retry later).
+        """
+        return self._rows(await self._executor.get_protein_models(protein))
+
+    async def protein_residues(self, protein: str) -> pl.DataFrame:
+        """Per-residue rows of a protein's model files: Calpha coordinates, pLDDT, mutation rate.
+
+        A residue is addressed by (`model_file_id`, `file_position`); `protein_position` is
+        its position in the protein. A position covered by several windows has a row per
+        window, and `is_owner` marks the one to use for a per-residue quantity — filter on
+        it before counting or averaging over a protein. `mu` is the summed rate of every
+        possible missense SNV at the position, null where none exists. The largest genes
+        return about 50,000 rows. Errors as for `protein_models`.
+        """
+        return self._rows(await self._executor.get_protein_residues(protein))
+
+    async def protein_features(self, protein: str) -> pl.DataFrame:
+        """Sequence features of a protein: UniProt features and TED domains, frozen at the release.
+
+        `start`/`end` are protein positions, 1-based inclusive, so the features covering
+        position p are `(pl.col("start") <= p) & (pl.col("end") >= p)`. `source` is
+        `uniprot` or `ted`; `evidence` keeps the source's ECO codes and `evidence_tier` is
+        the strongest tier among them (`unknown` for a code the release does not classify;
+        TED domains are `predicted`). A protein with no feature raises GeneticsError with
+        `code` "not_found"; other errors as for `protein_models`.
+        """
+        return self._rows(await self._executor.get_protein_features(protein))
+
+    async def protein_scores(
+        self, protein: str, predictors: str | list[str] | None = None
+    ) -> pl.DataFrame:
+        """Per-residue missense predictor scores of a protein, one row per (predictor, position).
+
+        `predictors` names one or several (`"alphamissense"`, `"esm1b"`); the default is
+        every predictor the deployment serves. Columns: the gene columns, `accession`,
+        `predictor`, `protein_position`, `aa_ref`, `mean_snv` (mean raw score over the
+        substitutions a single-nucleotide change reaches) with `n_snv`, `percentile` (0-100,
+        the rank of `mean_snv` among all residues of the release for that predictor),
+        `mean_all` (mean over all 19 substitutions) with `n_all`, and three columns the SDK
+        adds: `direction` and `licence`, the predictor's own, repeated on each of its rows,
+        and `damage_percentile`.
+
+        DIRECTION: `percentile` and the means are RAW and are not turned towards damage.
+        `direction` says which end is damaging: "higher_is_more_damaging" (AlphaMissense) or
+        "lower_is_more_damaging" (ESM1b, a log-likelihood ratio), so a damaging residue has
+        a HIGH AlphaMissense percentile and a LOW ESM1b one. Whenever you want "high = more
+        damaging" — to rank, threshold or compare across predictors — use
+        `damage_percentile`: it is `percentile` for a higher-is-more-damaging predictor and
+        `100 - percentile` for a lower one, and null where the percentile is null or the
+        direction unknown. Leave `percentile` as the raw rank and never overwrite either
+        column: `genetics.plots.protein_track` reads them as returned and refuses a frame
+        in which they disagree. The direction is the server's statement for the response;
+        it wins over the SDK's built-in table when both state one, and the table is used
+        when the server states none. `direction` is null only for a predictor the server
+        did not describe and the SDK does not know; do not interpret its scores' sign.
+        `licence` is the predictor's licence tag (ESM1b's is non-commercial); name it when
+        showing the scores.
+
+        Positions are per protein, not per model window, so there is one row per position
+        however the protein is modelled. `mean_snv` and `percentile` are null where no
+        substitution is reachable by a single-nucleotide change; a position with no row has
+        no score from that predictor, which says nothing about its tolerance. A protein
+        under several genes is returned once, with the first gene's columns.
+        `genetics.plots.protein_track(protein, predictors=True)` draws these.
+
+        Raises GeneticsError with `code` "scores_not_available" when the deployment's
+        release holds no predictor scores (the rest of the layer still works),
+        "invalid_request" for a predictor it does not have (the message lists those it
+        has), and as for `protein_models`.
+        """
+        frame = self._rows(await self._executor.get_protein_scores(protein, predictors))
+        from genetics_mcp_server.sdk import _structure_contract as contract
+
+        # a column with no value at all would otherwise come back as Null
+        types = {str: pl.Utf8, float: pl.Float64}
+        return frame.with_columns(
+            pl.col(name).cast(types[kind]) for name, kind in contract.SCORE_SDK_COLUMNS
+        )
+
+    async def protein_variants(self, variants: str | list[str]) -> pl.DataFrame:
+        """The residue each variant changes, one row per (variant, protein).
+
+        `variants` are `chr:pos:ref:alt` ids (GRCh38). Columns: `variant`, `accession`,
+        `gene_id`, `gene_name`, `aa_pos` (the protein position), `aa_ref`, `aa_alt`,
+        `model_file_id` and `file_position` (the residue's address in the file that owns
+        it) and `mu_snp`; a variant on several proteins has a row for each. A variant
+        WITHOUT a row is not missense on the canonical UniProt isoform under the release's
+        annotation, or is on a protein this deployment does not serve — nothing stronger,
+        so compare the input with the `variant` column rather than assuming every variant
+        came back. The same rows, untyped, are
+        `variant_annotation(variants=..., source="protein")`. Errors as for `protein_models`.
+        """
+        variants = [variants] if isinstance(variants, str) else list(variants)
+        if not variants:
+            raise GeneticsUsageError("protein_variants needs at least one variant")
+        return self._rows(await self._executor.get_protein_variant_residues(variants))
+
+    async def protein_structure_file(self, model_file_id: str) -> bytes:
+        """One model file of the release as PDB text bytes.
+
+        What `genetics.structure.parse_model()` reads and `genetics.structure.protein()`
+        takes in `structures`. `model_file_id` comes from `protein_models` or
+        `protein_variants`.
+        """
+        return self._payload(await self._executor.get_protein_structure_file(model_file_id))[
+            "content"
+        ]
+
+    async def protein_pae(
+        self, model_file_id: str, positions: list[int] | None = None
+    ) -> bytes | dict[int, bytes]:
+        """PAE of one model file in the release's uint8 encoding (PAE in angstrom = byte / 8).
+
+        Without `positions`: the whole n x n matrix as n*n bytes, row-major. The largest
+        models' matrices are over the per-response limit and raise GeneticsError with
+        `code` "too_large" — ask for rows instead. With `positions` (file positions, from
+        1): {file position: that residue's row of n bytes}, which is all that
+        `genetics.structure` needs for distances involving those residues and for their
+        neighbourhoods. Either form is what `genetics.structure.protein()` takes in `pae`.
+        A protein the release holds no PAE for (`has_pae` false) raises with `code`
+        "not_found".
+        """
+        return self._payload(await self._executor.get_protein_pae(model_file_id, positions))["pae"]
+
+    async def protein_structure(
+        self,
+        protein: str | None = None,
+        *,
+        variants: list[str] | None = None,
+        positions: list[int] | None = None,
+        pae: bool = True,
+    ) -> Any:
+        """One protein fetched and assembled into a `genetics.structure.Protein`, in one call.
+
+            p = genetics.protein_structure(variants=["7:140753336:A:T", "7:140753337:C:T"])
+            genetics.structure.distances(p, [600, 599])
+            p = genetics.protein_structure("HBA1", positions=[59])
+            genetics.structure.neighbourhood(p, 59)["neighbours"]
+            genetics.structure.adjacency(genetics.protein_structure("P69905"))
+
+        The protein is `protein` (a UniProt accession, or a gene with one protein in the
+        release), or the one the `variants` change; variants on several proteins need
+        `protein=` to choose. `protein_variants(variants)` gives each variant's `aa_pos`,
+        the protein position the geometry functions take.
+
+        With `variants` and/or `positions` (protein positions) only the model files
+        containing those residues are fetched, and of PAE only those residues' rows:
+        enough for `distances` among them and `neighbourhood` of each, not for
+        `adjacency` or for any other residue. With neither, every model file and every
+        whole PAE matrix is fetched — a matrix over the per-response limit in blocks of
+        rows — and PAE is n*n bytes per file, so ask for positions on a long protein.
+        `pae=False` fetches no PAE.
+
+        A distance from the result is only as good as its `pae` and `min_plddt`; report
+        them with it. Raises GeneticsError: `code` "no_residue_row" when none of the
+        variants has a residue row, "ambiguous_protein" when the protein is not unique,
+        and as for `protein_models`.
+        """
+        if protein is None and not variants:
+            raise GeneticsUsageError("protein_structure needs `protein` or `variants`")
+        payload = self._payload(
+            await self._executor.get_protein_structure_inputs(
+                protein=protein, variants=variants, positions=positions, pae=pae
+            )
+        )
+        # resolved here rather than at import: it pulls in numpy, which the servers that
+        # import this module never need
+        import importlib
+
+        structure = importlib.import_module("genetics_mcp_server.sdk.structure")
+        return structure.protein(payload["models"], payload["structures"], payload["pae"])
+
     # ------------------------------------------------------------------ sumstats / LD
 
     async def summary_stats(

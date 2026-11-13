@@ -18,6 +18,9 @@
     ],
     "cellxgene_summary_v": [
       "daly"
+    ],
+    "missense_residue_v": [
+      "daly"
     ]
   }
 }

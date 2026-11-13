@@ -144,6 +144,26 @@ def url_fetch_allowed_hosts() -> tuple[str, ...] | None:
     return hosts
 
 
+_PROTEIN_STRUCTURE_SDK_RULE = """
+### Protein Structure (frozen release)
+
+To place genomic variants on protein residues and in 3D, scripts have `genetics.protein_variants` (variant to residue on the release's AlphaFold model), `genetics.protein_features`/`protein_residues`, and `genetics.protein_structure(...)` with `genetics.structure` (`distances`, `neighbourhood`, `view` for a 3D view in the chat). `get_protein_annotations` is live protein-level UniProt and can disagree with the frozen release: the release wins for residue changed, pLDDT and distances, live UniProt for current annotation. Say which source a statement comes from.
+
+Give every distance with its PAE and min pLDDT: a small distance with a large PAE (above about 15) is two confident pieces placed against each other at a guess; pLDDT below 70 is low confidence, below 50 usually disorder. No distance for a pair sharing no model file. No residue row means "not missense on the canonical UniProt isoform under the release's annotation, or on a protein the deployment does not serve", nothing stronger.
+"""
+
+
+def protein_structure_sdk_rule() -> str | None:
+    """The script-side protein structure guidance, where the deployment serves the layer.
+
+    The tool list cannot gate it: on the code surface the layer is SDK functions, which exist
+    by profile, and the flag says whether results-api has a release behind them.
+    """
+    from genetics_mcp_server.config.settings import get_settings
+
+    return _PROTEIN_STRUCTURE_SDK_RULE if get_settings().protein_structure_offered else None
+
+
 def url_input_hosts_rule() -> str | None:
     """Names the hosts a URL input can come from, or says nothing at all.
 

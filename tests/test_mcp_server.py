@@ -275,11 +275,26 @@ class TestMCPDisabledTools:
             # UniProt and ChEMBL entries record, not a technical limit
             "get_alphagenome_variant_predictions",
             "compare_alphagenome_with_measured",
+            # chat-only for now by product decision
+            "get_protein_features_at_variant",
+            "get_3d_distance_between_variants",
+            "get_3d_neighbourhood",
         ):
             assert tool_name in names, f"Expected tool '{tool_name}' not found in TOOL_DEFINITIONS"
             assert tool_name in mcp_server._mcp_disabled, (
                 f"'{tool_name}' is chat-backend only and must stay in _mcp_disabled"
             )
+
+        # `_mcp_disabled` also holds whatever the deployment's flags withdraw, and with the
+        # protein structure flag off (as here) that half names these three on its own; only
+        # the literal keeps them off /mcp where the feature is on
+        from test_tool_surface_golden import _mcp_hardcoded_exclusions
+
+        assert {
+            "get_protein_features_at_variant",
+            "get_3d_distance_between_variants",
+            "get_3d_neighbourhood",
+        } <= _mcp_hardcoded_exclusions()
 
     def test_chembl_tools_excluded_from_mcp_when_disabled(self):
         # mirror pattern for the chat-backend-only ChEMBL tools

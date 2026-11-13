@@ -98,6 +98,14 @@ _FUNCTIONS = (
     "expression",
     "cell_type_expression",
     "gene_disease",
+    "protein_models",
+    "protein_residues",
+    "protein_features",
+    "protein_scores",
+    "protein_variants",
+    "protein_structure_file",
+    "protein_pae",
+    "protein_structure",
     "summary_stats",
     "ld",
     "ld_panels",
@@ -121,7 +129,17 @@ _FUNCTIONS = (
 # advertising data it does not. The sandbox stubs are filtered by this same table
 # (genetics-results-suite scripts/gen-sandbox-docs.py reads it with ast, so keep it a
 # literal), which is what keeps the stub and the import surface from disagreeing.
-_PROFILE_GATED = {"cell_type_expression": ("daly",)}
+_PROFILE_GATED = {
+    "cell_type_expression": ("daly",),
+    "protein_models": ("daly",),
+    "protein_residues": ("daly",),
+    "protein_features": ("daly",),
+    "protein_scores": ("daly",),
+    "protein_variants": ("daly",),
+    "protein_structure_file": ("daly",),
+    "protein_pae": ("daly",),
+    "protein_structure": ("daly",),
+}
 
 
 def _offered(name: str) -> bool:
@@ -276,11 +294,11 @@ del _name
 
 # the submodules a script reaches as `genetics.<name>`, resolved on first use and never
 # imported by this package: they are the analysis surfaces, not the data client
-_LAZY_MODULES = ("plots", "linemodels", "mr", "enrichment")
+_LAZY_MODULES = ("plots", "linemodels", "mr", "enrichment", "structure")
 
 
 def __getattr__(name: str):
-    """`genetics.plots`, `genetics.linemodels`, `genetics.mr` and `genetics.enrichment` resolve on first use, and only then.
+    """`genetics.plots`, `genetics.linemodels`, `genetics.mr`, `genetics.enrichment` and `genetics.structure` resolve on first use, and only then.
 
     Deliberately lazy rather than an import at the top of this file: they import numpy,
     scipy or matplotlib.pyplot (mr through plots), and this package is imported by
