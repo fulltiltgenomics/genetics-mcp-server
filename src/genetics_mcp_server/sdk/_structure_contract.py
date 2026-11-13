@@ -4,7 +4,8 @@ A copy, not an import: the definition lives in genetics-results-munge
 `scripts/protein_structure_contract.py`, and the SDK ships into a sandbox image that holds no
 other repo's code. Only what the geometry and its fetches need is copied: the contract
 version, the PAE encoding, the two window rules, `models.tsv.gz`'s column list, the
-per-response byte limit, and what a view-spec for the browser's viewer may hold.
+predictor scores' column list and which end of each predictor's score is the damaging one,
+the per-response byte limit, and what a view-spec for the browser's viewer may hold.
 tests/test_sdk_structure.py pins these and compares them with the munge module when a
 checkout of it is found.
 """
@@ -42,6 +43,42 @@ MODEL_COLUMNS = [
     ("pae_bytes", int),
     ("source_pdb_sha256", str),
     ("source_pae_sha256", str),
+]
+
+# `percentile` ranks a predictor's raw per-residue mean ascending, so which end is damaging
+# is the predictor's own. The scores route states it per response; this is what a reader
+# falls back on when that statement is absent
+SCORE_HIGHER_IS_DAMAGING = "higher_is_more_damaging"
+SCORE_LOWER_IS_DAMAGING = "lower_is_more_damaging"
+SCORE_DIRECTIONS = {
+    "alphamissense": SCORE_HIGHER_IS_DAMAGING,
+    "esm1b": SCORE_LOWER_IS_DAMAGING,
+}
+
+SCORE_COLUMNS = [
+    ("gene_id", str),
+    ("chrom", int),
+    ("gene_start", int),
+    ("gene_end", int),
+    ("gene_name", str),
+    ("accession", str),
+    ("predictor", str),
+    ("protein_position", int),
+    ("aa_ref", str),
+    ("mean_snv", float),
+    ("n_snv", int),
+    ("percentile", float),
+    ("mean_all", float),
+    ("n_all", int),
+]
+
+# What `genetics.protein_scores` adds to each row. Not part of the release contract and not
+# compared with it: `direction` and `licence` are the route's statement about the row's
+# predictor, `damage_percentile` is `percentile` turned so that high is more damaging
+SCORE_SDK_COLUMNS = [
+    ("direction", str),
+    ("licence", str),
+    ("damage_percentile", float),
 ]
 
 PAE_SCALE = 8

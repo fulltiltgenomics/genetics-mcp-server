@@ -188,7 +188,22 @@ Where a stretch has more residues than the figure has pixels across, the strips 
 to one column per pixel, because the renderer would otherwise resample them and drop
 residues by position rather than by value: pLDDT shows the lowest band present in a column,
 and each score the reduction its caller named (`max` unless told `min` or `mean`), with the
-rules printed under the figure. Like the client functions it reads, it only works where the
+rules printed under the figure. A score column where low is the finding is named with
+`"higher_is": "light"`, which draws its low end dark and bins by `min` unless told otherwise.
+Missense predictor rows (`predictors=`, fetched through `protein_scores` unless the long frame
+is passed as `predictor_scores=`) are one heatmap row per predictor of its `percentile`,
+turned so that dark always means more damaging: the percentile ranks the raw score ascending,
+so a lower-is-more-damaging predictor is drawn as `100 - percentile`. Which end is damaging
+comes from the frame's `direction` column, else from `SCORE_DIRECTIONS` in
+`sdk/_structure_contract.py`, and a frame that carries `damage_percentile` is drawn from it
+as it stands. A frame the track cannot trust is refused rather than drawn: `percentile` and
+`damage_percentile` that disagree for the stated direction, rows of one predictor that
+state two directions, and a predictor with two rows for a position (rows of another
+accession are left out by the `accession` column and reported; without it they would merge); a predictor neither states is left out and named in the note
+rather than drawn with an unknown dark end. A predictor row bins by the mean of the oriented
+percentile over a column's scored residues (`predictor_bin="max"` keeps the most damaging
+one instead), because the maximum of many ranks is near 100 everywhere; it draws a residue
+without a score as missing, and the note names each predictor's licence tag. Like the client functions it reads, it only works where the
 structure layer is offered.
 
 ### BigQuery tools (fallback for complex queries)
@@ -1122,6 +1137,7 @@ winner.
 | `expression(gene)` | `get_gene_expression` |
 | `gene_disease(gene)` | `get_gene_disease_associations` |
 | `protein_models(protein)`, `protein_residues(protein)`, `protein_features(protein)` | `get_protein_models`, `get_protein_residues`, `get_protein_features` — executor fetches over results-api's `/protein_structure/*`, not chat tools; daly only (`_PROFILE_GATED`). The row tables are read as TSV because results-api refuses the JSON form of the largest genes |
+| `protein_scores(protein, predictors=None)` | `get_protein_scores` — results-api's `/protein_structure/scores/{protein}` as TSV, typed by the mirrored `SCORE_COLUMNS`, one row per (accession, predictor, protein position) after dropping the repeats of an accession under several genes; daly only. The response's `X-Score-Predictors` header (each predictor's direction and licence) reaches the script as `direction` and `licence` columns, with `SCORE_DIRECTIONS` the fallback for a direction the header does not state; only a header piece of exactly the stated shape with one of the contract's two directions is believed, and a name stated twice with different values states nothing. A third added column, `damage_percentile`, is `percentile` turned so that high is more damaging (null where the direction is unknown), so that no script turns it itself; the added columns are listed in `SCORE_SDK_COLUMNS`, which is the SDK's and not part of the mirrored contract. A release without scores raises `scores_not_available`, distinct from the layer's `not_available` |
 | `protein_variants(variants)` | `get_protein_variant_residues` — `get_variant_annotations(source="protein")` with the values typed |
 | `protein_structure_file(model_file_id)`, `protein_pae(model_file_id[, positions=])` | `get_protein_structure_file`, `get_protein_pae` — bytes, not frames: what `genetics.structure` takes |
 | `protein_structure(protein \| variants=[, positions=, pae=])` | `get_protein_structure_inputs` — returns a `genetics.structure.Protein`; with variants or positions it fetches only the model files containing them and their PAE rows, otherwise everything, a PAE matrix past the per-response limit in blocks of rows |

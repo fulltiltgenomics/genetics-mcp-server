@@ -3722,7 +3722,10 @@ def test_protein_track_writes_a_figure_and_reports_what_it_drew(tmp_path, monkey
         ("Region", 1, 1),
     ]
     assert result["plddt_fractions"] == {"> 90": 0.3333, "70–90": 0.0, "50–70": 0.0, "< 50": 0.6667}
-    assert result["scores"] == [{"name": "mu", "range": (2 * 1e-9, 300 * 1e-9), "bin": "max"}]
+    assert result["scores"] == [
+        {"name": "mu", "range": (2 * 1e-9, 300 * 1e-9), "bin": "max", "higher_is": "dark"}
+    ]
+    assert result["predictors"] == []
     assert result["rows"] == [
         {
             "name": "credible sets",
@@ -3971,7 +3974,12 @@ def test_a_gene_with_two_proteins_is_refused_rather_than_overlaid():
 def test_scores_take_a_label_and_colour_over_the_whole_proteins_range():
     result, ax = drawn_track(scores={"mutation rate": "mu"}, region=(100, 200), feature_types=[])
     assert result["scores"] == [
-        {"name": "mutation rate", "range": (2 * 1e-9, 300 * 1e-9), "bin": "max"}
+        {
+            "name": "mutation rate",
+            "range": (2 * 1e-9, 300 * 1e-9),
+            "bin": "max",
+            "higher_is": "dark",
+        }
     ]
     assert [t.get_text() for t in ax.get_yticklabels()] == ["pLDDT", "mutation rate"]
     heat = ax.images[1]
@@ -4153,6 +4161,312 @@ def test_each_score_says_how_it_is_binned_and_the_note_repeats_it():
     assert 0 < hot_mean.max() < 1
     assert [s["bin"] for s in result["scores"]] == ["min", "max", "max", "mean"]
     assert "LLR: min; LLR by default: max; hot: max; hot mean: mean" in result["note"]
+
+
+def test_a_score_where_low_is_the_finding_is_drawn_dark_at_its_low_end():
+    result, ax = drawn_track(
+        residues=long_residues(),
+        feature_types=[],
+        scores={
+            "LLR": {"column": "llr", "higher_is": "light"},
+            "LLR max": {"column": "llr", "higher_is": "light", "bin": "max"},
+            "hot": "hot",
+        },
+    )
+    _plddt, llr, llr_max, hot = ax.images
+    values = np.asarray(llr.get_array())[0]
+    # the damaging residue survives the binning without the script asking for "min"
+    assert values.min() == -12.0 and np.asarray(llr_max.get_array())[0].min() == 0.0
+    damaging, rest = int(values.argmin()), int(values.argmax())
+    assert luminance(llr, damaging) < luminance(llr, rest)
+    # same colours as a higher-is-dark row gives its own damaging end
+    hot_values = np.asarray(hot.get_array())[0]
+    assert luminance(llr, damaging) == pytest.approx(luminance(hot, int(hot_values.argmax())))
+    assert [(s["bin"], s["higher_is"]) for s in result["scores"]] == [
+        ("min", "light"),
+        ("max", "light"),
+        ("max", "dark"),
+    ]
+    assert "-12–0, low = dark" in [t.get_text() for t in ax.texts]
+    with pytest.raises(GeneticsUsageError, match="higher_is must be one of"):
+        drawn_track(scores={"x": {"column": "mu", "higher_is": "red"}})
+
+
+def luminance(image, column):
+    values = image.get_array()
+    r, g, b, _a = image.cmap(image.norm(values))[0][column]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def track_scores(length=300, damaging=150, accession="P00001", missing=(), stated=True):
+    """Predictor rows in the shape `protein_scores` returns, one damaging residue each.
+
+    The damaging residue has the HIGHEST alphamissense percentile and the LOWEST esm1b one,
+    which is what the two directions mean; `missing` positions have no row, and position 1
+    has a row whose percentile is null.
+    """
+    described = {
+        "alphamissense": ("higher_is_more_damaging", "CC-BY-4.0", 99.9, 10.0),
+        "esm1b": ("lower_is_more_damaging", "CC-BY-NC-4.0", 0.1, 90.0),
+    }
+    rows = []
+    for predictor, (direction, licence, peak, background) in described.items():
+        for position in range(1, length + 1):
+            if position in missing:
+                continue
+            percentile = peak if position == damaging else background
+            rows.append(
+                {
+                    "accession": accession,
+                    "predictor": predictor,
+                    "protein_position": position,
+                    "percentile": None if position == 1 else percentile,
+                    "direction": direction,
+                    "licence": licence,
+                }
+            )
+    frame = pl.DataFrame(rows)
+    return frame if stated else frame.drop("direction", "licence")
+
+
+def test_each_predictor_row_is_dark_where_the_residue_is_damaging():
+    result, ax = drawn_track(feature_types=[], predictor_scores=track_scores())
+    _plddt, alphamissense, esm1b = ax.images
+    for image in (alphamissense, esm1b):
+        values = image.get_array()[0]
+        assert (image.norm.vmin, image.norm.vmax) == (0.0, 100.0)
+        # position 150 is column 149: the darkest of the row, for both directions
+        assert int(values.argmax()) == 149 and values[149] == pytest.approx(99.9)
+        assert all(luminance(image, 149) < luminance(image, c) for c in (10, 148, 150, 299))
+    assert luminance(alphamissense, 149) == pytest.approx(luminance(esm1b, 149))
+    labels = [t.get_text() for t in ax.get_yticklabels()]
+    assert labels == ["pLDDT", "AlphaMissense", "ESM1b"]
+    assert [(p["name"], p["direction"], p["oriented"], p["flipped"]) for p in result["predictors"]] == [
+        ("alphamissense", "higher_is_more_damaging", True, False),
+        ("esm1b", "lower_is_more_damaging", True, True),
+    ]  # fmt: skip
+    assert "dark = more damaging (ESM1b drawn as 100 − percentile)" in result["note"]
+    assert "licences: AlphaMissense CC-BY-4.0, ESM1b CC-BY-NC-4.0" in result["note"]
+
+
+def test_a_binned_predictor_column_is_the_mean_of_its_scored_residues_for_both_directions():
+    scores = track_scores(
+        length=34_350, damaging=5_000, accession="Q8WZ42", missing=range(10_000, 12_000)
+    )
+    result, ax = drawn_track(residues=long_residues(), feature_types=[], predictor_scores=scores)
+    size = result["bin_size"]
+    assert size > 1
+    hit = (5_000 - 1) // size
+    for image in ax.images[1:]:
+        values = image.get_array()[0]
+        # one damaging residue among benign ones lifts its column a little, not to dark
+        assert int(values.argmax()) == hit
+        assert values[hit] == pytest.approx(10.0 + 89.9 / size) and values[hit] < 20
+        assert np.ma.median(values) == pytest.approx(10.0)
+        assert luminance(image, hit) > 0.8
+        # a column with no scored residue is missing; one partly scored averages what it has
+        masked = np.ma.getmaskarray(values)
+        assert masked[10_100 // size] and not masked[(10_000 - 2) // size]
+        assert values[(10_000 - 2) // size] == pytest.approx(10.0)
+        # the first column holds position 1, whose percentile is null
+        assert values[0] == pytest.approx(10.0)
+    assert "AlphaMissense: mean; ESM1b: mean" in result["note"]
+    assert [p["bin"] for p in result["predictors"]] == ["mean", "mean"]
+
+
+def test_predictor_bin_max_keeps_the_most_damaging_residue_of_a_column():
+    result, ax = drawn_track(
+        residues=long_residues(),
+        feature_types=[],
+        predictor_scores=track_scores(length=34_350, damaging=5_000, accession="Q8WZ42"),
+        predictor_bin="max",
+    )
+    hit = (5_000 - 1) // result["bin_size"]
+    for image in ax.images[1:]:
+        values = image.get_array()[0]
+        assert int(values.argmax()) == hit and values[hit] == pytest.approx(99.9)
+        assert luminance(image, hit) < 0.3
+    assert "AlphaMissense: max; ESM1b: max" in result["note"]
+    assert [p["bin"] for p in result["predictors"]] == ["max", "max"]
+    with pytest.raises(GeneticsUsageError, match="predictor_bin must be one of"):
+        drawn_track(predictor_scores=track_scores(), predictor_bin="min")
+
+
+def test_a_residue_without_a_score_is_drawn_as_missing_and_counted():
+    scores = track_scores(missing=range(200, 221))
+    result, ax = drawn_track(feature_types=[], predictor_scores=scores, region=(101, 300))
+    for image in ax.images[1:]:
+        values = image.get_array()[0]
+        masked = np.ma.getmaskarray(values)
+        # region starts at 101, so position 200 is column 99
+        assert masked[99:120].all() and masked.sum() == 21
+        assert tuple(image.cmap(image.norm(values))[99]) == pytest.approx(
+            matplotlib_rgba(plots._TRACK_MISSING)
+        )
+    for row in result["predictors"]:
+        assert (row["n"], row["n_no_score"], row["n_outside"]) == (179, 21, 0)
+    # the null percentile at position 1 is a row without a score, when in view
+    whole, _ax = drawn_track(feature_types=[], predictor_scores=scores)
+    assert [(p["n"], p["n_no_score"]) for p in whole["predictors"]] == [(279, 22), (279, 22)]
+    assert "grey = no score" in whole["note"]
+
+
+def test_predictors_choose_among_the_frames_rows_and_other_proteins_rows_are_left_out():
+    scores = pl.concat([track_scores(), track_scores(damaging=7, accession="P99999")])
+    result, ax = drawn_track(feature_types=[], predictor_scores=scores, predictors="esm1b")
+    assert [p["name"] for p in result["predictors"]] == ["esm1b"]
+    assert int(ax.images[1].get_array()[0].argmax()) == 149
+    assert "AlphaMissense" not in result["note"] and "ESM1b CC-BY-NC-4.0" in result["note"]
+    none, ax = drawn_track(feature_types=[], predictor_scores=scores, predictors=False)
+    assert none["predictors"] == [] and len(ax.images) == 1 and "licence" not in none["note"]
+    with pytest.raises(GeneticsUsageError, match=r"no rows of \['cadd'\].*it has \['alpha"):
+        drawn_track(predictor_scores=scores, predictors=["cadd"])
+    with pytest.raises(GeneticsUsageError, match="no rows of any predictor for P00001"):
+        drawn_track(predictor_scores=track_scores(accession="P99999"))
+    with pytest.raises(GeneticsUsageError, match=r"needs \['percentile'\]"):
+        drawn_track(predictor_scores=scores.drop("percentile"))
+
+
+def test_direction_falls_back_to_the_contract_and_an_unknown_one_is_not_drawn():
+    bare = track_scores(stated=False)
+    unknown = bare.filter(pl.col("predictor") == "esm1b").with_columns(predictor=pl.lit("newer"))
+    result, ax = drawn_track(feature_types=[], predictor_scores=pl.concat([bare, unknown]))
+    assert len(ax.images) == 3
+    assert int(ax.images[2].get_array()[0].argmax()) == 149
+    by_name = {p["name"]: p for p in result["predictors"]}
+    assert by_name["esm1b"]["flipped"] and by_name["esm1b"]["licence"] is None
+    assert by_name["newer"]["drawn"] is False and by_name["newer"]["oriented"] is False
+    assert by_name["newer"]["direction"] is None and by_name["newer"]["n"] == 300
+    assert "ESM1b licence not stated" in result["note"]
+    assert "newer not drawn: nothing states which end of its score is damaging" in result["note"]
+    # the frame's own statement wins over the contract's
+    turned = bare.with_columns(direction=pl.lit("higher_is_more_damaging"))
+    result, ax = drawn_track(feature_types=[], predictor_scores=turned, predictors="esm1b")
+    assert int(ax.images[1].get_array()[0].argmin()) == 149
+    assert not result["predictors"][0]["flipped"]
+
+
+def oriented_scores(**kwargs):
+    """`track_scores` with the `damage_percentile` column `protein_scores` adds."""
+    lower = pl.col("direction") == "lower_is_more_damaging"
+    return track_scores(**kwargs).with_columns(
+        damage_percentile=pl.when(lower)
+        .then(100.0 - pl.col("percentile"))
+        .otherwise(pl.col("percentile"))
+    )
+
+
+def test_the_row_is_the_frames_damage_percentile_and_a_script_that_flipped_is_refused():
+    scores = oriented_scores()
+    result, ax = drawn_track(feature_types=[], predictor_scores=scores)
+    for image in ax.images[1:]:
+        values = image.get_array()[0]
+        assert int(values.argmax()) == 149 and values[149] == pytest.approx(99.9)
+    assert [p["flipped"] for p in result["predictors"]] == [False, True]
+    # the column alone is enough, and is not turned a second time
+    alone, ax = drawn_track(feature_types=[], predictor_scores=scores.drop("percentile"))
+    assert int(ax.images[2].get_array()[0].argmax()) == 149
+    # what the old advice produced: percentile overwritten with its oriented form
+    lower = pl.col("direction") == "lower_is_more_damaging"
+    flipped = scores.with_columns(
+        percentile=pl.when(lower).then(100.0 - pl.col("percentile")).otherwise(pl.col("percentile"))
+    )
+    with pytest.raises(GeneticsUsageError, match="for 'esm1b'.*one of the two was overwritten"):
+        drawn_track(feature_types=[], predictor_scores=flipped)
+    turned = scores.with_columns(damage_percentile=100.0 - pl.col("damage_percentile"))
+    with pytest.raises(GeneticsUsageError, match="for 'alphamissense'.*overwritten"):
+        drawn_track(feature_types=[], predictor_scores=turned)
+
+
+def test_rows_of_one_predictor_that_state_two_directions_are_refused():
+    scores = track_scores().with_columns(
+        direction=pl.when((pl.col("predictor") == "esm1b") & (pl.col("protein_position") < 5))
+        .then(pl.lit("higher_is_more_damaging"))
+        .otherwise(pl.col("direction"))
+    )
+    with pytest.raises(
+        GeneticsUsageError,
+        match=r"more than one direction for 'esm1b': "
+        r"\['higher_is_more_damaging', 'lower_is_more_damaging'\]",
+    ):
+        drawn_track(feature_types=[], predictor_scores=scores)
+
+
+def test_rows_of_two_proteins_are_never_merged_position_by_position():
+    two = pl.concat([track_scores(), track_scores(damaging=7, accession="P99999")])
+    # with the column, the other protein's rows are left out and said to be
+    result, ax = drawn_track(feature_types=[], predictor_scores=two)
+    assert int(ax.images[1].get_array()[0].argmax()) == 149
+    assert [p["n_other_accession"] for p in result["predictors"]] == [300, 300]
+    assert "predictor rows of P99999 left out, not P00001" in result["note"]
+    one, _ax = drawn_track(feature_types=[], predictor_scores=track_scores())
+    assert one["predictors"][0]["n_other_accession"] == 0 and "left out" not in one["note"]
+    # without it on either frame there is nothing to choose a protein by
+    with pytest.raises(GeneticsUsageError, match="repeat protein positions for 'alphamissense'"):
+        drawn_track(feature_types=[], predictor_scores=two.drop("accession"))
+    with pytest.raises(GeneticsUsageError, match="keep the 'accession' column"):
+        drawn_track(
+            residues=track_residues().drop("accession"), feature_types=[], predictor_scores=two
+        )
+
+
+def test_a_score_row_with_no_position_is_left_out_and_counted():
+    scores = track_scores().with_columns(
+        protein_position=pl.when(pl.col("protein_position").is_in([10, 11]))
+        .then(None)
+        .otherwise(pl.col("protein_position"))
+    )
+    result, ax = drawn_track(feature_types=[], predictor_scores=scores)
+    assert [(p["n_no_position"], p["n"]) for p in result["predictors"]] == [(2, 298), (2, 298)]
+    assert np.ma.getmaskarray(ax.images[1].get_array()[0])[[9, 10]].all()
+
+
+def test_a_binned_column_resting_on_few_scored_residues_is_reported():
+    full, _ax = drawn_track(
+        residues=long_residues(),
+        feature_types=[],
+        predictor_scores=track_scores(length=34_350, damaging=5_000, accession="Q8WZ42"),
+    )
+    size = full["bin_size"]
+    # only position 1 has no score, so the thinnest column lacks one residue
+    assert [p["min_scored_fraction"] for p in full["predictors"]] == [round(1 - 1 / size, 4)] * 2
+    assert "under half" not in full["note"]
+    # one scored residue left in each of three columns
+    gaps = [p for c in (10, 20, 30) for p in range(c * size + 2, (c + 1) * size + 1)]
+    thin, ax = drawn_track(
+        residues=long_residues(),
+        feature_types=[],
+        predictor_scores=track_scores(
+            length=34_350, damaging=5_000, accession="Q8WZ42", missing=set(gaps)
+        ),
+    )
+    assert [p["min_scored_fraction"] for p in thin["predictors"]] == [round(1 / size, 4)] * 2
+    assert "columns averaging under half their residues: AlphaMissense 3, ESM1b 3" in thin["note"]
+    # what is drawn does not change: the column is its one residue's value, not grey
+    assert ax.images[1].get_array()[0][10] == pytest.approx(10.0)
+    unbinned, _ax = drawn_track(feature_types=[], predictor_scores=track_scores())
+    assert [p["min_scored_fraction"] for p in unbinned["predictors"]] == [1.0, 1.0]
+
+
+def test_predictor_rows_are_fetched_when_asked_for_and_not_given(monkeypatch):
+    from genetics_mcp_server import sdk
+
+    asked = []
+
+    def scores(protein, predictors=None):
+        asked.append((protein, predictors))
+        return track_scores()
+
+    monkeypatch.setattr(sdk, "protein_scores", scores, raising=False)
+    plain, _ax = drawn_track(feature_types=[])
+    assert asked == [] and plain["predictors"] == []
+    result, _ax = drawn_track(feature_types=[], predictors=True)
+    assert asked == [("P00001", None)] and len(result["predictors"]) == 2
+    drawn_track(feature_types=[], predictors=["esm1b"])
+    assert asked[-1] == ("P00001", ["esm1b"])
+    monkeypatch.delattr(sdk, "protein_scores")
+    with pytest.raises(GeneticsUsageError, match="pass predictor_scores=, or leave predictors="):
+        drawn_track(feature_types=[], predictors=True)
 
 
 def test_binning_rules_are_not_in_the_note_when_nothing_is_binned():

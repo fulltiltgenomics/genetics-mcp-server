@@ -3519,6 +3519,134 @@ class ToolExecutor:
         return await self._protein_rows("features", protein)
 
     @staticmethod
+    def _score_predictors(header: str | None, names: list[str]) -> dict[str, dict[str, Any]]:
+        """Direction and licence of each of `names`, from the scores route's own statement.
+
+        The header is `name;direction=...;licence=...` per predictor, comma-separated. Only
+        a piece of exactly that shape is believed, and a direction only when it is one of
+        the contract's two values: a piece that states anything else, or a name stated
+        twice with different values, states nothing. A predictor left without a direction
+        gets the one the contract mirror knows, and None where that has none either; a
+        licence has no fallback.
+        """
+        from genetics_mcp_server.sdk import _structure_contract as contract
+
+        directions = (contract.SCORE_HIGHER_IS_DAMAGING, contract.SCORE_LOWER_IS_DAMAGING)
+        seen: dict[str, set[tuple[str | None, str | None]]] = {}
+        for part in (header or "").split(","):
+            name, *fields = (f.strip() for f in part.split(";"))
+            if not name:
+                continue
+            pairs = [
+                (k.strip(), sep, v.strip()) for k, sep, v in (f.partition("=") for f in fields)
+            ]
+            keys = [k for k, _sep, _v in pairs]
+            well_formed = all(k and sep for k, sep, _v in pairs) and len(set(keys)) == len(keys)
+            entry = {k: v for k, _sep, v in pairs} if well_formed else {}
+            direction = entry.get("direction")
+            seen.setdefault(name, set()).add(
+                (direction if direction in directions else None, entry.get("licence") or None)
+            )
+        stated = {
+            name: next(iter(values)) if len(values) == 1 else (None, None)
+            for name, values in seen.items()
+        }
+        return {
+            name: {
+                "direction": stated.get(name, (None, None))[0]
+                or contract.SCORE_DIRECTIONS.get(name),
+                "licence": stated.get(name, (None, None))[1],
+            }
+            for name in names
+        }
+
+    async def get_protein_scores(
+        self, protein: str, predictors: list[str] | str | None = None
+    ) -> dict[str, Any]:
+        """Per-residue missense predictor scores of a protein, one row per (accession, predictor, position)."""
+        import io
+
+        import polars as pl
+
+        from genetics_mcp_server.sdk import _structure_contract as contract
+
+        protein = self._structure_path_arg(protein, "protein")
+        if isinstance(protein, dict):
+            return protein
+        params = {"format": "tsv"}
+        if predictors is not None:
+            asked = predictors.split(",") if isinstance(predictors, str) else list(predictors)
+            asked = list(dict.fromkeys(str(p).strip() for p in asked if str(p).strip()))
+            if not asked:
+                return {
+                    "success": False,
+                    "error_code": "invalid_request",
+                    "error": "predictors must name at least one predictor; leave it out for all",
+                }
+            params["predictor"] = ",".join(asked)
+        # TSV, because results-api refuses the JSON form of the largest gene's rows
+        resp = await self.client.get(
+            f"{self.base_url}/v1/protein_structure/scores/{_seg(protein)}", params=params
+        )
+        if resp.status_code != 200:
+            detail = _detail(resp)
+            # the scores object is the one optional part of a release, so its absence is
+            # not the layer's absence and must not read as `not_available` or `not_found`
+            if resp.status_code == 404 and "no predictor scores" in str(detail):
+                return {
+                    "success": False,
+                    "error_code": "scores_not_available",
+                    "error": (
+                        f"No missense predictor scores on this deployment ({detail}). The rest "
+                        "of the protein structure layer is unaffected: draw protein_track "
+                        "without predictors=, and do not retry."
+                    ),
+                }
+            return self._structure_failure(resp)
+        types = {str: pl.Utf8, int: pl.Int64, float: pl.Float64}
+        frame = pl.read_csv(
+            io.BytesIO(resp.content),
+            separator="\t",
+            null_values="NA",
+            schema_overrides={name: types[kind] for name, kind in contract.SCORE_COLUMNS},
+            quote_char=None,
+        )
+        # an accession under several genes repeats under each, with the same scores
+        frame = frame.unique(
+            subset=["accession", "predictor", "protein_position"], keep="first", maintain_order=True
+        )
+        described = self._score_predictors(
+            resp.headers.get("X-Score-Predictors"),
+            frame["predictor"].unique(maintain_order=True).to_list(),
+        )
+        frame = frame.with_columns(
+            pl.col("predictor")
+            .replace_strict(
+                {name: d[key] for name, d in described.items()}, default=None, return_dtype=pl.Utf8
+            )
+            .alias(key)
+            for key in ("direction", "licence")
+        )
+        # the one place a percentile is turned, so that no script has to and none does twice
+        frame = frame.with_columns(
+            pl.when(pl.col("direction") == contract.SCORE_HIGHER_IS_DAMAGING)
+            .then(pl.col("percentile"))
+            .when(pl.col("direction") == contract.SCORE_LOWER_IS_DAMAGING)
+            .then(100.0 - pl.col("percentile"))
+            .otherwise(None)
+            .alias("damage_percentile")
+        )
+        return {
+            "success": True,
+            **self._columns_meta_from(frame.columns),
+            "protein": protein,
+            "release": resp.headers.get("X-Dataset-Version"),
+            "predictors": described,
+            "count": frame.height,
+            "results": frame.to_dicts(),
+        }
+
+    @staticmethod
     def _variant_key(variant: Any) -> str:
         """A variant id in the spelling the variant-to-residue map uses, to match rows to input."""
         parts = re.split(r"[:_-]", str(variant).strip().upper().removeprefix("CHR"))

@@ -4795,6 +4795,9 @@ _TRACK_FEATURE_COLUMNS = (
     "release",
 )
 _TRACK_BINS = ("max", "min", "mean")
+_TRACK_HIGHER_IS = ("dark", "light")
+_TRACK_PREDICTOR_NAMES = {"alphamissense": "AlphaMissense", "esm1b": "ESM1b"}
+_TRACK_PREDICTOR_BINS = ("mean", "max")
 
 # what a model file id's prefix says about where the prediction came from; "" is any other
 _TRACK_SOURCES = {
@@ -4822,21 +4825,22 @@ _TRACK_LABEL_CHARS = 28
 _TRACK_MAX_LANES = 3
 
 
-def _track_fetch(name: str, protein: str, have_residues: bool = False) -> pl.DataFrame:
+def _track_fetch(name: str, protein: str, have_residues: bool = False, *args: Any) -> pl.DataFrame:
     from genetics_mcp_server import sdk
 
     fetch = getattr(sdk, name, None)
     if fetch is None:
-        remedy = (
-            "pass features= as well, or feature_types=[] to draw no feature rows"
-            if have_residues
-            else "pass residues= (and features=) to draw frames already in hand"
-        )
+        if name == "protein_scores":
+            remedy = "pass predictor_scores=, or leave predictors= out to draw no predictor rows"
+        elif have_residues:
+            remedy = "pass features= as well, or feature_types=[] to draw no feature rows"
+        else:
+            remedy = "pass residues= (and features=) to draw frames already in hand"
         raise GeneticsUsageError(
             f"genetics.{name} is not offered on this deployment, so protein_track cannot "
             f"fetch {protein!r} itself; {remedy}"
         )
-    return fetch(protein)
+    return fetch(protein, *args)
 
 
 def _track_whole(frame: pl.DataFrame, columns: list[str], what: str) -> pl.DataFrame:
@@ -4931,7 +4935,7 @@ def _track_binned(values: np.ndarray, lo: int, hi: int, bin_size: int, how: str)
 
 
 def _track_scores(scores: Any, columns: list[str]) -> dict[str, dict[str, str]]:
-    """`scores=` in any of its forms as {label: {"column": ..., "bin": ...}}."""
+    """`scores=` in any of its forms as {label: {"column": ..., "bin": ..., "higher_is": ...}}."""
     if scores is None:
         return {}
     if isinstance(scores, str):
@@ -4942,22 +4946,194 @@ def _track_scores(scores: Any, columns: list[str]) -> dict[str, dict[str, str]]:
     for label, spec in scores.items():
         if not isinstance(spec, dict):
             spec = {"column": spec}
-        if "column" not in spec or set(spec) - {"column", "bin"}:
+        if "column" not in spec or set(spec) - {"column", "bin", "higher_is"}:
             raise GeneticsUsageError(
-                f"score {label!r} is a column name or {{'column': ..., 'bin': ...}}; got {spec!r}"
+                f"score {label!r} is a column name or "
+                f"{{'column': ..., 'bin': ..., 'higher_is': ...}}; got {spec!r}"
             )
-        how = spec.get("bin", "max")
+        higher_is = spec.get("higher_is", "dark")
+        if higher_is not in _TRACK_HIGHER_IS:
+            raise GeneticsUsageError(
+                f"score {label!r}: higher_is must be one of {_TRACK_HIGHER_IS}, not {higher_is!r}"
+            )
+        # binning keeps the dark end unless told otherwise, since dark is what is looked for
+        how = spec.get("bin", "max" if higher_is == "dark" else "min")
         if how not in _TRACK_BINS:
             raise GeneticsUsageError(
                 f"score {label!r}: bin must be one of {_TRACK_BINS}, not {how!r}"
             )
-        specs[str(label)] = {"column": str(spec["column"]), "bin": how}
+        specs[str(label)] = {"column": str(spec["column"]), "bin": how, "higher_is": higher_is}
     absent = [s["column"] for s in specs.values() if s["column"] not in columns]
     if absent:
         raise GeneticsUsageError(
             f"scores name columns the residues do not have: {absent}; columns are {columns}"
         )
     return specs
+
+
+def _track_predictors(
+    frame: pl.DataFrame,
+    names: list[str] | None,
+    accession: str | None,
+    length: int,
+    lo: int,
+    hi: int,
+) -> list[dict[str, Any]]:
+    """One entry per predictor of the long scores frame, its percentile turned towards damage.
+
+    `values` is the percentile by protein position with 100 = most damaging and NaN where
+    the predictor has no score, or None for a predictor whose direction nothing states:
+    drawn raw, its dark end could be the benign one.
+    """
+    from genetics_mcp_server.sdk import _structure_contract as contract
+
+    columns = frame.columns
+    absent = [c for c in ("predictor", "protein_position") if c not in columns]
+    if "percentile" not in columns and "damage_percentile" not in columns:
+        absent.append("percentile")
+    if absent:
+        raise GeneticsUsageError(
+            f"predictor_scores is the frame genetics.protein_scores returns and needs "
+            f"{absent}; columns are {columns}"
+        )
+    others: list[str] = []
+    if accession and "accession" in columns:
+        others = sorted(set(frame["accession"].drop_nulls().to_list()) - {accession})
+        other_rows = frame.filter(pl.col("accession") != accession)
+        frame = frame.filter(pl.col("accession") == accession)
+    frame = _track_whole(frame, ["protein_position"], "predictor_scores")
+    present = frame["predictor"].drop_nulls().unique(maintain_order=True).to_list()
+    if names is None:
+        names = present
+    missing = [n for n in names if n not in present]
+    if missing or not names:
+        raise GeneticsUsageError(
+            f"predictor_scores has no rows of {missing or 'any predictor'} for "
+            f"{accession or 'this protein'}; it has {present}"
+        )
+
+    def numeric(rows: pl.DataFrame, column: str) -> np.ndarray:
+        try:
+            return rows[column].cast(pl.Float64).to_numpy()
+        except Exception as error:
+            raise GeneticsUsageError(
+                f"predictor_scores: column {column!r} is {rows[column].dtype}, not numeric"
+            ) from error
+
+    out = []
+    for name in names:
+        rows = frame.filter(pl.col("predictor") == name)
+        placed = rows.drop_nulls("protein_position")
+        n_no_position = rows.height - placed.height
+        rows = placed
+        if rows["protein_position"].is_duplicated().any():
+            # which protein's residue a position shows is what `accession` says; taking the
+            # first row instead would draw another protein's scores on this track
+            raise GeneticsUsageError(
+                f"predictor_scores repeat protein positions for {name!r}"
+                + (f" on {accession}" if accession else "")
+                + ": keep the 'accession' column from genetics.protein_scores (and from the "
+                "residues), or pass one protein's rows"
+            )
+        stated = (
+            sorted(rows["direction"].drop_nulls().unique().to_list())
+            if "direction" in columns
+            else []
+        )
+        if len(stated) > 1:
+            raise GeneticsUsageError(
+                f"predictor_scores state more than one direction for {name!r}: {stated}; "
+                f"a predictor has one"
+            )
+        direction = stated[0] if stated else contract.SCORE_DIRECTIONS.get(name)
+        flipped = direction == contract.SCORE_LOWER_IS_DAMAGING
+        known = flipped or direction == contract.SCORE_HIGHER_IS_DAMAGING
+        raw = derived = None
+        if "percentile" in columns:
+            raw = numeric(rows, "percentile")
+            derived = (100.0 - raw if flipped else raw) if known else None
+        if "damage_percentile" in columns:
+            oriented = numeric(rows, "damage_percentile")
+            both = np.isfinite(oriented) & np.isfinite(derived) if derived is not None else None
+            if both is not None and not np.allclose(oriented[both], derived[both], atol=1e-6):
+                raise GeneticsUsageError(
+                    f"predictor_scores: for {name!r} ({direction}) 'damage_percentile' is not "
+                    f"'percentile' turned towards damage, so one of the two was overwritten; "
+                    f"pass the frame as genetics.protein_scores returned it"
+                )
+            drawn = known or bool(np.isfinite(oriented).any())
+        else:
+            oriented, drawn = derived, known
+        scored = oriented if drawn or raw is None else raw
+        positions = rows["protein_position"].to_numpy()
+        on = (positions >= 1) & (positions <= length)
+        values = np.full(length, np.nan)
+        values[positions[on] - 1] = scored[on]
+        shown = _TRACK_PREDICTOR_NAMES.get(name, name)
+        out.append(
+            {
+                "name": name,
+                "shown": shown,
+                "label": _plain(shown, 40),
+                "direction": direction,
+                "licence": _first(rows, "licence"),
+                "flipped": flipped,
+                "values": values if drawn else None,
+                "n": int(((positions >= lo) & (positions <= hi)).sum()),
+                "n_no_score": int((~np.isfinite(values[lo - 1 : hi])).sum()),
+                "n_outside": int((~on).sum()),
+                "n_no_position": n_no_position,
+                "n_other_accession": (
+                    other_rows.filter(pl.col("predictor") == name).height if others else 0
+                ),
+                "other_accessions": others,
+            }
+        )
+    return out
+
+
+def _track_scored_fraction(
+    values: np.ndarray, lo: int, hi: int, bin_size: int
+) -> tuple[float | None, int]:
+    """Over the binned columns that hold a score: the smallest scored share, and how many are under half."""
+    window = np.isfinite(values[lo - 1 : hi])
+    pad = -len(window) % bin_size
+    scored = np.concatenate([window, np.zeros(pad, bool)]).reshape(-1, bin_size).sum(axis=1)
+    # the last column holds fewer residues than the others when the stretch does not divide
+    held = np.full(len(scored), bin_size)
+    held[-1] -= pad
+    share = scored[scored > 0] / held[scored > 0]
+    if not share.size:
+        return None, 0
+    return round(float(share.min()), 4), int((share < 0.5).sum())
+
+
+def _track_predictor_note(predictors: list[dict[str, Any]], accession: str | None) -> str | None:
+    drawn = [p for p in predictors if p["values"] is not None]
+    parts = []
+    if drawn:
+        flipped = [f"{p['shown']} drawn as 100 − percentile" for p in drawn if p["flipped"]]
+        licences = ", ".join(f"{p['shown']} {p['licence'] or 'licence not stated'}" for p in drawn)
+        parts.append(
+            "predictor rows: percentile of the residue's mean missense score within the "
+            "release, dark = more damaging"
+            + (f" ({'; '.join(flipped)})" if flipped else "")
+            + f", grey = no score; licences: {licences}"
+        )
+    parts += [
+        f"{p['shown']} not drawn: nothing states which end of its score is damaging"
+        for p in predictors
+        if p["values"] is None
+    ]
+    thin = [f"{p['shown']} {p['n_thin']}" for p in drawn if p.get("n_thin")]
+    if thin:
+        parts.append(f"columns averaging under half their residues: {', '.join(thin)}")
+    others = sorted(
+        {a for p in predictors if p["n_other_accession"] for a in p["other_accessions"]}
+    )
+    if others:
+        parts.append(f"predictor rows of {', '.join(others)} left out, not {accession}")
+    return " · ".join(parts) or None
 
 
 def _track_lanes(spans: list[tuple[float, float]]) -> list[int]:
@@ -5261,6 +5437,9 @@ def protein_track(
     features: pl.DataFrame | None = None,
     feature_types: Any = _TRACK_FEATURE_TYPES,
     scores: Any = None,
+    predictors: Any = None,
+    predictor_scores: pl.DataFrame | None = None,
+    predictor_bin: str = "mean",
     rows: Any = None,
     region: tuple[int, int] | None = None,
     release: str | None = None,
@@ -5268,11 +5447,12 @@ def protein_track(
     title: str | None = None,
     ax: Any = None,
 ) -> dict[str, Any]:
-    """Protein track: domains, pLDDT, per-residue scores and your own variant rows on one amino-acid axis.
+    """Protein track: domains, pLDDT, per-residue scores, missense predictors and your own variant rows on one amino-acid axis.
 
         genetics.plots.protein_track(
             "SETD1A",
             scores="mu",
+            predictors=True,
             rows=[
                 {"name": "SCZ credible sets", "data": cs_residues, "weight": "pip"},
                 {"name": "burden variants", "data": genetics.protein_variants(ids)},
@@ -5299,10 +5479,29 @@ def protein_track(
       TED domain is), dotted grey for unknown.
     - pLDDT in AlphaFold's four bands; grey where a position has no residue row.
     - one heatmap row per entry of `scores` — a column of `residues`, a list of them,
-      `{label: column}`, or `{label: {"column": ..., "bin": "max" | "min" | "mean"}}`. Each
-      row runs light to dark over that column's own range across the whole protein, printed
-      at its right; to draw a score from elsewhere, join it onto the residues frame by
-      `protein_position`.
+      `{label: column}`, or `{label: {"column": ..., "bin": "max" | "min" | "mean",
+      "higher_is": "dark" | "light"}}`. Each row runs light to dark over that column's own
+      range across the whole protein, printed at its right; to draw a score from elsewhere,
+      join it onto the residues frame by `protein_position`. HIGH values are dark unless
+      `"higher_is": "light"`, which is for a column where LOW is the finding (a
+      log-likelihood ratio, a constraint score): its low values are then the dark ones and
+      `bin` defaults to `"min"`.
+    - one heatmap row per missense predictor when `predictors=` asks: `True` for every
+      predictor served, or names (`"alphamissense"`, `["esm1b"]`). The rows are fetched
+      (`genetics.protein_scores`) unless passed as `predictor_scores=`, the frame that
+      returns; passing the frame alone draws every predictor in it. DIRECTION: a row is the
+      predictor's `percentile` ORIENTED so that dark always means more damaging — as it is
+      for a higher-is-more-damaging predictor (AlphaMissense), as `100 - percentile` for a
+      lower-is-more-damaging one (ESM1b). So read every predictor row the same way, and do
+      NOT flip the frame yourself before passing it: the row is the frame's
+      `damage_percentile` column when it has one, and a frame whose `percentile` and
+      `damage_percentile` disagree for the stated direction is refused, as is a predictor
+      whose rows state two directions or repeat a position (keep the `accession` column so
+      rows of another protein are left out, and reported, rather than merged). The row label is the predictor's name
+      and the note under the figure says the rows are turned and which predictor was drawn
+      as 100 - percentile; the scale is 0-100 for every predictor, and grey is a residue
+      with no score, never a low one. A predictor whose direction neither the frame's `direction` column nor the
+      SDK knows is not drawn, and the note says so.
     - one row per entry of `rows` (a list), each a dict: `name`, `data` (a frame, or a list
       of positions), and optionally `kind`, `weight`, `colour`, `position`. Positions are
       read from `position=`, else `aa_pos` (what `genetics.protein_variants` returns), else
@@ -5320,13 +5519,19 @@ def protein_track(
     in a column, so a short low-confidence stretch stays visible and a column reads as
     confident only if all of it is. A score shows its `bin`: `"max"` (the default) keeps
     the highest value in a column and hides the low ones, which suits a score where high
-    is the finding; for one where LOW is the finding (a log-likelihood ratio) say `"min"`,
-    or the damaging residues are exactly what the binning removes; `"mean"` keeps neither
-    extreme. Variant rows are never binned.
+    is the finding; for one where LOW is the finding say `"higher_is": "light"` (or
+    `"bin": "min"`), or the damaging residues are exactly what the binning removes;
+    `"mean"` keeps neither extreme. A predictor row shows the MEAN oriented percentile of
+    the scored residues in a column (`predictor_bin="mean"`): a percentile row shows where
+    a protein is constrained on average, and the maximum of many ranks is near 100
+    everywhere, so to see single damaging residues zoom with `region=` until nothing is
+    binned; `predictor_bin="max"` keeps the most damaging residue of each column instead.
+    Variant rows are never binned.
 
     Under the figure: that the structure is predicted and the model file id(s) the
-    residues came from; when `release=` or a `release` column in the frames names it, the
-    release the features were frozen at; why there are no feature rows, when features
+    residues came from; for predictor rows, what they show, which were turned, and each
+    predictor's licence tag; when `release=` or a `release` column in the frames names it,
+    the release the features were frozen at; why there are no feature rows, when features
     were fetched and none could be drawn; and the binning rules when binning is in effect.
 
     Returns a dict describing what was drawn: `path`, `protein`, `accession`, `gene`,
@@ -5334,8 +5539,16 @@ def protein_track(
     `features_dropped` (features of the requested types with a null extent or a start past
     their end), `feature_note` (None, or why fetched features gave no rows),
     `plddt_fractions` (share of the drawn residues in each band, per residue whatever the
-    binning), `scores` with each column's `range` and `bin`, `rows`, `models`, `bin_size`
-    and `note`. Each of `rows` has `kind`, `n` marks drawn, `n_out_of_view` (on the protein
+    binning), `scores` with each column's `range`, `bin` and `higher_is`, `predictors`,
+    `rows`, `models`, `bin_size` and `note`. Each of `predictors` has `name`, `label`,
+    `direction`, `licence`, `drawn`, `oriented` (dark is more damaging; true of every drawn
+    row), `flipped` (drawn as 100 - percentile), `bin`, `n` (score rows in view),
+    `n_no_score` (residues in view without a score), `n_outside` (rows at positions the
+    protein does not have), `n_no_position` (rows with a null position, left out),
+    `n_other_accession` (rows of another protein, left out) and `min_scored_fraction` (the
+    smallest share of scored residues among the drawn columns that hold a score: a binned
+    column's mean can rest on few residues, and the note says how many columns rest on
+    under half). Each of `rows` has `kind`, `n` marks drawn, `n_out_of_view` (on the protein
     but outside `region`) and `n_outside` (not on the protein at all) — the three sum to
     the row's marks with a position; a lollipop row also has `n_no_weight`, taken off first.
 
@@ -5402,6 +5615,26 @@ def protein_track(
             )
 
     scores = _track_scores(scores, owners.columns)
+    if predictors is None or isinstance(predictors, bool):
+        predictor_names = None
+        wanted = predictor_scores is not None if predictors is None else predictors
+    else:
+        predictor_names = (
+            [predictors] if isinstance(predictors, str) else [str(p) for p in predictors]
+        )
+        wanted = bool(predictor_names)
+    if predictor_bin not in _TRACK_PREDICTOR_BINS:
+        raise GeneticsUsageError(
+            f"predictor_bin must be one of {_TRACK_PREDICTOR_BINS}, not {predictor_bin!r}"
+        )
+    predictor_rows: list[dict[str, Any]] = []
+    if wanted:
+        if predictor_scores is None:
+            predictor_scores = _track_fetch("protein_scores", protein, False, predictor_names)
+        predictor_rows = _track_predictors(
+            predictor_scores, predictor_names, accession, length, lo, hi
+        )
+    drawn_predictors = [p for p in predictor_rows if p["values"] is not None]
     if isinstance(rows, dict):
         rows = [{"name": name, "data": data} for name, data in rows.items()]
     elif rows is not None and not isinstance(rows, (list, tuple)):
@@ -5414,7 +5647,10 @@ def protein_track(
 
     own_figure = ax is None
     row_names = (
-        [*feature_types, "pLDDT"] + [_plain(s, 40) for s in scores] + [r["name"] for r in own_rows]
+        [*feature_types, "pLDDT"]
+        + [_plain(s, 40) for s in scores]
+        + [p["label"] for p in drawn_predictors]
+        + [r["name"] for r in own_rows]
     )
     score_values = {
         label: _track_dense(owners, spec["column"], length) for label, spec in scores.items()
@@ -5426,6 +5662,8 @@ def protein_track(
         score_ranges[label] = (float(finite.min()), float(finite.max())) if finite.size else None
         if finite.size:
             scales[label] = f"{finite.min():.2g}–{finite.max():.2g}"
+            if scores[label]["higher_is"] == "light":
+                scales[label] += ", low = dark"
     for own in own_rows:
         if own["kind"] == "lollipop":
             own["scale"] = f"{_plain(own['weight'], 16)} 0–{own['top']:.3g}"
@@ -5433,6 +5671,8 @@ def protein_track(
                 own["scale"] += f" ({own['n_no_weight']} without)"
     left_in = max(_text_width_in(n, _TICK_SIZE) for n in row_names) + 0.14
     scale_texts = [*scales.values(), *(r["scale"] for r in own_rows if "scale" in r)]
+    if drawn_predictors:
+        scale_texts.append("0–100")
     right_in = 0.12 + max((_text_width_in(t, _TRACK_LABEL_SIZE) for t in scale_texts), default=0)
     if own_figure:
         axis_in = _TRACK_WIDTH_IN - left_in - right_in
@@ -5452,6 +5692,14 @@ def protein_track(
 
     models = _track_models(owners, lo, hi)
     notes = [_track_source(models)]
+    # ahead of the notes that can run long, so the licence tags are not what a cut removes
+    for drawn in drawn_predictors:
+        drawn["min_scored_fraction"], drawn["n_thin"] = _track_scored_fraction(
+            drawn["values"], lo, hi, bin_size
+        )
+    predictor_note = _track_predictor_note(predictor_rows, accession)
+    if predictor_note:
+        notes.append(predictor_note)
     frozen = _track_release(release, features, residues)
     if frozen and feature_rows:
         notes.append(f"features frozen at release {frozen}")
@@ -5464,6 +5712,7 @@ def protein_track(
     if bin_size > 1:
         rules = ["pLDDT: lowest band in the column"]
         rules += [f"{_plain(label, 40)}: {spec['bin']}" for label, spec in scores.items()]
+        rules += [f"{p['label']}: {predictor_bin}" for p in drawn_predictors]
         notes.append(f"strips: {bin_size} residues per column ({'; '.join(rules)})")
     note = _plain(" · ".join(notes), 600)
     note_lines = textwrap.wrap(
@@ -5480,10 +5729,12 @@ def protein_track(
     if feature_rows:
         bands.append((None, _TRACK_GAP_IN, None))
     bands.append(("pLDDT", _TRACK_STRIP_IN, "plddt"))
-    if scores:
+    if scores or drawn_predictors:
         bands.append((None, _TRACK_GAP_IN, None))
     for label in scores:
         bands.append((_plain(label, 40), _TRACK_STRIP_IN, ("score", label)))
+    for drawn in drawn_predictors:
+        bands.append((drawn["label"], _TRACK_STRIP_IN, ("predictor", drawn)))
     for own in own_rows:
         bands.append((None, _TRACK_GAP_IN, None))
         height = _TRACK_LOLLIPOP_IN if own["kind"] == "lollipop" else _TRACK_TICK_IN
@@ -5595,10 +5846,27 @@ def protein_track(
                 cmap=cmap,
                 norm=BoundaryNorm([*floors, 100.5], cmap.N),
             )
+        elif isinstance(what, tuple) and what[0] == "predictor":
+            cmap = plt.get_cmap("OrRd").copy()
+            cmap.set_bad(_TRACK_MISSING)
+            scale_text("0–100", bottom + height / 2)
+            # reduced after orienting, so "max" keeps the most damaging residue of a column
+            # for either direction
+            strip(
+                np.ma.masked_invalid(
+                    _track_binned(what[1]["values"], lo, hi, bin_size, predictor_bin)
+                ),
+                bottom,
+                height,
+                cmap=cmap,
+                vmin=0.0,
+                vmax=100.0,
+            )
         elif isinstance(what, tuple):
             values = score_values[what[1]]
             low, high = score_ranges[what[1]] or (0.0, 1.0)
-            cmap = plt.get_cmap("OrRd").copy()
+            dark_high = scores[what[1]]["higher_is"] == "dark"
+            cmap = plt.get_cmap("OrRd" if dark_high else "OrRd_r").copy()
             cmap.set_bad(_TRACK_MISSING)
             if what[1] in scales:
                 scale_text(scales[what[1]], bottom + height / 2)
@@ -5764,8 +6032,32 @@ def protein_track(
         "feature_note": feature_note,
         "plddt_fractions": fractions,
         "scores": [
-            {"name": label, "range": score_ranges[label], "bin": spec["bin"]}
+            {
+                "name": label,
+                "range": score_ranges[label],
+                "bin": spec["bin"],
+                "higher_is": spec["higher_is"],
+            }
             for label, spec in scores.items()
+        ],
+        "predictors": [
+            {
+                "name": p["name"],
+                "label": p["label"],
+                "direction": p["direction"],
+                "licence": p["licence"],
+                "drawn": p["values"] is not None,
+                "oriented": p["values"] is not None,
+                "flipped": p["flipped"],
+                "bin": predictor_bin,
+                "n": p["n"],
+                "n_no_score": p["n_no_score"],
+                "n_outside": p["n_outside"],
+                "n_no_position": p["n_no_position"],
+                "n_other_accession": p["n_other_accession"],
+                "min_scored_fraction": p.get("min_scored_fraction"),
+            }
+            for p in predictor_rows
         ],
         "rows": drawn_rows,
         "models": models,

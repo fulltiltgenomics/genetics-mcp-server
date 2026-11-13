@@ -152,6 +152,10 @@ class TestContractMirror:
         for name in (
             "CONTRACT_VERSION",
             "MODEL_COLUMNS",
+            "SCORE_HIGHER_IS_DAMAGING",
+            "SCORE_LOWER_IS_DAMAGING",
+            "SCORE_DIRECTIONS",
+            "SCORE_COLUMNS",
             "PAE_SCALE",
             "PAE_NO_VALUE",
             "PAE_MAX_CODE",

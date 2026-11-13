@@ -45,6 +45,7 @@ SDK_FUNCTIONS = (
     "protein_models",
     "protein_residues",
     "protein_features",
+    "protein_scores",
     "protein_variants",
     "protein_structure_file",
     "protein_pae",
@@ -166,6 +167,43 @@ RESIDUES_TSV = (
     f"G\t3\t1\t9\tVHLL\tQ6RSH7\t{SINGLE_FILE}\t2\t2\tA\ttrue\t2.5\t-2.0\t3.25\t52.0\t2.5e-08\t6\t7\n"
 )
 
+SCORES_HEADER = (
+    "alphamissense;direction=higher_is_more_damaging;licence=CC-BY-4.0,"
+    "esm1b;direction=lower_is_more_damaging;licence=CC-BY-NC-4.0"
+)
+SCORES_COLUMNS = (
+    "gene_id\tchrom\tgene_start\tgene_end\tgene_name\taccession\tpredictor\tprotein_position"
+    "\taa_ref\tmean_snv\tn_snv\tpercentile\tmean_all\tn_all\n"
+)
+# the accession sits under two genes, so every score row comes twice
+SCORES_ROWS = [
+    f"{gene}\tQ6RSH7\t{row}\n"
+    for gene in ("G\t3\t1\t9\tVHLL", "G2\t3\t5\t9\tVHLL2")
+    for row in (
+        "alphamissense\t1\tM\tNA\t0\tNA\t0.41\t19",
+        "alphamissense\t2\tA\t0.91234\t6\t97.5\t0.88\t19",
+        "esm1b\t1\tM\t-1.5\t3\t60\t-2.0\t19",
+        "esm1b\t2\tA\t-14.25\t6\t0.8\t-13.0\t19",
+    )
+]
+
+
+def _scores_response(request: httpx.Request, rest: str, headers: dict) -> httpx.Response:
+    assert request.url.params["format"] == "tsv"
+    have = ["alphamissense", "esm1b"]
+    asked = request.url.params.get("predictor")
+    names = asked.split(",") if asked else have
+    unknown = [n for n in names if n not in have]
+    if unknown:
+        detail = f"No predictor {unknown[0]!r} in release {RELEASE}; it has {', '.join(have)}"
+        return httpx.Response(422, json={"detail": detail})
+    if rest != SINGLE:
+        detail = f"No score rows for {rest} in release {RELEASE}"
+        return httpx.Response(404, json={"detail": detail})
+    body = SCORES_COLUMNS + "".join(r for r in SCORES_ROWS if r.split("\t")[6] in names)
+    stated = ",".join(p for p in SCORES_HEADER.split(",") if p.split(";")[0] in names)
+    return httpx.Response(200, text=body, headers={**headers, "X-Score-Predictors": stated})
+
 
 def _positions(spec: str) -> list[int]:
     out: set[int] = set()
@@ -209,6 +247,8 @@ def _api(seen: list[httpx.Request] | None = None, fail: dict[str, httpx.Response
             return httpx.Response(
                 200, text=FEATURES_TSV if kind == "features" else RESIDUES_TSV, headers=version
             )
+        if kind == "scores":
+            return _scores_response(request, rest, version)
         if kind == "structure":
             return httpx.Response(200, content=_structure(rest), headers=version)
         mid, _, rows_route = rest.partition("/")
@@ -445,6 +485,189 @@ async def test_an_unreachable_upstream_is_not_reported_as_a_release_still_loadin
     finally:
         await ex.close()
     assert result.get("error_code") is None and "unreachable" in result["error"]
+
+
+# --------------------------------------------------------------------------- scores
+
+
+async def test_scores_are_typed_with_na_as_null_and_once_per_position(executor, seen):
+    client = GeneticsClient(executor=executor)
+    scores = await client.protein_scores(SINGLE)
+    assert seen[-1].url.params["format"] == "tsv" and "predictor" not in seen[-1].url.params
+    # eight rows served, four distinct (accession, predictor, protein_position)
+    assert scores.height == 4 and set(scores["gene_name"].to_list()) == {"VHLL"}
+    assert scores.select("predictor", "protein_position").rows() == [
+        ("alphamissense", 1),
+        ("alphamissense", 2),
+        ("esm1b", 1),
+        ("esm1b", 2),
+    ]
+    assert scores.schema["mean_snv"] == pl.Float64 and scores.schema["percentile"] == pl.Float64
+    assert all(scores.schema[c] == pl.Int64 for c in ("protein_position", "n_snv", "n_all"))
+    assert scores["mean_snv"].to_list() == [None, 0.91234, -1.5, -14.25]
+    assert scores["percentile"].to_list() == [None, 97.5, 60.0, 0.8]
+    assert scores["mean_all"].to_list()[0] == 0.41
+
+
+async def test_direction_and_licence_reach_the_frame_from_the_response_header(executor):
+    scores = await GeneticsClient(executor=executor).protein_scores(SINGLE)
+    stated = dict(scores.select("predictor", pl.struct("direction", "licence")).unique().rows())
+    assert stated == {
+        "alphamissense": {"direction": "higher_is_more_damaging", "licence": "CC-BY-4.0"},
+        "esm1b": {"direction": "lower_is_more_damaging", "licence": "CC-BY-NC-4.0"},
+    }
+    result = await executor.get_protein_scores(SINGLE)
+    assert result["predictors"] == stated and result["release"] == RELEASE
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        # no header at all: the contract mirror gives the direction, nothing gives a licence
+        (None, {"alphamissense": ("higher_is_more_damaging", None), "esm1b": ("lower_is_more_damaging", None), "newer": (None, None)}),
+        # the header wins over the mirror, and a predictor it leaves out falls back alone
+        (
+            "esm1b;direction=higher_is_more_damaging;licence=X-1.0, newer;licence=MIT;direction=lower_is_more_damaging",
+            {"alphamissense": ("higher_is_more_damaging", None), "esm1b": ("higher_is_more_damaging", "X-1.0"), "newer": ("lower_is_more_damaging", "MIT")},
+        ),
+        ("garbage;;=,;", {"alphamissense": ("higher_is_more_damaging", None), "esm1b": ("lower_is_more_damaging", None), "newer": (None, None)}),
+        # each piece that is not exactly `name;key=value...` with a contract direction states
+        # nothing: an unknown word, wrong case, quotes, a key twice, a field without `=`
+        (
+            "alphamissense;direction=damaging;licence=A, esm1b;direction=Higher_Is_More_Damaging, newer;direction=\"lower_is_more_damaging\"",
+            {"alphamissense": ("higher_is_more_damaging", "A"), "esm1b": ("lower_is_more_damaging", None), "newer": (None, None)},
+        ),
+        (
+            "esm1b;direction=higher_is_more_damaging;direction=lower_is_more_damaging;licence=B, newer;higher_is_more_damaging;licence=C, alphamissense;",
+            {"alphamissense": ("higher_is_more_damaging", None), "esm1b": ("lower_is_more_damaging", None), "newer": (None, None)},
+        ),
+        # a name stated twice: agreeing pieces stand, conflicting ones state nothing
+        (
+            "esm1b;direction=higher_is_more_damaging;licence=B, esm1b;direction=lower_is_more_damaging;licence=B, newer;direction=lower_is_more_damaging, newer;direction=lower_is_more_damaging",
+            {"alphamissense": ("higher_is_more_damaging", None), "esm1b": ("lower_is_more_damaging", None), "newer": ("lower_is_more_damaging", None)},
+        ),
+        # padding around a well-formed piece is trimmed, not held against it
+        (
+            " esm1b ; direction = higher_is_more_damaging ; licence = B ",
+            {"alphamissense": ("higher_is_more_damaging", None), "esm1b": ("higher_is_more_damaging", "B"), "newer": (None, None)},
+        ),
+    ],
+)  # fmt: skip
+async def test_a_missing_or_partial_predictor_header_falls_back_to_the_contract(header, expected):
+    body = SCORES_COLUMNS + "".join(SCORES_ROWS[:4]) + SCORES_ROWS[3].replace("esm1b", "newer")
+    headers = {"X-Score-Predictors": header} if header is not None else {}
+    ex = _failing({"scores": httpx.Response(200, text=body, headers=headers)})
+    try:
+        scores = await GeneticsClient(executor=ex).protein_scores(SINGLE)
+    finally:
+        await ex.close()
+    got = {p: (d, lic) for p, d, lic in scores.select("predictor", "direction", "licence").rows()}
+    assert got == expected
+    assert scores.schema["direction"] == pl.Utf8 and scores.schema["licence"] == pl.Utf8
+
+
+async def test_scores_can_be_narrowed_to_predictors_and_an_unknown_one_names_what_there_is(
+    executor, seen
+):
+    client = GeneticsClient(executor=executor)
+    assert set((await client.protein_scores(SINGLE, "esm1b"))["predictor"]) == {"esm1b"}
+    assert seen[-1].url.params["predictor"] == "esm1b"
+    both = await client.protein_scores(SINGLE, ["esm1b", " alphamissense "])
+    assert seen[-1].url.params["predictor"] == "esm1b,alphamissense" and both.height == 4
+    with pytest.raises(GeneticsError) as raised:
+        await client.protein_scores(SINGLE, ["cadd"])
+    assert raised.value.code == "invalid_request"
+    assert "'cadd'" in str(raised.value) and "alphamissense, esm1b" in str(raised.value)
+    asked = len(seen)
+    with pytest.raises(GeneticsError) as raised:
+        await client.protein_scores(SINGLE, [])
+    assert raised.value.code == "invalid_request" and len(seen) == asked
+
+
+@pytest.mark.parametrize(
+    ("response", "code", "says"),
+    [
+        (
+            httpx.Response(404, json={"detail": "Release r1 holds no predictor scores"}),
+            "scores_not_available",
+            "without predictors=",
+        ),
+        (
+            httpx.Response(
+                404, json={"detail": "This deployment serves no predictor scores of release r1"}
+            ),
+            "scores_not_available",
+            "release r1",
+        ),
+        (httpx.Response(404, json={"detail": "Not Found"}), "not_available", "not available"),
+        (
+            httpx.Response(404, json={"detail": "No score rows for X in release r1"}),
+            "not_found",
+            "No score rows",
+        ),
+        (
+            httpx.Response(413, json={"detail": "over 16777216 bytes as JSON"}),
+            "too_large",
+            "size limit",
+        ),
+        (httpx.Response(503, json={"detail": "no release"}), "release_not_loaded", "Try again"),
+    ],
+)
+async def test_score_refusals_are_told_apart(response, code, says):
+    ex = _failing({"scores": response})
+    try:
+        with pytest.raises(GeneticsError) as raised:
+            await GeneticsClient(executor=ex).protein_scores(SINGLE)
+    finally:
+        await ex.close()
+    assert raised.value.code == code and says in str(raised.value)
+
+
+async def test_damage_percentile_is_the_percentile_turned_and_the_track_draws_it_as_returned(
+    executor,
+):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from genetics_mcp_server.sdk import plots
+
+    client = GeneticsClient(executor=executor)
+    scores = await client.protein_scores(SINGLE)
+    assert scores.columns[-3:] == [name for name, _kind in contract.SCORE_SDK_COLUMNS]
+    assert scores.schema["damage_percentile"] == pl.Float64
+    # alphamissense as ranked, esm1b turned, null where the percentile is
+    assert scores["percentile"].to_list() == [None, 97.5, 60.0, 0.8]
+    assert scores["damage_percentile"].to_list() == pytest.approx([None, 97.5, 40.0, 99.2])
+    figure, ax = plt.subplots()
+    result = plots.protein_track(
+        SINGLE,
+        residues=await client.protein_residues(SINGLE),
+        feature_types=[],
+        predictor_scores=scores,
+        ax=ax,
+    )
+    plt.close(figure)
+    _plddt, alphamissense, esm1b = (image.get_array()[0] for image in ax.images)
+    assert np.ma.getmaskarray(alphamissense).tolist() == [True, False]
+    assert alphamissense[1] == pytest.approx(97.5)
+    assert esm1b.tolist() == pytest.approx([40.0, 99.2])
+    assert [(p["name"], p["flipped"], p["licence"]) for p in result["predictors"]] == [
+        ("alphamissense", False, "CC-BY-4.0"),
+        ("esm1b", True, "CC-BY-NC-4.0"),
+    ]
+
+
+async def test_a_predictor_of_unknown_direction_has_no_damage_percentile():
+    body = SCORES_COLUMNS + SCORES_ROWS[3].replace("esm1b", "newer")
+    ex = _failing({"scores": httpx.Response(200, text=body)})
+    try:
+        scores = await GeneticsClient(executor=ex).protein_scores(SINGLE)
+    finally:
+        await ex.close()
+    assert scores["percentile"].to_list() == [0.8]
+    assert scores["damage_percentile"].to_list() == [None]
+    assert scores.schema["damage_percentile"] == pl.Float64
 
 
 # --------------------------------------------------------------------------- tools

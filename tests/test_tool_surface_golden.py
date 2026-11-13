@@ -83,11 +83,11 @@ _DISABLED_TOOLS_ENV_VARS = (
 # besides. CONFIG_PROFILE and CELL_TYPE_EXPRESSION_ENABLED are envsubst'd into both manifests;
 # the baseline records the daly profile with the flag on (a deployment that sets the release
 # pointer), so get_cell_type_expression is offered — again the withdrawn direction is trivial.
-# PROTEIN_STRUCTURE_ENABLED is the exception to "read off the manifests": no manifest names
-# it yet. It is recorded as it is intended to be deployed on daly — on, for both surfaces, so
-# the chat backend offers the protein structure tools and /mcp withholds them by
-# `_mcp_disabled` alone. The manifests follow in the suite's deploy-wiring change; until then
-# a deploy leaves the flag unset, which is off.
+# PROTEIN_STRUCTURE_ENABLED is rendered into both manifests by the suite's deploy, derived
+# from the protein structure release pointer: "false" where the pointer is empty. The
+# baseline records a daly deployment that sets the pointer — on, for both surfaces, so the
+# chat backend offers the protein structure tools and /mcp withholds them by `_mcp_disabled`
+# alone.
 DEPLOYED_FLAGS: dict[str, dict[str, str]] = {
     "chat_backend": {
         "SANDBOX_ENABLED": "true",

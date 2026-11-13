@@ -943,6 +943,57 @@ class GeneticsClient:
         """
         return self._rows(await self._executor.get_protein_features(protein))
 
+    async def protein_scores(
+        self, protein: str, predictors: str | list[str] | None = None
+    ) -> pl.DataFrame:
+        """Per-residue missense predictor scores of a protein, one row per (predictor, position).
+
+        `predictors` names one or several (`"alphamissense"`, `"esm1b"`); the default is
+        every predictor the deployment serves. Columns: the gene columns, `accession`,
+        `predictor`, `protein_position`, `aa_ref`, `mean_snv` (mean raw score over the
+        substitutions a single-nucleotide change reaches) with `n_snv`, `percentile` (0-100,
+        the rank of `mean_snv` among all residues of the release for that predictor),
+        `mean_all` (mean over all 19 substitutions) with `n_all`, and three columns the SDK
+        adds: `direction` and `licence`, the predictor's own, repeated on each of its rows,
+        and `damage_percentile`.
+
+        DIRECTION: `percentile` and the means are RAW and are not turned towards damage.
+        `direction` says which end is damaging: "higher_is_more_damaging" (AlphaMissense) or
+        "lower_is_more_damaging" (ESM1b, a log-likelihood ratio), so a damaging residue has
+        a HIGH AlphaMissense percentile and a LOW ESM1b one. Whenever you want "high = more
+        damaging" — to rank, threshold or compare across predictors — use
+        `damage_percentile`: it is `percentile` for a higher-is-more-damaging predictor and
+        `100 - percentile` for a lower one, and null where the percentile is null or the
+        direction unknown. Leave `percentile` as the raw rank and never overwrite either
+        column: `genetics.plots.protein_track` reads them as returned and refuses a frame
+        in which they disagree. The direction is the server's statement for the response;
+        it wins over the SDK's built-in table when both state one, and the table is used
+        when the server states none. `direction` is null only for a predictor the server
+        did not describe and the SDK does not know; do not interpret its scores' sign.
+        `licence` is the predictor's licence tag (ESM1b's is non-commercial); name it when
+        showing the scores.
+
+        Positions are per protein, not per model window, so there is one row per position
+        however the protein is modelled. `mean_snv` and `percentile` are null where no
+        substitution is reachable by a single-nucleotide change; a position with no row has
+        no score from that predictor, which says nothing about its tolerance. A protein
+        under several genes is returned once, with the first gene's columns.
+        `genetics.plots.protein_track(protein, predictors=True)` draws these.
+
+        Raises GeneticsError with `code` "scores_not_available" when the deployment's
+        release holds no predictor scores (the rest of the layer still works),
+        "invalid_request" for a predictor it does not have (the message lists those it
+        has), and as for `protein_models`.
+        """
+        frame = self._rows(await self._executor.get_protein_scores(protein, predictors))
+        from genetics_mcp_server.sdk import _structure_contract as contract
+
+        # a column with no value at all would otherwise come back as Null
+        types = {str: pl.Utf8, float: pl.Float64}
+        return frame.with_columns(
+            pl.col(name).cast(types[kind]) for name, kind in contract.SCORE_SDK_COLUMNS
+        )
+
     async def protein_variants(self, variants: str | list[str]) -> pl.DataFrame:
         """The residue each variant changes, one row per (variant, protein).
 
