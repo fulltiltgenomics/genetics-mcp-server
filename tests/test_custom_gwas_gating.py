@@ -7,37 +7,20 @@ install its answer and read what the prompt and the tool definitions then say.
 
 import httpx
 import pytest
+from helpers import assert_module_definitions_lack
+from helpers import tool_description as _description
+from helpers import tool_param as _param
 
 from genetics_mcp_server.config import prompt_blocks
 from genetics_mcp_server.config.defaults import default_system_prompt
 from genetics_mcp_server.tools.definitions import (
     all_anthropic_tools,
     get_anthropic_tools,
-    resolve_tools,
 )
 from genetics_mcp_server.tools.executor import ToolExecutor
 
 HEADING = "### Users' own custom GWAS (sandbox userresults)"
 _ALL_VARIANTS = (None, "condensed")
-
-
-@pytest.fixture
-def deployment_answers(monkeypatch):
-    def install(answer):
-        monkeypatch.setattr(prompt_blocks, "_probe_on_request_datasets", lambda: answer)
-        monkeypatch.setattr(prompt_blocks, "_on_request_datasets", None)
-
-    return install
-
-
-def _param(tools, name, param):
-    (tool,) = [t for t in tools if t["name"] == name]
-    return tool["input_schema"]["properties"][param]["description"]
-
-
-def _description(tools, name):
-    (tool,) = [t for t in tools if t["name"] == name]
-    return tool["description"]
 
 
 class TestPrompt:
@@ -130,9 +113,7 @@ class TestToolHints:
         assert "custom" not in _param(tools, "get_hla_by_phenotype", "resource")
 
     def test_the_module_definitions_are_not_rewritten(self):
-        get_anthropic_tools()
-        for tool in resolve_tools(False):
-            assert "finngen_custom" not in repr(tool), tool["name"]
+        assert_module_definitions_lack("finngen_custom")
 
 
 class TestProbe:

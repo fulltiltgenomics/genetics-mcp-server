@@ -48,6 +48,34 @@ def on_request_datasets_known(monkeypatch):
     monkeypatch.setattr(prompt_blocks, "_on_request_datasets", None)
 
 
+@pytest.fixture
+def deployment_answers(monkeypatch):
+    """Install what results-api answers the on-request probe, in place of the finngen
+    deployment every test otherwise sees."""
+    from genetics_mcp_server.config import prompt_blocks
+
+    def install(answer):
+        monkeypatch.setattr(prompt_blocks, "_probe_on_request_datasets", lambda: answer)
+        monkeypatch.setattr(prompt_blocks, "_on_request_datasets", None)
+
+    return install
+
+
+SANDBOX_SIGNING_KEY = "test-sandbox-signing-key-that-is-32-bytes+"
+
+
+@pytest.fixture
+def signing_key(monkeypatch):
+    """Mint sandbox tokens with SANDBOX_SIGNING_KEY. A module whose every test needs it
+    opts in with `pytestmark = pytest.mark.usefixtures("signing_key")`."""
+    from genetics_mcp_server.config import settings as settings_module
+
+    settings_module.get_settings.cache_clear()
+    monkeypatch.setenv("SANDBOX_TOKEN_SIGNING_KEY", SANDBOX_SIGNING_KEY)
+    yield
+    settings_module.get_settings.cache_clear()
+
+
 def pytest_configure(config):
     """Abort the run if genetics_mcp_server resolves outside the tree being tested.
 
@@ -169,6 +197,51 @@ def close_and_unlink(db, db_path):
             pass
 
 
+@contextmanager
+def temp_singleton_db(db_class):
+    """A fresh instance of one of the Singleton database classes over a temporary file,
+    removed again on exit.
+
+    This leaves the module global that `get_chat_history_db()` / `get_llm_config_db()`
+    caches alone; the `chat_history_db` and `llm_config_db` fixtures reset it as well.
+    """
+    from genetics_mcp_server.db.singleton import Singleton
+
+    Singleton._instances.pop(db_class, None)
+
+    # a temporary file instead of :memory: to allow multiple connections
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    db = db_class(db_path)
+    try:
+        yield db
+    finally:
+        Singleton._instances.pop(db_class, None)
+        close_and_unlink(db, db_path)
+
+
+@contextmanager
+def authed_client(db_getter, db, user="test@example.com"):
+    """A TestClient signed in as `user`, with the router's database getter (a dotted
+    path, as `patch` takes it) answering `db`."""
+    from fastapi.testclient import TestClient
+
+    from genetics_mcp_server.auth import auth_required
+    from genetics_mcp_server.chat_api import app
+
+    async def mock_auth():
+        return user
+
+    app.dependency_overrides[auth_required] = mock_auth
+    try:
+        with patch(db_getter, return_value=db):
+            with TestClient(app) as client:
+                yield client
+    finally:
+        app.dependency_overrides.clear()
+
+
 @pytest.fixture
 def chat_history_db(monkeypatch):
     """Create a temporary ChatHistoryDB instance for testing.
@@ -180,25 +253,10 @@ def chat_history_db(monkeypatch):
     """
     from genetics_mcp_server.db import chat_history_db as chat_history_db_module
     from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
-    from genetics_mcp_server.db.singleton import Singleton
 
     monkeypatch.setattr(chat_history_db_module, "_chat_history_db", None)
-
-    # clear singleton to allow fresh instance
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-
-    # use a temporary file instead of :memory: to allow multiple connections
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-
-    db = ChatHistoryDB(db_path)
-    yield db
-
-    # cleanup
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-    close_and_unlink(db, db_path)
+    with temp_singleton_db(ChatHistoryDB) as db:
+        yield db
 
 
 @pytest.fixture
@@ -212,25 +270,10 @@ def llm_config_db(monkeypatch):
     """
     from genetics_mcp_server.db import llm_config_db as llm_config_db_module
     from genetics_mcp_server.db.llm_config_db import LLMConfigDB
-    from genetics_mcp_server.db.singleton import Singleton
 
     monkeypatch.setattr(llm_config_db_module, "_llm_config_db", None)
-
-    # clear singleton to allow fresh instance
-    if LLMConfigDB in Singleton._instances:
-        del Singleton._instances[LLMConfigDB]
-
-    # use a temporary file instead of :memory: to allow multiple connections
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-
-    db = LLMConfigDB(db_path)
-    yield db
-
-    # cleanup
-    if LLMConfigDB in Singleton._instances:
-        del Singleton._instances[LLMConfigDB]
-    close_and_unlink(db, db_path)
+    with temp_singleton_db(LLMConfigDB) as db:
+        yield db
 
 
 def block_writes(db, table, event="INSERT"):

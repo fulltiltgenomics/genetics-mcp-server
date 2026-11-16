@@ -19,7 +19,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 
 | column | type | description |
 | --- | --- | --- |
-| `chr` | `INT64` | Chromosome number (GRCh38; X=23, Y=24, M=25). The staged file column is 'chrom'; the BigQuery view exposes it as INT64 'chr' |
+| `chr` | `INT64` | Chromosome number (GRCh38; X=23, Y=24, M=26). The staged file column is 'chrom'; the BigQuery view exposes it as INT64 'chr' |
 | `pos` | `INT64` | Genomic position (GRCh38) |
 | `variant` | `STRING` | Variant identifier as chr:pos:ref:alt (chromosome X=23) |
 | `ref` | `STRING` | Reference allele |

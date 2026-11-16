@@ -4,8 +4,9 @@ Run with: pytest -m integration
 """
 
 import pytest
+from helpers import ExecutorCase, mock_response
 
-from genetics_mcp_server.tools import ServerToolExecutor, ToolExecutor
+from genetics_mcp_server.tools import ServerToolExecutor
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
     CODE_EXECUTION_TOOL_DEFINITIONS,
@@ -20,15 +21,8 @@ from genetics_mcp_server.tools.definitions import (
 
 
 @pytest.mark.integration
-class TestSearchTools:
+class TestSearchTools(ExecutorCase):
     """Tests for search tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_search_phenotypes(self):
         """Test searching phenotypes by query."""
@@ -99,15 +93,8 @@ class TestSearchTools:
 
 
 @pytest.mark.integration
-class TestCredibleSetTools:
+class TestCredibleSetTools(ExecutorCase):
     """Tests for credible set tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_credible_sets_by_gene(self):
         """Test getting credible sets for a gene."""
@@ -160,15 +147,8 @@ class TestCredibleSetTools:
 
 
 @pytest.mark.integration
-class TestGeneDataTools:
+class TestGeneDataTools(ExecutorCase):
     """Tests for gene data tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_gene_expression(self):
         """Test getting tissue expression for a gene."""
@@ -225,15 +205,8 @@ class TestGeneDataTools:
 
 
 @pytest.mark.integration
-class TestLDTools:
+class TestLDTools(ExecutorCase):
     """Tests for FinnGen LD server tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_ld_between_variants_found(self):
         """Test getting LD between two variants that are in LD."""
@@ -311,15 +284,8 @@ class TestLDTools:
 
 
 @pytest.mark.integration
-class TestColocalizationTools:
+class TestColocalizationTools(ExecutorCase):
     """Tests for colocalization and report tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_colocalization(self):
         """Test getting colocalization results."""
@@ -337,15 +303,8 @@ class TestColocalizationTools:
 
 
 @pytest.mark.integration
-class TestRegionTools:
+class TestRegionTools(ExecutorCase):
     """Tests for region/variant location tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_nearest_genes(self):
         """Test getting genes nearest to a variant."""
@@ -376,15 +335,10 @@ class TestRegionTools:
 
 
 @pytest.mark.integration
-class TestLiteratureSearch:
+class TestLiteratureSearch(ExecutorCase):
     """Tests for literature search tools."""
 
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ServerToolExecutor()
-        yield
-        await self.executor.close()
+    executor_class = ServerToolExecutor
 
     async def test_search_scientific_literature(self):
         """Test searching scientific literature via Europe PMC."""
@@ -448,15 +402,10 @@ class TestLiteratureSearch:
 
 
 @pytest.mark.integration
-class TestLiteratureSearchPerplexity:
+class TestLiteratureSearchPerplexity(ExecutorCase):
     """Tests for Perplexity-based literature search (requires API key)."""
 
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ServerToolExecutor()
-        yield
-        await self.executor.close()
+    executor_class = ServerToolExecutor
 
     @pytest.mark.skipif(
         not __import__("os").environ.get("PERPLEXITY_API_KEY"),
@@ -493,14 +442,8 @@ class TestLiteratureSearchPerplexity:
 
 
 @pytest.mark.integration
-class TestCredibleSetStatsTools:
+class TestCredibleSetStatsTools(ExecutorCase):
     """Tests for credible set statistics tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_credible_sets_stats(self):
         """Test getting credible sets statistics."""
@@ -531,15 +474,8 @@ class TestCredibleSetStatsTools:
 
 
 @pytest.mark.integration
-class TestSummaryStatsTools:
+class TestSummaryStatsTools(ExecutorCase):
     """Tests for summary statistics tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_summary_stats(self):
         """Test fetching summary stats for a variant-phenotype pair."""
@@ -632,15 +568,8 @@ class TestSummaryStatsTools:
 
 
 @pytest.mark.integration
-class TestVariantAnnotationTools:
+class TestVariantAnnotationTools(ExecutorCase):
     """Tests for variant annotation tools."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_get_variant_annotations_by_gene(self):
         """Test fetching variant annotations for a gene."""
@@ -909,26 +838,10 @@ class TestProfileCoercionAtTheEdge:
 # 'view=' attribute on the inline XML in executor._mgi_* helpers. The mocks
 # below mirror those exact column orders so the parsing logic is exercised.
 @pytest.mark.asyncio
-class TestSearchMGI:
+class TestSearchMGI(ExecutorCase):
     """Mocked HTTP tests for ToolExecutor.search_mgi against MouseMine."""
 
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        from genetics_mcp_server.tools.executor import ToolExecutor
-
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
-    @staticmethod
-    def _mock_response(status_code: int = 200, json_data: dict | None = None, text: str = ""):
-        from unittest.mock import MagicMock
-
-        resp = MagicMock()
-        resp.status_code = status_code
-        resp.text = text
-        resp.json = MagicMock(return_value=json_data or {})
-        return resp
+    _mock_response = staticmethod(mock_response)
 
     async def test_gene_phenotypes_success(self):
         from unittest.mock import AsyncMock, patch
@@ -1150,16 +1063,8 @@ class TestSearchMGI:
 # fans out to several endpoints; the fixtures below mirror the real payload
 # shapes verified against https://www.cbioportal.org/api.
 @pytest.mark.asyncio
-class TestSearchCBioPortal:
+class TestSearchCBioPortal(ExecutorCase):
     """Mocked HTTP tests for ToolExecutor.search_cbioportal."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        from genetics_mcp_server.tools.executor import ToolExecutor
-
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     STUDIES = [
         {

@@ -11,19 +11,12 @@ import time
 
 import jwt
 import pytest
+from conftest import SANDBOX_SIGNING_KEY as SIGNING_KEY
 
 from genetics_mcp_server import sandbox_token
 from genetics_mcp_server.config import settings as settings_module
 
-SIGNING_KEY = "test-sandbox-signing-key-that-is-32-bytes+"
-
-
-@pytest.fixture(autouse=True)
-def signing_key(monkeypatch):
-    settings_module.get_settings.cache_clear()
-    monkeypatch.setenv("SANDBOX_TOKEN_SIGNING_KEY", SIGNING_KEY)
-    yield
-    settings_module.get_settings.cache_clear()
+pytestmark = pytest.mark.usefixtures("signing_key")
 
 
 def _decode(token, audience):

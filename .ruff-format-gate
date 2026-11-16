@@ -1,0 +1,1 @@
+# marks this repo as gating `ruff format --check` in scripts/lint-staged.sh

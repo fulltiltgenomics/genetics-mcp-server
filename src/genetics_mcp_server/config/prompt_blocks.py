@@ -314,3 +314,20 @@ def custom_gwas_hla_resources() -> tuple[str, ...]:
     return tuple(
         sorted({r for r, data_type in (on_request_datasets() or ()) if data_type == "hla"})
     )
+
+
+def custom_gwas_section(template: str) -> str | None:
+    """The section with this deployment's release resources filled in, or nothing."""
+    resources = custom_gwas_resources()
+    if not resources:
+        return None
+    return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
+
+
+def r12_model_section(template: str, lines: dict[str, str]) -> str | None:
+    """The section listing this deployment's R12 model-specific releases, or nothing."""
+    models = r12_model_datasets()
+    if not models:
+        return None
+    described = [lines[t].replace("{resource}", r) for r, t in models if t in lines]
+    return template.replace("{models}", "\n".join(described))

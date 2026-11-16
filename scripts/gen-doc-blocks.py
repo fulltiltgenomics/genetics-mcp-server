@@ -31,6 +31,11 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# the test suite loads this file by path, so the sibling module is not otherwise importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import doc_blocks  # noqa: E402
+
 PKG = "src/genetics_mcp_server"
 SPEC = "docs/project-spec.md"
 
@@ -478,27 +483,9 @@ BLOCKS = {
     "module-tree": (SPEC, block_module_tree),
 }
 
-MARKER = re.compile(
-    r"(<!-- BEGIN GENERATED: (?P<name>[a-z-]+) -->\n)(?P<body>.*?)(<!-- END GENERATED: (?P=name) -->)",
-    re.S,
-)
-
 
 def render(doc, text):
-    seen = set()
-
-    def repl(m):
-        name = m.group("name")
-        seen.add(name)
-        if name not in BLOCKS or BLOCKS[name][0] != doc:
-            harness(f"{doc}: unknown generated block {name!r}")
-        return m.group(1) + "\n" + BLOCKS[name][1]().rstrip() + "\n\n" + m.group(4)
-
-    out = MARKER.sub(repl, text)
-    missing = {n for n, (d, _) in BLOCKS.items() if d == doc} - seen
-    if missing:
-        harness(f"{doc}: no marker for generated block(s) {sorted(missing)}")
-    return out
+    return doc_blocks.render(doc, text, BLOCKS, harness)
 
 
 def main():

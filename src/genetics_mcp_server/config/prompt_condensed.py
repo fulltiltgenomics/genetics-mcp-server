@@ -45,8 +45,8 @@ from genetics_mcp_server import schema_docs
 from genetics_mcp_server.config.prompt_blocks import (
     _Block,
     _fs,
-    custom_gwas_resources,
-    r12_model_datasets,
+    custom_gwas_section,
+    r12_model_section,
     url_input_hosts_rule,
 )
 
@@ -55,13 +55,6 @@ _CUSTOM_GWAS_SECTION = """
 
 Sandbox custom GWAS runs are served straight from the userresults bucket as resources {resources} (one per freeze), the run name being the "phenotype". **Only on request**: they are users' own unreviewed analyses, hidden from `search_phenotypes` and `list_datasets` unless called with one of these resources, and reached by no other tool without it. Touch them only when the user explicitly asks about a GWAS they ran themselves, a custom GWAS or userresults; never to answer a general question about FinnGen, a disease or a variant, never presented beside release results as the same kind of evidence, and always named as a user's custom run in the answer. Every user sees every run and no owner is recorded, so take the run name the user gives and ask when it is ambiguous. Per run: summary statistics always; SuSiE 95% credible sets only where the user ran fine-mapping; HLA alleles for R14 runs. No cross-run index (by-gene/by-variant/by-region credible-set tools, coloc and PheWAS do not cover them); `get_resource_metadata` on the release's resource with the run name in `phenotypes` (the unfiltered table of hundreds of runs is truncated) gives case/control counts, the description and the date the run was written; credible-set `aaf` is NA.
 """
-
-
-def _custom_gwas_section(template: str) -> str | None:
-    resources = custom_gwas_resources()
-    if not resources:
-        return None
-    return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
 
 
 _R12_MODEL_SECTION = """
@@ -77,14 +70,6 @@ _R12_MODEL_LINES = {
     "gwas_sex_specific": "- `{resource}` (data_type `gwas_sex_specific`): females and males separately, meta-analysed; `female_*`, `male_*`, combined `beta`/`pval`, `het_p`. The sex difference is `het_p`, not significance in one sex only (the male analysis is usually smaller): show both betas with sample sizes. Nothing of it is in BigQuery.",
     "gwas_recessive": "- `{resource}` (data_type `gwas_recessive`): recessive model beside the additive test; unsuffixed statistics recessive, `additive_*` additive, `effect_allele`/`flipped` say which allele was tested (minor; flipped rows are on the opposite allele from the additive beta), `mlog10p_diff` the recessive-minus-additive evidence. X in females only. Nothing in BigQuery.",
 }
-
-
-def _r12_model_section(template: str, lines: dict[str, str]) -> str | None:
-    models = r12_model_datasets()
-    if not models:
-        return None
-    described = [lines[t].replace("{resource}", r) for r, t in models if t in lines]
-    return template.replace("{models}", "\n".join(described))
 
 
 CONDENSED_PROMPT_BLOCKS: tuple[_Block, ...] = (
@@ -479,12 +464,12 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
         requires_any=_fs(
             "get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"
         ),
-        render=lambda: _custom_gwas_section(_CUSTOM_GWAS_SECTION),
+        render=lambda: custom_gwas_section(_CUSTOM_GWAS_SECTION),
     ),
     _Block(
         _R12_MODEL_SECTION,
         requires_any=_fs("get_summary_stats", "search_phenotypes"),
-        render=lambda: _r12_model_section(_R12_MODEL_SECTION, _R12_MODEL_LINES),
+        render=lambda: r12_model_section(_R12_MODEL_SECTION, _R12_MODEL_LINES),
     ),
     _Block(
         """

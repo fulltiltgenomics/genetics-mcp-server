@@ -27,35 +27,31 @@ Series shape (mirrored by the frontend):
 import math
 from datetime import date, datetime, timedelta
 
-from .conversation_prompts import ISSUE_CATEGORIES, NON_ISSUE_CATEGORIES
+from .conversation_prompts import (
+    ISSUE_CATEGORIES,
+    NON_ISSUE_CATEGORIES,
+    NON_QUALITY_DISPOSITIONS,
+)
 
 SCORES = [1, 2, 3, 4, 5]
 
 # every success_label bucket (quality labels + non-quality disposition buckets +
-# unknown), plotted together as a share of all conversations.
-DISPOSITION_LABELS = [
-    "successful",
-    "neutral",
-    "unsuccessful",
-    "technical_failure",
-    "out_of_scope",
-    "unfinished",
-    "weird_or_unclear",
-    "unknown",
-]
+# unknown), plotted together as a share of all conversations. The colours sit here, not
+# with the renderer's other palettes, so a bucket cannot be added without one.
+DISPOSITION_COLORS = {
+    "successful": "#1a9850",
+    "neutral": "#fee08b",
+    "unsuccessful": "#d73027",
+    "technical_failure": "#762a83",
+    "out_of_scope": "#4575b4",
+    "unfinished": "#999999",
+    "weird_or_unclear": "#fc8d59",
+    "unknown": "#000000",
+}
+DISPOSITION_LABELS = list(DISPOSITION_COLORS)
 
 # the fixed issue taxonomy, imported so it stays in sync with the analyzer.
 ISSUE_CATEGORY_NAMES = [c for c, _ in ISSUE_CATEGORIES if c not in NON_ISSUE_CATEGORIES]
-
-# dispositions that are not agent-quality failures; excluded from the score trend
-# so out-of-scope / unfinished / weird / technical conversations don't skew it.
-# empty disposition (pre-disposition records) is kept for backward compatibility.
-_NON_QUALITY_DISPOSITIONS = {
-    "technical_failure",
-    "out_of_scope",
-    "unfinished",
-    "weird_or_unclear",
-}
 
 
 def parse_date(value) -> date | None:
@@ -118,12 +114,16 @@ def _rolling_windows(records: list[dict], grid: list[date], window_days: int):
 
 
 def _scored(records: list[dict]) -> list[dict]:
-    """Conversations that count toward the agent-quality score trend."""
+    """Conversations that count toward the agent-quality score trend.
+
+    Out-of-scope, unfinished, weird and technical conversations are left out so they do
+    not skew it; a record with no disposition predates dispositions and is kept.
+    """
     return [
         r
         for r in records
         if isinstance(r.get("llm_quality_score"), int)
-        and r.get("llm_disposition", "") not in _NON_QUALITY_DISPOSITIONS
+        and r.get("llm_disposition", "") not in NON_QUALITY_DISPOSITIONS
     ]
 
 

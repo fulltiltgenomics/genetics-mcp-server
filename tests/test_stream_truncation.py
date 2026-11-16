@@ -10,8 +10,9 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from helpers import bare_llm_service
 
-from genetics_mcp_server.llm_service import LLMService, _has_unfilled_output
+from genetics_mcp_server.llm_service import _has_unfilled_output
 
 
 def _delta_event(delta_type, value):
@@ -84,12 +85,7 @@ def _without_cache_control(content):
 
 
 def _service(turns, executor=None):
-    svc = LLMService.__new__(LLMService)
-    svc.openai_client = None
-    svc.executor = executor
-    svc.subagent_service = None
-    svc.anthropic_client = SimpleNamespace(messages=_FakeMessages(turns))
-    return svc
+    return bare_llm_service(_FakeMessages(turns), executor)
 
 
 def _text_turn(text, stop_reason="end_turn"):

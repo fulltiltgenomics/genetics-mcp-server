@@ -1,6 +1,7 @@
 """Integration tests for MCP server and tool definitions."""
 
 import pytest
+from helpers import ExecutorCase
 
 from genetics_mcp_server.tools.definitions import (
     BIGQUERY_TOOL_DEFINITIONS,
@@ -504,15 +505,8 @@ class TestMCPRegistrationGate:
 
 
 @pytest.mark.integration
-class TestMCPServerIntegration:
+class TestMCPServerIntegration(ExecutorCase):
     """Integration tests for MCP server (requires live API)."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        """Create and cleanup executor for each test."""
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_mcp_tool_search_phenotypes(self):
         """Test MCP tool for searching phenotypes."""

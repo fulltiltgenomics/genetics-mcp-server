@@ -5,38 +5,21 @@ the one thing results-api's answer carries besides the resource.
 """
 
 import pytest
+from helpers import assert_module_definitions_lack
+from helpers import tool_description as _description
+from helpers import tool_param as _param
 
 from genetics_mcp_server.config import prompt_blocks
 from genetics_mcp_server.config.defaults import default_system_prompt
 from genetics_mcp_server.tools.definitions import (
     all_anthropic_tools,
     get_anthropic_tools,
-    resolve_tools,
 )
 
 HEADING = "### FinnGen R12 sex-specific and recessive GWAS"
 CUSTOM_HEADING = "### Users' own custom GWAS (sandbox userresults)"
 _ALL_VARIANTS = (None, "condensed")
 MODELS = (("finngen_recessive", "gwas_recessive"), ("finngen_sex_specific", "gwas_sex_specific"))
-
-
-@pytest.fixture
-def deployment_answers(monkeypatch):
-    def install(answer):
-        monkeypatch.setattr(prompt_blocks, "_probe_on_request_datasets", lambda: answer)
-        monkeypatch.setattr(prompt_blocks, "_on_request_datasets", None)
-
-    return install
-
-
-def _param(tools, name, param):
-    (tool,) = [t for t in tools if t["name"] == name]
-    return tool["input_schema"]["properties"][param]["description"]
-
-
-def _description(tools, name):
-    (tool,) = [t for t in tools if t["name"] == name]
-    return tool["description"]
 
 
 class TestKinds:
@@ -112,8 +95,4 @@ class TestToolHints:
                 assert "sex_specific" not in blob and "recessive" not in blob, tool["name"]
 
     def test_the_module_definitions_are_not_rewritten(self):
-        get_anthropic_tools()
-        for tool in resolve_tools(False):
-            assert "sex_specific" not in repr(tool) and "finngen_recessive" not in repr(tool), tool[
-                "name"
-            ]
+        assert_module_definitions_lack("sex_specific", "finngen_recessive")

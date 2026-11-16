@@ -19,6 +19,8 @@ import logging
 import httpx
 import jwt
 import pytest
+from conftest import SANDBOX_SIGNING_KEY as SIGNING_KEY
+from helpers import sandbox_result_body as _ok_body
 
 from genetics_mcp_server import sandbox_client
 from genetics_mcp_server.config import settings as settings_module
@@ -37,36 +39,12 @@ from genetics_mcp_server.sandbox_client import (
 )
 from genetics_mcp_server.sandbox_token import SandboxTokenUnavailable
 
-SIGNING_KEY = "test-sandbox-signing-key-that-is-32-bytes+"
 USER = "u@finngen.fi"
 SESSION = "conv-9"
 CODE = "print('hello')"
 
 
-@pytest.fixture(autouse=True)
-def signing_key(monkeypatch):
-    settings_module.get_settings.cache_clear()
-    monkeypatch.setenv("SANDBOX_TOKEN_SIGNING_KEY", SIGNING_KEY)
-    yield
-    settings_module.get_settings.cache_clear()
-
-
-def _ok_body(execution_id, **overrides):
-    body = {
-        "execution_id": execution_id,
-        "status": "ok",
-        "exit_code": 0,
-        "signal": None,
-        "duration_ms": 12,
-        "output": "hello\n",
-        "output_bytes": 6,
-        "output_truncated": False,
-        "error": None,
-        "artifacts": [],
-        "artifacts_omitted": 0,
-    }
-    body.update(overrides)
-    return body
+pytestmark = pytest.mark.usefixtures("signing_key")
 
 
 def _error_response(status, error_type, message="", headers=None):

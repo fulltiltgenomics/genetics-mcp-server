@@ -155,12 +155,11 @@ DEFAULT_MODALITIES: tuple[str, ...] = tuple(name for name, m in MODALITIES.items
 # The suite's BigQuery views encode X as 23. AlphaGenome accepts 'chrX' and rejects
 # 'chr23', '23' and bare 'X' with ValueError('Chromosome ... not found.'), so this map is
 # mandatory rather than cosmetic.
-# UNVERIFIED: only 23 -> chrX was checked against the live API. 24/25/26 -> chrY/chrM are
+# UNVERIFIED: only 23 -> chrX was checked against the live API. 24/26 -> chrY/chrM are
 # the same convention read off the same views, believed but not measured.
 _CHROM_ALIASES = {
     "23": "chrX",
     "24": "chrY",
-    "25": "chrM",
     "26": "chrM",
     "X": "chrX",
     "Y": "chrY",

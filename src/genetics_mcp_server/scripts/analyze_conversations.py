@@ -37,7 +37,11 @@ import polars as pl
 from dotenv import load_dotenv
 
 from genetics_mcp_server.config import model_rejects_disabled_thinking
-from genetics_mcp_server.scripts.conversation_prompts import ISSUE_CATEGORIES, NON_ISSUE_CATEGORIES
+from genetics_mcp_server.scripts.conversation_prompts import (
+    ISSUE_CATEGORIES,
+    NON_ISSUE_CATEGORIES,
+    NON_QUALITY_DISPOSITIONS,
+)
 
 load_dotenv()
 
@@ -1410,15 +1414,6 @@ def compute_success_score(m: ConversationMetrics) -> float:
 # quality average/trend). dispositions outside the agent's control get their own
 # labels so they bucket separately and are excluded from the quality metric.
 QUALITY_RELEVANT_LABELS = {"successful", "neutral", "unsuccessful"}
-
-# dispositions that are NOT the agent failing to answer an answerable question.
-# each maps to its own report bucket; none counts toward the agent-quality average.
-NON_QUALITY_DISPOSITIONS = {
-    "technical_failure",
-    "out_of_scope",
-    "unfinished",
-    "weird_or_unclear",
-}
 
 
 def label_success(score: float) -> str:

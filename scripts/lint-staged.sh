@@ -1,7 +1,12 @@
 #!/usr/bin/env sh
-# Lints and format-checks the Python files in the index and FAILS the commit when ruff
-# reports anything. Formatting is gated, not applied: a hook that rewrites files behind the
-# commit stages something the author never saw.
+# Lints the Python files in the index and FAILS the commit when ruff reports anything. In a
+# repo that tracks a `.ruff-format-gate` file at its root it format-checks them as well.
+# Formatting is gated, not applied: a hook that rewrites files behind the commit stages
+# something the author never saw.
+#
+# One file for every repo of the suite: genetics-results-suite's copy is the source and
+# scripts/vendor.py writes the others, so edit it there. The marker file is what lets one
+# script serve repos that have adopted `ruff format` and repos that have not.
 #
 # Deliberately blocking, unlike the doc-drift check next to it in the hook: a gate that
 # only warns is one nobody reads. `git commit --no-verify` is the escape hatch.
@@ -26,6 +31,9 @@ RUFF_PIN=0.15.12
 
 root=$(git rev-parse --show-toplevel) || exit 2
 cd "$root"
+
+format_gate=0
+[ -f "$root/.ruff-format-gate" ] && format_gate=1
 
 # resolution order matters for worktrees: one under .claude/worktrees has no .venv of
 # its own, so fall back to the main checkout's before reaching for the network
@@ -63,7 +71,10 @@ fi
 if [ "${1:-}" = "--all" ]; then
     # word splitting is wanted: $ruff may be `uvx ruff@<pin>`
     # shellcheck disable=SC2086
-    $ruff check . && exec $ruff format --check .
+    $ruff check . || exit 1
+    [ "$format_gate" -eq 1 ] || exit 0
+    # shellcheck disable=SC2086
+    exec $ruff format --check .
 fi
 
 tmp=$(mktemp -d)
@@ -94,6 +105,7 @@ if ! xargs -0 $ruff check --force-exclude -- < "$tmp/staged"; then
     printf '  Bypass:        git commit --no-verify\n\n' >&2
     exit 1
 fi
+[ "$format_gate" -eq 1 ] || exit 0
 # shellcheck disable=SC2086
 if ! xargs -0 $ruff format --check --force-exclude -- < "$tmp/staged"; then
     printf '\nlint-staged: the staged Python files above are not ruff-formatted.\n\n' >&2

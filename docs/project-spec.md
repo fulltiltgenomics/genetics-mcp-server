@@ -2248,7 +2248,7 @@ hostage dependence on them was invisible profile-by-profile.
 `tests/test_llm_service.py::TestResolveLocalToolNames` pins the resolution itself: `MCP_ENABLED=false`
 advertises nothing, and `ENABLE_SUBAGENTS=true` with a dead `subagent_service` still hides
 `launch_subagents`. Those two disabling reasons must remain distinguishable in tests, so
-`_CapturingService` in `tests/test_chat_api.py` holds a live `subagent_service`.
+`CapturingService` in `tests/helpers.py` holds a live `subagent_service`.
 
 **Routing arbitration has one home.** The preference between "call a dedicated API tool", "write
 SQL" and "write one script" is stated once, in the prompt's "Choosing How to Get Data" section,
@@ -2462,7 +2462,7 @@ src/genetics_mcp_server/
 │   ├── __init__.py                 # Database utilities for chat history and LLM config.
 │   ├── chat_history_db.py          # SQLite service for chat history persistence.
 │   ├── llm_config_db.py            # SQLite service for LLM configuration with change history.
-│   └── singleton.py                # Singleton metaclass for database connections.
+│   └── singleton.py                # Singleton metaclass and per-thread connection base for the SQLite databases.
 ├── routers/
 │   ├── __init__.py                 # API routers for chat history and LLM configuration.
 │   ├── access_grants.py            # Admin endpoints for runtime access grants, plus the internal check other services call.
@@ -3027,8 +3027,8 @@ are kept in that script.
 
 <!-- END GENERATED: database-env -->
 
-**Both SQLite databases run in WAL mode**, set by `_create_connection` in `chat_history_db.py`
-and `llm_config_db.py`. Under the default rollback journal a reader is refused while a write is
+**Both SQLite databases run in WAL mode**, set by `ThreadLocalDB._create_connection` in
+`db/singleton.py`, the base both database classes share. Under the default rollback journal a reader is refused while a write is
 being applied (commit takes an EXCLUSIVE lock), and a writer's commit is refused while any
 reader still holds a read transaction; WAL removes both directions. For `llm_config.db` the
 mixed read+write hot path is API-token validation: `validate_api_token` runs a SELECT plus a
@@ -4330,7 +4330,13 @@ literature result is shown to the judge up to the answering model's own tool-res
 reports anything. `git commit --no-verify` is the bypass. It is the one pre-commit check
 that blocks; `scripts/check-doc-drift.sh` only warns. The gate checks formatting rather
 than applying it: a hook that rewrites files behind the commit stages something the author
-never saw, so an unformatted file is fixed with `ruff format <file>` and re-staged.
+never saw, so an unformatted file is fixed with `ruff format <file>` and re-staged. The
+format half is switched on by the tracked `.ruff-format-gate` file at the repo root.
+
+The hook scripts are not this repo's own: `scripts/lint-staged.sh`, `scripts/install-git-hooks.sh`
+and `scripts/doc-drift-lib.sh`, plus `scripts/doc_blocks.py`, the renderer `gen-doc-blocks.py` imports, are copies genetics-results-suite's `scripts/vendor.py` writes
+(`configs/vendored.yaml` there). Edit them in that repo; only the rules in
+`scripts/check-doc-drift.sh` are maintained here.
 
 - **Staged, not repo-wide.** A finding in a file the commit does not touch never blocks it.
   The other side of that coin is that a pre-existing finding is only ever cleared by
