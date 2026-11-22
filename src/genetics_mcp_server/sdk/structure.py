@@ -6,6 +6,7 @@
     genetics.structure.neighbourhood(p, 175)["neighbours"]  # residues within 15 Å, PAE < 15
     genetics.structure.adjacency(p)["adjacency"]            # the whole protein, n x n bool
     genetics.structure.view(p, [{"position": 175, "label": "p.R175H", "role": "case"}])
+    genetics.structure.view(p, [175], regions=features.filter(pl.col("feature_type") == "DOMAIN"))
 
 A port of the geometry in the Finucane lab's 3D rare-variant scan (`utils.py`:
 `get_pairwise_distances`, `get_distance_matrix_structure`, `get_pae_matrix_structure`,
@@ -41,7 +42,9 @@ selects from the stored codes exactly the pairs it selects from the model's own 
 fractional cutoff would not, which is why `pae_cutoff` must be a whole number.
 
 SHOWING IT. `view` writes a `.structure-view.json` artifact, which the chat draws as an
-interactive 3D model with the given residues marked; `pml` writes the same marking as a PyMOL
+interactive 3D model with the given residues marked, and with `regions=` named ranges such as
+domains. Labels and region names are not text on the model: the viewer lists them in a legend
+under it, and hovering an entry shows where it is. `pml` writes the residue marking as a PyMOL
 script. Both show ONE model file, so for a long protein they say which residues that file
 does not contain rather than placing them in another file's coordinates.
 
@@ -809,6 +812,9 @@ def distances(
 _MAX_VIEW_BYTES = min(512 * 1024, contract.VIEW_MAX_BYTES)
 
 _HIGHLIGHT_KEYS = ("position", "label", "role", "colour")
+# a region is named by the first of these it has; the last two are protein_features columns,
+# so a row of that frame is a region as it stands
+_REGION_NAME_KEYS = ("name", "description", "feature_type")
 
 # Mol*'s pLDDT confidence theme, which the chat's viewer colours by: each band starts above
 # the pLDDT given, the first covering everything below
@@ -846,7 +852,7 @@ def _artifact_path(path: str | None, default: str, suffix: str) -> str:
     return path
 
 
-def _view_text(value: Any, what: str) -> str | None:
+def _view_text(value: Any, what: str, *, cut: bool = False) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
@@ -857,6 +863,12 @@ def _view_text(value: Any, what: str) -> str | None:
     except UnicodeEncodeError:
         raise GeneticsUsageError(f"{what} is not valid Unicode text") from None
     limit = contract.VIEW_MAX_TEXT_LENGTH
+    if length > limit and cut:
+        # the viewer's own cut, `slice(0, limit - 1) + "…"` over UTF-16 code units, so it
+        # reads back what is written here; "ignore" drops a lead surrogate the cut left
+        # without its pair, which could not be written as UTF-8
+        kept = text.encode("utf-16-le")[: 2 * (limit - 1)]
+        return kept.decode("utf-16-le", "ignore") + "…"
     if length > limit:
         raise GeneticsUsageError(
             f"{what} is too long: {length} UTF-16 code units, and the viewer shows at most "
@@ -896,6 +908,54 @@ def _highlight(item: Any, i: int) -> dict[str, Any]:
         "role": role,
         "colour": colour,
     }
+
+
+def _region(item: Any, i: int) -> dict[str, Any]:
+    what = f"regions[{i}]"
+    # other keys are let through, because a protein_features row carries its own; the
+    # American spelling is the one stray key that would silently lose what was asked for
+    if not isinstance(item, Mapping) or not {"start", "end"} <= set(item) or "color" in item:
+        raise GeneticsUsageError(
+            f"{what} is a dict with 'start', 'end', a 'name' and optionally 'colour' "
+            f"('#rrggbb'), or a row of protein_features, which is named by its description; "
+            f"got {sorted(item) if isinstance(item, Mapping) else item!r}"
+        )
+    name = None
+    for key in _REGION_NAME_KEYS:
+        # cut, not refused: a protein_features description can be longer than the viewer shows
+        if name := _view_text(item.get(key), f"{what}: {key}", cut=True):
+            break
+    if name is None:
+        raise GeneticsUsageError(
+            f"{what} needs a name that is not blank ('name', or a protein_features row's "
+            "'description' or 'feature_type')"
+        )
+    colour = item.get("colour")
+    if colour is not None:
+        if not isinstance(colour, str) or not contract.VIEW_COLOUR_RE.match(colour):
+            raise GeneticsUsageError(
+                f"{what}: colour must be '#rrggbb', got {colour!r}; or leave it out"
+            )
+        colour = colour.lower()
+    return {"name": name, "start": item["start"], "end": item["end"], "colour": colour}
+
+
+def _regions(regions: Any) -> list[dict[str, Any]]:
+    if isinstance(regions, pl.DataFrame):
+        regions = regions.to_dicts()
+    elif isinstance(regions, (str, bytes, Mapping)) or not isinstance(regions, Sequence):
+        raise GeneticsUsageError(
+            "regions is a list of dicts with 'name', 'start' and 'end', or a protein_features frame"
+        )
+    return [_region(r, i) for i, r in enumerate(regions)]
+
+
+def _span(n: int, region: Mapping[str, Any], i: int, positions: str) -> tuple[int, int]:
+    start = _file_index(n, region["start"], f"regions[{i}]: start {positions}") + 1
+    end = _file_index(n, region["end"], f"regions[{i}]: end {positions}") + 1
+    if start > end:
+        raise GeneticsUsageError(f"regions[{i}]: start {start} is after end {end}")
+    return start, end
 
 
 def _sphere(sphere: Any) -> tuple[Any, float] | None:
@@ -938,6 +998,7 @@ class _Layout:
         sphere: Any,
         colour_mode: str,
         model_file_id: str | None,
+        regions: Any = (),
     ):
         if colour_mode not in contract.VIEW_COLOUR_MODES:
             raise GeneticsUsageError(
@@ -951,6 +1012,10 @@ class _Layout:
             raise GeneticsUsageError("highlights is a list of positions or of dicts")
         items = [_highlight(h, i) for i, h in enumerate(list(highlights))]
         ball = _sphere(sphere)
+        spans = _regions(regions)
+        self.regions: list[dict[str, Any]] = []
+        self.regions_clipped: list[dict[str, Any]] = []
+        self.regions_outside: list[dict[str, Any]] = []
         self.outside: list[dict[str, Any]] = []
         self.sphere: dict[str, Any] | None = None
         self.sphere_left_out = False
@@ -958,7 +1023,7 @@ class _Layout:
 
         if isinstance(target, Protein):
             self.accession: str | None = target.accession
-            k = self._choose(target, items, ball, model_file_id)
+            k = self._choose(target, items, ball, spans, model_file_id)
             # again here: the object's attributes are assignable after protein() checked them
             self.accession = _contract_id(target.accession, "the protein's accession")
             self.model_file_id = _contract_id(target.model_file_ids[k], "the model file id")
@@ -981,6 +1046,34 @@ class _Layout:
                     }
                 else:
                     self.sphere_left_out = True
+
+            def holders(*ranges: tuple[int, int]) -> list[str]:
+                return [
+                    mid
+                    for mid, (ws, we) in zip(target.model_file_ids, target.windows)
+                    # lo <= hi: a window can straddle an empty range and must not match it
+                    if any(lo <= hi and ws <= hi and we >= lo for lo, hi in ranges)
+                ]
+
+            for i, region in enumerate(spans):
+                a, b = _span(target.n_residues, region, i, "protein position")
+                given = {"name": region["name"], "start": a, "end": b}
+                if b < s or a > e:
+                    self.regions_outside.append({**given, "model_file_ids": holders((a, b))})
+                    continue
+                lo, hi = max(a, s), min(b, e)
+                if (lo, hi) != (a, b):
+                    # the files for the part cut off, which is where a further view is needed
+                    cut_off = holders((a, s - 1), (e + 1, b))
+                    self.regions_clipped.append({**given, "model_file_ids": cut_off})
+                self.regions.append(
+                    {
+                        "name": region["name"],
+                        "start": _view_position(e - s + 1, lo - s + 1, "file position"),
+                        "end": _view_position(e - s + 1, hi - s + 1, "file position"),
+                        "colour": region["colour"],
+                    }
+                )
         elif isinstance(target, str) and contract.MODEL_FILE_ID_RE.match(target):
             if model_file_id not in (None, target):
                 raise GeneticsUsageError(f"model_file_id {model_file_id!r} is not {target!r}")
@@ -993,6 +1086,9 @@ class _Layout:
                     "centre": self._file_position(ball[0], "sphere centre"),
                     "radius": ball[1],
                 }
+            for i, region in enumerate(spans):
+                a, b = _span(contract.VIEW_MAX_POSITION, region, i, "file position")
+                self.regions.append({**region, "start": a, "end": b})
         else:
             raise GeneticsUsageError(
                 "the first argument is a Protein (genetics.protein_structure(...)) or a "
@@ -1014,6 +1110,11 @@ class _Layout:
         labelled = [r for r in self.residues if r["label"]]
         self.labels_not_drawn = [r["label"] for r in labelled[contract.VIEW_MAX_LABELS :]]
         self.n_labels = len(labelled)
+        if len(self.regions) > contract.VIEW_MAX_REGIONS:
+            raise GeneticsUsageError(
+                f"{len(self.regions)} regions to mark; the viewer shows at most "
+                f"{contract.VIEW_MAX_REGIONS}. Mark fewer"
+            )
 
     def _file_position(self, position: Any, what: str) -> int:
         if _is_address(position):
@@ -1027,7 +1128,11 @@ class _Layout:
 
     @staticmethod
     def _choose(
-        protein: Protein, items: list[dict], ball: tuple[Any, float] | None, mid: str | None
+        protein: Protein,
+        items: list[dict],
+        ball: tuple[Any, float] | None,
+        spans: list[dict],
+        mid: str | None,
     ) -> int:
         if mid is not None:
             if mid not in protein.model_file_ids:
@@ -1035,11 +1140,17 @@ class _Layout:
             return protein.model_file_ids.index(mid)
         if len(protein.windows) == 1:
             return 0
-        if ball is None and not items:
+        if ball is None and not items and not spans:
             raise GeneticsUsageError(
                 f"{protein.accession} has {len(protein.windows)} model files and nothing was "
                 f"given to choose one by; pass model_file_id, one of {protein.model_file_ids}"
             )
+        if ball is None and not items:
+            # a region is a range, so the file showing most of it is the one to open; max
+            # keeps the first of equals, and a file holding all of it cannot be beaten
+            a, b = _span(protein.n_residues, spans[0], 0, "protein position")
+            held = [min(b, e) - max(a, s) for s, e in protein.windows]
+            return held.index(max(held))
         anchor = ball[0] if ball else items[0]["position"]
         position = protein._position(anchor)
         if _is_address(anchor):
@@ -1047,16 +1158,40 @@ class _Layout:
         return int(protein._owner(np.array([position]))[0])
 
     def report(self) -> dict[str, Any]:
-        others = list(dict.fromkeys(o["model_file_id"] for o in self.outside))
+        highlight_files = list(dict.fromkeys(o["model_file_id"] for o in self.outside))
+        others = list(
+            dict.fromkeys(
+                highlight_files
+                + [
+                    mid
+                    for o in self.regions_outside + self.regions_clipped
+                    for mid in o["model_file_ids"]
+                ]
+            )
+        )
         notes = []
         if self.outside:
             notes.append(
                 f"highlights not in {self.model_file_id} were left out "
-                f"({len(self.outside)}); they are in {', '.join(others)}. A model file has its own "
+                f"({len(self.outside)}); they are in {', '.join(highlight_files)}. A model file has its own "
                 "coordinates, so write one view per file (model_file_id=...)"
             )
         if self.sphere_left_out:
             notes.append(f"the sphere's centre is not in {self.model_file_id}; no sphere")
+        if self.regions_outside:
+            notes.append(
+                f"regions with no residue in {self.model_file_id} were left out "
+                f"({len(self.regions_outside)}): "
+                f"{', '.join(o['name'] for o in self.regions_outside)}. Write one view per "
+                "file (model_file_id=...)"
+            )
+        if self.regions_clipped:
+            notes.append(
+                f"regions reaching past {self.model_file_id} are shown only as far as it goes "
+                f"({len(self.regions_clipped)}): "
+                f"{', '.join(o['name'] for o in self.regions_clipped)}. The rest of each is in "
+                "the files its regions_clipped entry names (model_file_id=...)"
+            )
         return {
             "model_file_id": self.model_file_id,
             "n_residues": len(self.residues),
@@ -1074,12 +1209,14 @@ def view(
     highlights: Sequence[Any] = (),
     sphere: tuple[Any, float] | Mapping[str, Any] | None = None,
     *,
+    regions: Sequence[Mapping[str, Any]] | pl.DataFrame = (),
     colour_mode: str = contract.VIEW_DEFAULT_COLOUR_MODE,
     gene: str | None = None,
     model_file_id: str | None = None,
     path: str | None = None,
 ) -> dict[str, Any]:
-    """Show a predicted model in the chat as an interactive 3D view with residues marked.
+    """Show a predicted model in the chat as an interactive 3D view with residues and
+    regions marked.
 
     Writes `<model_file_id>.structure-view.json` into the execution's artifacts directory;
     the chat draws a file with that ending as the structure, so do not also describe a
@@ -1093,39 +1230,66 @@ def view(
     "role": ...}` with `colour` ("#rrggbb") in place of `role`. Roles are "case", "control",
     "both" and "neutral", drawn in the viewer's own colours; a residue with neither is
     neutral grey. Only a residue with a `label` is labelled. A residue given twice is one
-    residue: its first role or colour and its first label stand.
+    residue: its first role or colour and its first label stand. A label is not text on the
+    model: the viewer lists the labels in a legend under it, and hovering one shows where
+    that residue is.
 
     `sphere` — (centre, radius in Å), drawn as a translucent ball around that residue's Cα.
     It is a picture of a radius in ONE file's coordinates, not a computed neighbourhood: to
     show `neighbourhood()`'s residues, list them in `highlights`.
+
+    `regions` — named ranges of residues, a domain or any other stretch: a list of dicts
+    `{"name": ..., "start": ..., "end": ...}`, both ends included, with an optional `colour`
+    ("#rrggbb"). Each is an entry in the viewer's legend, and hovering it shows the range on
+    the model. With a `colour` the cartoon over the range is painted in it for good; without
+    one the cartoon keeps its colouring and the range shows only while hovered, so colour the
+    few that the picture is about. A region colour near the confidence palette's blues,
+    yellow or orange is hard to tell from the model's own colouring. Regions may overlap and keep their order. For a `Protein`,
+    `start` and `end` are protein positions, as in `genetics.protein_features`, and that
+    frame or rows of it can be passed as they are: a row without `name` is named by its
+    `description`, or else its `feature_type`. A name over 80 characters is cut to 80,
+    ending in "…". Filter it first — a frame holds every feature:
+
+        domains = features.filter(pl.col("feature_type") == "DOMAIN")
+        genetics.structure.view(p, highlights, regions=domains)
 
     `colour_mode` — "plddt" (the default: the cartoon in the AlphaFold confidence bands) or
     "uniform".
 
     ONE VIEW SHOWS ONE MODEL FILE. For a protein in several files the file is, in order:
     `model_file_id` if given; the file a (model_file_id, file_position) address names, or
-    else the file that owns the residue, for the sphere's centre if there is a sphere and
-    otherwise for the first highlight. Highlights the file does not contain are NOT drawn
-    and come back in `outside_model_file`; write one more view per file in
-    `other_model_files`, passing `model_file_id=`.
+    else the file that owns the residue, for the sphere's centre if there is a sphere,
+    otherwise for the first highlight. With regions alone it is the file that contains the
+    whole first region, or else the one containing most of it, the earlier file of equals.
+    Highlights the file does not contain are NOT drawn and come back in
+    `outside_model_file`. A region is shown as the part of it the file contains
+    (`regions_clipped`), and one the file contains none of is left out
+    (`regions_outside_model_file`). Write one more view per file in `other_model_files`,
+    passing `model_file_id=`: those are the files holding what this one left out, the cut-off
+    part of a clipped region included.
 
     WHAT A RUN DELIVERS. The chat gets at most four non-image files of one run, taken in
     name order, and none over 512 KiB. One view per model file plus a `.pml` plus a model
     file can be more than four: spread them over several runs.
 
     Returns `path`, `model_file_id`, `n_residues` (distinct residues written), `n_labels`,
-    `labels_not_drawn` (labels past the 40 the viewer draws; those stay visible on hover),
+    `labels_not_drawn` (labels past the 40 the viewer lists in its legend; those are told
+    when the residue itself is hovered),
     `outside_model_file` (one `{position, label, model_file_id}` per highlight left out,
     `position` the protein position and `model_file_id` the file owning it),
     `other_model_files`, `sphere` (as written, in file positions, or None),
-    `sphere_left_out` (true when the chosen file does not contain the centre) and `notes`.
+    `sphere_left_out` (true when the chosen file does not contain the centre), `n_regions`,
+    `regions` (as written, in file positions), `regions_clipped` and
+    `regions_outside_model_file` (one `{name, start, end, model_file_ids}` each, in protein
+    positions as given; `model_file_ids` are the files containing the part of the region not
+    shown, for a region left out every file that contains any of it) and `notes`.
 
     Raises GeneticsUsageError, writing nothing, for what the viewer would refuse or cut:
-    more than 2,000 residues, a label or gene over 80 characters (an emoji counts as two), a
-    radius over 100 Å, a
-    colour that is not #rrggbb, role and colour together, or a file over 512 KiB.
+    more than 2,000 residues, more than 50 regions, a label or gene over 80 characters (an
+    emoji counts as two), a region without a name or with its start after its end, a radius over 100 Å, a colour that is not #rrggbb, role and colour together, or
+    a file over 512 KiB.
     """
-    layout = _Layout(protein, highlights, sphere, colour_mode, model_file_id)
+    layout = _Layout(protein, highlights, sphere, colour_mode, model_file_id, regions)
     spec: dict[str, Any] = {
         "version": contract.VIEW_SPEC_VERSION,
         "model_file_id": _contract_id(layout.model_file_id, "the model file id"),
@@ -1141,12 +1305,15 @@ def view(
     ]
     if layout.sphere:
         spec["sphere"] = layout.sphere
+    written_regions = [{k: v for k, v in r.items() if v is not None} for r in layout.regions]
+    if written_regions:
+        spec["regions"] = written_regions
     spec["colour_mode"] = layout.colour_mode
     data = json.dumps(spec, ensure_ascii=False).encode("utf-8")
     if len(data) > _MAX_VIEW_BYTES:
         raise GeneticsUsageError(
             f"the view is {len(data)} bytes; the chat delivers at most {_MAX_VIEW_BYTES}. "
-            "Mark fewer residues or shorten the labels"
+            "Mark fewer residues or regions, or shorten the labels"
         )
     written = _artifact_path(
         path, layout.model_file_id + contract.VIEW_NAME_SUFFIX, contract.VIEW_NAME_SUFFIX
@@ -1157,9 +1324,18 @@ def view(
     if layout.labels_not_drawn:
         report["notes"].append(
             f"{len(layout.labels_not_drawn)} labels are past the "
-            f"{contract.VIEW_MAX_LABELS} the viewer draws; they show on hover only"
+            f"{contract.VIEW_MAX_LABELS} the viewer lists in its legend; they are told "
+            "only when the residue itself is hovered"
         )
-    return {"path": written, "labels_not_drawn": layout.labels_not_drawn, **report}
+    return {
+        "path": written,
+        "labels_not_drawn": layout.labels_not_drawn,
+        **report,
+        "n_regions": len(written_regions),
+        "regions": written_regions,
+        "regions_clipped": layout.regions_clipped,
+        "regions_outside_model_file": layout.regions_outside,
+    }
 
 
 def _rgb(colour: str) -> str:
@@ -1236,7 +1412,7 @@ def pml(
     """The same marking as `view`, as a PyMOL script for someone who opens the model in
     their own PyMOL.
 
-    Takes what `view` takes and chooses the model file the same way. Writes
+    Takes what `view` takes except `regions` and chooses the model file the same way. Writes
     `<model_file_id>.pml` into the artifacts directory (`path` renames it; it must end
     `.pml`): the cartoon coloured by pLDDT in the four AlphaFold bands (pLDDT is the
     B-factor column) or plain grey with `colour_mode="uniform"`, a sphere on the Cα of every
@@ -1261,7 +1437,7 @@ def pml(
     file for it is not downloadable from the chat.
 
     Returns `path`, `model_file` (the name the script loads) and what `view` returns except
-    the label counts: PyMOL draws every label.
+    the region keys and the label counts: PyMOL draws every label.
     """
     layout = _Layout(protein, highlights, sphere, colour_mode, model_file_id)
     mid = layout.model_file_id
