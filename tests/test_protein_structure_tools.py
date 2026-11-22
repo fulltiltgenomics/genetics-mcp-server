@@ -1204,12 +1204,14 @@ def test_code_surface_prompt_carries_the_sdk_block_where_the_layer_is_served(var
     assert CODE_HEADING not in without
     assert prompt.count(CODE_HEADING) == 1
     block = CODE_HEADING + prompt.split(CODE_HEADING)[1].split("\n###")[0]
-    assert len(prompt) - len(without) == len(block) + 1 <= 1050
+    assert len(prompt) - len(without) == len(block) + 1 <= 1240
     for name in (
         "`genetics.protein_variants`",
         "`genetics.protein_features`/`protein_residues`",
         "`genetics.protein_structure(...)`",
         "`genetics.structure` (`distances`, `neighbourhood`, `view` for a 3D view in the chat)",
+        "with `regions=`, domains or other ranges",
+        "listed in a legend under the model, not written on it",
         "`get_protein_annotations`",
         "its PAE and min pLDDT",
         "PAE (above about 15)",

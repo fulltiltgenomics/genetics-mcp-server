@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import polars as pl
 import pytest
 
 from genetics_mcp_server.sdk import _structure_contract as contract
@@ -105,7 +106,6 @@ def browser_parse(text: str) -> dict:
         if not (first["label"] or "").strip() and (entry["label"] or "").strip():
             first["label"] = entry["label"]
     distinct = list(by_position.values())
-    labels = sum(1 for r in distinct[:2000] if (r["label"] or "").strip())
     sphere = raw.get("sphere")
     if sphere is not None:
         radius = sphere.get("radius") if isinstance(sphere, dict) else None
@@ -117,6 +117,25 @@ def browser_parse(text: str) -> dict:
     mode = raw.get("colour_mode") or "plddt"
     if mode not in ("plddt", "uniform"):
         raise SpecError("colour_mode")
+    regions = raw.get("regions")
+    if regions is not None and not isinstance(regions, list):
+        raise SpecError("regions")
+    spans = []
+    for r in regions or []:
+        if not isinstance(r, dict):
+            raise SpecError("region")
+        name = text_of(r.get("name"), "name")
+        if not (name or "").strip():
+            raise SpecError("name")
+        start, end = position(r.get("start"), "start"), position(r.get("end"), "end")
+        if start > end:
+            raise SpecError("order")
+        colour = r.get("colour")
+        if colour is not None:
+            if not isinstance(colour, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
+                raise SpecError("colour")
+            colour = colour.lower()
+        spans.append({"name": name, "start": start, "end": end, "colour": colour})
     return {
         "modelFileId": mid,
         "accession": text_of(raw.get("accession"), "accession"),
@@ -124,7 +143,8 @@ def browser_parse(text: str) -> dict:
         "residues": distinct[:2000],
         "sphere": sphere,
         "colourMode": mode,
-        "omitted": {"residues": max(0, len(distinct) - 2000), "labels": max(0, labels - 40)},
+        "regions": spans[:50],
+        "omitted": {"residues": max(0, len(distinct) - 2000), "regions": max(0, len(spans) - 50)},
     }
 
 
@@ -157,7 +177,7 @@ class TestOneFile:
         assert (spec["modelFileId"], spec["accession"], spec["gene"]) == ("T-F1", "T", "TP53")
         assert spec["sphere"] == {"centre": 175, "radius": 15.0}
         assert spec["colourMode"] == "plddt"
-        assert spec["omitted"] == {"residues": 0, "labels": 0}
+        assert spec["omitted"] == {"residues": 0, "regions": 0}
         assert [(r["filePosition"], r["label"], r["colour"]) for r in spec["residues"]] == [
             (175, "p.R175H", "#d62728"),
             (248, "p.R248Q", "#1f77b4"),
@@ -257,6 +277,248 @@ class TestSeveralFiles:
             st.view(TWO, [10])
 
 
+def _features(rows) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            dict(source="uniprot", feature_type=t, start=a, end=b, description=d, evidence="")
+            for t, a, b, d in rows
+        ]
+    )
+
+
+class TestRegions:
+    def test_regions_are_written_in_order_and_parse_under_the_browsers_rules(self):
+        regions = [
+            {"name": " DNA-binding ", "start": 102, "end": 292, "colour": "#2CA02C"},
+            {"name": "Tetramerisation", "start": 325, "end": 356},
+            {"name": "inside the first", "start": 175, "end": 175},
+        ]
+        result = st.view(ONE, [175], regions=regions)
+        written = json.loads(Path(result["path"]).read_text())
+        assert written["version"] == 1
+        assert written["regions"] == [
+            {"name": "DNA-binding", "start": 102, "end": 292, "colour": "#2ca02c"},
+            {"name": "Tetramerisation", "start": 325, "end": 356},
+            {"name": "inside the first", "start": 175, "end": 175},
+        ]
+        assert result["regions"] == written["regions"] and result["n_regions"] == 3
+        assert result["regions_clipped"] == [] and result["regions_outside_model_file"] == []
+        assert result["notes"] == []
+        assert [
+            (r["name"], r["start"], r["end"], r["colour"]) for r in _parsed(result)["regions"]
+        ] == [
+            ("DNA-binding", 102, 292, "#2ca02c"),
+            ("Tetramerisation", 325, 356, None),
+            ("inside the first", 175, 175, None),
+        ]
+
+    def test_no_regions_writes_no_key(self):
+        assert "regions" not in json.loads(Path(st.view(ONE, [1])["path"]).read_text())
+        assert st.view(ONE, [1])["n_regions"] == 0
+
+    def test_rows_of_the_features_frame_are_regions_as_they_stand(self):
+        features = _features(
+            [("DOMAIN", 5, 20, "Kinase"), ("REGION", 30, 40, None), ("DOMAIN", 50, 60, "  ")]
+        )
+        expected = [
+            {"name": "Kinase", "start": 5, "end": 20},
+            {"name": "REGION", "start": 30, "end": 40},
+            {"name": "DOMAIN", "start": 50, "end": 60},
+        ]
+        assert st.view(ONE, regions=features)["regions"] == expected
+        assert st.view(ONE, regions=features.to_dicts())["regions"] == expected
+        coloured = features.with_columns(name=pl.lit("mine"), colour=pl.lit("#000000"))
+        assert st.view(ONE, regions=coloured)["regions"][0] == {
+            "name": "mine",
+            "start": 5,
+            "end": 20,
+            "colour": "#000000",
+        }
+
+    def test_a_model_file_id_takes_file_positions(self):
+        result = st.view("AF-X-F1-model_v6", regions=[{"name": "a", "start": 1, "end": 100_000}])
+        assert result["regions"] == [{"name": "a", "start": 1, "end": 100_000}]
+
+    def test_a_region_is_cut_to_the_model_file_and_one_outside_it_is_left_out(self):
+        # windows are protein positions 1..6 and 4..9
+        regions = [
+            {"name": "whole", "start": 1, "end": 9, "colour": "#111111"},
+            {"name": "head", "start": 1, "end": 3},
+            {"name": "tail", "start": 7, "end": 9},
+            {"name": "overlap", "start": 5, "end": 7},
+        ]
+        first = st.view(TWO, [2], regions=regions)
+        assert first["model_file_id"] == "T-F1"
+        assert first["regions"] == [
+            {"name": "whole", "start": 1, "end": 6, "colour": "#111111"},
+            {"name": "head", "start": 1, "end": 3},
+            {"name": "overlap", "start": 5, "end": 6},
+        ]
+        assert first["regions_clipped"] == [
+            {"name": "whole", "start": 1, "end": 9, "model_file_ids": ["T-F2"]},
+            {"name": "overlap", "start": 5, "end": 7, "model_file_ids": ["T-F2"]},
+        ]
+        assert first["regions_outside_model_file"] == [
+            {"name": "tail", "start": 7, "end": 9, "model_file_ids": ["T-F2"]}
+        ]
+        assert first["other_model_files"] == ["T-F2"]
+        assert any("tail" in n and "left out" in n for n in first["notes"])
+        assert any("whole, overlap" in n and "only as far" in n for n in first["notes"])
+        second = st.view(TWO, regions=regions, model_file_id="T-F2")
+        # window 2 starts at protein position 4, so protein 5..7 is file 2..4
+        assert second["regions"] == [
+            {"name": "whole", "start": 1, "end": 6, "colour": "#111111"},
+            {"name": "tail", "start": 4, "end": 6},
+            {"name": "overlap", "start": 2, "end": 4},
+        ]
+        assert [o["name"] for o in second["regions_outside_model_file"]] == ["head"]
+        assert second["regions_clipped"] == [
+            {"name": "whole", "start": 1, "end": 9, "model_file_ids": ["T-F1"]}
+        ]
+        assert _parsed(second)["regions"][1]["end"] == 6
+
+    def test_a_clipped_region_names_the_files_holding_the_rest_of_it(self):
+        result = st.view(TWO, [2], regions=[{"name": "whole", "start": 1, "end": 9}])
+        assert result["model_file_id"] == "T-F1"
+        assert result["regions_clipped"] == [
+            {"name": "whole", "start": 1, "end": 9, "model_file_ids": ["T-F2"]}
+        ]
+        assert result["regions_outside_model_file"] == []
+        assert result["other_model_files"] == ["T-F2"]
+        assert any("only as far" in n and "regions_clipped" in n for n in result["notes"])
+        # following other_model_files reaches the part cut off
+        (mid,) = result["other_model_files"]
+        assert st.view(TWO, regions=[{"name": "whole", "start": 1, "end": 9}], model_file_id=mid)[
+            "regions"
+        ] == [{"name": "whole", "start": 1, "end": 6}]
+        # only a side that is cut off counts: 5..10 loses 10 from the middle file and nothing
+        # before it, so the first file is not named although it holds 5..6
+        three = st.protein(_rows([(1, 6), (4, 9), (7, 12)]), {})
+        middle = st.view(
+            three, regions=[{"name": "r", "start": 5, "end": 10}], model_file_id="T-F2"
+        )
+        assert middle["regions_clipped"][0]["model_file_ids"] == ["T-F3"]
+        assert middle["other_model_files"] == ["T-F3"]
+        both = st.view(three, regions=[{"name": "r", "start": 2, "end": 11}], model_file_id="T-F2")
+        assert both["other_model_files"] == ["T-F1", "T-F3"]
+
+    def test_the_highlight_note_names_only_the_highlights_files(self):
+        three = st.protein(_rows([(1, 6), (4, 9), (7, 12)]), {})
+        result = st.view(three, [2, 8], regions=[{"name": "r", "start": 1, "end": 12}])
+        assert result["other_model_files"] == ["T-F2", "T-F3"]
+        assert any(n.startswith("highlights") and "T-F3" not in n for n in result["notes"])
+
+    def test_with_regions_alone_the_file_holding_most_of_the_first_region_is_shown(self):
+        def chosen(start, end, protein=TWO, **kwargs):
+            return st.view(protein, regions=[{"name": "t", "start": start, "end": end}], **kwargs)
+
+        assert chosen(8, 9)["model_file_id"] == "T-F2"
+        # 4..9 starts in the first file's own stretch but only the second holds it whole
+        whole = chosen(4, 9)
+        assert whole["model_file_id"] == "T-F2"
+        assert whole["regions"] == [{"name": "t", "start": 1, "end": 6}]
+        assert whole["regions_clipped"] == [] and whole["other_model_files"] == []
+        # held whole by both: the earlier file
+        assert chosen(4, 6)["model_file_id"] == "T-F1"
+        # held whole by neither: 3..9 has four residues in the first file and six in the second
+        assert chosen(3, 9)["model_file_id"] == "T-F2"
+        assert chosen(1, 7)["model_file_id"] == "T-F1"
+        # as much in each: the earlier file
+        assert chosen(1, 9)["model_file_id"] == "T-F1"
+        # only the first region chooses
+        two = [{"name": "a", "start": 1, "end": 2}, {"name": "b", "start": 4, "end": 9}]
+        assert st.view(TWO, regions=two)["model_file_id"] == "T-F1"
+        # a highlight or a sphere still chooses before any region
+        assert st.view(TWO, [2], regions=[{"name": "t", "start": 4, "end": 9}])[
+            "model_file_id"
+        ] == ("T-F1")
+        assert st.view(TWO, [2], regions=[{"name": "t", "start": 8, "end": 9}])["n_regions"] == 0
+        sphere = st.view(TWO, sphere=(2, 5), regions=[{"name": "t", "start": 4, "end": 9}])
+        assert sphere["model_file_id"] == "T-F1"
+
+    @pytest.mark.parametrize(
+        "match, region",
+        [
+            ("start 3 is after end 2", {"name": "a", "start": 3, "end": 2}),
+            ("start protein position 0 is outside 1..9", {"name": "a", "start": 0, "end": 2}),
+            ("end protein position 10 is outside 1..9", {"name": "a", "start": 1, "end": 10}),
+            ("must be an integer", {"name": "a", "start": 1, "end": None}),
+        ],
+    )
+    def test_a_bad_first_region_is_refused_before_it_chooses_a_file(self, artifacts, match, region):
+        with pytest.raises(GeneticsUsageError, match=match):
+            st.view(TWO, regions=[region])
+        assert list(artifacts.iterdir()) == []
+
+    def test_the_cap(self, artifacts):
+        many = [{"name": f"r{i}", "start": i, "end": i + 1} for i in range(1, 52)]
+        assert contract.VIEW_MAX_REGIONS == 50
+        assert st.view(ONE, regions=many[:50])["n_regions"] == 50
+        os.remove(artifacts / f"T-F1{SUFFIX}")
+        with pytest.raises(GeneticsUsageError, match="51 regions to mark.*at most 50"):
+            st.view(ONE, regions=many)
+        assert list(artifacts.iterdir()) == []
+        # counted over what the chosen file holds, as the viewer counts
+        spread = [{"name": "t", "start": 8, "end": 9}] * 30 + [
+            {"name": "h", "start": 1, "end": 2}
+        ] * 30
+        assert st.view(TWO, regions=spread)["n_regions"] == 30
+
+    @pytest.mark.parametrize(
+        "match, region",
+        [
+            ("needs a name", {"start": 1, "end": 2}),
+            ("needs a name", {"name": " ", "start": 1, "end": 2}),
+            ("name must be text", {"name": 5, "start": 1, "end": 2}),
+            ("is a dict with 'start', 'end'", {"name": "a", "start": 1}),
+            ("is a dict with 'start', 'end'", (1, 2)),
+            (
+                "is a dict with 'start', 'end'",
+                {"name": "a", "start": 1, "end": 2, "color": "#000000"},
+            ),
+            ("start 3 is after end 2", {"name": "a", "start": 3, "end": 2}),
+            ("start protein position 0 is outside 1..3000", {"name": "a", "start": 0, "end": 2}),
+            ("end protein position 3001 is outside", {"name": "a", "start": 1, "end": 3001}),
+            ("must be an integer", {"name": "a", "start": 1.0, "end": 2}),
+            ("must be an integer", {"name": "a", "start": 1, "end": True}),
+            ("must be an integer", {"name": "a", "start": None, "end": 2}),
+            ("#rrggbb", {"name": "a", "start": 1, "end": 2, "colour": "red"}),
+            ("#rrggbb", {"name": "a", "start": 1, "end": 2, "colour": "#fff"}),
+        ],
+    )
+    def test_a_bad_region_is_refused_and_nothing_written(self, artifacts, match, region):
+        with pytest.raises(GeneticsUsageError, match=match):
+            st.view(ONE, [1], regions=[region])
+        assert list(artifacts.iterdir()) == []
+
+    @pytest.mark.parametrize("key", ["name", "description", "feature_type"])
+    def test_a_long_name_is_cut_as_the_viewer_would_cut_it(self, key):
+        def named(text):
+            result = st.view(ONE, regions=[{key: text, "start": 1, "end": 2}])
+            assert _parsed(result)["regions"][0]["name"] == result["regions"][0]["name"]
+            return result["regions"][0]["name"]
+
+        assert named("x" * 80) == "x" * 80
+        assert named("x" * 81) == "x" * 79 + "…"
+        # counted in UTF-16 units, where a character outside the BMP is two
+        assert named("\U0001f9ec" * 41) == "\U0001f9ec" * 39 + "…"
+        # a cut that would land inside such a character leaves it out whole
+        assert named("xx" + "\U0001f9ec" * 40) == "xx" + "\U0001f9ec" * 38 + "…"
+        # the surrounding blanks are gone before the count
+        assert named(" " + "x" * 80 + " ") == "x" * 80
+
+    def test_what_is_not_a_list_of_regions(self, artifacts):
+        for bad in ({"name": "a", "start": 1, "end": 2}, "DOMAIN", 5):
+            with pytest.raises(GeneticsUsageError, match="regions is a list of dicts"):
+                st.view(ONE, regions=bad)
+        with pytest.raises(GeneticsUsageError, match="file position 100001 is outside"):
+            st.view("AF-X-F1-model_v6", regions=[{"name": "a", "start": 1, "end": 100_001}])
+        assert list(artifacts.iterdir()) == []
+
+    def test_pml_takes_no_regions(self):
+        assert "n_regions" not in st.pml(ONE, [1])
+
+
 class TestLimits:
     def _refused(self, artifacts, match, *args, **kwargs):
         with pytest.raises(GeneticsUsageError, match=match):
@@ -273,8 +535,7 @@ class TestLimits:
     def test_labels_past_the_drawn_ones_are_kept_and_named(self):
         result = st.view(ONE, [{"position": i, "label": f"L{i}"} for i in range(1, 43)])
         assert result["n_labels"] == 42 and result["labels_not_drawn"] == ["L41", "L42"]
-        assert "hover" in result["notes"][-1]
-        assert _parsed(result)["omitted"]["labels"] == 2
+        assert "legend" in result["notes"][-1] and "hover" in result["notes"][-1]
 
     def test_text_length_is_counted_as_the_viewer_counts_it(self, artifacts):
         assert st.view(ONE, [{"position": 1, "label": "x" * 80}], gene="g" * 80)
@@ -341,7 +602,14 @@ class TestLimits:
 
     def test_the_docstring_states_the_limits_the_contract_holds(self):
         doc = st.view.__doc__
-        for said in ("2,000 residues", "80 characters", "100 Å", "512 KiB", "the 40 the viewer"):
+        for said in (
+            "2,000 residues",
+            "50 regions",
+            "80 characters",
+            "100 Å",
+            "512 KiB",
+            "the 40 the viewer lists in its legend",
+        ):
             assert said in doc
         assert (
             contract.VIEW_MAX_RESIDUES,
@@ -349,7 +617,8 @@ class TestLimits:
             contract.VIEW_MAX_SPHERE_RADIUS,
             contract.VIEW_MAX_LABELS,
             contract.VIEW_MAX_POSITION,
-        ) == (2000, 80, 100, 40, 100_000)
+            contract.VIEW_MAX_REGIONS,
+        ) == (2000, 80, 100, 40, 100_000, 50)
 
 
 def _real_parser() -> str | None:
@@ -373,6 +642,18 @@ def test_the_browsers_own_parser_accepts_the_written_views(artifacts, tmp_path_f
         st.view(TWO, [2, 5, 8], model_file_id="T-F2", path="two-f2.structure-view.json"),
         st.view(ONE, many, colour_mode="uniform", path="many.structure-view.json"),
         st.view("AF-X-F1-model_v6", path="bare.Structure-View.JSON"),
+        # a parser from before regions has to read this one too: the version did not change
+        st.view(
+            TWO,
+            [2],
+            regions=[{"name": "d", "start": 1, "end": 9, "colour": "#2ca02c"}],
+            path="regions.structure-view.json",
+        ),
+        st.view(
+            ONE,
+            regions=[{"description": "d" * 200, "start": 1, "end": 9}],
+            path="long-name.structure-view.json",
+        ),
     ]
     paths = [r["path"] for r in results]
     script = tmp_path_factory.mktemp("node") / "parse.mjs"
@@ -386,9 +667,12 @@ def test_the_browsers_own_parser_accepts_the_written_views(artifacts, tmp_path_f
         "  VIEW_DEFAULT_COLOUR_MODE: v.VIEW_DEFAULT_COLOUR_MODE,\n"
         "  VIEW_ROLE_COLOURS: v.ROLE_COLOURS, VIEW_SPHERE_COLOUR: v.NEIGHBOURHOOD_COLOUR,\n"
         "  VIEW_MAX_BYTES: v.MAX_SPEC_BYTES, VIEW_MAX_RESIDUES: v.MAX_RESIDUES,\n"
-        "  VIEW_MAX_LABELS: v.MAX_LABELS, VIEW_MAX_TEXT_LENGTH: v.MAX_TEXT_LENGTH,\n"
+        "  VIEW_MAX_LABELS: v.MAX_LABELS, VIEW_MAX_REGIONS: v.MAX_REGIONS,\n"
+        "  VIEW_MAX_TEXT_LENGTH: v.MAX_TEXT_LENGTH,\n"
         "  VIEW_MAX_POSITION: v.MAX_POSITION, VIEW_MAX_SPHERE_RADIUS: v.MAX_SPHERE_RADIUS};\n"
-        "console.log(JSON.stringify({views, pins}));\n"
+        # a name the parser does not export is written as null, so its pin fails by name
+        # where JSON.stringify would have dropped the key and the comparison with it
+        "console.log(JSON.stringify({views, pins}, (k, x) => (x === undefined ? null : x)));\n"
     )
     run = subprocess.run(
         [node, "--experimental-strip-types", "--no-warnings", str(script), *paths],
@@ -407,8 +691,13 @@ def test_the_browsers_own_parser_accepts_the_written_views(artifacts, tmp_path_f
         assert spec["modelFileId"] == result["model_file_id"] == port["modelFileId"]
         assert len(spec["residues"]) == result["n_residues"]
         assert spec["omitted"] == port["omitted"]
-        assert spec["omitted"]["residues"] == 0
-        assert spec["omitted"]["labels"] == len(result["labels_not_drawn"])
+        assert spec["omitted"] == {"residues": 0, "regions": 0}
+        assert [{k: v for k, v in r.items() if v is not None} for r in spec["regions"]] == result[
+            "regions"
+        ]
+        assert [(r["name"], r["start"], r["end"], r.get("colour")) for r in spec["regions"]] == [
+            (r["name"], r["start"], r["end"], r["colour"]) for r in port["regions"]
+        ]
         assert spec.get("sphere") == result["sphere"] == port["sphere"]
         # the port and the real parser agree residue by residue, so the port's verdicts on
         # the other tests' files stand for the browser's
