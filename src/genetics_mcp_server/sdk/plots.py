@@ -37,6 +37,7 @@ a script's author to discover it.
 
 from __future__ import annotations
 
+import collections
 import itertools
 import math
 import os
@@ -4819,10 +4820,19 @@ _TRACK_LABEL_SIZE = 4.5
 _TRACK_LABEL_PAD_IN = 0.02
 _TRACK_LABEL_CHARS = 28
 
-# Lanes a feature type may take while its labels hang beside the boxes too narrow to hold
-# them. Past this the hanging labels are what is filling the lanes, so they are dropped and
-# the boxes packed again on their own.
-_TRACK_MAX_LANES = 3
+# what parts one feature row from the next: more than the space between two lanes of one
+# row, or stacked lanes read as rows of their own
+_TRACK_ROW_GAP_IN = 0.06
+_TRACK_BAND = "#F1F3F6"
+
+# A description this many boxes of one row share is said once, in the legend, and its boxes
+# are drawn thin — when at least one of them has no room for the words. Below this the
+# legend entry costs more than the boxes it names.
+_TRACK_SHARED_MIN = 3
+_TRACK_THIN = 0.4
+
+# TED writes a domain made of separate stretches as one feature per stretch
+_TRACK_SEGMENT = re.compile(r"\bsegment \d+/\d+\b")
 
 
 def _track_fetch(name: str, protein: str, have_residues: bool = False, *args: Any) -> pl.DataFrame:
@@ -5181,6 +5191,56 @@ def _track_feature_labels(row: dict[str, Any]) -> list[str]:
     return [_plain(description, _TRACK_LABEL_CHARS)]
 
 
+def _track_segmented(row: dict[str, Any]) -> str | None:
+    """The domain a TED feature is one segment of, or None for a feature that is whole."""
+    found = _TRACK_SEGMENT.search(str(row.get("description") or ""))
+    if str(row.get("source") or "").lower() != "ted" or not found:
+        return None
+    # the words ahead of the marker name the domain; with none there is nothing to say
+    # which other segments this one belongs with
+    ahead = found.string[: found.start()].split()
+    return ahead[0] if ahead else None
+
+
+def _track_place_labels(
+    units: list[dict[str, Any]], lo: int, hi: int, per_in: float, needs: Any
+) -> None:
+    """Give each unit its label where there is room for one, and none where there is not.
+
+    A unit is one feature, or the segments of one domain. Lanes are already decided and a
+    label never moves a box: it goes inside the unit's widest box, else right of the unit,
+    else left of it, and only into space nothing else in the lane is using.
+    """
+    by_lane: dict[int, list[dict[str, Any]]] = {}
+    for unit in units:
+        by_lane.setdefault(unit["lane"], []).append(unit)
+    for lane in by_lane.values():
+        taken = lo - 0.5
+        for unit, after in zip(lane, [*lane[1:], None]):
+            marks = unit["marks"]
+            for mark in marks:
+                mark["inside"] = mark["outside"] = mark["side"] = None
+            left, right = marks[0]["start"] - 0.5, unit["end"] + 0.5
+            free_to = after["marks"][0]["start"] - 0.5 if after else hi + 0.5
+            labels = [] if unit["thin"] else unit["labels"]
+            unit["said"] = False
+            if labels:
+                widest = max(marks, key=lambda m: m["end"] - m["start"])
+                box_in = (widest["end"] - widest["start"] + 1) / per_in
+                widest["inside"] = next((t for t in labels if needs(t) <= box_in), None)
+                room = needs(labels[-1]) * per_in
+                if widest["inside"]:
+                    pass
+                elif right + room <= free_to:
+                    last = max(marks, key=lambda m: m["end"])
+                    last["outside"], last["side"] = labels[-1], "right"
+                    right += room
+                elif left - room >= taken:
+                    marks[0]["outside"], marks[0]["side"] = labels[-1], "left"
+                unit["said"] = any(m["inside"] or m["outside"] for m in marks)
+            taken = right
+
+
 def _track_feature_rows(
     features: pl.DataFrame | None, feature_types: list[str], lo: int, hi: int, axis_in: float
 ) -> tuple[list[dict[str, Any]], int]:
@@ -5222,39 +5282,66 @@ def _track_feature_rows(
         if chosen.is_empty():
             continue
         marks = []
+        by_key: dict[Any, dict[str, Any]] = {}
         for row in chosen.iter_rows(named=True):
-            start, end = max(row["start"], lo), min(row["end"], hi)
-            labels = _track_feature_labels(row)
-            box_in = (end - start + 1) / per_in
-            inside = next((t for t in labels if needs(t) <= box_in), None)
-            reach = None
-            if inside is None and labels:
-                reach = end + 0.5 + needs(labels[-1]) * per_in
-                if reach > hi + 0.5:
-                    reach = None
             tier = str(row.get("evidence_tier") or "unknown").lower()
-            marks.append(
+            mark = {
+                "start": max(row["start"], lo),
+                "end": min(row["end"], hi),
+                "tier": tier if tier in _TRACK_TIERS else "unknown",
+                "thin": False,
+            }
+            domain = _track_segmented(row)
+            unit = by_key.setdefault(
+                domain or len(marks),
                 {
-                    "start": start,
-                    "end": end,
-                    "tier": tier if tier in _TRACK_TIERS else "unknown",
-                    "inside": inside,
-                    "outside": labels[-1] if reach is not None else None,
-                    "reach": reach,
-                }
+                    "marks": [],
+                    "labels": _track_feature_labels(row),
+                    "whole": domain is None,
+                    "thin": False,
+                },
             )
-        lanes = _track_lanes([(m["start"], m["reach"] or m["end"]) for m in marks])
-        if max(lanes) + 1 > _TRACK_MAX_LANES:
-            for mark in marks:
-                mark["outside"] = None
-            lanes = _track_lanes([(m["start"], m["end"]) for m in marks])
-        for mark, lane in zip(marks, lanes):
-            mark["lane"] = lane
+            unit["marks"].append(mark)
+            marks.append(mark)
+        # in start order, as the features are: a unit is keyed at its first box
+        units = list(by_key.values())
+        for unit in units:
+            unit["end"] = max(m["end"] for m in unit["marks"])
+        # a segmented domain holds its lane from its first residue to its last, so what
+        # lies between two of its segments is drawn on another lane and not across the link
+        lanes = _track_lanes([(u["marks"][0]["start"], u["end"]) for u in units])
+        for unit, lane in zip(units, lanes):
+            unit["lane"] = lane
+            for mark in unit["marks"]:
+                mark["lane"] = lane
+        _track_place_labels(units, lo, hi, per_in, needs)
+
+        shared = None
+        named = [u for u in units if u["whole"] and u["labels"]]
+        for text, n in collections.Counter(u["labels"][0] for u in named).most_common():
+            same = [u for u in named if u["labels"][0] == text]
+            if n >= _TRACK_SHARED_MIN and not all(u["said"] for u in same):
+                shared = text
+                for unit in same:
+                    unit["thin"] = unit["marks"][0]["thin"] = True
+                # the words these boxes held are room their neighbours may now use
+                _track_place_labels(units, lo, hi, per_in, needs)
+                break
         rows.append(
             {
                 "feature_type": str(chosen["feature_type"][0]),
                 "marks": marks,
+                "links": [
+                    (unit["lane"], a["end"] + 0.5, b["start"] - 0.5, a["tier"])
+                    for unit in units
+                    for a, b in zip(unit["marks"], unit["marks"][1:])
+                    if b["start"] > a["end"] + 1
+                ],
                 "lanes": max(lanes) + 1,
+                "shared": shared,
+                "n_unlabelled": sum(
+                    len(u["marks"]) for u in units if not u["said"] and not u["thin"]
+                ),
             }
         )
     return rows, dropped
@@ -5472,11 +5559,15 @@ def protein_track(
 
     - one row per feature type in `feature_types` that the protein has — by default TED
       domains and UniProt domains, repeats, zinc fingers and regions; pass any
-      `feature_type` values the features frame holds. Features of a type that overlap are
-      stacked in lanes: taken in start order, each goes in the first lane that is free. A
-      box says its description when that fits inside it, else beside it. The fill is the
-      evidence tier: solid for experimental, tinted for curated, hollow for predicted (every
-      TED domain is), dotted grey for unknown.
+      `feature_type` values the features frame holds. Features of a type that overlap in
+      residues are stacked in lanes: taken in start order, each goes in the first lane that
+      is free; the row's name is level with its first lane. The segments of one TED domain
+      share a lane, joined by a line and named once. A box says its description inside it
+      when that fits, else beside it when nothing else is there, else not at all
+      (`n_unlabelled` counts those). A description three or more boxes of a row share, not
+      all with room for it, is said once in the legend (`thin: Disordered`) and those boxes
+      are drawn thin. The fill is the evidence tier: solid for experimental, tinted for
+      curated, hollow for predicted (every TED domain is), dotted grey for unknown.
     - pLDDT in AlphaFold's four bands; grey where a position has no residue row.
     - one heatmap row per entry of `scores` — a column of `residues`, a list of them,
       `{label: column}`, or `{label: {"column": ..., "bin": "max" | "min" | "mean",
@@ -5559,7 +5650,8 @@ def protein_track(
     import matplotlib
     import matplotlib.pyplot as plt
     from matplotlib.colors import BoundaryNorm, ListedColormap
-    from matplotlib.patches import Patch
+    from matplotlib.legend_handler import HandlerPatch
+    from matplotlib.patches import Patch, Rectangle
 
     if isinstance(feature_types, str):
         feature_types = [feature_types]
@@ -5723,6 +5815,8 @@ def protein_track(
     # label is a gap
     bands: list[tuple[str | None, float, Any]] = []
     for feature_row in feature_rows:
+        if bands:
+            bands.append((None, _TRACK_ROW_GAP_IN, None))
         bands.append(
             (feature_row["feature_type"], feature_row["lanes"] * _TRACK_LANE_IN, feature_row)
         )
@@ -5788,50 +5882,78 @@ def protein_track(
     )
     tick_at, tick_labels = [], []
     tiers_drawn: set[str] = set()
+    shared: dict[str, str] = {}
     drawn_rows = []
     top = body_in
     for label, height, what in bands:
         bottom = top - height
+        is_features = isinstance(what, dict) and "marks" in what
         if label is not None:
-            tick_at.append(bottom + height / 2)
+            # a feature row is named at its first lane, where a row of one lane has its
+            # name too, so the names line up the same way whatever the lane count
+            tick_at.append(top - _TRACK_LANE_IN / 2 if is_features else bottom + height / 2)
             tick_labels.append(label)
-        if isinstance(what, dict) and "marks" in what:
-            unlabelled = 0
-            for mark in what["marks"]:
-                tiers_drawn.add(mark["tier"])
-                unlabelled += mark["inside"] is None and mark["outside"] is None
+        if is_features:
+            tiers_drawn.update(mark["tier"] for mark in what["marks"])
+            if what["shared"]:
+                shared[what["feature_type"]] = what["shared"]
+            ax.broken_barh(
+                [(lo - 0.5, hi - lo + 1)],
+                (bottom, height),
+                facecolors=_TRACK_BAND,
+                linewidth=0,
+                zorder=1,
+            )
+            box = _TRACK_LANE_IN - 0.03
+            for lane, x_from, x_to, tier in what["links"]:
+                y = top - (lane + 0.5) * _TRACK_LANE_IN
+                ax.plot(
+                    [x_from, x_to],
+                    [y, y],
+                    color=_TRACK_TIERS[tier][1],
+                    linewidth=0.5,
+                    solid_capstyle="butt",
+                    zorder=2,
+                )
             for lane in range(what["lanes"]):
                 y = top - (lane + 1) * _TRACK_LANE_IN + 0.015
-                box = _TRACK_LANE_IN - 0.03
                 for tier, (face, edge, style, ink) in _TRACK_TIERS.items():
                     marks = [m for m in what["marks"] if m["lane"] == lane and m["tier"] == tier]
-                    if not marks:
-                        continue
-                    ax.broken_barh(
-                        [(m["start"] - 0.5, m["end"] - m["start"] + 1) for m in marks],
-                        (y, box),
-                        facecolors=face,
-                        edgecolors=edge,
-                        linewidths=0.5,
-                        linestyles=style,
-                        zorder=2,
-                    )
+                    for thin in (False, True):
+                        boxes = [m for m in marks if m["thin"] == thin]
+                        if not boxes:
+                            continue
+                        tall = box * _TRACK_THIN if thin else box
+                        ax.broken_barh(
+                            [(m["start"] - 0.5, m["end"] - m["start"] + 1) for m in boxes],
+                            (y + (box - tall) / 2, tall),
+                            facecolors=face,
+                            edgecolors=edge,
+                            linewidths=0.5,
+                            linestyles=style,
+                            zorder=2,
+                        )
                     for mark in marks:
                         inside = mark["inside"]
-                        if inside is None and mark["outside"] is None:
+                        if inside:
+                            x, text, ha = (mark["start"] + mark["end"]) / 2, inside, "center"
+                        elif mark["side"] == "right":
+                            x, text, ha = mark["end"] + 0.5, " " + mark["outside"], "left"
+                        elif mark["side"] == "left":
+                            x, text, ha = mark["start"] - 0.5, mark["outside"] + " ", "right"
+                        else:
                             continue
                         ax.text(
-                            (mark["start"] + mark["end"]) / 2 if inside else mark["end"] + 0.5,
+                            x,
                             y + box / 2,
-                            inside or " " + mark["outside"],
-                            ha="center" if inside else "left",
+                            text,
+                            ha=ha,
                             va="center_baseline",
                             fontsize=_TRACK_LABEL_SIZE,
                             color=ink if inside else "#333333",
                             clip_on=True,
                             zorder=3,
                         )
-            what["n_unlabelled"] = unlabelled
         elif what == "plddt":
             floors = [floor for floor, _colour, _label in reversed(_PLDDT_BANDS)]
             cmap = ListedColormap([colour for _floor, colour, _label in reversed(_PLDDT_BANDS)])
@@ -5972,8 +6094,26 @@ def protein_track(
                 )
             )
             first_tier = False
+    thin_handle = None
+    if shared:
+        texts = set(shared.values())
+        said = (
+            texts.pop()
+            if len(texts) == 1
+            else ", ".join(f"{text} ({row})" for row, text in shared.items())
+        )
+        thin_handle = Patch(
+            facecolor="white", edgecolor=_TRACK_INK, linewidth=0.5, label=f"thin: {said}"
+        )
+        handles.append(thin_handle)
+
+    def thin_box(legend, orig_handle, xdescent, ydescent, width, height, fontsize):
+        tall = height * _TRACK_THIN
+        return Rectangle((-xdescent, -ydescent + (height - tall) / 2), width, tall)
+
     ax.legend(
         handles=handles,
+        handler_map={thin_handle: HandlerPatch(patch_func=thin_box)} if thin_handle else None,
         loc="upper left",
         bbox_to_anchor=(0, 0),
         ncol=len(handles),

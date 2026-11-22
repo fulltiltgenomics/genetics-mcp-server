@@ -3783,31 +3783,125 @@ def test_overlapping_features_take_the_first_free_lane():
     assert plots._track_lanes([(1, 10), (10, 20)]) == [0, 1]
 
 
-def test_a_label_that_does_not_fit_its_box_hangs_beside_it_and_holds_the_lane():
+def track_labels(ax):
+    """Each feature label drawn and its alignment; the notes and scales are annotations."""
+    from matplotlib.text import Annotation
+
+    return {t.get_text().strip(): t.get_ha() for t in ax.texts if not isinstance(t, Annotation)}
+
+
+def test_a_label_never_takes_a_lane_and_is_left_out_where_the_lane_has_no_room_for_it():
     features = track_features(
         [
             ("uniprot", "Domain", 10, 12, "Short box long name", "curated"),
             ("uniprot", "Domain", 14, 20, None, "curated"),
+            ("uniprot", "Domain", 100, 102, "Hangs", "curated"),
             ("uniprot", "Domain", 200, 290, "Fits", "curated"),
         ]
     )
     result, ax = drawn_track(features=features)
-    # the unnamed box would share the first lane were the label beside its neighbour not there
+    # no two of the boxes share a residue, so one lane, however wide the first one's name
     assert result["feature_rows"] == [
-        {"feature_type": "Domain", "n": 3, "lanes": 2, "n_unlabelled": 1}
+        {"feature_type": "Domain", "n": 4, "lanes": 1, "n_unlabelled": 2}
     ]
-    placed = {t.get_text().strip(): t.get_ha() for t in ax.texts if t.get_text().strip()}
-    assert placed["Short box long name"] == "left" and placed["Fits"] == "center"
+    assert track_labels(ax) == {"Hangs": "left", "Fits": "center"}
 
 
-def test_hanging_labels_are_dropped_before_they_fill_more_lanes_than_the_boxes_need():
+def test_a_crowd_of_narrow_boxes_stays_on_one_lane():
     crowded = track_features(
         [("uniprot", "Domain", 10 + 3 * i, 11 + 3 * i, f"Long name {i}", "curated") for i in range(8)]
     )  # fmt: skip
-    result, _ax = drawn_track(features=crowded)
+    result, ax = drawn_track(features=crowded)
     assert result["feature_rows"] == [
-        {"feature_type": "Domain", "n": 8, "lanes": 1, "n_unlabelled": 8}
+        {"feature_type": "Domain", "n": 8, "lanes": 1, "n_unlabelled": 7}
     ]
+    # only the last has nothing to its right
+    assert track_labels(ax) == {"Long name 7": "left"}
+
+
+def test_a_label_with_no_room_to_the_right_goes_to_the_left_of_its_box():
+    features = track_features([("uniprot", "Domain", 296, 300, "At the end", "curated")])
+    _result, ax = drawn_track(features=features)
+    assert track_labels(ax) == {"At the end": "right"}
+
+
+def test_the_segments_of_one_ted_domain_share_a_lane_and_one_label():
+    ted = "medium consensus CATH 2.170.270.10 (H, foldseek)"
+    features = track_features(
+        [
+            ("ted", "TED domain", 10, 90, "TED01 high consensus", "predicted"),
+            ("ted", "TED domain", 250, 254, f"TED03 {ted} segment 1/2", "predicted"),
+            ("ted", "TED domain", 260, 280, "TED02 high consensus", "predicted"),
+            ("ted", "TED domain", 290, 300, f"TED03 {ted} segment 2/2", "predicted"),
+        ]
+    )
+    rows, _dropped = plots._track_feature_rows(features, ["TED domain"], 1, 300, 5.0)
+    # TED02 lies between the two segments, so it is what moves, not the second segment
+    assert [m["lane"] for m in rows[0]["marks"]] == [0, 0, 1, 0]
+    assert rows[0]["links"] == [(0, 254.5, 289.5, "predicted")]
+
+    result, ax = drawn_track(features=features, feature_types=["TED domain"])
+    assert result["feature_rows"] == [
+        {"feature_type": "TED domain", "n": 4, "lanes": 2, "n_unlabelled": 0}
+    ]
+    assert sorted(track_labels(ax)) == ["TED01", "TED02", "TED03"]
+    assert [line.get_xdata().tolist() for line in ax.lines] == [[254.5, 289.5]]
+
+
+def test_a_description_many_boxes_share_is_said_once_in_the_legend():
+    spans = [(10, 12), (30, 32), (50, 52), (200, 290)]
+    shared = [("uniprot", "Region", s, e, "Disordered", "predicted") for s, e in spans]
+    named = ("uniprot", "Region", 100, 190, "Interaction", "experimental")
+    result, ax = drawn_track(features=track_features([*shared, named]))
+    assert result["feature_rows"] == [
+        {"feature_type": "Region", "n": 5, "lanes": 1, "n_unlabelled": 0}
+    ]
+    assert track_labels(ax) == {"Interaction": "center"}
+    legend = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert legend[4:] == ["evidence: experimental", "predicted", "thin: Disordered"]
+
+    # every box has room for the word: nothing to gain from a legend entry
+    wide = [("uniprot", "Region", 1 + 60 * i, 50 + 60 * i, "Disordered", "predicted") for i in range(4)]  # fmt: skip
+    result, ax = drawn_track(features=track_features(wide))
+    assert set(track_labels(ax)) == {"Disordered"}
+    assert "thin: Disordered" not in [t.get_text() for t in ax.get_legend().get_texts()]
+
+
+def test_two_boxes_sharing_a_description_are_too_few_for_a_legend_entry():
+    pair = [("uniprot", "Region", s, e, "Disordered", "predicted") for s, e in [(10, 12), (200, 290)]]  # fmt: skip
+    # takes the room beside the narrow box, so the word can go neither in it nor next to it
+    features = track_features([*pair, ("uniprot", "Region", 14, 190, "Interaction", "curated")])
+    rows, _dropped = plots._track_feature_rows(features, ["Region"], 1, 300, 5.0)
+    assert rows[0]["shared"] is None and not any(m["thin"] for m in rows[0]["marks"])
+    result, ax = drawn_track(features=features)
+    assert result["feature_rows"] == [
+        {"feature_type": "Region", "n": 3, "lanes": 1, "n_unlabelled": 1}
+    ]
+    assert track_labels(ax) == {"Interaction": "center", "Disordered": "center"}
+    assert not any("thin" in t.get_text() for t in ax.get_legend().get_texts())
+
+
+def test_a_segment_with_no_domain_id_is_not_grouped_with_another():
+    features = track_features(
+        [
+            ("ted", "TED domain", 10, 40, "segment 1/2", "predicted"),
+            ("ted", "TED domain", 60, 90, "segment 1/2", "predicted"),
+            ("ted", "TED domain", 200, 240, "segment 2/2", "predicted"),
+        ]
+    )
+    rows, _dropped = plots._track_feature_rows(features, ["TED domain"], 1, 300, 5.0)
+    assert rows[0]["links"] == [] and rows[0]["lanes"] == 1
+    assert plots._track_segmented({"source": "ted", "description": "segment 1/2"}) is None
+    assert plots._track_segmented({"source": "ted", "description": "TED03 segment 1/2"}) == "TED03"
+
+
+def test_a_feature_row_is_named_at_its_first_lane_and_set_apart_from_the_next_row():
+    result, ax = drawn_track()
+    assert [r["lanes"] for r in result["feature_rows"]] == [1, 2, 1]
+    ted, domain, region = ax.get_yticks()[:3]
+    lane, gap = plots._TRACK_LANE_IN, plots._TRACK_ROW_GAP_IN
+    assert ted - domain == pytest.approx(lane + gap)
+    assert domain - region == pytest.approx(2 * lane + gap)
 
 
 def test_the_evidence_tier_of_a_feature_is_the_fill_of_its_box():
@@ -4611,7 +4705,8 @@ def boxes(ax):
 def test_a_feature_box_covers_its_first_and_last_residue_whole():
     features = track_features([("uniprot", "Domain", 20, 100, "RRM", "curated")])
     _result, ax = drawn_track(features=features)
-    assert boxes(ax) == {(19.5, 100.5)}
+    # the other span is the band behind the row
+    assert boxes(ax) == {(0.5, 300.5), (19.5, 100.5)}
     # clipped to the view, not drawn past it
     _result, ax = drawn_track(features=features, region=(50, 80))
     assert boxes(ax) == {(49.5, 80.5)}
