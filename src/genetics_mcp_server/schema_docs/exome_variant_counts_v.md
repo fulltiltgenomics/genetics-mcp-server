@@ -4,18 +4,30 @@
 # exome_variant_counts_v
 
 Per-variant allele COUNTS from exome studies whose release carries counts but no per-variant
-test statistic. First source: the Autism Sequencing Consortium 2026 release (dataset ASC2,
-trait ASD): every SNV/indel in the release — 7,045,130 rows, GRCh38, chrX (23) and chrY (24)
-included — with its VEP consequence, variant class, MPC and AlphaMissense scores, gnomAD AF
-and six counts: de novo alleles in probands and in unaffected siblings, alleles transmitted
-and untransmitted to probands, and alleles in cases and controls. Not filtered on
-significance (there is none) and not filtered on gnomad_af, which is an annotation here
-rather than the source's rarity filter (it reaches 0.89). No CNV rows: the DEL and DUP
-classes are gene-level only (exome_gene_counts_v). Summing these counts over a gene
-reproduces neither that table's "independent" counts nor the Bayes factor; do not present
-such a sum, or an odds ratio computed from these counts, as a result of the study. Large, so
-a literal `chr = <n>` beside `gene =` or `variant =` is required to stay under the sandbox
-scan cap.
+test statistic. GRCh38; not filtered on significance (there is none). Two sources, and they
+do NOT carry the same columns — a column a source lacks is NULL for it, never zero, so
+always filter on `dataset` and read only the counts that dataset has: ASC2 (Autism
+Sequencing Consortium 2026, trait ASD): every SNV/indel in the release — 7,045,150 rows for
+7,045,130 variants, chrX (23) and chrY (24) included — with its VEP consequence, variant
+class, MPC and AlphaMissense scores and six counts: de novo alleles in probands and in
+unaffected siblings, alleles transmitted and untransmitted to probands, and alleles in cases
+and controls. No allele numbers (an_case, an_ctrl are NULL). A variant is NOT always one
+row: 20 "other splice" SNVs have a PTV row carrying their de novo counts and a second row,
+classed by the underlying consequence, carrying their inherited and case-control counts. Sum
+over a variant's rows for its total counts. SCHEMA2 (Schizophrenia Exome Meta-analysis v2,
+trait SCZ): only the 737,813 variants the source marks as used in its gene-level analysis,
+so a variant absent here is not a variant with zero carriers. Case and control allele counts
+WITH allele numbers (an_case, an_ctrl), and a de novo count in de_novo_ac_proband that is
+NOT included in ac_case (a variant seen only de novo has ac_case 0). No sibling or
+transmission counts, no variant_class and no is_other_splice (all NULL). Its `consequence`
+uses VEP's own terms (missense_variant, stop_gained, an `_LC` suffix on low-confidence
+calls), not ASC2's spelling. SCHEMA2 reports no per-variant p-value or effect size: do not
+compute an odds ratio or p-value from these counts and present it as the study's result. No
+CNV rows: the DEL and DUP classes are gene-level only (exome_gene_counts_v). Summing these
+counts over a gene reproduces neither that table's "independent" counts nor the Bayes
+factor; do not present such a sum, or an odds ratio computed from these counts, as a result
+of the study. Large, so a literal `chr = <n>` beside `gene =` or `variant =` is required to
+stay under the sandbox scan cap.
 
 ## Scan pruning
 
@@ -25,27 +37,29 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 
 | column | type | description |
 | --- | --- | --- |
-| `dataset` | `STRING` | Study name (ASC2) |
-| `chr` | `INT64` | Chromosome number, chromosome X is 23, Y is 24. The partitioning column |
+| `dataset` | `STRING` | Study name (ASC2, SCHEMA2). Decides which count columns are populated |
+| `chr` | `INT64` | Chromosome number, chromosome X is 23, Y is 24, MT is 26. The partitioning column |
 | `pos` | `INT64` | Genomic position (GRCh38) |
 | `ref` | `STRING` | Reference allele |
 | `alt` | `STRING` | Alternative allele |
-| `gene` | `STRING` | Gene symbol the variant was assigned to (ASC2: GENCODE v29 spelling) |
+| `gene` | `STRING` | Gene symbol the variant was assigned to (ASC2: GENCODE v29 spelling, SCHEMA2: v39) |
 | `gene_id` | `STRING` | Ensembl gene ID (unversioned) |
 | `transcript_id` | `STRING` | Ensembl transcript the consequence was called on |
-| `consequence` | `STRING` | VEP consequence as the source spells it (missense, synonymous, frameshift, stop gained, splice donor, ...) |
-| `variant_class` | `STRING` | PTV, Mis2, Mis1, Mis0 or synonymous; the same spelling as exome_gene_counts_v.variant_class |
+| `consequence` | `STRING` | VEP consequence as the source spells it, so the spelling differs by dataset (ASC2: missense, stop gained; SCHEMA2: missense_variant, stop_gained). Read the values from the enumerable values scoped by resource |
+| `variant_class` | `STRING` | PTV, Mis2, Mis1, Mis0 or synonymous; the same spelling as exome_gene_counts_v.variant_class. NULL for SCHEMA2 |
+| `hgvsc` | `STRING` | Coding change (HGVS c.), NULL where none |
 | `hgvsp` | `STRING` | Protein change (HGVS p.), NULL where none |
 | `mpc` | `FLOAT64` | MPC missense deleteriousness score; NULL outside missense |
 | `alpha_missense` | `FLOAT64` | AlphaMissense pathogenicity score; NULL outside missense |
-| `is_other_splice` | `BOOL` | LOFTEE 'other splice': an SNV that may disrupt splicing, counted as PTV by the source under its rules |
-| `gnomad_af` | `FLOAT64` | gnomAD allele frequency as annotated by the source; an annotation, not a filter |
-| `de_novo_ac_proband` | `INT64` | De novo allele count in probands |
-| `de_novo_ac_sibling` | `INT64` | De novo allele count in unaffected siblings |
-| `transmitted_ac_proband` | `INT64` | Alleles transmitted to probands |
-| `untransmitted_ac_proband` | `INT64` | Alleles not transmitted to probands |
+| `is_other_splice` | `BOOL` | LOFTEE 'other splice': an SNV that may disrupt splicing, counted as PTV by the source under its rules. NULL for SCHEMA2 |
+| `de_novo_ac_proband` | `INT64` | De novo allele count in probands (SCHEMA2: the source's n_de_novo) |
+| `de_novo_ac_sibling` | `INT64` | De novo allele count in unaffected siblings. NULL for SCHEMA2 |
+| `transmitted_ac_proband` | `INT64` | Alleles transmitted to probands. NULL for SCHEMA2 |
+| `untransmitted_ac_proband` | `INT64` | Alleles not transmitted to probands. NULL for SCHEMA2 |
 | `ac_case` | `INT64` | Allele count in cases |
+| `an_case` | `INT64` | Allele number in cases (alleles genotyped). NULL for ASC2 and for a few SCHEMA2 rows; 0 on SCHEMA2 variants seen only de novo |
 | `ac_ctrl` | `INT64` | Allele count in controls |
+| `an_ctrl` | `INT64` | Allele number in controls. NULL for ASC2 and for a few SCHEMA2 rows |
 | `trait` | `STRING` | Trait/phenotype name |
 | `trait_original` | `STRING` | Original trait name in the respective dataset (the phenotypes_v join key) |
 | `variant` | `STRING` | Variant identifier as chr:pos:ref:alt |
@@ -78,9 +92,19 @@ ORDER BY pos
 ### Counts for one variant. chr beside variant as above.
 
 ```sql
-SELECT gene, consequence, variant_class, hgvsp, gnomad_af,
+SELECT dataset, gene, consequence, variant_class, hgvsp,
        de_novo_ac_proband, de_novo_ac_sibling, transmitted_ac_proband,
        untransmitted_ac_proband, ac_case, ac_ctrl
 FROM exome_variant_counts_v
 WHERE chr = 1 AND variant = '1:939436:C:CT'
+```
+
+### SCHEMA2 case and control allele counts with allele numbers for the variants of one gene. SCHEMA2 has no variant_class, so the consequence is the only annotation to filter on.
+
+```sql
+SELECT variant, consequence, hgvsp, mpc, alpha_missense,
+       ac_case, an_case, ac_ctrl, an_ctrl, de_novo_ac_proband
+FROM exome_variant_counts_v
+WHERE chr = 16 AND gene = 'SETD1A' AND dataset = 'SCHEMA2'
+ORDER BY pos
 ```
