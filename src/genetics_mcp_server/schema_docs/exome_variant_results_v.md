@@ -4,8 +4,8 @@
 # exome_variant_results_v
 
 Single-variant exome association results from multiple resources with different significance
-thresholds. Genebass contains variants filtered to p < 1e-4. IBD exome (ibd_exome_2026)
-contains variants filtered to mlog10p > 4.
+thresholds. Genebass contains variants filtered to mlog10p >= 3 (p <= 1e-3). IBD exome
+(ibd_exome_2026) contains variants filtered to mlog10p > 4.
 
 ## Scan pruning
 
