@@ -311,3 +311,22 @@ def tool_executor():
 
     executor = ToolExecutor()
     yield executor
+
+
+@pytest.fixture
+def sdk_for_profile(monkeypatch):
+    """The `genetics` package as imported under a given CONFIG_PROFILE, restored afterwards."""
+    import importlib
+
+    import genetics_mcp_server.sdk as sdk
+
+    def _load(profile):
+        if profile is None:
+            monkeypatch.delenv("CONFIG_PROFILE", raising=False)
+        else:
+            monkeypatch.setenv("CONFIG_PROFILE", profile)
+        return importlib.reload(sdk)
+
+    yield _load
+    monkeypatch.undo()
+    importlib.reload(sdk)

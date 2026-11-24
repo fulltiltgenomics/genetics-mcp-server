@@ -9,7 +9,6 @@ map and the feature rows are made up here; the routes are genetics-results-api's
 """
 
 import gzip
-import importlib
 import json
 import re
 from pathlib import Path
@@ -18,6 +17,7 @@ import httpx
 import numpy as np
 import polars as pl
 import pytest
+from helpers import code_surface_tool_names
 from test_tool_surface_golden import _mcp_hardcoded_exclusions
 
 from genetics_mcp_server.config.defaults import PROMPT_VARIANTS, default_system_prompt
@@ -860,22 +860,6 @@ async def test_sdk_refuses_an_ambiguous_protein_with_the_choices(executor):
     assert SINGLE in str(raised.value) and WINDOWED in str(raised.value)
 
 
-@pytest.fixture
-def sdk_for_profile(monkeypatch):
-    import genetics_mcp_server.sdk as sdk
-
-    def _load(profile):
-        if profile is None:
-            monkeypatch.delenv("CONFIG_PROFILE", raising=False)
-        else:
-            monkeypatch.setenv("CONFIG_PROFILE", profile)
-        return importlib.reload(sdk)
-
-    yield _load
-    monkeypatch.undo()
-    importlib.reload(sdk)
-
-
 def test_sdk_binds_the_functions_on_daly_only(sdk_for_profile):
     sdk = sdk_for_profile("daly")
     assert set(SDK_FUNCTIONS) <= set(sdk.__all__)
@@ -959,8 +943,7 @@ def test_reads_the_enabled_flag_from_the_environment(monkeypatch):
 
 
 def test_sdk_replaceable_so_the_code_surface_uses_the_sdk():
-    names = {t["name"] for t in get_anthropic_tools(code_execution=True)}
-    assert not PROTEIN_STRUCTURE_TOOLS & names
+    assert not PROTEIN_STRUCTURE_TOOLS & code_surface_tool_names()
 
 
 def _feature(monkeypatch, profile: str | None, enabled: bool) -> None:

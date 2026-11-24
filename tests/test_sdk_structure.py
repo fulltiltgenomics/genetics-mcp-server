@@ -152,6 +152,8 @@ class TestContractMirror:
         for name in (
             "CONTRACT_VERSION",
             "MODEL_COLUMNS",
+            "THREE_TO_ONE",
+            "EVIDENCE_TIERS",
             "SCORE_HIGHER_IS_DAMAGING",
             "SCORE_LOWER_IS_DAMAGING",
             "SCORE_DIRECTIONS",

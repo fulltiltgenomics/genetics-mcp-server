@@ -49,6 +49,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from genetics_mcp_server.sdk._structure_contract import EVIDENCE_TIERS
 from genetics_mcp_server.sdk.client import parse_region
 from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import LD_MAX_WINDOW
@@ -4767,12 +4768,20 @@ _TRACK_MUTED = "#8A8A8A"
 # One hue, three amounts of ink: the better the evidence for a feature, the more of the box
 # is filled. A second hue per tier would compete with the pLDDT strip directly below, whose
 # colours already mean something. (face, edge, line style, label colour inside the box)
-_TRACK_TIERS: dict[str, tuple[str, str, str, str]] = {
-    "experimental": (_TRACK_INK, _TRACK_INK, "-", "white"),
-    "curated": (_TRACK_TINT, _TRACK_INK, "-", "#1B3F66"),
-    "predicted": ("white", _TRACK_INK, "-", "#1B3F66"),
-    "unknown": ("white", _TRACK_MUTED, ":", "#555555"),
-}
+# per tier, in the release contract's order, which is strongest first; `strict` so a tier
+# the contract gains or loses fails here rather than drawing in another tier's style
+_TRACK_TIERS: dict[str, tuple[str, str, str, str]] = dict(
+    zip(
+        EVIDENCE_TIERS,
+        (
+            (_TRACK_INK, _TRACK_INK, "-", "white"),
+            (_TRACK_TINT, _TRACK_INK, "-", "#1B3F66"),
+            ("white", _TRACK_INK, "-", "#1B3F66"),
+            ("white", _TRACK_MUTED, ":", "#555555"),
+        ),
+        strict=True,
+    )
+)
 
 # The features that say what a stretch of the protein IS. Left out by default: the
 # secondary-structure types (helix, strand, turn), which run to hundreds of slivers, the

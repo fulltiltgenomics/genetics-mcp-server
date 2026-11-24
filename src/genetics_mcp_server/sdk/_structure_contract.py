@@ -4,7 +4,7 @@ A copy, not an import: the definition lives in genetics-results-munge
 `scripts/protein_structure_contract.py`, and the SDK ships into a sandbox image that holds no
 other repo's code. Only what the geometry and its fetches need is copied: the contract
 version, the PAE encoding, the two window rules, `models.tsv.gz`'s column list, the
-predictor scores' column list and which end of each predictor's score is the damaging one,
+residue-letter table, the feature evidence tiers, the predictor scores' column list and which end of each predictor's score is the damaging one,
 the per-response byte limit, and what a view-spec for the browser's viewer may hold.
 tests/test_sdk_structure.py pins these and compares them with the munge module when a
 checkout of it is found.
@@ -44,6 +44,18 @@ MODEL_COLUMNS = [
     ("source_pdb_sha256", str),
     ("source_pae_sha256", str),
 ]
+
+# the `residue` letter for a model file's three-letter residue name: the SDK parses model
+# files itself and has to agree with the release's residues table
+THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E",
+    "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F",
+    "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V", "SEC": "U",
+    "PYL": "O",
+}  # fmt: skip
+
+# strongest first
+EVIDENCE_TIERS = ("experimental", "curated", "predicted", "unknown")
 
 # `percentile` ranks a predictor's raw per-residue mean ascending, so which end is damaging
 # is the predictor's own. The scores route states it per response; this is what a reader

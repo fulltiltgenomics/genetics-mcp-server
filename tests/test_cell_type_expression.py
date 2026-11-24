@@ -8,6 +8,7 @@ from urllib.parse import unquote
 
 import httpx
 import pytest
+from helpers import code_surface_tool_names
 
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.sdk.client import GeneticsClient
@@ -223,25 +224,6 @@ async def test_sdk_function_raises_on_a_deployment_without_the_data():
     assert info.value.code == "not_available"
 
 
-@pytest.fixture
-def sdk_for_profile(monkeypatch):
-    """The `genetics` package as imported under a given CONFIG_PROFILE, restored afterwards."""
-    import importlib
-
-    import genetics_mcp_server.sdk as sdk
-
-    def _load(profile):
-        if profile is None:
-            monkeypatch.delenv("CONFIG_PROFILE", raising=False)
-        else:
-            monkeypatch.setenv("CONFIG_PROFILE", profile)
-        return importlib.reload(sdk)
-
-    yield _load
-    monkeypatch.undo()
-    importlib.reload(sdk)
-
-
 def test_sdk_exports_it_on_daly_under_a_name_that_is_not_a_view_stem(sdk_for_profile):
     sdk = sdk_for_profile("daly")
     assert "cell_type_expression" in sdk.__all__
@@ -299,8 +281,7 @@ def test_offered_only_where_enabled_on_a_profile_that_serves_the_data(profile, e
 
 
 def test_sdk_replaceable_so_the_code_surface_uses_the_sdk():
-    names = {t["name"] for t in get_anthropic_tools(code_execution=True)}
-    assert TOOL not in names
+    assert TOOL not in code_surface_tool_names()
 
 
 def test_reads_config_profile_and_enabled_flag_from_the_environment(monkeypatch):

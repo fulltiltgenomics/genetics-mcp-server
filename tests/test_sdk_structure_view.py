@@ -77,7 +77,7 @@ def browser_parse(text: str) -> dict:
     mid = raw.get("model_file_id")
     if not isinstance(mid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", mid):
         raise SpecError("model_file_id")
-    roles = {"case": "#d62728", "control": "#1f77b4", "both": "#9467bd", "neutral": "#7f7f7f"}
+    roles = contract.VIEW_ROLE_COLOURS
     by_position: dict[int, dict] = {}
     residues = raw.get("residues")
     if residues is not None and not isinstance(residues, list):

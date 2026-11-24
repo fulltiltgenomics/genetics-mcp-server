@@ -68,6 +68,11 @@ def mock_response(status_code: int = 200, json_data: dict | None = None, text: s
     return resp
 
 
+def code_surface_tool_names() -> set[str]:
+    """The tools offered alongside code execution: the SDK-replaceable ones are left out."""
+    return {t["name"] for t in get_anthropic_tools(code_execution=True)}
+
+
 def tool_param(tools, name, param):
     (tool,) = [t for t in tools if t["name"] == name]
     return tool["input_schema"]["properties"][param]["description"]

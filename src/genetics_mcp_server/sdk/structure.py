@@ -96,13 +96,6 @@ _NO_SHARED_MODEL = "no single model file contains both residues"
 # to tens of MiB whatever the model's length
 _BLOCK_ELEMENTS = 3 * 2**20
 
-_ONE_LETTER = {
-    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E",
-    "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F",
-    "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V", "SEC": "U",
-    "PYL": "O",
-}  # fmt: skip
-
 _MODEL_ROW_FIELDS = (
     "model_file_id",
     "accession",
@@ -176,7 +169,7 @@ def _parse(data: str | bytes) -> _Model:
         numbers.append(number)
         xyz.append(coords)
         bfac.append(plddt)
-        letters.append(_ONE_LETTER.get(line[17:20], "X"))
+        letters.append(contract.THREE_TO_ONE.get(line[17:20], "X"))
     if not numbers:
         raise GeneticsUsageError("no CA atoms found: this is not a PDB-format model file")
     if len(chains) != 1 or numbers != list(range(1, len(numbers) + 1)):
