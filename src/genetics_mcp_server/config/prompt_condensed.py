@@ -46,6 +46,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _Block,
     _fs,
     custom_gwas_section,
+    phenotype_pc_section,
     r12_model_section,
     url_input_hosts_rule,
 )
@@ -54,6 +55,13 @@ _CUSTOM_GWAS_SECTION = """
 ### Users' own custom GWAS (sandbox userresults)
 
 Sandbox custom GWAS runs are served straight from the userresults bucket as resources {resources} (one per freeze), the run name being the "phenotype". **Only on request**: they are users' own unreviewed analyses, hidden from `search_phenotypes` and `list_datasets` unless called with one of these resources, and reached by no other tool without it. Touch them only when the user explicitly asks about a GWAS they ran themselves, a custom GWAS or userresults; never to answer a general question about FinnGen, a disease or a variant, never presented beside release results as the same kind of evidence, and always named as a user's custom run in the answer. Every user sees every run and no owner is recorded, so take the run name the user gives and ask when it is ambiguous. Per run: summary statistics always; SuSiE 95% credible sets only where the user ran fine-mapping; HLA alleles for R14 runs. No cross-run index (by-gene/by-variant/by-region credible-set tools, coloc and PheWAS do not cover them); `get_resource_metadata` on the release's resource with the run name in `phenotypes` (the unfiltered table of hundreds of runs is truncated) gives case/control counts, the description and the date the run was written; credible-set `aaf` is NA.
+"""
+
+
+_PHENOTYPE_PC_SECTION = """
+### FinnGen phenotype principal components (PC GWAS)
+
+Served as {pcs}: GWAS and SuSiE fine-mapping of principal components (`PPC1`, `PPC2`, ...) of the binary individuals x core endpoints matrix (R `prcomp()`, centred, not scaled, so prevalent endpoints dominate; scores inverse-rank normalised; full cohort). **Only on request**: a PC is an axis through all endpoints, not a disease, so these are hidden from `search_phenotypes` and `list_datasets` unless called with the resource, returned by a variant, gene or region credible-set query only when the resource is named, and absent from BigQuery and colocalization. Use them only when the user explicitly asks about the phenotype PCs or phenotype PCA; never for a general question about a disease, variant or locus, never beside release results as if a PC were a diagnosis, and always named as a phenotype-PC GWAS. `beta` is in SDs of the normalised score and ITS SIGN IS ARBITRARY (no "risk" or "protective"; compare directions within one PC only). No endpoint loadings are served: what a PC represents can only be inferred from its loci, and must be called an inference. Summary statistics need the resource and its data type; the component list and sample size come from the resource's metadata.
 """
 
 
@@ -470,6 +478,13 @@ Prefer measured readouts (MPRA, caQTL) over in-silico predictions when both exis
         _R12_MODEL_SECTION,
         requires_any=_fs("get_summary_stats", "search_phenotypes"),
         render=lambda: r12_model_section(_R12_MODEL_SECTION, _R12_MODEL_LINES),
+    ),
+    _Block(
+        _PHENOTYPE_PC_SECTION,
+        requires_any=_fs(
+            "get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"
+        ),
+        render=lambda: phenotype_pc_section(_PHENOTYPE_PC_SECTION),
     ),
     _Block(
         """

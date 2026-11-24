@@ -256,8 +256,8 @@ def on_request_datasets() -> tuple[tuple[str, str], ...] | None:
     """(resource, data_type) of the datasets this deployment serves only on request, or
     None while results-api has not said.
 
-    A daly results-api answers (), a finngen one names its sandbox custom GWAS releases
-    and the R12 sex-specific and recessive GWAS. The prompt sections and the
+    A finngen results-api names its sandbox custom GWAS releases, the R12 sex-specific and
+    recessive GWAS and the phenotype-PC GWAS; a daly one the last alone. The prompt sections and the
     tool-description hints that name those resources are rendered from this and from
     nothing static, so a deployment without such data never hears of it; None and ()
     both render nothing.
@@ -278,10 +278,12 @@ def on_request_datasets() -> tuple[tuple[str, str], ...] | None:
 
 
 # results-api's answer carries nothing but (resource, data_type), so the data type is what
-# tells the on-request kinds apart: the R12 model-specific releases serve these types and
-# nothing else does; whatever remains is a sandbox custom GWAS release. A third on-request
-# kind needs its own types here, or it is described as a custom GWAS.
+# tells the on-request kinds apart: the R12 model-specific releases and the phenotype-PC
+# GWAS each serve types nothing else does; whatever remains is a sandbox custom GWAS
+# release. A further on-request kind needs its own types here, or it is described as a
+# custom GWAS.
 _R12_MODEL_DATA_TYPES = frozenset({"gwas_sex_specific", "gwas_recessive"})
+_PHENOTYPE_PC_DATA_TYPES = frozenset({"gwas_phenotype_pc"})
 
 
 def custom_gwas_resources() -> tuple[str, ...]:
@@ -291,8 +293,20 @@ def custom_gwas_resources() -> tuple[str, ...]:
             {
                 resource
                 for resource, data_type in (on_request_datasets() or ())
-                if data_type not in _R12_MODEL_DATA_TYPES
+                if data_type not in _R12_MODEL_DATA_TYPES | _PHENOTYPE_PC_DATA_TYPES
             }
+        )
+    )
+
+
+def phenotype_pc_datasets() -> tuple[tuple[str, str], ...]:
+    """(resource, data_type) of the on-request phenotype-PC GWAS this deployment serves;
+    () when none or unknown."""
+    return tuple(
+        sorted(
+            (resource, data_type)
+            for resource, data_type in (on_request_datasets() or ())
+            if data_type in _PHENOTYPE_PC_DATA_TYPES
         )
     )
 
@@ -322,6 +336,14 @@ def custom_gwas_section(template: str) -> str | None:
     if not resources:
         return None
     return template.replace("{resources}", ", ".join(f"`{r}`" for r in resources))
+
+
+def phenotype_pc_section(template: str) -> str | None:
+    """The section with this deployment's phenotype-PC resources filled in, or nothing."""
+    pcs = phenotype_pc_datasets()
+    if not pcs:
+        return None
+    return template.replace("{pcs}", ", ".join(f"`{r}` (data_type `{t}`)" for r, t in pcs))
 
 
 def r12_model_section(template: str, lines: dict[str, str]) -> str | None:
