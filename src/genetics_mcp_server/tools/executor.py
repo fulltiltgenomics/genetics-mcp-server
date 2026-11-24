@@ -1738,8 +1738,14 @@ class ToolExecutor:
             return out
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
 
-    async def get_cell_type_expression(self, gene: str, level: str = "summary") -> dict[str, Any]:
-        """Single-cell expression by cell type for one or more genes."""
+    async def get_cell_type_expression(
+        self, gene: str, level: str = "summary", include_low_support: bool = False
+    ) -> dict[str, Any]:
+        """Single-cell expression by cell type for one or more genes.
+
+        results-api marks thinly supported summary rows `low_support` (the rule and its
+        thresholds are its own); they are left out here unless asked for, and counted.
+        """
         if level not in CELL_TYPE_EXPRESSION_LEVELS:
             return {
                 "success": False,
@@ -1752,12 +1758,18 @@ class ToolExecutor:
         )
         if resp.status_code == 200:
             results = resp.json()
+            hidden = {}
+            if level == "summary" and not include_low_support:
+                kept = [r for r in results if r.get("low_support") is not True]
+                hidden = {"low_support_rows_hidden": len(results) - len(kept)}
+                results = kept
             return {
                 "success": True,
                 **self._columns_meta(resp),
                 "gene": genes,
                 "level": level,
                 "release": resp.headers.get("X-Dataset-Version"),
+                **hidden,
                 "results": results,
                 "_download_data": {
                     "results": results,

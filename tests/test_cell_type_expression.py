@@ -82,6 +82,31 @@ async def test_both_levels_reach_the_endpoint_and_return_rows(level, body):
     assert request.url.params["format"] == "json"
 
 
+async def test_low_support_summary_rows_are_hidden_unless_asked_for():
+    thin = {**SUMMARY_ROW, "cell_type_rollup": "stromal cell", "low_support": True}
+    solid = {**SUMMARY_ROW, "low_support": False}
+    unflagged = dict(SUMMARY_ROW)  # a results-api that does not serve the flag yet
+    executor = _executor(body=[thin, solid, unflagged])
+    try:
+        default = await executor.get_cell_type_expression("PCSK9")
+        everything = await executor.get_cell_type_expression("PCSK9", include_low_support=True)
+    finally:
+        await executor.close()
+    assert default["results"] == [solid, unflagged] and default["low_support_rows_hidden"] == 1
+    assert default["_download_data"]["results"] == default["results"]
+    assert everything["results"] == [thin, solid, unflagged]
+    assert "low_support_rows_hidden" not in everything
+
+
+async def test_dataset_level_is_never_filtered():
+    executor = _executor(body=[{**r, "low_support": True} for r in DATASET_ROWS])
+    try:
+        result = await executor.get_cell_type_expression("PCSK9", level="dataset")
+    finally:
+        await executor.close()
+    assert len(result["results"]) == 2 and "low_support_rows_hidden" not in result
+
+
 async def test_measured_no_row_is_passed_through_untouched():
     executor = _executor(body=DATASET_ROWS)
     try:
