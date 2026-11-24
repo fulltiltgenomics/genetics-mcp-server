@@ -20,13 +20,14 @@ os.environ["CACHE_PREWARM"] = "false"
 
 
 # what results-api answers a finngen deployment: the three sandbox custom GWAS releases,
-# R14 also with HLA, and the R12 sex-specific and recessive GWAS. Every test sees this
-# deployment (see the autouse fixture below).
+# R14 also with HLA, the phenotype-PC GWAS, and the R12 sex-specific and recessive GWAS.
+# Every test sees this deployment (see the autouse fixture below).
 FINNGEN_ON_REQUEST_DATASETS = (
     ("finngen_custom_r12", "gwas"),
     ("finngen_custom_r13", "gwas"),
     ("finngen_custom_r14", "gwas"),
     ("finngen_custom_r14", "hla"),
+    ("finngen_phenotype_pca", "gwas_phenotype_pc"),
     ("finngen_recessive", "gwas_recessive"),
     ("finngen_sex_specific", "gwas_sex_specific"),
 )

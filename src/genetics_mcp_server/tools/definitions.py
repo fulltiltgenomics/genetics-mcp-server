@@ -2798,6 +2798,61 @@ _R12_MODEL_HINTS: list[tuple[str, str, str]] = [
     ),
 ]
 
+# The phenotype-PC GWAS: on request because a PC is an axis through every endpoint, not a
+# trait a disease or variant question is about. Unlike the two kinds above it has a combined
+# credible-set file, so the cross-resource credible-set tools reach it when the resource is
+# named. `{pc_resources}` = the resources, `{pc_pairs}` = each with its data type,
+# `{pc_types}` = the data types alone.
+_PHENOTYPE_PC_HINTS: list[tuple[str, str, str]] = [
+    (
+        "search_phenotypes",
+        "",
+        " The FinnGen phenotype-PC GWAS (resources {pc_resources}) is NOT in the default index either: only when the user asks about the phenotype PCs, pass that resource in `resource`.",
+    ),
+    ("search_phenotypes", "resource", "; one of {pc_resources} for the phenotype-PC GWAS"),
+    (
+        "list_datasets",
+        "resource",
+        " The phenotype-PC GWAS ({pc_resources}) is an on-request dataset too: listed only when named here.",
+    ),
+    *[
+        (
+            tool,
+            "resource",
+            "; the phenotype-PC GWAS ({pc_resources}) is NEVER included when this is omitted: name it, and only when the user asks about the phenotype PCs",
+        )
+        for tool in (
+            "get_credible_sets_by_variant",
+            "get_credible_sets_by_gene",
+            "get_credible_sets_by_region",
+        )
+    ],
+    *[
+        (
+            tool,
+            "resource",
+            "; one of {pc_resources} for a phenotype PC (PPC1, PPC2, ...), on request only",
+        )
+        for tool in (
+            "get_credible_sets_by_phenotype",
+            "get_credible_set_leads_by_phenotype",
+            "get_credible_set_by_id",
+        )
+    ],
+    *[
+        hint
+        for tool in ("get_summary_stats", "get_summary_stats_by_region")
+        for hint in (
+            (
+                tool,
+                "resource",
+                "; ON REQUEST ONLY, when the user asks about the phenotype PCs: {pc_pairs}",
+            ),
+            (tool, "data_type", "; {pc_types} only with the phenotype-PC resource"),
+        )
+    ],
+]
+
 # what a row of each R12 model-specific data type carries, for `{model_pairs}`
 _R12_MODEL_ROWS = {
     "gwas_sex_specific": "female, male and combined effects per variant, het_p for the sex difference",
@@ -2832,10 +2887,12 @@ def _apply_hints(
 
 def _with_on_request_hints(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The definitions with this deployment's on-request hints appended: the sandbox
-    custom GWAS releases and the R12 model-specific releases, each only where served."""
+    custom GWAS releases, the R12 model-specific releases and the phenotype-PC GWAS, each
+    only where served."""
     from genetics_mcp_server.config.prompt_blocks import (
         custom_gwas_hla_resources,
         custom_gwas_resources,
+        phenotype_pc_datasets,
         r12_model_datasets,
     )
 
@@ -2860,6 +2917,17 @@ def _with_on_request_hints(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     f"'{r}' with data_type '{t}' ({_R12_MODEL_ROWS.get(t, t)})" for r, t in models
                 ),
                 "{model_types}": " or ".join(f"'{t}'" for _, t in models),
+            },
+        )
+    pcs = phenotype_pc_datasets()
+    if pcs:
+        tools = _apply_hints(
+            tools,
+            _PHENOTYPE_PC_HINTS,
+            {
+                "{pc_resources}": ", ".join(f"'{r}'" for r, _ in pcs),
+                "{pc_pairs}": "; ".join(f"'{r}' with data_type '{t}'" for r, t in pcs),
+                "{pc_types}": " or ".join(f"'{t}'" for _, t in pcs),
             },
         )
     return tools

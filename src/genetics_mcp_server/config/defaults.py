@@ -34,6 +34,7 @@ from genetics_mcp_server.config.prompt_blocks import (
     _fs,
     block_text,
     custom_gwas_section,
+    phenotype_pc_section,
     protein_structure_sdk_rule,
     r12_model_section,
     url_input_hosts_rule,
@@ -69,6 +70,17 @@ A FinnGen sandbox user can run a custom GWAS (REGENIE unmodifiable pipeline) and
 **Only on request.** These are users' own, unreviewed analyses — a run may be underpowered, mis-specified or a test — so they are kept out of every default surface: `search_phenotypes` and `list_datasets` do not show them unless called with one of these resources, and no other tool reaches them without the resource named. Touch them ONLY when the user explicitly asks about a GWAS they (or a named colleague) ran themselves, a custom GWAS, or userresults. Never use one to answer a question about FinnGen, a disease or a variant in general, never present its numbers next to release results as if they were the same kind of evidence, and say in the answer that the result is a user's custom run. Every user sees every run and the bucket records no owner, so "my GWAS" cannot be verified — take the run name the user gives, and when it is ambiguous (the same name exists in several freezes, or matches a core endpoint code) ask which run they mean rather than guessing.
 
 What is available per run: summary statistics for every run (`get_summary_stats`, `get_summary_stats_by_region`), SuSiE 95% credible sets only for runs whose user also ran the fine-mapping pipeline (`get_credible_sets_by_phenotype`, `get_credible_set_leads_by_phenotype`, `get_credible_set_by_id`), and HLA allele results for R14 runs (`get_hla_by_phenotype`). There is no cross-run index: `get_credible_sets_by_gene` / `_by_variant` / `_by_region`, colocalization and PheWAS-style questions do not cover custom runs. Case and control counts, the run's description and the date it was written come from `get_resource_metadata` for the release's resource with the run name in `phenotypes` — a release holds hundreds of runs and the unfiltered table is truncated; who ran it is recorded nowhere that is served. Credible-set rows carry `aaf` as NA because the pipeline records the minor-allele frequency instead. A run finished minutes ago is queryable by its exact name before it appears in `search_phenotypes`.
+"""
+
+
+_PHENOTYPE_PC_SECTION = """
+### FinnGen phenotype principal components (PC GWAS)
+
+Served as {pcs}: GWAS and SuSiE fine-mapping of principal components of FinnGen phenotype data. A PCA was run on the binary matrix of individuals x core endpoints (R `prcomp()`, centred but not scaled, so prevalent endpoints dominate the components), and each PC score was inverse-rank normalised and run as a quantitative GWAS in the full cohort. The "phenotypes" are the components: `PPC1`, `PPC2`, ...
+
+**Only on request.** A PC is a data-driven axis through all endpoints at once, not a disease, so these results are kept out of every default surface: `search_phenotypes` and `list_datasets` show them only when called with the resource, `get_credible_sets_by_variant`, `get_credible_sets_by_gene` and `get_credible_sets_by_region` return their credible sets only when the resource is named (omitting the resource never includes them), and nothing of them is in BigQuery or in colocalization. Use them ONLY when the user explicitly asks about the phenotype PCs or the phenotype PCA. Never use them to answer a general question about a disease, a variant or a locus, never present a PC association beside release results as if the PC were a diagnosis, and say in the answer that the result is a phenotype-PC GWAS.
+
+Reading them: `beta` is in standard deviations of the normalised PC score and ITS SIGN IS ARBITRARY, as a PC's direction is — "risk-increasing" and "protective" mean nothing here, and directions are comparable only between variants of the same PC. No endpoint loadings are served, so which diagnoses a PC stands for is not in this data: what a PC represents can only be inferred from the loci it maps to, and the answer must say it is an inference. Available: summary statistics (`get_summary_stats`, `get_summary_stats_by_region`, with the resource and its data type), credible sets by phenotype, id, variant, gene and region, and `get_resource_metadata` for the list of components and the sample size.
 """
 
 
@@ -269,6 +281,13 @@ A magnitude-only modality's comparison carries no direction at all — that abse
         _R12_MODEL_SECTION,
         requires_any=_fs("get_summary_stats", "search_phenotypes"),
         render=lambda: r12_model_section(_R12_MODEL_SECTION, _R12_MODEL_LINES),
+    ),
+    _Block(
+        _PHENOTYPE_PC_SECTION,
+        requires_any=_fs(
+            "get_summary_stats", "get_credible_sets_by_phenotype", "search_phenotypes"
+        ),
+        render=lambda: phenotype_pc_section(_PHENOTYPE_PC_SECTION),
     ),
     _Block(
         """
