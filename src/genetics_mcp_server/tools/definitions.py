@@ -405,7 +405,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "get_cell_type_expression",
         "group": "results",
         "sdk_replaceable": True,
-        "description": """Get SINGLE-CELL expression of a gene by cell type, from human CZ CELLxGENE Discover datasets with raw integer counts on supported assays, primary cells only. This is cell-type-resolved and distinct from get_gene_expression, which is bulk tissue (GTEx): use this tool for "which cell types express X", "is X expressed in hepatocytes / T cells / microglia", or cell-type specificity; use get_gene_expression for tissue-level questions.
+        "description": """Get SINGLE-CELL expression of a gene by cell type, from human CZ CELLxGENE Discover datasets with raw integer counts on supported assays, primary cells with at least 500 genes detected. This is cell-type-resolved and distinct from get_gene_expression, which is bulk tissue (GTEx): use this tool for "which cell types express X", "is X expressed in hepatocytes / T cells / microglia", or cell-type specificity; use get_gene_expression for tissue-level questions.
 
 UNITS ARE log1p CP10K, NOT TPM. Never compare these numbers with bulk TPM values or describe them as TPM.
 - PRIMARY metrics, per cell type: `mean_log1p_cp10k` (mean of log1p counts-per-10k over every cell of that type, expressing or not) and `frac_expressing` (fraction of those cells with any count of the gene). Report both: a low mean can be a few cells expressing highly or many expressing weakly, and `frac_expressing` tells which.
@@ -3183,15 +3183,19 @@ def register_mcp_tools(
         return await executor.get_gene_expression(gene)
 
     @_tool()
-    async def get_cell_type_expression(gene: str, level: str = "summary") -> dict:
+    async def get_cell_type_expression(
+        gene: str, level: str = "summary", include_low_support: bool = False
+    ) -> dict:
         """Get single-cell expression of a gene by cell type; bulk tissue is get_gene_expression.
 
         Source: human CZ CELLxGENE Discover datasets with raw integer counts on supported
-        assays, primary cells only.
+        assays, primary cells with at least 500 genes detected.
 
         Units are log1p CP10K, not TPM. Primary metrics: `mean_log1p_cp10k` and
         `frac_expressing`; `donor_pseudobulk_mean_cp10k` is secondary. level='summary' pools
-        normal tissue across datasets per (cell type, tissue), all-prenatal datasets left out;
+        normal tissue across datasets per (cell type, tissue), all-prenatal datasets left out,
+        and hides thinly supported rows (few donors or cells, or a small single-dataset row)
+        unless include_low_support is true, counting them in `low_support_rows_hidden`;
         level='dataset' gives per-dataset rows, sparse: a group passing the size thresholds (50
         cells and 3 donors) with no expressing cell has no row, and a below-threshold group never
         has one, so its absence is unknown, not zero. One `status: "measured_no_row"` row per
@@ -3199,7 +3203,7 @@ def register_mcp_tools(
         expressed it (a real zero); an absent dataset did not measure the gene or had every group
         below the thresholds.
         """
-        return await executor.get_cell_type_expression(gene, level)
+        return await executor.get_cell_type_expression(gene, level, include_low_support)
 
     @_tool()
     async def get_asm_qtl_by_variant(

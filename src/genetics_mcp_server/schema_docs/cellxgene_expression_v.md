@@ -5,15 +5,16 @@
 
 CZ CELLxGENE Discover human single-cell expression per dataset and cell group (tissue x cell
 type x disease x assay), every disease, tissue_type and assay, with the native and rolled-up
-labels. DENSE over measured genes: a gene the dataset measured but never detected in a group
-has a row with mean_log1p_cp10k = 0 and frac_expressing = 0; a dataset that did NOT measure
-the gene has no row at all — absence means not measured, never 0. Groups below 50 cells or 3
-donors (release defaults; the view applies each release's min_cells/min_donors) are left
-out. PRIMARY metrics: mean_log1p_cp10k and frac_expressing; donor_pseudobulk_mean_cp10k is
-SECONDARY (linear scale, does not rank) and is NULL on every zero-filled row (measured, not
-detected), and otherwise when fewer than the release's min_pseudobulk_donors (default 3)
-donors have a nonzero library. Genes are GENCODE v49; chr uses X=23, Y=24, MT=26. Always
-filter on chr.
+labels. Cells with fewer than 500 genes detected are dropped before aggregation, so n_cells
+counts the cells that passed. DENSE over measured genes: a gene the dataset measured but
+never detected in a group has a row with mean_log1p_cp10k = 0 and frac_expressing = 0; a
+dataset that did NOT measure the gene has no row at all — absence means not measured, never
+0. Groups below 50 cells or 3 donors (release defaults; the view applies each release's
+min_cells/min_donors) are left out. PRIMARY metrics: mean_log1p_cp10k and frac_expressing;
+donor_pseudobulk_mean_cp10k is SECONDARY (linear scale, does not rank) and is NULL on every
+zero-filled row (measured, not detected), and otherwise when fewer than the release's
+min_pseudobulk_donors (default 3) donors have a nonzero library. Genes are GENCODE v49; chr
+uses X=23, Y=24, MT=26. Always filter on chr.
 
 ## Scan pruning
 

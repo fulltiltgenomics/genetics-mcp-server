@@ -19,7 +19,7 @@ views were loaded from; min_cells and min_donors are its suppression thresholds.
 | `title` | `STRING` | Dataset title |
 | `collection_doi` | `STRING` | Publication DOI of the collection |
 | `citation` | `STRING` | Citation string from CELLxGENE |
-| `cells_kept` | `INT64` | Primary cells aggregated |
+| `cells_kept` | `INT64` | Primary cells aggregated, after the per-cell depth filter |
 | `n_groups` | `INT64` | Cell groups, before suppression |
 | `n_genes` | `INT64` | Features in the source file |
 | `n_genes_measured` | `INT64` | Features the dataset measured |
