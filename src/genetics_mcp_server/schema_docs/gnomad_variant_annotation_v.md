@@ -45,8 +45,8 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `AF_nfe` | `FLOAT64` | Alternative allele frequency, non-Finnish European |
 | `AF_remaining` | `FLOAT64` | Alternative allele frequency, remaining individuals |
 | `AF_sas` | `FLOAT64` | Alternative allele frequency, South Asian |
-| `most_severe` | `STRING` | Most severe VEP-predicted variant consequence |
-| `gene_most_severe` | `STRING` | Gene symbol associated with the most severe consequence |
+| `most_severe` | `STRING` | Most severe VEP-predicted consequence on a canonical transcript, protein-coding genes first; a variant with no canonical transcript falls back to its other transcripts. Not VEP's most_severe_consequence, which is the worst over every transcript. The array in consequences holds every annotation |
+| `gene_most_severe` | `STRING` | Gene of the transcript most_severe was taken from: its gene symbol, or its Ensembl gene id (ENSG...) when the gene has no symbol. NULL when the variant has no transcript annotation |
 | `consequences` | `ARRAY<STRUCT<gene_symbol STRING, gene_id STRING, consequences ARRAY<STRING>, gene_symbol_source STRING, canonical INT64, biotype STRING>>` | VEP annotations in the source's order, one element per distinct gene-level annotation (a gene repeats when its transcripts differ), as ARRAY<STRUCT>: gene_symbol (NULL when the gene has none), gene_id (Ensembl), consequences (ARRAY<STRING> of VEP terms for that gene), gene_symbol_source (e.g. HGNC), canonical (1 when on the gene's canonical transcript, else NULL), biotype. Empty array when the variant has no annotation. Read with UNNEST(consequences) AS c |
 | `genome_or_exome` | `STRING` | Source of the row's statistics: g (genomes) or e (exomes) |
 | `resource` | `STRING` | Data source identifier, constant 'gnomad' |
