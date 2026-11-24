@@ -5,12 +5,12 @@ composite executor methods driven through a mocked httpx client.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+from helpers import ExecutorCase
 
 from genetics_mcp_server.tools import uniprot
-from genetics_mcp_server.tools.executor import ToolExecutor
 
 
 @pytest.fixture(autouse=True)
@@ -668,30 +668,8 @@ def _resolution(result: dict) -> dict:
 
 
 @pytest.mark.asyncio
-class TestUniProtToolMethods:
+class TestUniProtToolMethods(ExecutorCase):
     """Mocked-HTTP tests for get_protein_annotations / map_protein_variants / search_uniprot."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
-    def _patch_get(self, resolver):
-        """Patch the shared client's GET with a URL router; returns the patch and call log."""
-        calls: list[str] = []
-
-        def handler(url, *args, **kwargs):
-            text = str(url)
-            calls.append(text)
-            resp = resolver(text)
-            assert resp is not None, f"unexpected request: {text}"
-            return resp
-
-        patcher = patch.object(
-            self.executor.external_client, "get", new_callable=AsyncMock, side_effect=handler
-        )
-        return patcher, calls
 
     async def test_tpo_resolves_to_p07202_not_thrombopoietin(self):
         # free text 'TPO' ranks P40225 (entry name literally TPO_HUMAN, thrombopoietin)

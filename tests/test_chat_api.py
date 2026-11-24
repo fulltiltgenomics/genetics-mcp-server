@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 from conftest import settings_env
+from helpers import CapturingService, seed_session
 
 from genetics_mcp_server import llm_service as llm_service_module
 from genetics_mcp_server import rate_limit
@@ -1264,42 +1265,10 @@ class TestInstructionSetResolution:
         assert "Applying" not in caplog.text
 
 
-class _CapturingService:
-    """A stand-in LLM service that records the kwargs the endpoint hands it."""
-
-    def __init__(self):
-        self.anthropic_client = object()
-        self.openai_client = object()
-        # deliberately LIVE: with it None, `Settings.enable_subagents` defaulting false and
-        # the service-liveness check would both be hiding launch_subagents at once, and no
-        # test here could tell which one did it. Subagent guidance is absent from these
-        # prompts because of the flag, and only the flag.
-        self.subagent_service = object()
-        self.kwargs = None
-
-    def resolve_local_tools(
-        self, *, code_execution=False, enable_tools=True, custom_tool_descriptions=None
-    ):
-        """The real resolution, not a stub: the endpoint assembles the system prompt from
-        it (genetics-results-suite-4h6.69), so a stub here would stop these tests from
-        seeing the prompt the endpoint actually sends."""
-        from genetics_mcp_server.llm_service import LLMService
-
-        self._disabled_tools = lambda: LLMService._disabled_tools(self)
-        return LLMService.resolve_local_tools(
-            self,
-            code_execution=code_execution,
-            enable_tools=enable_tools,
-            custom_tool_descriptions=custom_tool_descriptions,
-        )
-
-    def stream_chat(self, **kwargs):
-        self.kwargs = kwargs
-
-        async def _stream():
-            yield StreamChunk(type="text", content="ok")
-
-        return _stream()
+def _CapturingService():
+    """Subagent guidance is absent from the prompts these tests read because of the
+    `enable_subagents` flag, and only the flag: the stand-in's subagent service is live."""
+    return CapturingService(chunks=(StreamChunk(type="text", content="ok"),))
 
 
 class TestInstructionSetWiring:
@@ -1930,10 +1899,7 @@ class TestUserMemoryResolution:
     USER = "a@finngen.fi"
 
     def _seed(self, chat_history_db, user, title, message="What about APOE?", project_id=None):
-        session = chat_history_db.create_session(user, project_id=project_id)
-        chat_history_db.update_session(session.id, user, title=title)
-        chat_history_db.add_message(session.id, f"m-{session.id}", "user", message)
-        return session
+        return seed_session(chat_history_db, user, title, message, project_id)
 
     def _opt_in(self, llm_config_db, user=USER, value="on"):
         llm_config_db.save_user_setting(

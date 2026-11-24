@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from helpers import set_updated_at as _set_updated_at
+
 
 @dataclass
 class FakeMetrics:
@@ -16,13 +18,6 @@ class FakeMetrics:
     llm_quality_score: int | None = None
     llm_disposition: str = ""
     llm_issue_categories: list[str] | None = None
-
-
-def _set_updated_at(db, session_id: str, value: str) -> None:
-    """Force a deterministic chat_sessions.updated_at (CURRENT_TIMESTAMP has 1s resolution)."""
-    conn = db._conn
-    conn.execute("UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (value, session_id))
-    conn.commit()
 
 
 def _set_analyzed_at(db, session_id: str, value: str) -> None:

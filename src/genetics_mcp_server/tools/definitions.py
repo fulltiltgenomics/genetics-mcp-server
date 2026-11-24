@@ -412,7 +412,7 @@ UNITS ARE log1p CP10K, NOT TPM. Never compare these numbers with bulk TPM values
 - SECONDARY: `donor_pseudobulk_mean_cp10k` (counts pooled per donor, then averaged across donors; linear CP10K, not log; NA when fewer than 3 donors have a nonzero library, or at dataset level on measured_no_row rows) — a robustness check against a few donors dominating, not the headline number and not for ranking.
 - `n_cells`, `n_donors` (and `n_datasets` at summary level) are the support behind a row; weigh a row with few donors accordingly. Cell groups with fewer than 50 cells or 3 donors are dropped, not shown. `tau` (summary level, same value on every row of a gene) is the gene's cell-type specificity index: 0 = ubiquitous, 1 = one cell type only.
 
-level='summary' (default): normal tissue, pooled across datasets, one row per (cell type, tissue), leaving out broad lineage labels such as 'leukocyte' or 'epithelial cell' and datasets whose donors are all prenatal (level='dataset' keeps both). Start here.
+level='summary' (default): normal tissue, pooled across datasets, one row per (cell type, tissue), leaving out broad lineage labels such as 'leukocyte' or 'epithelial cell' and datasets whose donors are all prenatal (level='dataset' keeps both). Start here. Thinly supported summary rows (few donors or cells, or a small row that comes from a single dataset) are hidden by default; `low_support_rows_hidden` counts them. Pass include_low_support=true to see them, each marked `low_support: true`, when a cell type you expected is missing or the user asks for rare cell types — and say that the support is thin when you report one.
 level='dataset': per-dataset groups (tissue, cell type, disease, assay), for per-dataset detail or to check that a summary value is not one dataset's artefact. Unlike the summary it includes disease samples — read the `disease` column. Rows are SPARSE: a `status: "present"` row exists only for a group where at least one cell expressed the gene, so in a dataset with any present row, a group passing the size thresholds (50 cells and 3 donors) that is missing had zero expressing cells; a below-threshold group never has a row, so its absence is unknown, not zero. One `status: "measured_no_row"` row per dataset means the dataset measured the gene and has groups passing the size thresholds, but no cell in any of those groups expressed it: real zeros, not missing data. A dataset absent from the result either did not measure the gene or had every group below the thresholds — unknown, not zero.
 
 A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before the lookup.""",
@@ -427,6 +427,11 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
                 "description": "'summary' (pooled across datasets per cell type and tissue, the default) or 'dataset' (per-dataset rows, including measured_no_row placeholders)",
                 "default": "summary",
                 "enum": ["summary", "dataset"],
+            },
+            "include_low_support": {
+                "type": "boolean",
+                "description": "Summary level only: also return rows marked low_support (default false)",
+                "default": False,
             },
         },
     },

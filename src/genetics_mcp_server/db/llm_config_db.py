@@ -10,13 +10,11 @@ import logging
 import os
 import secrets
 import sqlite3
-import threading
 import uuid
-from collections import defaultdict as dd
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from .singleton import Singleton
+from .singleton import ThreadLocalDB
 
 logger = logging.getLogger(__name__)
 
@@ -137,30 +135,12 @@ class AccessGrant:
         return self.revoked_at is None and self.expires_at > now
 
 
-class LLMConfigDB(object, metaclass=Singleton):
+class LLMConfigDB(ThreadLocalDB):
     """
     SQLite database for LLM configuration with versioned history.
 
     Uses thread-local connections for thread safety.
     """
-
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
-        self._connections: dict[int, sqlite3.Connection] = dd(lambda: self._create_connection())
-        self._init_db()
-
-    def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # under journal_mode=delete a reader is refused while a write is being applied (commit
-        # takes an EXCLUSIVE lock), and a writer's commit is refused while any reader still
-        # holds a read transaction. WAL removes both, as it already does for chat history
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
-
-    @property
-    def _conn(self) -> sqlite3.Connection:
-        return self._connections[threading.get_ident()]
 
     def _table_exists(self, cursor: sqlite3.Cursor, name: str) -> bool:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))

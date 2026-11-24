@@ -1,55 +1,31 @@
 """Integration tests for chat history router endpoints."""
 
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import close_and_unlink
+from conftest import authed_client, temp_singleton_db
 from fastapi.testclient import TestClient
+from helpers import seed_session
 
 from genetics_mcp_server.auth import auth_required
 from genetics_mcp_server.chat_api import app
 from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
-from genetics_mcp_server.db.singleton import Singleton
 
 
 @pytest.fixture
 def test_db():
     """Create a temporary database for testing."""
-    # clear singleton to allow fresh instance
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-
-    db = ChatHistoryDB(db_path)
-    yield db
-
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-    close_and_unlink(db, db_path)
+    with temp_singleton_db(ChatHistoryDB) as db:
+        yield db
 
 
 @pytest.fixture
 def client_with_auth(test_db):
     """Create a test client with mocked authentication and database."""
-
-    # override auth dependency to return a test user
-    async def mock_auth():
-        return "test@example.com"
-
-    app.dependency_overrides[auth_required] = mock_auth
-
-    # patch get_chat_history_db to return our test database
-    with patch(
-        "genetics_mcp_server.routers.chat_history.get_chat_history_db", return_value=test_db
-    ):
-        with TestClient(app) as client:
-            yield client
-
-    # cleanup overrides
-    app.dependency_overrides.clear()
+    with authed_client(
+        "genetics_mcp_server.routers.chat_history.get_chat_history_db", test_db
+    ) as client:
+        yield client
 
 
 class TestSessionEndpoints:
@@ -1040,10 +1016,7 @@ class TestMemoryEndpoints:
     USER = "test@example.com"
 
     def _seed(self, test_db, title, user=USER):
-        session = test_db.create_session(user)
-        test_db.update_session(session.id, user, title=title)
-        test_db.add_message(session.id, f"m-{session.id}", "user", "What about APOE?")
-        return session
+        return seed_session(test_db, user, title)
 
     def test_pin_toggles_and_unpins(self, client_with_auth, test_db):
         session = self._seed(test_db, "APOE and LDL")
@@ -1127,10 +1100,7 @@ class TestProjectMemoryEndpoint:
         return test_db.create_project(user, name)
 
     def _seed(self, test_db, project_id, title, user=USER):
-        session = test_db.create_session(user, project_id=project_id)
-        test_db.update_session(session.id, user, title=title)
-        test_db.add_message(session.id, f"m-{session.id}", "user", "What about APOE?")
-        return session
+        return seed_session(test_db, user, title, project_id=project_id)
 
     def test_memory_is_disabled_until_the_user_opts_in(
         self, client_with_auth, test_db, llm_config_db

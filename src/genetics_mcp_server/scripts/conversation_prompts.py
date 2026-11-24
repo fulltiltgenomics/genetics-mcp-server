@@ -114,6 +114,15 @@ ISSUE_CATEGORIES = [
 # list, the conversation_issue table, the report or the admin chart
 NON_ISSUE_CATEGORIES = frozenset({"not_an_issue"})
 
+# dispositions that are NOT the agent failing to answer an answerable question.
+# each maps to its own report bucket; none counts toward the agent-quality average.
+NON_QUALITY_DISPOSITIONS = {
+    "technical_failure",
+    "out_of_scope",
+    "unfinished",
+    "weird_or_unclear",
+}
+
 ISSUE_CATEGORIZATION_PROMPT = """\
 You are grouping individual quality issues found across a genetics AI assistant's
 conversations into recurring underlying problem categories.

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 
 import polars as pl
 import pytest
+from helpers import RecordingExecutor
 
 import genetics_mcp_server.sdk as genetics
 from genetics_mcp_server.sdk.client import GeneticsClient, parse_region
@@ -19,26 +20,21 @@ from genetics_mcp_server.sdk.errors import GeneticsError, GeneticsUsageError
 from genetics_mcp_server.tools.executor import ToolExecutor
 
 
-class FakeExecutor:
+class FakeExecutor(RecordingExecutor):
     """Records which executor method the SDK dispatched to."""
 
     def __init__(self, payload=None):
-        self.calls: list[tuple[str, tuple, dict]] = []
+        super().__init__(
+            payload
+            or {
+                "success": True,
+                "results": [{"variant": "1:1:A:G", "pip": 0.9}],
+                "variants": [{"variant": "1:1:A:G", "r2": 0.8}],
+                "genes": [{"symbol": "IL7R"}],
+                "members": [{"symbol": "IL7R"}],
+            }
+        )
         self._row_limit = 500
-        self._payload = payload or {
-            "success": True,
-            "results": [{"variant": "1:1:A:G", "pip": 0.9}],
-            "variants": [{"variant": "1:1:A:G", "r2": 0.8}],
-            "genes": [{"symbol": "IL7R"}],
-            "members": [{"symbol": "IL7R"}],
-        }
-
-    def __getattr__(self, name):
-        async def call(*args, **kwargs):
-            self.calls.append((name, args, kwargs))
-            return self._payload
-
-        return call
 
     @property
     def last(self):

@@ -17,6 +17,7 @@ import re
 
 import polars as pl
 import pytest
+from helpers import RecordingExecutor
 
 from genetics_mcp_server.sdk import client as sdk_client
 from genetics_mcp_server.sdk.client import GeneticsClient
@@ -33,30 +34,18 @@ LINE_RE = re.compile(
 )
 
 
-class _StubExecutor:
+class _StubExecutor(RecordingExecutor):
     """Stands in for ToolExecutor: any method the client reaches for returns the payload.
-
-    __getattr__ rather than named methods because the SDK dispatches one function across
-    several executor methods depending on which argument was supplied, and which one is
-    reached is not what these tests are about.
-    """
+    Which one is reached is not what these tests are about."""
 
     def __init__(self, payload=None):
-        self.payload = payload or {"success": True, "results": [], "columns": ["gene", "pip"]}
-        self.calls = []
+        super().__init__(payload or {"success": True, "results": [], "columns": ["gene", "pip"]})
 
     async def close(self):
         pass
 
     async def get_available_resources(self):
         return {"success": True, "resources": {"a": 1, "b": 2, "c": 3}}
-
-    def __getattr__(self, name):
-        async def call(*args, **kwargs):
-            self.calls.append((name, args, kwargs))
-            return self.payload
-
-        return call
 
 
 def _client(payload=None) -> GeneticsClient:

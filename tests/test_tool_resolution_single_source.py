@@ -15,9 +15,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from helpers import CapturingService, bare_llm_service
 
 from genetics_mcp_server import chat_api, llm_service
-from genetics_mcp_server.llm_service import LLMService, ResolvedLocalTools
+from genetics_mcp_server.llm_service import ResolvedLocalTools
 
 
 class _FakeStream:
@@ -54,12 +55,7 @@ class _FakeMessages:
 
 
 def _service():
-    svc = LLMService.__new__(LLMService)
-    svc.openai_client = None
-    svc.executor = None
-    svc.subagent_service = None
-    svc.anthropic_client = SimpleNamespace(messages=_FakeMessages())
-    return svc
+    return bare_llm_service(_FakeMessages())
 
 
 def _tool(name):
@@ -114,36 +110,6 @@ async def test_resolved_names_are_projected_off_the_definitions_not_stored():
     assert resolved.names == {"a", "b"}
 
 
-class _CapturingService:
-    """Records what the endpoint hands `stream_chat`, resolving tools for real."""
-
-    def __init__(self):
-        self.anthropic_client = object()
-        self.openai_client = object()
-        self.subagent_service = object()
-        self.kwargs = None
-
-    def resolve_local_tools(
-        self, *, code_execution=False, enable_tools=True, custom_tool_descriptions=None
-    ):
-        self._disabled_tools = lambda: LLMService._disabled_tools(self)
-        return LLMService.resolve_local_tools(
-            self,
-            code_execution=code_execution,
-            enable_tools=enable_tools,
-            custom_tool_descriptions=custom_tool_descriptions,
-        )
-
-    def stream_chat(self, **kwargs):
-        self.kwargs = kwargs
-
-        async def _stream():
-            return
-            yield  # pragma: no cover
-
-        return _stream()
-
-
 def test_the_endpoint_resolves_once_and_hands_that_same_resolution_down(test_client):
     """One derivation per request, and the model gets the object the prompt was built from.
 
@@ -164,7 +130,7 @@ def test_the_endpoint_resolves_once_and_hands_that_same_resolution_down(test_cli
         recorded["tool_names"] = tool_names
         return "SYSTEM"
 
-    service = _CapturingService()
+    service = CapturingService()
     with (
         patch.object(llm_service, "get_anthropic_tools", _counting),
         patch.object(chat_api, "default_system_prompt", _recording_prompt),

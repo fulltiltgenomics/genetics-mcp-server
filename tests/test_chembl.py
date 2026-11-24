@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from helpers import ExecutorCase
 
 from genetics_mcp_server.tools import chembl
 from genetics_mcp_server.tools.chembl import ChEMBLClient
@@ -207,32 +208,14 @@ class TestPageWalking:
 
 
 @pytest.mark.asyncio
-class TestHttpBehaviour:
+class TestHttpBehaviour(ExecutorCase):
     """Driven through the shared external_client with a URL router, as test_uniprot does."""
 
     @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
+    def setup_client(self, setup_executor):
         self.client = ChEMBLClient(
             self.executor.external_client, _Settings(), self.executor.uniprot
         )
-        yield
-        await self.executor.close()
-
-    def _patch_get(self, resolver):
-        calls: list[str] = []
-
-        def handler(url, *args, **kwargs):
-            text = str(url)
-            calls.append(text)
-            resp = resolver(text)
-            assert resp is not None, f"unexpected request: {text}"
-            return resp
-
-        patcher = patch.object(
-            self.executor.external_client, "get", new_callable=AsyncMock, side_effect=handler
-        )
-        return patcher, calls
 
     async def test_a_404_carries_the_status_and_a_truncated_body(self):
         patcher, _calls = self._patch_get(lambda url: _resp(status=404, text="x" * 500))
@@ -362,29 +345,8 @@ _UNIPROT_P2RY12 = {
 
 
 @pytest.mark.asyncio
-class TestTargetResolution:
+class TestTargetResolution(ExecutorCase):
     """resolve_target driven through the shared client, with the resolver stubbed."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
-    def _patch_get(self, resolver):
-        calls: list[str] = []
-
-        def handler(url, *args, **kwargs):
-            text = str(url)
-            calls.append(text)
-            resp = resolver(text)
-            assert resp is not None, f"unexpected request: {text}"
-            return resp
-
-        patcher = patch.object(
-            self.executor.external_client, "get", new_callable=AsyncMock, side_effect=handler
-        )
-        return patcher, calls
 
     def _stub_resolver(self, result):
         return patch.object(self.executor.uniprot, "resolve", new=AsyncMock(return_value=result))
@@ -549,29 +511,8 @@ def _molecule(molecule_id, pref_name, max_phase=4, **rest):
     }
 
 
-class _ChEMBLToolCase:
+class _ChEMBLToolCase(ExecutorCase):
     """Shared plumbing: a real executor, a stubbed UniProt resolver, a URL router."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
-    def _patch_get(self, resolver):
-        calls: list[str] = []
-
-        def handler(url, *args, **kwargs):
-            text = str(url)
-            calls.append(text)
-            resp = resolver(text)
-            assert resp is not None, f"unexpected request: {text}"
-            return resp
-
-        patcher = patch.object(
-            self.executor.external_client, "get", new_callable=AsyncMock, side_effect=handler
-        )
-        return patcher, calls
 
     def _stub_resolver(self, result=None):
         return patch.object(
@@ -1219,15 +1160,9 @@ class TestTargetBioactivity(_ChEMBLToolCase):
 
 
 @pytest.mark.asyncio
-class TestChEMBLExecutorDelegates:
+class TestChEMBLExecutorDelegates(ExecutorCase):
     """The delegates add a download hint and turn an unexpected exception into the
     generic message; everything else is the client's result verbatim."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     def _raise(self, name):
         return patch.object(

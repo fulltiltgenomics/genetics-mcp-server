@@ -45,6 +45,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from . import analysis_timeseries as ats  # noqa: E402
 from .analysis_timeseries import (  # noqa: E402
+    DISPOSITION_COLORS,
     DISPOSITION_LABELS,
     ISSUE_CATEGORY_NAMES,
     SCORES,
@@ -57,17 +58,6 @@ SCORE_COLORS = {
     3: "#fee08b",
     4: "#91cf60",
     5: "#1a9850",
-}
-
-DISPOSITION_COLORS = {
-    "successful": "#1a9850",
-    "neutral": "#fee08b",
-    "unsuccessful": "#d73027",
-    "technical_failure": "#762a83",
-    "out_of_scope": "#4575b4",
-    "unfinished": "#999999",
-    "weird_or_unclear": "#fc8d59",
-    "unknown": "#000000",
 }
 
 # distinct colour per issue category from a 20-colour qualitative map

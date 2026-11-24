@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
 import pytest
+from helpers import RecordingExecutor
 
 from genetics_mcp_server.tools import ToolExecutor
 
@@ -335,21 +336,10 @@ def test_by_gene_tools_take_limit_on_both_surfaces(method):
 
     from genetics_mcp_server.tools.definitions import get_anthropic_tools, register_mcp_tools
 
-    class _Recorder:
-        def __init__(self):
-            self.calls = []
-
-        def __getattr__(self, name):
-            async def _call(*args, **kwargs):
-                self.calls.append((name, args, kwargs))
-                return {}
-
-            return _call
-
     chat = {t["name"]: t["input_schema"] for t in get_anthropic_tools()}
     assert chat[method]["properties"]["limit"]["default"] == 500
 
-    recorder = _Recorder()
+    recorder = RecordingExecutor({})
     mcp = FastMCP("limit-test")
     register_mcp_tools(mcp, recorder)
     schema = {t.name: t.inputSchema for t in asyncio.run(mcp.list_tools())}[method]

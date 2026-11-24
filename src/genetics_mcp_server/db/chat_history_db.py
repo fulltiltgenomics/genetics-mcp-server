@@ -7,13 +7,12 @@ Stores chat sessions and messages with support for ratings and comments.
 import json
 import logging
 import sqlite3
-import threading
 import uuid
 from collections import defaultdict as dd
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from .singleton import Singleton
+from .singleton import ThreadLocalDB
 
 logger = logging.getLogger(__name__)
 
@@ -138,29 +137,14 @@ class ChatAttachment:
     text_path: str | None = None  # parsed text/TSV representation (excel files)
 
 
-class ChatHistoryDB(object, metaclass=Singleton):
+class ChatHistoryDB(ThreadLocalDB):
     """
     SQLite database for chat history persistence.
 
     Uses thread-local connections for thread safety.
     """
 
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
-        self._connections: dict[int, sqlite3.Connection] = dd(lambda: self._create_connection())
-        self._init_db()
-
-    def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        # WAL lets the nightly analysis job read/write without blocking live chat writers
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
-
-    @property
-    def _conn(self) -> sqlite3.Connection:
-        return self._connections[threading.get_ident()]
+    _foreign_keys = True
 
     def _init_db(self) -> None:
         """Create tables if they don't exist."""

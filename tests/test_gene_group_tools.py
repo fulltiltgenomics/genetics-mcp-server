@@ -7,29 +7,15 @@ touched. The unresolved/mapping shapes here match the genetics-results-api
 /v1/gene_group/members and /v1/gene/normalize endpoints.
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
-
-
-def _mock_response(status_code: int = 200, json_data: dict | None = None, text: str = ""):
-    resp = MagicMock()
-    resp.status_code = status_code
-    resp.text = text
-    resp.json = MagicMock(return_value=json_data or {})
-    return resp
+from helpers import ExecutorCase
+from helpers import mock_response as _mock_response
 
 
 @pytest.mark.asyncio
-class TestGetGeneGroupMembers:
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        from genetics_mcp_server.tools.executor import ToolExecutor
-
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
+class TestGetGeneGroupMembers(ExecutorCase):
     async def test_success_by_group_id(self):
         json_data = {
             "group_id": 588,
@@ -132,15 +118,7 @@ class TestGetGeneGroupMembers:
 
 
 @pytest.mark.asyncio
-class TestNormalizeGeneSymbols:
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        from genetics_mcp_server.tools.executor import ToolExecutor
-
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
-
+class TestNormalizeGeneSymbols(ExecutorCase):
     async def test_success_passthrough(self):
         json_data = {
             "mappings": [

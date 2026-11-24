@@ -139,7 +139,7 @@ def pairings_for(modality: str) -> tuple[Pairing, ...]:
 # same convention read off the same views and are believed rather than measured, exactly as
 # `alphagenome._CHROM_ALIASES` records for the other direction; a wrong spelling here yields
 # no measured rows rather than the wrong ones, because the whole variant id must match.
-_SUITE_CHROM = {"chrX": "23", "chrY": "24", "chrM": "25"}
+_SUITE_CHROM = {"chrX": "23", "chrY": "24", "chrM": "26"}
 
 
 def suite_variant_id(variant: dict[str, Any]) -> str | None:

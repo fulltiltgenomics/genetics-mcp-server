@@ -169,7 +169,6 @@ class FakeGrpcError(Exception):
         ("x", "chrX"),
         ("24", "chrY"),
         ("Y", "chrY"),
-        ("25", "chrM"),
         ("26", "chrM"),
         ("MT", "chrM"),
         ("M", "chrM"),
@@ -665,11 +664,16 @@ async def test_default_modalities_exclude_the_unvalidated_tier():
 TOOL = "get_alphagenome_variant_predictions"
 
 
-def _definition():
+def _definition(name=TOOL):
     from genetics_mcp_server.tools.definitions import all_local_tool_definitions
 
-    [tool] = [t for t in all_local_tool_definitions() if t["name"] == TOOL]
+    [tool] = [t for t in all_local_tool_definitions() if t["name"] == name]
     return tool
+
+
+def _assert_declares_the_client_modalities(name):
+    declared = _definition(name)["parameters"]["modalities"]["items"]["enum"]
+    assert sorted(declared) == sorted(alphagenome.MODALITIES)
 
 
 def _executor(atlas_obj, **kwargs):
@@ -684,8 +688,7 @@ def test_the_declared_modalities_are_exactly_the_ones_the_client_knows():
     """Spelled out in the schema, pinned here — the same arrangement as
     defaults._SUMMARIZE_PARAM_TOOLS, so definitions.py does not have to import a module
     that pulls the AlphaGenome SDK into every process that reads the tool catalogue."""
-    declared = _definition()["parameters"]["modalities"]["items"]["enum"]
-    assert sorted(declared) == sorted(alphagenome.MODALITIES)
+    _assert_declares_the_client_modalities(TOOL)
 
 
 def test_the_tool_is_on_both_surfaces_and_no_script_can_reach_it():

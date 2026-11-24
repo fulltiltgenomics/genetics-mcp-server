@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from helpers import ExecutorCase
 
 from genetics_mcp_server.tools.executor import ToolExecutor
 
@@ -151,14 +152,8 @@ class TestFlattenMyvariantResult:
 
 
 @pytest.mark.asyncio
-class TestGetMyvariantAnnotations:
+class TestGetMyvariantAnnotations(ExecutorCase):
     """Mocked HTTP tests for get_myvariant_annotations."""
-
-    @pytest.fixture(autouse=True)
-    async def setup_executor(self):
-        self.executor = ToolExecutor()
-        yield
-        await self.executor.close()
 
     async def test_single_variant_success(self):
         mock_response = MagicMock()

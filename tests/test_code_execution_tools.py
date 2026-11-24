@@ -16,10 +16,11 @@ import time
 import pytest
 from conftest import settings_env
 from fastapi import Request
+from helpers import sandbox_result_body
 
 from genetics_mcp_server.config.settings import Settings
 from genetics_mcp_server.llm_service import _script_result_payload, _truncation_notice
-from genetics_mcp_server.sandbox_client import ArtifactResult
+from genetics_mcp_server.sandbox_client import ArtifactResult, SandboxClient
 from genetics_mcp_server.tools import ServerToolExecutor
 from genetics_mcp_server.tools import executor as executor_module
 from genetics_mcp_server.tools import orchestration as orchestration_module
@@ -262,16 +263,8 @@ class _ArtifactSandbox:
             return ArtifactResult(ok=False, name=name, status_code=404, error_type="NotFound")
         return answer
 
-    async def fetch_artifact(self, execution_id, name):
-        result = await self.get_artifact(execution_id, name)
-        if not result.ok or result.data is None:
-            return None
-        return {
-            "name": name,
-            "content_type": result.content_type,
-            "content_base64": result.content_base64,
-            "size": len(result.data),
-        }
+    # the real wrapper over this stub's get_artifact
+    fetch_artifact = SandboxClient.fetch_artifact
 
 
 def _served(name, data, content_type=None):
@@ -920,19 +913,12 @@ class _StubSandbox:
 
 
 def _result_body(**overrides):
-    body = {
-        "execution_id": "8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b",
-        "status": "ok",
-        "exit_code": 0,
-        "signal": None,
-        "duration_ms": 1234,
-        "output": "rows: 12\n",
-        "output_bytes": 9,
-        "output_truncated": False,
-        "error": None,
-        "artifacts": [],
-        "artifacts_omitted": 0,
-    }
+    body = sandbox_result_body(
+        "8f14e45f-ceea-467a-a3d3-6f1b1b1b1b1b",
+        duration_ms=1234,
+        output="rows: 12\n",
+        output_bytes=9,
+    )
     body.update(overrides)
     return body
 

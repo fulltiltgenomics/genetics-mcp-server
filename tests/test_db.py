@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from conftest import block_writes, unblock_writes
+from helpers import set_updated_at
 
 USER = "user@example.com"
 # what a read degrades an unusable stored timestamp to, rather than raising
@@ -583,11 +584,7 @@ class TestGetRecentSessionsForDigest:
         )
         return session
 
-    def _set_updated_at(self, db, session_id, value):
-        db._conn.execute(
-            "UPDATE chat_sessions SET updated_at = ? WHERE id = ?", (value, session_id)
-        )
-        db._conn.commit()
+    _set_updated_at = staticmethod(set_updated_at)
 
     def test_newest_first_and_content_shape(self, chat_history_db):
         s1 = self._session_with_turn(chat_history_db, USER, "first question")

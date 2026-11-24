@@ -4,13 +4,12 @@ import asyncio
 import base64
 import json
 import re
-import tempfile
 import threading
 import time
 from unittest.mock import patch
 
 import pytest
-from conftest import close_and_unlink
+from conftest import temp_singleton_db
 from fastapi.testclient import TestClient
 
 from genetics_mcp_server import llm_service as llm_service_module
@@ -18,7 +17,6 @@ from genetics_mcp_server import turns
 from genetics_mcp_server.auth import auth_required
 from genetics_mcp_server.chat_api import app
 from genetics_mcp_server.db.chat_history_db import ChatHistoryDB
-from genetics_mcp_server.db.singleton import Singleton
 from genetics_mcp_server.llm_service import StreamChunk
 from genetics_mcp_server.turns import (
     Turn,
@@ -299,15 +297,8 @@ class TestRenderTranscript:
 
 @pytest.fixture
 def history_db():
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-    db = ChatHistoryDB(db_path)
-    yield db
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-    close_and_unlink(db, db_path)
+    with temp_singleton_db(ChatHistoryDB) as db:
+        yield db
 
 
 @pytest.fixture

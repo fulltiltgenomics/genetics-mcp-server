@@ -7,7 +7,7 @@ from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
-from conftest import close_and_unlink, settings_env
+from conftest import close_and_unlink, settings_env, temp_singleton_db
 from fastapi.testclient import TestClient
 
 from genetics_mcp_server.auth import admin_required, auth_required
@@ -22,18 +22,8 @@ INTERNAL_SECRET = "test-internal-secret"
 @pytest.fixture
 def test_db():
     """Create a temporary database for testing."""
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-
-    db = ChatHistoryDB(db_path)
-    yield db
-
-    if ChatHistoryDB in Singleton._instances:
-        del Singleton._instances[ChatHistoryDB]
-    close_and_unlink(db, db_path)
+    with temp_singleton_db(ChatHistoryDB) as db:
+        yield db
 
 
 @pytest.fixture

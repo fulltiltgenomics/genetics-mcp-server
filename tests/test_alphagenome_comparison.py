@@ -12,22 +12,17 @@ and every measured value carries `measured: true` and names where it came from.
 """
 
 import pytest
-from test_alphagenome import FakeAtlas, _client, entry
+from test_alphagenome import (
+    FakeAtlas,
+    _assert_declares_the_client_modalities,
+    _client,
+    _definition,
+    clear_module_state,  # noqa: F401
+    entry,
+)
 
 from genetics_mcp_server.tools import alphagenome
 from genetics_mcp_server.tools import alphagenome_comparison as comparison
-
-
-@pytest.fixture(autouse=True)
-def clear_module_state():
-    alphagenome._METADATA_CACHE.clear()
-    alphagenome._LIMITER.clear()
-    alphagenome._CACHE.clear()
-    yield
-    alphagenome._METADATA_CACHE.clear()
-    alphagenome._LIMITER.clear()
-    alphagenome._CACHE.clear()
-
 
 TOOL = "compare_alphagenome_with_measured"
 
@@ -420,13 +415,6 @@ async def test_a_tier_4_only_request_asks_db_api_for_nothing():
 # --------------------------------------------------------------------------- #
 
 
-def _definition(name):
-    from genetics_mcp_server.tools.definitions import all_local_tool_definitions
-
-    [tool] = [t for t in all_local_tool_definitions() if t["name"] == name]
-    return tool
-
-
 def test_the_opt_in_wording_covers_both_tools_identically():
     """The user ruled that this wording is the entire enforcement, so a second capability
     under a second name must not carry a second, drifting copy of it."""
@@ -456,8 +444,7 @@ def test_the_comparison_tool_is_on_both_surfaces():
 
 
 def test_the_declared_modalities_are_exactly_the_ones_the_client_knows():
-    declared = _definition(TOOL)["parameters"]["modalities"]["items"]["enum"]
-    assert sorted(declared) == sorted(alphagenome.MODALITIES)
+    _assert_declares_the_client_modalities(TOOL)
 
 
 def test_the_description_states_the_rules_the_response_shape_enforces():

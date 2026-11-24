@@ -76,7 +76,7 @@ genetics-mcp-server is a Model Context Protocol (MCP) server and LLM chat servic
 | Tool | Description |
 |------|-------------|
 | `get_gene_expression` | Get tissue-specific gene expression levels (bulk, e.g. GTEx) |
-| `get_cell_type_expression` | Single-cell expression by cell type from human CZ CELLxGENE Discover datasets with raw integer counts on supported assays, primary cells only, `level` summary or dataset; log1p CP10K. Strips an Ensembl version before calling. Offered only where `CELL_TYPE_EXPRESSION_ENABLED` is true and `CONFIG_PROFILE` is in `CELL_TYPE_EXPRESSION_PROFILES` (`daly`), via `Settings.disabled_tools`: the flag follows whether the deployment gives results-api a release pointer, so the tool is advertised only where the endpoint can answer; results-api's 404 "not configured" and 503 (no release loaded yet) come back as `error_code` `not_available` / `release_not_loaded`. SDK: `genetics.cell_type_expression()` |
+| `get_cell_type_expression` | Single-cell expression by cell type from human CZ CELLxGENE Discover datasets with raw integer counts on supported assays, primary cells only, `level` summary or dataset; log1p CP10K. Strips an Ensembl version before calling. Offered only where `CELL_TYPE_EXPRESSION_ENABLED` is true and `CONFIG_PROFILE` is in `CELL_TYPE_EXPRESSION_PROFILES` (`daly`), via `Settings.disabled_tools`: the flag follows whether the deployment gives results-api a release pointer, so the tool is advertised only where the endpoint can answer; results-api's 404 "not configured" and 503 (no release loaded yet) come back as `error_code` `not_available` / `release_not_loaded`. SDK: `genetics.cell_type_expression()` At summary level, rows results-api marks `low_support` are left out and counted in `low_support_rows_hidden` unless `include_low_support` is true (the SDK function takes the same argument). |
 | `get_gene_disease_associations` | Get Mendelian disease relationships from GenCC curation submissions and the Monarch Initiative KG |
 | `get_protein_features_at_variant` | For genomic variants, the residue each one changes (from the protein structure release's variant-to-residue map), the sequence features covering it with their `evidence_tier`, and its pLDDT, one result per (variant, protein). The three protein structure tools are offered only where `PROTEIN_STRUCTURE_ENABLED` is true and `CONFIG_PROFILE` is in `PROTEIN_STRUCTURE_PROFILES`, via `Settings.disabled_tools`, are `sdk_replaceable` (a script uses `genetics.protein_structure` and `genetics.structure`), and are withheld from `/mcp` by `_mcp_disabled`. A variant with no residue row is reported as exactly that (`variants_without_residue_row`); results-api's 404 for an unregistered route or source maps to `not_available` and its 503 to `release_not_loaded`. The same release is reachable through `get_variant_annotations(source="protein")`, so that source follows the layer: the executor refuses it with `not_available` where `Settings.protein_structure_offered` is false (the sandbox image has no settings and leaves it to results-api), and the `/mcp` handler in `register_mcp_tools` refuses it whenever any of the three tools is in the registration's `disabled_tools`. On the code surface the layer is SDK functions, and `prompt_blocks.protein_structure_sdk_rule` emits its prompt block only where `protein_structure_offered` is true |
 | `get_3d_distance_between_variants` | Cα distance, PAE and lower pLDDT for every pair of the given variants that fall on one protein, computed by `sdk/structure.py` on the model files and PAE rows the executor fetches for just those residues. A pair no single model file contains gets `status: no_shared_model_file` and no number; `same_residue` and `different_proteins` are the other non-measured answers |
@@ -2287,7 +2287,7 @@ hostage dependence on them was invisible profile-by-profile.
 `tests/test_llm_service.py::TestResolveLocalToolNames` pins the resolution itself: `MCP_ENABLED=false`
 advertises nothing, and `ENABLE_SUBAGENTS=true` with a dead `subagent_service` still hides
 `launch_subagents`. Those two disabling reasons must remain distinguishable in tests, so
-`_CapturingService` in `tests/test_chat_api.py` holds a live `subagent_service`.
+`CapturingService` in `tests/helpers.py` holds a live `subagent_service`.
 
 **Routing arbitration has one home.** The preference between "call a dedicated API tool", "write
 SQL" and "write one script" is stated once, in the prompt's "Choosing How to Get Data" section,
@@ -2501,7 +2501,7 @@ src/genetics_mcp_server/
 │   ├── __init__.py                 # Database utilities for chat history and LLM config.
 │   ├── chat_history_db.py          # SQLite service for chat history persistence.
 │   ├── llm_config_db.py            # SQLite service for LLM configuration with change history.
-│   └── singleton.py                # Singleton metaclass for database connections.
+│   └── singleton.py                # Singleton metaclass and per-thread connection base for the SQLite databases.
 ├── routers/
 │   ├── __init__.py                 # API routers for chat history and LLM configuration.
 │   ├── access_grants.py            # Admin endpoints for runtime access grants, plus the internal check other services call.
@@ -3069,8 +3069,8 @@ are kept in that script.
 
 <!-- END GENERATED: database-env -->
 
-**Both SQLite databases run in WAL mode**, set by `_create_connection` in `chat_history_db.py`
-and `llm_config_db.py`. Under the default rollback journal a reader is refused while a write is
+**Both SQLite databases run in WAL mode**, set by `ThreadLocalDB._create_connection` in
+`db/singleton.py`, the base both database classes share. Under the default rollback journal a reader is refused while a write is
 being applied (commit takes an EXCLUSIVE lock), and a writer's commit is refused while any
 reader still holds a read transaction; WAL removes both directions. For `llm_config.db` the
 mixed read+write hot path is API-token validation: `validate_api_token` runs a SELECT plus a
@@ -4372,7 +4372,13 @@ literature result is shown to the judge up to the answering model's own tool-res
 reports anything. `git commit --no-verify` is the bypass. It is the one pre-commit check
 that blocks; `scripts/check-doc-drift.sh` only warns. The gate checks formatting rather
 than applying it: a hook that rewrites files behind the commit stages something the author
-never saw, so an unformatted file is fixed with `ruff format <file>` and re-staged.
+never saw, so an unformatted file is fixed with `ruff format <file>` and re-staged. The
+format half is switched on by the tracked `.ruff-format-gate` file at the repo root.
+
+The hook scripts are not this repo's own: `scripts/lint-staged.sh`, `scripts/install-git-hooks.sh`
+and `scripts/doc-drift-lib.sh`, plus `scripts/doc_blocks.py`, the renderer `gen-doc-blocks.py` imports, are copies genetics-results-suite's `scripts/vendor.py` writes
+(`configs/vendored.yaml` there). Edit them in that repo; only the rules in
+`scripts/check-doc-drift.sh` are maintained here.
 
 - **Staged, not repo-wide.** A finding in a file the commit does not touch never blocks it.
   The other side of that coin is that a pre-existing finding is only ever cleared by
