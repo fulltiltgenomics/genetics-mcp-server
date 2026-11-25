@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 # the profiles whose results-api can serve a cell-type expression release at all. Within them
 # a deployment still opts in with CELL_TYPE_EXPRESSION_ENABLED; elsewhere the endpoint answers
 # 404 "not configured", so advertising the tool would only invite failures
-CELL_TYPE_EXPRESSION_PROFILES = frozenset({"daly"})
+CELL_TYPE_EXPRESSION_PROFILES = frozenset({"daly", "finngen"})
 
 # the profiles whose results-api can serve a protein structure release; the same two-step
 # gate as above, with PROTEIN_STRUCTURE_ENABLED as the deployment's opt-in
-PROTEIN_STRUCTURE_PROFILES = frozenset({"daly"})
+PROTEIN_STRUCTURE_PROFILES = frozenset({"daly", "finngen"})
 PROTEIN_STRUCTURE_TOOLS = frozenset(
     {
         "get_protein_features_at_variant",

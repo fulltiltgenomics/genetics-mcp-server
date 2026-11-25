@@ -5,22 +5,28 @@
   ],
   "views": {
     "cellxgene_datasets_v": [
-      "daly"
+      "daly",
+      "finngen"
     ],
     "cellxgene_expression_v": [
-      "daly"
+      "daly",
+      "finngen"
     ],
     "cellxgene_groups_v": [
-      "daly"
+      "daly",
+      "finngen"
     ],
     "cellxgene_measured_genes_v": [
-      "daly"
+      "daly",
+      "finngen"
     ],
     "cellxgene_summary_v": [
-      "daly"
+      "daly",
+      "finngen"
     ],
     "missense_residue_v": [
-      "daly"
+      "daly",
+      "finngen"
     ]
   }
 }

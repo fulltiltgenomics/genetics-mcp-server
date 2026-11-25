@@ -130,15 +130,15 @@ _FUNCTIONS = (
 # (genetics-results-suite scripts/gen-sandbox-docs.py reads it with ast, so keep it a
 # literal), which is what keeps the stub and the import surface from disagreeing.
 _PROFILE_GATED = {
-    "cell_type_expression": ("daly",),
-    "protein_models": ("daly",),
-    "protein_residues": ("daly",),
-    "protein_features": ("daly",),
-    "protein_scores": ("daly",),
-    "protein_variants": ("daly",),
-    "protein_structure_file": ("daly",),
-    "protein_pae": ("daly",),
-    "protein_structure": ("daly",),
+    "cell_type_expression": ("daly", "finngen"),
+    "protein_models": ("daly", "finngen"),
+    "protein_residues": ("daly", "finngen"),
+    "protein_features": ("daly", "finngen"),
+    "protein_scores": ("daly", "finngen"),
+    "protein_variants": ("daly", "finngen"),
+    "protein_structure_file": ("daly", "finngen"),
+    "protein_pae": ("daly", "finngen"),
+    "protein_structure": ("daly", "finngen"),
 }
 
 

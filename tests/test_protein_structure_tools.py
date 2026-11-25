@@ -860,11 +860,12 @@ async def test_sdk_refuses_an_ambiguous_protein_with_the_choices(executor):
     assert SINGLE in str(raised.value) and WINDOWED in str(raised.value)
 
 
-def test_sdk_binds_the_functions_on_daly_only(sdk_for_profile):
-    sdk = sdk_for_profile("daly")
-    assert set(SDK_FUNCTIONS) <= set(sdk.__all__)
-    assert all(callable(getattr(sdk, name)) for name in SDK_FUNCTIONS)
-    for profile in ("finngen", None, "unknown"):
+def test_sdk_binds_the_functions_on_serving_profiles_only(sdk_for_profile):
+    for profile in ("daly", "finngen"):
+        sdk = sdk_for_profile(profile)
+        assert set(SDK_FUNCTIONS) <= set(sdk.__all__)
+        assert all(callable(getattr(sdk, name)) for name in SDK_FUNCTIONS)
+    for profile in (None, "unknown"):
         sdk = sdk_for_profile(profile)
         assert not set(SDK_FUNCTIONS) & set(sdk.__all__)
         assert not set(SDK_FUNCTIONS) & set(dir(sdk))
@@ -920,7 +921,8 @@ def test_the_three_tools_are_defined_and_are_the_gated_set():
     [
         ("daly", True, True),
         ("daly", False, False),
-        ("finngen", True, False),
+        ("finngen", True, True),
+        ("finngen", False, False),
         (None, True, False),
         ("unknown", True, False),
     ],
@@ -939,6 +941,8 @@ def test_reads_the_enabled_flag_from_the_environment(monkeypatch):
     monkeypatch.setenv("PROTEIN_STRUCTURE_ENABLED", "true")
     assert not PROTEIN_STRUCTURE_TOOLS & Settings().disabled_tools
     monkeypatch.setenv("CONFIG_PROFILE", "finngen")
+    assert not PROTEIN_STRUCTURE_TOOLS & Settings().disabled_tools
+    monkeypatch.setenv("CONFIG_PROFILE", "unknown")
     assert PROTEIN_STRUCTURE_TOOLS <= Settings().disabled_tools
 
 
@@ -963,7 +967,7 @@ def feature(monkeypatch):
     get_settings.cache_clear()
 
 
-OFF_STATES = [("daly", False), ("finngen", True), (None, True), ("unknown", True)]
+OFF_STATES = [("daly", False), ("finngen", False), (None, True), ("unknown", True)]
 
 
 def _mcp_exclusions_with_the_feature_on() -> set[str]:

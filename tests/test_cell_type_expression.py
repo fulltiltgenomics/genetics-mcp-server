@@ -231,9 +231,9 @@ def test_sdk_exports_it_on_daly_under_a_name_that_is_not_a_view_stem(sdk_for_pro
     assert not any(name.lower().startswith("cellxgene") for name in sdk.__all__)
 
 
-@pytest.mark.parametrize("profile", ["finngen", None, "unknown"])
+@pytest.mark.parametrize("profile", [None, "unknown"])
 def test_sdk_neither_lists_nor_binds_it_elsewhere(sdk_for_profile, profile):
-    # the SDK fails closed like the tool: a sandbox on finngen, or one with no profile at all,
+    # the SDK fails closed like the tool: a sandbox with an unknown profile, or with none at all,
     # has no genetics.cell_type_expression to call and no stub line naming it
     sdk = sdk_for_profile(profile)
     assert "cell_type_expression" not in sdk.__all__
@@ -268,7 +268,7 @@ def test_tool_text_names_no_gated_view():
     [
         ("daly", True, True),
         ("daly", False, False),
-        ("finngen", True, False),
+        ("finngen", True, True),
         ("finngen", False, False),
         (None, True, False),
         ("unknown", True, False),
@@ -294,6 +294,8 @@ def test_reads_config_profile_and_enabled_flag_from_the_environment(monkeypatch)
     assert TOOL in Settings().disabled_tools
     monkeypatch.setenv("CELL_TYPE_EXPRESSION_ENABLED", "true")
     monkeypatch.setenv("CONFIG_PROFILE", "finngen")
+    assert TOOL not in Settings().disabled_tools
+    monkeypatch.setenv("CONFIG_PROFILE", "unknown")
     assert TOOL in Settings().disabled_tools
     monkeypatch.delenv("CONFIG_PROFILE")
     assert TOOL in Settings().disabled_tools
