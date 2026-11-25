@@ -24,6 +24,12 @@
       "daly",
       "finngen"
     ],
+    "gnomad_missense_constraint_regions_v": [
+      "daly"
+    ],
+    "gnomad_mpc_v": [
+      "daly"
+    ],
     "missense_residue_v": [
       "daly",
       "finngen"

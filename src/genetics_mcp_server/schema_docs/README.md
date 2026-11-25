@@ -51,6 +51,8 @@ each shows the filters that view expects.
 | `rcnv_window_associations_v` | Sliding-window rare-CNV associations |
 | `variant_annotation_v` | Per-variant annotation, rsIDs, FinnGen frequencies |
 | `gnomad_variant_annotation_v` | gnomAD per-variant frequencies by ancestry group and VEP annotation |
+| `gnomad_mpc_v` | gnomAD MPC missense deleteriousness score for every possible missense SNV |
+| `gnomad_missense_constraint_regions_v` | gnomAD regional missense constraint: per-transcript regions with observed and expected missense counts |
 | `peak_to_gene_v` | Peak-to-gene links (makes caQTL gene-based) |
 | `phenotypes_v` | Phenotype metadata behind trait codes |
 | `datasets_v` | Dataset registry: resource, version, caveats |
