@@ -4,8 +4,8 @@
 # exome_variant_counts_v
 
 Per-variant allele COUNTS from exome studies whose release carries counts but no per-variant
-test statistic. GRCh38; not filtered on significance (there is none). Three sources, and
-they do NOT carry the same columns — a column a source lacks is NULL for it, never zero, so
+test statistic. GRCh38; not filtered on significance (there is none). Four sources, and they
+do NOT carry the same columns — a column a source lacks is NULL for it, never zero, so
 always filter on `dataset` and read only the counts that dataset has: ASC2 (Autism
 Sequencing Consortium 2026, trait ASD): every SNV/indel in the release — 7,045,150 rows for
 7,045,130 variants, chrX (23) and chrY (24) included — with its VEP consequence, variant
@@ -27,13 +27,23 @@ variant_class and no is_other_splice (all NULL). Its `consequence` uses VEP's ow
 spelling. BipEx2 (Bipolar Exomes v2, trait BIP): as SCHEMA2 — every variant that has a gene,
 31,840,420 rows, `in_analysis` TRUE on 3,734,032 of them (its analysed set includes
 synonymous variants) — with case and control allele counts and allele numbers. No de novo
-count (de_novo_ac_proband is NULL, not zero) and no transcript_id. SCHEMA2 and BipEx2 report
-no per-variant p-value or effect size: do not compute an odds ratio or p-value from these
-counts and present it as the study's result. No CNV rows: the DEL and DUP classes are gene-
-level only (exome_gene_counts_v). Summing these counts over a gene reproduces neither that
-table's "independent" counts nor the Bayes factor; do not present such a sum, or an odds
-ratio computed from these counts, as a result of the study. Large, so a literal `chr = <n>`
-beside `gene =` or `variant =` is required to stay under the sandbox scan cap.
+count (de_novo_ac_proband is NULL, not zero) and no transcript_id. SCHEMA1 (the 2021 SCHEMA
+release, Singh et al. 2022, trait SCZ; 24,248 cases and 97,322 controls): the 8,640,041
+variants of the release's analysis set that have a consequence, lifted from GRCh37 to GRCh38
+(the few that do not lift cleanly are left out). Columns as SCHEMA2 — `in_analysis` (TRUE on
+398,033), case and control allele counts with allele numbers, a de novo count — but no
+transcript_id and no alpha_missense. Its `consequence` uses VEP's terms with missense split
+by MPC bin: `missense_variant_mpc_<2`, `missense_variant_mpc_2-3`,
+`missense_variant_mpc_>=3`, so match missense with `consequence LIKE 'missense_variant%'`.
+SCHEMA1 and SCHEMA2 are two releases of one study with overlapping samples: never add their
+counts together, and prefer SCHEMA2 unless the question is about the 2022 paper. SCHEMA2 and
+BipEx2 report no per-variant p-value or effect size, and the SCHEMA1 release's per-variant
+statistics are not loaded: do not compute an odds ratio or p-value from these counts and
+present it as the study's result. No CNV rows: the DEL and DUP classes are gene-level only
+(exome_gene_counts_v). Summing these counts over a gene reproduces neither that table's
+"independent" counts nor the Bayes factor; do not present such a sum, or an odds ratio
+computed from these counts, as a result of the study. Large, so a literal `chr = <n>` beside
+`gene =` or `variant =` is required to stay under the sandbox scan cap.
 
 ## Scan pruning
 
@@ -43,26 +53,26 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 
 | column | type | description |
 | --- | --- | --- |
-| `dataset` | `STRING` | Study name (ASC2, SCHEMA2, BipEx2). Decides which count columns are populated |
+| `dataset` | `STRING` | Study name (ASC2, SCHEMA1, SCHEMA2, BipEx2). Decides which count columns are populated |
 | `chr` | `INT64` | Chromosome number, chromosome X is 23, Y is 24, MT is 26. The partitioning column |
 | `pos` | `INT64` | Genomic position (GRCh38) |
 | `ref` | `STRING` | Reference allele |
 | `alt` | `STRING` | Alternative allele |
-| `gene` | `STRING` | Gene symbol the variant was assigned to (ASC2: GENCODE v29 spelling, SCHEMA2 and BipEx2: v39) |
+| `gene` | `STRING` | Gene symbol the variant was assigned to (ASC2: GENCODE v29 spelling, SCHEMA2 and BipEx2: v39, SCHEMA1: v39, or v19 for a gene v39 no longer has) |
 | `gene_id` | `STRING` | Ensembl gene ID (unversioned) |
-| `transcript_id` | `STRING` | Ensembl transcript the consequence was called on. NULL for BipEx2 |
-| `consequence` | `STRING` | VEP consequence as the source spells it, so the spelling differs by dataset (ASC2: missense, stop gained; SCHEMA2 and BipEx2: missense_variant, stop_gained). Read the values from the enumerable values scoped by resource |
-| `variant_class` | `STRING` | PTV, Mis2, Mis1, Mis0 or synonymous; the same spelling as exome_gene_counts_v.variant_class. NULL for SCHEMA2 and BipEx2 |
+| `transcript_id` | `STRING` | Ensembl transcript the consequence was called on. NULL for BipEx2 and SCHEMA1 |
+| `consequence` | `STRING` | VEP consequence as the source spells it, so the spelling differs by dataset (ASC2: missense, stop gained; SCHEMA2 and BipEx2: missense_variant, stop_gained; SCHEMA1: the same terms with missense split into missense_variant_mpc_<2, _2-3 and _>=3). Read the values from the enumerable values scoped by resource |
+| `variant_class` | `STRING` | PTV, Mis2, Mis1, Mis0 or synonymous; the same spelling as exome_gene_counts_v.variant_class. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
 | `hgvsc` | `STRING` | Coding change (HGVS c.), NULL where none |
 | `hgvsp` | `STRING` | Protein change (HGVS p.), NULL where none |
 | `mpc` | `FLOAT64` | MPC missense deleteriousness score; NULL outside missense |
-| `alpha_missense` | `FLOAT64` | AlphaMissense pathogenicity score; NULL outside missense |
-| `is_other_splice` | `BOOL` | LOFTEE 'other splice': an SNV that may disrupt splicing, counted as PTV by the source under its rules. NULL for SCHEMA2 and BipEx2 |
-| `in_analysis` | `BOOL` | SCHEMA2 and BipEx2: TRUE on the variants the source's gene-level analysis used, FALSE or NULL (the source's NA) on the others. NULL for ASC2, which has no such flag |
-| `de_novo_ac_proband` | `INT64` | De novo allele count in probands (SCHEMA2: the source's n_de_novo). NULL for BipEx2 |
-| `de_novo_ac_sibling` | `INT64` | De novo allele count in unaffected siblings. NULL for SCHEMA2 and BipEx2 |
-| `transmitted_ac_proband` | `INT64` | Alleles transmitted to probands. NULL for SCHEMA2 and BipEx2 |
-| `untransmitted_ac_proband` | `INT64` | Alleles not transmitted to probands. NULL for SCHEMA2 and BipEx2 |
+| `alpha_missense` | `FLOAT64` | AlphaMissense pathogenicity score; NULL outside missense, and for SCHEMA1 |
+| `is_other_splice` | `BOOL` | LOFTEE 'other splice': an SNV that may disrupt splicing, counted as PTV by the source under its rules. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
+| `in_analysis` | `BOOL` | SCHEMA1, SCHEMA2 and BipEx2: TRUE on the variants the source's gene-level analysis used, FALSE or NULL (the source's NA) on the others. NULL for ASC2, which has no such flag |
+| `de_novo_ac_proband` | `INT64` | De novo allele count in probands (SCHEMA2: the source's n_de_novo, SCHEMA1: its n_denovos). NULL for BipEx2 |
+| `de_novo_ac_sibling` | `INT64` | De novo allele count in unaffected siblings. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
+| `transmitted_ac_proband` | `INT64` | Alleles transmitted to probands. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
+| `untransmitted_ac_proband` | `INT64` | Alleles not transmitted to probands. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
 | `ac_case` | `INT64` | Allele count in cases |
 | `an_case` | `INT64` | Allele number in cases (alleles genotyped). NULL for ASC2 and for a few SCHEMA2 rows; 0 where no case was genotyped |
 | `ac_ctrl` | `INT64` | Allele count in controls |

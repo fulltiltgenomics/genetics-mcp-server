@@ -3,7 +3,7 @@
 
 # gene_burden_results_v
 
-Gene-level burden test results from exome sequencing studies (e.g. BipEx2, SCHEMA2,
+Gene-level burden test results from exome sequencing studies (e.g. BipEx2, SCHEMA1, SCHEMA2,
 Genebass, IBD exome). UNFILTERED: every gene x annotation x trait combination is present, so
 a null result for a specific gene in a specific trait is a real null result and not a
 missing row. Genebass contributes the bulk of the rows, and a query that names only a gene
@@ -20,7 +20,14 @@ the phenotype code for the cross-ancestry meta-analysis and `<code>|<STRATUM>` (
 EAS, EUR, SAS, non_EUR) for a stratum, and `n_cases`/`n_controls` are that stratum's counts
 — on BRaVa's quantitative traits `n_cases` carries the analysed sample size and `n_controls`
 is NULL. `total_variants` and `total_variants_pheno` are NULL for every BRaVa row; the
-published files carry no variant counts.
+published files carry no variant counts. SCHEMA1 and SCHEMA2 are two releases of the same
+schizophrenia study and do NOT share mask names: SCHEMA2 has `PTV` and `PTV_missense`;
+SCHEMA1 has `Class_I` (PTV plus missense with MPC >= 3), `Class_II` (missense with MPC 2-3)
+and `meta`, the release's headline p-value combining the case-control and de novo tests,
+which has a p-value only (`beta` and `se` are NULL, as they are on a SCHEMA1 mask row whose
+odds ratio the release does not give). SCHEMA1 has no PTV-only test. Always filter on
+`dataset` when asking for one of them, and prefer SCHEMA2, the larger and later analysis,
+unless the question is about the 2022 paper.
 
 ## Scan pruning
 
@@ -30,7 +37,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 
 | column | type | description |
 | --- | --- | --- |
-| `dataset` | `STRING` | Study name (e.g. BipEx2, SCHEMA2, genebass, IBD_exome) |
+| `dataset` | `STRING` | Study name (e.g. BipEx2, SCHEMA1, SCHEMA2, genebass, IBD_exome) |
 | `trait` | `STRING` | Trait/phenotype name |
 | `gene` | `STRING` | Gene symbol (e.g. PCSK9) |
 | `gene_id` | `STRING` | Ensembl gene ID (e.g. ENSG00000169174) |
@@ -39,7 +46,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `gene_end_pos` | `INT64` | Gene end position (GRCh38) |
 | `annotation` | `STRING` | Variant annotation filter used in burden test (e.g. pLoF, nonsynonymous); BRaVa spells it `<mask>\|MAF<<cutoff>` |
 | `mlog10p_burden` | `FLOAT64` | -log10(p-value) from the gene-level burden test. Higher = more significant |
-| `beta` | `FLOAT64` | Effect size estimate from burden test |
+| `beta` | `FLOAT64` | Effect size estimate from burden test. NULL where the source reports none: every SCHEMA1 `meta` row and the SCHEMA1 mask rows without a usable odds ratio |
 | `se` | `FLOAT64` | Standard error of beta |
 | `total_variants` | `INT64` | Total qualifying variants in the gene |
 | `total_variants_pheno` | `INT64` | Qualifying variants with phenotype data |

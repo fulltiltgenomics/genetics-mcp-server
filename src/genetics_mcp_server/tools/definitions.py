@@ -930,7 +930,7 @@ A versioned Ensembl id (ENSG....14) is accepted; the version is dropped before t
         "parameters": {
             "resource": {
                 "type": "string",
-                "description": "Gene-based data resource ('genebass', 'brava', 'schema2', 'bipex2', 'ibd_exome_2026')",
+                "description": "Gene-based data resource ('genebass', 'brava', 'schema1', 'schema2', 'bipex2', 'ibd_exome_2026')",
                 "required": True,
             },
             "phenotype": {
