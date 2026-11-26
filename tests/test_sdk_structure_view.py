@@ -924,4 +924,5 @@ def test_the_docstrings_say_what_a_run_delivers():
     for function in (st.view, st.pml):
         assert "at most four non-image files" in function.__doc__
         assert "512 KiB" in function.__doc__
-    assert "25 of the 21,946 models" in st.pml.__doc__
+    # the model itself no longer goes through a run: the viewer saves it
+    assert "VIEWER ALREADY OFFERS BOTH FILES" in st.pml.__doc__

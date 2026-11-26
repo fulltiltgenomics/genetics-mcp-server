@@ -1413,21 +1413,13 @@ def pml(
     `neighbourhood` of the residues whose Cα is within the radius of the centre's — by
     distance in this one file only, without PAE.
 
-    THE SCRIPT LOADS THE MODEL FROM A FILE BESIDE IT, named `<model_file_id>.pdb` unless
-    `model_file` gives another bare file name. The chat's viewer offers no download of the
-    model, so write it in the same run for the user to download with the script, gzipped,
-    which PyMOL reads, and pass `model_file=mid + ".pdb.gz"`:
-
-        data = gzip.compress(genetics.protein_structure_file(mid))
-        with open(os.path.join(os.environ["SANDBOX_ARTIFACTS_DIR"], mid + ".pdb.gz"), "wb") as f:
-            f.write(data)
-
-    WHAT A RUN DELIVERS. The chat gets at most four non-image files of one run, taken in
-    name order, and none over 512 KiB, so several scripts and models go in several runs.
-    Check `len(data)`: in the release of 2026-11-12, 25 of the 21,946 models are over 512 KiB
-    even gzipped (all AlphaFold Server `AF3-` models, the largest 784 KiB). A run cannot
-    hand those to the user at all; write the script anyway and say plainly that the model
-    file for it is not downloadable from the chat.
+    THE CHAT'S VIEWER ALREADY OFFERS BOTH FILES under a drawn `view`: the model as
+    `<model_file_id>.pdb` and a PyMOL script with that view's colouring, highlights, labels
+    and neighbourhood. Call this only for a script whose marking a view cannot express, and
+    tell the user to save it beside the viewer's PDB download: the script loads the model
+    from `<model_file_id>.pdb` in its own directory unless `model_file` gives another bare
+    file name. The script itself is delivered as any file of a run is: the chat gets
+    at most four non-image files of one run, taken in name order, and none over 512 KiB.
 
     Returns `path`, `model_file` (the name the script loads) and what `view` returns except
     the region keys and the label counts: PyMOL draws every label.
