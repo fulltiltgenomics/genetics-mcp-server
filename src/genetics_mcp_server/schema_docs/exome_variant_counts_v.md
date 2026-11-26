@@ -32,8 +32,10 @@ release, Singh et al. 2022, trait SCZ; 24,248 cases and 97,322 controls): the 8,
 variants of the release's analysis set that have a consequence, lifted from GRCh37 to GRCh38
 (the few that do not lift cleanly are left out). Columns as SCHEMA2 — `in_analysis` (TRUE on
 398,033), case and control allele counts with allele numbers, a de novo count — but no
-transcript_id and no alpha_missense. Its `consequence` uses VEP's terms with missense split
-by MPC bin: `missense_variant_mpc_<2`, `missense_variant_mpc_2-3`,
+transcript_id and no alpha_missense. Unlike SCHEMA2, every SCHEMA1 variant with a de novo
+count also has ac_case above 0, so its de novo carriers appear to be counted in ac_case
+already: do not add de_novo_ac_proband to ac_case for SCHEMA1. Its `consequence` uses VEP's
+terms with missense split by MPC bin: `missense_variant_mpc_<2`, `missense_variant_mpc_2-3`,
 `missense_variant_mpc_>=3`, so match missense with `consequence LIKE 'missense_variant%'`.
 SCHEMA1 and SCHEMA2 are two releases of one study with overlapping samples: never add their
 counts together, and prefer SCHEMA2 unless the question is about the 2022 paper. SCHEMA2 and
@@ -69,7 +71,7 @@ Partitioned on `chr`: a literal `chr = <n>` predicate is what keeps a query unde
 | `alpha_missense` | `FLOAT64` | AlphaMissense pathogenicity score; NULL outside missense, and for SCHEMA1 |
 | `is_other_splice` | `BOOL` | LOFTEE 'other splice': an SNV that may disrupt splicing, counted as PTV by the source under its rules. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
 | `in_analysis` | `BOOL` | SCHEMA1, SCHEMA2 and BipEx2: TRUE on the variants the source's gene-level analysis used, FALSE or NULL (the source's NA) on the others. NULL for ASC2, which has no such flag |
-| `de_novo_ac_proband` | `INT64` | De novo allele count in probands (SCHEMA2: the source's n_de_novo, SCHEMA1: its n_denovos). NULL for BipEx2 |
+| `de_novo_ac_proband` | `INT64` | De novo allele count in probands (SCHEMA2: the source's n_de_novo, not included in ac_case; SCHEMA1: its n_denovos, which ac_case appears to include already). NULL for BipEx2 |
 | `de_novo_ac_sibling` | `INT64` | De novo allele count in unaffected siblings. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
 | `transmitted_ac_proband` | `INT64` | Alleles transmitted to probands. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
 | `untransmitted_ac_proband` | `INT64` | Alleles not transmitted to probands. NULL for SCHEMA1, SCHEMA2 and BipEx2 |
